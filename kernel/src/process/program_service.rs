@@ -436,6 +436,7 @@ impl ProgramExecError {
                 };
             }
             FsError::NoEntry => ProgramExecErrorKind::NotFound,
+            FsError::OutOfMemory => ProgramExecErrorKind::OutOfMemory,
             FsError::Io | FsError::NoSpace => ProgramExecErrorKind::Io,
             FsError::NotDirectory
             | FsError::IsDirectory

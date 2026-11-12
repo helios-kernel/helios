@@ -813,10 +813,10 @@ mod tests {
         assert!(!start.is_null(), "host allocation for the test pool failed");
         // SAFETY: `bytes` bytes just allocated.
         unsafe { start.write_bytes(GARBAGE, bytes) };
-        let pool = Box::leak(Box::new(UserMemoryPool::empty()));
-        pool.initialize(&[(start as usize, start as usize + bytes)]);
-        pool.configure_processors(1);
-        pool
+        Box::leak(Box::new(UserMemoryPool::single_node(
+            1,
+            &[(start as usize, start as usize + bytes)],
+        )))
     }
 
     fn allocated(pool: &UserMemoryPool) -> usize {

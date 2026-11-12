@@ -449,6 +449,25 @@ where
         self.activity.instance()
     }
 
+    /// The user pool, installed during boot before any program runs.
+    pub(super) fn user_pool() -> &'static crate::UserMemoryPool {
+        crate::memory::installed_user_memory_pool()
+            .expect("the user memory pool is installed before any program runs")
+    }
+
+    /// Asks the shared OOM path to cover `requested_bytes` of user memory
+    /// for this instance, which is never its own victim.
+    pub(super) fn request_user_memory_oom_kill(&self, requested_bytes: u64) {
+        crate::wasmtime_adapter::store::request_oom_kill(
+            &self.runtime_state,
+            &self.runtime_state.instance_registry(),
+            &self.cpu,
+            self.instance().id(),
+            crate::MemoryPool::User,
+            usize::try_from(requested_bytes).unwrap_or(usize::MAX),
+        );
+    }
+
     /// The handle the code driving this store accounts its processor
     /// turns through. Taken before the store is borrowed for the call;
     /// see [`crate::component::GuestTurns::drive`].

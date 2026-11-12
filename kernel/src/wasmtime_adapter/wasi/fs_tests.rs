@@ -1803,6 +1803,7 @@ impl MemoryHostFileSystem {
                 IoError::Unsupported
             }
             FsError::NoSpace => return crate::HostFsError::Protocol("no space"),
+            FsError::OutOfMemory => return crate::HostFsError::Protocol("out of memory"),
             FsError::NameTooLong => {
                 return crate::HostFsError::NameTooLong {
                     len: 256,
