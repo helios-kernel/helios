@@ -1679,10 +1679,7 @@ impl NetworkShardSet {
         request: TcpConnectRequest,
     ) -> Result<TcpStreamId, TcpError> {
         let owners = request.port_owners(self.shard_count());
-        let (first, last, draw) = self.shard_at(accepting).lock().connect_draw();
-        let candidates = EphemeralCandidates::classify(first, last, draw, |port| {
-            owners.owner_of(port) == accepting
-        });
+        let candidates = self.classify_ephemeral_window(accepting, &owners);
         if let Some(stream) = self
             .shard_at(accepting)
             .lock()
@@ -1766,16 +1763,6 @@ impl NetworkShard {
             .set_tcp_hop_limit(socket, hop_limit)
             .map_err(|_| TcpConnectStartError::Failed(START_FAILED))?;
         Ok(self.insert_tcp_stream(socket))
-    }
-
-    /// This shard's window `(first, last)` and the draw, below the
-    /// window's length, that [`EphemeralCandidates::classify`] selects
-    /// its starting points from. The entropy stream is touched only
-    /// here, under this shard's lock, which the caller holds.
-    pub(super) fn connect_draw(&mut self) -> (u16, u16, u32) {
-        let (first, last) = self.ephemeral_window();
-        let draw = self.entropy.below(EphemeralWalk::window_len(first, last));
-        (first, last, draw)
     }
 
     /// Opens an ephemeral-port connection on this shard from the own

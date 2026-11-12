@@ -613,33 +613,31 @@ impl NetworkShard {
     ///
     /// The same trade as the TCP form: ownership follows the hash
     /// whatever port is chosen, and aiming at this shard is what keeps
-    /// a socket opened on this processor being received on it.
+    /// a socket opened on this processor being received on it. The
+    /// first free port among this shard's own `candidates` is taken,
+    /// uniform over them when all are free; with none free, the first
+    /// free port that hashes elsewhere, which still works because the
+    /// caller opens the socket on the shard the flow hashes to.
+    ///
+    /// `candidates` classify this shard's window
+    /// ([`NetworkShardSet::classify_ephemeral_window`]) outside the
+    /// lock; only the free check runs under this shard's lock, which
+    /// the caller holds. The caller opens the socket afterwards, on
+    /// the flow's owning shard and under that shard's lock, so the bind
+    /// has never been part of this step and the classification's
+    /// placement changes nothing about it.
     pub(super) fn allocate_udp_local_port_for(
-        &mut self,
-        remote: IpAddress,
-        remote_port: u16,
-        shard_count: usize,
+        &self,
+        candidates: &EphemeralCandidates,
     ) -> Result<u16, UdpError> {
-        let local = self
-            .udp_local_endpoint(0, remote)
-            .map_err(map_udp_connect_error)?
-            .address;
-        let mut fallback = None;
-        for candidate in self.ephemeral_walk() {
-            if !self.is_udp_local_port_free(candidate) {
-                continue;
-            }
-            if shard_idx_for_flow(local, candidate, remote, remote_port, shard_count)
-                == self.shard_idx
-            {
-                return Ok(candidate);
-            }
-            fallback.get_or_insert(candidate);
-        }
-        fallback.ok_or(UdpError {
-            kind: UdpErrorKind::Unavailable,
-            detail: NetworkErrorDetail::UdpNoEphemeralPorts,
-        })
+        candidates
+            .own_ports()
+            .chain(candidates.foreign_ports())
+            .find(|port| self.is_udp_local_port_free(*port))
+            .ok_or(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UdpNoEphemeralPorts,
+            })
     }
 
     pub(super) fn allocate_udp_local_port(&mut self) -> Result<u16, UdpError> {

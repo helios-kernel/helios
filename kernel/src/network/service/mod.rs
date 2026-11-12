@@ -4400,6 +4400,148 @@ mod tests {
         }
     }
 
+    /// The owners of the local ports of a flow to the resolver
+    /// [`connect_remote`] on the DNS port, as `open_resolver_socket`
+    /// builds them.
+    fn resolver_owners(shard_count: usize) -> super::PortOwners {
+        super::PortOwners::new(
+            IpAddress::Ipv6(connect_local()),
+            IpAddress::Ipv6(connect_remote()),
+            super::DNS_PORT,
+            shard_count,
+        )
+    }
+
+    /// Binds `port` on `shard` the way a datagram socket holds it.
+    fn hold_udp_port(shard: &mut NetworkShard, port: u16) {
+        shard
+            .stack
+            .open_udp(UdpSocketBinding::wildcard(port))
+            .expect("a free datagram port binds");
+    }
+
+    /// Issue #831: every draw the resolver's port allocation can make,
+    /// on every shard of a set, through the allocation function with
+    /// every port free. Each own port is returned `floor(W / n)` or
+    /// `ceil(W / n)` times of the `W` draws and no foreign port is,
+    /// however the shard's own ports are spaced in its window.
+    #[test]
+    fn a_resolver_port_is_drawn_equally_often_from_each_own_port() {
+        for shard_count in [3usize, 4, 7] {
+            let state = connect_shard_set(shard_count);
+            let owners = resolver_owners(shard_count);
+            for accepting in 0..shard_count {
+                let shard = state.shard_at(accepting).lock();
+                let (first, last) = shard.ephemeral_window();
+                let window = u32::from(last - first) + 1;
+                let is_own: Vec<bool> = (first..=last)
+                    .map(|port| owners.owner_of(port) == accepting)
+                    .collect();
+                let own_count = is_own.iter().filter(|own| **own).count() as u32;
+                assert!(own_count != 0, "the fixture needs an own port");
+                let mut taken = alloc::collections::BTreeMap::<u16, u32>::new();
+                for draw in 0..window {
+                    let candidates =
+                        super::EphemeralCandidates::classify(first, last, draw, |port| {
+                            is_own[usize::from(port - first)]
+                        });
+                    let port = shard
+                        .allocate_udp_local_port_for(&candidates)
+                        .expect("every port is free");
+                    *taken.entry(port).or_default() += 1;
+                }
+                assert_eq!(
+                    taken.len() as u32,
+                    own_count,
+                    "every own port is returned for some draw \
+                     (shards {shard_count}, accepting {accepting})"
+                );
+                for (port, times) in &taken {
+                    assert!(
+                        is_own[usize::from(port - first)],
+                        "a foreign port {port} was returned"
+                    );
+                    assert!(
+                        *times == window / own_count || *times == window.div_ceil(own_count),
+                        "port {port} was returned {times} times of {window} draws over \
+                         {own_count} own ports (shards {shard_count}, accepting {accepting})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The allocation takes an own port whenever one is free: with
+    /// every own port but one bound, every draw returns that one.
+    #[test]
+    fn a_resolver_port_is_the_one_free_own_port() {
+        const SHARDS: usize = 64;
+        let state = connect_shard_set(SHARDS);
+        let owners = resolver_owners(SHARDS);
+        let mut shard = state.shard_at(0).lock();
+        let (first, last) = shard.ephemeral_window();
+        let window = u32::from(last - first) + 1;
+        let own: Vec<u16> = (first..=last)
+            .filter(|port| owners.owner_of(*port) == 0)
+            .collect();
+        assert!(own.len() > 2, "the fixture needs several own ports");
+        let free = own[own.len() / 2];
+        for port in own.iter().filter(|port| **port != free) {
+            hold_udp_port(&mut shard, *port);
+        }
+        for draw in 0..window {
+            let candidates = super::EphemeralCandidates::classify(first, last, draw, |port| {
+                owners.owner_of(port) == 0
+            });
+            assert_eq!(
+                shard.allocate_udp_local_port_for(&candidates).ok(),
+                Some(free),
+                "draw {draw} did not take the one free own port"
+            );
+        }
+    }
+
+    /// With no own port free a free foreign port is returned, and with
+    /// the whole window bound the allocation fails.
+    #[test]
+    fn a_resolver_port_falls_back_to_a_foreign_port_then_fails() {
+        // A window small enough to bind whole: the stack holds
+        // `MAX_UDP_SOCKETS` datagram sockets, and the window is 128.
+        const SHARDS: usize = 128;
+        let state = connect_shard_set(SHARDS);
+        let owners = resolver_owners(SHARDS);
+        // Classifies under the shard's own lock, so it comes first.
+        // The first shard whose window holds an own port.
+        let (accepting, candidates) = (0..SHARDS)
+            .map(|accepting| {
+                (
+                    accepting,
+                    state.classify_ephemeral_window(accepting, &owners),
+                )
+            })
+            .find(|(_, candidates)| candidates.own_ports().next().is_some())
+            .expect("the fixture needs a shard with an own port");
+        let mut shard = state.shard_at(accepting).lock();
+        let (first, last) = shard.ephemeral_window();
+        for port in candidates.own_ports() {
+            hold_udp_port(&mut shard, port);
+        }
+
+        let port = shard
+            .allocate_udp_local_port_for(&candidates)
+            .expect("a foreign port is free");
+        assert!((first..=last).contains(&port));
+        assert_ne!(owners.owner_of(port), accepting, "an own port was returned");
+
+        for foreign in (first..=last).filter(|port| owners.owner_of(*port) != accepting) {
+            hold_udp_port(&mut shard, foreign);
+        }
+        let error = shard
+            .allocate_udp_local_port_for(&candidates)
+            .expect_err("the whole window is bound");
+        assert_eq!(error.detail, crate::NetworkErrorDetail::UdpNoEphemeralPorts);
+    }
+
     /// Issue #788: a walk that starts on ports whose four-tuple to this
     /// remote a lingering connection still holds takes the next
     /// candidate instead of failing the connect.
