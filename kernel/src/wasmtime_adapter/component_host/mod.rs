@@ -2615,6 +2615,9 @@ where
         }
         crate::wasmtime_adapter::preemption::kill_or_yield(caller.data().pending_kill())
     });
+    crate::wasmtime_adapter::store::install_stack_reserve(&mut store, |data, requested_bytes| {
+        data.request_oom_kill_for_growth(crate::MemoryPool::User, requested_bytes);
+    });
     let interrupts = engine
         .interrupts()
         .register(instance, &store, store.data().cpu.clone());
