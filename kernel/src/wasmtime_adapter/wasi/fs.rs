@@ -137,6 +137,7 @@ pub(crate) fn fs_error_code(error: VfsError) -> fs_types::ErrorCode {
         VfsError::NameTooLong => fs_types::ErrorCode::NameTooLong,
         VfsError::Unsupported => fs_types::ErrorCode::Unsupported,
         VfsError::NoSpace => fs_types::ErrorCode::InsufficientSpace,
+        VfsError::OutOfMemory => fs_types::ErrorCode::InsufficientMemory,
         VfsError::Io => fs_types::ErrorCode::Io,
     }
 }

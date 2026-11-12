@@ -5383,9 +5383,10 @@ pub(super) fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
         fs_types::ErrorCode::Unsupported => p1::errno::NOTSUP,
         fs_types::ErrorCode::Overflow => p1::errno::OVERFLOW,
         fs_types::ErrorCode::NotPermitted => p1::errno::PERM,
-        fs_types::ErrorCode::InsufficientSpace => p1::errno::NOSPC,
         fs_types::ErrorCode::ReadOnly => p1::errno::ROFS,
         fs_types::ErrorCode::CrossDevice => p1::errno::XDEV,
+        fs_types::ErrorCode::InsufficientSpace => p1::errno::NOSPC,
+        fs_types::ErrorCode::InsufficientMemory => p1::errno::NOMEM,
         _ => p1::errno::IO,
     }
 }
@@ -7433,5 +7434,19 @@ mod open_file_offset_tests {
             Some(Ok(payload.to_vec()))
         );
         assert_eq!(block_on(p1_tell_open_file(&fd1)), payload.len() as u64);
+    }
+
+    /// A full storage budget is `NOSPC` and a refused frame is `NOMEM`;
+    /// neither falls through to the catch-all `IO`.
+    #[test]
+    fn storage_exhaustion_has_its_own_errnos() {
+        assert_eq!(
+            p1_errno_from_fs(fs_types::ErrorCode::InsufficientSpace),
+            p1::errno::NOSPC
+        );
+        assert_eq!(
+            p1_errno_from_fs(fs_types::ErrorCode::InsufficientMemory),
+            p1::errno::NOMEM
+        );
     }
 }

@@ -2940,3 +2940,19 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
         }
     }
 }
+
+/// The two exhaustion errors of the filesystem contract reach the WASI
+/// error codes a guest tells apart: the storage budget and the pool.
+#[test]
+fn storage_exhaustion_maps_to_the_wasi_insufficient_codes() {
+    use helios_hal::fs::FsError;
+
+    assert!(matches!(
+        super::fs_error_code(FsError::NoSpace),
+        fs_types::ErrorCode::InsufficientSpace
+    ));
+    assert!(matches!(
+        super::fs_error_code(FsError::OutOfMemory),
+        fs_types::ErrorCode::InsufficientMemory
+    ));
+}
