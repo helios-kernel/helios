@@ -831,6 +831,60 @@ fn the_address_space_s_account_condemns_the_resident_instance() {
     address_space.release(small_range).expect("release");
 }
 
+/// An instance whose memory is all store-held buffers (checkpoints,
+/// snapshots, fork stacks), with no linear memory, is what a user-pool
+/// shortfall condemns, and the condemnation covers those bytes. Killing
+/// it frees them, so they are its score, and the ledger records them.
+#[test]
+fn held_user_memory_makes_an_instance_the_user_pool_victim() {
+    const HELD_BYTES: u64 = 64 * 1024 * 1024;
+    const REQUESTED_BYTES: u64 = 32 * 1024 * 1024;
+
+    let registry = registry_on_processor_zero();
+    let holder = registry.register("snapshot-holder", 0);
+    let bystander = registry.register("bystander", 0);
+    let requester = registry.register("requester", 0);
+    bystander.set_memory_bytes(HELD_BYTES / 2);
+    let residency: UserResidency = [(owner_of(&bystander), HELD_BYTES / 2)]
+        .into_iter()
+        .collect();
+    assert_eq!(holder.memory_bytes(), 0);
+    let charge = holder.charge_user_memory(HELD_BYTES);
+
+    let decision =
+        registry.condemn_for_oom(requester.id(), MemoryPool::User, REQUESTED_BYTES, 0, &residency);
+    let OomKillOutcome::Condemned(victim) = decision.outcome else {
+        panic!("a holder of {HELD_BYTES} bytes is a user-pool victim: {decision:?}");
+    };
+    assert_eq!(victim.id, holder.id());
+    assert_eq!(victim.score, HELD_BYTES);
+    assert_eq!(
+        registry.condemned_memory(MemoryPool::User, 0).pending_bytes,
+        HELD_BYTES,
+        "the condemnation records what the held buffers return"
+    );
+    assert_eq!(registry.snapshot(1)[0].memory_bytes, HELD_BYTES);
+
+    // The buffers go with the store; the entry goes with the last handle.
+    drop(charge);
+    assert_eq!(holder.user_pool_bytes(), 0);
+}
+
+/// A kernel-heap shortfall is not answered by user-pool charges: the
+/// held buffers are frames of the other pool.
+#[test]
+fn held_user_memory_is_not_a_kernel_heap_candidate() {
+    let registry = registry_on_processor_zero();
+    let holder = registry.register("snapshot-holder", 0);
+    let _charge = holder.charge_user_memory(64 * 1024 * 1024);
+    assert!(
+        registry
+            .pick_oom_victim(MemoryPool::Kernel, &UserResidency::default())
+            .is_none(),
+        "held user frames must not be ranked in the kernel pool"
+    );
+}
+
 #[test]
 fn no_swap_reports_unsupported() {
     let backend = NoSwap;
