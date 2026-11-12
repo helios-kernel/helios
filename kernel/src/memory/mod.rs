@@ -32,6 +32,7 @@ mod locality;
 mod mapping_cost;
 mod native_pages;
 mod owner;
+mod paged;
 mod per_processor;
 mod policy;
 mod reported;
@@ -69,6 +70,7 @@ pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner,
 };
+pub use paged::{DetachedPages, FrameReservation, FrameShortage, PagedBytes};
 pub use per_processor::{LocalMemory, LocalSlice, NodeLocalArena, NodeMemory, PerProcessor};
 pub use policy::{
     BootMemoryPlan, BootRegionSplitter, KERNEL_HEAP_BOOTSTRAP_BYTES,
