@@ -122,7 +122,7 @@ impl Group {
 
 /// The extent item/back-reference changes the transaction must publish for a
 /// newly reserved metadata block. No record is written by the allocator alone.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MetadataReservation {
     pub(crate) tree: u64,
     pub(crate) level: u8,

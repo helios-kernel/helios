@@ -103,6 +103,7 @@ fn contents(trees: &Trees, root: TreeRoot) -> BTreeMap<Key, Vec<u8>> {
         assert_eq!(block.header().bytenr, address);
         assert_eq!(block.header().level, level);
         assert_eq!(block.header().generation, generation);
+        assert_eq!(block.header().owner, root.tree);
         assert!(ChecksumType::Crc32c.verifies(&blocks[&address][32..], &block.header().csum));
         match &block {
             TreeBlock::Leaf { items, .. } => {
@@ -154,13 +155,13 @@ fn large_middle_item_can_require_three_leaves_and_preserves_payloads() {
             .into_iter()
             .zip([small.as_slice(), large.as_slice(), small.as_slice()])
     {
-        let bytes = leaf.encode(range, 32 << 20, 2, ChecksumType::Crc32c);
+        let bytes = leaf.encode(range, 32 << 20, 2, 5, ChecksumType::Crc32c);
         let parsed = TreeBlock::parse(&bytes);
         assert_eq!(parsed.item_data(0), Some(expected));
     }
     let oversized = vec![0; capacity];
     assert!(leaf.set(middle, &oversized).is_err());
-    let bytes = leaf.encode(1..2, 32 << 20, 2, ChecksumType::Crc32c);
+    let bytes = leaf.encode(1..2, 32 << 20, 2, 5, ChecksumType::Crc32c);
     assert_eq!(
         TreeBlock::parse(&bytes).item_data(0),
         Some(large.as_slice())
@@ -545,5 +546,188 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
             Some(original)
         );
         assert!(!space.cancel_metadata(block.address));
+    });
+}
+
+#[test]
+fn metadata_registration_converges_across_extent_tree_growth_and_cancellation() {
+    use crate::accounting::Accounting;
+    use crate::ondisk::{item_type, objectid};
+    use crate::space::Space;
+
+    block_on(async {
+        let fs = filesystem();
+        let extent_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
+            .await
+            .unwrap()
+            .root;
+        let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+        let mut trees = Trees::new(
+            fs.superblock().generation() + 1,
+            fs.superblock().csum_type(),
+        );
+        let size = u64::from(fs.superblock().nodesize());
+        let mut accounting = Accounting::new(extent_root, size);
+        let mut root = fs.default_subvolume.root;
+        // Full leaves force enough allocations to split the extent tree as its
+        // own allocation records are registered.
+        let count = (size as usize - 101) / 33 + 3;
+        let payload = vec![0x56; size as usize - 101 - 25];
+        for index in 0..count {
+            root = trees
+                .apply(
+                    &fs.volume,
+                    root,
+                    Key::new(1000 + index as u64, 24, 0),
+                    Some(&payload),
+                    &mut space,
+                )
+                .await
+                .unwrap();
+        }
+        let mut previously_registered: Vec<Key> = Vec::new();
+        for shrink in [false, true] {
+            if shrink {
+                for index in 0..count {
+                    root = trees
+                        .apply(
+                            &fs.volume,
+                            root,
+                            Key::new(1000 + index as u64, 24, 0),
+                            None,
+                            &mut space,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            accounting
+                .sync_metadata(&fs.volume, &mut trees, &mut space)
+                .await
+                .unwrap();
+            let current: BTreeMap<_, _> = space.metadata().collect();
+            assert_eq!(current.len(), trees.blocks().count());
+            if !shrink {
+                assert!(accounting.root.level > 0);
+            }
+            for (&address, record) in &current {
+                let skinny = fs.superblock().incompat_flags() & (1 << 8) != 0;
+                let key = if skinny {
+                    Key::new(address, item_type::METADATA_ITEM, u64::from(record.level))
+                } else {
+                    Key::new(address, item_type::EXTENT_ITEM, size)
+                };
+                let bytes = trees
+                    .get(&fs.volume, accounting.root, key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let disk_key = btrfs_disk::tree::DiskKey {
+                    objectid: address,
+                    key_type: if skinny {
+                        btrfs_disk::tree::KeyType::MetadataItem
+                    } else {
+                        btrfs_disk::tree::KeyType::ExtentItem
+                    },
+                    offset: key.offset,
+                };
+                let independent = btrfs_disk::items::ExtentItem::parse(&bytes, &disk_key).unwrap();
+                assert_eq!(independent.refs, 1);
+                assert_eq!(independent.generation, trees.generation());
+                assert_eq!(independent.inline_refs.len(), 1);
+                assert!(
+                    matches!(independent.inline_refs[0], btrfs_disk::items::InlineRef::TreeBlockBackref { root, .. } if root == record.tree)
+                );
+                if !skinny {
+                    let first = independent.tree_block_key.unwrap();
+                    assert_eq!(first.objectid, record.first.objectid);
+                    assert_eq!(first.key_type.to_raw(), record.first.item_type);
+                    assert_eq!(first.offset, record.first.offset);
+                }
+            }
+            for key in previously_registered {
+                if !current.contains_key(&key.objectid) {
+                    assert_eq!(
+                        trees.get(&fs.volume, accounting.root, key).await.unwrap(),
+                        None
+                    );
+                }
+            }
+            previously_registered = current
+                .iter()
+                .map(|(&address, record)| {
+                    if fs.superblock().incompat_flags() & (1 << 8) != 0 {
+                        Key::new(address, item_type::METADATA_ITEM, u64::from(record.level))
+                    } else {
+                        Key::new(address, item_type::EXTENT_ITEM, size)
+                    }
+                })
+                .collect();
+            let stable: Vec<_> = trees
+                .blocks()
+                .map(|(address, bytes)| (address, bytes.to_vec()))
+                .collect();
+            let available = space.available_metadata();
+            accounting
+                .sync_metadata(&fs.volume, &mut trees, &mut space)
+                .await
+                .unwrap();
+            assert_eq!(
+                stable,
+                trees
+                    .blocks()
+                    .map(|(address, bytes)| (address, bytes.to_vec()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(space.available_metadata(), available);
+        }
+        assert!(!space.cancel_metadata(fs.default_subvolume.root.bytenr));
+    });
+}
+
+#[test]
+fn cow_blocks_take_the_writing_tree_owner_from_a_shared_original() {
+    block_on(async {
+        let fs = filesystem();
+        let original = fs.default_subvolume.root;
+        let mut root = TreeRoot {
+            tree: 256,
+            ..original
+        };
+        let mut trees = Trees::new(original.generation + 1, fs.superblock().csum_type());
+        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+            .await
+            .unwrap();
+        let payload = vec![0x74; fs.superblock().nodesize() as usize - 101 - 25];
+        for index in 0..3 {
+            root = trees
+                .apply(
+                    &fs.volume,
+                    root,
+                    Key::new(1000 + index, 24, 0),
+                    Some(&payload),
+                    &mut space,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(root.level > 0);
+        contents(&trees, root);
+        for (address, reservation) in space.metadata() {
+            let bytes = trees
+                .blocks()
+                .find(|(candidate, _)| *candidate == address)
+                .unwrap()
+                .1;
+            assert_eq!(TreeBlock::parse(bytes).header().owner, reservation.tree);
+            assert_eq!(reservation.tree, 256);
+        }
+        let original_node = root_node(&fs);
+        assert_eq!(original_node.key(0), Key::new(256, 1, 0));
+        assert!(
+            trees
+                .blocks()
+                .all(|(address, _)| address != original.bytenr)
+        );
     });
 }

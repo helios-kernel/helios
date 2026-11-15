@@ -173,7 +173,7 @@ impl Trees {
                 continue;
             };
             let fresh = destination(&mut reusable, allocator, root.tree, 0, first)?;
-            self.insert(leaf.encode(range, fresh, self.generation, self.checksum));
+            self.insert(leaf.encode(range, fresh, self.generation, root.tree, self.checksum));
             children.push(Child {
                 key: first,
                 address: fresh,
@@ -198,7 +198,7 @@ impl Trees {
                     continue;
                 };
                 let fresh = destination(&mut reusable, allocator, root.tree, level, first)?;
-                self.insert(branch.encode(range, fresh, self.generation, self.checksum));
+                self.insert(branch.encode(range, fresh, self.generation, root.tree, self.checksum));
                 children.push(Child {
                     key: first,
                     address: fresh,
@@ -215,7 +215,7 @@ impl Trees {
         if children.is_empty() {
             let fresh = allocator.allocate(root.tree, 0, Key::new(0, 0, 0))?;
             let leaf = Leaf::empty(Header::for_level(&original_root, 0));
-            self.insert(leaf.encode(0..0, fresh, self.generation, self.checksum));
+            self.insert(leaf.encode(0..0, fresh, self.generation, root.tree, self.checksum));
             return Ok(TreeRoot {
                 tree: root.tree,
                 bytenr: fresh,
@@ -235,7 +235,7 @@ impl Trees {
             for range in branch.partitions() {
                 let first = branch.first_key(&range).expect("nonempty new root");
                 let fresh = allocator.allocate(root.tree, level, first)?;
-                self.insert(branch.encode(range, fresh, self.generation, self.checksum));
+                self.insert(branch.encode(range, fresh, self.generation, root.tree, self.checksum));
                 children.push(Child {
                     key: first,
                     address: fresh,
@@ -276,6 +276,10 @@ impl Trees {
             generation: child.generation,
             level,
         })
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(crate) fn blocks(&self) -> impl Iterator<Item = (u64, &[u8])> {

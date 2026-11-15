@@ -46,12 +46,13 @@ impl Header {
         }
     }
 
-    fn block(&self, address: u64, generation: u64, count: usize) -> Box<[u8]> {
+    fn block(&self, address: u64, generation: u64, owner: u64, count: usize) -> Box<[u8]> {
         let mut bytes = vec![0; self.size].into_boxed_slice();
         let mut raw = self.raw;
         raw.csum.fill(0);
         raw.bytenr.set(address);
         raw.generation.set(generation);
+        raw.owner.set(owner);
         raw.nritems.set(count as u32);
         // BTRFS_HEADER_FLAG_WRITTEN: encoded blocks are about to be written. Keep the
         // relocation and backref revision bits while setting the written bit.
@@ -169,10 +170,11 @@ impl Leaf {
         range: Range<usize>,
         address: u64,
         generation: u64,
+        owner: u64,
         kind: ChecksumType,
     ) -> Box<[u8]> {
         let items = &self.items[range];
-        let mut bytes = self.header.block(address, generation, items.len());
+        let mut bytes = self.header.block(address, generation, owner, items.len());
         let mut end = bytes.len();
         for (slot, item) in items.iter().enumerate() {
             end -= item.data.len();
@@ -252,10 +254,13 @@ impl Branch {
         range: Range<usize>,
         address: u64,
         generation: u64,
+        owner: u64,
         kind: ChecksumType,
     ) -> Box<[u8]> {
         let children = &self.children[range];
-        let mut bytes = self.header.block(address, generation, children.len());
+        let mut bytes = self
+            .header
+            .block(address, generation, owner, children.len());
         for (slot, child) in children.iter().enumerate() {
             let raw = RawKeyPtr {
                 key: raw_key(child.key),

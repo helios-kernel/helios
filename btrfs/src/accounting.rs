@@ -2,10 +2,14 @@
 //! change references, never allocator availability: committed blocks stay pinned
 //! until publication and the last reader of their generation have completed.
 
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
 use crate::Key;
 use crate::allocation::{AllocationDefect, MetadataExtent, MetadataReference};
 use crate::ondisk::item_type;
 use crate::source::BlockSource;
+use crate::space::{MetadataReservation, Space};
 use crate::tree::TreeRoot;
 use crate::tree::write::{MetadataAllocator, Trees, WriteError};
 use crate::volume::Volume;
@@ -19,11 +23,75 @@ pub(crate) struct MetadataBlock {
 pub(crate) struct Accounting {
     pub(crate) root: TreeRoot,
     nodesize: u64,
+    registered: BTreeMap<u64, MetadataReservation>,
 }
 
 impl Accounting {
     pub(crate) fn new(root: TreeRoot, nodesize: u64) -> Self {
-        Self { root, nodesize }
+        Self {
+            root,
+            nodesize,
+            registered: BTreeMap::new(),
+        }
+    }
+
+    /// Reconcile transaction-owned allocations, including blocks allocated by
+    /// these extent-tree edits. Private tree blocks keep their addresses, so
+    /// further passes are needed only for structural changes and first keys.
+    /// An error aborts the enclosing transaction, like any other tree edit.
+    pub(crate) async fn sync_metadata<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+    ) -> Result<(), WriteError> {
+        // BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA, from btrfs.h.
+        let skinny = volume.superblock().incompat_flags() & (1 << 8) != 0;
+        loop {
+            let current: BTreeMap<_, _> = space.metadata().collect();
+            let removed: Vec<_> = self
+                .registered
+                .iter()
+                .filter(|(address, _)| !current.contains_key(address))
+                .map(|(&address, &record)| (address, record))
+                .collect();
+            let changed: Vec<_> = current
+                .iter()
+                .filter(|(address, record)| self.registered.get(address) != Some(record))
+                .map(|(&address, &record)| (address, record))
+                .collect();
+            if removed.is_empty() && changed.is_empty() {
+                return Ok(());
+            }
+            for (address, record) in removed {
+                let extent = metadata_extent(trees.generation(), record, skinny);
+                self.root = trees
+                    .apply(
+                        volume,
+                        self.root,
+                        extent.key(address, self.nodesize),
+                        None,
+                        space,
+                    )
+                    .await?;
+                self.registered.remove(&address);
+            }
+            for (address, record) in changed {
+                let extent = metadata_extent(trees.generation(), record, skinny);
+                let key = extent.key(address, self.nodesize);
+                if let Some(&old) = self.registered.get(&address) {
+                    let old_key = metadata_extent(trees.generation(), old, skinny)
+                        .key(address, self.nodesize);
+                    if old_key != key {
+                        self.root = trees.apply(volume, self.root, old_key, None, space).await?;
+                    }
+                }
+                self.root = trees
+                    .apply(volume, self.root, key, Some(&extent.encode()), space)
+                    .await?;
+                self.registered.insert(address, record);
+            }
+        }
     }
 
     /// Returns true only when the last reference was removed. As with any tree
@@ -75,4 +143,13 @@ impl Accounting {
             .await?;
         Ok(last)
     }
+}
+
+fn metadata_extent(generation: u64, record: MetadataReservation, skinny: bool) -> MetadataExtent {
+    MetadataExtent::new(
+        generation,
+        record.tree,
+        record.level,
+        (!skinny).then_some(record.first),
+    )
 }
