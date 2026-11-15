@@ -27,6 +27,9 @@ def main():
     for name in ("Image", "initramfs.gz", "disk.raw"):
         if not (args.assets / name).is_file():
             parser.error(f"missing {args.assets / name}; run tools/prepare-linux-vmm.py")
+    # A previous successful run must not satisfy the persistence check.
+    with (args.assets / "disk.raw").open("r+b") as disk:
+        disk.write(bytes(512))
     command = [args.inspector, "vm", "--arch", "aarch64", "--accel", "tcg",
                "--cpu", "max", "--smp", "3", "--qemu-arg=-machine",
                "--qemu-arg=virtualization=on", "--shared-dir", str(args.assets.resolve()),
