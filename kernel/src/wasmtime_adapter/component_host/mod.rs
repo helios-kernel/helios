@@ -269,14 +269,11 @@ macro_rules! impl_program_bindings {
             Net: ComponentHostNetwork,
             StorageImpl: crate::Storage,
         {
-            async fn drop(
-                accessor: &Accessor<U, Self>,
+            fn drop(
+                mut access: Access<'_, U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<()> {
-                accessor.with(|mut access| {
-                    let _ = access.get().table.delete(child)?;
-                    Ok::<_, wasmtime::Error>(())
-                })?;
+                let _ = access.get().table.delete(child)?;
                 Ok(())
             }
 
@@ -2367,9 +2364,7 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(STATS_INSTANCE)?;
-    instance.func_wrap("snapshot", |caller, (): ()| {
-        Ok((snapshot_sample(caller.data()),))
-    })?;
+    instance.func_wrap_data("snapshot", |data, (): ()| Ok((snapshot_sample(data),)))?;
     instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
         let period = stats_period(period)?;
         let reader = StreamReader::new(&mut caller, StatsStreamProducer::new(period))?;
@@ -2657,18 +2652,13 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]tcp-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let socket = access.get().table.get_mut(&resource)?;
-                    socket.resource.backend.close();
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::TcpError>(()),))
-            })
+            let socket = caller.data_mut().table.get_mut(&resource)?;
+            socket.resource.backend.close();
+            Ok((Ok::<(), debugger_wit::net::TcpError>(()),))
         },
     )?;
     instance.func_wrap_concurrent(
@@ -2726,18 +2716,13 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]udp-socket.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let socket = access.get().table.get_mut(&resource)?;
-                    socket.resource.backend.close();
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::UdpError>(()),))
-            })
+            let socket = caller.data_mut().table.get_mut(&resource)?;
+            socket.resource.backend.close();
+            Ok((Ok::<(), debugger_wit::net::UdpError>(()),))
         },
     )?;
     Ok(())
@@ -2994,18 +2979,13 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]tcp-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let socket = access.get().table.get_mut(&resource)?;
-                    socket.resource.backend.close();
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::TcpError>(()),))
-            })
+            let socket = caller.data_mut().table.get_mut(&resource)?;
+            socket.resource.backend.close();
+            Ok((Ok::<(), program_wit::net::TcpError>(()),))
         },
     )?;
     instance.func_wrap_concurrent(
@@ -3063,18 +3043,13 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]udp-socket.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let socket = access.get().table.get_mut(&resource)?;
-                    socket.resource.backend.close();
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::UdpError>(()),))
-            })
+            let socket = caller.data_mut().table.get_mut(&resource)?;
+            socket.resource.backend.close();
+            Ok((Ok::<(), program_wit::net::UdpError>(()),))
         },
     )?;
     Ok(())
@@ -3089,17 +3064,18 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
-    instance.func_wrap(
+    instance.func_wrap_data(
         "set-target-enabled",
-        |caller, (target, enabled): (String, bool)| {
-            let result = observation::set_target_enabled(caller.data(), &target, enabled).map_err(
-                |refusal| match refusal {
-                    TargetRefusal::Denied => debugger_wit::tracing::TargetError::Denied,
-                    TargetRefusal::Unknown(error) => {
-                        debugger_wit::tracing::TargetError::UnknownTarget(error)
+        |data, (target, enabled): (String, bool)| {
+            let result =
+                observation::set_target_enabled(data, &target, enabled).map_err(|refusal| {
+                    match refusal {
+                        TargetRefusal::Denied => debugger_wit::tracing::TargetError::Denied,
+                        TargetRefusal::Unknown(error) => {
+                            debugger_wit::tracing::TargetError::UnknownTarget(error)
+                        }
                     }
-                },
-            );
+                });
             Ok((result,))
         },
     )?;
@@ -3170,13 +3146,13 @@ macro_rules! impl_profiling_bindings {
                 // need the right to observe the machine; the folded and
                 // metric reads are answered for every caller, within the
                 // scope its authority selects. See `observation`.
-                instance.func_wrap("set-enabled", |caller, (enabled,): (bool,)| {
-                    let result = observation::set_profiling_enabled(caller.data(), enabled)
+                instance.func_wrap_data("set-enabled", |data, (enabled,): (bool,)| {
+                    let result = observation::set_profiling_enabled(data, enabled)
                         .map_err(|Denied| $wit::profiling::ControlError::Denied);
                     Ok((result,))
                 })?;
-                instance.func_wrap("clear", |caller, (): ()| {
-                    let result = observation::clear_profile(caller.data())
+                instance.func_wrap_data("clear", |data, (): ()| {
+                    let result = observation::clear_profile(data)
                         .map_err(|Denied| $wit::profiling::ControlError::Denied);
                     Ok((result,))
                 })?;
@@ -3210,26 +3186,29 @@ macro_rules! impl_profiling_bindings {
                         Ok((samples,))
                     },
                 )?;
-                instance.func_wrap("set-instruction-sampling", |caller, (enabled,): (bool,)| {
-                    let result = observation::set_instruction_sampling(caller.data(), enabled)
-                        .map_err(convert_instruction_profile_refusal);
-                    Ok((result,))
-                })?;
-                instance.func_wrap("instruction-samples", |caller, (): ()| {
-                    let profile = observation::instruction_samples(caller.data())?
+                instance.func_wrap_data(
+                    "set-instruction-sampling",
+                    |data, (enabled,): (bool,)| {
+                        let result = observation::set_instruction_sampling(data, enabled)
+                            .map_err(convert_instruction_profile_refusal);
+                        Ok((result,))
+                    },
+                )?;
+                instance.func_wrap_data("instruction-samples", |data, (): ()| {
+                    let profile = observation::instruction_samples(data)?
                         .map(convert_instruction_profile)
                         .map_err(convert_instruction_profile_refusal);
                     Ok((profile,))
                 })?;
-                instance.func_wrap("raw-profile-size", |caller, (): ()| {
-                    let size = observation::raw_profile_size(caller.data())
-                        .map_err(convert_raw_profile_refusal);
+                instance.func_wrap_data("raw-profile-size", |data, (): ()| {
+                    let size =
+                        observation::raw_profile_size(data).map_err(convert_raw_profile_refusal);
                     Ok((size,))
                 })?;
-                instance.func_wrap(
+                instance.func_wrap_data(
                     "raw-profile-read",
-                    |caller, (offset, length): (u64, u32)| {
-                        let window = observation::raw_profile_read(caller.data(), offset, length)
+                    |data, (offset, length): (u64, u32)| {
+                        let window = observation::raw_profile_read(data, offset, length)
                             .map_err(convert_raw_profile_refusal);
                         Ok((window,))
                     },
@@ -3387,8 +3366,8 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(STATS_INSTANCE)?;
-    instance.func_wrap("snapshot", |caller, (): ()| {
-        Ok((snapshot_program_sample(caller.data()),))
+    instance.func_wrap_data("snapshot", |data, (): ()| {
+        Ok((snapshot_program_sample(data),))
     })?;
     instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
         let period = stats_period(period)?;
@@ -3407,17 +3386,18 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
-    instance.func_wrap(
+    instance.func_wrap_data(
         "set-target-enabled",
-        |caller, (target, enabled): (String, bool)| {
-            let result = observation::set_target_enabled(caller.data(), &target, enabled).map_err(
-                |refusal| match refusal {
-                    TargetRefusal::Denied => program_wit::tracing::TargetError::Denied,
-                    TargetRefusal::Unknown(error) => {
-                        program_wit::tracing::TargetError::UnknownTarget(error)
+        |data, (target, enabled): (String, bool)| {
+            let result =
+                observation::set_target_enabled(data, &target, enabled).map_err(|refusal| {
+                    match refusal {
+                        TargetRefusal::Denied => program_wit::tracing::TargetError::Denied,
+                        TargetRefusal::Unknown(error) => {
+                            program_wit::tracing::TargetError::UnknownTarget(error)
+                        }
                     }
-                },
-            );
+                });
             Ok((result,))
         },
     )?;
@@ -3799,29 +3779,26 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(INSTANCES_INSTANCE)?;
-    instance.func_wrap("snapshot", |caller, (): ()| {
-        Ok((caller
-            .data()
+    instance.func_wrap_data("snapshot", |data, (): ()| {
+        Ok((data
             .instance_registry
-            .snapshot(caller.data().now_nanos())
+            .snapshot(data.now_nanos())
             .into_iter()
             .map(convert_instance)
             .collect::<Vec<_>>(),))
     })?;
-    instance.func_wrap("kill", |caller, (id,): (u64,)| {
-        let now = caller.data().now_nanos();
+    instance.func_wrap_data("kill", |data, (id,): (u64,)| {
+        let now = data.now_nanos();
         let victim = InstanceId::from_raw(id);
         // The flag and the interruption are all this does: the victim
         // unwinds at its next check, and whoever owns it — a plugin
         // supervisor, or nobody — decides what happens after.
-        let outcome =
-            caller
-                .data()
-                .instance_registry
-                .request_kill(victim, KillReason::Operator, now);
+        let outcome = data
+            .instance_registry
+            .request_kill(victim, KillReason::Operator, now);
         Ok((match outcome {
             KillOutcome::Requested => {
-                deliver_kill(&caller.data().runtime_state, victim);
+                deliver_kill(&data.runtime_state, victim);
                 Ok(())
             }
             KillOutcome::AlreadyStopping => {
@@ -3861,10 +3838,10 @@ where
             })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_data(
         "finished",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
-            if let Some(host_fs) = caller.data().runtime_state.host_fs_service() {
+        |data: &mut StoreData<CpuImpl, Net, StorageImpl>, (): ()| {
+            if let Some(host_fs) = data.runtime_state.host_fs_service() {
                 host_fs.snapshot_finished();
             }
             Ok(())
@@ -3888,15 +3865,15 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn debug_port(
-        accessor: &Accessor<U, Self>,
+    fn debug_port(
+        mut access: Access<'_, U, Self>,
     ) -> wasmtime::Result<Option<Resource<SbiSerialPort>>> {
-        accessor.with(|mut access| match access.get().debug_port() {
+        match access.get().debug_port() {
             Some(()) => Ok(Some(access.get().table.push(SbiSerialPort {
                 _resource: SerialPortResource,
             })?)),
             None => Ok(None),
-        })
+        }
     }
 }
 
@@ -3916,28 +3893,22 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn rights(
-        accessor: &Accessor<U, Self>,
+    fn rights(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<debugger_wit::serial::SerialRights> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.get(&resource)?;
-            Ok::<_, wasmtime::Error>(
-                debugger_wit::serial::SerialRights::READ
-                    | debugger_wit::serial::SerialRights::WRITE
-                    | debugger_wit::serial::SerialRights::FLUSH,
-            )
-        })
+        let _ = access.get().table.get(&resource)?;
+        Ok(debugger_wit::serial::SerialRights::READ
+            | debugger_wit::serial::SerialRights::WRITE
+            | debugger_wit::serial::SerialRights::FLUSH)
     }
 
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 
     async fn read(
@@ -3986,14 +3957,11 @@ where
         }
     }
 
-    async fn flush(
-        accessor: &Accessor<U, Self>,
+    fn flush(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.get(&resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })?;
+        let _ = access.get().table.get(&resource)?;
         Ok(())
     }
 }
@@ -4022,27 +3990,21 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    fn new(
-        mut access: Access<'_, U, Self>,
-    ) -> impl core::future::Future<Output = wasmtime::Result<Resource<SbiRawMutex>>> + Send {
-        // `Access` is not `Send`; do the table work synchronously and hand
-        // back a ready future that only captures the `Send` result.
+    fn new(mut access: Access<'_, U, Self>) -> wasmtime::Result<Resource<SbiRawMutex>> {
         let pushed = access.get().table.push(SbiRawMutex {
             resource: RawMutexResource {
                 inner: Arc::new(RawMutex::new()),
             },
         });
-        async move { Ok(pushed?) }
+        Ok(pushed?)
     }
 
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawMutex>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 
     async fn lock(
@@ -4077,14 +4039,12 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawMutexGuard>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 }
 
@@ -4104,25 +4064,21 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    fn new(
-        mut access: Access<'_, U, Self>,
-    ) -> impl core::future::Future<Output = wasmtime::Result<Resource<SbiRawRwLock>>> + Send {
+    fn new(mut access: Access<'_, U, Self>) -> wasmtime::Result<Resource<SbiRawRwLock>> {
         let pushed = access.get().table.push(SbiRawRwLock {
             resource: RawRwLockResource {
                 inner: Arc::new(RawRwLock::new()),
             },
         });
-        async move { Ok(pushed?) }
+        Ok(pushed?)
     }
 
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawRwLock>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 
     async fn read(
@@ -4172,14 +4128,12 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawRwLockReadGuard>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 }
 
@@ -4199,14 +4153,12 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawRwLockWriteGuard>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 }
 

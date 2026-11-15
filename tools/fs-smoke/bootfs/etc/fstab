@@ -1,0 +1,2 @@
+disk:erofs-smoke /image ro
+btrfs:btrfs-smoke /btrfs ro

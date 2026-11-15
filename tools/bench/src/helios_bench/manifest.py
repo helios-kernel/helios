@@ -175,6 +175,7 @@ class Lane(BaseModel):
             # fits in the suite and not in the collection profiles
             # nothing.
             "memory": self.memory,
+            "vcpus": str(self.vcpus),
         }
 
 
