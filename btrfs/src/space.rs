@@ -9,6 +9,7 @@ use core::ops::Range;
 
 use thiserror::Error;
 
+use crate::allocation::{AllocationDefect, MetadataExtent};
 use crate::fs::find_root;
 use crate::ondisk::{item_type, objectid};
 use crate::source::BlockSource;
@@ -40,6 +41,8 @@ pub(crate) enum SpaceError {
 
 #[derive(Debug, Error)]
 pub(crate) enum SpaceDefect {
+    #[error(transparent)]
+    Allocation(#[from] AllocationDefect),
     #[error("truncated allocation record")]
     Truncated,
     #[error("unaligned, empty, or overflowing extent range")]
@@ -204,6 +207,10 @@ impl Space {
                     || (key.item_type == item_type::METADATA_ITEM && flags & 3 != 2)
                 {
                     return Err(defect(SpaceDefect::ExtentHeader));
+                }
+                if flags & 2 != 0 {
+                    MetadataExtent::parse(key, item, space.nodesize)
+                        .map_err(|error| defect(error.into()))?;
                 }
                 let length = if key.item_type == item_type::METADATA_ITEM {
                     space.nodesize

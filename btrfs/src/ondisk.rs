@@ -60,6 +60,8 @@ pub(crate) mod item_type {
     pub(crate) const ROOT_ITEM: u8 = 132;
     pub(crate) const EXTENT_ITEM: u8 = 168;
     pub(crate) const METADATA_ITEM: u8 = 169;
+    pub(crate) const TREE_BLOCK_REF: u8 = 176;
+    pub(crate) const SHARED_BLOCK_REF: u8 = 182;
     pub(crate) const BLOCK_GROUP_ITEM: u8 = 192;
     pub(crate) const CHUNK_ITEM: u8 = 228;
 }

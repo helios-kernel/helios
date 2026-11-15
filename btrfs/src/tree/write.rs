@@ -93,6 +93,49 @@ impl Trees {
         );
     }
 
+    async fn path<S: BlockSource>(
+        &self,
+        volume: &Volume<S>,
+        root: TreeRoot,
+        key: Key,
+    ) -> Result<ArrayVec<(u64, Node, usize), { MAX_LEVEL as usize }>, WriteError> {
+        let mut path = ArrayVec::new();
+        let mut address = root.bytenr;
+        let mut expected = Expected {
+            level: root.level,
+            generation: root.generation,
+            first_key: None,
+        };
+        loop {
+            let node = self.read(volume, address, expected).await?;
+            let slot = node.floor_slot(key);
+            if node.level == 0 {
+                path.push((address, node, slot));
+                return Ok(path);
+            }
+            let (child, generation) = node.child(slot);
+            expected = Expected {
+                level: node.level - 1,
+                generation,
+                first_key: Some(node.key(slot)),
+            };
+            path.push((address, node, slot));
+            address = child;
+        }
+    }
+
+    /// Reads the transaction's current value, including unpublished edits.
+    pub(crate) async fn get<S: BlockSource>(
+        &self,
+        volume: &Volume<S>,
+        root: TreeRoot,
+        key: Key,
+    ) -> Result<Option<Vec<u8>>, WriteError> {
+        let path = self.path(volume, root, key).await?;
+        let (_, node, slot) = path.last().expect("path includes a leaf");
+        Ok((node.nritems > 0 && node.key(*slot) == key).then(|| node.item(*slot).to_vec()))
+    }
+
     /// Applies one insertion, replacement, or deletion. On error the owner
     /// aborts the entire transaction, releasing all reservations; no partial
     /// root or block from this overlay has been published to readers.
@@ -104,27 +147,9 @@ impl Trees {
         value: Option<&[u8]>,
         allocator: &mut A,
     ) -> Result<TreeRoot, WriteError> {
-        let mut path = ArrayVec::<(u64, Node, usize), { MAX_LEVEL as usize }>::new();
-        let mut address = root.bytenr;
-        let mut expected = Expected {
-            level: root.level,
-            generation: root.generation,
-            first_key: None,
-        };
-        let original_root = self.read(volume, address, expected).await?;
-        let mut node = original_root.clone();
-        while node.level > 0 {
-            let slot = node.floor_slot(key);
-            let (child, generation) = node.child(slot);
-            expected = Expected {
-                level: node.level - 1,
-                generation,
-                first_key: Some(node.key(slot)),
-            };
-            path.push((address, node, slot));
-            address = child;
-            node = self.read(volume, address, expected).await?;
-        }
+        let mut path = self.path(volume, root, key).await?;
+        let original_root = path[0].1.clone();
+        let (address, node, _) = path.pop().expect("path includes a leaf");
         let mut leaf = Leaf::from_node(&node);
         match value {
             Some(bytes) => leaf.set(key, bytes)?,

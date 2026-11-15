@@ -42,6 +42,7 @@
 
 extern crate alloc;
 
+mod allocation;
 mod chunk;
 mod compress;
 mod csum;

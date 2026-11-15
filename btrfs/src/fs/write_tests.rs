@@ -362,6 +362,16 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
     let original = fs.default_subvolume.root;
     let mut root = original;
     let mut trees = Trees::new(original.generation + 1, ChecksumType::Crc32c);
+    let original_node = root_node(&fs);
+    let original_key = original_node.key(0);
+    assert_eq!(
+        block_on(trees.get(&fs.volume, root, original_key)).unwrap(),
+        Some(original_node.item(0).to_vec())
+    );
+    assert_eq!(
+        block_on(trees.get(&fs.volume, root, Key::new(u64::MAX, 0, 0))).unwrap(),
+        None
+    );
     let key = Key::new(900, 1, 0);
     for revision in 0_u64..2048 {
         root = block_on(trees.apply(
@@ -372,6 +382,10 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
             &mut space,
         ))
         .unwrap();
+        assert_eq!(
+            block_on(trees.get(&fs.volume, root, key)).unwrap(),
+            Some(revision.to_le_bytes().to_vec())
+        );
         assert_eq!(trees.blocks().count(), 1);
         assert_eq!(space.metadata().count(), 1);
         assert_eq!(
