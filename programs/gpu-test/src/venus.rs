@@ -5,11 +5,18 @@ use helios_venus::driver::entry;
 use helios_venus::helios::Context;
 
 mod compute;
+mod webgpu;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Vulkan returned {0}")]
     Vulkan(#[from] vk::Result),
+    #[error(transparent)]
+    WebGpu(#[from] wgpu_hal::InstanceError),
+    #[error(transparent)]
+    WebGpuDevice(#[from] wgpu_hal::DeviceError),
+    #[error("wgpu found no usable Vulkan adapters through Venus")]
+    NoWebGpuAdapter,
     #[error("the Venus instance has no physical devices")]
     NoPhysicalDevices,
     #[error("the Venus physical device has no compute queue")]
@@ -96,7 +103,8 @@ pub fn run() -> Result<(), Error> {
             Ok(())
         })();
         instance.destroy_instance(None);
-        result
+        result?;
+        webgpu::run()
     }
 }
 
