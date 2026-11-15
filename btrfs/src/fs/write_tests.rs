@@ -37,10 +37,10 @@ fn filesystem() -> Filesystem<Disk> {
 }
 
 fn filesystem_image() -> (Filesystem<Disk>, File) {
-    filesystem_image_with_groups(true)
+    filesystem_image_with_features(true, true)
 }
 
-fn filesystem_image_with_groups(separate: bool) -> (Filesystem<Disk>, File) {
+fn filesystem_image_with_features(separate: bool, free_tree: bool) -> (Filesystem<Disk>, File) {
     let mut file = tempfile::tempfile().unwrap();
     // ferrosys' default single-device geometry needs at least 109 MiB.
     let size = 128 << 20;
@@ -53,6 +53,13 @@ fn filesystem_image_with_groups(separate: bool) -> (Filesystem<Disk>, File) {
             .plan
             .compat_ro_flags
             .without(ferrosys::btrfs::ondisk::CompatRoFlags::BLOCK_GROUP_TREE);
+    }
+    if !free_tree {
+        options.plan.compat_ro_flags = options
+            .plan
+            .compat_ro_flags
+            .without(ferrosys::btrfs::ondisk::CompatRoFlags::FREE_SPACE_TREE)
+            .without(ferrosys::btrfs::ondisk::CompatRoFlags::FREE_SPACE_TREE_VALID);
     }
     format_to(&mut file, tree, size, options).unwrap();
     let reference = file.try_clone().unwrap();
@@ -317,6 +324,40 @@ fn space_reservations_exclude_existing_extents_and_return_private_allocations() 
         )
         .unwrap();
         let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+        let free_root = super::find_root(
+            &fs.volume,
+            fs.root_tree,
+            crate::ondisk::objectid::FREE_SPACE_TREE,
+        )
+        .await
+        .unwrap()
+        .root;
+        let mut records = BTreeMap::new();
+        let mut cursor = crate::tree::Cursor::ceiling(&fs.volume, free_root, Key::new(0, 0, 0))
+            .await
+            .unwrap();
+        while let Some(key) = cursor.key() {
+            records.insert(key, cursor.item().unwrap().to_vec());
+            cursor.advance(&fs.volume).await.unwrap();
+        }
+        for group in space
+            .committed_free(&alloc::collections::BTreeSet::new())
+            .unwrap()
+        {
+            let key = Key::new(
+                group.range.start,
+                crate::ondisk::item_type::FREE_SPACE_INFO,
+                group.range.end - group.range.start,
+            );
+            let decoded = crate::free_space::FreeGroup::decode(
+                key,
+                &records[&key],
+                &records,
+                u64::from(fs.superblock().sectorsize()),
+            )
+            .unwrap();
+            assert_eq!(decoded.free, group.free);
+        }
         let original_available = space.available_metadata();
         let size = u64::from(fs.superblock().nodesize());
         let mut allocated = Vec::new();
@@ -463,6 +504,9 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
         let size = u64::from(fs.superblock().nodesize());
         let mut trees = Trees::new(fs.superblock().generation() + 1, ChecksumType::Crc32c);
         let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+        let mut accounting = Accounting::new(&fs.volume, original_root, &space)
+            .await
+            .unwrap();
         let mut key = Key::new(
             block.address,
             item_type::METADATA_ITEM,
@@ -492,7 +536,7 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
             .apply(&fs.volume, root, parent_key, Some(&[]), &mut space)
             .await
             .unwrap();
-        let mut accounting = Accounting::new(root, space.group_root(), size);
+        accounting.root = root;
         assert!(
             !accounting
                 .remove_metadata(
@@ -565,9 +609,9 @@ fn metadata_registration_converges_across_extent_tree_growth_and_cancellation() 
     use crate::ondisk::{item_type, objectid};
     use crate::space::Space;
 
-    for separate in [false, true] {
+    for (separate, free_tree) in [(false, true), (true, true), (false, false)] {
         block_on(async {
-            let fs = filesystem_image_with_groups(separate).0;
+            let fs = filesystem_image_with_features(separate, free_tree).0;
             let extent_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
                 .await
                 .unwrap()
@@ -578,7 +622,10 @@ fn metadata_registration_converges_across_extent_tree_growth_and_cancellation() 
                 fs.superblock().csum_type(),
             );
             let size = u64::from(fs.superblock().nodesize());
-            let mut accounting = Accounting::new(extent_root, space.group_root(), size);
+            let mut accounting = Accounting::new(&fs.volume, extent_root, &space)
+                .await
+                .unwrap();
+            assert_eq!(accounting.free_root().is_some(), free_tree);
             let mut root = fs.default_subvolume.root;
             // Full leaves force enough allocations to split the extent tree as its
             // own allocation records are registered.
@@ -754,6 +801,7 @@ async fn verify_group_usage(
 ) {
     use crate::ondisk::item_type;
     let extents = contents(trees, accounting.root);
+    let free_records = accounting.free_root().map(|root| contents(trees, root));
     let mut cursor = crate::tree::Cursor::ceiling(&fs.volume, original_groups, Key::new(0, 0, 0))
         .await
         .unwrap();
@@ -782,6 +830,50 @@ async fn verify_group_usage(
             assert_eq!(group.used, expected, "group {key}");
             assert_eq!(group.flags, original.flags);
             assert_eq!(group.chunk_objectid, original.chunk_objectid);
+            if let Some(records) = &free_records {
+                let info_key = Key::new(key.objectid, item_type::FREE_SPACE_INFO, key.offset);
+                let info = btrfs_disk::items::FreeSpaceInfo::parse(&records[&info_key]).unwrap();
+                let decoded = crate::free_space::FreeGroup::decode(
+                    info_key,
+                    &records[&info_key],
+                    records,
+                    u64::from(fs.superblock().sectorsize()),
+                )
+                .unwrap();
+                let mut expected_free = Vec::new();
+                let mut address = key.objectid;
+                for extent in extents.keys().filter(|extent| {
+                    key.objectid <= extent.objectid
+                        && extent.objectid < key.objectid + key.offset
+                        && matches!(
+                            extent.item_type,
+                            item_type::EXTENT_ITEM | item_type::METADATA_ITEM
+                        )
+                }) {
+                    if address < extent.objectid {
+                        expected_free.push(address..extent.objectid);
+                    }
+                    address = extent.objectid
+                        + if extent.item_type == item_type::METADATA_ITEM {
+                            u64::from(fs.superblock().nodesize())
+                        } else {
+                            extent.offset
+                        };
+                }
+                if address < key.objectid + key.offset {
+                    expected_free.push(address..key.objectid + key.offset);
+                }
+                assert_eq!(decoded.free.iter().collect::<Vec<_>>(), expected_free);
+                assert_eq!(info.extent_count as usize, expected_free.len());
+                assert_eq!(
+                    expected_free
+                        .iter()
+                        .map(|range| range.end - range.start)
+                        .sum::<u64>()
+                        + group.used,
+                    key.offset
+                );
+            }
             groups += 1;
         }
         cursor.advance(&fs.volume).await.unwrap();

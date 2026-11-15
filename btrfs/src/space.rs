@@ -10,6 +10,7 @@ use core::ops::Range;
 use thiserror::Error;
 
 use crate::allocation::{AllocationDefect, MetadataExtent};
+use crate::free_space::{FreeGroup, FreeSpaceDefect, Intervals};
 use crate::fs::find_root;
 use crate::ondisk::{item_type, objectid};
 use crate::source::BlockSource;
@@ -42,6 +43,8 @@ pub(crate) enum SpaceError {
 #[derive(Debug, Error)]
 pub(crate) enum SpaceDefect {
     #[error(transparent)]
+    FreeSpace(#[from] FreeSpaceDefect),
+    #[error(transparent)]
     Allocation(#[from] AllocationDefect),
     #[error("truncated allocation record")]
     Truncated,
@@ -67,7 +70,8 @@ struct Group {
     flags: u64,
     declared_used: u64,
     found_used: u64,
-    free: BTreeMap<u64, u64>,
+    free: Intervals,
+    excluded_free: Intervals,
 }
 
 impl Group {
@@ -75,49 +79,20 @@ impl Group {
         self.start <= range.start && range.end <= self.start + self.length
     }
 
-    /// Removes an allocated range only when it was wholly free. Overlapping
-    /// allocation records are corruption, not ranges that can be silently merged.
-    fn occupy(&mut self, range: Range<u64>) -> bool {
-        let Some((&start, &end)) = self.free.range(..=range.start).next_back() else {
-            return false;
-        };
-        if range.end > end {
-            return false;
-        }
-        self.free.remove(&start);
-        if start < range.start {
-            self.free.insert(start, range.start);
-        }
-        if range.end < end {
-            self.free.insert(range.end, end);
-        }
-        true
-    }
-
-    fn release(&mut self, mut range: Range<u64>) {
-        if let Some((&start, &end)) = self.free.range(..range.start).next_back()
-            && end == range.start
-        {
-            self.free.remove(&start);
-            range.start = start;
-        }
-        if let Some(end) = self.free.remove(&range.end) {
-            range.end = end;
-        }
-        self.free.insert(range.start, range.end);
-    }
-
     /// A reserved mirror stripe may already contain an extent-tree reservation.
     /// Remove only its intersections with the remaining free intervals.
     fn exclude(&mut self, range: &Range<u64>) {
         let overlaps: Vec<_> = self
             .free
-            .range(..range.end)
-            .filter(|(_, end)| **end > range.start)
-            .map(|(&start, &end)| start.max(range.start)..end.min(range.end))
+            .iter()
+            .filter(|free| free.start < range.end && free.end > range.start)
+            .map(|free| free.start.max(range.start)..free.end.min(range.end))
             .collect();
         for overlap in overlaps {
-            assert!(self.occupy(overlap));
+            self.excluded_free
+                .release(overlap.clone())
+                .expect("excluded ranges are disjoint");
+            assert!(self.free.occupy(overlap));
         }
     }
 }
@@ -134,6 +109,7 @@ pub(crate) struct MetadataReservation {
 pub(crate) struct Space {
     groups: Vec<Group>,
     group_root: TreeRoot,
+    free_root: Option<TreeRoot>,
     nodesize: u64,
     sector: u64,
     metadata: BTreeMap<u64, MetadataReservation>,
@@ -152,6 +128,16 @@ impl Space {
                 .root
         } else {
             extent_root
+        };
+        // BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE.
+        let free_root = if sb.compat_ro_flags() & 1 != 0 {
+            Some(
+                find_root(volume, roots, objectid::FREE_SPACE_TREE)
+                    .await?
+                    .root,
+            )
+        } else {
+            None
         };
         let mut groups = Vec::new();
         let mut cursor = Cursor::ceiling(volume, group_root, Key::new(0, 0, 0)).await?;
@@ -179,7 +165,8 @@ impl Space {
                     flags,
                     declared_used: used,
                     found_used: 0,
-                    free: BTreeMap::from([(key.objectid, key.objectid + key.offset)]),
+                    free: Intervals::whole(key.objectid..key.objectid + key.offset),
+                    excluded_free: Intervals::default(),
                 });
             }
             cursor.advance(volume).await?;
@@ -187,6 +174,7 @@ impl Space {
         let mut space = Self {
             groups,
             group_root,
+            free_root,
             nodesize: u64::from(sb.nodesize()),
             sector: u64::from(sb.sectorsize()),
             metadata: BTreeMap::new(),
@@ -237,7 +225,7 @@ impl Space {
                     .iter_mut()
                     .find(|group| group.contains(&range))
                     .ok_or_else(|| defect(SpaceDefect::ExtentOverlap))?;
-                if !group.occupy(range) {
+                if !group.free.occupy(range) {
                     return Err(defect(SpaceDefect::ExtentOverlap));
                 }
                 group.found_used += length;
@@ -271,10 +259,10 @@ impl Space {
             let found = group
                 .free
                 .iter()
-                .find(|(start, end)| **end - **start >= length)
-                .map(|(&start, _)| start);
+                .find(|range| range.end - range.start >= length)
+                .map(|range| range.start);
             if let Some(start) = found {
-                assert!(group.occupy(start..start + length));
+                assert!(group.free.occupy(start..start + length));
                 return Ok(start);
             }
         }
@@ -282,6 +270,38 @@ impl Space {
             bytes: length,
             flags,
         })
+    }
+
+    /// Free-space-tree state after commit. Unlike allocation availability, this
+    /// includes free superblock stripes and extents retired from the old roots.
+    pub(crate) fn committed_free(
+        &self,
+        retired: &BTreeSet<u64>,
+    ) -> Result<Vec<FreeGroup>, SpaceError> {
+        self.groups
+            .iter()
+            .map(|group| {
+                let range = group.start..group.start + group.length;
+                let mut free = group.free.clone();
+                for returned in group.excluded_free.iter().chain(
+                    retired
+                        .range(range.clone())
+                        .map(|&address| address..address + self.nodesize),
+                ) {
+                    free.release(returned)
+                        .map_err(|defect| SpaceError::Corrupt {
+                            tree: objectid::FREE_SPACE_TREE,
+                            key: Key::new(group.start, item_type::FREE_SPACE_INFO, group.length),
+                            defect: defect.into(),
+                        })?;
+                }
+                Ok(FreeGroup::new(range, free))
+            })
+            .collect()
+    }
+
+    pub(crate) fn free_root(&self) -> Option<TreeRoot> {
+        self.free_root
     }
 
     pub(crate) fn group_root(&self) -> TreeRoot {
@@ -334,7 +354,10 @@ impl Space {
             .iter_mut()
             .find(|group| group.contains(&range))
             .expect("reservation belongs to its block group");
-        group.release(range);
+        group
+            .free
+            .release(range)
+            .expect("private reservation is allocated");
         true
     }
 
@@ -343,7 +366,7 @@ impl Space {
             .iter()
             .filter(|group| group.flags & METADATA != 0)
             .flat_map(|group| group.free.iter())
-            .map(|(start, end)| end - start)
+            .map(|range| range.end - range.start)
             .sum()
     }
 }

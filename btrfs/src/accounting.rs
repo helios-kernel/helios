@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 
 use crate::Key;
 use crate::allocation::{AllocationDefect, MetadataExtent, MetadataReference};
+use crate::free_space::FreeTree;
 use crate::ondisk::{item_type, objectid};
 use crate::source::BlockSource;
 use crate::space::{MetadataReservation, Space, SpaceDefect, SpaceError};
@@ -24,21 +25,32 @@ pub(crate) struct Accounting {
     pub(crate) root: TreeRoot,
     nodesize: u64,
     groups: TreeRoot,
+    free_space: Option<FreeTree>,
     group_used: BTreeMap<Key, u64>,
     retired_metadata: BTreeSet<u64>,
     registered: BTreeMap<u64, MetadataReservation>,
 }
 
 impl Accounting {
-    pub(crate) fn new(root: TreeRoot, groups: TreeRoot, nodesize: u64) -> Self {
-        Self {
+    pub(crate) async fn new<S: BlockSource>(
+        volume: &Volume<S>,
+        root: TreeRoot,
+        space: &Space,
+    ) -> Result<Self, WriteError> {
+        let free_space = if let Some(root) = space.free_root() {
+            Some(FreeTree::load(volume, root, &space.committed_free(&BTreeSet::new())?).await?)
+        } else {
+            None
+        };
+        Ok(Self {
             root,
-            nodesize,
-            groups,
+            nodesize: u64::from(volume.superblock().nodesize()),
+            groups: space.group_root(),
+            free_space,
             group_used: BTreeMap::new(),
             retired_metadata: BTreeSet::new(),
             registered: BTreeMap::new(),
-        }
+        })
     }
 
     /// Reconcile transaction-owned allocations, including blocks allocated by
@@ -54,6 +66,12 @@ impl Accounting {
         // BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA, from btrfs.h.
         let skinny = volume.superblock().incompat_flags() & (1 << 8) != 0;
         loop {
+            let free_changed = if let Some(free) = &mut self.free_space {
+                free.sync(volume, trees, space, &self.retired_metadata)
+                    .await?
+            } else {
+                false
+            };
             let groups_changed = self.sync_groups(volume, trees, space).await?;
             let current: BTreeMap<_, _> = space.metadata().collect();
             let removed: Vec<_> = self
@@ -67,7 +85,7 @@ impl Accounting {
                 .filter(|(address, record)| self.registered.get(address) != Some(record))
                 .map(|(&address, &record)| (address, record))
                 .collect();
-            if removed.is_empty() && changed.is_empty() && !groups_changed {
+            if removed.is_empty() && changed.is_empty() && !groups_changed && !free_changed {
                 return Ok(());
             }
             for (address, record) in removed {
@@ -99,6 +117,10 @@ impl Accounting {
                 self.registered.insert(address, record);
             }
         }
+    }
+
+    pub(crate) fn free_root(&self) -> Option<TreeRoot> {
+        self.free_space.as_ref().map(|free| free.root)
     }
 
     pub(crate) fn group_root(&self) -> TreeRoot {

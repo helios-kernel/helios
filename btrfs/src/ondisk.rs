@@ -39,6 +39,7 @@ pub(crate) mod objectid {
     pub(crate) const ROOT_TREE: u64 = 1;
     pub(crate) const EXTENT_TREE: u64 = 2;
     pub(crate) const CHUNK_TREE: u64 = 3;
+    pub(crate) const FREE_SPACE_TREE: u64 = 10;
     pub(crate) const BLOCK_GROUP_TREE: u64 = 11;
     pub(crate) const FS_TREE: u64 = 5;
     pub(crate) const ROOT_TREE_DIR: u64 = 6;
@@ -63,6 +64,9 @@ pub(crate) mod item_type {
     pub(crate) const TREE_BLOCK_REF: u8 = 176;
     pub(crate) const SHARED_BLOCK_REF: u8 = 182;
     pub(crate) const BLOCK_GROUP_ITEM: u8 = 192;
+    pub(crate) const FREE_SPACE_INFO: u8 = 198;
+    pub(crate) const FREE_SPACE_EXTENT: u8 = 199;
+    pub(crate) const FREE_SPACE_BITMAP: u8 = 200;
     pub(crate) const CHUNK_ITEM: u8 = 228;
 }
 

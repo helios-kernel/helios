@@ -48,6 +48,7 @@ mod chunk;
 mod compress;
 mod csum;
 mod error;
+mod free_space;
 mod fs;
 mod items;
 mod key;

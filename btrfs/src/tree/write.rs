@@ -23,6 +23,11 @@ pub(crate) enum WriteError {
     Space(#[from] crate::space::SpaceError),
     #[error(transparent)]
     Item(#[from] EditError),
+    #[error("free-space item {key}: {defect}")]
+    FreeSpace {
+        key: Key,
+        defect: crate::free_space::FreeSpaceDefect,
+    },
     #[error("allocation item {key}: {defect}")]
     Allocation {
         key: Key,
