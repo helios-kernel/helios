@@ -1,0 +1,7 @@
+cat /image/hello.txt
+ls /image/docs
+cat /btrfs/docs/hello
+ls /btrfs/docs
+cat /btrfs/docs/中文.txt
+cat /btrfs/docs/日本語.txt
+cat /btrfs/docs/한국어.txt

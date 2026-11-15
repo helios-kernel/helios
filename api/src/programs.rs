@@ -12,10 +12,11 @@ use crate::wit_bindgen::{FutureReader, StreamReader};
 use futures_lite::future::zip;
 
 pub use crate::bindings::helios::system::programs::{
-    AotHint, AotRequest, AotResult, CapabilityGrant, ClockGrant, ClockRight, DirectoryGrant,
-    ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult, ExitStatus, FilesystemRight,
-    LinkGrant, LinkRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SpawnError,
-    SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
+    AotHint, AotRequest, AotResult, CapabilityGrant, ClockGrant, ClockRight, DeviceClass,
+    DeviceGrant, DiagnosticsGrant, DiagnosticsRight, DirectoryGrant, ExecError, ExecErrorKind,
+    ExecOutput, ExecRequest, ExecResult, ExitStatus, FilesystemRight, LinkGrant, LinkRight,
+    MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant,
+    ProcessRight, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
 };
 
 /// Build a directory capability grant for `helios:system/programs`.
@@ -73,6 +74,16 @@ pub fn link_grant(rights: Vec<LinkRight>) -> CapabilityGrant {
     CapabilityGrant::Link(LinkGrant { rights })
 }
 
+/// Build a mount-table capability grant: the child may attach or detach
+/// filesystems at directories its directory grants let it change.
+pub fn mount_grant(rights: Vec<MountRight>) -> CapabilityGrant {
+    CapabilityGrant::Mount(MountGrant { rights })
+}
+
+pub fn root_mount_grant() -> CapabilityGrant {
+    mount_grant(vec![MountRight::Mount, MountRight::Unmount])
+}
+
 pub fn root_link_grant() -> CapabilityGrant {
     link_grant(vec![
         LinkRight::Source,
@@ -80,6 +91,48 @@ pub fn root_link_grant() -> CapabilityGrant {
         LinkRight::SymlinkCreate,
         LinkRight::SymlinkRead,
     ])
+}
+
+/// Build a device-class grant. A program holds a class only when its
+/// parent granted it, so the classes must be a subset of the caller's.
+pub fn device_grant(classes: Vec<DeviceClass>) -> CapabilityGrant {
+    CapabilityGrant::Device(DeviceGrant { classes })
+}
+
+/// Every device class, for a trusted launcher that runs programs on the
+/// machine owner's behalf.
+pub fn all_device_classes_grant() -> CapabilityGrant {
+    device_grant(vec![
+        DeviceClass::Display,
+        DeviceClass::Input,
+        DeviceClass::Gpu,
+        DeviceClass::Audio,
+    ])
+}
+
+/// Build a diagnostics grant. A program holds a right only when its
+/// parent granted it, so the rights must be a subset of the caller's.
+pub fn diagnostics_grant(rights: Vec<DiagnosticsRight>) -> CapabilityGrant {
+    CapabilityGrant::Diagnostics(DiagnosticsGrant { rights })
+}
+
+/// Control the machine's tracing and profiling and read every
+/// instance's records, for a trusted launcher that runs programs on the
+/// machine owner's behalf.
+pub fn observe_machine_grant() -> CapabilityGrant {
+    diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])
+}
+
+/// Build a machine grant. A program holds a right only when its parent
+/// granted it, so the rights must be a subset of the caller's.
+pub fn machine_grant(rights: Vec<MachineRight>) -> CapabilityGrant {
+    CapabilityGrant::Machine(MachineGrant { rights })
+}
+
+/// Take processors offline and bring them online, for a trusted
+/// launcher that runs programs on the machine owner's behalf.
+pub fn control_processors_grant() -> CapabilityGrant {
+    machine_grant(vec![MachineRight::ControlProcessors])
 }
 
 pub fn root_process_grant() -> CapabilityGrant {

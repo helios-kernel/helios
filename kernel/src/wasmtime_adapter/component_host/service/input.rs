@@ -42,18 +42,21 @@ use super::super::StoreData;
 /// Register `helios:system/input` in a linker.
 ///
 /// Every program linker gets it, for the reason the display interface
-/// does: the claim is the capability, not the import. A program that
-/// never claims a device learns nothing from having the import, and one
-/// that claims on a machine with no input device is told `unavailable`.
-pub(in crate::wasmtime_adapter::component_host) fn add_input_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+/// does: linkage is cached per binary while authority belongs to the
+/// instance. `available` and `claim` check the instance's input device
+/// class, and an instance without it is told what a machine with no
+/// input device tells every program: no devices, and `unavailable`.
+pub(in crate::wasmtime_adapter::component_host) fn add_input_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    input_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
+    input_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(linker, |state| {
+        state
+    })
 }
 
 /// A program's hold on one input device, as its store records it.
@@ -129,11 +132,11 @@ const fn to_wit_abs_axis(axis: &AbsAxis) -> input_wit::AbsAxis {
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// The indicator queue of one held device, checked against the
     /// generation the handle names.
@@ -146,13 +149,18 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> input_wit::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> input_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn available(&mut self) -> wasmtime::Result<Vec<input_wit::Capabilities>> {
+        // Without the input class the list is the one a machine with no
+        // input device gives.
+        if self.process_authority().derive_input_claim_cap().is_err() {
+            return Ok(Vec::new());
+        }
         let Some(service) = self.runtime_state.input_service() else {
             return Ok(Vec::new());
         };
@@ -166,7 +174,10 @@ where
         let Some(service) = self.runtime_state.input_service() else {
             return Ok(Err(input_wit::Error::Unavailable));
         };
-        let (index, generation) = match self.input.claim(&service, &name) {
+        let Ok(cap) = self.process_authority().derive_input_claim_cap() else {
+            return Ok(Err(input_wit::Error::Unavailable));
+        };
+        let (index, generation) = match self.input.claim(&service, &name, cap) {
             Ok(claim) => (claim.index(), claim.generation()),
             Err(error) => {
                 tracing::warn!(
@@ -189,11 +200,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> input_wit::HostDevice for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> input_wit::HostDevice for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn capabilities(
         &mut self,
@@ -241,7 +252,7 @@ impl<T: 'static> StreamProducer<T> for InputEventStreamProducer {
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
         match self.events.poll_burst(cx) {
-            Poll::Ready(burst) => {
+            Poll::Ready(Some(burst)) => {
                 let events: Vec<Self::Item> = burst
                     .into_iter()
                     .map(|event| input_wit::InputEvent {
@@ -253,18 +264,22 @@ impl<T: 'static> StreamProducer<T> for InputEventStreamProducer {
                 destination.set_buffer(VecBuffer::from(events));
                 Poll::Ready(Ok(StreamResult::Completed))
             }
+            // The claim this stream was opened under is gone. A reader
+            // that ended is how the program learns that without polling
+            // for it.
+            Poll::Ready(None) => Poll::Ready(Ok(StreamResult::Dropped)),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> input_wit::HostDeviceWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> input_wit::HostDeviceWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn events(
         mut accessor: Access<'_, U, Self>,

@@ -676,6 +676,16 @@ class ComparedCells:
     candidate: Cell
     rebuild: Cell | None = None
     first_pass: dict[Column, Cell] = field(default_factory=dict)
+    baseline_workload: WorkloadResult | None = None
+
+    @property
+    def matched_metrics(self) -> frozenset[str]:
+        """Metrics either run's record holds matched: a baseline built before a
+        metric existed has no record of it, and the candidate's does."""
+        names = set(self.workload.matched_metrics)
+        if self.baseline_workload is not None:
+            names.update(self.baseline_workload.matched_metrics)
+        return frozenset(names)
 
 
 def series(cell: Cell, measurement: str) -> SeriesStats | None:
@@ -760,6 +770,9 @@ def gate_rows(
         for metric in sorted(set(base_cell.metrics) | set(cand_cell.metrics)):
             if metric.endswith(SAMPLE_COUNT_SUFFIX):
                 # Context for the percentiles beside it, not a row.
+                continue
+            if metric in compared.matched_metrics:
+                # A condition the comparison is held at, not a measurement.
                 continue
             before = base_cell.metrics.get(metric)
             after = cand_cell.metrics.get(metric)
@@ -887,7 +900,14 @@ def evaluate(baseline: Report, candidate: Report) -> GateResult:
             continue
         # Two jobs: neither run's rebuild column or reconfirm boots
         # measured anything about the other run's machine.
-        pairs.append(ComparedCells(workload=workload, baseline=base_cell, candidate=cand_cell))
+        pairs.append(
+            ComparedCells(
+                workload=workload,
+                baseline=base_cell,
+                candidate=cand_cell,
+                baseline_workload=before,
+            )
+        )
     bound = candidate.thresholds.cv_bound
     rows, unpaired = gate_rows(pairs, floor, bound)
     # Two runs of one lane are two machines as often as they are one
@@ -935,6 +955,7 @@ def image_label(
     other_profile: str | None = None,
     uncovered: int | None = None,
     functions: int | None = None,
+    wasmtime: str | None = None,
 ) -> str:
     """How one column of a paired table names its image.
 
@@ -945,7 +966,9 @@ def image_label(
     the commit, and once every release build reads a profile it varies
     which profile (#226), so without these the two columns would carry
     the same label. A profile-use column also names how many of the
-    kernel's functions its profile covered nothing about (#329).
+    kernel's functions its profile covered nothing about (#329), and every
+    column names the Wasmtime fork revision it was built against, which
+    its own commit pins (#486).
     """
     qualifiers = []
     if ref:
@@ -958,6 +981,8 @@ def image_label(
         qualifiers.append(f"{uncovered:,} of {functions:,} functions uncovered")
     elif uncovered is not None:
         qualifiers.append(f"{uncovered:,} uncovered functions")
+    if wasmtime is not None:
+        qualifiers.append(f"Wasmtime `{short(wasmtime)}`")
     label = f"`{short(sha)}`"
     return f"{label} ({', '.join(qualifiers)})" if qualifiers else label
 
@@ -1067,6 +1092,10 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
         for name, (uncovered, functions) in pgo_uncovered.items()
         if candidate.run.baseline_ref is not None and uncovered / functions > UNDERPROFILED_SHARE
     ]
+    # A report written before #486 recorded one fork for the run; it names
+    # no column's, rather than the candidate's for both.
+    baseline_wasmtime = candidate.pins.baseline_wasmtime_revision
+    candidate_wasmtime = candidate.pins.wasmtime_revision if baseline_wasmtime is not None else None
     return GateResult(
         kind=GateKind.PAIRED,
         lane=candidate.run.lane,
@@ -1081,6 +1110,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
             candidate.run.kernel_profile,
             candidate.run.baseline_kernel_pgo_uncovered,
             candidate.run.baseline_kernel_pgo_functions,
+            baseline_wasmtime,
         ),
         candidate_label=image_label(
             candidate.run.helios_git_sha,
@@ -1091,6 +1121,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
             candidate.run.baseline_kernel_profile,
             candidate.run.kernel_pgo_uncovered,
             candidate.run.kernel_pgo_functions,
+            candidate_wasmtime,
         ),
         rebuild_label=(
             image_label(
@@ -1102,6 +1133,7 @@ def evaluate_paired(candidate: Report) -> GateResult | None:
                 candidate.run.baseline_kernel_profile,
                 candidate.run.baseline_rebuild_kernel_pgo_uncovered,
                 candidate.run.baseline_rebuild_kernel_pgo_functions,
+                baseline_wasmtime,
             )
             if rebuilt
             else None

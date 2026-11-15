@@ -3,7 +3,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{HostDirEntry, HostFileSystem, HostFsError, HostMetadata};
+use crate::{HostDirEntry, HostDirLimit, HostFileSystem, HostFsError, HostMetadata};
 
 /// A [`HostFileSystem`] implementation that rejects every operation with
 /// [`helios_hal::io::IoError::Unsupported`].
@@ -21,10 +21,27 @@ fn unsupported<T>() -> core::future::Ready<Result<T, HostFsError>> {
 }
 
 impl HostFileSystem for UnsupportedHostFileSystem {
+    type Write<'a> = core::convert::Infallible;
+
     /// There is no share here, so there is nothing to have cached.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats> {
         None
     }
+
+    /// No session and no cache, so a restore leaves nothing to drop.
+    fn after_machine_restore(
+        &self,
+        _restore: crate::HostShareRestore,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    /// No session, so nothing to release for a snapshot.
+    fn prepare_snapshot(&self) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    fn snapshot_finished(&self) {}
 
     fn stat_path(
         &self,
@@ -35,6 +52,7 @@ impl HostFileSystem for UnsupportedHostFileSystem {
     fn read_dir(
         &self,
         _path: &str,
+        _limit: HostDirLimit,
     ) -> impl core::future::Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + '_
     {
         unsupported()
@@ -53,19 +71,12 @@ impl HostFileSystem for UnsupportedHostFileSystem {
     ) -> impl core::future::Future<Output = Result<Vec<u8>, HostFsError>> + Send + '_ {
         unsupported()
     }
-    fn write_file(
+    fn prepare_write(
         &self,
         _path: &str,
-        _offset: u64,
-        _bytes: &[u8],
-    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        unsupported()
-    }
-    fn append_file(
-        &self,
-        _path: &str,
-        _bytes: &[u8],
-    ) -> impl core::future::Future<Output = Result<u64, HostFsError>> + Send + '_ {
+        _position: helios_hal::fs::WritePosition,
+        _len: usize,
+    ) -> impl core::future::Future<Output = Result<Self::Write<'_>, HostFsError>> + Send + '_ {
         unsupported()
     }
     fn sync_file(

@@ -280,7 +280,11 @@ tools/wasi-apps/smoke.sh
 It runs the AArch64/HVF VM path for standard dash, the wall clock the
 kernel seeded from the platform RTC, Bash plus coreutils
 pipeline/redirection/script/cwd/env/exit-status behavior, QuickJS,
-CPython stdlib imports, and an ICMP echo against the slirp gateway. Set
+CPython stdlib imports, the refusal of a guest-written cwasm whose
+signature does not verify (an unchanged copy of a bootfs cwasm still
+verifies and runs; only boot-payload bytes skip the check), and an ICMP
+echo against the slirp gateway. The `smoke-x86-64` CI lane runs the same
+cwasm refusal step under KVM. Set
 `HELIOS_WASI_SMOKE_RELEASE=1` when the smoke should rebuild and boot
 release artifacts. Set `HELIOS_WASI_SMOKE_CURL=1` to include the networked
 curl smoke (run twice, once by bootfs path and once by bare name, so both
@@ -424,10 +428,13 @@ Expected output contains:
 - `tools/wasi-apps/curl` uses `helios_api::http` (`wasi:http/client`)
   instead of host libc sockets, so it runs correctly inside helios. The
   kernel forwards each request to the `http-client` kernel plugin
-  (`programs/http-client`), which speaks HTTP/1.1 over `helios:system/net`;
-  the plugin must be provisioned (`--boot-program http-client`) or
-  `wasi:http/client` reports `configuration-error`. `https://` returns the
-  typed `TLS-protocol-error` until the TLS transport lands.
+  (`programs/http-client`), which hosts zenwave's native backend over
+  `helios_api::http_kit` (`wasi:sockets` and the monotonic clock); the
+  plugin must be provisioned (`--boot-program http-client`) or
+  `wasi:http/client` reports `configuration-error`. `https://` runs rustls
+  against the Mozilla roots compiled in (`webpki-roots`), checking validity
+  against `wasi:clocks/wall-clock`; an untrusted, expired or mismatched
+  certificate is the typed `TLS-certificate-error`.
 - `tools/wasi-apps/extract-webc-wasm.pl` extracts the single raw wasm atom
   from the pinned Wasmer WEBc images. The build script validates both WEBc
   and raw wasm SHA-256 digests before staging.

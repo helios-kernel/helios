@@ -118,7 +118,7 @@ impl Chunk {
 
         let mut copies = ArrayVec::new();
         let stripe_bytes = &bytes[size_of::<RawChunk>()..consumed];
-        for stripe in stripe_bytes.chunks_exact(size_of::<RawStripe>()) {
+        for stripe in stripe_bytes.as_chunks::<{ size_of::<RawStripe>() }>().0 {
             let stripe: &RawStripe = view(stripe).ok_or(ChunkDefect::Truncated)?;
             let devid = stripe.devid.get();
             if devid != superblock.devid() {

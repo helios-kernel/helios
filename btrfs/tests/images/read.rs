@@ -309,3 +309,13 @@ fn walks_every_inode() {
     // Hello, empty, big, hostname and its link, leaf, CJK, many, notes.
     assert_eq!(census.files, 6 + CJK_FILES.len() + MANY_FILES + 1);
 }
+
+#[test]
+fn subvolume_inventory_distinguishes_identical_root_inode_numbers() {
+    let fs = mount(base_image()).expect("mounts");
+    let home = block_on(fs.resolve(b"/@home")).expect("subvolume root");
+    let mut roots = Vec::new();
+    block_on(fs.subvolumes(|tree, inode| roots.push((tree, inode)))).expect("subvolumes");
+    assert_eq!(roots, [(5, 256), (home.tree(), home.number())]);
+    assert_eq!(home.number(), 256);
+}

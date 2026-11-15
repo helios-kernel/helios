@@ -169,6 +169,41 @@ impl<S: BlockSource> Filesystem<S> {
         self.default_subvolume.root.tree
     }
 
+    /// Visits each subvolume once, in tree-id order. A mount uses this
+    /// inventory to assign distinct device identities before publishing
+    /// the filesystem; inode numbers are unique only within a subvolume.
+    pub async fn subvolumes<F>(&self, mut visit: F) -> Result<(), Error>
+    where
+        F: FnMut(u64, u64),
+    {
+        let mut cursor = Cursor::ceiling(&self.volume, self.root_tree, Key::new(0, 0, 0)).await?;
+        let mut previous: Option<(u64, u64)> = None;
+        while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
+            if key.item_type == item_type::ROOT_ITEM
+                && (key.objectid == objectid::FS_TREE
+                    || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&key.objectid))
+            {
+                let record = RootRecord::parse(key, item, self.volume.superblock().sectorsize())
+                    .map_err(|defect| Error::Item {
+                        tree: self.root_tree.tree,
+                        key,
+                        defect,
+                    })?;
+                if let Some((tree, root_inode)) = previous
+                    && tree != key.objectid
+                {
+                    visit(tree, root_inode);
+                }
+                previous = Some((key.objectid, record.root_dirid));
+            }
+            cursor.advance(&self.volume).await?;
+        }
+        if let Some((tree, root_inode)) = previous {
+            visit(tree, root_inode);
+        }
+        Ok(())
+    }
+
     /// The root directory of the default subvolume.
     pub async fn root(&self) -> Result<Inode, Error> {
         self.load_inode(

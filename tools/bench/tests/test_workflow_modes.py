@@ -22,7 +22,6 @@ def jobs(workflow):
 
 
 CANDIDATE_SHA = "0123456789abcdef0123456789abcdef01234567"
-PR_BASE_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 
 
 @pytest.mark.parametrize(
@@ -63,9 +62,9 @@ PR_BASE_SHA = "fedcba9876543210fedcba9876543210fedcba98"
         ("workflow_dispatch", "false", "", "profile-use", "", "false", "false", "false", "false", "false"),
         # The TCP probe pairs for diagnosis and reads the fetched profile.
         ("workflow_dispatch", "true", "baseline", "profile-use", "", "true", "true", "true", "false", "true"),
-        # A labelled pull request is paired against its base SHA and
-        # collects a profile for each column (#384); an unlabelled one
-        # runs nothing.
+        # A labelled pull request is paired against the commit it is
+        # merged against and collects a profile for each column (#384);
+        # an unlabelled one runs nothing.
         ("pull_request", "", "", "", "true", "", "true", "false", "true", "true"),
         ("pull_request", "", "", "", "false", "", "true", "false", "false", "false"),
         ("push", "", "", "", "", "", "false", "false", "false", "false"),
@@ -98,7 +97,7 @@ def test_workflow_mode(
             "BASELINE_KERNEL_BUILD": build,
             "TCP_PROBE": tcp_probe,
             "PR_BENCH": pr_bench,
-            "PR_BASE_SHA": PR_BASE_SHA if event == "pull_request" else "",
+            "PR_MERGE_SHA": CANDIDATE_SHA if event == "pull_request" else "",
             "GITHUB_OUTPUT": str(output),
         },
     )
@@ -107,9 +106,9 @@ def test_workflow_mode(
     assert outputs["paired_acceptance"] == paired
     assert outputs["per_column_profiles"] == per_column
     assert outputs["baseline_profile"] == baseline_profile
-    # The ref the suite pairs against: the dispatch's, or a labelled
-    # pull request's base (#384).
-    assert outputs["pairing_ref"] == (PR_BASE_SHA if pr_bench == "true" else baseline)
+    # The ref the suite pairs against: the dispatch's, or the first
+    # parent of a labelled pull request's merge commit (#384, #773).
+    assert outputs["pairing_ref"] == (f"{CANDIDATE_SHA}^1" if pr_bench == "true" else baseline)
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -156,12 +155,26 @@ def test_profile_columns_resolve_the_pairing_ref_to_its_commit(
     repo, base, head = history
     columns = next(step for step in jobs["tooling"]["steps"] if step.get("id") == "columns")
     output = tmp_path / "outputs"
+    # `helios-bench baseline-fork` reads the pin from the baseline commit
+    # (tests/test_baseline.py); here it answers for a baseline pinning
+    # another fork than the candidate's, and records what it was asked.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    asked = tmp_path / "asked"
+    fork = {
+        "root": "wasmtime-fork-2fb47b20aaaa",
+        "repository": "lexoliu/wasmtime",
+        "revision": "2fb47b20" + "a" * 32,
+    }
+    (bin_dir / "uv").write_text(f"#!/bin/sh\necho \"$*\" >> {asked}\necho '{json.dumps(fork)}'\n")
+    (bin_dir / "uv").chmod(0o755)
     subprocess.run(
         ["bash", "-eu", "-c", columns["run"]],
         check=True,
         cwd=repo,
         env=os.environ
         | {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "CANDIDATE_SHA": head,
             "PAIRING_REF": base[:8] if pairing_ref == "short" else pairing_ref,
             "BASELINE_PROFILE": baseline_profile,
@@ -169,9 +182,20 @@ def test_profile_columns_resolve_the_pairing_ref_to_its_commit(
         },
     )
     outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    expected = [{"column": "candidate", "ref": head, "artifact": "helios-kernel-profdata-candidate"}]
+    expected = [
+        {"column": "candidate", "ref": head, "artifact": "helios-kernel-profdata-candidate", "root": ""}
+    ]
     if baseline_profile == "true":
-        expected.append({"column": "baseline", "ref": base, "artifact": "helios-kernel-profdata-baseline"})
+        # #486: each baseline collection is laid out beside the fork its
+        # commit pins, at the root the suite builds it in.
+        expected.append(
+            {
+                "column": "baseline",
+                "ref": base,
+                "artifact": "helios-kernel-profdata-baseline",
+                "root": fork["root"],
+            }
+        )
         # #479: the same commit collected a second time, independently,
         # for the baseline's rebuild.
         expected.append(
@@ -179,9 +203,92 @@ def test_profile_columns_resolve_the_pairing_ref_to_its_commit(
                 "column": "baseline-rebuild",
                 "ref": base,
                 "artifact": "helios-kernel-profdata-baseline-rebuild",
+                "root": fork["root"],
             }
         )
     assert json.loads(outputs["profile_columns"]) == expected
+    # #773: the suite job pairs against this output, the same commit the
+    # collections were given.
+    assert outputs["baseline_sha"] == (base if pairing_ref else "")
+    if pairing_ref:
+        assert asked.read_text().split() == [
+            "run",
+            "--project",
+            "tools/bench",
+            "--quiet",
+            "helios-bench",
+            "baseline-fork",
+            "--sha",
+            base,
+        ]
+        assert outputs["baseline_fork_root"] == fork["root"]
+        assert outputs["baseline_wasmtime_repository"] == fork["repository"]
+        assert outputs["baseline_wasmtime_revision"] == fork["revision"]
+    else:
+        assert not asked.exists()
+        assert outputs["baseline_fork_root"] == ""
+
+
+def test_a_pull_request_pairs_against_the_commit_it_is_merged_against(jobs, history, tmp_path: Path):
+    """#773: run 43091069072 timed a pull request's merge commit against
+    the tip `dev` had when the pull request was opened, 21 merges behind
+    the one it was built on. The baseline is the merge commit's first
+    parent — neither that stale tip nor the merge base — and the suite
+    job reads the commit the collections were given."""
+    repo, base, head = history
+    git(repo, "checkout", "-q", "dev")
+    (repo / "b").write_text("dev moved\n")
+    git(repo, "add", "b")
+    git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "dev moved")
+    merged_against = git(repo, "rev-parse", "HEAD")
+    git(repo, "update-ref", "refs/remotes/origin/dev", merged_against)
+    git(repo, "-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "-m", "merge", head)
+    merge = git(repo, "rev-parse", "HEAD")
+
+    steps = {step["id"]: step for step in jobs["tooling"]["steps"] if "id" in step}
+    mode_output = tmp_path / "mode"
+    subprocess.run(
+        ["bash", "-eu", "-c", steps["mode"]["run"]],
+        check=True,
+        env=os.environ
+        | {
+            "EVENT_NAME": "pull_request",
+            "REQUESTED_ADVISORY": "",
+            "BASELINE_REF": "",
+            "BASELINE_KERNEL_BUILD": "",
+            "TCP_PROBE": "",
+            "PR_BENCH": "true",
+            "PR_MERGE_SHA": merge,
+            "GITHUB_OUTPUT": str(mode_output),
+        },
+    )
+    mode = dict(line.split("=", 1) for line in mode_output.read_text().splitlines())
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "uv").write_text('#!/bin/sh\necho \'{"root": "", "repository": "", "revision": ""}\'\n')
+    (bin_dir / "uv").chmod(0o755)
+    columns_output = tmp_path / "columns"
+    subprocess.run(
+        ["bash", "-eu", "-c", steps["columns"]["run"]],
+        check=True,
+        cwd=repo,
+        env=os.environ
+        | {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "CANDIDATE_SHA": merge,
+            "PAIRING_REF": mode["pairing_ref"],
+            "BASELINE_PROFILE": mode["baseline_profile"],
+            "GITHUB_OUTPUT": str(columns_output),
+        },
+    )
+    columns = dict(line.split("=", 1) for line in columns_output.read_text().splitlines())
+    assert merged_against != base
+    assert columns["baseline_sha"] == merged_against
+    refs = {column["column"]: column["ref"] for column in json.loads(columns["profile_columns"])}
+    assert refs == {"candidate": merge, "baseline": merged_against, "baseline-rebuild": merged_against}
+    assert jobs["tooling"]["outputs"]["baseline_sha"] == "${{ steps.columns.outputs.baseline_sha }}"
+    assert jobs["suite"]["env"]["BENCH_BASELINE_REF"] == "${{ needs.tooling.outputs.baseline_sha }}"
 
 
 def run_arguments(
@@ -358,6 +465,7 @@ def test_profile_jobs_follow_the_mode_output(jobs):
     assert profile_columns["with"] == {
         "ref": "${{ matrix.ref }}",
         "artifact": "${{ matrix.artifact }}",
+        "root": "${{ matrix.root }}",
     }
     # A non-paired run is not held to a skipped collection job; a paired
     # one fails here rather than comparing a column on a stale profile.
@@ -440,7 +548,7 @@ def test_keep_going_preserves_failed_workload_logs(jobs):
 
 @pytest.mark.parametrize(
     ("filename", "job", "condition"),
-    [("ci.yml", "bench", "failure()"), ("bench-suite.yml", "suite", "always()")],
+    [("bench-lane.yml", "bench", "failure()"), ("bench-suite.yml", "suite", "always()")],
 )
 def test_benchmark_diagnostics_keep_symbols_but_not_kernels_or_keys(filename, job, condition, tmp_path):
     workflow = yaml.load((REPO_ROOT / ".github/workflows" / filename).read_text(), Loader=yaml.BaseLoader)
@@ -474,8 +582,8 @@ def test_benchmark_diagnostics_keep_symbols_but_not_kernels_or_keys(filename, jo
     assert not (set(kernels) | {key}) & matched
 
 
-def test_ci_preserves_the_built_kernel_before_starting_guests():
-    workflow = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+def test_bench_lane_preserves_the_built_kernel_before_starting_guests():
+    workflow = yaml.load((REPO_ROOT / ".github/workflows/bench-lane.yml").read_text(), Loader=yaml.BaseLoader)
     steps = workflow["jobs"]["bench"]["steps"]
     names = [step.get("name") for step in steps]
     build = names.index("Build the Helios guest and inspector")
@@ -563,7 +671,7 @@ def _step_index(steps: list[dict], predicate) -> int:
 
 def test_every_vsock_boot_is_preceded_by_the_device_provisioning():
     """The device is provisioned by one action wherever a guest is booted
-    with `--rpc-transport vsock`: the riscv64 smoke step, CI's own bench
+    with `--rpc-transport vsock`: the riscv64 smoke step, the nightly bench
     lane, and `bench-host` for the suite and the PGO collection (#413)."""
     workflow = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
     smoke = workflow["jobs"]["smoke-riscv64"]["steps"]
@@ -575,12 +683,15 @@ def test_every_vsock_boot_is_preceded_by_the_device_provisioning():
     assert provision < boot
     assert "--rpc-transport vsock" in smoke[boot]["run"]
 
-    bench = workflow["jobs"]["bench"]["steps"]
+    lane_workflow = yaml.load(
+        (REPO_ROOT / ".github/workflows/bench-lane.yml").read_text(), Loader=yaml.BaseLoader
+    )
+    bench = lane_workflow["jobs"]["bench"]["steps"]
     provision = _step_index(bench, lambda step: step.get("uses") == VHOST_VSOCK_ACTION)
     run = _step_index(bench, lambda step: step.get("name") == "Run Helios workload benchmarks")
     assert provision < run
     assert bench[run]["env"]["HELIOS_WORKLOAD_BENCH_RPC_TRANSPORT"] == "${{ matrix.rpc-transport }}"
-    (lane,) = workflow["jobs"]["bench"]["strategy"]["matrix"]["include"]
+    (lane,) = lane_workflow["jobs"]["bench"]["strategy"]["matrix"]["include"]
     assert lane["rpc-transport"] == "vsock"
 
     host = yaml.load(
@@ -595,3 +706,145 @@ def test_every_vsock_boot_is_preceded_by_the_device_provisioning():
     boots = [step["run"] for step in collect["runs"]["steps"] if "workload-bench" in step.get("run", "")]
     assert boots
     assert all('--rpc-transport "${{ steps.lane.outputs.rpc-transport }}"' in run for run in boots)
+
+
+def test_the_baseline_builds_against_the_fork_its_commit_pins(jobs):
+    """#486: the suite checks the baseline commit's own fork out where
+    tools/bench lays the baseline checkout out, and only when it is not
+    the candidate's; `kernel-profile.yml` collects each column under the
+    root it is handed, so the profile and the build see one fork path."""
+    outputs = jobs["tooling"]["outputs"]
+    for name in ("baseline_fork_root", "baseline_wasmtime_repository", "baseline_wasmtime_revision"):
+        assert outputs[name] == f"${{{{ steps.columns.outputs.{name} }}}}"
+    steps = jobs["suite"]["steps"]
+    names = [step.get("name") or step.get("uses") for step in steps]
+    fork = steps[names.index("Check out the baseline's Wasmtime fork")]
+    assert names.index("./helios/.github/actions/checkout-wasmtime") < names.index(
+        "Check out the baseline's Wasmtime fork"
+    )
+    assert fork["if"] == "needs.tooling.outputs.baseline_fork_root != ''"
+    assert fork["with"] == {
+        "repository": "${{ needs.tooling.outputs.baseline_wasmtime_repository }}",
+        "ref": "${{ needs.tooling.outputs.baseline_wasmtime_revision }}",
+        "path": "${{ needs.tooling.outputs.baseline_fork_root }}/wasmtime",
+    }
+    profile = yaml.load(
+        (REPO_ROOT / ".github/workflows/kernel-profile.yml").read_text(), Loader=yaml.BaseLoader
+    )
+    assert "root" in profile["on"]["workflow_call"]["inputs"]
+    job = profile["jobs"]["kernel-profile"]
+    assert (
+        job["env"]["CHECKOUT_PATH"] == "${{ inputs.root && format('{0}/helios', inputs.root) || 'helios' }}"
+    )
+    assert (
+        job["env"]["WASMTIME_PATH"]
+        == "${{ inputs.root && format('{0}/wasmtime', inputs.root) || 'wasmtime' }}"
+    )
+    by_uses = {step.get("uses"): step for step in job["steps"]}
+    assert by_uses["./helios/.github/actions/checkout-wasmtime"]["with"]["path"] == "${{ env.WASMTIME_PATH }}"
+    assert (
+        by_uses["./helios/.github/actions/bench-host"]["with"]["checkout-path"] == "${{ env.CHECKOUT_PATH }}"
+    )
+    assert (
+        by_uses["./helios/.github/actions/collect-kernel-profile"]["with"]["checkout-path"]
+        == "${{ env.CHECKOUT_PATH }}"
+    )
+
+
+def evaluate(expression: str, event_name: str, action: str = "", labels=(), label: str = "") -> bool:
+    """Evaluate the boolean subset of GitHub's expression language the
+    workflows' conditions use: `==`, `!=`, `!`, `&&`, `||`, parentheses,
+    string literals, `github.event_name`, `github.event.action`,
+    `github.event.label.name` and `contains(...labels.*.name, '<name>')`."""
+    python = expression.strip().removeprefix("${{").removesuffix("}}")
+    python = re.sub(
+        r"contains\(github\.event\.pull_request\.labels\.\*\.name,\s*('[^']*')\)", r"(\1 in labels)", python
+    )
+    python = python.replace("&&", " and ").replace("||", " or ")
+    python = re.sub(r"!(?!=)", " not ", python)
+    python = python.replace("github.event.label.name", "label")
+    python = python.replace("github.event.action", "action").replace("github.event_name", "event_name")
+    scope = {"event_name": event_name, "action": action, "labels": list(labels), "label": label}
+    return eval(python, {"__builtins__": {}}, scope)  # noqa: S307 - the expression is the repository's own
+
+
+PULL_REQUEST_ACTIONS = ["opened", "synchronize", "reopened", "labeled", "ready_for_review"]
+
+
+@pytest.mark.parametrize(
+    ("event_name", "action", "cancels"),
+    [
+        # Only a new head cancels the run that is measuring or building it.
+        ("pull_request", "synchronize", True),
+        ("pull_request", "opened", False),
+        ("pull_request", "reopened", False),
+        ("pull_request", "labeled", False),
+        ("pull_request", "ready_for_review", False),
+        # The suite's push and dispatch supersede their predecessors; the
+        # CI workflow's `dev` push runs to completion.
+        ("push", "", None),
+        ("workflow_dispatch", "", None),
+    ],
+)
+def test_only_a_new_head_cancels_a_run(workflow, event_name, action, cancels):
+    """The expressions are evaluated by `evaluate`, a translation of the
+    boolean subset they use, not by GitHub."""
+    ci = yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    suite = workflow["concurrency"]["cancel-in-progress"]
+    ci_cancel = ci["concurrency"]["cancel-in-progress"]
+    if cancels is None:
+        assert evaluate(suite, event_name, action) is True
+        assert evaluate(ci_cancel, event_name, action) is False
+    else:
+        assert evaluate(suite, event_name, action) is cancels
+        assert evaluate(ci_cancel, event_name, action) is cancels
+
+
+@pytest.mark.parametrize("action", PULL_REQUEST_ACTIONS)
+@pytest.mark.parametrize("carries_bench", [True, False])
+def test_a_labelled_pull_request_is_measured_by_its_label_event(jobs, action, carries_bench):
+    """`changes` is the root every other job needs, so its condition is
+    what starts a run. A pull request opened with `bench` gets `opened`
+    and `labeled` together; only `labeled` measures the head, and
+    `ready_for_review` on a labelled pull request starts nothing either.
+    A new head or a reopening of one that carries `bench` still runs."""
+    labels = ["bench"] if carries_bench else []
+    runs = evaluate(
+        jobs["changes"]["if"],
+        "pull_request",
+        action,
+        labels=labels,
+        label="bench" if action == "labeled" else "",
+    )
+    expected = not (carries_bench and action in {"opened", "ready_for_review"})
+    assert runs is expected
+
+
+def test_a_foreign_label_and_other_events_still_decide_as_before(jobs):
+    condition = jobs["changes"]["if"]
+    assert not evaluate(condition, "pull_request", "labeled", labels=["docs"], label="docs")
+    assert evaluate(condition, "pull_request", "opened", labels=["docs"])
+    assert evaluate(condition, "push")
+    assert evaluate(condition, "workflow_dispatch")
+
+
+def test_release_signs_the_boot_payload_with_the_secret_key_and_removes_it_last():
+    workflow = yaml.load((REPO_ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["kernel-profile"]["steps"]
+    names = [step.get("name") for step in steps]
+    install = names.index("Install the release signing key")
+    build = names.index("Build the released kernel against the profile")
+    attach = names.index("Attach the profile, the profile-guided kernel and its boot payload to the release")
+    remove = names.index("Remove the release signing key")
+    assert install < build < attach < remove == len(steps) - 1
+    assert steps[remove]["if"] == "always()"
+    # The secret reaches only the step that decodes it, and the key lands
+    # outside the checkout.
+    assert steps[install]["env"]["HELIOS_BOOTFS_ROOT_KEY"] == "${{ secrets.HELIOS_BOOTFS_ROOT_KEY }}"
+    assert sum("secrets.HELIOS_BOOTFS_ROOT_KEY" in str(step) for step in steps) == 1
+    assert 'key="${RUNNER_TEMP}/' in steps[install]["run"]
+    assert "install -m 600" in steps[install]["run"]
+    assert '--root-secret-key "${HELIOS_ROOT_KEY_FILE}"' in steps[build]["run"]
+    upload = steps[attach]["run"]
+    assert "bootfs-path" in upload
+    assert "assets/helios-bootfs-x86-64 \\" in upload

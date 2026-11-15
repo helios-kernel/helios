@@ -388,6 +388,26 @@ run_smoke \
     -c \
     '/bin/wasix-thread-trap main; echo main-trap:exit=$?; /bin/wasix-thread-trap; echo thread-trap:exit=$?'
 
+# Only bytes from the boot payload load without a signature check; a
+# cwasm a guest writes must verify (#483). CPython copies a bootfs cwasm
+# unchanged to /copy, which still verifies and runs, and with one
+# signature byte flipped to /forged, which must be refused. A missing
+# /forged is refused too, so the writes must report success.
+run_smoke \
+    unsigned-cwasm \
+    cwasm:written \
+    copy:ran \
+    forged:refused \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program python3 \
+    --boot-program wasix-atomic-wait-timeout \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused'
+
 run_smoke \
     cpython \
     '{"ok":"a"}' \
@@ -457,4 +477,40 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         shell \
         -c \
         'curl http://detectportal.firefox.com/success.txt'
+
+    # The same fetch through the http-client plugin's TLS transport: the
+    # handshake, the chain against the compiled-in roots, and the validity
+    # window against the RTC-seeded wall clock.
+    run_smoke \
+        curl-https \
+        'success' \
+        -- \
+        --boot-program dash \
+        --boot-program debugger \
+        --boot-program curl \
+        --boot-program http-client \
+        --no-compiler-plugin \
+        shell \
+        -c \
+        'curl https://detectportal.firefox.com/success.txt'
+
+    # A failed verification must surface as `tls-certificate-error`. The
+    # inspector exits non-zero when the guest command does, and `run_smoke`
+    # treats that as a failed smoke, so the guest shell swallows curl's
+    # status and the check is on curl's own error text (`ErrorCode`'s
+    # `Display` is its variant name).
+    for host in expired wrong.host self-signed; do
+        run_smoke \
+            "curl-https-${host}" \
+            'TlsCertificateError' \
+            -- \
+            --boot-program dash \
+            --boot-program debugger \
+            --boot-program curl \
+            --boot-program http-client \
+            --no-compiler-plugin \
+            shell \
+            -c \
+            "curl https://${host}.badssl.com/ 2>&1 || true"
+    done
 fi
