@@ -178,7 +178,7 @@ pub fn record(data: &[u8]) {
             }
         }
         5 => {
-            if payload.len() < 4 {
+            if payload.len() < 5 {
                 return;
             }
             let algorithm = match payload[0] % 3 {
@@ -186,10 +186,12 @@ pub fn record(data: &[u8]) {
                 1 => Compression::Lzo,
                 _ => Compression::Zstd,
             };
-            let len = u16::from_le_bytes([payload[1], payload[2]]) as usize * 2;
-            let sector = 4096 << (payload[3] % 5);
+            // BTRFS_MAX_UNCOMPRESSED; include zero and the full 128 KiB boundary.
+            let len = u32::from_le_bytes([payload[1], payload[2], payload[3], 0]) as usize
+                % (128 * 1024 + 1);
+            let sector = 4096 << (payload[4] % 5);
             let mut output = vec![0; len];
-            let _ = crate::compress::decompress(algorithm, &payload[4..], &mut output, sector);
+            let _ = crate::compress::decompress(algorithm, &payload[5..], &mut output, sector);
         }
         _ => unreachable!(),
     }

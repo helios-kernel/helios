@@ -2666,14 +2666,7 @@ jobs:
         working-directory: helios
         env:
           FUZZ_TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          mkdir -p target/btrfs-results target/btrfs-crashes
-          cargo fuzz run --fuzz-dir btrfs --features fuzzing --dev \
-            --target-dir target/btrfs-fuzz "$FUZZ_TARGET" "target/btrfs-seeds/$FUZZ_TARGET" -- \
-            -max_total_time=180 -timeout=30 -rss_limit_mb=4096 \
-            -max_len=134217728 -artifact_prefix=target/btrfs-crashes/ \
-            2>&1 | tee "target/btrfs-results/$FUZZ_TARGET.log"
+        run: python3 tools/btrfs/run.py fuzz "$FUZZ_TARGET"
       - name: Preserve sanitizer output, corpus and reproducers
         if: always()
         uses: actions/upload-artifact@v4
