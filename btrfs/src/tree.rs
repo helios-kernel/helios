@@ -87,6 +87,13 @@ impl Node {
         })
     }
 
+    pub(crate) fn owner(&self) -> u64 {
+        view::<RawHeader>(&self.bytes)
+            .expect("validated node")
+            .owner
+            .get()
+    }
+
     pub(crate) fn level(&self) -> u8 {
         self.level
     }
@@ -118,7 +125,7 @@ impl Node {
     }
 
     /// The block and generation internal slot `slot` points at.
-    fn child(&self, slot: usize) -> (u64, u64) {
+    pub(crate) fn child(&self, slot: usize) -> (u64, u64) {
         let ptr: &RawKeyPtr = view(&self.bytes[HEADER_BYTES + slot * KEY_PTR_BYTES..])
             .expect("validated key pointer array");
         (ptr.blockptr.get(), ptr.generation.get())

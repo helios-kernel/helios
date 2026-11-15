@@ -62,9 +62,10 @@ impl Header {
         raw.generation.set(generation);
         raw.owner.set(owner);
         raw.nritems.set(count as u32);
-        // BTRFS_HEADER_FLAG_WRITTEN: encoded blocks are about to be written. Keep the
-        // relocation and backref revision bits while setting the written bit.
-        raw.flags.set(raw.flags.get() | 1);
+        // Normal CoW copies use BTRFS_MIXED_BACKREF_REV (high byte 1), clear
+        // BTRFS_HEADER_FLAG_RELOC (bit 1), and set WRITTEN (bit 0).
+        raw.flags
+            .set((raw.flags.get() & !((0xff_u64 << 56) | 2)) | (1_u64 << 56) | 1);
         bytes[..HEADER_BYTES].copy_from_slice(raw.as_bytes());
         bytes
     }
@@ -299,4 +300,24 @@ fn partitions(sizes: impl Iterator<Item = usize>, capacity: usize) -> Vec<Range<
     // child instead of calling encode for it.
     ranges.push(start..end);
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zerocopy::FromZeros;
+
+    #[test]
+    fn normal_cow_clears_relocation_and_sets_mixed_backref_revision() {
+        for revision in [0, 1, 255] {
+            let mut raw = RawHeader::new_zeroed();
+            raw.flags.set((revision << 56) | 2);
+            raw.owner.set(5);
+            let header = Header { raw, size: 4096 };
+            let bytes = Leaf::empty(header).encode(0..0, 1 << 20, 42, 256, ChecksumType::Crc32c);
+            let parsed = btrfs_disk::tree::TreeBlock::parse(&bytes);
+            assert_eq!(parsed.header().flags.bits(), (1_u64 << 56) | 1);
+            assert_eq!(parsed.header().owner, 256);
+        }
+    }
 }

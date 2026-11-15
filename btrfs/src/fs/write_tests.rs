@@ -333,6 +333,191 @@ fn root_node(fs: &Filesystem<Disk>) -> Node {
 }
 
 #[test]
+fn shared_tree_cow_converts_data_references_and_retires_only_the_last_owner() {
+    block_on(async {
+        use crate::accounting::{Accounting, MetadataBlock};
+        use crate::allocation::MetadataReference;
+        use crate::allocation::data::{DataExtent, DataReference};
+        use crate::items::{ExtentData, FileExtent};
+        use crate::ondisk::{item_type, objectid};
+
+        for siblings in [0, 512] {
+            let timestamp = Timestamp::from_secs(1_700_000_000);
+            let mut tree = TreeBuilder::new()
+                .root(Metadata::new(0o755, timestamp))
+                .file(
+                    "/data.bin",
+                    vec![0x53; 32768],
+                    Metadata::new(0o644, timestamp),
+                );
+            for index in 0..siblings {
+                tree = tree.file(
+                    alloc::format!("/sibling-{index}"),
+                    b"inline data",
+                    Metadata::new(0o644, timestamp),
+                );
+            }
+            let (fs, _) = filesystem_image_tree(true, true, tree);
+            let inode = fs.resolve(b"/data.bin").await.unwrap();
+            let mut trees = Trees::new(
+                fs.superblock().generation() + 1,
+                fs.superblock().csum_type(),
+            );
+            let original = fs.default_subvolume.root;
+            assert_eq!(original.level == 0, siblings == 0);
+            let file_key = Key::new(inode.number(), item_type::EXTENT_DATA, 0);
+            let bytes = trees
+                .get(&fs.volume, original, file_key)
+                .await
+                .unwrap()
+                .unwrap();
+            let original_file = bytes.clone();
+            let file = FileExtent::parse(file_key, &bytes, fs.superblock().sectorsize()).unwrap();
+            let ExtentData::Regular {
+                disk_bytenr,
+                disk_num_bytes,
+                ..
+            } = file.data
+            else {
+                panic!("regular fixture extent")
+            };
+            let data_key = Key::new(disk_bytenr, item_type::EXTENT_ITEM, disk_num_bytes);
+            let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+                .await
+                .unwrap();
+            let extent_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
+                .await
+                .unwrap()
+                .root;
+            let mut accounting = Accounting::new(&fs.volume, extent_root, &space, fs.csum_tree)
+                .await
+                .unwrap();
+            let block = MetadataBlock {
+                address: original.bytenr,
+                level: original.level,
+            };
+            // Model two roots sharing this committed tree. Their extent pointers
+            // initially have only the original owner's implicit data references.
+            accounting
+                .add_metadata(
+                    &fs.volume,
+                    &mut trees,
+                    &mut space,
+                    block,
+                    MetadataReference::root(256),
+                )
+                .await
+                .unwrap();
+            let first = trees
+                .apply(
+                    &fs.volume,
+                    original,
+                    file_key,
+                    Some(&original_file),
+                    &mut space,
+                )
+                .await
+                .unwrap();
+            accounting
+                .sync_allocations(&fs.volume, &mut trees, &mut space)
+                .await
+                .unwrap();
+            let (_, old) = accounting
+                .metadata(&fs.volume, &trees, block)
+                .await
+                .unwrap();
+            assert_eq!(old.references(), 1);
+            assert!(old.full_backrefs());
+            let bytes = trees
+                .get(&fs.volume, accounting.root, data_key)
+                .await
+                .unwrap()
+                .unwrap();
+            let data = DataExtent::parse(data_key, &bytes, fs.superblock().sectorsize()).unwrap();
+            assert_eq!(data.refs, 2);
+            // The old leaf's parent reference is external; the owner's reference
+            // remains inline and now belongs to the new copy.
+            assert_eq!(
+                data.roots[&DataReference {
+                    root: 5,
+                    inode: inode.number(),
+                    offset: 0
+                }],
+                1
+            );
+            let (parent_key, _) = trees
+                .ceiling(
+                    &fs.volume,
+                    accounting.root,
+                    Key::new(disk_bytenr, item_type::SHARED_DATA_REF, 0),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(parent_key.is(disk_bytenr, item_type::SHARED_DATA_REF));
+
+            let second = trees
+                .apply(
+                    &fs.volume,
+                    TreeRoot {
+                        tree: 256,
+                        ..original
+                    },
+                    file_key,
+                    Some(&original_file),
+                    &mut space,
+                )
+                .await
+                .unwrap();
+            accounting
+                .sync_allocations(&fs.volume, &mut trees, &mut space)
+                .await
+                .unwrap();
+            assert!(matches!(
+                accounting.metadata(&fs.volume, &trees, block).await,
+                Err(WriteError::MissingExtent { .. })
+            ));
+            let bytes = trees
+                .get(&fs.volume, accounting.root, data_key)
+                .await
+                .unwrap()
+                .unwrap();
+            let data = DataExtent::parse(data_key, &bytes, fs.superblock().sectorsize()).unwrap();
+            assert_eq!(data.refs, 2);
+            assert!(
+                trees
+                    .get(&fs.volume, accounting.root, parent_key)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                trees
+                    .get(&fs.volume, first, file_key)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                trees
+                    .get(&fs.volume, second, file_key)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                trees
+                    .get(&fs.volume, fs.csum_tree, crate::checksums::key(disk_bytenr))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
+        }
+    });
+}
+
+#[test]
 fn checksum_deletion_splits_items_preserves_neighbors_and_crosses_holes() {
     block_on(async {
         use crate::checksums::{Checksums, key};
@@ -994,7 +1179,12 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
         );
         assert_eq!(
             trees.retired(),
-            &[(original.tree, original.bytenr, original.level)]
+            &[crate::tree::write::RetiredBlock {
+                tree: original.tree,
+                address: original.bytenr,
+                level: original.level,
+                generation: original.generation
+            }]
         );
         assert!(!space.cancel_metadata(original.bytenr));
         let (address, reservation) = space.metadata().next().unwrap();

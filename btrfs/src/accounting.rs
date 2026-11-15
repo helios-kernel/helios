@@ -2,6 +2,8 @@
 //! change references, never allocator availability: committed blocks stay pinned
 //! until publication and the last reader of their generation have completed.
 
+mod cow;
+
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -38,6 +40,7 @@ pub(crate) struct Accounting {
     group_used: BTreeMap<Key, u64>,
     retired_extents: BTreeMap<u64, u64>,
     registered: BTreeMap<u64, MetadataReservation>,
+    processed_retired: usize,
 }
 
 impl Accounting {
@@ -179,6 +182,7 @@ impl Accounting {
             group_used: BTreeMap::new(),
             retired_extents: BTreeMap::new(),
             registered: BTreeMap::new(),
+            processed_retired: 0,
         })
     }
 
@@ -195,6 +199,7 @@ impl Accounting {
         // BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA, from btrfs.h.
         let skinny = volume.superblock().incompat_flags() & (1 << 8) != 0;
         loop {
+            self.sync_references(volume, trees, space).await?;
             let free_changed = if let Some(free) = &mut self.free_space {
                 free.sync(volume, trees, space, &self.retired_extents)
                     .await?
@@ -215,7 +220,10 @@ impl Accounting {
                 .map(|(&address, &record)| (address, record))
                 .collect();
             if removed.is_empty() && changed.is_empty() && !groups_changed && !free_changed {
-                return Ok(());
+                if self.processed_retired == trees.retired().len() {
+                    return Ok(());
+                }
+                continue;
             }
             for (address, record) in removed {
                 let extent = metadata_extent(trees.generation(), record, skinny);

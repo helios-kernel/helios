@@ -378,15 +378,8 @@ impl<'a> FileExtent<'a> {
             .checked_add(num_bytes)
             .ok_or(ItemDefect::ExtentOverflow)?;
 
-        if head.extent_type == EXTENT_PREALLOC {
-            if compression.is_some() {
-                return Err(ItemDefect::Compression(head.compression));
-            }
-            return Ok(Self {
-                start,
-                end,
-                data: ExtentData::Zero,
-            });
+        if head.extent_type == EXTENT_PREALLOC && compression.is_some() {
+            return Err(ItemDefect::Compression(head.compression));
         }
         if disk_bytenr == 0 {
             return Ok(Self {
@@ -414,6 +407,13 @@ impl<'a> FileExtent<'a> {
                 offset,
                 len: num_bytes,
                 limit,
+            });
+        }
+        if head.extent_type == EXTENT_PREALLOC {
+            return Ok(Self {
+                start,
+                end,
+                data: ExtentData::Zero,
             });
         }
         Ok(Self {

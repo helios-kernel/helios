@@ -72,11 +72,19 @@ pub(crate) trait MetadataAllocator {
     fn cancel(&mut self, address: u64);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetiredBlock {
+    pub(crate) tree: u64,
+    pub(crate) address: u64,
+    pub(crate) level: u8,
+    pub(crate) generation: u64,
+}
+
 pub(crate) struct Trees {
     generation: u64,
     checksum: ChecksumType,
     blocks: BTreeMap<u64, Node>,
-    retired: Vec<(u64, u64, u8)>,
+    retired: Vec<RetiredBlock>,
 }
 
 impl Trees {
@@ -105,13 +113,19 @@ impl Trees {
         &mut self,
         tree: u64,
         address: u64,
-        level: u8,
+        node: &Node,
         allocator: &mut A,
     ) {
         if self.blocks.remove(&address).is_some() {
             allocator.cancel(address);
         } else {
-            self.retired.push((tree, address, level));
+            let header: &RawHeader = view(&node.bytes).expect("validated retired node");
+            self.retired.push(RetiredBlock {
+                tree,
+                address,
+                level: node.level,
+                generation: header.generation.get(),
+            });
         }
     }
 
@@ -263,7 +277,7 @@ impl Trees {
             .first()
             .is_none_or(|child| child.address != address)
         {
-            self.retire(root.tree, address, 0, allocator);
+            self.retire(root.tree, address, &node, allocator);
         }
         let mut level = 0;
         while let Some((address, node, slot)) = path.pop() {
@@ -288,7 +302,7 @@ impl Trees {
                 .first()
                 .is_none_or(|child| child.address != address)
             {
-                self.retire(root.tree, address, level, allocator);
+                self.retire(root.tree, address, &node, allocator);
             }
         }
         if children.is_empty() {
@@ -341,7 +355,7 @@ impl Trees {
                 break;
             }
             let (address, generation) = node.child(0);
-            self.retire(root.tree, child.address, level, allocator);
+            self.retire(root.tree, child.address, &node, allocator);
             child = Child {
                 key: node.key(0),
                 address,
@@ -396,7 +410,7 @@ impl Trees {
             .map(|(&address, node)| (address, &*node.bytes))
     }
 
-    pub(crate) fn retired(&self) -> &[(u64, u64, u8)] {
+    pub(crate) fn retired(&self) -> &[RetiredBlock] {
         &self.retired
     }
 }

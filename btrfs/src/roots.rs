@@ -153,8 +153,8 @@ impl Roots {
         for (_, record) in space.metadata() {
             changes.entry(record.tree).or_default().0 += size;
         }
-        for &(tree, _, _) in trees.retired() {
-            changes.entry(tree).or_default().1 += size;
+        for block in trees.retired() {
+            changes.entry(block.tree).or_default().1 += size;
         }
         let mut changed = false;
         for (&tree, entry) in &mut self.entries {
