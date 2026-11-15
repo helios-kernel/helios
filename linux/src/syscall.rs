@@ -91,8 +91,12 @@ async fn write<M: UserMemory, O: Output>(args: [u64; 6], memory: &M, output: &mu
     let mut buffer = [0; 4096];
     let mut written = 0_u64;
     while written < count {
-        let size = (count - written).min(buffer.len() as u64) as usize;
-        if memory.read(args[1] + written, &mut buffer[..size]).is_err() {
+        let address = args[1] + written;
+        // Stop at a user-page boundary so a fault on the next page preserves
+        // the bytes already written, including an unaligned first buffer.
+        let page_remaining = buffer.len() - (address as usize & (buffer.len() - 1));
+        let size = (count - written).min(page_remaining as u64) as usize;
+        if memory.read(address, &mut buffer[..size]).is_err() {
             return if written == 0 { errno(EFAULT) } else { written };
         }
         match output.write(stream, &buffer[..size]).await {

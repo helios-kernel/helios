@@ -98,6 +98,12 @@ fn preserves_short_writes_partial_faults_and_interrupts() {
         ready(dispatch(write(2, 0, 8192), &memory, &mut sink)),
         ControlFlow::Continue(4096)
     );
+    let mut sink = Sink::default();
+    assert_eq!(
+        ready(dispatch(write(1, 4090, 32), &memory, &mut sink)),
+        ControlFlow::Continue(6)
+    );
+    assert_eq!(sink.bytes, vec![42; 6]);
     let mut sink = Sink {
         error: Some(WriteError::Interrupted),
         ..Sink::default()
