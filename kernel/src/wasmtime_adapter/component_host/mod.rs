@@ -35,7 +35,7 @@ use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
     Access, Accessor, Component, Destination, FutureReader, HasSelf, Linker, Resource,
-    ResourceTable, ResourceType, StreamProducer, StreamReader, StreamResult,
+    ResourceTable, ResourceType, StreamProducer, StreamReader, StreamResult, WasmStr,
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
 
@@ -3064,9 +3064,10 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
-    instance.func_wrap_data(
+    instance.func_wrap_data_memory(
         "set-target-enabled",
-        |data, (target, enabled): (String, bool)| {
+        |data, memory, (target, enabled): (WasmStr, bool)| {
+            let target = target.to_str_in(memory)?;
             let result =
                 observation::set_target_enabled(data, &target, enabled).map_err(|refusal| {
                     match refusal {
@@ -3386,9 +3387,10 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
-    instance.func_wrap_data(
+    instance.func_wrap_data_memory(
         "set-target-enabled",
-        |data, (target, enabled): (String, bool)| {
+        |data, memory, (target, enabled): (WasmStr, bool)| {
+            let target = target.to_str_in(memory)?;
             let result =
                 observation::set_target_enabled(data, &target, enabled).map_err(|refusal| {
                     match refusal {
