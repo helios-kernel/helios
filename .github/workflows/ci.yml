@@ -93,6 +93,7 @@ jobs:
               - '!api/**'
               - '!api-macro/**'
               - '!compiler-plugin/**'
+              - '!tools/bench/**'
               - '!docs/**'
               - '!**/*.md'
             pin:

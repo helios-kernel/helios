@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+from fnmatch import fnmatchcase
 
 import pytest
 import yaml
@@ -13,12 +14,7 @@ def ci_jobs():
     return yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)["jobs"]
 
 
-@pytest.mark.parametrize("changed", [[], ["host_tools"], ["shared"], ["aarch64"], None])
-@pytest.mark.parametrize("draft", [False, True])
-@pytest.mark.parametrize("heavy", [False, True])
-def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
-    ci_jobs, tmp_path, changed, draft, heavy
-):
+def select_lanes(ci_jobs, tmp_path, changed, draft=False, heavy=False):
     select = next(step for step in ci_jobs["changes"]["steps"] if step.get("id") == "select")
     output = tmp_path / "outputs"
     subprocess.run(
@@ -34,7 +30,16 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
         check=True,
         capture_output=True,
     )
-    selected = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+
+@pytest.mark.parametrize("changed", [[], ["host_tools"], ["shared"], ["aarch64"], None])
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("heavy", [False, True])
+def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
+    ci_jobs, tmp_path, changed, draft, heavy
+):
+    selected = select_lanes(ci_jobs, tmp_path, changed, draft, heavy)
     lanes = json.loads(selected["lanes"])
     checks = json.loads(selected["checks"])
     tests = json.loads(selected["tests"])
@@ -57,6 +62,44 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
     for name in lanes:
         if name.startswith("smoke-"):
             assert f"wasm-{catalog[name]['guest-wasm']}" in ci_jobs[name]["needs"]
+
+
+@pytest.mark.parametrize(
+    ("paths", "rust"),
+    [
+        (["tools/bench/src/helios_bench/cli.py", "tools/bench/tests/test_gate.py"], False),
+        (["tools/bench/native/sched-tasks.c", "tools/bench/manifest.toml"], False),
+        (["tools/bench/src/helios_bench/cli.py", "kernel/src/lib.rs"], True),
+        (["new-shared-input.toml"], True),
+    ],
+)
+def test_benchmark_inputs_select_tooling_without_unrelated_rust(ci_jobs, tmp_path, paths, rust):
+    filtering = next(step for step in ci_jobs["changes"]["steps"] if step.get("id") == "filter")
+    assert filtering["with"]["predicate-quantifier"] == "some-with-excludes"
+    filters = yaml.safe_load(filtering["with"]["filters"])
+    changed = [
+        name
+        for name, patterns in filters.items()
+        if any(
+            any(fnmatchcase(path, pattern) for pattern in patterns if not pattern.startswith("!"))
+            and all(not fnmatchcase(path, pattern[1:]) for pattern in patterns if pattern.startswith("!"))
+            for path in paths
+        )
+    ]
+    selected = select_lanes(ci_jobs, tmp_path, changed)
+    lanes = json.loads(selected["lanes"])
+    assert ("test-kernel" in lanes) == rust
+    if not rust:
+        assert lanes == []
+        assert json.loads(selected["wasm_profiles"]) == []
+
+    benchmark = yaml.load(
+        (REPO_ROOT / ".github/workflows/bench-suite.yml").read_text(), Loader=yaml.BaseLoader
+    )
+    filtering = next(step for step in benchmark["jobs"]["changes"]["steps"] if step.get("id") == "filter")
+    patterns = yaml.safe_load(filtering["with"]["filters"])["tooling"]
+    if any(path.startswith("tools/bench/") for path in paths):
+        assert any(fnmatchcase(path, pattern) for path in paths for pattern in patterns)
 
 
 @pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled"])
