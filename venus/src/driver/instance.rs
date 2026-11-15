@@ -166,7 +166,6 @@ unsafe extern "system" fn create_instance<F: Factory>(
 ) -> vk::Result {
     // SAFETY: Vulkan requires writable output storage and valid callbacks.
     unsafe { *output = vk::Instance::null() };
-    let allocator = unsafe { HostAllocator::new(allocator, vk::SystemAllocationScope::INSTANCE) };
     let connection = match open::<F>() {
         Ok(connection) => connection,
         Err(error) => {
@@ -174,6 +173,19 @@ unsafe extern "system" fn create_instance<F: Factory>(
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         }
     };
+    // SAFETY: forwarded unchanged from the Vulkan entry point.
+    unsafe { create_on_connection::<F>(connection, info, allocator, output) }
+}
+
+pub(super) unsafe fn create_on_connection<F: Factory>(
+    connection: Connection<F::Transport>,
+    info: *const vk::InstanceCreateInfo<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    output: *mut vk::Instance,
+) -> vk::Result {
+    // SAFETY: both callers supply writable output and Vulkan-valid inputs.
+    unsafe { *output = vk::Instance::null() };
+    let allocator = unsafe { HostAllocator::new(allocator, vk::SystemAllocationScope::INSTANCE) };
     let owner = Arc::new(Exclusive::new(State::<F> {
         connection,
         physical: None,

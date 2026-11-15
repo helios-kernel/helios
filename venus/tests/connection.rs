@@ -575,6 +575,43 @@ mod entry_tests {
     }
 
     #[test]
+    fn explicit_connection_is_used_for_instance_creation() {
+        let (transport, capset) = TestFactory::create().unwrap();
+        let recorded = transport.0.clone();
+        let configuration = TestFactory::configuration();
+        let connection = Connection::new(
+            transport,
+            capset,
+            configuration.layout,
+            configuration.idle_timeout,
+        )
+        .unwrap();
+        // SAFETY: the test owns the connection and the complete object tree.
+        unsafe {
+            let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
+                connection,
+                &vk::InstanceCreateInfo::default(),
+                None,
+            )
+            .unwrap();
+            assert!(recorded.lock().unwrap().consumed.iter().any(|commands| {
+                word(commands, 0) as i32 == wire::VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT.0
+                    && word(commands, 36) as i32 == wire::VK_COMMAND_TYPE_vkCreateInstance_EXT.0
+            }));
+            assert_eq!(instance.enumerate_physical_devices().unwrap().len(), 2);
+            instance.destroy_instance(None);
+        }
+        assert!(
+            recorded
+                .lock()
+                .unwrap()
+                .blobs
+                .values()
+                .all(|blob| blob.upgrade().is_none())
+        );
+    }
+
+    #[test]
     fn ash_instances_have_independent_connections_and_stable_physical_handles() {
         let entry = entry::<TestFactory>();
         // SAFETY: the factory's recorded renderer implements these requests.

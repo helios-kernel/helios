@@ -83,3 +83,32 @@ pub fn entry<F: Factory>() -> ash::Entry {
         })
     }
 }
+
+/// Create a Vulkan instance on an explicitly owned renderer connection.
+///
+/// This consumes the connection without calling the factory. The resulting
+/// instance owns it until `ash::Instance::destroy_instance`; child handles use
+/// the same dispatch table as instances created through [`entry`].
+///
+/// # Safety
+/// `info` and `allocator` must satisfy Vulkan's instance creation contract.
+/// Callback userdata must outlive the instance and every child allocation.
+/// The caller must destroy all children before destroying the instance.
+pub unsafe fn instance_from_connection<F: Factory>(
+    connection: crate::connection::Connection<F::Transport>,
+    info: &ash::vk::InstanceCreateInfo<'_>,
+    allocator: Option<&ash::vk::AllocationCallbacks<'_>>,
+) -> Result<ash::Instance, ash::vk::Result> {
+    let mut handle = ash::vk::Instance::null();
+    // SAFETY: the caller supplies Vulkan-valid inputs; handle is writable.
+    unsafe {
+        instance::create_on_connection::<F>(
+            connection,
+            info,
+            allocator.map_or(core::ptr::null(), |allocator| allocator),
+            &mut handle,
+        )
+        .result()?;
+        Ok(ash::Instance::load(entry::<F>().static_fn(), handle))
+    }
+}
