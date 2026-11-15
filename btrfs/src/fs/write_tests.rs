@@ -1643,6 +1643,238 @@ async fn exercise_extent_cuts(
 
 #[cfg(feature = "write")]
 #[test]
+fn reader_accepts_compat_ro_features_that_the_writer_refuses() {
+    use super::writer::Writer;
+    use btrfs_disk::superblock::{read_superblock, write_superblock_all_mirrors};
+    block_on(async {
+        for (bit, name) in [(1 << 2, "verity"), (1 << 63, "undefined")] {
+            let (formatted, mut image) = filesystem_image();
+            drop(formatted);
+            let mut superblock = read_superblock(&mut image, 0).unwrap();
+            superblock.compat_ro_flags |= bit;
+            write_superblock_all_mirrors(&mut image, &superblock.to_bytes()).unwrap();
+            let reader = Filesystem::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            assert_eq!(reader.superblock().compat_ro_flags() & bit, bit);
+            assert_eq!(
+                reader.root().await.unwrap().kind(),
+                crate::FileKind::Directory
+            );
+            assert!(matches!(Writer::mount(Disk(image)).await,
+                Err(WriteError::UnsupportedCompatRo { name: found_name, bit: found_bit })
+                if found_name == name && found_bit == bit));
+        }
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn reflink_from_readonly_subvolume_preserves_source() {
+    use super::writer::Writer;
+    use crate::transaction::reflink::{CloneRange, FileId};
+    use ferrosys::btrfs::SubvolumeRequest;
+    block_on(async {
+        let stamp = Timestamp::from_secs(1_700_000_000);
+        let directory = Metadata::new(0o755, stamp);
+        let file = Metadata::new(0o644, stamp);
+        let contents = vec![0x4b; 8192];
+        let tree = TreeBuilder::new()
+            .root(directory)
+            .directory("/ro", directory)
+            .file("/ro/source", contents.clone(), file)
+            .directory("/rw", directory)
+            .file("/rw/clone", Vec::new(), file);
+        let options = FormatOptions::new([0x53; 16], stamp)
+            .subvolume(SubvolumeRequest::new(b"/ro".to_vec(), [0x31; 16]).read_only(true))
+            .subvolume(SubvolumeRequest::new(b"/rw".to_vec(), [0x32; 16]));
+        let (formatted, image) =
+            filesystem_image_options(tree, tempfile::tempfile().unwrap(), options);
+        drop(formatted);
+        let mut writer = Writer::mount(Disk(image)).await.unwrap();
+        let base = writer.snapshot().unwrap();
+        let source = base.resolve(b"/ro/source").await.unwrap();
+        let destination = base.resolve(b"/rw/clone").await.unwrap();
+        let source_id = FileId {
+            tree: source.tree(),
+            inode: source.number(),
+        };
+        let destination_id = FileId {
+            tree: destination.tree(),
+            inode: destination.number(),
+        };
+        let when = crate::Timestamp {
+            seconds: 1_700_000_100,
+            nanoseconds: 0,
+        };
+        let concurrency = std::thread::available_parallelism().unwrap();
+        let tx = writer
+            .begin()
+            .await
+            .unwrap()
+            .clone_range(
+                CloneRange {
+                    source: source_id,
+                    destination: destination_id,
+                    source_offset: 0,
+                    destination_offset: 0,
+                    length: contents.len() as u64,
+                },
+                when,
+                concurrency,
+            )
+            .await
+            .unwrap();
+        tx.commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        let cloned = writer.snapshot().unwrap();
+        let cloned_inode = cloned.resolve(b"/rw/clone").await.unwrap();
+        assert_eq!(
+            disk_allocation(&cloned, &cloned_inode, 0).await,
+            disk_allocation(&base, &source, 0).await
+        );
+        let mut output = vec![0; contents.len()];
+        cloned.read(&cloned_inode, 0, &mut output).await.unwrap();
+        assert_eq!(output, contents);
+        let replacement = vec![0x82; contents.len()];
+        let (tx, _) = writer
+            .begin()
+            .await
+            .unwrap()
+            .write_file(
+                destination_id,
+                0,
+                &replacement,
+                WriteOptions::plain(when, concurrency),
+            )
+            .await
+            .unwrap();
+        tx.commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        let current = writer.snapshot().unwrap();
+        current
+            .read(
+                &current.resolve(b"/ro/source").await.unwrap(),
+                0,
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, contents);
+        current
+            .read(
+                &current.resolve(b"/rw/clone").await.unwrap(),
+                0,
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, replacement);
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn owned_mutations_preserve_readonly_subvolumes() {
+    use super::writer::Writer;
+    use crate::transaction::namespace::{Attributes, Name};
+    use crate::transaction::reflink::{CloneRange, FileId};
+    block_on(async {
+        let stamp = Timestamp::from_secs(1_700_000_000);
+        let contents = b"read-only contents";
+        let tree = TreeBuilder::new().root(Metadata::new(0o755, stamp)).file(
+            "/data",
+            contents.to_vec(),
+            Metadata::new(0o644, stamp),
+        );
+        let (formatted, image) = filesystem_image_tree(true, true, tree);
+        let tree = formatted.root().await.unwrap().tree();
+        drop(formatted);
+        let mut external =
+            btrfs_transaction::filesystem::Filesystem::open(image.try_clone().unwrap()).unwrap();
+        let mut fixture =
+            btrfs_transaction::transaction::Transaction::start(&mut external).unwrap();
+        fixture.set_root_readonly(&mut external, tree).unwrap();
+        fixture.commit(&mut external).unwrap();
+        drop(external);
+        let mut writer = Writer::mount(Disk(image)).await.unwrap();
+        let base = writer.snapshot().unwrap();
+        let root = base.root().await.unwrap();
+        let inode = base.resolve(b"/data").await.unwrap();
+        let file = FileId {
+            tree,
+            inode: inode.number(),
+        };
+        let name = |bytes| Name {
+            tree,
+            parent: root.number(),
+            bytes,
+        };
+        let attributes = || Attributes {
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+        };
+        let when = crate::Timestamp {
+            seconds: 1_700_000_100,
+            nanoseconds: 0,
+        };
+        let concurrency = std::thread::available_parallelism().unwrap();
+        macro_rules! refused {
+            ($tx:ident, $operation:expr) => {{
+                let $tx = writer.begin().await.unwrap();
+                assert!(matches!($operation.await, Err(WriteError::ReadOnlySubvolume { tree: rejected }) if rejected == tree));
+                assert_eq!(writer.snapshot().unwrap().snapshot, base.snapshot);
+            }};
+        }
+        refused!(
+            tx,
+            tx.write_file(
+                file,
+                0,
+                b"replacement",
+                WriteOptions::plain(when, concurrency)
+            )
+        );
+        refused!(tx, tx.truncate_file(file, 0, when, concurrency));
+        refused!(tx, tx.set_times(file, Some(when), Some(when), when));
+        refused!(tx, tx.create_node(name(b"new"), attributes(), when));
+        refused!(tx, tx.hard_link(name(b"alias"), file.inode, when));
+        refused!(tx, tx.symlink(name(b"link"), b"data", attributes(), when));
+        refused!(tx, tx.rename(name(b"data"), name(b"renamed"), when));
+        refused!(tx, tx.unlink_name(name(b"data"), when));
+        refused!(
+            tx,
+            tx.clone_range(
+                CloneRange {
+                    source: file,
+                    destination: file,
+                    source_offset: 0,
+                    destination_offset: 4096,
+                    length: contents.len() as u64,
+                },
+                when,
+                concurrency
+            )
+        );
+        let tx = writer.begin().await.unwrap();
+        let mut output = [0; 18];
+        assert_eq!(
+            tx.read_file(file, 0, &mut output).await.unwrap(),
+            contents.len()
+        );
+        assert_eq!(&output, contents);
+        tx.commit(|| panic!("unchanged transaction"), concurrency)
+            .await
+            .unwrap();
+        assert_eq!(writer.snapshot().unwrap().snapshot, base.snapshot);
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn owned_mutations_commit_as_one_generation() {
     use super::writer::Writer;
     use crate::transaction::namespace::{Attributes, Name};

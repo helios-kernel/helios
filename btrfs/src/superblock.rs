@@ -11,6 +11,8 @@ use crate::ondisk::{
     SYS_CHUNK_ARRAY_BYTES, view,
 };
 use crate::source::BlockSource;
+#[cfg(feature = "write")]
+use crate::tree::write::WriteError;
 
 /// Device offsets of the superblock copies: the primary, then the backups
 /// at 64 MiB and 256 GiB where the device is long enough to hold them.
@@ -208,6 +210,21 @@ impl Superblock {
             return Err(Error::LogReplayRequired {
                 log_root: self.log_root,
             });
+        }
+        Ok(())
+    }
+
+    /// COMPAT_RO explicitly permits readers that do not implement a feature,
+    /// but a writer must understand every set bit before changing the image.
+    #[cfg(feature = "write")]
+    pub(crate) fn check_writable(&self) -> Result<(), WriteError> {
+        // FREE_SPACE_TREE, FREE_SPACE_TREE_VALID and BLOCK_GROUP_TREE are
+        // maintained by the transaction's accounting and root catalogue.
+        let unsupported = self.compat_ro_flags & !((1 << 0) | (1 << 1) | (1 << 3));
+        if unsupported != 0 {
+            let bit = 1_u64 << unsupported.trailing_zeros();
+            let name = if bit == 1 << 2 { "verity" } else { "undefined" };
+            return Err(WriteError::UnsupportedCompatRo { name, bit });
         }
         Ok(())
     }

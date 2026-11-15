@@ -17,6 +17,10 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[error("read-write mount does not support compat-ro feature {name} ({bit:#x})")]
+    UnsupportedCompatRo { name: &'static str, bit: u64 },
+    #[error("subvolume {tree} is read-only")]
+    ReadOnlySubvolume { tree: u64 },
     #[error("clone offsets must be sector aligned and any partial sector must end both files")]
     CloneAlignment,
     #[error("clone source range extends beyond the file")]

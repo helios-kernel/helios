@@ -23,8 +23,10 @@ pub(crate) struct Writer<S> {
 
 impl<S: BlockSink> Writer<S> {
     pub(crate) async fn mount(source: S) -> Result<Self, WriteError> {
+        let current = Filesystem::mount(Arc::new(source)).await?;
+        current.superblock().check_writable()?;
         Ok(Self {
-            current: Some(Filesystem::mount(Arc::new(source)).await?),
+            current: Some(current),
             retirements: Retirements::default(),
         })
     }
@@ -103,6 +105,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         data: &[u8],
         options: WriteOptions<E>,
     ) -> Result<(Self, usize), WriteError> {
+        self.inner.roots.check_writable(file.tree)?;
         let written = self
             .inner
             .write_file(file.tree, file.inode, offset, data, options)
@@ -117,6 +120,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         when: Timestamp,
         concurrency: NonZeroUsize,
     ) -> Result<Self, WriteError> {
+        self.inner.roots.check_writable(file.tree)?;
         self.inner
             .truncate_file(file.tree, file.inode, size, when, concurrency)
             .await?;
@@ -129,6 +133,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         when: Timestamp,
         concurrency: NonZeroUsize,
     ) -> Result<Self, WriteError> {
+        self.inner.roots.check_writable(range.destination.tree)?;
         self.inner.clone_range(range, when, concurrency).await?;
         Ok(self)
     }
@@ -140,6 +145,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         modified: Option<Timestamp>,
         changed: Timestamp,
     ) -> Result<Self, WriteError> {
+        self.inner.roots.check_writable(file.tree)?;
         self.inner
             .set_times(file.tree, file.inode, access, modified, changed)
             .await?;
@@ -152,6 +158,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         attributes: Attributes,
         when: Timestamp,
     ) -> Result<(Self, FileId), WriteError> {
+        self.inner.roots.check_writable(name.tree)?;
         let inode = self.inner.create_node(name, attributes, when).await?;
         Ok((
             self,
@@ -168,6 +175,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         inode: u64,
         when: Timestamp,
     ) -> Result<Self, WriteError> {
+        self.inner.roots.check_writable(name.tree)?;
         self.inner.hard_link(name, inode, when).await?;
         Ok(self)
     }
@@ -179,6 +187,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         attributes: Attributes,
         when: Timestamp,
     ) -> Result<(Self, FileId), WriteError> {
+        self.inner.roots.check_writable(name.tree)?;
         let inode = self.inner.symlink(name, target, attributes, when).await?;
         Ok((
             self,
@@ -195,6 +204,8 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         destination: Name<'_>,
         when: Timestamp,
     ) -> Result<Self, WriteError> {
+        self.inner.roots.check_writable(source.tree)?;
+        self.inner.roots.check_writable(destination.tree)?;
         self.inner.rename(source, destination, when).await?;
         Ok(self)
     }
@@ -204,6 +215,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         name: Name<'_>,
         when: Timestamp,
     ) -> Result<Self, WriteError> {
+        self.inner.roots.check_writable(name.tree)?;
         self.inner.unlink_name(name, when).await?;
         Ok(self)
     }

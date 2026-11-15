@@ -133,6 +133,17 @@ impl Roots {
             .ok_or_else(|| Error::MissingRoot { tree }.into())
     }
 
+    #[cfg(feature = "write")]
+    pub(crate) fn check_writable(&self, tree: u64) -> Result<(), WriteError> {
+        let entry = self.entries.get(&tree).ok_or(Error::MissingRoot { tree })?;
+        let head = view::<RawRootItem>(&entry.bytes).expect("validated root item");
+        // BTRFS_ROOT_SUBVOL_RDONLY is bit zero of the root item's flags.
+        if head.flags.get() & 1 != 0 {
+            return Err(WriteError::ReadOnlySubvolume { tree });
+        }
+        Ok(())
+    }
+
     pub(crate) fn set(&mut self, root: TreeRoot) -> Result<(), WriteError> {
         self.entries
             .get_mut(&root.tree)
