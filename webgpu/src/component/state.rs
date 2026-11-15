@@ -14,17 +14,14 @@ struct Scope {
 
 pub struct ErrorSink {
     scopes: RefCell<Vec<Scope>>,
-    send: Sender<GpuError>,
-    events: Receiver<GpuError>,
+    subscribers: RefCell<Vec<Sender<GpuError>>>,
 }
 
 impl Default for ErrorSink {
     fn default() -> Self {
-        let (send, events) = async_channel::unbounded();
         Self {
             scopes: RefCell::new(Vec::new()),
-            send,
-            events,
+            subscribers: RefCell::new(Vec::new()),
         }
     }
 }
@@ -61,13 +58,18 @@ impl ErrorSink {
                 scope.first = Some(error);
             }
         } else {
-            // A dropped stream no longer observes uncaptured errors.
-            let _ = self.send.try_send(error);
+            // Each WIT stream observes the event independently. Closed readers
+            // are removed, and no subscriber means there is no event backlog.
+            self.subscribers
+                .borrow_mut()
+                .retain(|send| send.try_send(error.clone()).is_ok());
         }
     }
 
     pub fn events(&self) -> Receiver<GpuError> {
-        self.events.clone()
+        let (send, events) = async_channel::unbounded();
+        self.subscribers.borrow_mut().push(send);
+        events
     }
 }
 
@@ -145,6 +147,7 @@ mod tests {
     #[test]
     fn innermost_matching_scope_captures_only_the_first_error() {
         let errors = ErrorSink::default();
+        let events = errors.events();
         errors.push(GpuErrorKind::Validation);
         errors.push(GpuErrorKind::OutOfMemory);
         errors.report(error(GpuErrorKind::Validation, "first validation"));
@@ -152,19 +155,38 @@ mod tests {
         errors.report(error(GpuErrorKind::Internal, "uncaptured"));
         assert!(errors.pop().unwrap().is_none());
         assert_eq!(errors.pop().unwrap().unwrap().message, "first validation");
-        assert_eq!(errors.events().try_recv().unwrap().message, "uncaptured");
+        assert_eq!(events.try_recv().unwrap().message, "uncaptured");
         assert!(errors.pop().is_err());
     }
 
     #[test]
     fn a_full_inner_scope_does_not_spill_into_an_outer_scope() {
         let errors = ErrorSink::default();
+        let events = errors.events();
         errors.push(GpuErrorKind::Validation);
         errors.push(GpuErrorKind::Validation);
         errors.report(error(GpuErrorKind::Validation, "first"));
         errors.report(error(GpuErrorKind::Validation, "second"));
         assert_eq!(errors.pop().unwrap().unwrap().message, "first");
         assert!(errors.pop().unwrap().is_none());
-        assert!(errors.events().try_recv().is_err());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn uncaptured_events_broadcast_and_close_with_the_device_sink() {
+        let errors = ErrorSink::default();
+        errors.report(error(GpuErrorKind::Internal, "before subscription"));
+        let first = errors.events();
+        let second = errors.events();
+        assert!(first.try_recv().is_err());
+        errors.report(error(GpuErrorKind::Validation, "both"));
+        assert_eq!(first.try_recv().unwrap().message, "both");
+        assert_eq!(second.try_recv().unwrap().message, "both");
+        drop(first);
+        errors.report(error(GpuErrorKind::Internal, "remaining"));
+        assert_eq!(second.try_recv().unwrap().message, "remaining");
+        assert_eq!(errors.subscribers.borrow().len(), 1);
+        drop(errors);
+        assert!(second.is_closed());
     }
 }

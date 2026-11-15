@@ -25,6 +25,36 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn create_texture(&self, mut descriptor: wit::GpuTextureDescriptor) -> wit::GpuTexture {
+        let owner = &self.object.owner;
+        let native = resource::TextureDescriptor {
+            label: descriptor.label.as_deref().map(Into::into),
+            size: descriptor.size.convert(),
+            mip_level_count: descriptor.mip_level_count.unwrap_or(1),
+            sample_count: descriptor.sample_count.unwrap_or(1),
+            dimension: descriptor
+                .dimension
+                .unwrap_or(wit::GpuTextureDimension::D2)
+                .convert(),
+            format: descriptor.format.convert(),
+            usage: descriptor.usage.convert(),
+            view_formats: descriptor
+                .view_formats
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .map(Convert::convert)
+                .collect(),
+        };
+        let raw = owner.created(owner.device.raw.create_texture(&native));
+        // Core devices leave this compatibility-only texture property undefined.
+        descriptor.texture_binding_view_dimension = None;
+        wit::GpuTexture::new(Texture {
+            object: Object::new(owner.clone(), raw, descriptor.label.clone()),
+            descriptor,
+        })
+    }
     pub fn create_bind_group_layout(
         &self,
         descriptor: wit::GpuBindGroupLayoutDescriptor,

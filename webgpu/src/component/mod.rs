@@ -25,3 +25,7 @@ pub mod encoder;
 pub mod device;
 
 pub mod pipeline;
+
+pub mod capability;
+
+pub mod adapter;
