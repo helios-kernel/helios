@@ -1,0 +1,19 @@
+[package]
+name = "helios-webgpu"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+runtime = ["dep:ash", "dep:async-channel", "dep:helios-api", "dep:helios-venus", "dep:thiserror", "dep:wgpu", "dep:wgpu-hal"]
+
+[dependencies]
+ash = { version = "0.38.0", default-features = false, features = ["std"], optional = true }
+async-channel = { version = "2.5.0", default-features = false, features = ["std"], optional = true }
+helios-api = { path = "../api", default-features = false, features = ["gpu", "surface", "sync"], optional = true }
+helios-venus = { path = "../venus", default-features = false, features = ["helios", "driver"], optional = true }
+thiserror = { version = "2.0.21", default-features = false, optional = true }
+wgpu = { git = "https://github.com/lexoliu/wgpu", branch = "feat/helios-wasi-vulkan", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
+wgpu-hal = { git = "https://github.com/lexoliu/wgpu", branch = "feat/helios-wasi-vulkan", default-features = false, features = ["vulkan"], optional = true }
+
+[lints]
+workspace = true

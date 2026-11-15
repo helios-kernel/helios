@@ -14,11 +14,11 @@ pub enum Error {
     #[error("queue completion failed: {0}")]
     Timeline(#[from] helios_api::sync::TimelineError),
     #[error(transparent)]
-    WebGpu(#[from] wgpu_hal::InstanceError),
+    WebGpu(#[from] helios_webgpu::runtime::Error),
     #[error(transparent)]
-    WebGpuDevice(#[from] wgpu_hal::DeviceError),
-    #[error("wgpu found no usable Vulkan adapters through Venus")]
-    NoWebGpuAdapter,
+    WebGpuReported(helios_webgpu::runtime::GpuError),
+    #[error(transparent)]
+    WebGpuMap(#[from] helios_webgpu::wgpu::MapRangeError),
     #[error("the Venus instance has no physical devices")]
     NoPhysicalDevices,
     #[error("the Venus physical device has no compute queue")]
@@ -110,7 +110,7 @@ pub async fn run() -> Result<(), Error> {
         .await;
         instance.destroy_instance(None);
         result?;
-        webgpu::run()
+        webgpu::run().await
     }
 }
 

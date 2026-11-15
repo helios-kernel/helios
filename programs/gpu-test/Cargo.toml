@@ -13,7 +13,7 @@ ash = { version = "0.38.0", default-features = false, features = ["std"] }
 helios-venus = { path = "../../venus", default-features = false, features = ["helios", "driver"] }
 helios-api = { path = "../../api", default-features = false, features = ["gpu", "programs", "sync", "task"] }
 thiserror = { version = "2.0.20", default-features = false }
-wgpu-hal = { git = "https://github.com/lexoliu/wgpu", branch = "feat/helios-wasi-vulkan", default-features = false, features = ["vulkan"] }
+helios-webgpu = { path = "../../webgpu", default-features = false, features = ["runtime"] }
 
 [lib]
 name = "helios_gpu_test"

@@ -886,7 +886,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
- "unicode-width 0.2.2",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -2445,9 +2445,9 @@ dependencies = [
  "ash",
  "helios-api",
  "helios-venus",
+ "helios-webgpu",
  "naga 30.0.2",
  "thiserror 2.0.21",
- "wgpu-hal",
 ]
 
 [[package]]
@@ -2805,6 +2805,19 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "zerocopy",
+]
+
+[[package]]
+name = "helios-webgpu"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "async-channel",
+ "helios-api",
+ "helios-venus",
+ "thiserror 2.0.21",
+ "wgpu",
+ "wgpu-hal",
 ]
 
 [[package]]
@@ -3895,6 +3908,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "spirv",
  "thiserror 2.0.21",
+ "unicode-ident",
 ]
 
 [[package]]
@@ -4483,6 +4497,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4902,6 +4925,12 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "renderdoc-sys"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "resolv-conf"
@@ -6756,6 +6785,90 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu"
+version = "30.0.0"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+dependencies = [
+ "arrayvec",
+ "bitflags 2.13.1",
+ "bytemuck",
+ "cfg-if",
+ "cfg_aliases 0.2.2",
+ "document-features",
+ "hashbrown 0.17.1",
+ "js-sys",
+ "log",
+ "portable-atomic",
+ "profiling",
+ "raw-window-handle",
+ "smallvec",
+ "static_assertions",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu-core",
+ "wgpu-hal",
+ "wgpu-types",
+]
+
+[[package]]
+name = "wgpu-core"
+version = "30.0.0"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+dependencies = [
+ "arrayvec",
+ "bit-set 0.11.1",
+ "bit-vec 0.10.2",
+ "bitflags 2.13.1",
+ "bytemuck",
+ "cfg_aliases 0.2.2",
+ "document-features",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "log",
+ "naga 30.0.0",
+ "naga-types 30.0.0",
+ "once_cell",
+ "parking_lot",
+ "portable-atomic",
+ "profiling",
+ "raw-window-handle",
+ "rustc-hash 1.1.0",
+ "smallvec",
+ "thiserror 2.0.21",
+ "wgpu-core-deps-linux-android-bsd",
+ "wgpu-core-deps-wasm",
+ "wgpu-core-deps-windows",
+ "wgpu-hal",
+ "wgpu-naga-bridge",
+ "wgpu-types",
+]
+
+[[package]]
+name = "wgpu-core-deps-linux-android-bsd"
+version = "30.0.0"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+dependencies = [
+ "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-core-deps-wasm"
+version = "30.0.0"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+dependencies = [
+ "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-core-deps-windows"
+version = "30.0.0"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+dependencies = [
+ "wgpu-hal",
+]
+
+[[package]]
 name = "wgpu-hal"
 version = "30.0.0"
 source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
@@ -6776,9 +6889,12 @@ dependencies = [
  "naga-types 30.0.0",
  "ordered-float",
  "parking_lot",
+ "portable-atomic",
+ "portable-atomic-util",
  "profiling",
  "raw-window-handle",
  "raw-window-metal",
+ "renderdoc-sys",
  "smallvec",
  "static_assertions",
  "thiserror 2.0.21",
@@ -6804,11 +6920,13 @@ source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#e
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
+ "js-sys",
  "log",
  "macro_rules_attribute",
  "naga-types 30.0.0",
  "raw-window-handle",
  "static_assertions",
+ "web-sys",
 ]
 
 [[package]]

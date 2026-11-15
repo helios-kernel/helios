@@ -71,7 +71,7 @@ clippy-host:
     # venus-protocol inputs when it builds.
     cargo run -p helios-cli --quiet -- venus-protocol-fetch
     cargo clippy \
-        --workspace --all-targets \
+        --workspace --all-targets --features helios-webgpu/runtime \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
         --exclude helios-audio-test --exclude helios-compositor --exclude helios-cpu \
