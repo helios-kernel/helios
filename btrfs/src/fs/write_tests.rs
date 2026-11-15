@@ -88,7 +88,7 @@ async fn change_root_mode_with_retirements<S: crate::source::BlockSink>(
 
     let inode = fs.resolve(b"/").await?;
     let mut transaction =
-        Transaction::new(&fs.volume, fs.root_tree, &fs.generation, retirements).await?;
+        Transaction::new(&fs.volume, fs.snapshot.root_tree, &fs.snapshot, retirements).await?;
     let root = transaction.roots.get(objectid::FS_TREE)?;
     let key = Key::new(inode.number(), item_type::INODE_ITEM, 0);
     let bytes = transaction.trees.get(&fs.volume, root, key).await?.unwrap();
@@ -239,6 +239,139 @@ fn committed_transaction_passes_btrfs_check() {
 
 #[cfg(feature = "write")]
 #[test]
+fn old_inodes_read_their_own_extent_and_checksum_generation() {
+    use crate::accounting::DataChange;
+    use crate::allocation::data::DataReference;
+    use crate::ondisk::{RawFileExtentBody, RawFileExtentHead, item_type, view};
+    use crate::retirement::Retirements;
+    use crate::transaction::Transaction;
+    use zerocopy::IntoBytes;
+
+    block_on(async {
+        let before = vec![0x53; 32768];
+        let after = vec![0xa7; before.len()];
+        let timestamp = Timestamp::from_secs(1_700_000_000);
+        let tree = TreeBuilder::new()
+            .root(Metadata::new(0o755, timestamp))
+            .file("/data.bin", before.clone(), Metadata::new(0o644, timestamp));
+        let (fs, image) = filesystem_image_tree(true, true, tree);
+        let old_dir = fs.root().await.unwrap();
+        let old_file = fs.lookup(&old_dir, b"data.bin").await.unwrap().unwrap();
+        let mut retirements = Retirements::default();
+        let mut transaction = Transaction::new(
+            &fs.volume,
+            fs.snapshot.root_tree,
+            &fs.snapshot,
+            &mut retirements,
+        )
+        .await
+        .unwrap();
+        let root = old_file.root;
+        let key = Key::new(old_file.number(), item_type::EXTENT_DATA, 0);
+        let mut bytes = transaction
+            .trees
+            .get(&fs.volume, root, key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut head = *view::<RawFileExtentHead>(&bytes).unwrap();
+        let head_len = size_of::<RawFileExtentHead>();
+        let mut body = *view::<RawFileExtentBody>(&bytes[head_len..]).unwrap();
+        assert_eq!(head.extent_type, 1);
+        assert_eq!(head.compression, 0);
+        assert_eq!(body.offset.get(), 0);
+        assert_eq!(body.num_bytes.get(), before.len() as u64);
+        let old_data = Key::new(
+            body.disk_bytenr.get(),
+            item_type::EXTENT_ITEM,
+            body.disk_num_bytes.get(),
+        );
+        let reference = DataReference {
+            root: root.tree,
+            inode: old_file.number(),
+            offset: 0,
+        };
+        let concurrency = std::thread::available_parallelism().unwrap();
+        let allocation = transaction
+            .accounting
+            .stage_data(
+                &fs.volume,
+                &mut transaction.trees,
+                &mut transaction.space,
+                &after,
+                reference,
+                concurrency,
+            )
+            .await
+            .unwrap();
+        head.generation.set(transaction.trees.generation());
+        body.disk_bytenr.set(allocation.objectid);
+        body.disk_num_bytes.set(allocation.offset);
+        bytes[..head_len].copy_from_slice(head.as_bytes());
+        bytes[head_len..].copy_from_slice(body.as_bytes());
+        let root = transaction
+            .trees
+            .apply(&fs.volume, root, key, Some(&bytes), &mut transaction.space)
+            .await
+            .unwrap();
+        transaction.roots.set(root).unwrap();
+        transaction
+            .accounting
+            .update_data(
+                &fs.volume,
+                &mut transaction.trees,
+                &mut transaction.space,
+                DataChange {
+                    key: old_data,
+                    reference,
+                    delta: -1,
+                },
+            )
+            .await
+            .unwrap();
+        transaction
+            .commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        drop(fs);
+
+        let current = Filesystem::mount(Disk(image)).await.unwrap();
+        let new_file = current.resolve(b"/data.bin").await.unwrap();
+        let mut output = vec![0; after.len()];
+        assert_eq!(
+            current.read(&new_file, 0, &mut output).await.unwrap(),
+            after.len()
+        );
+        assert_eq!(output, after);
+        // The new checksum tree has removed the old allocation's checksums.
+        assert!(matches!(
+            current
+                .lookup_checksums(&current.snapshot, old_data.objectid, before.len())
+                .await,
+            Err(crate::Error::MissingDataChecksum { .. })
+        ));
+        assert_eq!(
+            current.read(&old_file, 0, &mut output).await.unwrap(),
+            before.len()
+        );
+        assert_eq!(output, before);
+        // Descendants opened through an old directory must retain that view too.
+        let from_old_dir = current
+            .lookup(&old_dir, b"data.bin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_old_dir, old_file);
+        assert_eq!(
+            current.read(&from_old_dir, 0, &mut output).await.unwrap(),
+            before.len()
+        );
+        assert_eq!(output, before);
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
     use crate::retirement::Retirements;
     use crate::space::Space;
@@ -275,15 +408,15 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
             .unwrap();
         drop(second);
         let current = Filesystem::mount(Disk(image)).await.unwrap();
-        let raw_space = Space::load(&current.volume, current.root_tree)
+        let raw_space = Space::load(&current.volume, current.snapshot.root_tree)
             .await
             .unwrap();
         let raw_free = raw_space.committed_free(&BTreeMap::new()).unwrap();
         {
             let mut transaction = Transaction::new(
                 &current.volume,
-                current.root_tree,
-                &current.generation,
+                current.snapshot.root_tree,
+                &current.snapshot,
                 &mut retirements,
             )
             .await
@@ -304,8 +437,8 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
         drop(clone);
         let mut transaction = Transaction::new(
             &current.volume,
-            current.root_tree,
-            &current.generation,
+            current.snapshot.root_tree,
+            &current.snapshot,
             &mut retirements,
         )
         .await
@@ -334,8 +467,8 @@ fn empty_transaction_does_not_publish() {
         .unwrap();
         crate::transaction::Transaction::new(
             &fs.volume,
-            fs.root_tree,
-            &fs.generation,
+            fs.snapshot.root_tree,
+            &fs.snapshot,
             &mut crate::retirement::Retirements::default(),
         )
         .await
@@ -447,8 +580,8 @@ fn transaction_publishes_roots_and_preserves_previous_generation() {
             assert!(matches!(
                 Transaction::new(
                     &fs.volume,
-                    fs.root_tree,
-                    &fs.generation,
+                    fs.snapshot.root_tree,
+                    &fs.snapshot,
                     &mut crate::retirement::Retirements::default()
                 )
                 .await,
@@ -463,7 +596,7 @@ fn transaction_publishes_roots_and_preserves_previous_generation() {
                 let disk = read_superblock_at(&mut image, offset).unwrap();
                 assert_eq!(disk.bytenr, offset);
                 assert_eq!(disk.generation, generation + 1);
-                assert_eq!(disk.root, mounted.root_tree.bytenr);
+                assert_eq!(disk.root, mounted.snapshot.root_tree.bytenr);
                 let backup = disk
                     .backup_roots
                     .iter()
@@ -472,7 +605,7 @@ fn transaction_publishes_roots_and_preserves_previous_generation() {
                 assert_eq!(backup.tree_root, disk.root);
                 assert_eq!(backup.fs_root, root.bytenr);
                 assert_eq!(backup.fs_root_gen, root.generation);
-                assert_eq!(backup.csum_root, mounted.csum_tree.bytenr);
+                assert_eq!(backup.csum_root, mounted.snapshot.csum_tree.bytenr);
                 assert_eq!(backup.bytes_used, disk.bytes_used);
                 assert_eq!(backup.total_bytes, disk.total_bytes);
             }
@@ -499,10 +632,10 @@ fn space_load_validates_formatted_file_data_references() {
             );
         let (fs, _) = filesystem_image_tree(true, true, tree);
         let inode = fs.resolve(b"/data.bin").await.unwrap();
-        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+        let mut space = crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)
             .await
             .unwrap();
-        let root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
+        let root = super::find_root(&fs.volume, fs.snapshot.root_tree, objectid::EXTENT_TREE)
             .await
             .unwrap()
             .root;
@@ -528,7 +661,7 @@ fn space_load_validates_formatted_file_data_references() {
         assert!(!allocations.is_empty());
         let (key, original) = allocations[0];
         assert!(key.offset > u64::from(fs.superblock().nodesize()));
-        let mut accounting = Accounting::new(&fs.volume, root, &space, fs.csum_tree)
+        let mut accounting = Accounting::new(&fs.volume, root, &space, fs.snapshot.csum_tree)
             .await
             .unwrap();
         let mut trees = Trees::new(
@@ -691,7 +824,7 @@ fn space_load_validates_formatted_file_data_references() {
         let checksum_key = crate::checksums::key(key.objectid);
         assert!(
             trees
-                .get(&fs.volume, fs.csum_tree, checksum_key)
+                .get(&fs.volume, fs.snapshot.csum_tree, checksum_key)
                 .await
                 .unwrap()
                 .is_some()
@@ -746,16 +879,18 @@ fn data_staging_writes_all_copies_without_publishing_roots() {
         use crate::ondisk::objectid;
 
         let (fs, image) = filesystem_image();
-        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+        let mut space = crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)
             .await
             .unwrap();
-        let extent_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
-            .await
-            .unwrap()
-            .root;
-        let mut accounting = Accounting::new(&fs.volume, extent_root, &space, fs.csum_tree)
-            .await
-            .unwrap();
+        let extent_root =
+            super::find_root(&fs.volume, fs.snapshot.root_tree, objectid::EXTENT_TREE)
+                .await
+                .unwrap()
+                .root;
+        let mut accounting =
+            Accounting::new(&fs.volume, extent_root, &space, fs.snapshot.csum_tree)
+                .await
+                .unwrap();
         let mut trees = Trees::new(
             fs.superblock().generation() + 1,
             fs.superblock().csum_type(),
@@ -844,14 +979,14 @@ fn private_data_allocations_register_cancel_and_reuse_their_full_ranges() {
 
         for (separate, free_tree) in [(true, true), (false, true), (false, false)] {
             let (fs, _) = filesystem_image_with_features(separate, free_tree);
-            let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+            let mut space = crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)
                 .await
                 .unwrap();
-            let root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
+            let root = super::find_root(&fs.volume, fs.snapshot.root_tree, objectid::EXTENT_TREE)
                 .await
                 .unwrap()
                 .root;
-            let mut accounting = Accounting::new(&fs.volume, root, &space, fs.csum_tree)
+            let mut accounting = Accounting::new(&fs.volume, root, &space, fs.snapshot.csum_tree)
                 .await
                 .unwrap();
             let mut trees = Trees::new(
@@ -998,16 +1133,18 @@ fn shared_tree_cow_converts_data_references_and_retires_only_the_last_owner() {
                 panic!("regular fixture extent")
             };
             let data_key = Key::new(disk_bytenr, item_type::EXTENT_ITEM, disk_num_bytes);
-            let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+            let mut space = crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)
                 .await
                 .unwrap();
-            let extent_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
-                .await
-                .unwrap()
-                .root;
-            let mut accounting = Accounting::new(&fs.volume, extent_root, &space, fs.csum_tree)
-                .await
-                .unwrap();
+            let extent_root =
+                super::find_root(&fs.volume, fs.snapshot.root_tree, objectid::EXTENT_TREE)
+                    .await
+                    .unwrap()
+                    .root;
+            let mut accounting =
+                Accounting::new(&fs.volume, extent_root, &space, fs.snapshot.csum_tree)
+                    .await
+                    .unwrap();
             let block = MetadataBlock {
                 address: original.bytenr,
                 level: original.level,
@@ -1123,7 +1260,11 @@ fn shared_tree_cow_converts_data_references_and_retires_only_the_last_owner() {
             );
             assert!(
                 trees
-                    .get(&fs.volume, fs.csum_tree, crate::checksums::key(disk_bytenr))
+                    .get(
+                        &fs.volume,
+                        fs.snapshot.csum_tree,
+                        crate::checksums::key(disk_bytenr)
+                    )
                     .await
                     .unwrap()
                     .is_some()
@@ -1138,14 +1279,16 @@ fn checksum_deletion_splits_items_preserves_neighbors_and_crosses_holes() {
     block_on(async {
         use crate::checksums::{Checksums, key};
         let fs = filesystem();
-        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+        let mut space = crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)
             .await
             .unwrap();
         let mut trees = Trees::new(
             fs.superblock().generation() + 1,
             fs.superblock().csum_type(),
         );
-        let mut checksums = Checksums { root: fs.csum_tree };
+        let mut checksums = Checksums {
+            root: fs.snapshot.csum_tree,
+        };
         let sector = u64::from(fs.superblock().sectorsize());
         let start = 16 << 20;
         let digests: Vec<_> = (0..20)
@@ -1259,7 +1402,7 @@ fn checksum_deletion_splits_items_preserves_neighbors_and_crosses_holes() {
         assert!(contents(&trees, checksums.root).is_empty());
         assert!(
             trees
-                .ceiling(&fs.volume, fs.csum_tree, key(0))
+                .ceiling(&fs.volume, fs.snapshot.csum_tree, key(0))
                 .await
                 .unwrap()
                 .is_none()
@@ -1273,14 +1416,16 @@ fn checksum_deletion_rejects_overlapping_or_partial_digest_items() {
         use crate::checksums::{Checksums, key};
         for overlap in [false, true] {
             let fs = filesystem();
-            let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+            let mut space = crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)
                 .await
                 .unwrap();
             let mut trees = Trees::new(
                 fs.superblock().generation() + 1,
                 fs.superblock().csum_type(),
             );
-            let mut checksums = Checksums { root: fs.csum_tree };
+            let mut checksums = Checksums {
+                root: fs.snapshot.csum_tree,
+            };
             let sector = u64::from(fs.superblock().sectorsize());
             let start = 16 << 20;
             let width = fs.superblock().csum_type().size();
@@ -1327,14 +1472,16 @@ fn checksum_writes_span_full_leaf_items() {
     block_on(async {
         use crate::checksums::Checksums;
         let fs = filesystem();
-        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+        let mut space = crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)
             .await
             .unwrap();
         let mut trees = Trees::new(
             fs.superblock().generation() + 1,
             fs.superblock().csum_type(),
         );
-        let mut checksums = Checksums { root: fs.csum_tree };
+        let mut checksums = Checksums {
+            root: fs.snapshot.csum_tree,
+        };
         let sector = fs.superblock().sectorsize() as usize;
         let algorithm = fs.superblock().csum_type();
         // Enough digests to fill a complete node before accounting for headers.
@@ -1368,12 +1515,17 @@ fn new_uuid_tree_supports_collisions_replacement_and_deletion() {
         use crate::uuid_tree::{UuidTree, key};
 
         let fs = filesystem();
-        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+        let mut space = crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)
             .await
             .unwrap();
-        let mut trees = Trees::new(fs.root_tree.generation + 1, ChecksumType::Crc32c);
+        let mut trees = Trees::new(fs.snapshot.root_tree.generation + 1, ChecksumType::Crc32c);
         let root = trees
-            .create(&fs.volume, fs.root_tree, objectid::UUID_TREE, &mut space)
+            .create(
+                &fs.volume,
+                fs.snapshot.root_tree,
+                objectid::UUID_TREE,
+                &mut space,
+            )
             .await
             .unwrap();
         assert!(contents(&trees, root).is_empty());
@@ -1674,10 +1826,12 @@ fn space_reservations_exclude_existing_extents_and_return_private_allocations() 
             },
         )
         .unwrap();
-        let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+        let mut space = Space::load(&fs.volume, fs.snapshot.root_tree)
+            .await
+            .unwrap();
         let free_root = super::find_root(
             &fs.volume,
-            fs.root_tree,
+            fs.snapshot.root_tree,
             crate::ondisk::objectid::FREE_SPACE_TREE,
         )
         .await
@@ -1756,7 +1910,7 @@ fn space_reservations_exclude_existing_extents_and_return_private_allocations() 
 #[test]
 fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
     let fs = filesystem();
-    let mut space = block_on(crate::space::Space::load(&fs.volume, fs.root_tree)).unwrap();
+    let mut space = block_on(crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)).unwrap();
     let available = space.available_metadata();
     let original = fs.default_subvolume.root;
     let mut root = original;
@@ -1846,20 +2000,24 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
 
     block_on(async {
         let fs = filesystem();
-        let original_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
-            .await
-            .unwrap()
-            .root;
+        let original_root =
+            super::find_root(&fs.volume, fs.snapshot.root_tree, objectid::EXTENT_TREE)
+                .await
+                .unwrap()
+                .root;
         let block = MetadataBlock {
             address: fs.default_subvolume.root.bytenr,
             level: fs.default_subvolume.root.level,
         };
         let size = u64::from(fs.superblock().nodesize());
         let mut trees = Trees::new(fs.superblock().generation() + 1, ChecksumType::Crc32c);
-        let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
-        let mut accounting = Accounting::new(&fs.volume, original_root, &space, fs.csum_tree)
+        let mut space = Space::load(&fs.volume, fs.snapshot.root_tree)
             .await
             .unwrap();
+        let mut accounting =
+            Accounting::new(&fs.volume, original_root, &space, fs.snapshot.csum_tree)
+                .await
+                .unwrap();
         let mut key = Key::new(
             block.address,
             item_type::METADATA_ITEM,
@@ -1876,7 +2034,7 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
                     .unwrap()
             }
         };
-        let parent = MetadataReference::parent(fs.root_tree.bytenr);
+        let parent = MetadataReference::parent(fs.snapshot.root_tree.bytenr);
         let parent_key = parent.key(block.address);
         accounting
             .add_metadata(&fs.volume, &mut trees, &mut space, block, parent)
@@ -1973,19 +2131,23 @@ fn metadata_registration_converges_across_extent_tree_growth_and_cancellation() 
     for (separate, free_tree) in [(false, true), (true, true), (false, false)] {
         block_on(async {
             let fs = filesystem_image_with_features(separate, free_tree).0;
-            let extent_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
+            let extent_root =
+                super::find_root(&fs.volume, fs.snapshot.root_tree, objectid::EXTENT_TREE)
+                    .await
+                    .unwrap()
+                    .root;
+            let mut space = Space::load(&fs.volume, fs.snapshot.root_tree)
                 .await
-                .unwrap()
-                .root;
-            let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+                .unwrap();
             let mut trees = Trees::new(
                 fs.superblock().generation() + 1,
                 fs.superblock().csum_type(),
             );
             let size = u64::from(fs.superblock().nodesize());
-            let mut accounting = Accounting::new(&fs.volume, extent_root, &space, fs.csum_tree)
-                .await
-                .unwrap();
+            let mut accounting =
+                Accounting::new(&fs.volume, extent_root, &space, fs.snapshot.csum_tree)
+                    .await
+                    .unwrap();
             assert_eq!(accounting.free_root().is_some(), free_tree);
             let mut root = fs.default_subvolume.root;
             // Full leaves force enough allocations to split the extent tree as its
@@ -2117,7 +2279,7 @@ fn cow_blocks_take_the_writing_tree_owner_from_a_shared_original() {
             ..original
         };
         let mut trees = Trees::new(original.generation + 1, fs.superblock().csum_type());
-        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+        let mut space = crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)
             .await
             .unwrap();
         let payload = vec![0x74; fs.superblock().nodesize() as usize - 101 - 25];
@@ -2251,13 +2413,17 @@ fn root_publication_preparation_converges_with_allocation_accounting() {
 
     block_on(async {
         let fs = filesystem();
-        let mut roots = Roots::load(&fs.volume, fs.root_tree).await.unwrap();
-        let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+        let mut roots = Roots::load(&fs.volume, fs.snapshot.root_tree)
+            .await
+            .unwrap();
+        let mut space = Space::load(&fs.volume, fs.snapshot.root_tree)
+            .await
+            .unwrap();
         let mut accounting = Accounting::new(
             &fs.volume,
             roots.get(objectid::EXTENT_TREE).unwrap(),
             &space,
-            fs.csum_tree,
+            fs.snapshot.csum_tree,
         )
         .await
         .unwrap();
@@ -2311,7 +2477,7 @@ fn root_publication_preparation_converges_with_allocation_accounting() {
             ] {
                 let cursor = crate::tree::Cursor::floor(
                     &fs.volume,
-                    fs.root_tree,
+                    fs.snapshot.root_tree,
                     Key::new(tree, crate::ondisk::item_type::ROOT_ITEM, u64::MAX),
                 )
                 .await
@@ -2339,7 +2505,10 @@ fn root_publication_preparation_converges_with_allocation_accounting() {
                     btrfs_disk::items::RootItem::parse(&original).unwrap().uuid
                 );
                 assert_eq!(
-                    trees.get(&fs.volume, fs.root_tree, key).await.unwrap(),
+                    trees
+                        .get(&fs.volume, fs.snapshot.root_tree, key)
+                        .await
+                        .unwrap(),
                     Some(original)
                 );
             }

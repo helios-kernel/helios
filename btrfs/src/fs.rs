@@ -1,6 +1,7 @@
 //! The mounted filesystem: inodes, directories, file data, symlinks and
 //! extended attributes.
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
@@ -18,7 +19,7 @@ use crate::ondisk::{MAX_COMPRESSED_EXTENT, NAME_MAX, SYMLINK_MAX, item_type, obj
 use crate::source::BlockSource;
 use crate::superblock::{self, Superblock};
 use crate::tree::{Cursor, TreeRoot};
-use crate::volume::Volume;
+use crate::volume::{Mapping, Volume};
 
 /// Most symlinks one path resolution follows, as Linux's `MAXSYMLINKS`.
 pub const MAX_SYMLINK_FOLLOWS: usize = 40;
@@ -43,19 +44,24 @@ const DATA_WINDOW: u64 = MAX_COMPRESSED_EXTENT;
 /// An [`Inode`] records the tree root of the commit it was read from, so
 /// operations on it see that commit's state whatever happens afterwards.
 pub struct Filesystem<S> {
-    #[cfg(feature = "write")]
-    generation: crate::retirement::Generation,
+    snapshot: Arc<Snapshot>,
     volume: Volume<S>,
+    default_subvolume: RootRecord,
+}
+
+/// Every tree and address translation needed to read a committed generation.
+/// Inodes retain this whole view, including its retirement pin.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub(crate) mapping: Arc<Mapping>,
     root_tree: TreeRoot,
     csum_tree: TreeRoot,
-    default_subvolume: RootRecord,
 }
 
 /// An inode, as of the commit it was read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inode {
-    #[cfg(feature = "write")]
-    generation: crate::retirement::Generation,
+    snapshot: Arc<Snapshot>,
     root: TreeRoot,
     number: u64,
     metadata: Metadata,
@@ -157,11 +163,12 @@ impl<S: BlockSource> Filesystem<S> {
         let default_tree = default_subvolume(&volume, root_tree).await?;
         let default_subvolume = find_root(&volume, root_tree, default_tree).await?;
         Ok(Self {
-            #[cfg(feature = "write")]
-            generation: crate::retirement::Generation::new(root_tree.generation),
+            snapshot: Arc::new(Snapshot {
+                mapping: volume.mapping(),
+                root_tree,
+                csum_tree,
+            }),
             volume,
-            root_tree,
-            csum_tree,
             default_subvolume,
         })
     }
@@ -182,7 +189,8 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(u64, u64),
     {
-        let mut cursor = Cursor::ceiling(&self.volume, self.root_tree, Key::new(0, 0, 0)).await?;
+        let mut cursor =
+            Cursor::ceiling(&self.volume, self.snapshot.root_tree, Key::new(0, 0, 0)).await?;
         let mut previous: Option<(u64, u64)> = None;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if key.item_type == item_type::ROOT_ITEM
@@ -191,7 +199,7 @@ impl<S: BlockSource> Filesystem<S> {
             {
                 let record = RootRecord::parse(key, item, self.volume.superblock().sectorsize())
                     .map_err(|defect| Error::Item {
-                        tree: self.root_tree.tree,
+                        tree: self.snapshot.root_tree.tree,
                         key,
                         defect,
                     })?;
@@ -215,19 +223,27 @@ impl<S: BlockSource> Filesystem<S> {
         self.load_inode(
             self.default_subvolume.root,
             self.default_subvolume.root_dirid,
+            &self.snapshot,
         )
         .await
     }
 
     /// The root directory of subvolume `tree`.
     pub async fn subvolume_root(&self, tree: u64) -> Result<Inode, Error> {
-        let record = find_root(&self.volume, self.root_tree, tree).await?;
-        self.load_inode(record.root, record.root_dirid).await
+        let record = find_root(&self.volume, self.snapshot.root_tree, tree).await?;
+        self.load_inode(record.root, record.root_dirid, &self.snapshot)
+            .await
     }
 
-    async fn load_inode(&self, root: TreeRoot, number: u64) -> Result<Inode, Error> {
+    async fn load_inode(
+        &self,
+        root: TreeRoot,
+        number: u64,
+        snapshot: &Arc<Snapshot>,
+    ) -> Result<Inode, Error> {
+        let volume = self.volume.view(&snapshot.mapping);
         let key = Key::new(number, item_type::INODE_ITEM, 0);
-        let cursor = Cursor::ceiling(&self.volume, root, key).await?;
+        let cursor = Cursor::ceiling(&volume, root, key).await?;
         let (Some(found), Some(item)) = (cursor.key(), cursor.item()) else {
             return Err(Error::MissingInode {
                 tree: root.tree,
@@ -246,8 +262,7 @@ impl<S: BlockSource> Filesystem<S> {
             defect,
         })?;
         Ok(Inode {
-            #[cfg(feature = "write")]
-            generation: self.generation.clone(),
+            snapshot: snapshot.clone(),
             root,
             number,
             metadata,
@@ -256,8 +271,13 @@ impl<S: BlockSource> Filesystem<S> {
 
     async fn open_target(&self, dir: &Inode, target: EntryTarget) -> Result<Inode, Error> {
         match target {
-            EntryTarget::Inode(number) => self.load_inode(dir.root, number).await,
-            EntryTarget::Subvolume(tree) => self.subvolume_root(tree).await,
+            EntryTarget::Inode(number) => self.load_inode(dir.root, number, &dir.snapshot).await,
+            EntryTarget::Subvolume(tree) => {
+                let volume = self.volume.view(&dir.snapshot.mapping);
+                let record = find_root(&volume, dir.snapshot.root_tree, tree).await?;
+                self.load_inode(record.root, record.root_dirid, &dir.snapshot)
+                    .await
+            }
         }
     }
 
@@ -269,13 +289,14 @@ impl<S: BlockSource> Filesystem<S> {
     /// Looks `name` up in directory `dir`. `None` when no entry has that
     /// name; `.` and `..` are not stored and are never found.
     pub async fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Option<Inode>, Error> {
+        let volume = self.volume.view(&dir.snapshot.mapping);
         dir.expect_kind(FileKind::Directory)?;
         if name.is_empty() || name.len() > NAME_MAX {
             return Ok(None);
         }
         let key = Key::new(dir.number, item_type::DIR_ITEM, name_hash(name));
         let target = {
-            let cursor = Cursor::ceiling(&self.volume, dir.root, key).await?;
+            let cursor = Cursor::ceiling(&volume, dir.root, key).await?;
             find_record(&cursor, key, name, RecordKind::Entry)?.map(|record| record.target())
         };
         match target {
@@ -299,9 +320,10 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(DirEntry<'_>) -> ControlFlow<()>,
     {
+        let volume = self.volume.view(&dir.snapshot.mapping);
         dir.expect_kind(FileKind::Directory)?;
         let start = Key::new(dir.number, item_type::DIR_INDEX, from.0);
-        let mut cursor = Cursor::ceiling(&self.volume, dir.root, start).await?;
+        let mut cursor = Cursor::ceiling(&volume, dir.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if !key.is(dir.number, item_type::DIR_INDEX) {
                 break;
@@ -320,7 +342,7 @@ impl<S: BlockSource> Filesystem<S> {
             if visit(entry).is_break() {
                 return Ok(Some(DirPosition(key.offset)));
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&volume).await?;
         }
         Ok(None)
     }
@@ -359,11 +381,12 @@ impl<S: BlockSource> Filesystem<S> {
         name: &[u8],
         buf: &mut [u8],
     ) -> Result<Option<usize>, Error> {
+        let volume = self.volume.view(&inode.snapshot.mapping);
         if name.is_empty() || name.len() > NAME_MAX {
             return Ok(None);
         }
         let key = Key::new(inode.number, item_type::XATTR_ITEM, name_hash(name));
-        let cursor = Cursor::ceiling(&self.volume, inode.root, key).await?;
+        let cursor = Cursor::ceiling(&volume, inode.root, key).await?;
         let Some(record) = find_record(&cursor, key, name, RecordKind::Xattr)? else {
             return Ok(None);
         };
@@ -378,8 +401,9 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(&[u8]) -> ControlFlow<()>,
     {
+        let volume = self.volume.view(&inode.snapshot.mapping);
         let start = Key::new(inode.number, item_type::XATTR_ITEM, 0);
-        let mut cursor = Cursor::ceiling(&self.volume, inode.root, start).await?;
+        let mut cursor = Cursor::ceiling(&volume, inode.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if !key.is(inode.number, item_type::XATTR_ITEM) {
                 break;
@@ -394,7 +418,7 @@ impl<S: BlockSource> Filesystem<S> {
                     return Ok(());
                 }
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&volume).await?;
         }
         Ok(())
     }
@@ -471,6 +495,7 @@ impl<S: BlockSource> Filesystem<S> {
 
     /// The file bytes at `offset`, through the inode's extents.
     async fn read_range(&self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        let volume = self.volume.view(&inode.snapshot.mapping);
         let size = inode.metadata.size;
         if offset >= size || buf.is_empty() {
             return Ok(0);
@@ -480,7 +505,7 @@ impl<S: BlockSource> Filesystem<S> {
         let end = offset + len as u64;
         let first_extent = Key::new(inode.number, item_type::EXTENT_DATA, 0);
         let mut cursor = Cursor::floor(
-            &self.volume,
+            &volume,
             inode.root,
             Key::new(inode.number, item_type::EXTENT_DATA, offset),
         )
@@ -492,7 +517,7 @@ impl<S: BlockSource> Filesystem<S> {
                 break;
             };
             if key < first_extent {
-                cursor.advance(&self.volume).await?;
+                cursor.advance(&volume).await?;
                 continue;
             }
             if !key.is(inode.number, item_type::EXTENT_DATA) {
@@ -503,8 +528,8 @@ impl<S: BlockSource> Filesystem<S> {
                 key,
                 defect,
             };
-            let extent =
-                FileExtent::parse(key, item, self.superblock().sectorsize()).map_err(item_error)?;
+            let extent = FileExtent::parse(key, item, volume.superblock().sectorsize())
+                .map_err(item_error)?;
             if extent.start < previous_end {
                 return Err(item_error(ItemDefect::ExtentOverlap(previous_end)));
             }
@@ -524,7 +549,7 @@ impl<S: BlockSource> Filesystem<S> {
                     position = copy_end;
                 }
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&volume).await?;
         }
         // Past the last extent the file reads as zeroes up to its size.
         buf[(position - offset) as usize..].fill(0);
@@ -540,7 +565,7 @@ impl<S: BlockSource> Filesystem<S> {
         from: u64,
         out: &mut [u8],
     ) -> Result<(), Error> {
-        let sectorsize = self.superblock().sectorsize() as usize;
+        let sectorsize = inode.snapshot.mapping.superblock.sectorsize() as usize;
         let decompress_error = |algorithm, defect| Error::Decompress {
             algorithm,
             tree: inode.root.tree,
@@ -574,8 +599,13 @@ impl<S: BlockSource> Filesystem<S> {
                 compression: None,
                 ..
             } => {
-                self.read_data(disk_bytenr + offset + from, out, inode.is_checksummed())
-                    .await?;
+                self.read_data(
+                    &inode.snapshot,
+                    disk_bytenr + offset + from,
+                    out,
+                    inode.is_checksummed(),
+                )
+                .await?;
             }
             ExtentData::Regular {
                 disk_bytenr,
@@ -586,8 +616,13 @@ impl<S: BlockSource> Filesystem<S> {
             } => {
                 // Both sizes were bounded by 128 KiB in `FileExtent::parse`.
                 let mut stored = vec![0_u8; disk_num_bytes as usize];
-                self.read_sectors(disk_bytenr, &mut stored, inode.is_checksummed())
-                    .await?;
+                self.read_sectors(
+                    &inode.snapshot,
+                    disk_bytenr,
+                    &mut stored,
+                    inode.is_checksummed(),
+                )
+                .await?;
                 let mut plain = vec![0_u8; ram_bytes as usize];
                 decompress(algorithm, &stored, &mut plain, sectorsize)
                     .map_err(|defect| decompress_error(algorithm, defect))?;
@@ -602,11 +637,12 @@ impl<S: BlockSource> Filesystem<S> {
     /// windows of at most [`DATA_WINDOW`] bytes.
     async fn read_data(
         &self,
+        snapshot: &Arc<Snapshot>,
         logical: u64,
         out: &mut [u8],
         checksummed: bool,
     ) -> Result<(), Error> {
-        let sector = u64::from(self.superblock().sectorsize());
+        let sector = u64::from(snapshot.mapping.superblock.sectorsize());
         let mut window = Vec::new();
         let mut done = 0;
         while done < out.len() {
@@ -617,7 +653,7 @@ impl<S: BlockSource> Filesystem<S> {
                 .next_multiple_of(sector)
                 .min(window_start + DATA_WINDOW);
             window.resize((window_end - window_start) as usize, 0);
-            self.read_sectors(window_start, &mut window, checksummed)
+            self.read_sectors(snapshot, window_start, &mut window, checksummed)
                 .await?;
             let skip = (at - window_start) as usize;
             let count = (window.len() - skip).min(out.len() - done);
@@ -632,18 +668,20 @@ impl<S: BlockSource> Filesystem<S> {
     /// `dup` chunk when one fails.
     async fn read_sectors(
         &self,
+        snapshot: &Arc<Snapshot>,
         logical: u64,
         buf: &mut [u8],
         checksummed: bool,
     ) -> Result<(), Error> {
-        let sector = self.superblock().sectorsize() as usize;
-        let csum_type = self.superblock().csum_type();
+        let volume = self.volume.view(&snapshot.mapping);
+        let sector = snapshot.mapping.superblock.sectorsize() as usize;
+        let csum_type = snapshot.mapping.superblock.csum_type();
         let expected = if checksummed {
-            Some(self.lookup_checksums(logical, buf.len()).await?)
+            Some(self.lookup_checksums(snapshot, logical, buf.len()).await?)
         } else {
             None
         };
-        self.volume
+        volume
             .read_verified(logical, buf, |data| {
                 let Some(expected) = &expected else {
                     return Ok(());
@@ -667,16 +705,22 @@ impl<S: BlockSource> Filesystem<S> {
 
     /// The stored checksum of every sector of `[logical, logical + len)`,
     /// concatenated.
-    async fn lookup_checksums(&self, logical: u64, len: usize) -> Result<Vec<u8>, Error> {
-        let sector = u64::from(self.superblock().sectorsize());
-        let size = self.superblock().csum_type().size();
+    async fn lookup_checksums(
+        &self,
+        snapshot: &Arc<Snapshot>,
+        logical: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let volume = self.volume.view(&snapshot.mapping);
+        let sector = u64::from(snapshot.mapping.superblock.sectorsize());
+        let size = snapshot.mapping.superblock.csum_type().size();
         let sectors = len / sector as usize;
         let mut sums = vec![0_u8; sectors * size];
         let mut filled = 0;
         let first = Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, 0);
         let mut cursor = Cursor::floor(
-            &self.volume,
-            self.csum_tree,
+            &volume,
+            snapshot.csum_tree,
             Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, logical),
         )
         .await?;
@@ -685,7 +729,7 @@ impl<S: BlockSource> Filesystem<S> {
                 break;
             };
             if key < first {
-                cursor.advance(&self.volume).await?;
+                cursor.advance(&volume).await?;
                 continue;
             }
             if !key.is(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM) {
@@ -712,7 +756,7 @@ impl<S: BlockSource> Filesystem<S> {
                 .ok_or(item_error(ItemDefect::ExtentOverflow))?;
             let wanted = logical + filled as u64 * sector;
             if item_end <= wanted {
-                cursor.advance(&self.volume).await?;
+                cursor.advance(&volume).await?;
                 continue;
             }
             if key.offset > wanted {
@@ -723,7 +767,7 @@ impl<S: BlockSource> Filesystem<S> {
             sums[filled * size..(filled + count) * size]
                 .copy_from_slice(&item[skip * size..(skip + count) * size]);
             filled += count;
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&volume).await?;
         }
         if filled < sectors {
             return Err(Error::MissingDataChecksum {

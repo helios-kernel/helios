@@ -315,7 +315,7 @@ pub(crate) struct RawDirItem {
 
 /// The head of `btrfs_file_extent_item` every extent type carries. An
 /// inline extent's data follows it directly.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawFileExtentHead {
     pub(crate) generation: U64,
@@ -328,7 +328,7 @@ pub(crate) struct RawFileExtentHead {
 
 /// The tail of `btrfs_file_extent_item` a regular or preallocated extent
 /// carries after [`RawFileExtentHead`].
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawFileExtentBody {
     pub(crate) disk_bytenr: U64,

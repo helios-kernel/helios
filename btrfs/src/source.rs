@@ -41,6 +41,16 @@ pub trait BlockSource: Send + Sync {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> impl Future<Output = IoResult<()>> + Send;
 }
 
+impl<S: BlockSource> BlockSource for &S {
+    fn size_bytes(&self) -> u64 {
+        S::size_bytes(self)
+    }
+
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+        S::read_at(self, offset, buf).await
+    }
+}
+
 /// Writable storage for copy-on-write transactions.
 ///
 /// # Concurrency

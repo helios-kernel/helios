@@ -9,8 +9,9 @@ use futures::{
 
 use crate::accounting::Accounting;
 use crate::commit::CommitImage;
+use crate::fs::Snapshot;
 use crate::ondisk::objectid;
-use crate::retirement::{Generation, Retirements};
+use crate::retirement::Retirements;
 use crate::roots::Roots;
 use crate::source::BlockSink;
 use crate::space::Space;
@@ -19,9 +20,10 @@ use crate::tree::{
     write::{Trees, WriteError},
 };
 use crate::volume::Volume;
+use alloc::sync::Arc;
 
 pub(crate) struct Transaction<'a, S> {
-    generation: &'a Generation,
+    generation: &'a Arc<Snapshot>,
     retirements: &'a mut Retirements,
     volume: &'a Volume<S>,
     image: CommitImage,
@@ -35,7 +37,7 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
     pub(crate) async fn new(
         volume: &'a Volume<S>,
         root: TreeRoot,
-        pin: &'a Generation,
+        pin: &'a Arc<Snapshot>,
         retirements: &'a mut Retirements,
     ) -> Result<Self, WriteError> {
         let image = volume.commit_image().await?;

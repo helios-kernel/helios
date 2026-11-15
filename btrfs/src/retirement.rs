@@ -6,16 +6,8 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use crate::fs::Snapshot;
 use crate::space::Space;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Generation(Arc<u64>);
-
-impl Generation {
-    pub(crate) fn new(generation: u64) -> Self {
-        Self(Arc::new(generation))
-    }
-}
 
 struct Retired {
     generation: u64,
@@ -24,14 +16,14 @@ struct Retired {
 
 #[derive(Default)]
 pub(crate) struct Retirements {
-    readers: Vec<Weak<u64>>,
+    readers: Vec<Weak<Snapshot>>,
     retired: Vec<Retired>,
 }
 
 impl Retirements {
-    pub(crate) fn protect(&mut self, generation: &Generation, space: &mut Space) {
+    pub(crate) fn protect(&mut self, generation: &Arc<Snapshot>, space: &mut Space) {
         self.readers.retain(|pin| pin.strong_count() != 0);
-        let pin = Arc::downgrade(&generation.0);
+        let pin = Arc::downgrade(generation);
         if !self.readers.iter().any(|reader| reader.ptr_eq(&pin)) {
             self.readers.push(pin);
         }
@@ -41,7 +33,7 @@ impl Retirements {
             .readers
             .iter()
             .filter_map(Weak::upgrade)
-            .map(|pin| *pin)
+            .map(|pin| pin.mapping.superblock.generation())
             .min()
             .expect("current transaction pins a generation");
         self.retired.retain(|retired| retired.generation >= oldest);
@@ -52,10 +44,10 @@ impl Retirements {
         }
     }
 
-    pub(crate) fn record(&mut self, generation: &Generation, extents: BTreeMap<u64, u64>) {
+    pub(crate) fn record(&mut self, generation: &Arc<Snapshot>, extents: BTreeMap<u64, u64>) {
         if !extents.is_empty() {
             self.retired.push(Retired {
-                generation: *generation.0,
+                generation: generation.mapping.superblock.generation(),
                 extents,
             });
         }

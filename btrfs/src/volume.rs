@@ -5,6 +5,13 @@ use crate::chunk::ChunkMap;
 use crate::error::Error;
 use crate::source::BlockSource;
 use crate::superblock::Superblock;
+use alloc::sync::Arc;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Mapping {
+    pub(crate) superblock: Superblock,
+    chunks: ChunkMap,
+}
 
 /// A mounted device's address space.
 ///
@@ -12,31 +19,41 @@ use crate::superblock::Superblock;
 /// run on any number of processors at once.
 pub(crate) struct Volume<S> {
     source: S,
-    superblock: Superblock,
-    chunks: ChunkMap,
+    mapping: Arc<Mapping>,
 }
 
 impl<S: BlockSource> Volume<S> {
     pub(crate) fn new(source: S, superblock: Superblock, chunks: ChunkMap) -> Self {
         Self {
             source,
-            superblock,
-            chunks,
+            mapping: Arc::new(Mapping { superblock, chunks }),
         }
     }
 
     pub(crate) fn superblock(&self) -> &Superblock {
-        &self.superblock
+        &self.mapping.superblock
     }
 
     pub(crate) fn chunks(&self) -> &ChunkMap {
-        &self.chunks
+        &self.mapping.chunks
     }
 
     /// Swaps in the chunk map read from the chunk tree, returning the
     /// bootstrap map it was read through.
     pub(crate) fn replace_chunks(&mut self, chunks: ChunkMap) -> ChunkMap {
-        core::mem::replace(&mut self.chunks, chunks)
+        let mapping = Arc::get_mut(&mut self.mapping).expect("bootstrap mapping is not published");
+        core::mem::replace(&mut mapping.chunks, chunks)
+    }
+
+    pub(crate) fn mapping(&self) -> Arc<Mapping> {
+        self.mapping.clone()
+    }
+
+    pub(crate) fn view(&self, mapping: &Arc<Mapping>) -> Volume<&S> {
+        Volume {
+            source: &self.source,
+            mapping: mapping.clone(),
+        }
     }
 
     /// Reads `buf.len()` bytes at `logical` into `buf` and runs `check`
@@ -51,7 +68,7 @@ impl<S: BlockSource> Volume<S> {
         buf: &mut [u8],
         check: impl Fn(&[u8]) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let copies = self.chunks.map(logical, buf.len() as u64)?;
+        let copies = self.chunks().map(logical, buf.len() as u64)?;
         let mut first_error = None;
         for physical in copies {
             let outcome = match self.source.read_at(physical, buf).await {
@@ -82,7 +99,7 @@ impl<S: crate::source::BlockSink> Volume<S> {
         &self,
     ) -> Result<crate::commit::CommitImage, crate::tree::write::WriteError> {
         let selected = crate::superblock::select(&self.source).await?;
-        if selected.superblock != self.superblock {
+        if selected.superblock != *self.superblock() {
             return Err(crate::tree::write::WriteError::StaleSnapshot);
         }
         Ok(crate::commit::CommitImage {
@@ -108,7 +125,7 @@ impl<S: crate::source::BlockSink> Volume<S> {
             self.source
                 .commit(
                     offset / READ_ALIGNMENT,
-                    image.at(offset, self.superblock.csum_type()),
+                    image.at(offset, self.superblock().csum_type()),
                 )
                 .await
                 .map_err(|source| Error::Io {
@@ -141,7 +158,7 @@ impl<S: crate::source::BlockSink> Volume<S> {
                 bytes: bytes.len(),
             });
         }
-        let copies = self.chunks.map(logical, bytes.len() as u64)?;
+        let copies = self.chunks().map(logical, bytes.len() as u64)?;
         let requests = copies.into_iter().flat_map(|physical| {
             bytes
                 .as_chunks::<{ READ_ALIGNMENT as usize }>()
