@@ -36,6 +36,7 @@
 
 extern crate alloc;
 
+mod btrfs;
 mod erofs;
 mod host;
 mod memory;
@@ -43,6 +44,7 @@ mod request;
 mod root;
 mod storage;
 
+pub use btrfs::BtrfsFs;
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
 pub use memory::{MemoryFs, MemoryWrite};
@@ -327,6 +329,8 @@ mount_kinds! {
     Host(HostShare<S::HostShare>),
     /// An EROFS image on a mount-source disk, read-only.
     Erofs(ErofsFs<S::Disk>),
+    /// A btrfs image on a mount-source disk, read-only.
+    Btrfs(BtrfsFs<S::Disk>),
 }
 
 /// Why a mount or unmount was refused.
@@ -964,6 +968,7 @@ impl<'a, S: Storage> Resolved<'a, S> {
             MountedFs::Memory(fs) => read_all(fs, path).await.map(FileContents::Written),
             MountedFs::Host(fs) => read_all(fs, path).await.map(FileContents::Written),
             MountedFs::Erofs(fs) => read_all(fs, path).await.map(FileContents::Written),
+            MountedFs::Btrfs(fs) => read_all(fs, path).await.map(FileContents::Written),
         }
     }
 }

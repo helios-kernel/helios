@@ -18,7 +18,7 @@ never depends on anything above it.
 | Layer | Crates | Contents |
 | --- | --- | --- |
 | Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
-| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/`, `firmware/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; `firmware/` turns the platform description a backend hands it (the device tree's NUMA properties, the ACPI SRAT and SLIT) into `hal/` values; all five depend on `hal/` and none on the kernel. |
+| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/`, `firmware/`, `btrfs/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; `firmware/` turns the platform description a backend hands it (the device tree's NUMA properties, the ACPI SRAT and SLIT) into `hal/` values; all six depend on `hal/` and none on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
 | Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
@@ -426,9 +426,9 @@ does.
 ## 7. Checks and CI
 
 Before a change is complete, run the recipes for every surface it can
-affect. `just check-target` and `just test-units` run `helios-cli
-kernel-prebuild` themselves and export the trusted-root public key file it
-writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY`, the only prebuild output the
+affect. Compile and lint recipes run `helios-cli kernel-keys`; tests that
+read a boot payload run `helios-cli kernel-prebuild`. They export the
+trusted-root public key file as `HELIOS_KERNEL_ROOT_PUBLIC_KEY`, the only prebuild output the
 kernel build tracks; a recipe that compiles the kernel's tests also exports
 `HELIOS_KERNEL_ROOT_SECRET_KEY`, which only a test build reads and no
 kernel image is given (the inspector's image build searches every image
@@ -454,7 +454,7 @@ just test-units
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
 `just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `firmware`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
+`inspector-protocol` and `workspace-root` unit tests, every `btrfs` and `hosted` test,
 and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
 in the same change or it never runs.
@@ -469,23 +469,27 @@ red lane names the surface that broke:
 | --- | --- | --- |
 | `check-host` | `ubuntu-24.04` | The host surfaces compile. |
 | `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
-| `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
+| `test-kernel`, `test-libraries`, `test-host-tools`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests, the btrfs reader against `mkfs.btrfs` images, and the embedded debugger. |
 | `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot on one node and on two NUMA nodes, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures; under `swtpm`, the kernel's signing key kept across two boots, resealed after a changed payload, and a tampered payload refused. |
 | `smoke-x86-64-venus` | `ubuntu-24.04`, `--accel kvm` | `gpu-test` on a Venus `virtio-gpu-gl` device rendered through lavapipe: a virgl context's fence, host and guest blobs, two instances at once. It runs only on changes to the 3D path, against a pinned QEMU and virglrenderer it builds and caches. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, a two-node NUMA boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
 | `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, each on one node and on two NUMA nodes; under `swtpm`, the kernel's signing key kept across two ACPI boots, resealed after a changed payload, changed state detected across device-tree boots, and a tampered payload refused. Runs against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
 | `bench-x86-64-linux` | `ubuntu-24.04`, `--accel kvm`, multi-queue tap | The workload benchmarks of §3.6, with the negotiated virtio-net features reported. |
 
-The bench lane is the exception: it lives in `bench-lane.yml` and runs
-nightly against `dev` and on `workflow_dispatch` for any ref, never on a
-pull request, because one unpaired run is no performance evidence (§3.6)
-and the lane is the heaviest job there is. A failed nightly run files a
-`bench`/`bug` issue, or comments on the one already open.
+All smoke suites, the benchmark lanes and kernel-profile collection run
+nightly and on demand. They retain their full coverage outside the review
+loop. A nightly failure opens or reopens its suite's issue and records the
+failed run. Release-triggered benchmarks also remain enabled.
 
-A pull request runs only the lanes whose surfaces its change touches
+A pull request runs only non-heavy lanes whose surfaces its change touches
 (`.github/ci-lanes.json`), and a draft runs `lint-fmt` alone until it is
-marked ready for review. Only the host lanes keep a Rust cache, and only
-a `dev` push writes it.
+marked ready for review. Compile, lint and test lanes keep a Rust cache,
+written only by a `dev` push. Other shared caches are written only from
+the default branch. Guest wasm is built once per profile and reused by
+every test and smoke lane that runs a kernel prebuild. Consumers start
+only after their wasm profile is ready; compile and lint remain independent.
+The CI result job requires every selected lane to succeed. Every job run by
+a pull request or dev push has a 15-minute timeout.
 
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI
@@ -498,9 +502,8 @@ reason that says why the lint is wrong there. `clippy::manual_async_fn` is
 the gate for §3.2's `async fn` rule.
 
 `dep-check.yml` runs on a schedule and on demand. `kernel-profile.yml`
-collects the x86-64 kernel profile every release build spends, on every
-push to `dev` that touches the kernel image's inputs, on demand and
-monthly (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
+collects the x86-64 kernel profile every release build spends, nightly and
+on demand (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
 calls it. `release.yml` runs `release-plz` on every push to `main`: it
 owns version numbers, the changelog and tags, so commits follow the
 conventional format (`feat:`, `fix:`, `feat!:`, `BREAKING CHANGE:`) and
