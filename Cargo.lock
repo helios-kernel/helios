@@ -886,7 +886,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -3890,7 +3890,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "naga"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "arrayvec",
  "bit-set 0.11.1",
@@ -3941,7 +3941,7 @@ dependencies = [
 [[package]]
 name = "naga-types"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
@@ -6788,7 +6788,7 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.1",
@@ -6815,7 +6815,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "arrayvec",
  "bit-set 0.11.1",
@@ -6848,7 +6848,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-linux-android-bsd"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "wgpu-hal",
 ]
@@ -6856,7 +6856,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-wasm"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "wgpu-hal",
 ]
@@ -6864,7 +6864,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "wgpu-hal",
 ]
@@ -6872,7 +6872,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -6908,7 +6908,7 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "naga 30.0.0",
  "wgpu-types",
@@ -6917,7 +6917,7 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "30.0.0"
-source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#ee5784e608c4936fa73ce98a547fbbd2b50ee26b"
+source = "git+https://github.com/lexoliu/wgpu?branch=feat%2Fhelios-wasi-vulkan#c342cae44d99459ef09302877c655dc66bc480f3"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
