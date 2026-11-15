@@ -13,8 +13,13 @@
 //! pointers, array lengths and `pNext` chains describe live memory.
 
 pub mod capset;
+pub mod connection;
 pub mod ring;
 pub mod runtime;
+pub mod transport;
+
+#[cfg(feature = "helios")]
+pub mod helios;
 
 pub use runtime::*;
 

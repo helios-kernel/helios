@@ -27,6 +27,13 @@
 //! blob create naming the same id.
 
 use std::env;
+use std::num::NonZeroU32;
+use std::time::Duration;
+
+use helios_venus::connection::Connection as VenusConnection;
+use helios_venus::helios::Context as VenusContext;
+use helios_venus::protocol::{VK_SUCCESS, vn_call_vkEnumerateInstanceVersion};
+use helios_venus::ring::Layout as RingLayout;
 
 use helios_api::gpu::{BlobMemory, BlobUsage, CapsetInfo, Context, Gpu, GpuError};
 use helios_api::programs::{Child, DeviceClass, SpawnError, SpawnRequest, device_grant};
@@ -67,6 +74,14 @@ const CHILD_DONE: &str = "gpu-test:child fence=1";
 
 #[derive(Debug, Error)]
 enum GpuTestError {
+    #[error(transparent)]
+    VenusTransport(#[from] helios_venus::helios::Error),
+    #[error(transparent)]
+    Venus(#[from] helios_venus::connection::Error<helios_venus::helios::Error>),
+    #[error(transparent)]
+    Ring(#[from] helios_venus::ring::RingError),
+    #[error("Venus Vulkan command returned {0}")]
+    Vulkan(i32),
     #[error("the 3D engine refused: {0}")]
     Gpu(#[from] GpuError),
     #[error("usage: gpu-test [--expect-renderer] [--child]; `{0}` is not an option")]
@@ -154,6 +169,12 @@ async fn main() -> Result<(), GpuTestError> {
     host_blob(&gpu, &context).await?;
     guest_blob(&gpu, &context).await?;
     second_instance().await?;
+    if capsets
+        .iter()
+        .any(|info| info.id == helios_venus::capset::ID)
+    {
+        venus_protocol()?;
+    }
     Ok(())
 }
 
@@ -371,5 +392,24 @@ async fn child(gpu: &Gpu) -> Result<(), GpuTestError> {
     context.submit(&buffer, 0, length, 0, Some(FENCE)).await?;
     retired(&mut fences, 0, FENCE).await?;
     println!("{CHILD_DONE}");
+    Ok(())
+}
+
+/// Exercise the synchronous Vulkan boundary through canonical lowering
+/// while the program's exported entry point remains asynchronous.
+fn venus_protocol() -> Result<(), GpuTestError> {
+    let (transport, capset) = VenusContext::open(1, "venus-test")?;
+    // The test uses one 64-KiB wasm page of command bytes; production
+    // callers supply their own capacity and renderer idle timeout.
+    let layout = RingLayout::new(NonZeroU32::new(65536).unwrap())?;
+    let mut connection = VenusConnection::new(transport, capset, layout, Duration::from_millis(1))?;
+    let mut version = 0;
+    // SAFETY: version is live for the call and its reply.
+    let result = unsafe { vn_call_vkEnumerateInstanceVersion(&mut connection, &mut version) }?;
+    if result != VK_SUCCESS {
+        return Err(GpuTestError::Vulkan(result.0));
+    }
+    connection.close()?;
+    println!("gpu-test:venus ring-reply ok api={version:#x}");
     Ok(())
 }

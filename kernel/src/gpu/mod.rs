@@ -171,6 +171,9 @@ pub enum Gpu3dServiceError {
     /// not come after the last one this context submitted on its ring.
     #[error("a fence must come after every fence already submitted on its ring")]
     StaleFence,
+    /// The requested wait is beyond every fence admitted on this ring.
+    #[error("the fence has not been submitted on this ring")]
+    UnsubmittedFence,
     /// The span is not whole pages inside the instance's memory, is not
     /// the length the request needs, or overlaps something already
     /// shown.

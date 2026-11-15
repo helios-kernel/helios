@@ -129,6 +129,10 @@ impl<'a> Ring<'a> {
         Ok(used)
     }
 
+    pub const fn capacity(&self) -> u32 {
+        self.layout.capacity()
+    }
+
     /// Current tail, suitable for `vkWaitRingSeqnoMESA` when a publish finds
     /// insufficient space. Waiting for it drains all outstanding bytes.
     pub const fn sequence(&self) -> u32 {

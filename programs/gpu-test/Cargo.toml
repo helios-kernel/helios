@@ -4,7 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 autobins = false
 
+[package.metadata.helios]
+venus-protocol = true
+
 [dependencies]
+helios-venus = { path = "../../venus", default-features = false, features = ["helios"] }
 helios-api = { path = "../../api", default-features = false, features = ["gpu", "programs", "task"] }
 thiserror = { version = "2.0.20", default-features = false }
 

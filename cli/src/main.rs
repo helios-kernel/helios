@@ -156,6 +156,16 @@ enum PrebuildError {
 /// Why one wasm program could not be built into an artifact.
 #[derive(Debug, thiserror::Error)]
 enum WasmBuildError {
+    #[error("failed to parse wasm build settings in {path}: {source}")]
+    ManifestSettings {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error(transparent)]
+    VenusInputs(#[from] venus_fetch::VenusFetchError),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceRootError),
     #[error("crate manifest {path} is missing")]
     ManifestMissing { path: String },
     #[error("failed to invoke cargo for {path}: {source}")]
@@ -2170,6 +2180,31 @@ fn build_component_program(
     )
 }
 
+#[derive(Default, Deserialize)]
+struct WasmBuildSettings {
+    #[serde(default)]
+    package: WasmPackageSettings,
+}
+
+#[derive(Default, Deserialize)]
+struct WasmPackageSettings {
+    #[serde(default)]
+    metadata: WasmMetadata,
+}
+
+#[derive(Default, Deserialize)]
+struct WasmMetadata {
+    #[serde(default)]
+    helios: WasmRequirements,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct WasmRequirements {
+    #[serde(default)]
+    venus_protocol: bool,
+}
+
 fn build_wasm_program(
     cargo: &Path,
     profile: &str,
@@ -2183,6 +2218,25 @@ fn build_wasm_program(
         return Err(WasmBuildError::ManifestMissing {
             path: manifest_path.display().to_string(),
         });
+    }
+    let manifest_text =
+        fs::read_to_string(manifest_path).map_err(|source| WasmBuildError::Read {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    let settings: WasmBuildSettings =
+        toml::from_str(&manifest_text).map_err(|source| WasmBuildError::ManifestSettings {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    let requirements = settings.package.metadata.helios;
+    if requirements.venus_protocol {
+        let root = WorkspaceRoot::discover_from(
+            manifest_path
+                .parent()
+                .expect("a manifest has a containing directory"),
+        )?;
+        venus_fetch::run(root.path())?;
     }
     let target_dir = out_dir.join(target_dir_name);
     let mut command = Command::new(cargo);
@@ -2207,7 +2261,16 @@ fn build_wasm_program(
         command.env("CARGO_PROFILE_DEV_PANIC", "abort");
     }
     command.env_remove("CARGO_ENCODED_RUSTFLAGS");
-    command.env("RUSTFLAGS", wasm_rustflags(target_triple));
+    if let Some(flags) = wasm_rustflags(target_triple) {
+        command.env("RUSTFLAGS", flags);
+    } else {
+        // Keep Cargo's target flags, including the component target's
+        // atomics requirement. Profile settings do not override them.
+        command.env_remove("RUSTFLAGS");
+        command.env("CARGO_PROFILE_DEV_STRIP", "debuginfo");
+        command.env("CARGO_PROFILE_RELEASE_STRIP", "debuginfo");
+        command.env("CARGO_PROFILE_RELEASE_DEBUG", "0");
+    }
     // C code a program links (ring's, for one) is archived by `cc`, which
     // falls back to the host's `ar` for a wasm target; that archive carries
     // no symbol index wasm-ld can read, and the link then misses every C
@@ -2277,12 +2340,12 @@ fn rustc_print(query: &'static str) -> Result<String, WasmBuildError> {
         .to_owned())
 }
 
-fn wasm_rustflags(target_triple: &str) -> String {
+fn wasm_rustflags(target_triple: &str) -> Option<String> {
     match target_triple {
-        "wasm32-wasip1-threads" => format!(
+        "wasm32-wasip1-threads" => Some(format!(
             "-C debuginfo=0 -C strip=symbols -C link-arg=--no-entry -C link-arg=--export=__tls_base -C link-arg=--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"
-        ),
-        _ => "-C debuginfo=0 -C strip=debuginfo".to_owned(),
+        )),
+        _ => None,
     }
 }
 
@@ -2806,6 +2869,27 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn component_builds_preserve_target_flags_and_threaded_plugins_keep_their_abi() {
+        assert!(wasm_rustflags("wasm32-wasip2").is_none());
+        let flags = wasm_rustflags("wasm32-wasip1-threads").unwrap();
+        assert!(flags.contains("--export=__tls_base"));
+        assert!(flags.contains("--no-entry"));
+        assert!(flags.contains(&format!(
+            "--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"
+        )));
+    }
+
+    #[test]
+    fn gpu_test_requests_protocol_inputs_and_ordinary_programs_do_not() {
+        let gpu: WasmBuildSettings =
+            toml::from_str(include_str!("../../programs/gpu-test/Cargo.toml")).unwrap();
+        assert!(gpu.package.metadata.helios.venus_protocol);
+        let init: WasmBuildSettings =
+            toml::from_str(include_str!("../../programs/init/Cargo.toml")).unwrap();
+        assert!(!init.package.metadata.helios.venus_protocol);
+    }
 
     #[test]
     fn a_prebuilt_tree_is_read_from_its_profile_directory() {

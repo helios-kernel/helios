@@ -4,8 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 build = "build.rs"
 
+[features]
+helios = ["dep:helios-api", "dep:wit-bindgen"]
+
 [dependencies]
 thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
+helios-api = { path = "../api", optional = true, default-features = false, features = ["gpu"] }
+wit-bindgen = { workspace = true, optional = true, features = ["macros", "async", "std"] }
 
 [build-dependencies]
 helios-venus-gen = { workspace = true, features = ["generate"] }

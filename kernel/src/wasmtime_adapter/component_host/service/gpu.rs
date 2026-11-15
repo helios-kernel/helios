@@ -145,6 +145,7 @@ fn to_wit_error(error: Gpu3dServiceError) -> gpu_wit::Error {
         Gpu3dServiceError::OutOfBounds => gpu_wit::Error::OutOfBounds,
         Gpu3dServiceError::BadRing => gpu_wit::Error::BadRing,
         Gpu3dServiceError::StaleFence => gpu_wit::Error::StaleFence,
+        Gpu3dServiceError::UnsubmittedFence => gpu_wit::Error::UnsubmittedFence,
         Gpu3dServiceError::BadSpan(_) | Gpu3dServiceError::BlobSpanMismatch => {
             gpu_wit::Error::BadSpan
         }
@@ -1033,6 +1034,30 @@ where
             Ok(Ok(SubmitCommands::Inline(inline.clone())))
         })
         .await
+    }
+
+    async fn wait(
+        accessor: &Accessor<U, Self>,
+        handle: Resource<ContextHandle>,
+        ring: u8,
+        fence: u64,
+    ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
+        let held = accessor.with(|mut access| {
+            let data = access.get();
+            let context = data.table.get(&handle)?;
+            Ok::<_, wasmtime::Error>(
+                data.gpu_sender(context.session)
+                    .map(|sender| (sender, context.shared.clone())),
+            )
+        })?;
+        let (sender, context) = match held {
+            Ok(held) => held,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        Ok(sender
+            .wait(&context, ring, fence)
+            .await
+            .map_err(to_wit_error))
     }
 
     fn fences(

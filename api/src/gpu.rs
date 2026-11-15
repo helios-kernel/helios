@@ -68,6 +68,8 @@ pub enum GpuError {
     BadRing,
     #[error("a fence must come after every fence already submitted on its ring")]
     StaleFence,
+    #[error("the fence has not been submitted on this ring")]
+    UnsubmittedFence,
     #[error("the pages are not a whole-page run of this program's memory, or do not suit the blob")]
     BadSpan,
     #[error("the blob's host storage is already shown in this program's memory")]
@@ -100,6 +102,7 @@ impl From<raw::Error> for GpuError {
             raw::Error::OutOfBounds => Self::OutOfBounds,
             raw::Error::BadRing => Self::BadRing,
             raw::Error::StaleFence => Self::StaleFence,
+            raw::Error::UnsubmittedFence => Self::UnsubmittedFence,
             raw::Error::BadSpan => Self::BadSpan,
             raw::Error::AlreadyMapped => Self::AlreadyMapped,
             raw::Error::NotMapped => Self::NotMapped,
@@ -265,6 +268,12 @@ impl Context {
             .execute(commands.to_vec(), ring, fence)
             .await
             .map_err(GpuError::from)
+    }
+
+    /// Wait for a submitted fence, including one already retired.
+    /// A faulted context or ended GPU session returns an error.
+    pub async fn wait(&self, ring: u8, fence: u64) -> Result<(), GpuError> {
+        self.raw.wait(ring, fence).await.map_err(GpuError::from)
     }
 
     /// Every fence `ring` of this context retires, in order.

@@ -2213,6 +2213,7 @@ name = "helios-gpu-test"
 version = "0.1.0"
 dependencies = [
  "helios-api",
+ "helios-venus",
  "thiserror 2.0.21",
 ]
 
@@ -2520,10 +2521,12 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "cc",
+ "helios-api",
  "helios-venus-gen",
  "libloading 0.9.0",
  "tempfile",
  "thiserror 2.0.21",
+ "wit-bindgen 0.61.1",
 ]
 
 [[package]]

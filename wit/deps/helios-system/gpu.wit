@@ -88,6 +88,8 @@ interface gpu {
     /// and a fence that would go backwards is a defect the device is
     /// not asked to carry.
     stale-fence,
+    /// A wait names a point beyond the newest submitted fence on its ring.
+    unsubmitted-fence,
     /// The span is not whole pages inside this instance's memory, is not
     /// the length the request needs, overlaps something already shown,
     /// or was given for a blob that has no pages of its own (or left
@@ -206,6 +208,13 @@ interface gpu {
     /// the newest answers for all that came before it on that ring, and
     /// for nothing on any other.
     fences: func(ring: u8) -> result<stream<u64>, error>;
+
+    /// Wait until this ring has retired `fence`, including a fence that
+    /// retired before this call. Zero is the initially completed point.
+    /// Refused `unsubmitted-fence` beyond the newest submitted point,
+    /// `device-fault` when the context faults, or `session-ended` when
+    /// the GPU session ends. Cancelling a wait leaves submissions intact.
+    wait: async func(ring: u8, fence: u64) -> result<_, error>;
 
     /// Make `blob` reachable from this context's command stream.
     attach: async func(blob: borrow<blob>) -> result<_, error>;

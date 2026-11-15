@@ -67,7 +67,9 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::future::poll_fn;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::task::Poll;
 
 use arrayvec::ArrayVec;
 use futures::channel::oneshot;
@@ -115,6 +117,8 @@ pub(crate) struct SessionState {
     /// Set once, when the session is dropped. A request read after it is
     /// set is dropped unanswered: its instance let the engine go.
     pub(super) ended: AtomicBool,
+    /// Broadcast to operations waiting on a session that has ended.
+    ended_notify: Notify,
     /// Submissions of this session the submit server has popped and the
     /// device has not finished with.
     ///
@@ -568,6 +572,7 @@ impl Gpu3dService {
             state: Arc::new(SessionState {
                 id,
                 ended: AtomicBool::new(false),
+                ended_notify: Notify::new(),
                 submits_in_flight: AtomicU64::new(0),
                 release: self.shared.release.clone(),
             }),
@@ -611,6 +616,7 @@ impl Drop for Gpu3dSession {
         // flag is what every request of the session is checked against,
         // and the permit is what has the owner task sweep up after it.
         self.state.ended.store(true, Ordering::Release);
+        self.state.ended_notify.notify_all();
         self.shared.release.notify_one();
     }
 }
@@ -625,6 +631,51 @@ pub struct Gpu3dSender {
 impl Gpu3dSender {
     pub fn session(&self) -> SessionId {
         self.state.id
+    }
+
+    /// Wait for an admitted fence, including one retired before this call.
+    /// Registers both broadcasts before checking progress; cancellation
+    /// drops only the listeners and never cancels the device submission.
+    pub async fn wait(
+        &self,
+        context: &ContextShared,
+        ring: u8,
+        fence: u64,
+    ) -> Result<(), Gpu3dServiceError> {
+        let timeline = RingIndex::new(ring)
+            .and_then(|ring| context.timeline(ring))
+            .ok_or(Gpu3dServiceError::BadRing)?;
+        if fence > timeline.submitted() {
+            return Err(Gpu3dServiceError::UnsubmittedFence);
+        }
+        let signal = timeline.signal();
+        let mut retired = signal.waiter();
+        let mut ended = self.state.ended_notify.waiter();
+        let mut last_seen = 0;
+        poll_fn(|cx| {
+            let _ = self.state.ended_notify.poll_notified(cx, &mut ended);
+            loop {
+                if self.state.has_ended() {
+                    return Poll::Ready(Err(Gpu3dServiceError::SessionEnded));
+                }
+                // Acquire retirement before checking fault: a failed
+                // submission publishes its fault before retiring fences.
+                let reached = signal.sequence() >= fence;
+                if context.is_faulted() {
+                    return Poll::Ready(Err(Gpu3dServiceError::DeviceFault));
+                }
+                if reached {
+                    return Poll::Ready(Ok(()));
+                }
+                if signal
+                    .poll_next(cx, &mut retired, &mut last_seen)
+                    .is_pending()
+                {
+                    return Poll::Pending;
+                }
+            }
+        })
+        .await
     }
 
     fn message(&self, request: Gpu3dRequest) -> ControlMessage {

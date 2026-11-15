@@ -73,6 +73,7 @@ pub fn protocol_tokens(an: &Analysis) -> Result<TokenStream, RegistryError> {
     }
     for &id in &an.generated_commands {
         functions.extend(wire.command_functions(id)?);
+        functions.extend(wire.command_call(id)?);
     }
     Ok(quote! {
         #scalars

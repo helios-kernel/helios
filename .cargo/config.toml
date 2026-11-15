@@ -29,3 +29,8 @@ rustflags = [
   # to compile the backend without this flag.
   "-Zbranch-protection=pac-ret",
 ]
+
+[target.wasm32-wasip2]
+# Components can share mapped device memory with a renderer outside wasm.
+# Emit real atomics for its ownership/publication protocol.
+rustflags = ["-C", "target-feature=+atomics"]

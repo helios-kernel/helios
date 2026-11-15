@@ -962,9 +962,8 @@ fn settle<CpuImpl: Cpu>(finished: Finished, cpu: &CpuImpl) {
         %error,
         "the display engine refused a command stream; the context is faulted"
     );
-    if let Some(fence) = fence {
-        timeline.retire(fence.raw(), nanos);
-    }
+    // Fault before publishing retirement so a waiter cannot observe a
+    // successful fence for a submission the device refused.
     context.fault(nanos);
     if let Some(reply) = reply {
         let _ = reply.send(Err(Gpu3dServiceError::from(error)));

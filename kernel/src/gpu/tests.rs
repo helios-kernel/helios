@@ -10,7 +10,9 @@
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::task::{Context as TaskContext, Poll, Waker};
+use std::task::Wake;
 
 use futures::channel::oneshot;
 use futures_lite::future::{block_on, poll_once};
@@ -23,7 +25,7 @@ use helios_hal::display::{
 use helios_hal::io::IoError;
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::vmm::VirtAddr;
-use std::sync::Mutex;
+use std::sync::{Arc as WakeArc, Mutex};
 use triomphe::Arc;
 
 use crate::buffer::{Buffer, GuestMemory, Span, ViewTable, WASM_PAGE_BYTES};
@@ -2084,4 +2086,104 @@ mod component_host {
         contract::HostGpu::drop(&mut data, second).expect("the drop is answered");
         assert!(!data.device.gpu().is_open(), "the last handle ends it");
     }
+}
+
+#[test]
+fn waiting_for_a_retired_fence_does_not_need_a_new_event() {
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let ownership = opened(&shared);
+    let sender = sender(&ownership);
+    let context = ContextShared::new(ContextId::new(1), RingCount::new(2).unwrap());
+    let timeline = context.timeline(RingIndex::new(0).unwrap()).unwrap();
+    timeline.record_submitted(FenceId::new(5));
+    timeline.retire(5, 0);
+    assert_eq!(block_on(sender.wait(&context, 0, 3)), Ok(()));
+    assert_eq!(block_on(sender.wait(&context, 0, 0)), Ok(()));
+    assert_eq!(
+        block_on(sender.wait(&context, 0, 6)),
+        Err(Gpu3dServiceError::UnsubmittedFence)
+    );
+    assert_eq!(
+        block_on(sender.wait(&context, 1, 5)),
+        Err(Gpu3dServiceError::UnsubmittedFence)
+    );
+    assert_eq!(
+        block_on(sender.wait(&context, 2, 0)),
+        Err(Gpu3dServiceError::BadRing)
+    );
+}
+
+struct FenceWake(AtomicUsize);
+
+impl Wake for FenceWake {
+    fn wake(self: WakeArc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn a_fence_wait_is_woken_by_retirement_and_not_completed_by_an_earlier_point() {
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let ownership = opened(&shared);
+    let sender = sender(&ownership);
+    let context = ContextShared::new(ContextId::new(1), RingCount::new(1).unwrap());
+    let timeline = context.timeline(RingIndex::new(0).unwrap()).unwrap();
+    timeline.record_submitted(FenceId::new(5));
+    let wakes = WakeArc::new(FenceWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut wait = pin!(sender.wait(&context, 0, 5));
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    timeline.retire(3, 0);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    wakes.0.store(0, Ordering::Relaxed);
+    timeline.retire(5, 0);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+}
+
+#[test]
+fn ending_a_session_wakes_a_fence_wait_whose_submission_never_retired() {
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let ownership = opened(&shared);
+    let sender = sender(&ownership);
+    let context = ContextShared::new(ContextId::new(1), RingCount::new(1).unwrap());
+    context
+        .timeline(RingIndex::new(0).unwrap())
+        .unwrap()
+        .record_submitted(FenceId::new(1));
+    let wakes = WakeArc::new(FenceWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut wait = pin!(sender.wait(&context, 0, 1));
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    drop(ownership);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        wait.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Gpu3dServiceError::SessionEnded))
+    );
+}
+
+#[test]
+fn faulting_a_context_does_not_report_its_retired_fences_as_successful() {
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let ownership = opened(&shared);
+    let sender = sender(&ownership);
+    let context = ContextShared::new(ContextId::new(1), RingCount::new(1).unwrap());
+    context
+        .timeline(RingIndex::new(0).unwrap())
+        .unwrap()
+        .record_submitted(FenceId::new(1));
+    block_on(async {
+        let mut wait = pin!(sender.wait(&context, 0, 1));
+        assert!(poll_once(wait.as_mut()).await.is_none());
+        context.fault(0);
+        assert_eq!(wait.await, Err(Gpu3dServiceError::DeviceFault));
+        assert_eq!(
+            sender.wait(&context, 0, 1).await,
+            Err(Gpu3dServiceError::DeviceFault)
+        );
+    });
 }

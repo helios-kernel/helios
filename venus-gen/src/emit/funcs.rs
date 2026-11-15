@@ -498,6 +498,75 @@ impl<'a> Wire<'a> {
         }
     }
 
+    /// Driver calls use the same wire walks as the parity-tested codec.
+    pub fn command_call(&self, id: TypeId) -> Result<TokenStream> {
+        let ty = &self.an.reg.types[id];
+        if ty.name.ends_with("MESA") {
+            return Ok(TokenStream::new());
+        }
+        let params = self.command_params(id)?;
+        let args = self.command_args(id);
+        let call = func("call", &ty.name);
+        let encode = func("encode", &ty.name);
+        let sizeof = func("sizeof", &ty.name);
+        let sizeof_reply = func("sizeof", &format!("{}_reply", ty.name));
+        let decode_reply = func("decode", &format!("{}_reply", ty.name));
+        let ret = match &ty.ret {
+            Some(ret) => decl_type(self.an, ret, "the return value")?,
+            None => quote!(()),
+        };
+        let reply = ty.ret.is_some() || ty.variables.iter().any(|var| var.attrs.var_out);
+        let flags = if reply {
+            quote!(VK_COMMAND_GENERATE_REPLY_BIT_EXT.0 as u32)
+        } else {
+            quote!(0)
+        };
+        let decode = if ty.ret.is_some() {
+            quote!(let venus_result = #decode_reply(&mut venus_decoder, #(#args),*);)
+        } else {
+            quote!(#decode_reply(&mut venus_decoder, #(#args),*);)
+        };
+        let result = if ty.ret.is_some() {
+            quote!(venus_result)
+        } else {
+            quote!(())
+        };
+        let finish = if reply {
+            quote! {
+                let venus_reply_size = #sizeof_reply(venus_connection.protocol(), #(#args),*)?;
+                let venus_reply = venus_connection.call(&venus_bytes, venus_reply_size)?;
+                let mut venus_decoder = Decoder::new(&venus_reply);
+                #decode
+                venus_decoder.finish()?;
+                Ok(#result)
+            }
+        } else {
+            quote! {
+                venus_connection.send(&venus_bytes)?;
+                Ok(())
+            }
+        };
+        Ok(quote! {
+            /// Submit through the connection, decoding outputs when present.
+            ///
+            /// # Safety
+            /// Pointers and handles satisfy the Vulkan command's contracts;
+            /// output handles have already been assigned renderer object ids.
+            pub unsafe fn #call<T: crate::transport::Transport>(
+                venus_connection: &mut crate::connection::Connection<T>, #(#params),*
+            ) -> Result<#ret, crate::connection::Error<T::Error>> {
+                unsafe {
+                    let venus_size = #sizeof(venus_connection.protocol(), #(#args),*)?;
+                    let mut venus_bytes = vec![0; venus_size];
+                    let mut venus_encoder = Encoder::new(&mut venus_bytes, venus_connection.protocol());
+                    #encode(&mut venus_encoder, #flags, #(#args),*);
+                    venus_encoder.finish()?;
+                    #finish
+                }
+            }
+        })
+    }
+
     /// `sizeof`, `encode`, `sizeof_reply`, `encode_reply` and `decode_reply`
     /// of a command.
     pub fn command_functions(&self, id: TypeId) -> Result<TokenStream> {
