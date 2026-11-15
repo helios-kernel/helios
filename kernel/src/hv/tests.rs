@@ -765,3 +765,60 @@ fn reset_discards_registers_pending_irqs_and_kicks_but_preserves_stop() {
     vm.control().stop();
     assert_eq!(cpu.reset(), Err(HvError::Stopped));
 }
+
+#[test]
+fn partial_guest_writes_preserve_neighbors_across_words_and_pages() {
+    let mut vm = vm([], 2);
+    let region = vm
+        .allocate_memory(range(2), PageFlags::READ | PageFlags::WRITE)
+        .unwrap();
+    for start in [0, PhysFrame::SIZE - 8] {
+        region.write(start, &[0xa5; 24]).unwrap();
+        region.write(start + 3, &[0x5a; 14]).unwrap();
+        let mut bytes = [0; 24];
+        region.read(start, &mut bytes).unwrap();
+        assert_eq!(&bytes[..3], &[0xa5; 3]);
+        assert_eq!(&bytes[3..17], &[0x5a; 14]);
+        assert_eq!(&bytes[17..], &[0xa5; 7]);
+    }
+}
+
+#[test]
+fn concurrent_guest_writes_preserve_other_lanes_and_never_tear_indices() {
+    let mut vm = vm([], 1);
+    let region = vm
+        .allocate_memory(range(1), PageFlags::READ | PageFlags::WRITE)
+        .unwrap();
+    std::thread::scope(|scope| {
+        let region = &region;
+        let writer = scope.spawn(move || {
+            for _ in 0..4096 {
+                for value in [0x55aau16, 0xaa55] {
+                    loop {
+                        match region.write(0, &value.to_ne_bytes()) {
+                            Ok(()) => break,
+                            Err(GuestMemoryError::Contended) => std::thread::yield_now(),
+                            error => panic!("unexpected write result: {error:?}"),
+                        }
+                    }
+                }
+            }
+        });
+        for _ in 0..4096 {
+            loop {
+                match region.write(2, &[0x37; 2]) {
+                    Ok(()) => break,
+                    Err(GuestMemoryError::Contended) => std::thread::yield_now(),
+                    error => panic!("unexpected write result: {error:?}"),
+                }
+            }
+            let mut index = [0; 2];
+            region.read(0, &mut index).unwrap();
+            assert!([0, 0x55aa, 0xaa55].contains(&u16::from_ne_bytes(index)));
+        }
+        writer.join().unwrap();
+    });
+    let mut bytes = [0; 4];
+    region.read(0, &mut bytes).unwrap();
+    assert_eq!(&bytes[2..], &[0x37; 2]);
+}

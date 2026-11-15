@@ -79,7 +79,10 @@ interface virtualization {
 
   /// Kernel-owned user-domain frames, entirely outside Wasm linear memory.
   /// Only the requested transfer buffer crosses the component boundary.
-  /// Concurrent accesses are byte-atomic, not coherent snapshots.
+  /// Naturally aligned 1/2/4/8-byte accesses are atomic, with acquire reads
+  /// and release writes. Larger or unaligned transfers are not snapshots.
+  /// A partial 8-byte cell write returns busy if it races with another writer;
+  /// a prefix may already be written. Device protocols own synchronization.
   resource memory-region {
     read: func(offset: u64, length: u32) -> result<list<u8>, hv-error>;
     write: func(offset: u64, bytes: list<u8>) -> result<_, hv-error>;

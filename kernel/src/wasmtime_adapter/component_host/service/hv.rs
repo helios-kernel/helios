@@ -33,6 +33,7 @@ impl From<GuestMemoryError> for wire::HvError {
         match error {
             GuestMemoryError::Budget { .. } => Self::MemoryBudget,
             GuestMemoryError::Frames(_) => Self::OutOfMemory,
+            GuestMemoryError::Contended => Self::Busy,
             GuestMemoryError::Bounds | GuestMemoryError::Length => Self::Bounds,
         }
     }
