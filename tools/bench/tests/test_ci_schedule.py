@@ -61,8 +61,8 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
             assert f"wasm-{catalog[name]['guest-wasm']}" in ci_jobs[name]["needs"]
 
 
-@pytest.mark.parametrize("lane", ["test-libraries", "test-kernel", "missing", "test-btrfs-fuzz"])
-def test_manual_command_lane_validates_selection_and_keeps_dependencies(ci_jobs, tmp_path, lane):
+@pytest.mark.parametrize("lane", ["test-libraries", "test-kernel", "missing", "test-btrfs-fuzz", "smoke-x86-64"])
+def test_manual_lane_validates_selection_and_keeps_dependencies(ci_jobs, tmp_path, lane):
     select = next(step for step in ci_jobs["changes"]["steps"] if step.get("id") == "select")
     output = tmp_path / "outputs"
     result = subprocess.run(
@@ -79,16 +79,18 @@ def test_manual_command_lane_validates_selection_and_keeps_dependencies(ci_jobs,
         },
         capture_output=True,
     )
-    if lane in {"missing", "test-btrfs-fuzz"}:
+    if lane == "missing":
         assert result.returncode != 0
-        assert b"Unknown command lane" in result.stderr
+        assert b"Unknown lane" in result.stderr
         return
     assert result.returncode == 0, result.stderr.decode()
     selected = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert json.loads(selected["lanes"]) == [lane]
-    assert json.loads(selected["wasm_profiles"]) == (["debug"] if lane == "test-kernel" else [])
+    catalog = json.loads((REPO_ROOT / ".github/ci-lanes.json").read_text())
+    profile = catalog[lane].get("guest-wasm")
+    assert json.loads(selected["wasm_profiles"]) == ([profile] if profile else [])
     checks = json.loads(selected["checks"]) + json.loads(selected["tests"])
-    assert [check["name"] for check in checks] == [lane]
+    assert [check["name"] for check in checks] == ([lane] if "command" in catalog[lane] else [])
 
 
 @pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled"])

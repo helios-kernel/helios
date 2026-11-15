@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       check_lane:
-        description: "Optional command lane from ci-lanes.json; empty runs the full suite"
+        description: "Optional lane from ci-lanes.json; empty runs the full suite"
         required: false
         default: ""
         type: string
@@ -173,8 +173,8 @@ jobs:
           set -euo pipefail
           CHECK_LANE="${CHECK_LANE:-}"
           if [[ -n "$CHECK_LANE" ]]; then
-            jq -e --arg lane "$CHECK_LANE" '.[$lane].command | type == "string"' .github/ci-lanes.json > /dev/null || {
-              echo "Unknown command lane: $CHECK_LANE" >&2
+            jq -e --arg lane "$CHECK_LANE" 'has($lane)' .github/ci-lanes.json > /dev/null || {
+              echo "Unknown lane: $CHECK_LANE" >&2
               exit 1
             }
           fi
