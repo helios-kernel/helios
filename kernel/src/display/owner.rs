@@ -47,7 +47,7 @@ use crate::Kernel;
 use crate::buffer::Buffer;
 use crate::component::{ProviderReceiver, provider_channel};
 use crate::exec::monotonic_nanos;
-use crate::gpu::ScanoutHold;
+use crate::gpu::BlobHold;
 
 use super::service::{
     ClaimState, ControlRequest, CursorRequest, DisplayService, DisplayShared, FrameToken,
@@ -211,7 +211,7 @@ enum SurfaceResource {
     Blob {
         id: BlobId,
         scanout: ScanoutId,
-        hold: ScanoutHold,
+        hold: BlobHold,
     },
 }
 
@@ -488,7 +488,7 @@ async fn create_blob_surface<Device: DisplayDevice>(
     held: &mut ClaimResources,
     scanout: ScanoutId,
     layout: helios_hal::display::BlobScanout,
-    hold: ScanoutHold,
+    hold: BlobHold,
 ) -> Result<(), DisplayServiceError> {
     debug_assert_eq!(hold.blob(), layout.blob, "the hold is on the blob shown");
     if held.surfaces.is_full() {

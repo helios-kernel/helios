@@ -233,7 +233,7 @@ impl Held {
     fn releasable_blob(&self, session: &SessionState) -> Option<usize> {
         self.blobs
             .iter()
-            .position(|held| held.session.id == session.id && !held.shared.is_scanned_out())
+            .position(|held| held.session.id == session.id && !held.shared.is_retained())
     }
 }
 
@@ -533,7 +533,7 @@ async fn create_blob<Device: Gpu3d>(
             return Err(Gpu3dServiceError::from(error));
         }
     };
-    let shared = Arc::new(BlobShared::new(blob, release.clone()));
+    let shared = Arc::new(BlobShared::new(blob, spec.size, release.clone()));
     held.blobs.push(HeldBlob {
         session: session.clone(),
         id: blob,
@@ -561,7 +561,7 @@ async fn destroy_blob<Device: Gpu3d>(
     let Some(index) = held.blob_index(session, blob) else {
         return;
     };
-    if held.blobs[index].shared.is_scanned_out() {
+    if held.blobs[index].shared.is_retained() {
         held.blobs[index].dropped = true;
         return;
     }
@@ -708,7 +708,7 @@ async fn advance_releases<Device: Gpu3d>(device: &Device, held: &mut Held) {
     while let Some(index) = held
         .blobs
         .iter()
-        .position(|blob| blob.dropped && !blob.session.has_ended() && !blob.shared.is_scanned_out())
+        .position(|blob| blob.dropped && !blob.session.has_ended() && !blob.shared.is_retained())
     {
         release_blob(device, held.blobs.remove(index)).await;
     }

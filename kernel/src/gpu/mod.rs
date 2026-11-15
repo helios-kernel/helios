@@ -49,6 +49,7 @@
 //! renderer has stopped reading it, on whichever processor drops the
 //! last reference.
 
+mod image;
 mod instance;
 mod owner;
 mod service;
@@ -97,11 +98,12 @@ pub const MAX_MACHINE_GPU_BLOBS: usize = 4 * MAX_GPU_BLOBS;
 /// a command buffer.
 pub const MAX_EXECUTE_BYTES: usize = 256;
 
+pub use image::GpuImage;
 pub use instance::Gpu3dOwnership;
 pub use owner::install_gpu3d_device;
 pub use service::{
-    BlobShared, ContextRecord, ContextShared, Gpu3dSender, Gpu3dService, Gpu3dSession,
-    RingTimeline, ScanoutHold, SessionId,
+    BlobHold, BlobShared, ContextRecord, ContextShared, Gpu3dSender, Gpu3dService, Gpu3dSession,
+    RingTimeline, SessionId,
 };
 pub(crate) use service::{
     BlobSpec, CompletionSignal, Gpu3dRequest, InlineCommands, SubmitCommands, SubmitCompletion,

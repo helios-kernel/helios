@@ -385,6 +385,17 @@ pub struct Blob {
 }
 
 impl Blob {
+    /// Retain a validated linear image independently of this blob handle.
+    pub fn image(
+        &self,
+        layout: crate::image::ImageLayout,
+    ) -> Result<crate::image::Image, GpuError> {
+        self.raw
+            .image(layout)
+            .map(crate::image::Image::from)
+            .map_err(GpuError::from)
+    }
+
     /// The virtio resource id the device knows this blob by, which a
     /// renderer's own protocol names it with.
     pub fn resource_id(&self) -> u32 {

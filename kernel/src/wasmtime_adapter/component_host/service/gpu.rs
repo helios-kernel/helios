@@ -40,8 +40,8 @@ use core::task::{Context, Poll};
 use futures::channel::oneshot;
 use helios_hal::device::DeviceRegion;
 use helios_hal::display::{
-    BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, FenceId, MAX_CONTEXT_NAME,
-    RingCount, RingIndex,
+    BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, DisplayMode, FenceId,
+    MAX_CONTEXT_NAME, PixelFormat, RingCount, RingIndex,
 };
 use helios_hal::iommu::PhysicalRange;
 use triomphe::Arc;
@@ -55,7 +55,7 @@ use crate::ComponentHostNetwork;
 use crate::buffer::{Buffer, GuestMemory, Span, ViewError, ViewGroup, ViewId, ViewTable};
 use crate::gpu::{
     BlobShared, BlobSpec, CompletionSignal, ContextShared, Gpu3dRequest, Gpu3dSender,
-    Gpu3dServiceError, InlineCommands, MAX_EXECUTE_BYTES, SessionId, SubmitCommands,
+    Gpu3dServiceError, GpuImage, InlineCommands, MAX_EXECUTE_BYTES, SessionId, SubmitCommands,
     SubmitCompletion, SubmitRequest,
 };
 use crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu as gpu_wit;
@@ -378,6 +378,51 @@ fn spawn_gpu_cleanup<CpuImpl>(
     }
 }
 
+pub(super) const fn from_wit_format(format: gpu_wit::PixelFormat) -> PixelFormat {
+    match format {
+        gpu_wit::PixelFormat::Bgrx8888 => PixelFormat::Bgrx8888,
+        gpu_wit::PixelFormat::Bgra8888 => PixelFormat::Bgra8888,
+        gpu_wit::PixelFormat::Xrgb8888 => PixelFormat::Xrgb8888,
+        gpu_wit::PixelFormat::Argb8888 => PixelFormat::Argb8888,
+        gpu_wit::PixelFormat::Rgbx8888 => PixelFormat::Rgbx8888,
+        gpu_wit::PixelFormat::Rgba8888 => PixelFormat::Rgba8888,
+        gpu_wit::PixelFormat::Xbgr8888 => PixelFormat::Xbgr8888,
+        gpu_wit::PixelFormat::Abgr8888 => PixelFormat::Abgr8888,
+    }
+}
+
+fn image_layout(image: &GpuImage) -> gpu_wit::ImageLayout {
+    let layout = image.layout();
+    gpu_wit::ImageLayout {
+        width: layout.mode.width,
+        height: layout.mode.height,
+        offset: layout.offset,
+        stride: layout.stride,
+        format: match layout.format {
+            PixelFormat::Bgrx8888 => gpu_wit::PixelFormat::Bgrx8888,
+            PixelFormat::Bgra8888 => gpu_wit::PixelFormat::Bgra8888,
+            PixelFormat::Xrgb8888 => gpu_wit::PixelFormat::Xrgb8888,
+            PixelFormat::Argb8888 => gpu_wit::PixelFormat::Argb8888,
+            PixelFormat::Rgbx8888 => gpu_wit::PixelFormat::Rgbx8888,
+            PixelFormat::Rgba8888 => gpu_wit::PixelFormat::Rgba8888,
+            PixelFormat::Xbgr8888 => gpu_wit::PixelFormat::Xbgr8888,
+            PixelFormat::Abgr8888 => gpu_wit::PixelFormat::Abgr8888,
+        },
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl> gpu_wit::HostImage for StoreData<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn drop(&mut self, image: Resource<GpuImage>) -> wasmtime::Result<()> {
+        self.table.delete(image)?;
+        Ok(())
+    }
+}
+
 /// An `UnmapBlob` nobody waits for the answer to.
 fn unmap_request(blob: BlobId) -> Gpu3dRequest {
     let (reply, _) = oneshot::channel();
@@ -390,6 +435,13 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    fn describe_image(
+        &mut self,
+        image: Resource<GpuImage>,
+    ) -> wasmtime::Result<gpu_wit::ImageLayout> {
+        Ok(image_layout(self.table.get(&image)?))
+    }
+
     fn open(&mut self) -> wasmtime::Result<Result<Resource<GpuHandle>, gpu_wit::Error>> {
         let Some(service) = self.runtime_state.gpu3d_service() else {
             return Ok(Err(gpu_wit::Error::Unavailable));
@@ -479,6 +531,28 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    fn image(
+        &mut self,
+        handle: Resource<BlobHandle>,
+        layout: gpu_wit::ImageLayout,
+    ) -> wasmtime::Result<Result<Resource<GpuImage>, gpu_wit::Error>> {
+        let blob = self.table.get(&handle)?;
+        if !self.device.gpu().is_current(blob.session) {
+            return Ok(Err(gpu_wit::Error::SessionEnded));
+        }
+        let image = match GpuImage::new(
+            &blob.shared,
+            DisplayMode::new(layout.width, layout.height),
+            from_wit_format(layout.format),
+            layout.offset,
+            layout.stride,
+        ) {
+            Ok(image) => image,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        Ok(Ok(self.table.push(image)?))
+    }
+
     fn resource_id(&mut self, handle: Resource<BlobHandle>) -> wasmtime::Result<u32> {
         Ok(self.table.get(&handle)?.id.raw())
     }

@@ -8,7 +8,7 @@ use ash::vk::{self, Handle};
 
 use super::Factory;
 use super::allocator::HostAllocator;
-use super::instance::{State, TransportError, invoke_result, invoke_void, object, shared};
+use super::instance::{TransportError, invoke_result, invoke_void, object, shared};
 use crate::connection::Error;
 use crate::protocol as wire;
 use crate::transport::{MappedBlob, Transport};
@@ -123,44 +123,83 @@ unsafe extern "system" fn map<F: Factory>(
 ) -> vk::Result {
     // SAFETY: Vulkan supplies a writable output pointer and valid range.
     unsafe { *output = null_mut() };
-    let device_id = unsafe { (*object(device)).id };
-    let memory_id = memory.as_raw();
+    // SAFETY: the Vulkan caller owns this device and allocation.
     let result = unsafe {
-        invoke_result::<F>(object(device), |state| {
-            let State {
-                connection,
-                devices,
-                ..
-            } = state;
-            let memory = devices
-                .get_mut(&device_id)
-                .unwrap()
-                .memories
-                .get_mut(&memory_id)
-                .expect("mapped Vulkan memory is owned by this device");
-            if memory.mapping.is_none() {
-                let Ok(length) = usize::try_from(memory.size) else {
-                    return Ok(wire::VK_ERROR_MEMORY_MAP_FAILED);
-                };
-                let length =
-                    NonZeroUsize::new(length).expect("Vulkan mapped allocations are nonempty");
-                let blob = connection.memory_blob(wire::VkDeviceMemory(memory_id), length)?;
-                memory.mapping = Some(Mapping { blob, active: None });
-            }
+        with_mapping::<F, _>(device, memory, |mapping, allocation_size| {
             let end = if size == vk::WHOLE_SIZE {
-                memory.size
+                allocation_size
             } else {
                 offset + size
             };
-            let mapping = memory.mapping.as_mut().unwrap();
             mapping.active = Some(offset..end);
-            // SAFETY: Vulkan validates this range against the allocation; the
-            // whole allocation fits the guest address space and stays mapped.
+            // SAFETY: Vulkan validates the range against the allocation.
             *output = mapping.blob.pointer().as_ptr().add(offset as usize).cast();
-            Ok(wire::VK_SUCCESS)
+            Ok(())
         })
     };
-    vk::Result::from_raw(result.0)
+    result.map_or_else(|error| error, |()| vk::Result::SUCCESS)
+}
+
+/// Visit an allocation's retained blob without changing its Vulkan mapping.
+///
+/// # Safety
+/// The device belongs to F and memory is a live allocation on that device.
+#[cfg(feature = "helios")]
+pub(crate) unsafe fn with_blob<F: Factory, R>(
+    device: vk::Device,
+    memory: vk::DeviceMemory,
+    visit: impl FnOnce(&<F::Transport as Transport>::Blob) -> Result<R, TransportError<F>>,
+) -> Result<R, vk::Result> {
+    // SAFETY: forwarded from the caller's device and allocation contract.
+    unsafe { with_mapping::<F, _>(device, memory, |mapping, _| visit(&mapping.blob)) }
+}
+
+unsafe fn with_mapping<F: Factory, R>(
+    device: vk::Device,
+    memory: vk::DeviceMemory,
+    visit: impl FnOnce(&mut Mapping<F::Transport>, u64) -> Result<R, TransportError<F>>,
+) -> Result<R, vk::Result> {
+    // SAFETY: the caller supplies a live device of this factory.
+    let owner = unsafe { shared::<F>(object(device)) };
+    let device_id = unsafe { (*object(device)).id };
+    let mut state = owner.lock();
+    if state.fault.is_some() {
+        return Err(vk::Result::ERROR_DEVICE_LOST);
+    }
+    let memory_id = memory.as_raw();
+    let allocation = state
+        .devices
+        .get(&device_id)
+        .unwrap()
+        .memories
+        .get(&memory_id)
+        .expect("Vulkan memory is owned by this device");
+    if allocation.mapping.is_none() {
+        let length =
+            usize::try_from(allocation.size).map_err(|_| vk::Result::ERROR_MEMORY_MAP_FAILED)?;
+        let length = NonZeroUsize::new(length).expect("Vulkan allocations are nonempty");
+        let blob = state
+            .connection
+            .memory_blob(wire::VkDeviceMemory(memory_id), length)
+            .map_err(|error| state.fail(error))?;
+        state
+            .devices
+            .get_mut(&device_id)
+            .unwrap()
+            .memories
+            .get_mut(&memory_id)
+            .unwrap()
+            .mapping = Some(Mapping { blob, active: None });
+    }
+    let allocation = state
+        .devices
+        .get_mut(&device_id)
+        .unwrap()
+        .memories
+        .get_mut(&memory_id)
+        .unwrap();
+    let result = visit(allocation.mapping.as_mut().unwrap(), allocation.size);
+    result.map_err(|error| state.fail(Error::Transport(error)))
 }
 
 unsafe extern "system" fn unmap<F: Factory>(device: vk::Device, memory: vk::DeviceMemory) {

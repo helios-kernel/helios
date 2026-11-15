@@ -25,7 +25,7 @@ use triomphe::Arc;
 use crate::buffer::Buffer;
 use crate::component::ProviderReceiver;
 use crate::device::test_hooks;
-use crate::gpu::ScanoutHold;
+use crate::gpu::BlobHold;
 use crate::process::test_caps;
 use crate::test_support::TestCpu;
 
@@ -436,7 +436,7 @@ fn a_surface_is_attached_when_it_is_created_and_a_present_flushes_it() {
 /// Releasing the claim blanks the output and destroys nothing: the blob
 /// is the gpu path's.
 #[test]
-fn a_blob_surface_is_scanned_out_once_and_each_present_flushes_the_blob() {
+fn a_blob_surface_is_retained_once_and_each_present_flushes_the_blob() {
     test_hooks::install();
     let (shared, control, _cursor) = display_channels();
     let device = FakeDisplay::new();
@@ -456,6 +456,7 @@ fn a_blob_surface_is_scanned_out_once_and_each_present_flushes_the_blob() {
     // The gpu path's record of the blob, which the surface holds.
     let held_blob = Arc::new(crate::gpu::BlobShared::new(
         blob,
+        u64::from(layout.stride) * u64::from(SMALL.height),
         Arc::new(crate::exec::Notify::new()),
     ));
     let region = Rect::of(SMALL);
@@ -469,7 +470,7 @@ fn a_blob_surface_is_scanned_out_once_and_each_present_flushes_the_blob() {
                     generation,
                     scanout,
                     layout,
-                    hold: ScanoutHold::new(&held_blob),
+                    hold: BlobHold::new(&held_blob),
                     reply,
                 },
                 answer,
@@ -496,7 +497,7 @@ fn a_blob_surface_is_scanned_out_once_and_each_present_flushes_the_blob() {
             assert_eq!(token.sequence, expected);
         }
         assert!(
-            held_blob.is_scanned_out(),
+            held_blob.is_retained(),
             "the surface holds the blob while it shows it"
         );
 
@@ -505,7 +506,7 @@ fn a_blob_surface_is_scanned_out_once_and_each_present_flushes_the_blob() {
         crate::yield_now().await;
     });
     assert!(
-        !held_blob.is_scanned_out(),
+        !held_blob.is_retained(),
         "the release lets the blob go, after blanking its scanout"
     );
 

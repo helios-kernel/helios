@@ -43,7 +43,7 @@ use triomphe::Arc;
 use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
 use crate::exec::{Notify, SequenceSignal};
-use crate::gpu::ScanoutHold;
+use crate::gpu::BlobHold;
 use crate::process::DisplayClaimCap;
 
 use super::DisplayServiceError;
@@ -139,7 +139,7 @@ pub(crate) enum ControlRequest {
         generation: u64,
         scanout: ScanoutId,
         layout: BlobScanout,
-        hold: ScanoutHold,
+        hold: BlobHold,
         reply: oneshot::Sender<Result<(), DisplayServiceError>>,
     },
     DestroySurface {

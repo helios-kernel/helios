@@ -58,7 +58,7 @@
 //! permit on the same [`Notify`] that has it resume.
 //!
 //! A blob a scanout shows is held by that scanout: the surface carries a
-//! [`ScanoutHold`] on the blob's [`BlobShared`], and the blob is not
+//! [`BlobHold`] on the blob's [`BlobShared`], and the blob is not
 //! destroyed — whether its handle was dropped or its session ended —
 //! until every hold is gone. The display path drops a hold only after it
 //! has blanked the scanout, so the device never scans out a resource
@@ -146,18 +146,20 @@ impl SessionState {
 /// about one blob.
 pub struct BlobShared {
     id: BlobId,
-    /// Scanouts showing the blob right now.
-    scanouts: AtomicU64,
+    /// Image capabilities and scanouts retaining the blob right now.
+    holds: AtomicU64,
+    size: u64,
     /// The control server's wake-up, banked when the last scanout lets
     /// go, so a release the scanout held back resumes.
     release: Arc<Notify>,
 }
 
 impl BlobShared {
-    pub(crate) fn new(id: BlobId, release: Arc<Notify>) -> Self {
+    pub(crate) fn new(id: BlobId, size: u64, release: Arc<Notify>) -> Self {
         Self {
             id,
-            scanouts: AtomicU64::new(0),
+            holds: AtomicU64::new(0),
+            size,
             release,
         }
     }
@@ -167,25 +169,30 @@ impl BlobShared {
         self.id
     }
 
-    /// Whether a scanout shows the blob.
-    pub fn is_scanned_out(&self) -> bool {
-        self.scanouts.load(Ordering::Acquire) != 0
+    /// The immutable byte length established when the device created the blob.
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Whether an image capability or scanout retains the blob.
+    pub fn is_retained(&self) -> bool {
+        self.holds.load(Ordering::Acquire) != 0
     }
 }
 
-/// One scanout's hold on a blob: the blob is not destroyed while it
-/// exists. Dropped by the display path once the scanout is blanked.
-pub struct ScanoutHold {
+/// An owned hold on a blob. Device destruction waits for every image
+/// capability and scanout to release its hold.
+pub struct BlobHold {
     blob: Arc<BlobShared>,
 }
 
-impl ScanoutHold {
-    /// Hold the blob for one scanout of it.
+impl BlobHold {
+    /// Retain the blob for a consumer independently of its creating handle.
     ///
     /// Taken in the store step that checks the blob's session is open,
     /// so a release that starts afterwards sees the hold.
     pub fn new(blob: &Arc<BlobShared>) -> Self {
-        blob.scanouts.fetch_add(1, Ordering::AcqRel);
+        blob.holds.fetch_add(1, Ordering::AcqRel);
         Self { blob: blob.clone() }
     }
 
@@ -195,9 +202,15 @@ impl ScanoutHold {
     }
 }
 
-impl Drop for ScanoutHold {
+impl Clone for BlobHold {
+    fn clone(&self) -> Self {
+        Self::new(&self.blob)
+    }
+}
+
+impl Drop for BlobHold {
     fn drop(&mut self) {
-        if self.blob.scanouts.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.blob.holds.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.blob.release.notify_one();
         }
     }

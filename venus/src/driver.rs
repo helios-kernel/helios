@@ -13,6 +13,9 @@ mod instance;
 mod memory;
 mod sync;
 
+#[cfg(feature = "helios")]
+pub(crate) use memory::with_blob;
+
 #[expect(
     non_snake_case,
     reason = "generated Vulkan entry points retain the registry's C names and signatures; all pointer access follows the entry caller's Vulkan contract"

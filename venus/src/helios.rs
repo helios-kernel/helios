@@ -21,6 +21,11 @@ mod bindings {
         world: "venus-host",
         generate_all,
         async: false,
+        with: {
+            "helios:system/gpu@0.1.0/image": helios_api::bindings::helios::system::gpu::Image,
+            "helios:system/gpu@0.1.0/image-layout": helios_api::image::ImageLayout,
+            "helios:system/gpu@0.1.0/pixel-format": helios_api::image::PixelFormat,
+        },
     });
 }
 
@@ -219,5 +224,31 @@ impl Transport for Context {
         self.context
             .execute(commands, ring, completion.as_ref())
             .map_err(Error::from)
+    }
+}
+
+/// Export Vulkan memory as an owned image for compositor presentation.
+///
+/// The exported image retains its storage independently of the allocation and
+/// does not change the application's Vulkan map/unmap state.
+///
+/// # Safety
+/// `device` must originate from this module's `Context` factory and `memory`
+/// must be a live allocation on it. `layout` must describe a linear image bound
+/// to that allocation. The caller synchronizes rendering with presentation.
+#[cfg(feature = "driver")]
+pub unsafe fn export_image(
+    device: ash::vk::Device,
+    memory: ash::vk::DeviceMemory,
+    layout: helios_api::image::ImageLayout,
+) -> Result<helios_api::image::Image, ash::vk::Result> {
+    // SAFETY: the caller supplies a live allocation from Context's entry table.
+    unsafe {
+        crate::driver::with_blob::<Context, _>(device, memory, |blob| {
+            blob.resource
+                .image(layout)
+                .map(Into::into)
+                .map_err(Error::from)
+        })
     }
 }

@@ -23,6 +23,7 @@ use helios_hal::display::{
     ContextId, ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult, RingCount, RingIndex,
     Submission,
 };
+use helios_hal::display::{DisplayMode, PixelFormat};
 use helios_hal::io::IoError;
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::vmm::VirtAddr;
@@ -38,11 +39,11 @@ use crate::test_support::TestCpu;
 use super::owner::{gpu3d_channels, serve_control, serve_submit};
 use super::service::{
     BlobShared, BlobSpec, CompletionSignal, ContextShared, ControlMessage, Gpu3dRequest,
-    Gpu3dSender, Gpu3dService, Gpu3dShared, InlineCommands, ScanoutHold, SubmitCommands,
-    SubmitCompletion, SubmitMessage, SubmitRequest,
+    Gpu3dSender, Gpu3dService, Gpu3dShared, InlineCommands, SubmitCommands, SubmitCompletion,
+    SubmitMessage, SubmitRequest,
 };
 use super::{
-    ContextRecord, Gpu3dOwnership, Gpu3dServiceError, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS,
+    ContextRecord, Gpu3dOwnership, Gpu3dServiceError, GpuImage, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS,
     MAX_GPU_VIEWS, MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS,
 };
 
@@ -1543,7 +1544,7 @@ fn an_ended_session_s_drain_does_not_stall_other_sessions() {
 /// asked for, and its session's end, wait for the scanout to let go,
 /// and only then is the blob destroyed — and its context after it.
 #[test]
-fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
+fn an_exported_image_retains_storage_until_its_last_scanout_retires() {
     test_hooks::install();
     let (shared, control, submit) = gpu3d_channels(true);
     let device = FakeGpu3d::new();
@@ -1562,8 +1563,19 @@ fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
         )
         .await
         .expect("the fake engine agrees");
-        // What a blob surface carries while it is presented.
-        let scanout = ScanoutHold::new(&blob);
+        let image = GpuImage::new(
+            &blob,
+            DisplayMode {
+                width: 4,
+                height: 4,
+            },
+            PixelFormat::Rgba8888,
+            0,
+            16,
+        )
+        .unwrap();
+        let (_, scanout) = image.clone().into_scanout();
+        drop(image);
 
         // The handle goes first.
         queue_destroy(&ownership, blob.id()).await;
@@ -1596,7 +1608,17 @@ fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
         )
         .await
         .expect("the fake engine agrees");
-        let scanout = ScanoutHold::new(&second);
+        let image = GpuImage::new(
+            &second,
+            DisplayMode {
+                width: 4,
+                height: 4,
+            },
+            PixelFormat::Rgba8888,
+            0,
+            16,
+        )
+        .unwrap();
         close(&mut ownership, &mut views);
         settle().await;
         assert!(!device.saw(&Call::DestroyBlob(second.id())));
@@ -1604,6 +1626,12 @@ fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
             !device.saw(&Call::DestroyContext(context.shared.id())),
             "nor does its context's, which goes after it"
         );
+        // A consumer may turn an exported image into a scanout after
+        // the producer session has ended: the capability owns its storage.
+        let (layout, scanout) = image.into_scanout();
+        assert_eq!(layout.blob, second.id());
+        settle().await;
+        assert!(!device.saw(&Call::DestroyBlob(second.id())));
         drop(scanout);
         settle().await;
         second.id()
@@ -1868,6 +1896,59 @@ mod component_host {
     use crate::wasmtime_adapter::component_host::service::test_store;
     use crate::wasmtime_adapter::component_host::service::{BlobHandle, CommandBufferHandle};
 
+    #[test]
+    fn exported_images_survive_their_source_session_but_stale_blobs_cannot_export() {
+        test_hooks::install();
+        let (shared, _control, _submit) = gpu3d_channels(true);
+        let service = Gpu3dService::from_shared(shared);
+        let mut data = test_store::store_data(&service);
+        let session = data
+            .device
+            .open_gpu(&service, &mut data.views, test_caps::gpu())
+            .expect("the engine renders");
+        let shared = Arc::new(BlobShared::new(
+            BlobId::new(9),
+            4096,
+            Arc::new(crate::exec::Notify::new()),
+        ));
+        let blob = data
+            .table
+            .push(BlobHandle {
+                session,
+                id: shared.id(),
+                shared: shared.clone(),
+                backing: None,
+                mapped: None,
+            })
+            .unwrap();
+        let layout = contract::ImageLayout {
+            width: 8,
+            height: 8,
+            format: contract::PixelFormat::Rgba8888,
+            offset: 32,
+            stride: 64,
+        };
+        let image = contract::HostBlob::image(&mut data, Resource::new_borrow(blob.rep()), layout)
+            .unwrap()
+            .unwrap();
+        assert!(shared.is_retained());
+        reopen(&mut data, &service, session);
+        let actual =
+            contract::Host::describe_image(&mut data, Resource::new_borrow(image.rep())).unwrap();
+        assert_eq!(
+            (actual.width, actual.height, actual.offset, actual.stride),
+            (8, 8, 32, 64)
+        );
+        assert!(matches!(
+            contract::HostBlob::image(&mut data, Resource::new_borrow(blob.rep()), layout).unwrap(),
+            Err(contract::Error::SessionEnded)
+        ));
+        contract::HostBlob::drop(&mut data, blob).unwrap();
+        assert!(shared.is_retained());
+        contract::HostImage::drop(&mut data, image).unwrap();
+        assert!(!shared.is_retained());
+    }
+
     /// Show a fresh 4 KiB buffer at wasm page `page` of the store's
     /// memory, in the open session's set.
     fn shown(data: &mut test_store::TestStoreData, page: u64) -> (Buffer, crate::ViewId) {
@@ -1930,6 +2011,7 @@ mod component_host {
                 id: BlobId::new(9),
                 shared: Arc::new(BlobShared::new(
                     BlobId::new(9),
+                    4096,
                     Arc::new(crate::exec::Notify::new()),
                 )),
                 backing: Some(backing),

@@ -250,6 +250,7 @@ pub mod gpu {
                     crate::wasmtime_adapter::component_host::ContextHandle,
                 "helios:system/gpu.command-buffer":
                     crate::wasmtime_adapter::component_host::CommandBufferHandle,
+                "helios:system/gpu.image": crate::gpu::GpuImage,
                 "helios:system/gpu.blob":
                     crate::wasmtime_adapter::component_host::BlobHandle,
             },

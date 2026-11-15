@@ -40,6 +40,35 @@ interface gpu {
   use memory.{span};
   use sync.{signal-point};
 
+  /// How the display engine reads the bytes of one pixel.
+  ///
+  /// The set is the eight 32-bit orderings a 2D display engine latches
+  /// directly; `x` names a byte the engine ignores and `a` one it reads
+  /// as alpha. Every one of them is four bytes wide; rows may include padding.
+  enum pixel-format {
+    bgrx8888,
+    bgra8888,
+    xrgb8888,
+    argb8888,
+    rgbx8888,
+    rgba8888,
+    xbgr8888,
+    abgr8888,
+  }
+
+  /// A linear image's immutable byte layout inside a blob.
+  record image-layout {
+    width: u32,
+    height: u32,
+    format: pixel-format,
+    offset: u32,
+    stride: u32,
+  }
+
+  /// Retains the blob independently of the originating GPU session.
+  resource image;
+  describe-image: func(image: borrow<image>) -> image-layout;
+
   /// Signals advance only when this fence retires successfully.
   record completion {
     fence: u64,
@@ -239,6 +268,9 @@ interface gpu {
   /// `map-blob`. Dropping the blob destroys it and makes every span it
   /// was shown at ordinary zeroed memory again.
   resource blob {
+    /// Validate a linear image and retain its storage for presentation.
+    image: func(layout: image-layout) -> result<image, error>;
+
     /// The virtio resource id the device knows this blob by: what a
     /// renderer's own protocol names it with, a Venus
     /// `vkAllocateMemory` importing it among them.

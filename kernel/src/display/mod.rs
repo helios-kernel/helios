@@ -111,10 +111,6 @@ pub enum DisplayServiceError {
     /// scan a blob out.
     #[error("this display engine cannot scan out a blob")]
     NoBlobScanout,
-    /// The blob was made under a gpu session its instance has since
-    /// ended.
-    #[error("the blob's gpu session has ended")]
-    StaleBlob,
     /// The display engine failed rather than refused.
     #[error("the display engine faulted")]
     DeviceFault,

@@ -21,6 +21,9 @@ pub mod display;
 mod error;
 #[cfg(feature = "fs")]
 pub mod fs;
+#[cfg(any(feature = "display", feature = "gpu", feature = "surface"))]
+pub mod image;
+
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(feature = "http")]
