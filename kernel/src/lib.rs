@@ -104,8 +104,7 @@ pub use device::{
 };
 pub use display::{
     DisplayClaim, DisplayOwnership, DisplaySender, DisplayService, DisplayServiceError, FrameToken,
-    MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, REQUEST_QUEUE_DEPTH, SequenceSignal,
-    install_display_device,
+    MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, REQUEST_QUEUE_DEPTH, install_display_device,
 };
 pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
@@ -120,11 +119,12 @@ pub use exec::{
     PrefixSetError, PressureLevel, ProcessorControl, ProcessorLifecycle, ProfileFilter,
     ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark, ProgressSignal,
     RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock,
-    RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding,
-    Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue,
-    UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
-    matches_trace_filter, monotonic_nanos, online_processor_count, parse_console_text,
-    wall_clock_offset_nanos, yield_now,
+    RwLockReadGuard, RwLockWriteGuard, SequenceSignal, SharedTimeline, SignalTimeline, Sleep,
+    Spawner, StatsSample, TaskCapacityError, TaskFunding, Timeline, TimelineError, TimelinePoint,
+    TimelineSource, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog,
+    TraceValue, UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter,
+    matches_profile_filter, matches_trace_filter, monotonic_nanos, online_processor_count,
+    parse_console_text, wait_timelines, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,

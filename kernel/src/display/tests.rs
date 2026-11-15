@@ -398,7 +398,7 @@ fn a_surface_is_attached_when_it_is_created_and_a_present_flushes_it() {
             .expect("the claim is held")
             .generation();
         let sender = ownership.claim_ref().expect("the claim is held").sender();
-        let vsync = Arc::new(super::SequenceSignal::new());
+        let vsync = Arc::new(crate::exec::SequenceSignal::new());
         let (reply, answer) = oneshot::channel();
         let token = sender
             .control(
@@ -477,7 +477,7 @@ fn a_blob_surface_is_scanned_out_once_and_each_present_flushes_the_blob() {
             .await
             .expect("the fake display agrees");
 
-        let vsync = Arc::new(super::SequenceSignal::new());
+        let vsync = Arc::new(crate::exec::SequenceSignal::new());
         for expected in 1..=2 {
             let (reply, answer) = oneshot::channel();
             let token = sender

@@ -61,8 +61,7 @@ pub const MAX_PINNED_FRAMES: usize = 16;
 
 pub(crate) use service::{ControlRequest, CursorRequest};
 pub use service::{
-    DisplayClaim, DisplaySender, DisplayService, FrameToken, REQUEST_QUEUE_DEPTH, SequenceSignal,
-    SurfaceSource,
+    DisplayClaim, DisplaySender, DisplayService, FrameToken, REQUEST_QUEUE_DEPTH, SurfaceSource,
 };
 
 /// Why a display request was refused.

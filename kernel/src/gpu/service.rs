@@ -83,8 +83,7 @@ use triomphe::Arc;
 
 use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
-use crate::display::SequenceSignal;
-use crate::exec::Notify;
+use crate::exec::{Notify, SequenceSignal};
 use crate::process::GpuOpenCap;
 
 use super::{Gpu3dServiceError, MAX_EXECUTE_BYTES};
