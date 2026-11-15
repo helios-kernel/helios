@@ -33,7 +33,7 @@ jobs:
   # `exclusive`, which reads only its own surfaces. A skipped lane
   # reports as skipped, which a required check counts as passing; no
   # ruleset on `dev` requires a lane of this workflow. A dispatch and a
-  # push to `dev` run every lane. A draft pull request is not a merge
+  # push to `dev` run every existing lane; Btrfs lanes also filter pushes. A draft pull request is not a merge
   # candidate and runs `lint-fmt` alone; marking it ready for review runs
   # the rest.
   #
@@ -71,8 +71,9 @@ jobs:
           sparse-checkout-cone-mode: false
       - uses: dorny/paths-filter@v4
         id: filter
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch'
         with:
+          base: ${{ github.event_name == 'pull_request' && github.base_ref || github.event.before }}
           # `shared` is everything no narrower surface claims, so a new
           # top-level path runs every lane until a surface claims it;
           # `docs/**` and Markdown run none, except the Wasmtime pin
@@ -161,11 +162,13 @@ jobs:
         env:
           CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
           DRAFT: ${{ github.event.pull_request.draft == true }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" '
+          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --arg event "${EVENT}" '
             to_entries
             | map(select($changed == null
+                or ($event == "push" and (.key != "test-btrfs-upstream" and .key != "test-btrfs-fuzz"))
                 or (.value.surfaces + (if .value.exclusive then [] else ["shared", "pin"] end)
                     | any(. as $surface | $changed | index($surface)))))
             | map(.key)
