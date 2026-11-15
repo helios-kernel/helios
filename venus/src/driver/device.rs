@@ -1,5 +1,6 @@
 use core::ffi::{CStr, c_char};
 use core::ptr::null;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ash::vk::{self, Handle};
@@ -13,8 +14,10 @@ use crate::protocol as wire;
 #[repr(C)]
 pub(super) struct Device<F: Factory> {
     dispatch: Dispatch<F>,
-    allocator: HostAllocator,
+    pub(super) allocator: HostAllocator,
     queues: Vec<Box<Queue<F>, HostAllocator>>,
+    pub(super) memories: BTreeMap<u64, Box<super::memory::Memory<F::Transport>, HostAllocator>>,
+    pub(super) pools: BTreeMap<u64, Box<super::command::Pool<F>, HostAllocator>>,
 }
 
 #[repr(C)]
@@ -50,6 +53,8 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
                 },
                 allocator,
                 queues: Vec::new(),
+                memories: BTreeMap::new(),
+                pools: BTreeMap::new(),
             },
             allocator,
         ) {
@@ -284,7 +289,7 @@ pub(super) fn lookup<F: Factory>(name: &[u8]) -> vk::PFN_vkVoidFunction {
         b"vkGetDeviceQueue2" => get_device_queue2::<F> as *const (),
         b"vkQueueWaitIdle" => queue_wait_idle::<F> as *const (),
         b"vkDeviceWaitIdle" => device_wait_idle::<F> as *const (),
-        _ => return None,
+        _ => return super::memory::lookup::<F>(name).or_else(|| super::command::lookup::<F>(name)),
     };
     // SAFETY: Vulkan resolves the erased pointer to the command's signature.
     Some(unsafe { core::mem::transmute::<*const (), unsafe extern "system" fn()>(pointer) })

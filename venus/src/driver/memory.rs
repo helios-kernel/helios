@@ -1,0 +1,230 @@
+use core::ffi::c_void;
+use core::num::NonZeroUsize;
+use core::ops::Range;
+use core::ptr::{null, null_mut};
+use core::sync::atomic::{Ordering, fence};
+
+use ash::vk::{self, Handle};
+
+use super::Factory;
+use super::allocator::HostAllocator;
+use super::instance::{State, TransportError, invoke_result, invoke_void, object, shared};
+use crate::connection::Error;
+use crate::protocol as wire;
+use crate::transport::{MappedBlob, Transport};
+
+pub(super) struct Memory<T: Transport> {
+    size: u64,
+    mapping: Option<Mapping<T>>,
+}
+
+struct Mapping<T: Transport> {
+    blob: T::Blob,
+    active: Option<Range<u64>>,
+}
+
+unsafe extern "system" fn allocate<F: Factory>(
+    device: vk::Device,
+    info: *const vk::MemoryAllocateInfo<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    output: *mut vk::DeviceMemory,
+) -> vk::Result {
+    // SAFETY: Vulkan requires writable output and a live device.
+    unsafe { *output = vk::DeviceMemory::null() };
+    let owner = unsafe { shared::<F>(object(device)) };
+    let device_id = unsafe { (*object(device)).id };
+    let mut state = owner.lock();
+    if state.fault.is_some() {
+        return vk::Result::ERROR_DEVICE_LOST;
+    }
+    let allocator = unsafe { HostAllocator::new(allocator, vk::SystemAllocationScope::OBJECT) };
+    let result = (|| -> Result<vk::Result, Error<TransportError<F>>> {
+        // SAFETY: the create-info remains live throughout this Vulkan call.
+        let allocation = Memory {
+            size: unsafe { (*info).allocation_size },
+            mapping: None,
+        };
+        let allocation = match Box::try_new_in(allocation, allocator) {
+            Ok(allocation) => allocation,
+            Err(_) => return Ok(vk::Result::ERROR_OUT_OF_HOST_MEMORY),
+        };
+        let mut handle = wire::VkDeviceMemory(state.connection.object_id()?);
+        // SAFETY: callback pointers are guest-only; the renderer allocates
+        // using its own allocator and the already assigned memory ID.
+        let result = unsafe {
+            wire::vn_call_vkAllocateMemory(
+                &mut state.connection,
+                wire::VkDevice(object(device)),
+                info.cast(),
+                null(),
+                &mut handle,
+            )
+        }?;
+        if result != wire::VK_SUCCESS {
+            return Ok(vk::Result::from_raw(result.0));
+        }
+        state
+            .devices
+            .get_mut(&device_id)
+            .unwrap()
+            .memories
+            .insert(handle.0, allocation);
+        // SAFETY: this transfers the registered Vulkan handle to the caller.
+        unsafe { *output = vk::DeviceMemory::from_raw(handle.0) };
+        Ok(vk::Result::SUCCESS)
+    })();
+    result.unwrap_or_else(|error| state.fail(error))
+}
+
+unsafe extern "system" fn free<F: Factory>(
+    device: vk::Device,
+    memory: vk::DeviceMemory,
+    _allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    if memory == vk::DeviceMemory::null() {
+        return;
+    }
+    // SAFETY: Vulkan requires a live allocation owned by device, without
+    // pending GPU accesses or resources still bound to it.
+    let owner = unsafe { shared::<F>(object(device)) };
+    let device_id = unsafe { (*object(device)).id };
+    let mut state = owner.lock();
+    let allocation = state
+        .devices
+        .get_mut(&device_id)
+        .unwrap()
+        .memories
+        .remove(&memory.as_raw())
+        .expect("freed Vulkan memory is owned by this device");
+    // Revoke guest mappings even after device loss, before renderer release.
+    drop(allocation);
+    if state.fault.is_none() {
+        let result = unsafe {
+            wire::vn_call_vkFreeMemory(
+                &mut state.connection,
+                wire::VkDevice(object(device)),
+                wire::VkDeviceMemory(memory.as_raw()),
+                null(),
+            )
+        };
+        if let Err(error) = result {
+            let _ = state.fail(error);
+        }
+    }
+}
+
+unsafe extern "system" fn map<F: Factory>(
+    device: vk::Device,
+    memory: vk::DeviceMemory,
+    offset: u64,
+    size: u64,
+    _flags: vk::MemoryMapFlags,
+    output: *mut *mut c_void,
+) -> vk::Result {
+    // SAFETY: Vulkan supplies a writable output pointer and valid range.
+    unsafe { *output = null_mut() };
+    let device_id = unsafe { (*object(device)).id };
+    let memory_id = memory.as_raw();
+    let result = unsafe {
+        invoke_result::<F>(object(device), |state| {
+            let State {
+                connection,
+                devices,
+                ..
+            } = state;
+            let memory = devices
+                .get_mut(&device_id)
+                .unwrap()
+                .memories
+                .get_mut(&memory_id)
+                .expect("mapped Vulkan memory is owned by this device");
+            if memory.mapping.is_none() {
+                let Ok(length) = usize::try_from(memory.size) else {
+                    return Ok(wire::VK_ERROR_MEMORY_MAP_FAILED);
+                };
+                let length =
+                    NonZeroUsize::new(length).expect("Vulkan mapped allocations are nonempty");
+                let blob = connection.memory_blob(wire::VkDeviceMemory(memory_id), length)?;
+                memory.mapping = Some(Mapping { blob, active: None });
+            }
+            let end = if size == vk::WHOLE_SIZE {
+                memory.size
+            } else {
+                offset + size
+            };
+            let mapping = memory.mapping.as_mut().unwrap();
+            mapping.active = Some(offset..end);
+            // SAFETY: Vulkan validates this range against the allocation; the
+            // whole allocation fits the guest address space and stays mapped.
+            *output = mapping.blob.pointer().as_ptr().add(offset as usize).cast();
+            Ok(wire::VK_SUCCESS)
+        })
+    };
+    vk::Result::from_raw(result.0)
+}
+
+unsafe extern "system" fn unmap<F: Factory>(device: vk::Device, memory: vk::DeviceMemory) {
+    // SAFETY: Vulkan requires a live, currently mapped allocation.
+    unsafe {
+        let device_id = (*object(device)).id;
+        invoke_void::<F>(object(device), |state| {
+            let memory = state
+                .devices
+                .get_mut(&device_id)
+                .unwrap()
+                .memories
+                .get_mut(&memory.as_raw())
+                .unwrap();
+            memory.mapping.as_mut().unwrap().active = None;
+            // As in Mesa's virtgpu backend, retain the coherent blob for
+            // remapping; only the application's mapping lifetime ends here.
+            Ok(())
+        });
+    }
+}
+
+unsafe extern "system" fn flush<F: Factory>(
+    device: vk::Device,
+    _count: u32,
+    _ranges: *const vk::MappedMemoryRange<'_>,
+) -> vk::Result {
+    // SAFETY: Vulkan supplies valid mapped ranges. MappedBlob guarantees
+    // coherence, so no device cache operation is needed; publish host writes.
+    let result = unsafe {
+        invoke_result::<F>(object(device), |_| {
+            fence(Ordering::Release);
+            Ok(wire::VK_SUCCESS)
+        })
+    };
+    vk::Result::from_raw(result.0)
+}
+
+unsafe extern "system" fn invalidate<F: Factory>(
+    device: vk::Device,
+    _count: u32,
+    _ranges: *const vk::MappedMemoryRange<'_>,
+) -> vk::Result {
+    // SAFETY: the caller has synchronized device writes. Coherent mappings
+    // need an acquire ordering point, not a renderer-side remapping request.
+    let result = unsafe {
+        invoke_result::<F>(object(device), |_| {
+            fence(Ordering::Acquire);
+            Ok(wire::VK_SUCCESS)
+        })
+    };
+    vk::Result::from_raw(result.0)
+}
+
+pub(super) fn lookup<F: Factory>(name: &[u8]) -> vk::PFN_vkVoidFunction {
+    let pointer = match name {
+        b"vkAllocateMemory" => allocate::<F> as *const (),
+        b"vkFreeMemory" => free::<F> as *const (),
+        b"vkMapMemory" => map::<F> as *const (),
+        b"vkUnmapMemory" => unmap::<F> as *const (),
+        b"vkFlushMappedMemoryRanges" => flush::<F> as *const (),
+        b"vkInvalidateMappedMemoryRanges" => invalidate::<F> as *const (),
+        _ => return None,
+    };
+    // SAFETY: Vulkan restores the function signature named by the lookup.
+    Some(unsafe { core::mem::transmute::<*const (), unsafe extern "system" fn()>(pointer) })
+}

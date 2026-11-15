@@ -479,6 +479,8 @@ mod entry_tests {
             wire::VK_COMMAND_TYPE_vkCreateInstance_EXT.0,
             wire::VK_COMMAND_TYPE_vkCreateDevice_EXT.0,
             wire::VK_COMMAND_TYPE_vkCreateBuffer_EXT.0,
+            wire::VK_COMMAND_TYPE_vkAllocateMemory_EXT.0,
+            wire::VK_COMMAND_TYPE_vkCreateCommandPool_EXT.0,
         ]
         .contains(&command)
         {
@@ -488,6 +490,24 @@ mod entry_tests {
                 word(commands, commands.len() - 8),
                 word(commands, commands.len() - 4),
             ]);
+        } else if command == wire::VK_COMMAND_TYPE_vkAllocateCommandBuffers_EXT.0 {
+            // The allocate-info ends with commandBufferCount; the output
+            // array carries an eight-byte count followed by object IDs.
+            let count = word(commands, 48);
+            words.extend([count, 0]);
+            for index in 0..count as usize {
+                words.extend([
+                    word(commands, 60 + index * 8),
+                    word(commands, 64 + index * 8),
+                ]);
+            }
+        } else if [
+            wire::VK_COMMAND_TYPE_vkBeginCommandBuffer_EXT.0,
+            wire::VK_COMMAND_TYPE_vkEndCommandBuffer_EXT.0,
+        ]
+        .contains(&command)
+        {
+            // These commands return only VkResult.
         } else if command == wire::VK_COMMAND_TYPE_vkGetDeviceQueue2_EXT.0 {
             // Void-returning commands omit VkResult from their reply.
             words.truncate(1);
@@ -637,6 +657,116 @@ mod entry_tests {
             second.destroy_buffer(second_buffer, None);
             second.device_wait_idle().unwrap();
             second.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    #[test]
+    fn ash_command_buffers_dispatch_through_their_pool_owner() {
+        let entry = entry::<TestFactory>();
+        // SAFETY: buffers are recorded and freed without any pending GPU use.
+        unsafe {
+            let instance = entry
+                .create_instance(&vk::InstanceCreateInfo::default(), None)
+                .unwrap();
+            let physical = instance.enumerate_physical_devices().unwrap()[0];
+            let priorities = [1.0];
+            let queues = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(0)
+                .queue_priorities(&priorities)];
+            let device = instance
+                .create_device(
+                    physical,
+                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                    None,
+                )
+                .unwrap();
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(0),
+                    None,
+                )
+                .unwrap();
+            let buffers = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(3),
+                )
+                .unwrap();
+            assert_eq!(buffers.len(), 3);
+            assert_ne!(buffers[0], buffers[1]);
+            assert_ne!(buffers[1], buffers[2]);
+            for &buffer in &buffers {
+                device
+                    .begin_command_buffer(buffer, &vk::CommandBufferBeginInfo::default())
+                    .unwrap();
+                device.end_command_buffer(buffer).unwrap();
+            }
+            device.free_command_buffers(pool, &[buffers[0], vk::CommandBuffer::null()]);
+            // Pool destruction implicitly frees the remaining two buffers.
+            device.destroy_command_pool(pool, None);
+            device.device_wait_idle().unwrap();
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    #[test]
+    fn ash_memory_maps_offsets_and_retains_its_blob_across_remaps() {
+        let entry = entry::<TestFactory>();
+        // SAFETY: the test owns every object and performs no GPU work while
+        // accessing its coherent mapped allocation.
+        unsafe {
+            let instance = entry
+                .create_instance(&vk::InstanceCreateInfo::default(), None)
+                .unwrap();
+            let physical = instance.enumerate_physical_devices().unwrap()[0];
+            let priorities = [1.0];
+            let queues = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(0)
+                .queue_priorities(&priorities)];
+            let device = instance
+                .create_device(
+                    physical,
+                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                    None,
+                )
+                .unwrap();
+            let memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(4096)
+                        .memory_type_index(0),
+                    None,
+                )
+                .unwrap();
+            let part = device
+                .map_memory(memory, 256, 256, vk::MemoryMapFlags::empty())
+                .unwrap()
+                .cast::<u32>();
+            for index in 0..8 {
+                part.add(index).write_volatile(index as u32 + 17);
+            }
+            let range = [vk::MappedMemoryRange::default()
+                .memory(memory)
+                .offset(256)
+                .size(256)];
+            device.flush_mapped_memory_ranges(&range).unwrap();
+            device.unmap_memory(memory);
+            let full = device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .unwrap()
+                .cast::<u32>();
+            device.invalidate_mapped_memory_ranges(&range).unwrap();
+            assert_eq!(full.add(64), part);
+            for index in 0..8 {
+                assert_eq!(full.add(index + 64).read_volatile(), index as u32 + 17);
+            }
+            device.unmap_memory(memory);
+            device.free_memory(memory, None);
+            device.destroy_device(None);
             instance.destroy_instance(None);
         }
     }

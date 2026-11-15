@@ -6,9 +6,11 @@
 //! asynchronous. There is no process-global registry or current connection.
 
 mod allocator;
+mod command;
 mod device;
 mod exclusive;
 mod instance;
+mod memory;
 
 #[expect(
     non_snake_case,
