@@ -1084,7 +1084,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     };
 
     #[cfg(helios_hv_self_test)]
-    kernel.spawn_local_detached(hv::self_test::run(cpu));
+    kernel.spawn_local_detached(hv::self_test::run(cpu, kernel.processor_control()));
 
     helios_kernel::run_component_host_processor_forever(
         cpu,

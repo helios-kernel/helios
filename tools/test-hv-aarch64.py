@@ -7,7 +7,6 @@ import logging
 import os
 from pathlib import Path
 import selectors
-import signal
 import socket
 import subprocess
 import time
@@ -21,7 +20,10 @@ def quit_vm(runtime_dir):
         connection.settimeout(5)
         connection.connect(str(endpoint))
         with connection.makefile("rwb", buffering=0) as stream:
-            json.loads(stream.readline())
+            greeting = stream.readline()
+            if not greeting:
+                return  # QEMU exited while its socket was still present.
+            json.loads(greeting)
             for command in ("qmp_capabilities", "quit"):
                 stream.write(json.dumps({"execute": command}).encode() + b"\n")
                 while True:
@@ -46,7 +48,7 @@ def main():
     args.runtime_dir.mkdir(parents=True, exist_ok=True)
     command = [
         args.inspector, "vm", "--arch", "aarch64", "--accel", "tcg",
-        "--cpu", "max", "--smp", "2", "--boot-program", "init",
+        "--cpu", "max", "--smp", "3", "--boot-program", "init",
         "--boot-program", "debugger", "--qemu-arg=-machine",
         "--qemu-arg=virtualization=on", "--runtime-dir", str(args.runtime_dir),
         "--keep-runtime-dir",
@@ -90,17 +92,17 @@ def main():
         finally:
             # QEMU owns a separate process group. Stop it through its own
             # monitor before stopping the inspector and build subprocesses.
-            quit_vm(args.runtime_dir)
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=10)
-            process.stdout.close()
+                quit_vm(args.runtime_dir)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+                process.stdout.close()
 
 
 if __name__ == "__main__":

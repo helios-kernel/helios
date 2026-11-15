@@ -12,7 +12,9 @@ use helios_hal::hv::{
 };
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::PageFlags;
-use helios_kernel::{allocate_user_run_zeroed_on, deallocate_user_run_on};
+use helios_kernel::{
+    ProcessorControl, ProcessorLifecycle, allocate_user_run_zeroed_on, deallocate_user_run_on,
+};
 use triomphe::Arc;
 
 struct TestPage {
@@ -70,7 +72,7 @@ impl Remote {
     }
 }
 
-pub(crate) async fn run(cpu: crate::Aarch64Cpu) {
+pub(crate) async fn run(cpu: crate::Aarch64Cpu, control: ProcessorControl<crate::Aarch64Cpu>) {
     let owner = current_processor();
     let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE).unwrap();
     let page = TestPage {
@@ -276,5 +278,15 @@ pub(crate) async fn run(cpu: crate::Aarch64Cpu) {
     drop(vcpu);
     drop(space);
     drop(page);
+    let resumed = ProcessorId::new(2);
+    assert!(
+        control.is_online(resumed),
+        "HV lifecycle test requires three online processors"
+    );
+    control.offline(resumed).await.unwrap();
+    assert!(!control.is_online(resumed));
+    control.online(resumed).await.unwrap();
+    assert!(control.is_online(resumed));
+    tracing::info!("HV self-test: EL2 processor offline/online completed");
     tracing::info!("HV self-test: complete");
 }
