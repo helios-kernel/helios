@@ -27,6 +27,8 @@
 //! [`HttpBody`] so that whoever consumes the body on the far side reports the
 //! verdict straight back to the producing guest.
 
+use alloc::borrow::Cow;
+
 use super::*;
 use crate::ComponentHostNetwork;
 
@@ -708,65 +710,64 @@ where
 
     fn from_list(
         &mut self,
-        entries: Vec<(String, Vec<u8>)>,
+        entries: Vec<(Cow<'_, str>, &[u8])>,
     ) -> core::result::Result<Resource<HttpFields>, HttpHeaderTrapError> {
         let entries = entries
             .into_iter()
-            .map(|(name, value)| (name, Bytes::from(value)))
-            .collect();
+            .map(|(name, value)| (name, Bytes::copy_from_slice(value)));
         let fields = HttpFields::from_list(entries).map_err(header_error)?;
         self.table.push(fields).map_err(header_trap)
     }
 
-    fn get(&mut self, fields: Resource<HttpFields>, name: String) -> Result<Vec<Vec<u8>>> {
+    fn get(&mut self, fields: Resource<HttpFields>, name: &str) -> Result<Vec<Vec<u8>>> {
         let fields = self.table.get(&fields)?;
         Ok(fields
-            .get(&name)
+            .get(name)
             .into_iter()
             .map(|value| value.to_vec())
             .collect())
     }
 
-    fn has(&mut self, fields: Resource<HttpFields>, name: String) -> Result<bool> {
-        Ok(self.table.get(&fields)?.has(&name))
+    fn has(&mut self, fields: Resource<HttpFields>, name: &str) -> Result<bool> {
+        Ok(self.table.get(&fields)?.has(name))
     }
 
     fn set(
         &mut self,
         fields: Resource<HttpFields>,
-        name: String,
-        values: Vec<Vec<u8>>,
+        name: &str,
+        values: Vec<&[u8]>,
     ) -> core::result::Result<(), HttpHeaderTrapError> {
-        let values = values.into_iter().map(Bytes::from).collect();
+        let values = values.into_iter().map(Bytes::copy_from_slice).collect();
         self.table
             .get_mut(&fields)
             .map_err(header_trap)?
-            .set(&name, values)
+            .set(name, values)
             .map_err(header_error)
     }
 
     fn delete(
         &mut self,
         fields: Resource<HttpFields>,
-        name: String,
+        name: &str,
     ) -> core::result::Result<(), HttpHeaderTrapError> {
         self.table
             .get_mut(&fields)
             .map_err(header_trap)?
-            .delete(&name)
+            .delete(name)
             .map_err(header_error)
     }
 
     fn get_and_delete(
         &mut self,
         fields: Resource<HttpFields>,
-        name: String,
+        name: &str,
     ) -> core::result::Result<Vec<Vec<u8>>, HttpHeaderTrapError> {
         let removed = self
             .table
             .get_mut(&fields)
             .map_err(header_trap)?
-            .get_and_delete(&name)
+            .get_and_delete(name)
             .map_err(header_error)?;
         Ok(removed.into_iter().map(|value| value.to_vec()).collect())
     }
@@ -774,13 +775,13 @@ where
     fn append(
         &mut self,
         fields: Resource<HttpFields>,
-        name: String,
-        value: Vec<u8>,
+        name: &str,
+        value: &[u8],
     ) -> core::result::Result<(), HttpHeaderTrapError> {
         self.table
             .get_mut(&fields)
             .map_err(header_trap)?
-            .append(&name, Bytes::from(value))
+            .append(name, Bytes::copy_from_slice(value))
             .map_err(header_error)
     }
 
@@ -1209,3 +1210,50 @@ where
 /// it as an import.
 #[cfg(test)]
 pub(crate) const LINKED_INTERFACES: &[&str] = &["wasi:http/types", "wasi:http/client"];
+
+#[cfg(test)]
+mod borrowed_fields_tests {
+    use super::*;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use alloc::vec;
+    use http_types::HostFields;
+
+    #[test]
+    fn borrowed_fields_keep_final_values_after_input_release() {
+        let mut store = test_store::store_data_with(|_| {});
+        let name = String::from("X-Input");
+        let bytes = "中文、日本語、한국어".as_bytes().to_vec();
+        let fields =
+            HostFields::from_list(&mut store, vec![(Cow::Borrowed(&name), &bytes)]).unwrap();
+        let rep = fields.rep();
+        drop(name);
+        drop(bytes);
+        assert_eq!(
+            HostFields::get(&mut store, Resource::new_borrow(rep), "x-input").unwrap(),
+            vec!["中文、日本語、한국어".as_bytes().to_vec()]
+        );
+        HostFields::append(&mut store, Resource::new_borrow(rep), "X-Input", b"second").unwrap();
+        HostFields::set(
+            &mut store,
+            Resource::new_borrow(rep),
+            "x-input",
+            vec![b"replacement"],
+        )
+        .unwrap();
+        assert_eq!(
+            HostFields::get_and_delete(&mut store, Resource::new_borrow(rep), "X-INPUT").unwrap(),
+            vec![b"replacement".to_vec()]
+        );
+        assert!(!HostFields::has(&mut store, Resource::new_borrow(rep), "x-input").unwrap());
+        assert!(
+            HostFields::append(&mut store, Resource::new_borrow(rep), "host", b"invalid").is_err()
+        );
+        let immutable = store.table.delete(fields).unwrap().into_immutable();
+        let immutable = store.table.push(immutable).unwrap();
+        let error = HostFields::delete(&mut store, immutable, "x-input").unwrap_err();
+        assert!(matches!(
+            error.downcast().unwrap(),
+            http_types::HeaderError::Immutable
+        ));
+    }
+}
