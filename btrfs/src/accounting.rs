@@ -8,7 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::Key;
-use crate::allocation::data::{DataBackref, DataDefect, DataExtent};
+use crate::allocation::data::{DataBackref, DataDefect, DataExtent, DataReference};
 use crate::allocation::{AllocationDefect, MetadataExtent, MetadataReference};
 use crate::checksums::Checksums;
 use crate::free_space::FreeTree;
@@ -44,6 +44,47 @@ pub(crate) struct Accounting {
 }
 
 impl Accounting {
+    /// Stage newly allocated, checksummed data. Failure aborts the enclosing
+    /// transaction; no published root can reach the reservation yet.
+    #[cfg(feature = "write")]
+    pub(crate) async fn stage_data<S: crate::source::BlockSink>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        bytes: &[u8],
+        reference: DataReference,
+        concurrency: core::num::NonZeroUsize,
+    ) -> Result<Key, WriteError> {
+        let key = self
+            .allocate_data(volume, trees, space, bytes.len() as u64, reference)
+            .await?;
+        self.checksums
+            .set(volume, trees, space, key.objectid, bytes)
+            .await?;
+        volume.stage(key.objectid, bytes, concurrency).await?;
+        Ok(key)
+    }
+
+    /// Reserve an unpublished data extent and register its first file mapping.
+    /// The transaction must stage the data and its checksums before commit.
+    pub(crate) async fn allocate_data<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        length: u64,
+        reference: DataReference,
+    ) -> Result<Key, WriteError> {
+        let address = space.reserve_data(length)?;
+        let key = Key::new(address, item_type::EXTENT_ITEM, length);
+        let extent = DataExtent::new(trees.generation(), reference);
+        self.root = trees
+            .apply(volume, self.root, key, Some(&extent.encode()), space)
+            .await?;
+        Ok(key)
+    }
+
     /// Change a counted data reference. The signed delta represents file extent
     /// items, not bytes. A zero result retires the whole physical allocation;
     /// it does not make that range reusable before commit/read-side retirement.
@@ -155,7 +196,9 @@ impl Accounting {
                     key.objectid..key.objectid + key.offset,
                 )
                 .await?;
-            self.retired_extents.insert(key.objectid, key.offset);
+            if !space.cancel_data(key.objectid) {
+                self.retired_extents.insert(key.objectid, key.offset);
+            }
         }
         Ok(refs == 0)
     }

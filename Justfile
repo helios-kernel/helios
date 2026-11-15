@@ -71,7 +71,7 @@ clippy-host:
     # venus-protocol inputs when it builds.
     cargo run -p helios-cli --quiet -- venus-protocol-fetch
     cargo clippy \
-        --workspace --all-targets \
+        --workspace --all-targets --features helios-btrfs/write \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
         --exclude helios-audio-test --exclude helios-compositor --exclude helios-cpu \
@@ -135,10 +135,10 @@ test-libraries:
     # capture check that links it.
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-inspector-protocol --lib
-    # The btrfs reader mounts images two pure-Rust writers build, intact
-    # and damaged. Images from `mkfs.btrfs` need btrfs-progs and run in
+    # Btrfs reader and transaction tests use images two pure-Rust writers build.
+    # Images from `mkfs.btrfs` need btrfs-progs and run in
     # `test-btrfs-mkfs`.
-    cargo nextest run -p helios-btrfs
+    cargo nextest run -p helios-btrfs --features write
     # The Venus protocol is generated from pinned venus-protocol inputs that
     # the CLI fetches and hash-verifies; the parity test then compares the
     # generated encoders with the pinned Mesa generator's output.

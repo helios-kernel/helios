@@ -151,6 +151,15 @@ pub(crate) struct DataExtent {
 }
 
 impl DataExtent {
+    pub(crate) fn new(generation: u64, reference: DataReference) -> Self {
+        Self {
+            refs: 1,
+            generation,
+            roots: BTreeMap::from([(reference, 1)]),
+            parents: BTreeMap::new(),
+        }
+    }
+
     pub(crate) fn parse(key: Key, bytes: &[u8], sector: u32) -> Result<Self, DataDefect> {
         let header: &RawExtent = view(bytes).ok_or(DataDefect::Truncated)?;
         let sector = u64::from(sector);

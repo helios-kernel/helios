@@ -32,6 +32,20 @@ impl BlockSource for Disk {
     }
 }
 
+#[cfg(feature = "write")]
+impl crate::source::BlockSink for Disk {
+    async fn stage(&self, block: u64, bytes: &[u8; 4096]) -> IoResult<()> {
+        self.0
+            .write_all_at(bytes, block * crate::source::READ_ALIGNMENT)
+            .map_err(|_| IoError::DeviceFault)
+    }
+    async fn commit(&self, block: u64, bytes: &[u8; 4096]) -> IoResult<()> {
+        self.0.sync_all().map_err(|_| IoError::DeviceFault)?;
+        self.stage(block, bytes).await?;
+        self.0.sync_all().map_err(|_| IoError::DeviceFault)
+    }
+}
+
 fn filesystem() -> Filesystem<Disk> {
     filesystem_image().0
 }
@@ -330,6 +344,217 @@ fn root_node(fs: &Filesystem<Disk>) -> Node {
         },
     ))
     .unwrap()
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn data_staging_writes_all_copies_without_publishing_roots() {
+    block_on(async {
+        use crate::accounting::Accounting;
+        use crate::allocation::data::DataReference;
+        use crate::ondisk::objectid;
+
+        let (fs, image) = filesystem_image();
+        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+            .await
+            .unwrap();
+        let extent_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
+            .await
+            .unwrap()
+            .root;
+        let mut accounting = Accounting::new(&fs.volume, extent_root, &space, fs.csum_tree)
+            .await
+            .unwrap();
+        let mut trees = Trees::new(
+            fs.superblock().generation() + 1,
+            fs.superblock().csum_type(),
+        );
+        let concurrency = std::thread::available_parallelism().unwrap();
+        let bytes: Vec<_> = (0..32768).map(|index| (index % 251) as u8).collect();
+        let reference = DataReference {
+            root: 5,
+            inode: 256,
+            offset: 0,
+        };
+        let key = accounting
+            .stage_data(
+                &fs.volume,
+                &mut trees,
+                &mut space,
+                &bytes,
+                reference,
+                concurrency,
+            )
+            .await
+            .unwrap();
+        let mut actual = vec![0; bytes.len()];
+        for physical in fs.volume.chunks().map(key.objectid, key.offset).unwrap() {
+            image.read_exact_at(&mut actual, physical).unwrap();
+            assert_eq!(actual, bytes);
+        }
+        let sums = trees
+            .get(
+                &fs.volume,
+                accounting.checksum_root(),
+                crate::checksums::key(key.objectid),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let algorithm = fs.superblock().csum_type();
+        for (sector, digest) in bytes
+            .chunks_exact(fs.superblock().sectorsize() as usize)
+            .zip(sums.chunks_exact(algorithm.size()))
+        {
+            assert!(algorithm.verifies(sector, digest));
+        }
+        accounting
+            .sync_allocations(&fs.volume, &mut trees, &mut space)
+            .await
+            .unwrap();
+        let mut copies_seen = 0;
+        for (logical, bytes) in trees.blocks() {
+            fs.volume.stage(logical, bytes, concurrency).await.unwrap();
+            let copies = fs.volume.chunks().map(logical, bytes.len() as u64).unwrap();
+            copies_seen = copies_seen.max(copies.len());
+            let mut actual = vec![0; bytes.len()];
+            for physical in copies {
+                image.read_exact_at(&mut actual, physical).unwrap();
+                assert_eq!(actual, bytes);
+            }
+        }
+        assert_eq!(copies_seen, 2);
+        let reopened = Filesystem::mount(Disk(image)).await.unwrap();
+        assert_eq!(
+            reopened.superblock().generation(),
+            fs.superblock().generation()
+        );
+        assert_eq!(
+            reopened.default_subvolume.root.bytenr,
+            fs.default_subvolume.root.bytenr
+        );
+        assert!(
+            trees
+                .get(&fs.volume, extent_root, key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn private_data_allocations_register_cancel_and_reuse_their_full_ranges() {
+    block_on(async {
+        use crate::accounting::{Accounting, DataChange};
+        use crate::allocation::data::{DataExtent, DataReference};
+        use crate::ondisk::objectid;
+        use crate::space::SpaceError;
+
+        for (separate, free_tree) in [(true, true), (false, true), (false, false)] {
+            let (fs, _) = filesystem_image_with_features(separate, free_tree);
+            let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+                .await
+                .unwrap();
+            let root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
+                .await
+                .unwrap()
+                .root;
+            let mut accounting = Accounting::new(&fs.volume, root, &space, fs.csum_tree)
+                .await
+                .unwrap();
+            let mut trees = Trees::new(
+                fs.superblock().generation() + 1,
+                fs.superblock().csum_type(),
+            );
+            let sector = u64::from(fs.superblock().sectorsize());
+            assert!(matches!(
+                space.reserve_data(0),
+                Err(SpaceError::DataLength { .. })
+            ));
+            assert!(matches!(
+                space.reserve_data(sector + 1),
+                Err(SpaceError::DataLength { .. })
+            ));
+            let reference = DataReference {
+                root: 5,
+                inode: 256,
+                offset: 0,
+            };
+            let first = accounting
+                .allocate_data(&fs.volume, &mut trees, &mut space, 3 * sector, reference)
+                .await
+                .unwrap();
+            let second = accounting
+                .allocate_data(&fs.volume, &mut trees, &mut space, 5 * sector, reference)
+                .await
+                .unwrap();
+            assert_eq!(second.objectid, first.objectid + first.offset);
+            assert!(matches!(
+                space.reserve_data(u64::MAX - (sector - 1)),
+                Err(SpaceError::Exhausted { .. })
+            ));
+            accounting
+                .sync_allocations(&fs.volume, &mut trees, &mut space)
+                .await
+                .unwrap();
+            verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
+            for key in [first, second] {
+                let bytes = trees
+                    .get(&fs.volume, accounting.root, key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let extent = DataExtent::parse(key, &bytes, fs.superblock().sectorsize()).unwrap();
+                assert_eq!(extent.refs, 1);
+                assert_eq!(extent.generation, trees.generation());
+                assert_eq!(extent.roots[&reference], 1);
+                let independent = btrfs_disk::items::ExtentItem::parse(
+                    &bytes,
+                    &btrfs_disk::tree::DiskKey {
+                        objectid: key.objectid,
+                        key_type: btrfs_disk::tree::KeyType::ExtentItem,
+                        offset: key.offset,
+                    },
+                )
+                .unwrap();
+                assert!(independent.is_data());
+                assert_eq!(independent.refs, 1);
+                assert!(trees.get(&fs.volume, root, key).await.unwrap().is_none());
+                assert!(
+                    accounting
+                        .update_data(
+                            &fs.volume,
+                            &mut trees,
+                            &mut space,
+                            DataChange {
+                                key,
+                                reference,
+                                delta: -1
+                            }
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+            accounting
+                .sync_allocations(&fs.volume, &mut trees, &mut space)
+                .await
+                .unwrap();
+            verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
+            let combined = accounting
+                .allocate_data(&fs.volume, &mut trees, &mut space, 8 * sector, reference)
+                .await
+                .unwrap();
+            assert_eq!(combined.objectid, first.objectid);
+            accounting
+                .sync_allocations(&fs.volume, &mut trees, &mut space)
+                .await
+                .unwrap();
+            verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
+            assert!(!space.cancel_data(fs.default_subvolume.root.bytenr));
+        }
+    });
 }
 
 #[test]

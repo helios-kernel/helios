@@ -17,6 +17,8 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[error("staging range at {logical} with {bytes} bytes is empty or not block-aligned")]
+    StagingRange { logical: u64, bytes: usize },
     #[error(transparent)]
     Read(#[from] Error),
     #[error(transparent)]

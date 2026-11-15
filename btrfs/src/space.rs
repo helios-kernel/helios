@@ -39,6 +39,8 @@ pub(crate) enum SpaceError {
     },
     #[error("no free block-group range can hold {bytes} bytes with flags {flags:#x}")]
     Exhausted { bytes: u64, flags: u64 },
+    #[error("data reservation length {bytes} must be a nonzero multiple of sector size {sector}")]
+    DataLength { bytes: u64, sector: u64 },
 }
 
 #[derive(Debug, Error)]
@@ -116,6 +118,7 @@ pub(crate) struct Space {
     nodesize: u64,
     sector: u64,
     metadata: BTreeMap<u64, MetadataReservation>,
+    data: BTreeMap<u64, u64>,
 }
 
 impl Space {
@@ -181,6 +184,7 @@ impl Space {
             nodesize: u64::from(sb.nodesize()),
             sector: u64::from(sb.sectorsize()),
             metadata: BTreeMap::new(),
+            data: BTreeMap::new(),
         };
         let mut cursor = Cursor::ceiling(volume, extent_root, Key::new(0, 0, 0)).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
@@ -278,6 +282,40 @@ impl Space {
         })
     }
 
+    pub(crate) fn reserve_data(&mut self, length: u64) -> Result<u64, SpaceError> {
+        if length == 0 || !length.is_multiple_of(self.sector) {
+            return Err(SpaceError::DataLength {
+                bytes: length,
+                sector: self.sector,
+            });
+        }
+        let address = self.reserve(length, DATA)?;
+        self.data.insert(address, length);
+        Ok(address)
+    }
+
+    /// Only unpublished allocations can be canceled. A committed extent must
+    /// stay pinned for readers even after its final reference is removed.
+    pub(crate) fn cancel_data(&mut self, address: u64) -> bool {
+        let Some(length) = self.data.remove(&address) else {
+            return false;
+        };
+        self.release_private(address..address + length);
+        true
+    }
+
+    fn release_private(&mut self, range: Range<u64>) {
+        let group = self
+            .groups
+            .iter_mut()
+            .find(|group| group.contains(&range))
+            .expect("reservation belongs to its block group");
+        group
+            .free
+            .release(range)
+            .expect("private reservation is allocated");
+    }
+
     /// Free-space-tree state after commit. Unlike allocation availability, this
     /// includes free superblock stripes and extents retired from the old roots.
     pub(crate) fn committed_free(
@@ -324,7 +362,12 @@ impl Space {
             .iter()
             .map(|group| {
                 let range = group.start..group.start + group.length;
-                let added = self.metadata.range(range.clone()).count() as u64 * self.nodesize;
+                let added = self.metadata.range(range.clone()).count() as u64 * self.nodesize
+                    + self
+                        .data
+                        .range(range.clone())
+                        .map(|(_, &length)| length)
+                        .sum::<u64>();
                 let removed = retired.range(range).map(|(_, &length)| length).sum::<u64>();
                 let key = Key::new(group.start, item_type::BLOCK_GROUP_ITEM, group.length);
                 let used = group
@@ -354,16 +397,7 @@ impl Space {
         if self.metadata.remove(&address).is_none() {
             return false;
         }
-        let range = address..address + self.nodesize;
-        let group = self
-            .groups
-            .iter_mut()
-            .find(|group| group.contains(&range))
-            .expect("reservation belongs to its block group");
-        group
-            .free
-            .release(range)
-            .expect("private reservation is allocated");
+        self.release_private(address..address + self.nodesize);
         true
     }
 
