@@ -75,11 +75,9 @@ where
 {
     type Item = u8;
 
-    /// Copy the guest's batch into the store's stdout/stderr sink.
-    ///
-    /// A child-pipe sink is bounded, so this parks — `pending` keeps the
-    /// bytes and `poll_write_output_bytes` registers the waker — instead
-    /// of dropping the batch or reporting a spurious error.
+    /// Deliver local output directly from the stream's source buffer.
+    /// A child pipe owns its queued bytes, so that path transfers an owned
+    /// batch and keeps it across backpressure until the queue accepts it.
     fn poll_consume(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -87,6 +85,42 @@ where
         mut source: Source<'_, Self::Item>,
         _: bool,
     ) -> Poll<Result<StreamResult>> {
+        let local_output = {
+            let state = (self.getter)(store.data_mut());
+            match state.output_mode().sink(self.stream, state.instance().id()) {
+                crate::ComponentOutputSink::Local(sink) => Some((
+                    sink,
+                    state.cpu.clone(),
+                    state.runtime_state.clone(),
+                    state.serial_writer(),
+                )),
+                crate::ComponentOutputSink::Child(_) => None,
+            }
+        };
+        if let Some((sink, cpu, runtime, writer)) = local_output {
+            // Arm before trying the port. Unconsumed bytes remain owned by
+            // the stream while it is parked; no guest borrow survives a poll.
+            let wait = self
+                .serial_wait
+                .get_or_insert_with(|| writer.debug_serial_output_waiter());
+            let mut source = source.as_direct(store);
+            loop {
+                let bytes = source.remaining();
+                if bytes.is_empty() {
+                    return Poll::Ready(Ok(StreamResult::Completed));
+                }
+                let written = sink.write(&cpu, &runtime, writer, bytes);
+                source.mark_read(written);
+                if source.remaining().is_empty() {
+                    return Poll::Ready(Ok(StreamResult::Completed));
+                }
+                match writer.poll_debug_serial_output_ready(cx, wait) {
+                    Poll::Ready(()) => continue,
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+
         if self.pending.is_none() {
             let available = source.remaining(&mut store);
             if available == 0 {
@@ -317,6 +351,94 @@ impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => Poll::Ready(Ok(StreamResult::Completed)),
             Poll::Ready(Err(_closed)) => Poll::Ready(Ok(StreamResult::Dropped)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_output_tests {
+    use super::*;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use wasmtime::component::WriteBuffer;
+
+    #[derive(Default)]
+    struct Reads {
+        skipped: AtomicUsize,
+        moved: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct TrackedBuffer {
+        bytes: &'static [u8],
+        reads: Arc<Reads>,
+    }
+
+    // SAFETY: take passes only initialized bytes and advances by exactly count.
+    unsafe impl WriteBuffer<u8> for TrackedBuffer {
+        fn remaining(&self) -> &[u8] {
+            self.bytes
+        }
+        fn skip(&mut self, count: usize) {
+            self.bytes = &self.bytes[count..];
+            self.reads.skipped.fetch_add(count, Ordering::Relaxed);
+        }
+        fn take(&mut self, count: usize, fun: &mut dyn FnMut(&[MaybeUninit<u8>])) {
+            let bytes = &self.bytes[..count];
+            // SAFETY: MaybeUninit<u8> has u8's layout and all bytes are initialized.
+            fun(unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) });
+            self.bytes = &self.bytes[count..];
+            self.reads.moved.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    impl StreamProducer<test_store::TestStoreData> for TrackedBuffer {
+        type Item = u8;
+        type Buffer = Self;
+        fn poll_produce<'a>(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: wasmtime::StoreContextMut<'a, test_store::TestStoreData>,
+            mut destination: Destination<'a, u8, Self>,
+            _: bool,
+        ) -> Poll<Result<StreamResult>> {
+            destination.set_buffer(core::mem::take(self.get_mut()));
+            Poll::Ready(Ok(StreamResult::Dropped))
+        }
+    }
+
+    #[test]
+    fn local_output_consumes_source_without_moving_bytes() {
+        for bytes in [
+            b"".as_slice(),
+            "first\n中文\n日本語\n한국어\ntail".as_bytes(),
+        ] {
+            let reads = Arc::new(Reads::default());
+            let mut config = wasmtime::Config::new();
+            config
+                .wasm_component_model(true)
+                .wasm_component_model_async(true);
+            let engine = wasmtime::Engine::new(&config).expect("stream engine");
+            let mut store = wasmtime::Store::new(&engine, test_store::store_data_with(|_| {}));
+            let (tx, rx) = oneshot::channel();
+            let consumer = SerialStreamConsumer::new(|state| state, tx, OutputStreamKind::Stdout);
+            let source = TrackedBuffer {
+                bytes,
+                reads: reads.clone(),
+            };
+            futures_lite::future::block_on(store.run_concurrent(async |accessor| {
+                accessor
+                    .with(|mut store| StreamReader::new(&mut store, source)?.pipe(store, consumer))
+                    .expect("connect stream");
+                rx.await
+                    .expect("completion sent")
+                    .expect("output completed");
+            }))
+            .expect("stream event loop");
+            assert_eq!(reads.skipped.load(Ordering::Relaxed), bytes.len());
+            assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
         }
     }
 }
