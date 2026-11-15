@@ -141,6 +141,18 @@ jobs:
               - '.github/qemu/virglrenderer-meson.args'
               - '.github/ci-lanes.json'
               - '.github/workflows/ci.yml'
+            btrfs:
+              - 'btrfs/**'
+              - 'hal/**'
+              - 'tools/btrfs/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/ci-lanes.json'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/checkout-wasmtime/**'
+              - 'docs/wasmtime.md'
             profile_format:
               - 'rust-toolchain.toml'
               - 'profdata/**'
@@ -2580,3 +2592,93 @@ jobs:
             helios/venus-smoke.out
           if-no-files-found: warn
           retention-days: 7
+
+  test-btrfs-upstream:
+    name: test-btrfs-upstream (${{ matrix.suite }})
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-upstream')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [btrfs, btrfs_single, btrfs_zlib, btrfs_lzo, btrfs_zstd, corpus]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install upstream test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs wamerican libclang-dev
+      - name: Build Helios upstream test adapters
+        working-directory: helios
+        run: cargo build --locked -p helios-btrfs --examples --features test-support
+      - name: Run independent reader assertions or malformed-image corpus
+        working-directory: helios
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          if [[ "$SUITE" == corpus ]]; then
+            python3 tools/btrfs/run.py corpus
+          else
+            python3 tools/btrfs/run.py grub "$SUITE"
+          fi
+      - name: Preserve results and populated fuzz seeds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-upstream-${{ matrix.suite }}
+          path: |
+            helios/target/btrfs-results
+            helios/target/btrfs-seeds
+          if-no-files-found: error
+          retention-days: 14
+
+  test-btrfs-fuzz:
+    name: test-btrfs-fuzz (${{ matrix.target }})
+    needs: [changes, test-btrfs-upstream]
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-fuzz')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [btrfs-image-fuzz, btrfs-record-fuzz]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: btrfs-upstream-*
+          path: helios/target
+          merge-multiple: true
+      - name: Fuzz Helios with upstream seeds and AddressSanitizer
+        working-directory: helios
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/btrfs-results target/btrfs-crashes
+          cargo fuzz run --fuzz-dir btrfs --features fuzzing --dev \
+            --target-dir target/btrfs-fuzz "$FUZZ_TARGET" "target/btrfs-seeds/$FUZZ_TARGET" -- \
+            -max_total_time=180 -timeout=30 -rss_limit_mb=4096 \
+            -max_len=134217728 -artifact_prefix=target/btrfs-crashes/ \
+            2>&1 | tee "target/btrfs-results/$FUZZ_TARGET.log"
+      - name: Preserve sanitizer output, corpus and reproducers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-fuzz-${{ matrix.target }}
+          path: |
+            helios/target/btrfs-results
+            helios/target/btrfs-crashes
+            helios/target/btrfs-seeds
+          if-no-files-found: error
+          retention-days: 14
