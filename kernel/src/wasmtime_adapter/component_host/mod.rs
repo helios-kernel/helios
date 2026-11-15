@@ -2205,69 +2205,49 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(SYNC_INSTANCE)?;
-    instance.resource_concurrent(
+    instance.resource(
         "raw-mutex",
         ResourceType::host::<SbiRawMutex>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let resource = Resource::<SbiRawMutex>::new_own(rep);
-                    let _ = access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(())
-                })
-            })
+        |mut caller, rep| {
+            let resource = Resource::<SbiRawMutex>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            Ok(())
         },
     )?;
-    instance.resource_concurrent(
+    instance.resource(
         "raw-mutex-guard",
         ResourceType::host::<SbiRawMutexGuard>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let resource = Resource::<SbiRawMutexGuard>::new_own(rep);
-                    let _ = access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(())
-                })
-            })
+        |mut caller, rep| {
+            let resource = Resource::<SbiRawMutexGuard>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            Ok(())
         },
     )?;
-    instance.resource_concurrent(
+    instance.resource(
         "raw-rw-lock",
         ResourceType::host::<SbiRawRwLock>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let resource = Resource::<SbiRawRwLock>::new_own(rep);
-                    let _ = access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(())
-                })
-            })
+        |mut caller, rep| {
+            let resource = Resource::<SbiRawRwLock>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            Ok(())
         },
     )?;
-    instance.resource_concurrent(
+    instance.resource(
         "raw-rw-lock-read-guard",
         ResourceType::host::<SbiRawRwLockReadGuard>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let resource = Resource::<SbiRawRwLockReadGuard>::new_own(rep);
-                    let _ = access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(())
-                })
-            })
+        |mut caller, rep| {
+            let resource = Resource::<SbiRawRwLockReadGuard>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            Ok(())
         },
     )?;
-    instance.resource_concurrent(
+    instance.resource(
         "raw-rw-lock-write-guard",
         ResourceType::host::<SbiRawRwLockWriteGuard>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let resource = Resource::<SbiRawRwLockWriteGuard>::new_own(rep);
-                    let _ = access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(())
-                })
-            })
+        |mut caller, rep| {
+            let resource = Resource::<SbiRawRwLockWriteGuard>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            Ok(())
         },
     )?;
     instance.func_wrap(
@@ -2428,36 +2408,22 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(NET_INSTANCE)?;
-    instance.resource_concurrent(
+    instance.resource(
         "tcp-stream",
         ResourceType::host::<SbiTcpStream<Net>>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                // Deleting the handle is the whole of it: the backend
-                // owns the kernel stream and retires it when dropped.
-                accessor.with(|mut access| {
-                    let resource = Resource::<SbiTcpStream<Net>>::new_own(rep);
-                    access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>(())
-            })
+        |mut caller, rep| {
+            let resource = Resource::<SbiTcpStream<Net>>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            Ok(())
         },
     )?;
-    instance.resource_concurrent(
+    instance.resource(
         "udp-socket",
         ResourceType::host::<SbiUdpSocket<Net>>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                // Deleting the handle is the whole of it: the backend
-                // owns the kernel socket and retires it when dropped.
-                accessor.with(|mut access| {
-                    let resource = Resource::<SbiUdpSocket<Net>>::new_own(rep);
-                    access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>(())
-            })
+        |mut caller, rep| {
+            let resource = Resource::<SbiUdpSocket<Net>>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            Ok(())
         },
     )?;
     instance.func_wrap_concurrent(
@@ -2737,36 +2703,22 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(NET_INSTANCE)?;
-    instance.resource_concurrent(
+    instance.resource(
         "tcp-stream",
         ResourceType::host::<SbiTcpStream<Net>>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                // Deleting the handle is the whole of it: the backend
-                // owns the kernel stream and retires it when dropped.
-                accessor.with(|mut access| {
-                    let resource = Resource::<SbiTcpStream<Net>>::new_own(rep);
-                    access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>(())
-            })
+        |mut caller, rep| {
+            let resource = Resource::<SbiTcpStream<Net>>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            Ok(())
         },
     )?;
-    instance.resource_concurrent(
+    instance.resource(
         "udp-socket",
         ResourceType::host::<SbiUdpSocket<Net>>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                // Deleting the handle is the whole of it: the backend
-                // owns the kernel socket and retires it when dropped.
-                accessor.with(|mut access| {
-                    let resource = Resource::<SbiUdpSocket<Net>>::new_own(rep);
-                    access.get().table.delete(resource)?;
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>(())
-            })
+        |mut caller, rep| {
+            let resource = Resource::<SbiUdpSocket<Net>>::new_own(rep);
+            caller.data_mut().table.delete(resource)?;
+            Ok(())
         },
     )?;
     instance.func_wrap_concurrent(
