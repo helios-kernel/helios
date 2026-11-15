@@ -856,7 +856,8 @@ fn the_long_term_bound_rises_in_probes_once_the_path_has_room_above_it() {
     let goodput = sim.goodput(from, to);
     assert!(
         goodput * 100 >= rate * 90,
-        "goodput {goodput} B/s against a {rate} B/s bottleneck"
+        "goodput {goodput} B/s against a {rate} B/s bottleneck; last={:?}",
+        observations.last()
     );
 }
 

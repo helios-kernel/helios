@@ -473,8 +473,13 @@ impl ResponseBody {
     }
 }
 
-async fn read_chunk(mut reader: StreamReader<u8>) -> (StreamReader<u8>, StreamResult, Vec<u8>) {
-    let (result, chunk) = reader.read(Vec::with_capacity(BODY_CHUNK_BYTES)).await;
+async fn read_chunk(
+    mut reader: StreamReader<u8>,
+    mut buffer: Vec<u8>,
+) -> (StreamReader<u8>, StreamResult, Vec<u8>) {
+    buffer.clear();
+    buffer.reserve(BODY_CHUNK_BYTES);
+    let (result, chunk) = reader.read(buffer).await;
     (reader, result, chunk)
 }
 
@@ -500,7 +505,8 @@ impl AsyncRead for ResponseBody {
             match core::mem::replace(&mut this.state, BodyState::Closed) {
                 BodyState::Closed => return Poll::Ready(Ok(0)),
                 BodyState::Idle(reader) => {
-                    this.state = BodyState::Reading(Box::pin(read_chunk(reader)));
+                    let buffer = core::mem::take(&mut this.buffered);
+                    this.state = BodyState::Reading(Box::pin(read_chunk(reader, buffer)));
                 }
                 BodyState::Reading(mut pending) => match pending.as_mut().poll(cx) {
                     Poll::Pending => {
