@@ -225,29 +225,43 @@ fn writer_abort_commit_and_failed_publication_have_distinct_lifetimes() {
 #[cfg(feature = "write")]
 #[test]
 fn file_writes_preserve_partial_sectors_and_transaction_visibility() {
-    block_on(exercise_file_writes(|_| {}));
+    for no_holes in [true, false] {
+        block_on(exercise_file_writes(no_holes, |_| {}));
+    }
 }
 
 #[cfg(feature = "write")]
 #[test]
 #[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
 fn file_writes_pass_btrfs_check() {
-    block_on(exercise_file_writes(assert_btrfs_check));
+    for no_holes in [true, false] {
+        block_on(exercise_file_writes(no_holes, assert_btrfs_check));
+    }
 }
 
 #[cfg(feature = "write")]
-async fn exercise_file_writes(mut verify: impl FnMut(&std::path::Path)) {
+async fn exercise_file_writes(no_holes: bool, mut verify: impl FnMut(&std::path::Path)) {
     use super::writer::Writer;
     let timestamp = Timestamp::from_secs(1_700_000_000);
     let named = tempfile::NamedTempFile::new().unwrap();
     let tree = TreeBuilder::new()
         .root(Metadata::new(0o755, timestamp))
         .file("/data.bin", Vec::new(), Metadata::new(0o644, timestamp));
-    drop(filesystem_image_tree_file(
-        true,
-        true,
+    let mut options = FormatOptions::new([0x53; 16], timestamp);
+    if !no_holes {
+        options.plan.incompat_flags = options
+            .plan
+            .incompat_flags
+            .without(ferrosys::btrfs::ondisk::IncompatFlags::NO_HOLES);
+        options.plan.compat_ro_flags = options
+            .plan
+            .compat_ro_flags
+            .without(ferrosys::btrfs::ondisk::CompatRoFlags::BLOCK_GROUP_TREE);
+    }
+    drop(filesystem_image_options(
         tree,
         named.reopen().unwrap(),
+        options,
     ));
     verify(named.path());
     let mut writer = Writer::mount(Disk(named.reopen().unwrap())).await.unwrap();
@@ -1146,11 +1160,8 @@ fn filesystem_image_tree_file(
     separate: bool,
     free_tree: bool,
     tree: TreeBuilder,
-    mut file: File,
+    file: File,
 ) -> (Filesystem<Disk>, File) {
-    // ferrosys' default single-device geometry needs at least 109 MiB.
-    let size = 128 << 20;
-    file.set_len(size).unwrap();
     let timestamp = Timestamp::from_secs(1_700_000_000);
     let mut options = FormatOptions::new([0x53; 16], timestamp);
     if !separate {
@@ -1166,6 +1177,17 @@ fn filesystem_image_tree_file(
             .without(ferrosys::btrfs::ondisk::CompatRoFlags::FREE_SPACE_TREE)
             .without(ferrosys::btrfs::ondisk::CompatRoFlags::FREE_SPACE_TREE_VALID);
     }
+    filesystem_image_options(tree, file, options)
+}
+
+fn filesystem_image_options(
+    tree: TreeBuilder,
+    mut file: File,
+    options: FormatOptions,
+) -> (Filesystem<Disk>, File) {
+    // ferrosys' default single-device geometry needs at least 109 MiB.
+    let size = 128 << 20;
+    file.set_len(size).unwrap();
     format_to(&mut file, tree, size, options).unwrap();
     let reference = file.try_clone().unwrap();
     (block_on(Filesystem::mount(Disk(file))).unwrap(), reference)
