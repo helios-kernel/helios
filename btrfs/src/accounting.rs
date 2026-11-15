@@ -174,17 +174,13 @@ impl Accounting {
         Ok(changed)
     }
 
-    /// Removes a committed block reference. Private allocation cancellation is
-    /// handled by `sync_allocations`. Returns true only for its last reference. As with any tree
-    /// edit, an error aborts the enclosing transaction, including earlier edits.
-    pub(crate) async fn remove_metadata<S: BlockSource, A: MetadataAllocator>(
-        &mut self,
+    /// Read the current extent record, including earlier reference edits.
+    pub(crate) async fn metadata<S: BlockSource>(
+        &self,
         volume: &Volume<S>,
-        trees: &mut Trees,
-        allocator: &mut A,
+        trees: &Trees,
         block: MetadataBlock,
-        reference: MetadataReference,
-    ) -> Result<bool, WriteError> {
+    ) -> Result<(Key, MetadataExtent), WriteError> {
         let mut key = Key::new(
             block.address,
             item_type::METADATA_ITEM,
@@ -204,10 +200,70 @@ impl Accounting {
                 })?
         };
         let defect = |defect| WriteError::Allocation { key, defect };
-        let mut extent = MetadataExtent::parse(key, &bytes, self.nodesize).map_err(defect)?;
+        let extent = MetadataExtent::parse(key, &bytes, self.nodesize).map_err(defect)?;
         if extent.level() != block.level {
             return Err(defect(AllocationDefect::Metadata));
         }
+        Ok((key, extent))
+    }
+
+    /// Add a root or parent reference to an existing committed block. Both the
+    /// count and external key live in the overlay; any failure aborts it.
+    pub(crate) async fn add_metadata<S: BlockSource, A: MetadataAllocator>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        allocator: &mut A,
+        block: MetadataBlock,
+        reference: MetadataReference,
+    ) -> Result<(), WriteError> {
+        let (key, mut extent) = self.metadata(volume, trees, block).await?;
+        let reference_key = reference.key(block.address);
+        let external = trees.get(volume, self.root, reference_key).await?;
+        extent
+            .add_external(reference, external.as_deref())
+            .map_err(|defect| WriteError::Allocation { key, defect })?;
+        self.root = trees
+            .apply(volume, self.root, reference_key, Some(&[]), allocator)
+            .await?;
+        self.root = trees
+            .apply(volume, self.root, key, Some(&extent.encode()), allocator)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark a block after its outgoing references have been converted to
+    /// parent references. This never edits the committed block's own header.
+    pub(crate) async fn set_full_backrefs<S: BlockSource, A: MetadataAllocator>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        allocator: &mut A,
+        block: MetadataBlock,
+    ) -> Result<(), WriteError> {
+        let (key, mut extent) = self.metadata(volume, trees, block).await?;
+        if !extent.full_backrefs() {
+            extent.set_full_backrefs();
+            self.root = trees
+                .apply(volume, self.root, key, Some(&extent.encode()), allocator)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Removes a committed block reference. Private allocation cancellation is
+    /// handled by `sync_allocations`. Returns true only for its last reference. As with any tree
+    /// edit, an error aborts the enclosing transaction, including earlier edits.
+    pub(crate) async fn remove_metadata<S: BlockSource, A: MetadataAllocator>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        allocator: &mut A,
+        block: MetadataBlock,
+        reference: MetadataReference,
+    ) -> Result<bool, WriteError> {
+        let (key, mut extent) = self.metadata(volume, trees, block).await?;
+        let defect = |defect| WriteError::Allocation { key, defect };
         let reference_key = reference.key(block.address);
         let external = trees.get(volume, self.root, reference_key).await?;
         let last = extent

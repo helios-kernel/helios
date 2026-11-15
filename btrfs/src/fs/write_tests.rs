@@ -573,20 +573,28 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
                     .unwrap()
             }
         };
-        let mut bytes = original.clone();
-        assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 1);
-        bytes[..8].copy_from_slice(&2_u64.to_le_bytes());
-        let root = trees
-            .apply(&fs.volume, original_root, key, Some(&bytes), &mut space)
-            .await
-            .unwrap();
         let parent = MetadataReference::parent(fs.root_tree.bytenr);
         let parent_key = parent.key(block.address);
-        let root = trees
-            .apply(&fs.volume, root, parent_key, Some(&[]), &mut space)
+        accounting
+            .add_metadata(&fs.volume, &mut trees, &mut space, block, parent)
             .await
             .unwrap();
-        accounting.root = root;
+        let (_, extent) = accounting
+            .metadata(&fs.volume, &trees, block)
+            .await
+            .unwrap();
+        assert_eq!(extent.references(), 2);
+        assert!(!extent.full_backrefs());
+        accounting
+            .set_full_backrefs(&fs.volume, &mut trees, &mut space, block)
+            .await
+            .unwrap();
+        let (_, extent) = accounting
+            .metadata(&fs.volume, &trees, block)
+            .await
+            .unwrap();
+        assert!(extent.full_backrefs());
+        assert_eq!(extent.references(), 2);
         assert!(
             !accounting
                 .remove_metadata(

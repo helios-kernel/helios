@@ -156,6 +156,46 @@ impl MetadataExtent {
         self.level
     }
 
+    pub(crate) fn references(&self) -> u64 {
+        self.refs
+    }
+
+    pub(crate) fn full_backrefs(&self) -> bool {
+        self.flags & FULL_BACKREF != 0
+    }
+
+    /// Describes the references held by this block's outgoing pointers, not
+    /// the references to this block. The caller converts those pointers first.
+    pub(crate) fn set_full_backrefs(&mut self) {
+        self.flags |= FULL_BACKREF;
+    }
+
+    /// Reserve one external reference. Keeping new references in separate
+    /// items bounds the extent payload even for heavily shared tree blocks.
+    /// The caller inserts the empty reference item in the same transaction.
+    pub(crate) fn add_external(
+        &mut self,
+        reference: MetadataReference,
+        external: Option<&[u8]>,
+    ) -> Result<(), AllocationDefect> {
+        if external.is_some_and(|bytes| !bytes.is_empty()) {
+            return Err(AllocationDefect::ExternalPayload);
+        }
+        let inline = if reference.kind == item_type::TREE_BLOCK_REF {
+            &self.roots
+        } else {
+            &self.parents
+        };
+        if inline.contains(&reference.identity) || external.is_some() {
+            return Err(AllocationDefect::Duplicate);
+        }
+        self.refs = self
+            .refs
+            .checked_add(1)
+            .ok_or(AllocationDefect::References)?;
+        Ok(())
+    }
+
     /// Remove exactly one reference, after the caller has looked up its external
     /// key in the same transaction. An empty external item is a real reference;
     /// absence and an empty payload must remain distinguishable.
@@ -266,6 +306,49 @@ mod tests {
     use btrfs_disk::tree::{DiskKey, KeyType};
 
     use super::*;
+
+    #[test]
+    fn external_reference_addition_preserves_state_on_invalid_input() {
+        let mut extent = MetadataExtent::new(42, 5, 0, None);
+        let original = extent.encode();
+        assert_eq!(
+            extent.add_external(MetadataReference::root(5), None),
+            Err(AllocationDefect::Duplicate)
+        );
+        assert_eq!(
+            extent.add_external(MetadataReference::parent(4096), Some(&[])),
+            Err(AllocationDefect::Duplicate)
+        );
+        assert_eq!(
+            extent.add_external(MetadataReference::parent(4096), Some(&[1])),
+            Err(AllocationDefect::ExternalPayload)
+        );
+        assert_eq!(extent.encode(), original);
+
+        extent
+            .add_external(MetadataReference::parent(4096), None)
+            .unwrap();
+        assert_eq!(extent.references(), 2);
+        extent.set_full_backrefs();
+        let key = extent.key(1 << 20, 4096);
+        let mut parsed = MetadataExtent::parse(key, &extent.encode(), 4096).unwrap();
+        assert!(parsed.full_backrefs());
+        assert!(
+            !parsed
+                .remove(MetadataReference::parent(4096), Some(&[]))
+                .unwrap()
+        );
+        assert_eq!(parsed.references(), 1);
+        assert!(parsed.remove(MetadataReference::root(5), None).unwrap());
+
+        extent.refs = u64::MAX;
+        let original = extent.encode();
+        assert_eq!(
+            extent.add_external(MetadataReference::root(256), None),
+            Err(AllocationDefect::References)
+        );
+        assert_eq!(extent.encode(), original);
+    }
 
     #[test]
     fn metadata_layouts_match_independent_encoder_and_parser() {
