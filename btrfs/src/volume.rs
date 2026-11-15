@@ -10,13 +10,24 @@ use alloc::sync::Arc;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Mapping {
     pub(crate) superblock: Superblock,
-    chunks: ChunkMap,
+    chunks: Arc<ChunkMap>,
+}
+
+impl Mapping {
+    #[cfg(feature = "write")]
+    pub(crate) fn advance(&self, superblock: Superblock) -> Arc<Self> {
+        Arc::new(Self {
+            superblock,
+            chunks: self.chunks.clone(),
+        })
+    }
 }
 
 /// A mounted device's address space.
 ///
 /// Immutable once built: every method takes `&self`, holds no lock and may
 /// run on any number of processors at once.
+#[derive(Clone)]
 pub(crate) struct Volume<S> {
     source: S,
     mapping: Arc<Mapping>,
@@ -26,7 +37,10 @@ impl<S: BlockSource> Volume<S> {
     pub(crate) fn new(source: S, superblock: Superblock, chunks: ChunkMap) -> Self {
         Self {
             source,
-            mapping: Arc::new(Mapping { superblock, chunks }),
+            mapping: Arc::new(Mapping {
+                superblock,
+                chunks: Arc::new(chunks),
+            }),
         }
     }
 
@@ -40,9 +54,14 @@ impl<S: BlockSource> Volume<S> {
 
     /// Swaps in the chunk map read from the chunk tree, returning the
     /// bootstrap map it was read through.
-    pub(crate) fn replace_chunks(&mut self, chunks: ChunkMap) -> ChunkMap {
+    pub(crate) fn replace_chunks(&mut self, chunks: ChunkMap) -> Arc<ChunkMap> {
         let mapping = Arc::get_mut(&mut self.mapping).expect("bootstrap mapping is not published");
-        core::mem::replace(&mut mapping.chunks, chunks)
+        core::mem::replace(&mut mapping.chunks, Arc::new(chunks))
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn install(&mut self, mapping: Arc<Mapping>) {
+        self.mapping = mapping;
     }
 
     pub(crate) fn mapping(&self) -> Arc<Mapping> {

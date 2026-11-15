@@ -1,6 +1,9 @@
 //! The mounted filesystem: inodes, directories, file data, symlinks and
 //! extended attributes.
 
+#[cfg(feature = "write")]
+mod writer;
+
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -43,10 +46,10 @@ const DATA_WINDOW: u64 = MAX_COMPRESSED_EXTENT;
 ///
 /// An [`Inode`] records the tree root of the commit it was read from, so
 /// operations on it see that commit's state whatever happens afterwards.
+#[derive(Clone)]
 pub struct Filesystem<S> {
     snapshot: Arc<Snapshot>,
     volume: Volume<S>,
-    default_subvolume: RootRecord,
 }
 
 /// Every tree and address translation needed to read a committed generation.
@@ -54,8 +57,28 @@ pub struct Filesystem<S> {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) mapping: Arc<Mapping>,
-    root_tree: TreeRoot,
+    pub(crate) root_tree: TreeRoot,
     csum_tree: TreeRoot,
+    default_subvolume: RootRecord,
+}
+
+#[cfg(feature = "write")]
+impl Snapshot {
+    pub(crate) fn advance(
+        &self,
+        superblock: Superblock,
+        roots: &crate::roots::Roots,
+    ) -> Result<Arc<Self>, crate::tree::write::WriteError> {
+        Ok(Arc::new(Self {
+            mapping: self.mapping.advance(superblock),
+            root_tree: roots.root,
+            csum_tree: roots.get(objectid::CSUM_TREE)?,
+            default_subvolume: RootRecord {
+                root: roots.get(self.default_subvolume.root.tree)?,
+                root_dirid: self.default_subvolume.root_dirid,
+            },
+        }))
+    }
 }
 
 /// An inode, as of the commit it was read from.
@@ -167,10 +190,16 @@ impl<S: BlockSource> Filesystem<S> {
                 mapping: volume.mapping(),
                 root_tree,
                 csum_tree,
+                default_subvolume,
             }),
             volume,
-            default_subvolume,
         })
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn publish(&mut self, committed: crate::transaction::Committed) {
+        self.volume.install(committed.snapshot.mapping.clone());
+        self.snapshot = committed.snapshot;
     }
 
     pub fn superblock(&self) -> &Superblock {
@@ -179,7 +208,7 @@ impl<S: BlockSource> Filesystem<S> {
 
     /// The id of the subvolume a mount lands in.
     pub fn default_subvolume(&self) -> u64 {
-        self.default_subvolume.root.tree
+        self.snapshot.default_subvolume.root.tree
     }
 
     /// Visits each subvolume once, in tree-id order. A mount uses this
@@ -221,8 +250,8 @@ impl<S: BlockSource> Filesystem<S> {
     /// The root directory of the default subvolume.
     pub async fn root(&self) -> Result<Inode, Error> {
         self.load_inode(
-            self.default_subvolume.root,
-            self.default_subvolume.root_dirid,
+            self.snapshot.default_subvolume.root,
+            self.snapshot.default_subvolume.root_dirid,
             &self.snapshot,
         )
         .await

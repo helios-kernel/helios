@@ -234,6 +234,7 @@ pub(crate) fn dir_index_record(payload: &[u8]) -> Result<DirRecord<'_>, ItemDefe
 }
 
 /// A root item: where a tree starts and which inode is its top directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RootRecord {
     pub(crate) root: TreeRoot,
     pub(crate) root_dirid: u64,

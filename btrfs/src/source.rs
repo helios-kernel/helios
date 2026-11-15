@@ -1,5 +1,6 @@
 //! What the filesystem reads from.
 
+use alloc::sync::Arc;
 use core::future::Future;
 
 use helios_hal::io::IoResult;
@@ -48,6 +49,33 @@ impl<S: BlockSource> BlockSource for &S {
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
         S::read_at(self, offset, buf).await
+    }
+}
+
+impl<S: BlockSource> BlockSource for Arc<S> {
+    fn size_bytes(&self) -> u64 {
+        S::size_bytes(self)
+    }
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+        S::read_at(self, offset, buf).await
+    }
+}
+
+impl<S: BlockSink> BlockSink for &S {
+    async fn stage(&self, block: u64, bytes: &[u8; READ_ALIGNMENT as usize]) -> IoResult<()> {
+        S::stage(self, block, bytes).await
+    }
+    async fn commit(&self, block: u64, bytes: &[u8; READ_ALIGNMENT as usize]) -> IoResult<()> {
+        S::commit(self, block, bytes).await
+    }
+}
+
+impl<S: BlockSink> BlockSink for Arc<S> {
+    async fn stage(&self, block: u64, bytes: &[u8; READ_ALIGNMENT as usize]) -> IoResult<()> {
+        S::stage(self, block, bytes).await
+    }
+    async fn commit(&self, block: u64, bytes: &[u8; READ_ALIGNMENT as usize]) -> IoResult<()> {
+        S::commit(self, block, bytes).await
     }
 }
 

@@ -14,6 +14,17 @@ pub(crate) struct CommitImage {
 }
 
 impl CommitImage {
+    pub(crate) fn superblock(
+        &mut self,
+        algorithm: ChecksumType,
+    ) -> Result<crate::Superblock, WriteError> {
+        let primary = crate::superblock::MIRROR_OFFSETS[0];
+        Ok(crate::Superblock::parse(
+            self.at(primary, algorithm),
+            primary,
+        )?)
+    }
+
     pub(crate) fn prepare(&mut self, roots: &Roots, used: u64) -> Result<(), WriteError> {
         let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
         let extent = roots.get(objectid::EXTENT_TREE)?;

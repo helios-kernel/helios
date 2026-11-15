@@ -17,6 +17,10 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[error("writer must be reopened after an interrupted durable commit")]
+    WriterPoisoned,
+    #[error("transaction superblock: {0}")]
+    CommitSuperblock(#[from] crate::SuperblockDefect),
     #[error("filesystem changed after this snapshot was mounted")]
     StaleSnapshot,
     #[error("filesystem generation cannot be incremented")]

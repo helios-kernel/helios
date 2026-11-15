@@ -73,7 +73,7 @@ impl crate::source::BlockSink for FaultDisk {
 #[cfg(feature = "write")]
 async fn change_root_mode<S: crate::source::BlockSink>(
     fs: &Filesystem<S>,
-) -> Result<TreeRoot, WriteError> {
+) -> Result<(TreeRoot, crate::transaction::Committed), WriteError> {
     change_root_mode_with_retirements(fs, &mut crate::retirement::Retirements::default()).await
 }
 
@@ -81,14 +81,34 @@ async fn change_root_mode<S: crate::source::BlockSink>(
 async fn change_root_mode_with_retirements<S: crate::source::BlockSink>(
     fs: &Filesystem<S>,
     retirements: &mut crate::retirement::Retirements,
+) -> Result<(TreeRoot, crate::transaction::Committed), WriteError> {
+    use crate::transaction::Transaction;
+
+    let mut transaction = Transaction::new(
+        fs.volume.view(&fs.snapshot.mapping),
+        fs.snapshot.clone(),
+        retirements,
+    )
+    .await?;
+    let root = edit_root_mode(fs, &mut transaction).await?;
+    let committed = transaction
+        .commit(
+            || panic!("formatted fixture already has valid UUIDs"),
+            std::thread::available_parallelism().unwrap(),
+            || {},
+        )
+        .await?;
+    Ok((root, committed))
+}
+
+#[cfg(feature = "write")]
+async fn edit_root_mode<S: BlockSource, T>(
+    fs: &Filesystem<S>,
+    transaction: &mut crate::transaction::Transaction<'_, T>,
 ) -> Result<TreeRoot, WriteError> {
     use crate::ondisk::{RawInodeItem, item_type, objectid, view};
-    use crate::transaction::Transaction;
     use zerocopy::IntoBytes;
-
     let inode = fs.resolve(b"/").await?;
-    let mut transaction =
-        Transaction::new(&fs.volume, fs.snapshot.root_tree, &fs.snapshot, retirements).await?;
     let root = transaction.roots.get(objectid::FS_TREE)?;
     let key = Key::new(inode.number(), item_type::INODE_ITEM, 0);
     let bytes = transaction.trees.get(&fs.volume, root, key).await?.unwrap();
@@ -106,13 +126,194 @@ async fn change_root_mode_with_retirements<S: crate::source::BlockSink>(
         )
         .await?;
     transaction.roots.set(root)?;
-    transaction
-        .commit(
-            || panic!("formatted fixture already has valid UUIDs"),
-            std::thread::available_parallelism().unwrap(),
-        )
-        .await?;
     Ok(root)
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn writer_abort_commit_and_failed_publication_have_distinct_lifetimes() {
+    use super::writer::Writer;
+    use crate::source::BlockSink;
+    use core::num::NonZeroUsize;
+
+    block_on(async {
+        let (_, image) = filesystem_image();
+        let mut writer = Writer::mount(Disk(image)).await.unwrap();
+        let old = writer.snapshot().unwrap();
+        let generation = old.superblock().generation();
+        let mut aborted = writer.begin().await.unwrap();
+        edit_root_mode(&old, aborted.edits()).await.unwrap();
+        drop(aborted);
+        assert_eq!(
+            writer.snapshot().unwrap().superblock().generation(),
+            generation
+        );
+        assert_eq!(
+            writer
+                .snapshot()
+                .unwrap()
+                .root()
+                .await
+                .unwrap()
+                .metadata()
+                .permissions,
+            0o755
+        );
+        for next in generation + 1..=generation + 2 {
+            let snapshot = writer.snapshot().unwrap();
+            let mut transaction = writer.begin().await.unwrap();
+            edit_root_mode(&snapshot, transaction.edits())
+                .await
+                .unwrap();
+            transaction
+                .commit(|| panic!("valid fixture UUID"), NonZeroUsize::MIN)
+                .await
+                .unwrap();
+            assert_eq!(writer.snapshot().unwrap().superblock().generation(), next);
+            assert_eq!(
+                writer
+                    .snapshot()
+                    .unwrap()
+                    .root()
+                    .await
+                    .unwrap()
+                    .metadata()
+                    .permissions,
+                0o700
+            );
+            assert_eq!(old.root().await.unwrap().metadata().permissions, 0o755);
+        }
+
+        // Fail exactly the first superblock operation after staging completes.
+        struct FailCommit(Disk);
+        impl BlockSource for FailCommit {
+            fn size_bytes(&self) -> u64 {
+                self.0.size_bytes()
+            }
+            async fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+                self.0.read_at(offset, buf).await
+            }
+        }
+        impl BlockSink for FailCommit {
+            async fn stage(&self, block: u64, bytes: &[u8; 4096]) -> IoResult<()> {
+                self.0.stage(block, bytes).await
+            }
+            async fn commit(&self, _: u64, _: &[u8; 4096]) -> IoResult<()> {
+                Err(IoError::DeviceFault)
+            }
+        }
+        let (_, image) = filesystem_image();
+        let mut writer = Writer::mount(FailCommit(Disk(image))).await.unwrap();
+        let old = writer.snapshot().unwrap();
+        let mut transaction = writer.begin().await.unwrap();
+        edit_root_mode(&old, transaction.edits()).await.unwrap();
+        assert!(
+            transaction
+                .commit(|| panic!("valid fixture UUID"), NonZeroUsize::MIN)
+                .await
+                .is_err()
+        );
+        assert!(matches!(writer.snapshot(), Err(WriteError::WriterPoisoned)));
+        assert!(matches!(
+            writer.begin().await,
+            Err(WriteError::WriterPoisoned)
+        ));
+        assert_eq!(old.root().await.unwrap().metadata().permissions, 0o755);
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn canceling_staging_restores_the_writer_but_canceling_publication_poisons_it() {
+    use super::writer::Writer;
+    use crate::source::BlockSink;
+    use core::future::pending;
+    use core::num::NonZeroUsize;
+    use futures_lite::future::poll_once;
+
+    struct PausingDisk {
+        disk: Disk,
+        pause_stage: bool,
+    }
+    impl BlockSource for PausingDisk {
+        fn size_bytes(&self) -> u64 {
+            self.disk.size_bytes()
+        }
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+            self.disk.read_at(offset, buf).await
+        }
+    }
+    impl BlockSink for PausingDisk {
+        async fn stage(&self, block: u64, bytes: &[u8; 4096]) -> IoResult<()> {
+            if self.pause_stage {
+                pending::<()>().await;
+            }
+            self.disk.stage(block, bytes).await
+        }
+        async fn commit(&self, _: u64, _: &[u8; 4096]) -> IoResult<()> {
+            pending().await
+        }
+    }
+    block_on(async {
+        for pause_stage in [true, false] {
+            let (_, image) = filesystem_image();
+            let mut writer = Writer::mount(PausingDisk {
+                disk: Disk(image),
+                pause_stage,
+            })
+            .await
+            .unwrap();
+            let old = writer.snapshot().unwrap();
+            let mut transaction = writer.begin().await.unwrap();
+            edit_root_mode(&old, transaction.edits()).await.unwrap();
+            {
+                let mut commit = core::pin::pin!(
+                    transaction.commit(|| panic!("valid fixture UUID"), NonZeroUsize::MIN)
+                );
+                assert!(poll_once(commit.as_mut()).await.is_none());
+            }
+            if pause_stage {
+                assert_eq!(writer.snapshot().unwrap().snapshot, old.snapshot);
+                drop(writer.begin().await.unwrap());
+            } else {
+                assert!(matches!(writer.snapshot(), Err(WriteError::WriterPoisoned)));
+                assert!(matches!(
+                    writer.begin().await,
+                    Err(WriteError::WriterPoisoned)
+                ));
+            }
+            assert_eq!(old.root().await.unwrap().metadata().permissions, 0o755);
+        }
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn successful_commits_publish_live_views_without_remounting() {
+    block_on(async {
+        let (mut fs, image) = filesystem_image();
+        let initial = fs.superblock().generation();
+        let old = fs.root().await.unwrap();
+        let mut retirements = crate::retirement::Retirements::default();
+        for generation in initial + 1..=initial + 3 {
+            let (_, committed) = change_root_mode_with_retirements(&fs, &mut retirements)
+                .await
+                .unwrap();
+            fs.publish(committed);
+            assert_eq!(fs.superblock().generation(), generation);
+            assert_eq!(fs.root().await.unwrap().metadata().permissions, 0o700);
+            assert_eq!(
+                fs.load_inode(old.root, old.number, &old.snapshot)
+                    .await
+                    .unwrap(),
+                old
+            );
+            let independent = Filesystem::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            assert_eq!(fs.snapshot, independent.snapshot);
+        }
+    });
 }
 
 #[cfg(feature = "write")]
@@ -259,9 +460,8 @@ fn old_inodes_read_their_own_extent_and_checksum_generation() {
         let old_file = fs.lookup(&old_dir, b"data.bin").await.unwrap().unwrap();
         let mut retirements = Retirements::default();
         let mut transaction = Transaction::new(
-            &fs.volume,
-            fs.snapshot.root_tree,
-            &fs.snapshot,
+            fs.volume.view(&fs.snapshot.mapping),
+            fs.snapshot.clone(),
             &mut retirements,
         )
         .await
@@ -330,7 +530,7 @@ fn old_inodes_read_their_own_extent_and_checksum_generation() {
             .await
             .unwrap();
         transaction
-            .commit(|| panic!("valid fixture UUID"), concurrency)
+            .commit(|| panic!("valid fixture UUID"), concurrency, || {})
             .await
             .unwrap();
         drop(fs);
@@ -414,9 +614,8 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
         let raw_free = raw_space.committed_free(&BTreeMap::new()).unwrap();
         {
             let mut transaction = Transaction::new(
-                &current.volume,
-                current.snapshot.root_tree,
-                &current.snapshot,
+                current.volume.view(&current.snapshot.mapping),
+                current.snapshot.clone(),
                 &mut retirements,
             )
             .await
@@ -436,9 +635,8 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
         }
         drop(clone);
         let mut transaction = Transaction::new(
-            &current.volume,
-            current.snapshot.root_tree,
-            &current.snapshot,
+            current.volume.view(&current.snapshot.mapping),
+            current.snapshot.clone(),
             &mut retirements,
         )
         .await
@@ -466,9 +664,8 @@ fn empty_transaction_does_not_publish() {
         .await
         .unwrap();
         crate::transaction::Transaction::new(
-            &fs.volume,
-            fs.snapshot.root_tree,
-            &fs.snapshot,
+            fs.volume.view(&fs.snapshot.mapping),
+            fs.snapshot.clone(),
             &mut crate::retirement::Retirements::default(),
         )
         .await
@@ -476,6 +673,7 @@ fn empty_transaction_does_not_publish() {
         .commit(
             || panic!("no new UUID required"),
             core::num::NonZeroUsize::MIN,
+            || {},
         )
         .await
         .unwrap();
@@ -563,7 +761,7 @@ fn transaction_publishes_roots_and_preserves_previous_generation() {
         for (separate, free_tree) in [(true, true), (false, true), (false, false)] {
             let (fs, mut image) = filesystem_image_with_features(separate, free_tree);
             let generation = fs.superblock().generation();
-            let root = change_root_mode(&fs).await.unwrap();
+            let (root, _) = change_root_mode(&fs).await.unwrap();
 
             let mounted = Filesystem::mount(Disk(image.try_clone().unwrap()))
                 .await
@@ -579,9 +777,8 @@ fn transaction_publishes_roots_and_preserves_previous_generation() {
             );
             assert!(matches!(
                 Transaction::new(
-                    &fs.volume,
-                    fs.snapshot.root_tree,
-                    &fs.snapshot,
+                    fs.volume.view(&fs.snapshot.mapping),
+                    fs.snapshot.clone(),
                     &mut crate::retirement::Retirements::default()
                 )
                 .await,
@@ -689,7 +886,7 @@ fn space_load_validates_formatted_file_data_references() {
                 collision.offset
             )
         );
-        let shared = SharedDataReference(fs.default_subvolume.root.bytenr);
+        let shared = SharedDataReference(fs.snapshot.default_subvolume.root.bytenr);
         assert!(
             !accounting
                 .update_data(
@@ -857,7 +1054,7 @@ fn space_load_validates_formatted_file_data_references() {
 }
 
 fn root_node(fs: &Filesystem<Disk>) -> Node {
-    let root = fs.default_subvolume.root;
+    let root = fs.snapshot.default_subvolume.root;
     block_on(Node::read(
         &fs.volume,
         root.bytenr,
@@ -956,8 +1153,8 @@ fn data_staging_writes_all_copies_without_publishing_roots() {
             fs.superblock().generation()
         );
         assert_eq!(
-            reopened.default_subvolume.root.bytenr,
-            fs.default_subvolume.root.bytenr
+            reopened.snapshot.default_subvolume.root.bytenr,
+            fs.snapshot.default_subvolume.root.bytenr
         );
         assert!(
             trees
@@ -1078,7 +1275,7 @@ fn private_data_allocations_register_cancel_and_reuse_their_full_ranges() {
                 .await
                 .unwrap();
             verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
-            assert!(!space.cancel_data(fs.default_subvolume.root.bytenr));
+            assert!(!space.cancel_data(fs.snapshot.default_subvolume.root.bytenr));
         }
     });
 }
@@ -1114,7 +1311,7 @@ fn shared_tree_cow_converts_data_references_and_retires_only_the_last_owner() {
                 fs.superblock().generation() + 1,
                 fs.superblock().csum_type(),
             );
-            let original = fs.default_subvolume.root;
+            let original = fs.snapshot.default_subvolume.root;
             assert_eq!(original.level == 0, siblings == 0);
             let file_key = Key::new(inode.number(), item_type::EXTENT_DATA, 0);
             let bytes = trees
@@ -1671,7 +1868,7 @@ fn cow_insert_replace_delete_preserve_the_original_tree_and_collapse_the_root() 
         let mut expected: BTreeMap<_, _> = (0..original.nritems())
             .map(|slot| (original.key(slot), original.item(slot).to_vec()))
             .collect();
-        let mut root = fs.default_subvolume.root;
+        let mut root = fs.snapshot.default_subvolume.root;
         let mut trees = Trees::new(
             fs.superblock().generation() + 1,
             fs.superblock().csum_type(),
@@ -1745,7 +1942,7 @@ fn cow_insert_replace_delete_preserve_the_original_tree_and_collapse_the_root() 
 fn splits_propagate_through_internal_nodes_and_deletion_shrinks_multiple_levels() {
     block_on(async {
         let fs = filesystem();
-        let mut root = fs.default_subvolume.root;
+        let mut root = fs.snapshot.default_subvolume.root;
         let mut trees = Trees::new(
             fs.superblock().generation() + 1,
             fs.superblock().csum_type(),
@@ -1891,7 +2088,7 @@ fn space_reservations_exclude_existing_extents_and_return_private_allocations() 
         unique.dedup();
         assert_eq!(unique.len(), allocated.len());
         assert_eq!(space.metadata().count(), allocated.len());
-        assert!(!space.cancel_metadata(fs.default_subvolume.root.bytenr));
+        assert!(!space.cancel_metadata(fs.snapshot.default_subvolume.root.bytenr));
         // Alternating holes exercise coalescing on both sides of each free.
         for &address in allocated.iter().step_by(2) {
             assert!(space.cancel_metadata(address));
@@ -1912,7 +2109,7 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
     let fs = filesystem();
     let mut space = block_on(crate::space::Space::load(&fs.volume, fs.snapshot.root_tree)).unwrap();
     let available = space.available_metadata();
-    let original = fs.default_subvolume.root;
+    let original = fs.snapshot.default_subvolume.root;
     let mut root = original;
     let mut trees = Trees::new(original.generation + 1, ChecksumType::Crc32c);
     let original_node = root_node(&fs);
@@ -2006,8 +2203,8 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
                 .unwrap()
                 .root;
         let block = MetadataBlock {
-            address: fs.default_subvolume.root.bytenr,
-            level: fs.default_subvolume.root.level,
+            address: fs.snapshot.default_subvolume.root.bytenr,
+            level: fs.snapshot.default_subvolume.root.level,
         };
         let size = u64::from(fs.superblock().nodesize());
         let mut trees = Trees::new(fs.superblock().generation() + 1, ChecksumType::Crc32c);
@@ -2149,7 +2346,7 @@ fn metadata_registration_converges_across_extent_tree_growth_and_cancellation() 
                     .await
                     .unwrap();
             assert_eq!(accounting.free_root().is_some(), free_tree);
-            let mut root = fs.default_subvolume.root;
+            let mut root = fs.snapshot.default_subvolume.root;
             // Full leaves force enough allocations to split the extent tree as its
             // own allocation records are registered.
             let count = (size as usize - 101) / 33 + 3;
@@ -2264,7 +2461,7 @@ fn metadata_registration_converges_across_extent_tree_growth_and_cancellation() 
                 );
                 assert_eq!(space.available_metadata(), available);
             }
-            assert!(!space.cancel_metadata(fs.default_subvolume.root.bytenr));
+            assert!(!space.cancel_metadata(fs.snapshot.default_subvolume.root.bytenr));
         });
     }
 }
@@ -2273,7 +2470,7 @@ fn metadata_registration_converges_across_extent_tree_growth_and_cancellation() 
 fn cow_blocks_take_the_writing_tree_owner_from_a_shared_original() {
     block_on(async {
         let fs = filesystem();
-        let original = fs.default_subvolume.root;
+        let original = fs.snapshot.default_subvolume.root;
         let mut root = TreeRoot {
             tree: 256,
             ..original
