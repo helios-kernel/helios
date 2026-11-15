@@ -487,7 +487,9 @@ A pull request runs only the lanes whose surfaces its change touches
 marked ready for review. Compile, lint and test lanes keep a Rust cache,
 written only by a `dev` push. Other shared caches are written only from
 the default branch. Guest wasm is built once per profile and reused by
-every test and smoke lane that runs a kernel prebuild.
+every test and smoke lane that runs a kernel prebuild. Consumers start
+only after their wasm profile is ready; compile and lint remain independent.
+The CI result job requires every selected lane to succeed.
 
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI

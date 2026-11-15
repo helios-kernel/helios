@@ -58,6 +58,7 @@ jobs:
       # JSON array of {name, command, rust-cache} for the legs of the
       # `checks` matrix.
       checks: ${{ steps.select.outputs.checks }}
+      tests: ${{ steps.select.outputs.tests }}
       # `true` when the change moves the kernel profile's format or the
       # compiler that reads it; `kernel-profile` then collects this run's.
       profile_format: ${{ steps.filter.outputs.profile_format || 'false' }}
@@ -169,7 +170,8 @@ jobs:
           {
             echo "wasm_profiles=${wasm_profiles}"
             echo "lanes=${lanes}"
-            echo "checks=${checks}"
+            echo "checks=$(jq -c 'map(select(.["guest-wasm"] == ""))' <<< "$checks")"
+            echo "tests=$(jq -c 'map(select(.["guest-wasm"] != ""))' <<< "$checks")"
           } >> "$GITHUB_OUTPUT"
           echo "${lanes}"
 
@@ -195,17 +197,16 @@ jobs:
   # result with the `prebuilt-wasm` action just before its first prebuild,
   # and reads it through `HELIOS_PREBUILT_WASM`, so a file missing from it
   # fails the lane's prebuild instead of being built there (#882).
-  wasm-programs:
+  wasm-debug:
     name: wasm-programs (${{ matrix.profile }})
     needs: changes
-    # An empty matrix is an error, not a skip.
-    if: needs.changes.outputs.wasm_profiles != '[]'
+    if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'debug')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       matrix:
-        profile: ${{ fromJSON(needs.changes.outputs.wasm_profiles) }}
-    steps:
+        profile: [debug]
+    steps: &wasm-steps
       - uses: actions/checkout@v4
         with:
           path: helios
@@ -229,6 +230,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  wasm-release:
+    name: wasm-programs (${{ matrix.profile }})
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'release')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        profile: [release]
+    steps: *wasm-steps
+
   checks:
     name: ${{ matrix.name }}
     needs: changes
@@ -248,7 +260,7 @@ jobs:
         # gates back to back locally; CI splits them so a lint failure
         # names the surface it came from.
         include: ${{ fromJSON(needs.changes.outputs.checks) }}
-    steps:
+    steps: &check-steps
       - uses: actions/checkout@v4
         with:
           path: helios
@@ -306,10 +318,6 @@ jobs:
           key: ${{ matrix.name }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       - uses: astral-sh/setup-uv@v6
-      - name: Build the prebuild tool while guest wasm builds
-        if: matrix.guest-wasm != ''
-        working-directory: helios
-        run: cargo build -p helios-cli
       - uses: ./helios/.github/actions/prebuilt-wasm
         if: matrix.guest-wasm != ''
         with:
@@ -321,6 +329,21 @@ jobs:
           HELIOS_PREBUILT_WASM: ${{ matrix.guest-wasm != '' && format('{0}/helios/target/wasm-programs', github.workspace) || '' }}
         run: ${{ matrix.command }}
 
+  tests:
+    name: ${{ matrix.name }}
+    needs: [changes, wasm-debug]
+    if: needs.changes.outputs.tests != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.tests) }}
+    steps: *check-steps
+
   # Every smoke step that boots a guest carries a bound of its own, so a
   # guest that hangs fails that step and the lane uploads its runtime
   # directories; the job's limit would cancel it hours later with nothing
@@ -330,7 +353,7 @@ jobs:
   # boot (64 s at most).
   smoke-riscv64:
     name: smoke-riscv64
-    needs: changes
+    needs: [changes, wasm-release]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-riscv64')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
@@ -743,7 +766,7 @@ jobs:
   # boot needs, which the inspector finds through the prefix.
   smoke-aarch64:
     name: smoke-aarch64
-    needs: changes
+    needs: [changes, wasm-release]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
@@ -1240,7 +1263,7 @@ jobs:
   # slow-timeout would kill the build it makes.
   smoke-aarch64-cfi:
     name: smoke-aarch64-cfi
-    needs: changes
+    needs: [changes, wasm-debug]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64-cfi')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
@@ -1325,8 +1348,8 @@ jobs:
 
   smoke-x86-64:
     name: smoke-x86-64
-    needs: [changes, kernel-profile]
-    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    needs: [changes, kernel-profile, wasm-release]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.wasm-release.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -2477,8 +2500,8 @@ jobs:
   # its own build of the inspector and the release kernel.
   smoke-x86-64-cpu-lifecycle:
     name: smoke-x86-64-cpu-lifecycle
-    needs: [changes, kernel-profile]
-    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-cpu-lifecycle') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    needs: [changes, kernel-profile, wasm-release]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.wasm-release.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-cpu-lifecycle') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -2605,7 +2628,7 @@ jobs:
   # needs.
   smoke-x86-64-venus:
     name: smoke-x86-64-venus
-    needs: changes
+    needs: [changes, wasm-debug]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-venus')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -2791,3 +2814,15 @@ jobs:
             helios/venus-smoke.out
           if-no-files-found: warn
           retention-days: 7
+
+  gate:
+    name: CI result
+    if: always()
+    needs: [changes, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every selected lane to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"
