@@ -11,7 +11,7 @@ target-features = ["atomics"]
 [dependencies]
 ash = { version = "0.38.0", default-features = false, features = ["std"] }
 helios-venus = { path = "../../venus", default-features = false, features = ["helios", "driver"] }
-helios-api = { path = "../../api", default-features = false, features = ["gpu", "programs", "task"] }
+helios-api = { path = "../../api", default-features = false, features = ["gpu", "programs", "sync", "task"] }
 thiserror = { version = "2.0.20", default-features = false }
 
 [lib]

@@ -27,6 +27,7 @@
 //! blob create naming the same id.
 
 use std::env;
+mod timeline;
 mod venus;
 
 use helios_api::gpu::{BlobMemory, BlobUsage, CapsetInfo, Context, Gpu, GpuError};
@@ -70,6 +71,8 @@ const CHILD_DONE: &str = "gpu-test:child fence=1";
 enum GpuTestError {
     #[error(transparent)]
     Venus(#[from] venus::Error),
+    #[error(transparent)]
+    Timeline(#[from] timeline::Error),
     #[error("the 3D engine refused: {0}")]
     Gpu(#[from] GpuError),
     #[error("usage: gpu-test [--expect-renderer] [--child]; `{0}` is not an option")]
@@ -123,6 +126,7 @@ impl Options {
 #[helios_api::main]
 async fn main() -> Result<(), GpuTestError> {
     let options = Options::parse()?;
+    timeline::run().await?;
     let gpu = match Gpu::open() {
         Ok(gpu) => gpu,
         Err(error @ (GpuError::NoRenderer | GpuError::Unavailable)) => {
