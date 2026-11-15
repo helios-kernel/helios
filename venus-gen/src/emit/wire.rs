@@ -143,6 +143,42 @@ fn u64_literal(value: u64) -> TokenStream {
 }
 
 impl<'a> Wire<'a> {
+    pub(super) fn entry_output_handles(&self, id: TypeId, assign: bool) -> Result<TokenStream> {
+        let frame = Frame {
+            container: id,
+            access: Access::Param,
+        };
+        let mut output = TokenStream::new();
+        for var in &self.an.reg.types[id].variables {
+            if !var.attrs.var_out || self.category(var.ty.base) != Category::Handle {
+                continue;
+            }
+            let name = ident(&var.name);
+            let handle = ident(&self.an.reg.types[var.ty.base].name);
+            let value = if assign {
+                quote!(venus_state.connection.object_id()?)
+            } else {
+                quote!(0)
+            };
+            let write = if let Some(len) = var.attrs.lens.first() {
+                let expression = expr::parse(&len.expr, &len.name)?;
+                let count = self.expr_tokens(frame, &expression, len, &var.name, false)?;
+                quote! {
+                    for venus_index in 0..(#count as usize) {
+                        #name.add(venus_index).write(#handle(#value));
+                    }
+                }
+            } else {
+                quote!(#name.write(#handle(#value));)
+            };
+            output.extend(quote! {
+                if !#name.is_null() {
+                    #write
+                }
+            });
+        }
+        Ok(output)
+    }
     pub fn new(an: &'a Analysis) -> Self {
         Self { an }
     }

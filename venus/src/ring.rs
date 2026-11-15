@@ -81,6 +81,10 @@ pub struct Ring<'a> {
     mapping: PhantomData<&'a UnsafeCell<[u8]>>,
 }
 
+// SAFETY: moving the sole producer does not change the renderer's shared
+// mapping. Producer mutation requires &mut self; control words use atomics.
+unsafe impl Send for Ring<'_> {}
+
 impl<'a> Ring<'a> {
     /// Initialise the ring before handing it to the renderer.
     ///

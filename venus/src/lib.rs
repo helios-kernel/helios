@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "driver", feature(allocator_ext))]
+
 //! The Venus wire protocol: Vulkan commands serialized for a renderer that
 //! runs them on a host GPU.
 //!
@@ -17,6 +19,9 @@ pub mod connection;
 pub mod ring;
 pub mod runtime;
 pub mod transport;
+
+#[cfg(feature = "driver")]
+pub mod driver;
 
 #[cfg(feature = "helios")]
 pub mod helios;

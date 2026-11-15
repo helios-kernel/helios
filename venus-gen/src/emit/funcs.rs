@@ -32,6 +32,103 @@ impl Variant {
 }
 
 impl<'a> Wire<'a> {
+    pub(super) fn command_entry(&self, id: TypeId) -> Result<Option<TokenStream>> {
+        let command = &self.an.reg.types[id];
+        // These commands alter guest ownership or synchronize GPU work;
+        // their entry points live in the hand-written driver modules.
+        if command.name.ends_with("MESA")
+            || matches!(
+                command.name.as_str(),
+                "vkDestroyInstance"
+                    | "vkDestroyDevice"
+                    | "vkAllocateMemory"
+                    | "vkFreeMemory"
+                    | "vkFreeCommandBuffers"
+                    | "vkDestroyCommandPool"
+                    | "vkQueueWaitIdle"
+                    | "vkDeviceWaitIdle"
+                    | "vkWaitForFences"
+                    | "vkWaitSemaphores"
+                    | "vkEnumeratePhysicalDeviceGroups"
+            )
+        {
+            return Ok(None);
+        }
+        let Some(first) = command.variables.first() else {
+            return Ok(None);
+        };
+        let dispatch_type = &self.an.reg.types[first.ty.base];
+        if first.ty.is_pointer() || !dispatch_type.dispatchable {
+            return Ok(None);
+        }
+        if command
+            .variables
+            .iter()
+            .any(|var| var.attrs.var_out && self.an.reg.types[var.ty.base].dispatchable)
+        {
+            return Ok(None);
+        }
+        let invocation = match command
+            .ret
+            .as_ref()
+            .map(|ret| self.an.reg.types[ret.base].name.as_str())
+        {
+            Some("VkResult") => quote!(invoke_result),
+            None => quote!(invoke_void),
+            _ => return Ok(None),
+        };
+        let mut params = Vec::new();
+        let mut args = Vec::new();
+        for var in &command.variables {
+            let name = ident(&var.name);
+            let declared = decl_type(self.an, &var.ty, &var.name)?;
+            if var.ty.is_static_array() {
+                let mut element = var.ty.clone();
+                element.decor.dim = None;
+                let element = decl_type(self.an, &element, &var.name)?;
+                // C parameters declared as fixed arrays decay to pointers;
+                // the Rust wire helper takes a copied array value instead.
+                params.push(quote!(#name: *const #element));
+                args.push(quote!(*#name.cast::<#declared>()));
+            } else {
+                params.push(quote!(#name: #declared));
+                args.push(quote!(#name));
+            }
+        }
+        let dispatch = ident(&first.name);
+        let entry = ident(&command.name);
+        let call = func("call", &command.name);
+        let ret = match &command.ret {
+            Some(ret) => {
+                let ret = decl_type(self.an, ret, "entry result")?;
+                quote!(-> #ret)
+            }
+            None => TokenStream::new(),
+        };
+        let clear = self.entry_output_handles(id, false)?;
+        let assign = self.entry_output_handles(id, true)?;
+        let body = if assign.is_empty() {
+            quote!(#call(&mut venus_state.connection, #(#args),*))
+        } else {
+            quote! {
+                let venus_result = (|| {
+                    #assign
+                    #call(&mut venus_state.connection, #(#args),*)
+                })();
+                venus_result.inspect_err(|_| { #clear })
+            }
+        };
+        Ok(Some(quote! {
+            unsafe extern "system" fn #entry<F: Factory>(#(#params),*) #ret {
+                unsafe {
+                    #clear
+                    super::instance::#invocation::<F>(#dispatch.0, |venus_state| {
+                        #body
+                    })
+                }
+            }
+        }))
+    }
     /// Everything generated for a struct or union that was reached by a
     /// command: the walks its `need_*` flags ask for.
     pub fn type_functions(&self, id: TypeId) -> Result<TokenStream> {

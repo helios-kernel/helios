@@ -14,7 +14,7 @@ use crate::transport::{MappedBlob, Transport, TransportFactory};
 mod bindings {
     wit_bindgen::generate!({
         path: "../wit",
-        world: "gpu-host",
+        world: "venus-host",
         generate_all,
         async: false,
     });
@@ -63,6 +63,34 @@ pub struct Blob {
     resource: gpu::Blob,
     mapping: Block,
     pointer: NonNull<u8>,
+}
+
+// SAFETY: Blob exclusively owns its mapping and resource. Moving it to
+// another guest thread transfers that ownership without exposing references.
+unsafe impl Send for Blob {}
+
+#[cfg(feature = "driver")]
+pub struct SubmissionLock(bindings::helios::system::sync::RawMutex);
+
+// SAFETY: the kernel mutex grants one guard at a time across guest tasks
+// and threads. The guard resource releases it on drop; canonical lowering
+// suspends the guest stack while acquisition waits in the host executor.
+#[cfg(feature = "driver")]
+unsafe impl crate::driver::SubmissionLock for SubmissionLock {
+    type Guard<'a> = bindings::helios::system::sync::RawMutexGuard;
+
+    fn new() -> Self {
+        Self(bindings::helios::system::sync::RawMutex::new())
+    }
+
+    fn lock(&self) -> Self::Guard<'_> {
+        self.0.lock()
+    }
+}
+
+#[cfg(feature = "driver")]
+impl crate::driver::Factory for Context {
+    type Lock = SubmissionLock;
 }
 
 // SAFETY: `mapping` owns aligned guest pages. The resource's destruction
