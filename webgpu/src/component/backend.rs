@@ -52,7 +52,38 @@ impl Device {
         adapter: &Arc<instance::Adapter>,
         descriptor: &device::DeviceDescriptor<'_>,
     ) -> Result<Self, instance::RequestDeviceError> {
-        let (raw, queue) = adapter.request_device(descriptor)?;
+        let mut descriptor = descriptor.clone();
+        adapter.validate_device_descriptor(&mut descriptor)?;
+        // SAFETY: this runtime creates Vulkan adapters exclusively. The HAL
+        // handle is retained only during synchronous device initialization.
+        let hal = unsafe { adapter.clone().as_hal::<wgpu_hal::api::Vulkan>() }
+            .expect("Helios WebGPU adapters use Vulkan");
+        let foreign = hal
+            .physical_device_capabilities()
+            .supports_extension(ash::ext::queue_family_foreign::NAME);
+        // SAFETY: core validated the features and limits. The callback only
+        // adds an advertised extension and changes no requested feature.
+        let opened = unsafe {
+            hal.open_with_callback(
+                descriptor.required_features,
+                &descriptor.required_limits,
+                &descriptor.memory_hints,
+                Some(Box::new(move |args| {
+                    if foreign
+                        && !args
+                            .extensions
+                            .contains(&ash::ext::queue_family_foreign::NAME)
+                    {
+                        args.extensions.push(ash::ext::queue_family_foreign::NAME);
+                    }
+                })),
+            )
+        }
+        .map_err(device::DeviceError::from_hal)?;
+        // SAFETY: this HAL device was created on this exact adapter with the
+        // validated descriptor, and ownership passes to core.
+        let (raw, queue) =
+            unsafe { adapter.create_device_and_queue_from_hal(opened.into(), &descriptor) }?;
         let (loss, notify) = DeviceLoss::new();
         raw.set_device_lost_closure(Box::new(notify));
         Ok(Self { raw, queue, loss })
