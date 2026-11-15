@@ -14,7 +14,8 @@
 //! per-(processor, node) frame cache that backs it. `entropy` owns the boot-seeded root DRBG and the
 //! per-instance pools derived from it. `reservations` is the AddressSpace
 //! reservation/committed-region bookkeeping shared by every backend,
-//! `mapping_cost` says what mapping user address space costs the kernel
+//! `residency` reads from it how much of the user pool each instance
+//! holds, `mapping_cost` says what mapping user address space costs the kernel
 //! heap that describes it, and `policy` states — once, for every
 //! backend — how the boot memory map is divided between the two
 //! domains.
@@ -34,6 +35,7 @@ mod per_processor;
 mod policy;
 mod reported;
 mod reservations;
+mod residency;
 mod swap;
 mod user;
 
@@ -76,6 +78,7 @@ pub use reservations::{
     AccessibilityPlan, CommittedRegion, CommittedRemoval, Decommitted, ReleasedReservation,
     ReservationLookup, ReservationTracker, SwapEntry, VaCursor, ranges_outside, validate_range,
 };
+pub use residency::{ResidencyVmHooks, UserResidency, install_residency_hooks, residency_vm_hooks};
 pub use swap::{
     AGE_BATCH_PAGES, GuestResidency, IDLE_SWAP_AFTER, InstalledAddressSpace, SWAP_BATCH_BYTES,
     SWAP_TICK, SwapDisabled, SwapFaultError, SwapFaultIn, SwapHandle, SwapLeafFormat, SwapSpace,

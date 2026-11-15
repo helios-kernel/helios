@@ -119,10 +119,13 @@ where
             if read == 0 {
                 break;
             }
-            let remaining = writer.write_all(buffer[..read].to_vec()).await;
-            if !remaining.is_empty() {
+            buffer.truncate(read);
+            // write_all returns the same allocation, with only unsent bytes left.
+            buffer = writer.write_all(buffer).await;
+            if !buffer.is_empty() {
                 return Err(body_stream_dropped());
             }
+            buffer.resize(BODY_CHUNK_BYTES, 0);
         }
         drop(writer);
         Ok(())

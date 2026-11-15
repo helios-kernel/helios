@@ -114,13 +114,15 @@
   },
   "test-btrfs-upstream": {
     "surfaces": [
-      "btrfs"
+      "btrfs",
+      "pin"
     ],
     "exclusive": true
   },
   "test-btrfs-fuzz": {
     "surfaces": [
-      "btrfs"
+      "btrfs",
+      "pin"
     ],
     "exclusive": true
   }

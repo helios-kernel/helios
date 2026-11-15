@@ -195,10 +195,12 @@ impl HttpFields {
     }
 
     /// Build a mutable section from name/value pairs, validating each.
-    pub fn from_list(entries: Vec<(String, Bytes)>) -> Result<Self, HttpHeaderError> {
+    pub fn from_list<N: AsRef<str>>(
+        entries: impl IntoIterator<Item = (N, Bytes)>,
+    ) -> Result<Self, HttpHeaderError> {
         let mut fields = Self::new_mutable();
         for (name, value) in entries {
-            fields.append(&name, value)?;
+            fields.append(name.as_ref(), value)?;
         }
         Ok(fields)
     }

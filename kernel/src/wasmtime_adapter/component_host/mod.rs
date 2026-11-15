@@ -35,7 +35,7 @@ use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
     Access, Accessor, Component, Destination, FutureReader, HasSelf, Linker, Resource,
-    ResourceTable, ResourceType, StreamProducer, StreamReader, StreamResult,
+    ResourceTable, ResourceType, StreamProducer, StreamReader, StreamResult, WasmStr,
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
 
@@ -3064,9 +3064,10 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
-    instance.func_wrap_data(
+    instance.func_wrap_data_memory(
         "set-target-enabled",
-        |data, (target, enabled): (String, bool)| {
+        |data, memory, (target, enabled): (WasmStr, bool)| {
+            let target = target.to_str_in(memory)?;
             let result =
                 observation::set_target_enabled(data, &target, enabled).map_err(|refusal| {
                     match refusal {
@@ -3386,9 +3387,10 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
-    instance.func_wrap_data(
+    instance.func_wrap_data_memory(
         "set-target-enabled",
-        |data, (target, enabled): (String, bool)| {
+        |data, memory, (target, enabled): (WasmStr, bool)| {
+            let target = target.to_str_in(memory)?;
             let result =
                 observation::set_target_enabled(data, &target, enabled).map_err(|refusal| {
                     match refusal {
@@ -3793,9 +3795,11 @@ where
         // The flag and the interruption are all this does: the victim
         // unwinds at its next check, and whoever owns it — a plugin
         // supervisor, or nobody — decides what happens after.
-        let outcome = data
-            .instance_registry
-            .request_kill(victim, KillReason::Operator, now);
+        // Before the registry's lock, never under it: see `UserResidency`.
+        let residency = super::store::user_residency();
+        let outcome =
+            data.instance_registry
+                .request_kill(victim, KillReason::Operator, now, &residency);
         Ok((match outcome {
             KillOutcome::Requested => {
                 deliver_kill(&data.runtime_state, victim);
