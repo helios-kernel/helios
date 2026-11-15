@@ -16,6 +16,10 @@ pub enum Error {
     NoComputeQueue,
     #[error("the Venus physical device has no host-visible coherent memory type")]
     NoHostMemory,
+    #[error("the Venus physical device does not support timeline semaphores")]
+    NoTimelineSemaphores,
+    #[error("Vulkan synchronization check failed: {0}")]
+    Synchronization(&'static str),
     #[error("Vulkan memory read back {found:#04x} at byte {offset}, expected {expected:#04x}")]
     MemoryReadback {
         offset: usize,
@@ -61,9 +65,17 @@ pub fn run() -> Result<(), Error> {
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(family)
                 .queue_priorities(&priorities)];
+            let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut timeline);
+            instance.get_physical_device_features2(physical, &mut features);
+            if timeline.timeline_semaphore == vk::FALSE {
+                return Err(Error::NoTimelineSemaphores);
+            }
             let device = instance.create_device(
                 physical,
-                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                &vk::DeviceCreateInfo::default()
+                    .queue_create_infos(&queues)
+                    .push_next(&mut timeline),
                 None,
             )?;
             let queue = device.get_device_queue(family, 0);

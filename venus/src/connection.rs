@@ -61,6 +61,10 @@ pub enum Error<E: std::error::Error> {
     IncompleteWait { sequence: u32 },
     #[error("Vulkan object identifiers are exhausted")]
     ObjectIds,
+    #[error("the renderer reported device loss")]
+    DeviceLost,
+    #[error("Vulkan fence generations are exhausted")]
+    FenceGenerations,
     #[error("fence identifiers are exhausted on ring {ring}")]
     FenceIds { ring: u8 },
     #[error("ring {ring} exceeds the virtio GPU timeline range")]
@@ -73,8 +77,7 @@ struct QueueTimeline<S: SignalTimeline> {
 }
 
 impl<S: SignalTimeline> QueueTimeline<S> {
-    fn new() -> Self {
-        let source = S::new(0);
+    fn new(source: S) -> Self {
         let reader = source.reader();
         Self { source, reader }
     }
@@ -208,6 +211,7 @@ impl<T: Transport> Connection<T> {
         &mut self,
         commands: &[u8],
         ring: u8,
+        extra: &[SignalPoint<'_, T::Signal>],
     ) -> Result<WaitPoint<T>, Error<T::Error>> {
         let fence = self
             .fences
@@ -215,20 +219,29 @@ impl<T: Transport> Connection<T> {
             .ok_or(Error::Timeline { ring })?;
         *fence = fence.checked_add(1).ok_or(Error::FenceIds { ring })?;
         let fence = *fence;
-        let timeline = self.signals[usize::from(ring)].get_or_insert_with(QueueTimeline::new);
-        let signals = [SignalPoint {
+        let transport = &self.transport;
+        let timeline = self.signals[usize::from(ring)]
+            .get_or_insert_with(|| QueueTimeline::new(transport.timeline(0)));
+        let own = [SignalPoint {
             source: &timeline.source,
             value: fence,
         }];
+        let joined;
+        let signals = if extra.is_empty() {
+            &own[..]
+        } else {
+            joined = own
+                .iter()
+                .chain(extra)
+                .map(|point| SignalPoint {
+                    source: point.source,
+                    value: point.value,
+                })
+                .collect::<Vec<_>>();
+            &joined
+        };
         self.transport
-            .execute(
-                commands,
-                ring,
-                Some(Completion {
-                    fence,
-                    signals: &signals,
-                }),
-            )
+            .execute(commands, ring, Some(Completion { fence, signals }))
             .map_err(Error::Transport)?;
         Ok(TimelinePoint {
             timeline: timeline.reader.clone(),
@@ -237,7 +250,7 @@ impl<T: Transport> Connection<T> {
     }
 
     fn execute_and_wait(&mut self, commands: &[u8], ring: u8) -> Result<(), Error<T::Error>> {
-        let point = self.execute_fenced(commands, ring)?;
+        let point = self.execute_fenced(commands, ring, &[])?;
         <T::Signal as SignalTimeline>::Timeline::wait(&[point], true, None)
             .map(|_| ())
             .map_err(Error::Transport)
@@ -342,7 +355,19 @@ impl<T: Transport> Connection<T> {
         &mut self,
         timelines: u64,
     ) -> Result<Vec<WaitPoint<T>>, Error<T::Error>> {
-        let command = self.inline(|encoder| {
+        let command = self.completion_command()?;
+        let mut points = Vec::with_capacity(timelines.count_ones() as usize);
+        let mut remaining = timelines;
+        while remaining != 0 {
+            let ring = remaining.trailing_zeros() as u8;
+            remaining &= remaining - 1;
+            points.push(self.execute_fenced(&command, ring, &[])?);
+        }
+        Ok(points)
+    }
+
+    fn completion_command(&self) -> Result<InlineCommand, Error<T::Error>> {
+        self.inline(|encoder| {
             // SAFETY: this command has only scalar parameters.
             unsafe {
                 vn_encode_vkWaitRingSeqnoMESA(
@@ -352,15 +377,28 @@ impl<T: Transport> Connection<T> {
                     u64::from(self.ring.sequence()),
                 )
             };
-        })?;
-        let mut points = Vec::with_capacity(timelines.count_ones() as usize);
-        let mut remaining = timelines;
-        while remaining != 0 {
-            let ring = remaining.trailing_zeros() as u8;
-            remaining &= remaining - 1;
-            points.push(self.execute_fenced(&command, ring)?);
+        })
+    }
+
+    /// Attach signals to completion of all commands published so far on this queue.
+    pub fn signal_queue(
+        &mut self,
+        ring: u8,
+        signals: &[SignalPoint<'_, T::Signal>],
+    ) -> Result<(), Error<T::Error>> {
+        let command = self.completion_command()?;
+        self.execute_fenced(&command, ring, signals)?;
+        Ok(())
+    }
+
+    pub fn timeline(&self, initial: u64) -> T::Signal {
+        self.transport.timeline(initial)
+    }
+
+    pub fn fail_timelines(&self) {
+        for timeline in self.signals.iter().flatten() {
+            timeline.source.fail();
         }
-        Ok(points)
     }
 
     /// Submit a reply-generating command and borrow its reply only after

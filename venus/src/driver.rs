@@ -11,6 +11,7 @@ mod device;
 mod exclusive;
 mod instance;
 mod memory;
+mod sync;
 
 #[expect(
     non_snake_case,

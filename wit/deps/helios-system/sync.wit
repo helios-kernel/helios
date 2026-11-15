@@ -15,6 +15,8 @@ interface sync {
     constructor(initial: u64);
     reader: func() -> timeline;
     signal: func(value: u64) -> result<_, error>;
+    /// Fail outstanding and future waits on this timeline.
+    fail: func();
   }
 
   record timeline-point {

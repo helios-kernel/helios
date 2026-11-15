@@ -64,6 +64,7 @@ unsafe impl MappedBlob for Blob {
 #[derive(Default)]
 struct Recorded {
     next: u32,
+    timelines: Vec<Weak<Mutex<TimelineState>>>,
     blobs: BTreeMap<u32, Weak<Memory>>,
     ring: Option<u32>,
     sequences: Vec<u64>,
@@ -102,6 +103,8 @@ struct Binding {
 struct TimelineState {
     value: u64,
     producers: usize,
+    failed: bool,
+    wait_started: Option<std::sync::mpsc::Sender<()>>,
     bindings: Vec<Binding>,
     waiters: Vec<Weak<std::sync::mpsc::Sender<()>>>,
 }
@@ -143,24 +146,24 @@ impl SignalTimeline for TestSignal {
     type Error = TestError;
     type Timeline = TestReader;
 
-    fn new(value: u64) -> Self {
-        Self(Arc::new(Mutex::new(TimelineState {
-            value,
-            producers: 1,
-            bindings: Vec::new(),
-            waiters: Vec::new(),
-        })))
-    }
-
     fn reader(&self) -> TestReader {
         TestReader(self.0.clone())
     }
 
     fn signal(&self, value: u64) -> Result<(), TestError> {
         let mut state = self.0.lock().unwrap();
+        if state.failed {
+            return Err(TestError);
+        }
         state.value = state.value.max(value);
         state.notify();
         Ok(())
+    }
+
+    fn fail(&self) {
+        let mut state = self.0.lock().unwrap();
+        state.failed = true;
+        state.notify();
     }
 }
 
@@ -182,7 +185,12 @@ impl Timeline for TestReader {
     type Error = TestError;
 
     fn value(&self) -> Result<u64, TestError> {
-        Ok(self.0.lock().unwrap().value)
+        let state = self.0.lock().unwrap();
+        if state.failed {
+            Err(TestError)
+        } else {
+            Ok(state.value)
+        }
     }
 
     fn wait(
@@ -194,19 +202,20 @@ impl Timeline for TestReader {
         let (sender, receiver) = std::sync::mpsc::channel();
         let sender = Arc::new(sender);
         for point in points {
-            point
-                .timeline
-                .0
-                .lock()
-                .unwrap()
-                .waiters
-                .push(Arc::downgrade(&sender));
+            let mut state = point.timeline.0.lock().unwrap();
+            state.waiters.push(Arc::downgrade(&sender));
+            if let Some(started) = state.wait_started.take() {
+                started.send(()).unwrap();
+            }
         }
         loop {
             let mut completed = 0;
             for point in points {
                 point.timeline.retire()?;
                 let state = point.timeline.0.lock().unwrap();
+                if state.failed {
+                    return Err(TestError);
+                }
                 if state.value >= point.value {
                     completed += 1;
                 } else if state.producers == 0 {
@@ -239,6 +248,23 @@ impl Transport for Recording {
     type Error = TestError;
     type Blob = Blob;
     type Signal = TestSignal;
+
+    fn timeline(&self, value: u64) -> TestSignal {
+        let state = Arc::new(Mutex::new(TimelineState {
+            value,
+            producers: 1,
+            failed: false,
+            wait_started: None,
+            bindings: Vec::new(),
+            waiters: Vec::new(),
+        }));
+        self.0
+            .lock()
+            .unwrap()
+            .timelines
+            .push(Arc::downgrade(&state));
+        TestSignal(state)
+    }
 
     fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Blob, TestError> {
         let memory = Arc::new(Memory(
@@ -283,6 +309,7 @@ impl Transport for Recording {
                     fence,
                     value: signal.value,
                 });
+                timeline.notify();
             }
         }
         Ok(())
@@ -653,6 +680,8 @@ mod entry_tests {
             wire::VK_COMMAND_TYPE_vkCreateBuffer_EXT.0,
             wire::VK_COMMAND_TYPE_vkAllocateMemory_EXT.0,
             wire::VK_COMMAND_TYPE_vkCreateCommandPool_EXT.0,
+            wire::VK_COMMAND_TYPE_vkCreateFence_EXT.0,
+            wire::VK_COMMAND_TYPE_vkCreateSemaphore_EXT.0,
         ]
         .contains(&command)
         {
@@ -676,6 +705,10 @@ mod entry_tests {
         } else if [
             wire::VK_COMMAND_TYPE_vkBeginCommandBuffer_EXT.0,
             wire::VK_COMMAND_TYPE_vkEndCommandBuffer_EXT.0,
+            wire::VK_COMMAND_TYPE_vkResetFences_EXT.0,
+            wire::VK_COMMAND_TYPE_vkSignalSemaphore_EXT.0,
+            wire::VK_COMMAND_TYPE_vkQueueSubmit_EXT.0,
+            wire::VK_COMMAND_TYPE_vkQueueSubmit2_EXT.0,
         ]
         .contains(&command)
         {
@@ -744,6 +777,321 @@ mod entry_tests {
 
     impl Factory for TestFactory {
         type Lock = TestLock;
+    }
+
+    struct SyncDevice {
+        instance: ash::Instance,
+        device: ash::Device,
+        queue: vk::Queue,
+        recorded: Arc<Mutex<Recorded>>,
+    }
+
+    impl SyncDevice {
+        fn new() -> Self {
+            let (transport, capset) = TestFactory::create().unwrap();
+            let recorded = transport.0.clone();
+            let configuration = TestFactory::configuration();
+            let connection = Connection::new(
+                transport,
+                capset,
+                configuration.layout,
+                configuration.idle_timeout,
+            )
+            .unwrap();
+            // SAFETY: the test renderer accepts these live creation structures.
+            unsafe {
+                let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
+                    connection,
+                    &vk::InstanceCreateInfo::default(),
+                    None,
+                )
+                .unwrap();
+                let physical = instance.enumerate_physical_devices().unwrap()[0];
+                let priorities = [1.0];
+                let queues = [vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(0)
+                    .queue_priorities(&priorities)];
+                let device = instance
+                    .create_device(
+                        physical,
+                        &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                        None,
+                    )
+                    .unwrap();
+                let queue = device.get_device_queue(0, 0);
+                Self {
+                    instance,
+                    device,
+                    queue,
+                    recorded,
+                }
+            }
+        }
+
+        fn observe_latest_wait(&self) -> std::sync::mpsc::Receiver<()> {
+            let timeline = self
+                .recorded
+                .lock()
+                .unwrap()
+                .timelines
+                .last()
+                .unwrap()
+                .upgrade()
+                .unwrap();
+            let (entered, receiver) = std::sync::mpsc::channel();
+            timeline.lock().unwrap().wait_started = Some(entered);
+            receiver
+        }
+    }
+
+    impl Drop for SyncDevice {
+        fn drop(&mut self) {
+            // SAFETY: tests join their threads and destroy children before the fixture.
+            unsafe {
+                self.device.destroy_device(None);
+                self.instance.destroy_instance(None);
+            }
+        }
+    }
+
+    #[test]
+    fn fences_wait_for_future_submissions_and_reset_by_generation() {
+        let fixture = SyncDevice::new();
+        let device = &fixture.device;
+        // SAFETY: all handles are owned here; reset occurs after completion and threads join before destruction.
+        unsafe {
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            assert!(!device.get_fence_status(fence).unwrap());
+            assert_eq!(
+                device.wait_for_fences(&[fence], true, 0),
+                Err(vk::Result::TIMEOUT)
+            );
+            let started = fixture.observe_latest_wait();
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| device.wait_for_fences(&[fence], true, 5_000_000_000));
+                started
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("fence wait is registered before submission");
+                device.queue_submit(fixture.queue, &[], fence).unwrap();
+                waiting.join().unwrap().unwrap();
+            });
+            assert!(device.get_fence_status(fence).unwrap());
+            device.reset_fences(&[fence]).unwrap();
+            assert!(!device.get_fence_status(fence).unwrap());
+            assert_eq!(
+                device.wait_for_fences(&[fence], true, 0),
+                Err(vk::Result::TIMEOUT)
+            );
+            let signaled = device
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+                .unwrap();
+            device
+                .wait_for_fences(&[fence, signaled], false, 0)
+                .unwrap();
+            assert_eq!(
+                device.wait_for_fences(&[fence, signaled], true, 0),
+                Err(vk::Result::TIMEOUT)
+            );
+            device.queue_submit2(fixture.queue, &[], fence).unwrap();
+            device.wait_for_fences(&[fence, signaled], true, 0).unwrap();
+            device.destroy_fence(fence, None);
+            device.destroy_fence(signaled, None);
+        }
+    }
+
+    #[test]
+    fn timeline_semaphore_waits_allow_future_cpu_signals_and_any_all_selection() {
+        let fixture = SyncDevice::new();
+        let device = &fixture.device;
+        // SAFETY: semaphore values advance, and every wait's arrays live until it returns.
+        unsafe {
+            let mut kind = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(3);
+            let left = device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(device.get_semaphore_counter_value(left).unwrap(), 3);
+            let handles = [left];
+            let values = [4];
+            assert_eq!(
+                device.wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(&handles)
+                        .values(&values),
+                    0
+                ),
+                Err(vk::Result::TIMEOUT)
+            );
+            let started = fixture.observe_latest_wait();
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| {
+                    device.wait_semaphores(
+                        &vk::SemaphoreWaitInfo::default()
+                            .semaphores(&handles)
+                            .values(&values),
+                        5_000_000_000,
+                    )
+                });
+                started
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("timeline wait is registered before CPU signal");
+                device
+                    .signal_semaphore(&vk::SemaphoreSignalInfo::default().semaphore(left).value(4))
+                    .unwrap();
+                waiting.join().unwrap().unwrap();
+            });
+            assert_eq!(device.get_semaphore_counter_value(left).unwrap(), 4);
+            kind.initial_value = 0;
+            let right = device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                    None,
+                )
+                .unwrap();
+            let handles = [left, right];
+            let values = [4, 1];
+            device
+                .wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .flags(vk::SemaphoreWaitFlags::ANY)
+                        .semaphores(&handles)
+                        .values(&values),
+                    0,
+                )
+                .unwrap();
+            assert_eq!(
+                device.wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(&handles)
+                        .values(&values),
+                    0
+                ),
+                Err(vk::Result::TIMEOUT)
+            );
+            device.destroy_semaphore(left, None);
+            device.destroy_semaphore(right, None);
+        }
+    }
+
+    #[test]
+    fn each_submit_batch_signals_its_timeline_values_before_the_next_batch() {
+        let fixture = SyncDevice::new();
+        let device = &fixture.device;
+        // SAFETY: all submissions use live semaphores and increasing timeline values.
+        unsafe {
+            let mut kind =
+                vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+            let semaphore = device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                    None,
+                )
+                .unwrap();
+            let handles = [semaphore];
+            let first = [3];
+            let second = [7];
+            let mut first_timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&first);
+            let mut second_timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&second);
+            let submits = [
+                vk::SubmitInfo::default()
+                    .signal_semaphores(&handles)
+                    .push_next(&mut first_timeline),
+                vk::SubmitInfo::default()
+                    .signal_semaphores(&handles)
+                    .push_next(&mut second_timeline),
+            ];
+            let before = fixture
+                .recorded
+                .lock()
+                .unwrap()
+                .submitted
+                .iter()
+                .filter(|(ring, _)| *ring != 0)
+                .count();
+            device
+                .queue_submit(fixture.queue, &submits, vk::Fence::null())
+                .unwrap();
+            let after = fixture
+                .recorded
+                .lock()
+                .unwrap()
+                .submitted
+                .iter()
+                .filter(|(ring, _)| *ring != 0)
+                .count();
+            assert_eq!(after - before, 2);
+            device
+                .wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(&handles)
+                        .values(&second),
+                    0,
+                )
+                .unwrap();
+            assert_eq!(device.get_semaphore_counter_value(semaphore).unwrap(), 7);
+            let signals = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .value(11)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            device
+                .queue_submit2(
+                    fixture.queue,
+                    &[vk::SubmitInfo2::default().signal_semaphore_infos(&signals)],
+                    vk::Fence::null(),
+                )
+                .unwrap();
+            device
+                .wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(&handles)
+                        .values(&[11]),
+                    0,
+                )
+                .unwrap();
+            device.destroy_semaphore(semaphore, None);
+        }
+    }
+
+    #[test]
+    fn connection_failure_wakes_an_unsignaled_fence_wait() {
+        let fixture = SyncDevice::new();
+        let device = &fixture.device;
+        // SAFETY: the failure is injected through the recording transport; cleanup still uses live handles.
+        unsafe {
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            let started = fixture.observe_latest_wait();
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| device.wait_for_fences(&[fence], true, 5_000_000_000));
+                started
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("fence wait is registered before failure");
+                fixture.recorded.lock().unwrap().premature_completion = true;
+                assert_eq!(
+                    device.create_buffer(
+                        &vk::BufferCreateInfo::default()
+                            .size(64)
+                            .usage(vk::BufferUsageFlags::STORAGE_BUFFER),
+                        None
+                    ),
+                    Err(vk::Result::ERROR_DEVICE_LOST)
+                );
+                assert_eq!(waiting.join().unwrap(), Err(vk::Result::ERROR_DEVICE_LOST));
+            });
+            device.destroy_fence(fence, None);
+        }
     }
 
     #[test]

@@ -11,6 +11,10 @@ struct Resources<'a> {
     pipeline: vk::Pipeline,
     pool: vk::DescriptorPool,
     commands: vk::CommandPool,
+    fence: vk::Fence,
+    semaphore: vk::Semaphore,
+    queue: vk::Queue,
+    pending: bool,
 }
 
 impl Drop for Resources<'_> {
@@ -18,6 +22,12 @@ impl Drop for Resources<'_> {
         // SAFETY: every field is either null or owned here. No submitted work
         // remains when this owner drops: run waits for the queue after submit.
         unsafe {
+            if self.pending {
+                // An expired smoke-test deadline does not cancel GPU work.
+                let _ = self.device.queue_wait_idle(self.queue);
+            }
+            self.device.destroy_fence(self.fence, None);
+            self.device.destroy_semaphore(self.semaphore, None);
             self.device.destroy_command_pool(self.commands, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
@@ -52,6 +62,10 @@ pub(super) fn run(
         pipeline: vk::Pipeline::null(),
         pool: vk::DescriptorPool::null(),
         commands: vk::CommandPool::null(),
+        fence: vk::Fence::null(),
+        semaphore: vk::Semaphore::null(),
+        queue,
+        pending: false,
     };
     // One page exercises multiple shader invocations and mapped cache lines.
     let bytes = super::super::PAGE_BYTES;
@@ -185,9 +199,54 @@ pub(super) fn run(
             &[],
         );
         device.end_command_buffer(command)?;
-        let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
-        device.queue_submit(queue, &submits, vk::Fence::null())?;
-        device.queue_wait_idle(queue)?;
+        resources.fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+        let mut kind =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        resources.semaphore = device.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+            None,
+        )?;
+        let fences = [resources.fence];
+        if device.wait_for_fences(&fences, true, 0) != Err(vk::Result::TIMEOUT) {
+            return Err(Error::Synchronization("new fence did not time out"));
+        }
+        device.signal_semaphore(
+            &vk::SemaphoreSignalInfo::default()
+                .semaphore(resources.semaphore)
+                .value(1),
+        )?;
+        let semaphores = [resources.semaphore];
+        let waits = [1];
+        let signals = [2];
+        let stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
+        let mut values = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&waits)
+            .signal_semaphore_values(&signals);
+        let submits = [vk::SubmitInfo::default()
+            .command_buffers(&commands)
+            .wait_semaphores(&semaphores)
+            .wait_dst_stage_mask(&stages)
+            .signal_semaphores(&semaphores)
+            .push_next(&mut values)];
+        device.queue_submit(queue, &submits, resources.fence)?;
+        resources.pending = true;
+        // Ten seconds bounds this one-page functional smoke, including CI scheduling.
+        let timeout = std::time::Duration::from_secs(10).as_nanos() as u64;
+        device.wait_semaphores(
+            &vk::SemaphoreWaitInfo::default()
+                .semaphores(&semaphores)
+                .values(&signals),
+            timeout,
+        )?;
+        device.wait_for_fences(&fences, true, timeout)?;
+        resources.pending = false;
+        if !device.get_fence_status(resources.fence)?
+            || device.get_semaphore_counter_value(resources.semaphore)? != 2
+        {
+            return Err(Error::Synchronization(
+                "completed submission has unsignaled objects",
+            ));
+        }
         for index in 0..count {
             let found = pointer.add(index as usize).read_volatile();
             // This mirrors compute.wgsl's arithmetic, not its GPU execution.
@@ -200,7 +259,16 @@ pub(super) fn run(
                 });
             }
         }
+        device.reset_fences(&fences)?;
+        if device.get_fence_status(resources.fence)? {
+            return Err(Error::Synchronization("reset fence remains signaled"));
+        }
+        device.queue_submit(queue, &[], resources.fence)?;
+        resources.pending = true;
+        device.wait_for_fences(&fences, true, timeout)?;
+        resources.pending = false;
     }
+    println!("gpu-test:venus synchronization ok cpu-signal=1 gpu-signal=2 fence-reset=1");
     println!("gpu-test:venus compute-readback ok words={count}");
     Ok(())
 }

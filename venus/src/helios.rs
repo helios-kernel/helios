@@ -49,14 +49,14 @@ impl SignalTimeline for Signal {
     type Error = Error;
     type Timeline = Reader;
 
-    fn new(initial: u64) -> Self {
-        Self(Arc::new(sync::SignalSource::new(initial)))
-    }
     fn reader(&self) -> Reader {
         Reader(Arc::new(self.0.reader()))
     }
     fn signal(&self, value: u64) -> Result<(), Error> {
         self.0.signal(value).map_err(Error::from)
+    }
+    fn fail(&self) {
+        self.0.fail();
     }
 }
 
@@ -169,6 +169,10 @@ impl Transport for Context {
     type Error = Error;
     type Blob = Blob;
     type Signal = Signal;
+
+    fn timeline(&self, initial: u64) -> Signal {
+        Signal(Arc::new(sync::SignalSource::new(initial)))
+    }
 
     fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Blob, Error> {
         let mut mapping = Block::zeroed(size.get())?;

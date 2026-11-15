@@ -65,9 +65,9 @@ pub struct TimelinePoint<T: Timeline> {
 pub trait SignalTimeline: Clone + Send + Sync {
     type Error: std::error::Error;
     type Timeline: Timeline<Error = Self::Error>;
-    fn new(initial: u64) -> Self;
     fn reader(&self) -> Self::Timeline;
     fn signal(&self, value: u64) -> Result<(), Self::Error>;
+    fn fail(&self);
 }
 
 pub struct SignalPoint<'a, S: SignalTimeline> {
@@ -88,6 +88,8 @@ pub trait Transport {
     type Error: std::error::Error;
     type Blob: MappedBlob;
     type Signal: SignalTimeline<Error = Self::Error>;
+
+    fn timeline(&self, initial: u64) -> Self::Signal;
 
     fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Self::Blob, Self::Error>;
     fn execute(

@@ -228,6 +228,10 @@ impl SignalSource {
     pub fn signal(&self, value: u64) -> Result<(), TimelineError> {
         self.raw.signal(value)
     }
+
+    pub fn fail(&self) {
+        self.raw.fail();
+    }
 }
 
 impl Timeline {

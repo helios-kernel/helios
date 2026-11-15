@@ -17,16 +17,19 @@ pub(super) struct Device<F: Factory> {
     pub(super) allocator: HostAllocator,
     queues: Vec<Box<Queue<F>, HostAllocator>>,
     pub(super) memories: BTreeMap<u64, Box<super::memory::Memory<F::Transport>, HostAllocator>>,
+    pub(super) fences: BTreeMap<u64, Box<super::sync::Fence<F::Transport>, HostAllocator>>,
+    pub(super) semaphores: BTreeMap<u64, Box<super::sync::Semaphore<F::Transport>, HostAllocator>>,
     pub(super) pools: BTreeMap<u64, Box<super::command::Pool<F>, HostAllocator>>,
 }
 
 #[repr(C)]
-struct Queue<F: Factory> {
+pub(super) struct Queue<F: Factory> {
     dispatch: Dispatch<F>,
     family: u32,
     index: u32,
     flags: vk::DeviceQueueCreateFlags,
-    ring: u8,
+    pub(super) ring: u8,
+    pub(super) device: u64,
 }
 
 pub(super) unsafe extern "system" fn create_device<F: Factory>(
@@ -55,6 +58,8 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
                 queues: Vec::new(),
                 memories: BTreeMap::new(),
                 pools: BTreeMap::new(),
+                fences: BTreeMap::new(),
+                semaphores: BTreeMap::new(),
             },
             allocator,
         ) {
@@ -89,6 +94,7 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
                     index,
                     flags: queue_info.flags,
                     ring: ring as u8,
+                    device: id,
                 };
                 match Box::try_new_in(
                     queue,
@@ -245,7 +251,7 @@ unsafe extern "system" fn queue_wait_idle<F: Factory>(queue: vk::Queue) -> vk::R
     // SAFETY: queue owns this immutable timeline assignment until destruction.
     let ring = unsafe { (*pointer.cast::<Queue<F>>()).ring };
     unsafe {
-        wait_for_points::<F>(pointer, |state| {
+        wait_for_points::<F>(pointer, true, u64::MAX, |state| {
             state.connection.completion_points(1u64 << ring)
         })
     }
@@ -255,7 +261,7 @@ unsafe extern "system" fn device_wait_idle<F: Factory>(device: vk::Device) -> vk
     // SAFETY: device is live and its dispatch header is immutable.
     let id = unsafe { (*object(device)).id };
     unsafe {
-        wait_for_points::<F>(object(device), |state| {
+        wait_for_points::<F>(object(device), true, u64::MAX, |state| {
             let timelines = state.devices[&id]
                 .queues
                 .iter()
@@ -285,7 +291,11 @@ pub(super) fn lookup<F: Factory>(name: &[u8]) -> vk::PFN_vkVoidFunction {
         b"vkGetDeviceQueue2" => get_device_queue2::<F> as *const (),
         b"vkQueueWaitIdle" => queue_wait_idle::<F> as *const (),
         b"vkDeviceWaitIdle" => device_wait_idle::<F> as *const (),
-        _ => return super::memory::lookup::<F>(name).or_else(|| super::command::lookup::<F>(name)),
+        _ => {
+            return super::sync::lookup::<F>(name)
+                .or_else(|| super::memory::lookup::<F>(name))
+                .or_else(|| super::command::lookup::<F>(name));
+        }
     };
     // SAFETY: Vulkan resolves the erased pointer to the command's signature.
     Some(unsafe { core::mem::transmute::<*const (), unsafe extern "system" fn()>(pointer) })

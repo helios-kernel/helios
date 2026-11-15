@@ -93,6 +93,14 @@ where
             .map_err(lower_error))
     }
 
+    fn fail(
+        mut access: Access<'_, U, Self>,
+        resource: Resource<TimelineSource>,
+    ) -> wasmtime::Result<()> {
+        access.get().table.get(&resource)?.fail();
+        Ok(())
+    }
+
     fn drop(
         mut access: Access<'_, U, Self>,
         resource: Resource<TimelineSource>,
@@ -190,6 +198,14 @@ where
                 .get(&resource)?
                 .signal(value)
                 .map_err(lower_error),))
+        },
+    )?;
+    instance.func_wrap(
+        "[method]signal-source.fail",
+        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+         (resource,): (Resource<TimelineSource>,)| {
+            caller.data().table.get(&resource)?.fail();
+            Ok(())
         },
     )?;
     instance.func_wrap(

@@ -55,6 +55,15 @@ pub(super) unsafe fn shared<F: Factory>(object: *mut ObjectBase) -> Arc<Shared<F
 impl<F: Factory> State<F> {
     pub(super) fn fail(&mut self, error: Error<TransportError<F>>) -> vk::Result {
         tracing::error!(error = %error, "Venus connection failed");
+        self.connection.fail_timelines();
+        for device in self.devices.values() {
+            for fence in device.fences.values() {
+                fence.fail();
+            }
+            for semaphore in device.semaphores.values() {
+                semaphore.fail();
+            }
+        }
         self.fault = Some(error);
         vk::Result::ERROR_DEVICE_LOST
     }
@@ -78,7 +87,16 @@ pub(super) unsafe fn invoke_result<F: Factory>(
     call: impl FnOnce(&mut State<F>) -> Result<wire::VkResult, Error<TransportError<F>>>,
 ) -> wire::VkResult {
     // SAFETY: forwarded unchanged from the Vulkan entry point.
-    match unsafe { invoke::<F, _>(object, call) } {
+    match unsafe {
+        invoke::<F, _>(object, |state| {
+            let result = call(state)?;
+            if result == wire::VK_ERROR_DEVICE_LOST {
+                Err(Error::DeviceLost)
+            } else {
+                Ok(result)
+            }
+        })
+    } {
         Ok(result) => result,
         Err(result) => wire::VkResult(result.as_raw()),
     }
@@ -88,6 +106,8 @@ pub(super) unsafe fn invoke_result<F: Factory>(
 /// without the lock so other threads can submit future signals.
 pub(super) unsafe fn wait_for_points<F: Factory>(
     object: *mut ObjectBase,
+    wait_all: bool,
+    timeout: u64,
     capture: impl FnOnce(
         &mut State<F>,
     ) -> Result<Vec<WaitPoint<F::Transport>>, Error<TransportError<F>>>,
@@ -105,14 +125,17 @@ pub(super) unsafe fn wait_for_points<F: Factory>(
         }
     };
     let result = <<F::Transport as Transport>::Signal as SignalTimeline>::Timeline::wait(
-        &points, true, None,
+        &points,
+        wait_all,
+        (timeout != u64::MAX).then(|| core::time::Duration::from_nanos(timeout)),
     );
     let mut state = owner.lock();
     if state.fault.is_some() {
         return vk::Result::ERROR_DEVICE_LOST;
     }
     match result {
-        Ok(_) => vk::Result::SUCCESS,
+        Ok(true) => vk::Result::SUCCESS,
+        Ok(false) => vk::Result::TIMEOUT,
         Err(error) => state.fail(Error::Transport(error)),
     }
 }
