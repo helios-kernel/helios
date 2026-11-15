@@ -37,19 +37,24 @@ fn filesystem() -> Filesystem<Disk> {
 }
 
 fn filesystem_image() -> (Filesystem<Disk>, File) {
+    filesystem_image_with_groups(true)
+}
+
+fn filesystem_image_with_groups(separate: bool) -> (Filesystem<Disk>, File) {
     let mut file = tempfile::tempfile().unwrap();
     // ferrosys' default single-device geometry needs at least 109 MiB.
     let size = 128 << 20;
     file.set_len(size).unwrap();
     let timestamp = Timestamp::from_secs(1_700_000_000);
     let tree = TreeBuilder::new().root(Metadata::new(0o755, timestamp));
-    format_to(
-        &mut file,
-        tree,
-        size,
-        FormatOptions::new([0x53; 16], timestamp),
-    )
-    .unwrap();
+    let mut options = FormatOptions::new([0x53; 16], timestamp);
+    if !separate {
+        options.plan.compat_ro_flags = options
+            .plan
+            .compat_ro_flags
+            .without(ferrosys::btrfs::ondisk::CompatRoFlags::BLOCK_GROUP_TREE);
+    }
+    format_to(&mut file, tree, size, options).unwrap();
     let reference = file.try_clone().unwrap();
     (block_on(Filesystem::mount(Disk(file))).unwrap(), reference)
 }
@@ -487,7 +492,7 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
             .apply(&fs.volume, root, parent_key, Some(&[]), &mut space)
             .await
             .unwrap();
-        let mut accounting = Accounting::new(root, size);
+        let mut accounting = Accounting::new(root, space.group_root(), size);
         assert!(
             !accounting
                 .remove_metadata(
@@ -546,6 +551,11 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
             Some(original)
         );
         assert!(!space.cancel_metadata(block.address));
+        accounting
+            .sync_allocations(&fs.volume, &mut trees, &mut space)
+            .await
+            .unwrap();
+        verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
     });
 }
 
@@ -555,134 +565,138 @@ fn metadata_registration_converges_across_extent_tree_growth_and_cancellation() 
     use crate::ondisk::{item_type, objectid};
     use crate::space::Space;
 
-    block_on(async {
-        let fs = filesystem();
-        let extent_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
-            .await
-            .unwrap()
-            .root;
-        let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
-        let mut trees = Trees::new(
-            fs.superblock().generation() + 1,
-            fs.superblock().csum_type(),
-        );
-        let size = u64::from(fs.superblock().nodesize());
-        let mut accounting = Accounting::new(extent_root, size);
-        let mut root = fs.default_subvolume.root;
-        // Full leaves force enough allocations to split the extent tree as its
-        // own allocation records are registered.
-        let count = (size as usize - 101) / 33 + 3;
-        let payload = vec![0x56; size as usize - 101 - 25];
-        for index in 0..count {
-            root = trees
-                .apply(
-                    &fs.volume,
-                    root,
-                    Key::new(1000 + index as u64, 24, 0),
-                    Some(&payload),
-                    &mut space,
-                )
+    for separate in [false, true] {
+        block_on(async {
+            let fs = filesystem_image_with_groups(separate).0;
+            let extent_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
                 .await
-                .unwrap();
-        }
-        let mut previously_registered: Vec<Key> = Vec::new();
-        for shrink in [false, true] {
-            if shrink {
-                for index in 0..count {
-                    root = trees
-                        .apply(
-                            &fs.volume,
-                            root,
-                            Key::new(1000 + index as u64, 24, 0),
-                            None,
-                            &mut space,
-                        )
-                        .await
-                        .unwrap();
-                }
-            }
-            accounting
-                .sync_metadata(&fs.volume, &mut trees, &mut space)
-                .await
-                .unwrap();
-            let current: BTreeMap<_, _> = space.metadata().collect();
-            assert_eq!(current.len(), trees.blocks().count());
-            if !shrink {
-                assert!(accounting.root.level > 0);
-            }
-            for (&address, record) in &current {
-                let skinny = fs.superblock().incompat_flags() & (1 << 8) != 0;
-                let key = if skinny {
-                    Key::new(address, item_type::METADATA_ITEM, u64::from(record.level))
-                } else {
-                    Key::new(address, item_type::EXTENT_ITEM, size)
-                };
-                let bytes = trees
-                    .get(&fs.volume, accounting.root, key)
+                .unwrap()
+                .root;
+            let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+            let mut trees = Trees::new(
+                fs.superblock().generation() + 1,
+                fs.superblock().csum_type(),
+            );
+            let size = u64::from(fs.superblock().nodesize());
+            let mut accounting = Accounting::new(extent_root, space.group_root(), size);
+            let mut root = fs.default_subvolume.root;
+            // Full leaves force enough allocations to split the extent tree as its
+            // own allocation records are registered.
+            let count = (size as usize - 101) / 33 + 3;
+            let payload = vec![0x56; size as usize - 101 - 25];
+            for index in 0..count {
+                root = trees
+                    .apply(
+                        &fs.volume,
+                        root,
+                        Key::new(1000 + index as u64, 24, 0),
+                        Some(&payload),
+                        &mut space,
+                    )
                     .await
-                    .unwrap()
                     .unwrap();
-                let disk_key = btrfs_disk::tree::DiskKey {
-                    objectid: address,
-                    key_type: if skinny {
-                        btrfs_disk::tree::KeyType::MetadataItem
-                    } else {
-                        btrfs_disk::tree::KeyType::ExtentItem
-                    },
-                    offset: key.offset,
-                };
-                let independent = btrfs_disk::items::ExtentItem::parse(&bytes, &disk_key).unwrap();
-                assert_eq!(independent.refs, 1);
-                assert_eq!(independent.generation, trees.generation());
-                assert_eq!(independent.inline_refs.len(), 1);
-                assert!(
-                    matches!(independent.inline_refs[0], btrfs_disk::items::InlineRef::TreeBlockBackref { root, .. } if root == record.tree)
-                );
-                if !skinny {
-                    let first = independent.tree_block_key.unwrap();
-                    assert_eq!(first.objectid, record.first.objectid);
-                    assert_eq!(first.key_type.to_raw(), record.first.item_type);
-                    assert_eq!(first.offset, record.first.offset);
-                }
             }
-            for key in previously_registered {
-                if !current.contains_key(&key.objectid) {
-                    assert_eq!(
-                        trees.get(&fs.volume, accounting.root, key).await.unwrap(),
-                        None
-                    );
+            let mut previously_registered: Vec<Key> = Vec::new();
+            for shrink in [false, true] {
+                if shrink {
+                    for index in 0..count {
+                        root = trees
+                            .apply(
+                                &fs.volume,
+                                root,
+                                Key::new(1000 + index as u64, 24, 0),
+                                None,
+                                &mut space,
+                            )
+                            .await
+                            .unwrap();
+                    }
                 }
-            }
-            previously_registered = current
-                .iter()
-                .map(|(&address, record)| {
-                    if fs.superblock().incompat_flags() & (1 << 8) != 0 {
+                accounting
+                    .sync_allocations(&fs.volume, &mut trees, &mut space)
+                    .await
+                    .unwrap();
+                verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
+                let current: BTreeMap<_, _> = space.metadata().collect();
+                assert_eq!(current.len(), trees.blocks().count());
+                if !shrink {
+                    assert!(accounting.root.level > 0);
+                }
+                for (&address, record) in &current {
+                    let skinny = fs.superblock().incompat_flags() & (1 << 8) != 0;
+                    let key = if skinny {
                         Key::new(address, item_type::METADATA_ITEM, u64::from(record.level))
                     } else {
                         Key::new(address, item_type::EXTENT_ITEM, size)
+                    };
+                    let bytes = trees
+                        .get(&fs.volume, accounting.root, key)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let disk_key = btrfs_disk::tree::DiskKey {
+                        objectid: address,
+                        key_type: if skinny {
+                            btrfs_disk::tree::KeyType::MetadataItem
+                        } else {
+                            btrfs_disk::tree::KeyType::ExtentItem
+                        },
+                        offset: key.offset,
+                    };
+                    let independent =
+                        btrfs_disk::items::ExtentItem::parse(&bytes, &disk_key).unwrap();
+                    assert_eq!(independent.refs, 1);
+                    assert_eq!(independent.generation, trees.generation());
+                    assert_eq!(independent.inline_refs.len(), 1);
+                    assert!(
+                        matches!(independent.inline_refs[0], btrfs_disk::items::InlineRef::TreeBlockBackref { root, .. } if root == record.tree)
+                    );
+                    if !skinny {
+                        let first = independent.tree_block_key.unwrap();
+                        assert_eq!(first.objectid, record.first.objectid);
+                        assert_eq!(first.key_type.to_raw(), record.first.item_type);
+                        assert_eq!(first.offset, record.first.offset);
                     }
-                })
-                .collect();
-            let stable: Vec<_> = trees
-                .blocks()
-                .map(|(address, bytes)| (address, bytes.to_vec()))
-                .collect();
-            let available = space.available_metadata();
-            accounting
-                .sync_metadata(&fs.volume, &mut trees, &mut space)
-                .await
-                .unwrap();
-            assert_eq!(
-                stable,
-                trees
+                }
+                for key in previously_registered {
+                    if !current.contains_key(&key.objectid) {
+                        assert_eq!(
+                            trees.get(&fs.volume, accounting.root, key).await.unwrap(),
+                            None
+                        );
+                    }
+                }
+                previously_registered = current
+                    .iter()
+                    .map(|(&address, record)| {
+                        if fs.superblock().incompat_flags() & (1 << 8) != 0 {
+                            Key::new(address, item_type::METADATA_ITEM, u64::from(record.level))
+                        } else {
+                            Key::new(address, item_type::EXTENT_ITEM, size)
+                        }
+                    })
+                    .collect();
+                let stable: Vec<_> = trees
                     .blocks()
                     .map(|(address, bytes)| (address, bytes.to_vec()))
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(space.available_metadata(), available);
-        }
-        assert!(!space.cancel_metadata(fs.default_subvolume.root.bytenr));
-    });
+                    .collect();
+                let available = space.available_metadata();
+                accounting
+                    .sync_allocations(&fs.volume, &mut trees, &mut space)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    stable,
+                    trees
+                        .blocks()
+                        .map(|(address, bytes)| (address, bytes.to_vec()))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(space.available_metadata(), available);
+            }
+            assert!(!space.cancel_metadata(fs.default_subvolume.root.bytenr));
+        });
+    }
 }
 
 #[test]
@@ -730,4 +744,47 @@ fn cow_blocks_take_the_writing_tree_owner_from_a_shared_original() {
                 .all(|(address, _)| address != original.bytenr)
         );
     });
+}
+
+async fn verify_group_usage(
+    fs: &Filesystem<Disk>,
+    trees: &Trees,
+    accounting: &crate::accounting::Accounting,
+    original_groups: TreeRoot,
+) {
+    use crate::ondisk::item_type;
+    let extents = contents(trees, accounting.root);
+    let mut cursor = crate::tree::Cursor::ceiling(&fs.volume, original_groups, Key::new(0, 0, 0))
+        .await
+        .unwrap();
+    let mut groups = 0;
+    while let Some(key) = cursor.key() {
+        if key.item_type == item_type::BLOCK_GROUP_ITEM {
+            let original =
+                btrfs_disk::items::BlockGroupItem::parse(cursor.item().unwrap()).unwrap();
+            let bytes = trees
+                .get(&fs.volume, accounting.group_root(), key)
+                .await
+                .unwrap()
+                .unwrap();
+            let group = btrfs_disk::items::BlockGroupItem::parse(&bytes).unwrap();
+            let expected: u64 = extents
+                .keys()
+                .filter(|extent| {
+                    key.objectid <= extent.objectid && extent.objectid < key.objectid + key.offset
+                })
+                .map(|extent| match extent.item_type {
+                    item_type::METADATA_ITEM => u64::from(fs.superblock().nodesize()),
+                    item_type::EXTENT_ITEM => extent.offset,
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(group.used, expected, "group {key}");
+            assert_eq!(group.flags, original.flags);
+            assert_eq!(group.chunk_objectid, original.chunk_objectid);
+            groups += 1;
+        }
+        cursor.advance(&fs.volume).await.unwrap();
+    }
+    assert!(groups > 0);
 }

@@ -2,14 +2,14 @@
 //! change references, never allocator availability: committed blocks stay pinned
 //! until publication and the last reader of their generation have completed.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use crate::Key;
 use crate::allocation::{AllocationDefect, MetadataExtent, MetadataReference};
-use crate::ondisk::item_type;
+use crate::ondisk::{item_type, objectid};
 use crate::source::BlockSource;
-use crate::space::{MetadataReservation, Space};
+use crate::space::{MetadataReservation, Space, SpaceDefect, SpaceError};
 use crate::tree::TreeRoot;
 use crate::tree::write::{MetadataAllocator, Trees, WriteError};
 use crate::volume::Volume;
@@ -23,14 +23,20 @@ pub(crate) struct MetadataBlock {
 pub(crate) struct Accounting {
     pub(crate) root: TreeRoot,
     nodesize: u64,
+    groups: TreeRoot,
+    group_used: BTreeMap<Key, u64>,
+    retired_metadata: BTreeSet<u64>,
     registered: BTreeMap<u64, MetadataReservation>,
 }
 
 impl Accounting {
-    pub(crate) fn new(root: TreeRoot, nodesize: u64) -> Self {
+    pub(crate) fn new(root: TreeRoot, groups: TreeRoot, nodesize: u64) -> Self {
         Self {
             root,
             nodesize,
+            groups,
+            group_used: BTreeMap::new(),
+            retired_metadata: BTreeSet::new(),
             registered: BTreeMap::new(),
         }
     }
@@ -39,7 +45,7 @@ impl Accounting {
     /// these extent-tree edits. Private tree blocks keep their addresses, so
     /// further passes are needed only for structural changes and first keys.
     /// An error aborts the enclosing transaction, like any other tree edit.
-    pub(crate) async fn sync_metadata<S: BlockSource>(
+    pub(crate) async fn sync_allocations<S: BlockSource>(
         &mut self,
         volume: &Volume<S>,
         trees: &mut Trees,
@@ -48,6 +54,7 @@ impl Accounting {
         // BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA, from btrfs.h.
         let skinny = volume.superblock().incompat_flags() & (1 << 8) != 0;
         loop {
+            let groups_changed = self.sync_groups(volume, trees, space).await?;
             let current: BTreeMap<_, _> = space.metadata().collect();
             let removed: Vec<_> = self
                 .registered
@@ -60,7 +67,7 @@ impl Accounting {
                 .filter(|(address, record)| self.registered.get(address) != Some(record))
                 .map(|(&address, &record)| (address, record))
                 .collect();
-            if removed.is_empty() && changed.is_empty() {
+            if removed.is_empty() && changed.is_empty() && !groups_changed {
                 return Ok(());
             }
             for (address, record) in removed {
@@ -94,7 +101,59 @@ impl Accounting {
         }
     }
 
-    /// Returns true only when the last reference was removed. As with any tree
+    pub(crate) fn group_root(&self) -> TreeRoot {
+        if self.groups.tree == objectid::EXTENT_TREE {
+            self.root
+        } else {
+            self.groups
+        }
+    }
+
+    async fn sync_groups<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+    ) -> Result<bool, WriteError> {
+        let mut changed = false;
+        for (key, used) in space.group_usage(&self.retired_metadata)? {
+            if self.group_used.get(&key) == Some(&used) {
+                continue;
+            }
+            let root = self.group_root();
+            let mut bytes = trees
+                .get(volume, root, key)
+                .await?
+                .ok_or(SpaceError::Corrupt {
+                    tree: root.tree,
+                    key,
+                    defect: SpaceDefect::ChunkMismatch,
+                })?;
+            if bytes.len() < 24 {
+                return Err(SpaceError::Corrupt {
+                    tree: root.tree,
+                    key,
+                    defect: SpaceDefect::Truncated,
+                }
+                .into());
+            }
+            if u64::from_le_bytes(bytes[..8].try_into().unwrap()) != used {
+                bytes[..8].copy_from_slice(&used.to_le_bytes());
+                let root = trees.apply(volume, root, key, Some(&bytes), space).await?;
+                if root.tree == objectid::EXTENT_TREE {
+                    self.root = root;
+                } else {
+                    self.groups = root;
+                }
+                changed = true;
+            }
+            self.group_used.insert(key, used);
+        }
+        Ok(changed)
+    }
+
+    /// Removes a committed block reference. Private allocation cancellation is
+    /// handled by `sync_allocations`. Returns true only for its last reference. As with any tree
     /// edit, an error aborts the enclosing transaction, including earlier edits.
     pub(crate) async fn remove_metadata<S: BlockSource, A: MetadataAllocator>(
         &mut self,
@@ -141,6 +200,9 @@ impl Accounting {
         self.root = trees
             .apply(volume, self.root, key, payload.as_deref(), allocator)
             .await?;
+        if last {
+            self.retired_metadata.insert(block.address);
+        }
         Ok(last)
     }
 }

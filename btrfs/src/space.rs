@@ -3,7 +3,7 @@
 //! exclusively; it never holds a lock across I/O and never returns retired
 //! committed extents to this map before publication/read-side retirement.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -53,6 +53,8 @@ pub(crate) enum SpaceDefect {
     ExtentOverlap,
     #[error("extent has no references or inconsistent flags")]
     ExtentHeader,
+    #[error("block-group used-byte accounting underflows or exceeds its length")]
+    Accounting,
     #[error(
         "block group reports {declared} allocated bytes but the extent tree accounts for {found}"
     )]
@@ -131,6 +133,7 @@ pub(crate) struct MetadataReservation {
 
 pub(crate) struct Space {
     groups: Vec<Group>,
+    group_root: TreeRoot,
     nodesize: u64,
     sector: u64,
     metadata: BTreeMap<u64, MetadataReservation>,
@@ -183,6 +186,7 @@ impl Space {
         }
         let mut space = Self {
             groups,
+            group_root,
             nodesize: u64::from(sb.nodesize()),
             sector: u64::from(sb.sectorsize()),
             metadata: BTreeMap::new(),
@@ -278,6 +282,38 @@ impl Space {
             bytes: length,
             flags,
         })
+    }
+
+    pub(crate) fn group_root(&self) -> TreeRoot {
+        self.group_root
+    }
+
+    /// Usage in the next committed generation. Retired metadata reduces disk
+    /// accounting but remains absent from the reusable free-range map.
+    pub(crate) fn group_usage(
+        &self,
+        retired: &BTreeSet<u64>,
+    ) -> Result<Vec<(Key, u64)>, SpaceError> {
+        self.groups
+            .iter()
+            .map(|group| {
+                let range = group.start..group.start + group.length;
+                let added = self.metadata.range(range.clone()).count() as u64 * self.nodesize;
+                let removed = retired.range(range).count() as u64 * self.nodesize;
+                let key = Key::new(group.start, item_type::BLOCK_GROUP_ITEM, group.length);
+                let used = group
+                    .declared_used
+                    .checked_add(added)
+                    .and_then(|used| used.checked_sub(removed))
+                    .filter(|used| *used <= group.length)
+                    .ok_or(SpaceError::Corrupt {
+                        tree: self.group_root.tree,
+                        key,
+                        defect: SpaceDefect::Accounting,
+                    })?;
+                Ok((key, used))
+            })
+            .collect()
     }
 
     pub(crate) fn metadata(&self) -> impl Iterator<Item = (u64, MetadataReservation)> + '_ {
