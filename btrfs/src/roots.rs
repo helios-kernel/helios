@@ -2,6 +2,7 @@
 //! them: the root tree itself remains in the CoW overlay until superblock commit.
 
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use zerocopy::IntoBytes;
@@ -12,6 +13,7 @@ use crate::source::BlockSource;
 use crate::space::Space;
 use crate::tree::write::{Trees, WriteError};
 use crate::tree::{Cursor, TreeRoot};
+use crate::uuid_tree::{self, UuidTree};
 use crate::volume::Volume;
 use crate::{Error, Key};
 
@@ -23,6 +25,19 @@ struct RootItem {
 }
 
 impl RootItem {
+    fn internal(root: TreeRoot) -> Self {
+        let mut bytes = vec![0; size_of::<RawRootItem>() + size_of::<RawRootTail>()];
+        let mut head = *view::<RawRootItem>(&bytes).expect("root item has its full size");
+        head.refs.set(1);
+        bytes[..size_of::<RawRootItem>()].copy_from_slice(head.as_bytes());
+        Self {
+            key: Key::new(root.tree, item_type::ROOT_ITEM, 0),
+            root,
+            initial_used: 0,
+            bytes,
+        }
+    }
+
     fn parse(key: Key, bytes: &[u8], sector: u32) -> Result<Self, Error> {
         let record = RootRecord::parse(key, bytes, sector).map_err(|defect| Error::Item {
             tree: objectid::ROOT_TREE,
@@ -39,8 +54,8 @@ impl RootItem {
     }
 
     /// Returns the replacement UUID when an old-format or invalid extension
-    /// needs initialization. The transaction must update its UUID index before
-    /// publication; callers cannot treat this as a purely structural edit.
+    /// needs initialization. Roots::sync updates the UUID index from these fields
+    /// before the enclosing transaction can reach a stable root catalogue.
     fn encode(&mut self, used: u64, new_uuid: &mut impl FnMut() -> [u8; 16]) -> Option<[u8; 16]> {
         let head_size = size_of::<RawRootItem>();
         let full_size = head_size + size_of::<RawRootTail>();
@@ -75,7 +90,7 @@ impl RootItem {
 pub(crate) struct Roots {
     pub(crate) root: TreeRoot,
     entries: BTreeMap<u64, RootItem>,
-    uuid_updates: BTreeMap<u64, [u8; 16]>,
+    uuid_tree: Option<UuidTree>,
 }
 
 impl Roots {
@@ -96,10 +111,15 @@ impl Roots {
             }
             cursor.advance(volume).await?;
         }
+        let uuid_tree = if let Some(entry) = entries.get(&objectid::UUID_TREE) {
+            Some(UuidTree::load(volume, entry.root).await?)
+        } else {
+            None
+        };
         Ok(Self {
             root,
             entries,
-            uuid_updates: BTreeMap::new(),
+            uuid_tree,
         })
     }
 
@@ -116,10 +136,6 @@ impl Roots {
             .ok_or(Error::MissingRoot { tree: root.tree })?
             .root = root;
         Ok(())
-    }
-
-    pub(crate) fn uuid_updates(&self) -> impl Iterator<Item = (u64, [u8; 16])> + '_ {
-        self.uuid_updates.iter().map(|(&tree, &uuid)| (tree, uuid))
     }
 
     /// Root bytes_used counts tree blocks reachable through that root, including
@@ -161,15 +177,62 @@ impl Roots {
             {
                 continue;
             }
-            if let Some(uuid) = entry.encode(used, new_uuid) {
-                self.uuid_updates.insert(tree, uuid);
-            }
+            entry.encode(used, new_uuid);
             self.root = trees
                 .apply(volume, self.root, entry.key, Some(&entry.bytes), space)
                 .await?;
             changed = true;
         }
+        let desired = self.uuid_records();
+        if self.uuid_tree.is_none() && !desired.is_empty() {
+            let root = trees
+                .create(volume, self.root, objectid::UUID_TREE, space)
+                .await?;
+            self.entries.insert(root.tree, RootItem::internal(root));
+            self.uuid_tree = Some(UuidTree::empty(root));
+            changed = true;
+        }
+        if let Some(index) = &mut self.uuid_tree {
+            changed |= index.sync(volume, trees, space, desired).await?;
+            self.entries
+                .get_mut(&objectid::UUID_TREE)
+                .expect("UUID tree has a root item")
+                .root = index.root;
+        }
         Ok(changed)
+    }
+
+    fn uuid_records(&self) -> BTreeMap<Key, Vec<u8>> {
+        let mut records = BTreeMap::<Key, Vec<u8>>::new();
+        for (&tree, entry) in &self.entries {
+            if tree != objectid::FS_TREE
+                && !(objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&tree)
+            {
+                continue;
+            }
+            let head: &RawRootItem = view(&entry.bytes).expect("validated root item");
+            if head.refs.get() == 0 {
+                continue;
+            }
+            let Some(tail) = view::<RawRootTail>(&entry.bytes[size_of::<RawRootItem>()..]) else {
+                continue;
+            };
+            if tail.generation_v2.get() != head.generation.get() {
+                continue;
+            }
+            for (uuid, kind) in [
+                (tail.uuid, item_type::UUID_SUBVOL),
+                (tail.received_uuid, item_type::UUID_RECEIVED),
+            ] {
+                if uuid != [0; 16] {
+                    records
+                        .entry(uuid_tree::key(uuid, kind))
+                        .or_default()
+                        .extend_from_slice(&tree.to_le_bytes());
+                }
+            }
+        }
+        records
     }
 }
 
@@ -178,6 +241,63 @@ mod tests {
     use btrfs_disk::items::RootItem as DiskRoot;
 
     use super::*;
+
+    #[test]
+    fn uuid_catalogue_preserves_collisions_and_removes_obsolete_mappings() {
+        let mut roots = Roots {
+            root: TreeRoot {
+                tree: 1,
+                bytenr: 4096,
+                generation: 42,
+                level: 0,
+            },
+            entries: BTreeMap::new(),
+            uuid_tree: None,
+        };
+        for tree in [objectid::FS_TREE, objectid::FIRST_FREE] {
+            let bytes = DiskRoot::new_internal(42, 1 << 20, 0).to_bytes();
+            let mut entry =
+                RootItem::parse(Key::new(tree, item_type::ROOT_ITEM, 0), &bytes, 4096).unwrap();
+            let offset = size_of::<RawRootItem>();
+            let mut tail = *view::<RawRootTail>(&entry.bytes[offset..]).unwrap();
+            tail.uuid = [1; 16];
+            tail.received_uuid = [2; 16];
+            entry.bytes[offset..].copy_from_slice(tail.as_bytes());
+            roots.entries.insert(tree, entry);
+        }
+        let both: Vec<_> = [objectid::FS_TREE, objectid::FIRST_FREE]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let shared = uuid_tree::key([1; 16], item_type::UUID_SUBVOL);
+        let received = uuid_tree::key([2; 16], item_type::UUID_RECEIVED);
+        let records = roots.uuid_records();
+        assert_eq!(records[&shared], both);
+        assert_eq!(records[&received], both);
+
+        let entry = roots.entries.get_mut(&objectid::FS_TREE).unwrap();
+        let offset = size_of::<RawRootItem>();
+        let mut tail = *view::<RawRootTail>(&entry.bytes[offset..]).unwrap();
+        tail.uuid = [3; 16];
+        tail.received_uuid = [0; 16];
+        entry.bytes[offset..].copy_from_slice(tail.as_bytes());
+        let records = roots.uuid_records();
+        assert_eq!(records[&shared], objectid::FIRST_FREE.to_le_bytes());
+        assert_eq!(records[&received], objectid::FIRST_FREE.to_le_bytes());
+        assert_eq!(
+            records[&uuid_tree::key([3; 16], item_type::UUID_SUBVOL)],
+            objectid::FS_TREE.to_le_bytes()
+        );
+
+        let entry = roots.entries.get_mut(&objectid::FIRST_FREE).unwrap();
+        let mut head = *view::<RawRootItem>(&entry.bytes).unwrap();
+        head.refs.set(0);
+        entry.bytes[..size_of::<RawRootItem>()].copy_from_slice(head.as_bytes());
+        let records = roots.uuid_records();
+        assert!(!records.contains_key(&shared));
+        assert!(!records.contains_key(&received));
+        assert_eq!(records.len(), 1);
+    }
 
     #[test]
     fn root_updates_preserve_valid_extensions_and_unrelated_fields() {

@@ -28,6 +28,11 @@ pub(crate) enum WriteError {
         key: Key,
         defect: crate::free_space::FreeSpaceDefect,
     },
+    #[error("UUID item {key}: {defect}")]
+    Uuid {
+        key: Key,
+        defect: crate::uuid_tree::UuidDefect,
+    },
     #[error("allocation item {key}: {defect}")]
     Allocation {
         key: Key,
@@ -287,6 +292,35 @@ impl Trees {
             bytenr: child.address,
             generation: child.generation,
             level,
+        })
+    }
+
+    pub(crate) async fn create<S: BlockSource, A: MetadataAllocator>(
+        &mut self,
+        volume: &Volume<S>,
+        template: TreeRoot,
+        tree: u64,
+        allocator: &mut A,
+    ) -> Result<TreeRoot, WriteError> {
+        let node = self
+            .read(
+                volume,
+                template.bytenr,
+                Expected {
+                    level: template.level,
+                    generation: template.generation,
+                    first_key: None,
+                },
+            )
+            .await?;
+        let address = allocator.allocate(tree, 0, Key::new(0, 0, 0))?;
+        let leaf = Leaf::empty(Header::new_tree(&node));
+        self.insert(leaf.encode(0..0, address, self.generation, tree, self.checksum));
+        Ok(TreeRoot {
+            tree,
+            bytenr: address,
+            generation: self.generation,
+            level: 0,
         })
     }
 

@@ -39,6 +39,14 @@ impl Header {
         header
     }
 
+    pub(crate) fn new_tree(template: &Node) -> Self {
+        let mut header = Self::for_level(template, 0);
+        // New tree blocks use BTRFS_BACKREF_REV_MIXED (1), stored in the
+        // high byte. Relocation flags belong to the old tree, not the new one.
+        header.raw.flags.set(1_u64 << 56);
+        header
+    }
+
     fn from_node(node: &Node) -> Self {
         Self {
             raw: *view::<RawHeader>(&node.bytes).expect("validated tree header"),

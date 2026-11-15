@@ -80,6 +80,56 @@ fn root_node(fs: &Filesystem<Disk>) -> Node {
     .unwrap()
 }
 
+#[test]
+fn new_uuid_tree_supports_collisions_replacement_and_deletion() {
+    block_on(async {
+        use crate::ondisk::{item_type, objectid};
+        use crate::uuid_tree::{UuidTree, key};
+
+        let fs = filesystem();
+        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+            .await
+            .unwrap();
+        let mut trees = Trees::new(fs.root_tree.generation + 1, ChecksumType::Crc32c);
+        let root = trees
+            .create(&fs.volume, fs.root_tree, objectid::UUID_TREE, &mut space)
+            .await
+            .unwrap();
+        assert!(contents(&trees, root).is_empty());
+        let mut index = UuidTree::empty(root);
+        let shared = key([1; 16], item_type::UUID_SUBVOL);
+        let received = key([2; 16], item_type::UUID_RECEIVED);
+        let both: Vec<_> = [5_u64, 256]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let desired = BTreeMap::from([(shared, both), (received, 5_u64.to_le_bytes().to_vec())]);
+        assert!(
+            index
+                .sync(&fs.volume, &mut trees, &mut space, desired.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(contents(&trees, index.root), desired);
+        assert!(
+            !index
+                .sync(&fs.volume, &mut trees, &mut space, desired)
+                .await
+                .unwrap()
+        );
+        let desired = BTreeMap::from([(shared, 256_u64.to_le_bytes().to_vec())]);
+        assert!(
+            index
+                .sync(&fs.volume, &mut trees, &mut space, desired.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(contents(&trees, index.root), desired);
+        assert_eq!(index.root.bytenr, root.bytenr);
+        assert!(trees.retired().is_empty());
+    });
+}
+
 struct Allocator {
     next: u64,
     size: u64,
@@ -940,7 +990,6 @@ fn root_publication_preparation_converges_with_allocation_accounting() {
                     break;
                 }
             }
-            assert_eq!(roots.uuid_updates().count(), 0);
             for tree in [
                 objectid::FS_TREE,
                 objectid::EXTENT_TREE,

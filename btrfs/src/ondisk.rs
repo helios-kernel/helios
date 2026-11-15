@@ -39,6 +39,7 @@ pub(crate) mod objectid {
     pub(crate) const ROOT_TREE: u64 = 1;
     pub(crate) const EXTENT_TREE: u64 = 2;
     pub(crate) const CHUNK_TREE: u64 = 3;
+    pub(crate) const UUID_TREE: u64 = 9;
     pub(crate) const FREE_SPACE_TREE: u64 = 10;
     pub(crate) const BLOCK_GROUP_TREE: u64 = 11;
     pub(crate) const FS_TREE: u64 = 5;
@@ -68,6 +69,8 @@ pub(crate) mod item_type {
     pub(crate) const FREE_SPACE_EXTENT: u8 = 199;
     pub(crate) const FREE_SPACE_BITMAP: u8 = 200;
     pub(crate) const CHUNK_ITEM: u8 = 228;
+    pub(crate) const UUID_SUBVOL: u8 = 251;
+    pub(crate) const UUID_RECEIVED: u8 = 252;
 }
 
 /// `btrfs_disk_key`.

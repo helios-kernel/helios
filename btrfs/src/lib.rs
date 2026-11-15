@@ -58,6 +58,7 @@ mod source;
 mod space;
 mod superblock;
 mod tree;
+mod uuid_tree;
 mod volume;
 
 pub use csum::{ChecksumType, Digest};
