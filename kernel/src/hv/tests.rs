@@ -157,6 +157,9 @@ unsafe impl GuestVcpu for TestVcpu {
         Ok(exit)
     }
     fn inject_irq(&mut self, irq: VirtualIrq) -> Result<bool, HvError> {
+        if irq.number == u32::MAX {
+            return Err(HvError::InvalidInterrupt);
+        }
         let accepted = self.space.accept_irq.load(Ordering::Acquire);
         if accepted {
             self.space.interrupts.with(|irqs| irqs.push(irq));
@@ -490,5 +493,49 @@ fn parked_vcpu_notifies_the_executor_waker() {
     assert_eq!(
         run.as_mut().poll(&mut context),
         Poll::Ready(Ok(VmExit::Shutdown))
+    );
+}
+
+#[test]
+fn rejected_irq_does_not_poison_later_guest_runs() {
+    let mut vm = vm([VmExit::Shutdown], 0);
+    let mut cpu = vcpu(&mut vm);
+    cpu.control()
+        .inject_irq(VirtualIrq {
+            number: u32::MAX,
+            level: IrqLevel::Pulse,
+        })
+        .unwrap();
+    assert_eq!(block_on(cpu.run_vcpu()), Err(HvError::InvalidInterrupt));
+    cpu.control().inject_irq(irq()).unwrap();
+    assert_eq!(block_on(cpu.run_vcpu()), Ok(VmExit::Shutdown));
+    assert_eq!(
+        vm.shared.space.interrupts.with(|irqs| irqs.clone()),
+        vec![irq()]
+    );
+}
+
+#[test]
+fn masked_pending_irq_does_not_busy_reenter_a_halted_guest() {
+    let mut vm = vm([VmExit::Halt, VmExit::Shutdown], 0);
+    let mut cpu = vcpu(&mut vm);
+    let control = cpu.control();
+    control.inject_irq(irq()).unwrap();
+    control.inject_irq(irq()).unwrap();
+    vm.shared.space.accept_irq.store(false, Ordering::Release);
+    {
+        let mut run = core::pin::pin!(cpu.run_vcpu());
+        assert!(poll(run.as_mut()).is_pending());
+        assert!(poll(run.as_mut()).is_pending());
+        assert_eq!(vm.shared.space.entries.with(|entries| entries.len()), 1);
+        control.kick();
+        assert!(poll(run.as_mut()).is_pending());
+        assert_eq!(poll(run.as_mut()), Poll::Ready(Ok(VmExit::Preempted)));
+    }
+    vm.shared.space.accept_irq.store(true, Ordering::Release);
+    assert_eq!(block_on(cpu.run_vcpu()), Ok(VmExit::Shutdown));
+    assert_eq!(
+        vm.shared.space.interrupts.with(|irqs| irqs.clone()),
+        vec![irq(), irq()]
     );
 }

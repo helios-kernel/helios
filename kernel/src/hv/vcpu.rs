@@ -39,10 +39,8 @@ impl<K: VcpuKick> VcpuSignals<K> {
         self.stopped.store(true, Ordering::Release);
         self.wake();
     }
-    fn ready(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
-            || self.requested.load(Ordering::Acquire)
-            || !self.irqs.is_empty()
+    fn interrupted(&self) -> bool {
+        self.stopped.load(Ordering::Acquire) || self.requested.load(Ordering::Acquire)
     }
 }
 
@@ -134,16 +132,21 @@ impl<S: Stage2Space> Vcpu<S> {
                 yield_now().await;
                 return Ok(VmExit::Preempted);
             }
+            // Arm before draining or entering: an IRQ arriving during guest
+            // execution must also wake a subsequent Halt with a blocked queue.
+            let wake = self.signals.wake.notified();
             // Bounded draining prevents an IRQ producer monopolizing this poll.
             for _ in 0..self.signals.capacity {
                 if self.pending.is_none() {
                     self.pending = self.signals.irqs.pop().ok();
                 }
-                let Some(irq) = self.pending else { break };
+                let Some(irq) = self.pending.take() else {
+                    break;
+                };
                 if !self.backend.inject_irq(irq)? {
+                    self.pending = Some(irq);
                     break;
                 }
-                self.pending = None;
             }
             self.backend.set_irq_window(self.pending.is_some());
             let processor = current_processor();
@@ -154,8 +157,9 @@ impl<S: Stage2Space> Vcpu<S> {
             match exit {
                 VmExit::Preempted | VmExit::IrqWindow => yield_now().await,
                 VmExit::Halt => {
-                    let wake = self.signals.wake.notified();
-                    if !self.signals.ready() && self.pending.is_none() {
+                    if !self.signals.interrupted()
+                        && (self.pending.is_some() || self.signals.irqs.is_empty())
+                    {
                         wake.await;
                     } else {
                         yield_now().await;
