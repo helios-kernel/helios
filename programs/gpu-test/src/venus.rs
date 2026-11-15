@@ -1,28 +1,15 @@
-//! Vulkan bring-up through the synchronous canonical import boundary.
+//! Vulkan bring-up through the ash driver and canonical import boundary.
 
-use std::num::{NonZeroU32, NonZeroUsize};
-use std::ptr::{null, null_mut};
-use std::time::Duration;
-
-use helios_venus::ObjectBase;
-use helios_venus::connection::Connection;
+use ash::vk;
+use helios_venus::driver::entry;
 use helios_venus::helios::Context;
-use helios_venus::protocol as vk;
-use helios_venus::ring::Layout;
-use helios_venus::transport::{MappedBlob, TransportFactory};
 
 mod compute;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error(transparent)]
-    Transport(#[from] helios_venus::helios::Error),
-    #[error(transparent)]
-    Connection(#[from] helios_venus::connection::Error<helios_venus::helios::Error>),
-    #[error(transparent)]
-    Ring(#[from] helios_venus::ring::RingError),
-    #[error("{command} returned Vulkan result {result}")]
-    Vulkan { command: &'static str, result: i32 },
+    #[error("Vulkan returned {0}")]
+    Vulkan(#[from] vk::Result),
     #[error("the Venus instance has no physical devices")]
     NoPhysicalDevices,
     #[error("the Venus physical device has no compute queue")]
@@ -43,248 +30,119 @@ pub enum Error {
     },
 }
 
-fn success(command: &'static str, result: vk::VkResult) -> Result<(), Error> {
-    if result == vk::VK_SUCCESS {
-        Ok(())
-    } else {
-        Err(Error::Vulkan {
-            command,
-            result: result.0,
-        })
-    }
-}
-
 pub fn run() -> Result<(), Error> {
-    // Atomics change wasm TLS relocations. Exercise std's thread-local
-    // hash seed so a build mixing atomics with the prebuilt non-atomic
-    // standard library traps before a later GPU consumer uses it.
+    // Exercise atomic std TLS before GPU consumers use randomized maps.
     std::hint::black_box(std::hash::RandomState::new());
-    // Ring zero tracks CPU command consumption; ring one tracks the
-    // compute queue bound below with VkDeviceQueueTimelineInfoMESA.
-    let (transport, capset) = Context::create()?;
-    // One wasm page of command bytes; the test keeps the renderer's
-    // idle period short enough to exercise notification as well.
-    let layout = Layout::new(NonZeroU32::new(65536).unwrap())?;
-    let mut connection = Connection::new(transport, capset, layout, Duration::from_millis(1))?;
-    let mut version = 0;
-    // SAFETY: the output lives until the reply has been decoded.
-    success("vkEnumerateInstanceVersion", unsafe {
-        vk::vn_call_vkEnumerateInstanceVersion(&mut connection, &mut version)?
-    })?;
-
-    let application = vk::VkApplicationInfo {
-        sType: vk::VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        pNext: null(),
-        pApplicationName: c"helios-gpu-test".as_ptr(),
-        applicationVersion: 0,
-        pEngineName: null(),
-        engineVersion: 0,
-        apiVersion: version,
-    };
-    let instance_info = vk::VkInstanceCreateInfo {
-        sType: vk::VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        pNext: null(),
-        flags: 0,
-        pApplicationInfo: &application,
-        enabledLayerCount: 0,
-        ppEnabledLayerNames: null(),
-        enabledExtensionCount: 0,
-        ppEnabledExtensionNames: null(),
-    };
-    let mut instance_storage = Box::new(ObjectBase {
-        id: connection.object_id()?,
-    });
-    let mut instance = vk::VkInstance(&mut *instance_storage);
-    // SAFETY: every create-info pointer is live; the output handle points
-    // at stable storage with a connection-local renderer identifier.
-    success("vkCreateInstance", unsafe {
-        vk::vn_call_vkCreateInstance(&mut connection, &instance_info, null(), &mut instance)?
-    })?;
-
-    let mut count = 0;
-    // SAFETY: this is the count-only form of physical-device enumeration.
-    success("vkEnumeratePhysicalDevices(count)", unsafe {
-        vk::vn_call_vkEnumeratePhysicalDevices(&mut connection, instance, &mut count, null_mut())?
-    })?;
-    let mut physical_storage = (0..count)
-        .map(|_| connection.object_id().map(|id| ObjectBase { id }))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut physical_devices: Vec<_> = physical_storage
-        .iter_mut()
-        .map(|storage| vk::VkPhysicalDevice(storage))
-        .collect();
-    if physical_devices.is_empty() {
-        return Err(Error::NoPhysicalDevices);
-    }
-    // SAFETY: the array has `count` live handles, each backed by stable
-    // object storage that remains alive until the instance is destroyed.
-    success("vkEnumeratePhysicalDevices", unsafe {
-        vk::vn_call_vkEnumeratePhysicalDevices(
-            &mut connection,
-            instance,
-            &mut count,
-            physical_devices.as_mut_ptr(),
-        )?
-    })?;
-    physical_devices.truncate(count as usize);
-    let physical = *physical_devices.first().ok_or(Error::NoPhysicalDevices)?;
-    let mut family_count = 0;
-    // SAFETY: count-only query for the selected live physical device.
+    let entry = entry::<Context>();
+    // SAFETY: all objects are used within their Vulkan lifetimes; the driver
+    // owns dispatch storage and serializes requests through its context.
     unsafe {
-        vk::vn_call_vkGetPhysicalDeviceQueueFamilyProperties(
-            &mut connection,
-            physical,
-            &mut family_count,
-            null_mut(),
+        let version = entry
+            .try_enumerate_instance_version()?
+            .unwrap_or(vk::API_VERSION_1_0);
+        let application = vk::ApplicationInfo::default()
+            .application_name(c"helios-gpu-test")
+            .api_version(version);
+        let instance = entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&application),
+            None,
         )?;
+        let result = (|| {
+            let physical_devices = instance.enumerate_physical_devices()?;
+            let physical = *physical_devices.first().ok_or(Error::NoPhysicalDevices)?;
+            let families = instance.get_physical_device_queue_family_properties(physical);
+            let family = families
+                .iter()
+                .position(|family| {
+                    family.queue_count != 0 && family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                })
+                .ok_or(Error::NoComputeQueue)? as u32;
+            let priorities = [1.0];
+            let queues = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(family)
+                .queue_priorities(&priorities)];
+            let device = instance.create_device(
+                physical,
+                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                None,
+            )?;
+            let queue = device.get_device_queue(family, 0);
+            let result = memory(&instance, physical, &device)
+                .and_then(|()| compute::run(&instance, physical, &device, queue, family));
+            device.destroy_device(None);
+            result?;
+            println!(
+                "gpu-test:venus device-queue ok devices={} family={family}",
+                physical_devices.len()
+            );
+            println!("gpu-test:venus ring-reply ok api={version:#x}");
+            Ok(())
+        })();
+        instance.destroy_instance(None);
+        result
     }
-    // SAFETY: queue-family properties contain only integer fields and
-    // integer aggregates. Zero initializes the output capacity for sizing.
-    let mut families =
-        vec![unsafe { core::mem::zeroed::<vk::VkQueueFamilyProperties>() }; family_count as usize];
-    // SAFETY: the output array has `family_count` initialized entries.
-    unsafe {
-        vk::vn_call_vkGetPhysicalDeviceQueueFamilyProperties(
-            &mut connection,
-            physical,
-            &mut family_count,
-            families.as_mut_ptr(),
-        )?;
-    }
-    families.truncate(family_count as usize);
-    let family = families
-        .iter()
-        .position(|family| {
-            family.queueCount != 0 && family.queueFlags & vk::VK_QUEUE_COMPUTE_BIT.0 as u32 != 0
-        })
-        .ok_or(Error::NoComputeQueue)? as u32;
-    let priority = 1.0;
-    let queue_info = vk::VkDeviceQueueCreateInfo {
-        sType: vk::VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        pNext: null(),
-        flags: 0,
-        queueFamilyIndex: family,
-        queueCount: 1,
-        pQueuePriorities: &priority,
-    };
-    let device_info = vk::VkDeviceCreateInfo {
-        sType: vk::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        pNext: null(),
-        flags: 0,
-        queueCreateInfoCount: 1,
-        pQueueCreateInfos: &queue_info,
-        enabledLayerCount: 0,
-        ppEnabledLayerNames: null(),
-        enabledExtensionCount: 0,
-        ppEnabledExtensionNames: null(),
-        pEnabledFeatures: null(),
-    };
-    let mut device_storage = Box::new(ObjectBase {
-        id: connection.object_id()?,
-    });
-    let mut device = vk::VkDevice(&mut *device_storage);
-    // SAFETY: the physical device, create-info chain, and preallocated
-    // output handle all remain live throughout request and reply processing.
-    success("vkCreateDevice", unsafe {
-        vk::vn_call_vkCreateDevice(&mut connection, physical, &device_info, null(), &mut device)?
-    })?;
-
-    let timeline = vk::VkDeviceQueueTimelineInfoMESA {
-        sType: vk::VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA,
-        pNext: null(),
-        ringIdx: 1,
-    };
-    let get_queue = vk::VkDeviceQueueInfo2 {
-        sType: vk::VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
-        pNext: (&raw const timeline).cast(),
-        flags: 0,
-        queueFamilyIndex: family,
-        queueIndex: 0,
-    };
-    let mut queue_storage = Box::new(ObjectBase {
-        id: connection.object_id()?,
-    });
-    let mut queue = vk::VkQueue(&mut *queue_storage);
-    // SAFETY: the device has this queue, and the pNext chain binds it to
-    // an available context timeline. Queue storage stays live until teardown.
-    unsafe {
-        vk::vn_call_vkGetDeviceQueue2(&mut connection, device, &get_queue, &mut queue)?;
-    }
-    memory(&mut connection, physical, device)?;
-    compute::run(&mut connection, physical, device, queue, family)?;
-    connection.wait_queue(1)?;
-    // SAFETY: no device work or child allocations remain. The final close
-    // waits for both destruction commands before any handle storage is freed.
-    unsafe {
-        vk::vn_call_vkDestroyDevice(&mut connection, device, null())?;
-        vk::vn_call_vkDestroyInstance(&mut connection, instance, null())?;
-    }
-    connection.close()?;
-    println!("gpu-test:venus device-queue ok devices={count} family={family}");
-    println!("gpu-test:venus ring-reply ok api={version:#x}");
-    Ok(())
 }
 
 fn memory(
-    connection: &mut Connection<Context>,
-    physical: vk::VkPhysicalDevice,
-    device: vk::VkDevice,
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    device: &ash::Device,
 ) -> Result<(), Error> {
-    // SAFETY: this output structure contains only integer fields, flags
-    // and fixed arrays of them; zero is a valid initialized representation.
-    let mut properties = unsafe { core::mem::zeroed::<vk::VkPhysicalDeviceMemoryProperties>() };
-    // SAFETY: the physical device is live and properties is writable.
+    // SAFETY: physical and device belong to this live instance.
     unsafe {
-        vk::vn_call_vkGetPhysicalDeviceMemoryProperties(connection, physical, &mut properties)?;
+        let properties = instance.get_physical_device_memory_properties(physical);
+        let memory_type = host_memory_type(&properties, u32::MAX)?;
+        let bytes = super::PAGE_BYTES;
+        let allocation = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(bytes)
+                .memory_type_index(memory_type),
+            None,
+        )?;
+        let result = (|| {
+            let pointer = device
+                .map_memory(allocation, 0, bytes, vk::MemoryMapFlags::empty())?
+                .cast::<u8>();
+            let result = (|| {
+                for offset in 0..bytes as usize {
+                    pointer
+                        .add(offset)
+                        .write_volatile((offset as u8).wrapping_mul(17));
+                }
+                for offset in 0..bytes as usize {
+                    let expected = (offset as u8).wrapping_mul(17);
+                    let found = pointer.add(offset).read_volatile();
+                    if found != expected {
+                        return Err(Error::MemoryReadback {
+                            offset,
+                            expected,
+                            found,
+                        });
+                    }
+                }
+                Ok(())
+            })();
+            device.unmap_memory(allocation);
+            result
+        })();
+        device.free_memory(allocation, None);
+        result?;
+        println!("gpu-test:venus memory-map ok bytes={bytes}");
+        Ok(())
     }
-    let required = (vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0
-        | vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.0) as u32;
-    let memory_type = properties
-        .memoryTypes
+}
+
+fn host_memory_type(
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+) -> Result<u32, Error> {
+    let required = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    properties.memory_types[..properties.memory_type_count as usize]
         .iter()
-        .take(properties.memoryTypeCount as usize)
-        .position(|memory| memory.propertyFlags & required == required)
-        .ok_or(Error::NoHostMemory)? as u32;
-    let allocate = vk::VkMemoryAllocateInfo {
-        sType: vk::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        pNext: null(),
-        allocationSize: super::PAGE_BYTES,
-        memoryTypeIndex: memory_type,
-    };
-    let mut memory = vk::VkDeviceMemory(connection.object_id()?);
-    // SAFETY: allocation metadata and the output object identifier are
-    // live, and the memory type came from this device's reported properties.
-    success("vkAllocateMemory", unsafe {
-        vk::vn_call_vkAllocateMemory(connection, device, &allocate, null(), &mut memory)?
-    })?;
-    let size = NonZeroUsize::new(super::PAGE_BYTES as usize).unwrap();
-    let blob = connection.memory_blob(memory, size)?;
-    let pointer = blob.pointer().as_ptr();
-    // A position-dependent test pattern exposes addressing mistakes.
-    let pattern = |offset: usize| (offset as u8).wrapping_mul(17);
-    for offset in 0..size.get() {
-        let expected = pattern(offset);
-        // SAFETY: this is newly allocated coherent host-visible memory;
-        // no GPU command uses it. Volatile accesses exercise the mapping.
-        unsafe { pointer.add(offset).write_volatile(expected) };
-    }
-    for offset in 0..size.get() {
-        let expected = pattern(offset);
-        // SAFETY: the same live mapping and bounds as the writes above.
-        let found = unsafe { pointer.add(offset).read_volatile() };
-        if found != expected {
-            return Err(Error::MemoryReadback {
-                offset,
-                expected,
-                found,
-            });
-        }
-    }
-    // Revoke the guest mapping and release the blob reference before
-    // enqueueing destruction of the renderer's Vulkan memory object.
-    drop(blob);
-    // SAFETY: no buffer, image or submitted work references this allocation.
-    unsafe { vk::vn_call_vkFreeMemory(connection, device, memory, null())? };
-    println!("gpu-test:venus memory-map ok bytes={}", size.get());
-    Ok(())
+        .enumerate()
+        .find(|(index, memory)| {
+            bits & (1 << index) != 0 && memory.property_flags.contains(required)
+        })
+        .map(|(index, _)| index as u32)
+        .ok_or(Error::NoHostMemory)
 }

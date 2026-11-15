@@ -2260,6 +2260,7 @@ dependencies = [
 name = "helios-gpu-test"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "helios-api",
  "helios-venus",
  "naga",
