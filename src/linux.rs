@@ -139,6 +139,11 @@ async fn run(payload: BootPayload, path: &str, expected: Expected) {
                 );
                 assert_eq!(vector, 14, "expected isolated user page fault");
                 assert_ne!(error & 4, 0, "page fault must originate in user mode");
+                assert_ne!(
+                    error & 1,
+                    0,
+                    "kernel mapping must be present but inaccessible"
+                );
                 tracing::info!(path, vector, "native user fault isolated");
                 break;
             }
