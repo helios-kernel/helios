@@ -29,16 +29,15 @@
 //! component, running concurrently with `run` inside one store. They own
 //! none of the desktop: each puts a request on a queue and waits for the
 //! answer, and `run` owns the state and is the only thing that touches
-//! it. The queue's sending end is the one thing here that outlives a
-//! call, and it is written once.
+//! it. The exported desktop resource owns the queue, so each request
+//! reaches its instance without a global registry.
 
 use std::string::String;
-use std::sync::OnceLock;
 use std::vec::Vec;
 
 use helios_api::bindings::wit_stream;
 use helios_api::channel::{Receiver, Sender, bounded};
-use helios_api::compositor::{BlockError, Error, Guest, Rect, Span};
+use helios_api::compositor::{BlockError, Error, Guest, GuestDesktop, Rect, Span};
 use helios_api::display::{Display, DisplayError, Mode, PixelFormat, Point};
 use helios_api::input::{Device, InputError, InputEvent, available, codes, ends_frame};
 use helios_api::programs::{
@@ -74,15 +73,6 @@ const SHELL_CHUNK: usize = 4096;
 
 /// The scanout the desktop draws on. One display, one output.
 const SCANOUT: u32 = 0;
-
-/// Where the surface calls put their work.
-///
-/// Written once, by `run`, before anything else can reach the desktop; a
-/// call that arrives before then is told there is no compositor, because
-/// at that moment there is not one. This is the whole of the state that
-/// outlives a call — the desktop itself is owned by `run` and passed
-/// nowhere.
-static REQUESTS: OnceLock<Sender<Event>> = OnceLock::new();
 
 /// Why the desktop gave up.
 #[derive(Debug, Error)]
@@ -150,8 +140,22 @@ struct Compositor;
 ::helios_api::bindings::export!(Compositor);
 
 impl Guest for Compositor {
-    async fn run() -> Result<(), Error> {
-        match run_desktop().await {
+    type Desktop = DesktopSession;
+}
+
+struct DesktopSession {
+    events: Sender<Event>,
+    queue: Receiver<Event>,
+}
+
+impl GuestDesktop for DesktopSession {
+    fn new() -> Self {
+        let (events, queue) = bounded(EVENT_QUEUE_DEPTH);
+        Self { events, queue }
+    }
+
+    async fn run(&self) -> Result<(), Error> {
+        match run_desktop(&self.events, &self.queue).await {
             Ok(()) => Ok(()),
             Err(error) => {
                 println!("compositor:failed {error}");
@@ -160,30 +164,32 @@ impl Guest for Compositor {
         }
     }
 
-    async fn create(id: u64, dimensions: Rect) -> Result<Span, Error> {
+    async fn create(&self, id: u64, dimensions: Rect) -> Result<Span, Error> {
         let (reply, answer) = bounded(1);
-        ask(Event::Create {
+        self.ask(Event::Create {
             id,
             width: dimensions.width,
             height: dimensions.height,
             reply,
-        })?;
+        })
+        .await?;
         answer.recv().await.map_err(|_| Error::NoCompositor)?
     }
 
-    async fn commit(id: u64, region: Rect) -> Result<(), Error> {
+    async fn commit(&self, id: u64, region: Rect) -> Result<(), Error> {
         let (reply, answer) = bounded(1);
-        ask(Event::Commit {
+        self.ask(Event::Commit {
             id,
             region: Region::new(region.x, region.y, region.width, region.height),
             reply,
-        })?;
+        })
+        .await?;
         answer.recv().await.map_err(|_| Error::NoCompositor)?
     }
 
-    async fn destroy(id: u64) {
+    async fn destroy(&self, id: u64) {
         let (reply, answer) = bounded(1);
-        if ask(Event::Destroy { id, reply }).is_ok() {
+        if self.ask(Event::Destroy { id, reply }).await.is_ok() {
             // The window's pages are freed by the desktop, so the answer
             // is waited for rather than assumed.
             let _ = answer.recv().await;
@@ -191,23 +197,18 @@ impl Guest for Compositor {
     }
 }
 
-/// Put one request on the desktop's queue.
-fn ask(event: Event) -> Result<(), Error> {
-    REQUESTS
-        .get()
-        .ok_or(Error::NoCompositor)?
-        .try_send(event)
-        .map_err(|_| Error::NoCompositor)
+impl DesktopSession {
+    /// Apply backpressure until the desktop accepts the request.
+    async fn ask(&self, event: Event) -> Result<(), Error> {
+        self.events
+            .send(event)
+            .await
+            .map_err(|_| Error::NoCompositor)
+    }
 }
 
 /// Own the desktop until it can no longer be owned.
-async fn run_desktop() -> Result<(), DesktopError> {
-    let (events, queue) = bounded::<Event>(EVENT_QUEUE_DEPTH);
-    // Installed before anything is claimed: a client that asks for a
-    // window while the display is still coming up waits in the queue
-    // rather than being told there is no desktop.
-    let _ = REQUESTS.set(events.clone());
-
+async fn run_desktop(events: &Sender<Event>, queue: &Receiver<Event>) -> Result<(), DesktopError> {
     let display = Display::claim()?;
     let mode = display.preferred_mode(SCANOUT).await?;
     if mode.width == 0 || mode.height == 0 {
@@ -237,12 +238,12 @@ async fn run_desktop() -> Result<(), DesktopError> {
         origin.1
     );
 
-    start_input(&events, mode)?;
+    start_input(events, mode)?;
     // The handle is held for as long as the desktop is: dropping it
     // would take the shell down with it.
-    let (_shell, mut keystrokes) = start_shell(&events).await?;
+    let (_shell, mut keystrokes) = start_shell(events).await?;
 
-    serve(&mut desktop, &queue, &mut keystrokes).await
+    serve(&mut desktop, queue, &mut keystrokes).await
 }
 
 /// Claim every input device and read it into the desktop's queue.

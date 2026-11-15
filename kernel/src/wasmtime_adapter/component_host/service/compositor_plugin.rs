@@ -5,7 +5,7 @@
 //! This module is what sits on the other end of that slot: it
 //! instantiates `bin/compositor` — an ordinary user-mode wasm component,
 //! with the ordinary isolation model — in its own store, calls the
-//! plugin's `helios:system/compositor.run` as a task of that store, and
+//! plugin's `helios:system/compositor.desktop.run` as a task of that store, and
 //! serves the surface calls concurrently with it.
 //!
 //! # Lifecycle
@@ -61,7 +61,7 @@ use crate::wasmtime_adapter::bindings::compositor::bindings::{CompositorHost, ex
 use crate::wasmtime_adapter::component_host::{guest_memory, view_trap};
 use crate::{DeviceClassRights, ProcessAuthority, ProviderReceiver, provider_channel};
 use thiserror::Error;
-use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceTable};
+use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceAny, ResourceTable};
 
 /// Bootfs path of the plugin. Absent on a kernel image built without it,
 /// in which case `helios:system/surface` reports `unavailable`.
@@ -280,7 +280,6 @@ where
     let host =
         CompositorHost::new(&mut store, &wasm_instance).map_err(map_program_runtime_error)?;
     let guest = host.helios_system_compositor().clone();
-
     let registry = exec_context.runtime_state.surface_service();
     // From here on this instance is the compositor: it is the one that
     // may `deliver` input to somebody else's window, and the one whose
@@ -297,19 +296,22 @@ where
     let turns = store.data().guest_turns();
     interrupts
         .drive(turns.drive(store.run_concurrent(async move |accessor| {
+            let desktop = guest.desktop().call_constructor(accessor).await?;
             // The desktop itself, as a task of this store, so the calls
             // into it are not queued behind it.
             accessor.spawn(RunDesktop {
                 guest: guest.clone(),
+                desktop,
                 _marker: core::marker::PhantomData,
             })?;
             accessor.spawn(DrainReturnedSurfaces {
                 guest: guest.clone(),
+                desktop,
                 registry: serve_registry.clone(),
                 _marker: core::marker::PhantomData,
             })?;
             while let Some(request) = receiver.recv().await {
-                serve_request(accessor, &serve_guest, &serve_registry, request).await?;
+                serve_request(accessor, &serve_guest, desktop, &serve_registry, request).await?;
             }
             Ok::<(), wasmtime::Error>(())
         })))
@@ -322,6 +324,7 @@ where
 async fn serve_request<CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
+    desktop: ResourceAny,
     registry: &SurfaceService,
     request: SurfaceRequest,
 ) -> wasmtime::Result<()>
@@ -331,11 +334,15 @@ where
     StorageImpl: crate::Storage,
 {
     match request {
-        SurfaceRequest::Create(create) => serve_create(accessor, guest, registry, create).await,
+        SurfaceRequest::Create(create) => {
+            serve_create(accessor, guest, desktop, registry, create).await
+        }
         SurfaceRequest::Commit { id, region, reply } => {
             let answer = guest
+                .desktop()
                 .call_commit(
                     accessor,
+                    desktop,
                     id.raw(),
                     exports::helios::system::compositor::Rect {
                         x: region.x,
@@ -361,6 +368,7 @@ where
 async fn serve_create<CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
+    desktop: ResourceAny,
     registry: &SurfaceService,
     create: SurfaceCreate,
 ) -> wasmtime::Result<()>
@@ -384,8 +392,10 @@ where
     }
 
     let answer = guest
+        .desktop()
         .call_create(
             accessor,
+            desktop,
             id.raw(),
             exports::helios::system::compositor::Rect {
                 x: 0,
@@ -426,7 +436,10 @@ where
         // told here, whatever the drain did: nothing was shown at its
         // span, and a destroy for a window it already let go does
         // nothing.
-        guest.call_destroy(accessor, id.raw()).await?;
+        guest
+            .desktop()
+            .call_destroy(accessor, desktop, id.raw())
+            .await?;
         let _ = reply.send(Err(SurfaceServiceError::Gone));
         return Ok(());
     }
@@ -441,7 +454,10 @@ where
             %error,
             "the compositor answered create with a span the window cannot be shown at"
         );
-        guest.call_destroy(accessor, id.raw()).await?;
+        guest
+            .desktop()
+            .call_destroy(accessor, desktop, id.raw())
+            .await?;
         let _ = reply.send(Err(error));
         return Ok(());
     }
@@ -457,6 +473,7 @@ where
 async fn destroy_surface<CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
+    desktop: ResourceAny,
     id: SurfaceId,
 ) -> wasmtime::Result<()>
 where
@@ -470,7 +487,10 @@ where
             data.device.surfaces_mut().end_view(id, &mut data.views)
         })
         .map_err(view_trap)?;
-    guest.call_destroy(accessor, id.raw()).await?;
+    guest
+        .desktop()
+        .call_destroy(accessor, desktop, id.raw())
+        .await?;
     Ok(())
 }
 
@@ -497,10 +517,11 @@ const fn from_guest_error(
 type StoreTypeMarker<CpuImpl, Net, StorageImpl> =
     core::marker::PhantomData<fn() -> (CpuImpl, Net, StorageImpl)>;
 
-/// The desktop itself: one `helios:system/compositor.run` that lasts as
+/// The desktop itself: one `helios:system/compositor.desktop.run` that lasts as
 /// long as the instance does.
 struct RunDesktop<CpuImpl, Net, StorageImpl> {
     guest: exports::helios::system::compositor::Guest,
+    desktop: ResourceAny,
     _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
 }
 
@@ -518,7 +539,11 @@ where
         self,
         accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     ) -> wasmtime::Result<()> {
-        let outcome = self.guest.call_run(accessor).await?;
+        let outcome = self
+            .guest
+            .desktop()
+            .call_run(accessor, self.desktop)
+            .await?;
         // A compositor that returned is a desktop that stopped, whatever
         // it says about why. Reporting it as an error is what ends the
         // concurrent run and hands the supervisor its rebuild.
@@ -537,6 +562,7 @@ where
 /// `create` its client stopped waiting for.
 struct DrainReturnedSurfaces<CpuImpl, Net, StorageImpl> {
     guest: exports::helios::system::compositor::Guest,
+    desktop: ResourceAny,
     registry: SurfaceService,
     _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
 }
@@ -565,7 +591,7 @@ where
                 // The view ends and the window goes off the desktop;
                 // the client's buffer goes back to its pool with the
                 // view's reference.
-                destroy_surface(accessor, &self.guest, returned.id()).await?;
+                destroy_surface(accessor, &self.guest, self.desktop, returned.id()).await?;
                 // Only now does the window's slot come back. A failure
                 // above ends this task and drops the guards it still
                 // holds, which releases them the way the dead
