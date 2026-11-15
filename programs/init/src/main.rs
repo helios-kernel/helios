@@ -11,9 +11,9 @@
 //! <source> <mount point> [ro|rw]
 //! ```
 //!
-//! where the source is `memory`, `boot-image`, `host-share` or
-//! `disk:<serial>`, the EROFS image on the disk that reported that
-//! serial. The mode defaults to `rw`; the boot image and disks are
+//! Sources are `memory`, `boot-image`, `host-share`, `disk:<serial>`
+//! for EROFS, and `btrfs:<serial>` for btrfs. Disk sources use the serial
+//! the device reported. The mode defaults to `rw`; the boot image and disks are
 //! read-only whatever it says. A line init cannot parse, or a mount the
 //! kernel refuses, fails init.
 
@@ -58,6 +58,13 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
             "memory" => MountSource::Memory,
             "boot-image" => MountSource::BootImage,
             "host-share" => MountSource::HostShare,
+            _ if label.starts_with("btrfs:") => {
+                let serial = &label["btrfs:".len()..];
+                if serial.is_empty() {
+                    return Err(invalid(number, "empty btrfs disk serial"));
+                }
+                MountSource::Btrfs(serial.to_owned())
+            }
             _ => match label.strip_prefix("disk:") {
                 Some(serial) if !serial.is_empty() => MountSource::Disk(serial.to_owned()),
                 _ => return Err(invalid(number, format!("unknown source `{label}`"))),

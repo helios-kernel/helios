@@ -131,6 +131,10 @@ test-units:
     # capture check that links it.
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-inspector-protocol --lib
+    # The btrfs reader mounts images two pure-Rust writers build, intact
+    # and damaged. Images from `mkfs.btrfs` need btrfs-progs and run in
+    # `test-btrfs-mkfs`.
+    cargo nextest run -p helios-btrfs
     # The host tools: QEMU arguments, network plans, the image audit, the
     # signature trailer, the profile store, the root keypair.
     cargo nextest run -p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support
@@ -153,6 +157,10 @@ test-units:
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-hosted
     python3 "{{repo_root}}/x86/tests/interrupt_state.py"
 
+# Mount the images `mkfs.btrfs --rootdir` builds, one per checksum type and
+# node size. Needs btrfs-progs on PATH; CI's test-units lane installs it.
+test-btrfs-mkfs:
+    cargo nextest run -p helios-btrfs --run-ignored ignored-only
 # Fetch the ACPI tables `acpi/tests/qemu-tables.sha256` pins — QEMU's own
 # expected tables for its q35 machine, from its `tests/data/acpi` at the
 # v9.2.0 commit — into `target/acpi-tables` (or `$HELIOS_ACPI_TABLES_DIR`).

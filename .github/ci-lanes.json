@@ -31,7 +31,7 @@
     "surfaces": ["x86"]
   },
   "test-units": {
-    "command": "just test-units && just test-erofs-mkfs",
+    "command": "just test-units && just test-erofs-mkfs && just test-btrfs-mkfs",
     "rust-cache": true,
     "surfaces": ["x86", "hosted", "host_tools", "programs"]
   },
