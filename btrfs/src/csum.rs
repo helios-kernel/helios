@@ -80,6 +80,16 @@ impl Digest {
     }
 }
 
+/// Ordering hash for an extent's ordinary data references.
+pub(crate) fn data_ref_hash(root: u64, inode: u64, offset: u64) -> u64 {
+    // btrfs hash_extent_data_ref uses raw CRC32C registers seeded with ~0.
+    let high = !CASTAGNOLI.checksum(&root.to_le_bytes());
+    let mut low = CASTAGNOLI.digest();
+    low.update(&inode.to_le_bytes());
+    low.update(&offset.to_le_bytes());
+    (u64::from(high) << 31) ^ u64::from(!low.finalize())
+}
+
 /// The hash directory items and xattr items are keyed by: the kernel's
 /// `crc32c(~1, name)`, a CRC32C register seeded with `0xfffffffe` and
 /// returned without the final inversion.

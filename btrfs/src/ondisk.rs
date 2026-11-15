@@ -63,7 +63,9 @@ pub(crate) mod item_type {
     pub(crate) const EXTENT_ITEM: u8 = 168;
     pub(crate) const METADATA_ITEM: u8 = 169;
     pub(crate) const TREE_BLOCK_REF: u8 = 176;
+    pub(crate) const EXTENT_DATA_REF: u8 = 178;
     pub(crate) const SHARED_BLOCK_REF: u8 = 182;
+    pub(crate) const SHARED_DATA_REF: u8 = 184;
     pub(crate) const BLOCK_GROUP_ITEM: u8 = 192;
     pub(crate) const FREE_SPACE_INFO: u8 = 198;
     pub(crate) const FREE_SPACE_EXTENT: u8 = 199;

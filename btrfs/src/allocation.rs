@@ -1,6 +1,8 @@
 //! Extent-tree records. These describe allocated storage, unlike file extent
 //! items, which describe a file's mapping into that storage.
 
+pub(crate) mod data;
+
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 

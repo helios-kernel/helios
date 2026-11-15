@@ -41,12 +41,21 @@ fn filesystem_image() -> (Filesystem<Disk>, File) {
 }
 
 fn filesystem_image_with_features(separate: bool, free_tree: bool) -> (Filesystem<Disk>, File) {
+    let timestamp = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, timestamp));
+    filesystem_image_tree(separate, free_tree, tree)
+}
+
+fn filesystem_image_tree(
+    separate: bool,
+    free_tree: bool,
+    tree: TreeBuilder,
+) -> (Filesystem<Disk>, File) {
     let mut file = tempfile::tempfile().unwrap();
     // ferrosys' default single-device geometry needs at least 109 MiB.
     let size = 128 << 20;
     file.set_len(size).unwrap();
     let timestamp = Timestamp::from_secs(1_700_000_000);
-    let tree = TreeBuilder::new().root(Metadata::new(0o755, timestamp));
     let mut options = FormatOptions::new([0x53; 16], timestamp);
     if !separate {
         options.plan.compat_ro_flags = options
@@ -64,6 +73,52 @@ fn filesystem_image_with_features(separate: bool, free_tree: bool) -> (Filesyste
     format_to(&mut file, tree, size, options).unwrap();
     let reference = file.try_clone().unwrap();
     (block_on(Filesystem::mount(Disk(file))).unwrap(), reference)
+}
+
+#[test]
+fn space_load_validates_formatted_file_data_references() {
+    block_on(async {
+        use crate::allocation::data::DataExtent;
+        use crate::ondisk::{item_type, objectid};
+
+        let timestamp = Timestamp::from_secs(1_700_000_000);
+        let tree = TreeBuilder::new()
+            .root(Metadata::new(0o755, timestamp))
+            .file(
+                "/data.bin",
+                vec![0x53; 32768],
+                Metadata::new(0o644, timestamp),
+            );
+        let (fs, _) = filesystem_image_tree(true, true, tree);
+        let inode = fs.resolve(b"/data.bin").await.unwrap();
+        crate::space::Space::load(&fs.volume, fs.root_tree)
+            .await
+            .unwrap();
+        let root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
+            .await
+            .unwrap()
+            .root;
+        let mut cursor = crate::tree::Cursor::ceiling(&fs.volume, root, Key::new(0, 0, 0))
+            .await
+            .unwrap();
+        let mut count = 0;
+        while let (Some(key), Some(bytes)) = (cursor.key(), cursor.item()) {
+            if key.item_type == item_type::EXTENT_ITEM
+                && u64::from_le_bytes(bytes[16..24].try_into().unwrap()) == 1
+            {
+                let extent = DataExtent::parse(key, bytes, fs.superblock().sectorsize()).unwrap();
+                assert_eq!(extent.refs, 1);
+                assert_eq!(extent.roots.len(), 1);
+                let (reference, references) = extent.roots.first_key_value().unwrap();
+                assert_eq!(reference.root, objectid::FS_TREE);
+                assert_eq!(reference.inode, inode.number());
+                assert_eq!(*references, 1);
+                count += 1;
+            }
+            cursor.advance(&fs.volume).await.unwrap();
+        }
+        assert!(count > 0);
+    });
 }
 
 fn root_node(fs: &Filesystem<Disk>) -> Node {
