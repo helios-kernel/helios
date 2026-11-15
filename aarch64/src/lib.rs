@@ -1107,6 +1107,7 @@ impl Drop for Aarch64WakeOnlyMask {
 }
 
 impl Cpu for Aarch64Cpu {
+    type Hypervisor = core::convert::Infallible;
     // `CNTV_CVAL_EL0` is this processor's one-shot comparator.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 

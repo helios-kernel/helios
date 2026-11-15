@@ -14,6 +14,7 @@ pub mod display;
 pub mod entropy;
 pub mod fs;
 pub mod generation;
+pub mod hv;
 pub mod input;
 pub mod interrupt;
 pub mod io;
@@ -345,6 +346,7 @@ mod tests {
     }
 
     impl cpu::Cpu for TestCpu {
+        type Hypervisor = core::convert::Infallible;
         const TIMER_INTERRUPT: cpu::TimerInterrupt = cpu::TimerInterrupt::Deadline;
 
         fn processor_count(&self) -> usize {
