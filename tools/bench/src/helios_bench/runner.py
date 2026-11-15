@@ -860,6 +860,17 @@ def missing_prebuilt_files(options: RunOptions, workloads: list[dict]) -> list[s
     """
     lane = options.lane
     missing = []
+    manifest = load_workloads()
+    inputs = list(workloads)
+    control = manifest["control_workload"]
+    if not any(workload["name"] == control for workload in inputs):
+        inputs.extend(select_workloads(manifest, [control]))
+    for source in sorted(
+        {artifact["wasm"] for artifact in gap_bench().artifact_provenance(manifest, inputs)}
+    ):
+        path = REPO_ROOT / source
+        if not path.is_file():
+            missing.append(f"{path} (workload or control wasm input)")
     if Side.HELIOS in options.sides:
         inspector = inspector_for(REPO_ROOT)
         cli = helios_cli_for_repo()
@@ -880,14 +891,14 @@ def missing_prebuilt_files(options: RunOptions, workloads: list[dict]) -> list[s
                 "the kernel image and helios-bootfs paths (they are asked of the inspector, which is missing)"
             )
     if options.sides & LINUX_SIDES:
-        for name in native_counterparts(options, workloads):
+        for name in native_counterparts(options, inputs):
             path = NATIVE_ARTIFACTS / lane.guest_arch / name
             if not path.is_file():
                 missing.append(f"{path} (native counterpart)")
         runner = workload_runner()
         hosts_plugin = any(
             runner.uses_placeholder(workload, side.value, runner.COMPILER_PLUGIN_PLACEHOLDER)
-            for workload in workloads
+            for workload in inputs
             if workload["name"] not in options.skip_linux_workloads
             for side in options.sides & LINUX_SIDES
         )
