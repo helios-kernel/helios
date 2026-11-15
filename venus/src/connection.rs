@@ -272,10 +272,11 @@ impl<T: Transport> Connection<T> {
         self.execute_and_wait(&command, ring)
     }
 
-    /// Submit a reply-generating command and copy its complete reply only
-    /// after the renderer has consumed the command. Each call installs its
-    /// reply stream before the command, in the same single-owner ring.
-    pub fn call(&mut self, commands: &[u8], reply_size: usize) -> Result<Vec<u8>, Error<T::Error>> {
+    /// Submit a reply-generating command and borrow its reply only after
+    /// the renderer has consumed the command. The borrow prevents another
+    /// submission from reusing the storage while it is being decoded.
+    /// Each call installs its reply stream before the command.
+    pub fn call(&mut self, commands: &[u8], reply_size: usize) -> Result<&[u8], Error<T::Error>> {
         if let Some(size) = NonZeroU64::new(reply_size as u64) {
             if self
                 .reply
@@ -305,12 +306,12 @@ impl<T: Transport> Connection<T> {
         self.send(commands)?;
         self.flush()?;
         if reply_size == 0 {
-            return Ok(Vec::new());
+            return Ok(&[]);
         }
         let blob = self.reply.as_ref().expect("nonempty replies have storage");
         // SAFETY: the completed CPU fence establishes that the renderer has
         // finished writing this reply. No subsequent command has been sent.
-        Ok(unsafe { core::slice::from_raw_parts(blob.pointer().as_ptr(), reply_size) }.to_vec())
+        Ok(unsafe { core::slice::from_raw_parts(blob.pointer().as_ptr(), reply_size) })
     }
 
     pub fn close(mut self) -> Result<T, Error<T::Error>> {

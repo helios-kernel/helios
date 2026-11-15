@@ -535,7 +535,7 @@ impl<'a> Wire<'a> {
             quote! {
                 let venus_reply_size = #sizeof_reply(venus_connection.protocol(), #(#args),*)?;
                 let venus_reply = venus_connection.call(&venus_bytes, venus_reply_size)?;
-                let mut venus_decoder = Decoder::new(&venus_reply);
+                let mut venus_decoder = Decoder::new(venus_reply);
                 #decode
                 venus_decoder.finish()?;
                 Ok(#result)
