@@ -48,14 +48,24 @@ pub fn entry_source(an: &Analysis) -> Result<String, EmitError> {
         };
         functions.extend(function);
         let function_name = names::ident(&an.reg.types[id].name);
+        let first = &an.reg.types[id].variables[0];
+        let instance_command = matches!(
+            an.reg.types[first.ty.base].name.as_str(),
+            "VkInstance" | "VkPhysicalDevice"
+        );
+        let guard = if instance_command {
+            quote!(if !device_only)
+        } else {
+            TokenStream::new()
+        };
         for name in an.reg.all_names(id) {
             let bytes = proc_macro2::Literal::byte_string(name.as_bytes());
-            arms.extend(quote!(#bytes => #function_name::<F> as *const (),));
+            arms.extend(quote!(#bytes #guard => #function_name::<F> as *const (),));
         }
     }
     format_tokens(quote! {
         #functions
-        pub(super) fn lookup<F: Factory>(name: &[u8]) -> Option<unsafe extern "system" fn()> {
+        pub(super) fn lookup<F: Factory>(name: &[u8], device_only: bool) -> Option<unsafe extern "system" fn()> {
             let pointer = match name { #arms _ => return None };
             // SAFETY: Vulkan resolves the erased pointer by its command name.
             Some(unsafe { core::mem::transmute::<*const (), unsafe extern "system" fn()>(pointer) })

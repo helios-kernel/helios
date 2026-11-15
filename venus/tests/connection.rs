@@ -66,6 +66,9 @@ struct Recorded {
     blobs: BTreeMap<u32, Weak<Memory>>,
     ring: Option<u32>,
     sequences: Vec<u64>,
+    submitted: Vec<(u8, u64)>,
+    waited: Vec<(u8, u64)>,
+    submissions_at_wait: Vec<usize>,
     consumed: Vec<Vec<u8>>,
     pending: Option<u32>,
     premature_completion: bool,
@@ -101,7 +104,6 @@ impl Transport for Recording {
     }
 
     fn execute(&mut self, commands: &[u8], ring: u8, fence: Option<u64>) -> Result<(), Infallible> {
-        assert_eq!(ring, 0);
         let mut state = self.0.lock().unwrap();
         let command = word(commands, 0) as i32;
         if command == VK_COMMAND_TYPE_vkCreateRingMESA_EXT.0 {
@@ -114,14 +116,24 @@ impl Transport for Recording {
         }
         if let Some(fence) = fence {
             state.sequences.push(fence);
+            state.submitted.push((ring, fence));
         }
         Ok(())
     }
 
     fn wait(&mut self, ring: u8, fence: u64) -> Result<(), Infallible> {
-        assert_eq!(ring, 0);
         let mut state = self.0.lock().unwrap();
-        assert_eq!(state.sequences.last(), Some(&fence));
+        assert_eq!(
+            state
+                .submitted
+                .iter()
+                .rev()
+                .find(|(submitted_ring, _)| *submitted_ring == ring),
+            Some(&(ring, fence))
+        );
+        state.waited.push((ring, fence));
+        let count = state.submitted.len();
+        state.submissions_at_wait.push(count);
         let Some(sequence) = state.pending.take() else {
             return Ok(());
         };
@@ -209,6 +221,26 @@ fn connection_with_capacity(state: Arc<Mutex<Recorded>>, capacity: u32) -> Conne
         Duration::from_millis(1),
     )
     .unwrap()
+}
+
+#[test]
+fn independent_queue_fences_are_submitted_before_either_waits() {
+    let state = Arc::new(Mutex::new(Recorded::default()));
+    let mut connection = connection(state.clone());
+    connection.wait_queues((1 << 1) | (1 << 2)).unwrap();
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(&state.waited[state.waited.len() - 2..], &[(1, 1), (2, 1)]);
+        assert!(
+            state
+                .submissions_at_wait
+                .iter()
+                .rev()
+                .take(2)
+                .all(|count| *count == state.submitted.len())
+        );
+    }
+    connection.close().unwrap();
 }
 
 #[test]
@@ -443,7 +475,22 @@ mod entry_tests {
     pub(super) fn reply(state: &mut Recorded, commands: &[u8]) {
         let command = word(commands, 0) as i32;
         let mut words = vec![command as u32, 0];
-        if command == wire::VK_COMMAND_TYPE_vkCreateInstance_EXT.0 {
+        if [
+            wire::VK_COMMAND_TYPE_vkCreateInstance_EXT.0,
+            wire::VK_COMMAND_TYPE_vkCreateDevice_EXT.0,
+            wire::VK_COMMAND_TYPE_vkCreateBuffer_EXT.0,
+        ]
+        .contains(&command)
+        {
+            words.extend([
+                1,
+                0,
+                word(commands, commands.len() - 8),
+                word(commands, commands.len() - 4),
+            ]);
+        } else if command == wire::VK_COMMAND_TYPE_vkGetDeviceQueue2_EXT.0 {
+            // Void-returning commands omit VkResult from their reply.
+            words.truncate(1);
             words.extend([
                 1,
                 0,
@@ -545,6 +592,52 @@ mod entry_tests {
             first.destroy_instance(None);
             assert_eq!(second.enumerate_physical_devices().unwrap().len(), 2);
             second.destroy_instance(None);
+        }
+    }
+
+    #[test]
+    fn ash_devices_own_stable_queues_and_generated_object_ids() {
+        let entry = entry::<TestFactory>();
+        // SAFETY: all objects below follow Vulkan creation and lifetime rules;
+        // the recorded transport supplies their renderer replies.
+        unsafe {
+            let instance = entry
+                .create_instance(&vk::InstanceCreateInfo::default(), None)
+                .unwrap();
+            let physical = instance.enumerate_physical_devices().unwrap()[0];
+            let priorities = [0.5, 1.0];
+            let queues = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(0)
+                .queue_priorities(&priorities)];
+            let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+            let first = instance.create_device(physical, &info, None).unwrap();
+            let second = instance.create_device(physical, &info, None).unwrap();
+            let queue = first.get_device_queue(0, 0);
+            assert_eq!(
+                queue,
+                first.get_device_queue2(
+                    &vk::DeviceQueueInfo2::default()
+                        .queue_family_index(0)
+                        .queue_index(0)
+                )
+            );
+            assert_ne!(queue, first.get_device_queue(0, 1));
+            assert_ne!(queue, second.get_device_queue(0, 0));
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(4096)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let first_buffer = first.create_buffer(&buffer_info, None).unwrap();
+            let second_buffer = second.create_buffer(&buffer_info, None).unwrap();
+            assert_ne!(first_buffer, vk::Buffer::null());
+            assert_ne!(first_buffer, second_buffer);
+            first.destroy_buffer(first_buffer, None);
+            first.queue_wait_idle(queue).unwrap();
+            first.destroy_device(None);
+            second.destroy_buffer(second_buffer, None);
+            second.device_wait_idle().unwrap();
+            second.destroy_device(None);
+            instance.destroy_instance(None);
         }
     }
 

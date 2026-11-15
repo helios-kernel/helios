@@ -12,6 +12,9 @@ pub(super) struct HostAllocator {
 }
 
 impl HostAllocator {
+    pub(super) fn with_scope(self, scope: SystemAllocationScope) -> Self {
+        Self { scope, ..self }
+    }
     /// The caller supplies Vulkan-valid callbacks and their userdata lifetime.
     pub(super) unsafe fn new(
         callbacks: *const AllocationCallbacks<'_>,

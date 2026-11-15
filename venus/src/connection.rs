@@ -186,7 +186,7 @@ impl<T: Transport> Connection<T> {
         Ok(command)
     }
 
-    fn execute_and_wait(&mut self, commands: &[u8], ring: u8) -> Result<(), Error<T::Error>> {
+    fn execute_fenced(&mut self, commands: &[u8], ring: u8) -> Result<u64, Error<T::Error>> {
         let fence = self
             .fences
             .get_mut(usize::from(ring))
@@ -196,6 +196,11 @@ impl<T: Transport> Connection<T> {
         self.transport
             .execute(commands, ring, Some(fence))
             .map_err(Error::Transport)?;
+        Ok(fence)
+    }
+
+    fn execute_and_wait(&mut self, commands: &[u8], ring: u8) -> Result<(), Error<T::Error>> {
+        let fence = self.execute_fenced(commands, ring)?;
         self.transport.wait(ring, fence).map_err(Error::Transport)
     }
 
@@ -276,6 +281,16 @@ impl<T: Transport> Connection<T> {
     /// Wait for a renderer queue's prior GPU work. The queue must have
     /// been bound to this timeline by `VkDeviceQueueTimelineInfoMESA`.
     pub fn wait_queue(&mut self, ring: u8) -> Result<(), Error<T::Error>> {
+        if usize::from(ring) >= TIMELINES {
+            return Err(Error::Timeline { ring });
+        }
+        self.wait_queues(1u64 << ring)
+    }
+
+    /// Join prior work on the timelines selected by this virtio ring mask.
+    /// All completion fences are submitted before the first wait, allowing
+    /// independent GPU queues to retire concurrently.
+    pub fn wait_queues(&mut self, timelines: u64) -> Result<(), Error<T::Error>> {
         let command = self.inline(|encoder| {
             // SAFETY: this command has only scalar parameters.
             unsafe {
@@ -287,7 +302,22 @@ impl<T: Transport> Connection<T> {
                 )
             };
         })?;
-        self.execute_and_wait(&command, ring)
+        let mut fences = [0; TIMELINES];
+        let mut remaining = timelines;
+        while remaining != 0 {
+            let ring = remaining.trailing_zeros() as u8;
+            remaining &= remaining - 1;
+            fences[usize::from(ring)] = self.execute_fenced(&command, ring)?;
+        }
+        let mut remaining = timelines;
+        while remaining != 0 {
+            let ring = remaining.trailing_zeros() as u8;
+            remaining &= remaining - 1;
+            self.transport
+                .wait(ring, fences[usize::from(ring)])
+                .map_err(Error::Transport)?;
+        }
+        Ok(())
     }
 
     /// Submit a reply-generating command and borrow its reply only after

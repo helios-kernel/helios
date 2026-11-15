@@ -6,6 +6,7 @@
 //! asynchronous. There is no process-global registry or current connection.
 
 mod allocator;
+mod device;
 mod exclusive;
 mod instance;
 

@@ -1,5 +1,6 @@
 use core::ffi::{CStr, c_char};
 use core::ptr::{null, null_mut};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use ash::vk::{self, Handle};
@@ -12,8 +13,9 @@ use crate::connection::{Connection, Error};
 use crate::protocol as wire;
 use crate::transport::Transport;
 
-type TransportError<F> = <<F as crate::transport::TransportFactory>::Transport as Transport>::Error;
-type Shared<F> = Exclusive<State<F>, <F as Factory>::Lock>;
+pub(super) type TransportError<F> =
+    <<F as crate::transport::TransportFactory>::Transport as Transport>::Error;
+pub(super) type Shared<F> = Exclusive<State<F>, <F as Factory>::Lock>;
 type OwnedDispatch<F> = Box<Dispatch<F>, HostAllocator>;
 
 #[repr(C)]
@@ -34,6 +36,20 @@ pub(super) struct State<F: Factory> {
     physical: Option<Vec<OwnedDispatch<F>>>,
     allocator: HostAllocator,
     pub(super) fault: Option<Error<TransportError<F>>>,
+    pub(super) devices: BTreeMap<u64, Box<super::device::Device<F>, HostAllocator>>,
+    pub(super) timelines: u64,
+}
+
+pub(super) fn object<H: Handle>(handle: H) -> *mut ObjectBase {
+    handle.as_raw() as usize as *mut ObjectBase
+}
+
+pub(super) unsafe fn shared<F: Factory>(object: *mut ObjectBase) -> Arc<Shared<F>> {
+    // SAFETY: the caller supplies a live dispatchable handle of this factory.
+    unsafe { &*object.cast::<Dispatch<F>>() }
+        .shared
+        .upgrade()
+        .expect("Vulkan object outlives its instance")
 }
 
 impl<F: Factory> State<F> {
@@ -49,11 +65,7 @@ unsafe fn invoke<F: Factory, R>(
     call: impl FnOnce(&mut State<F>) -> Result<R, Error<TransportError<F>>>,
 ) -> Result<R, vk::Result> {
     // SAFETY: the Vulkan caller supplies a live object from this entry table.
-    let dispatch = unsafe { &*object.cast::<Dispatch<F>>() };
-    let shared = dispatch
-        .shared
-        .upgrade()
-        .expect("Vulkan object outlives its instance");
+    let shared = unsafe { shared::<F>(object) };
     let mut state = shared.lock();
     if state.fault.is_some() {
         return Err(vk::Result::ERROR_DEVICE_LOST);
@@ -167,6 +179,9 @@ unsafe extern "system" fn create_instance<F: Factory>(
         physical: None,
         allocator,
         fault: None,
+        devices: BTreeMap::new(),
+        // Virtio's CPU timeline occupies ring zero.
+        timelines: 1,
     }));
     let mut state = owner.lock();
     let id = match state.connection.object_id() {
@@ -332,7 +347,11 @@ pub(super) unsafe extern "system" fn get_instance_proc_addr<F: Factory>(
         _ if instance == vk::Instance::null() => return None,
         b"vkDestroyInstance" => destroy_instance::<F> as *const (),
         b"vkEnumeratePhysicalDevices" => enumerate_physical_devices::<F> as *const (),
-        _ => return super::generated::lookup::<F>(name),
+        b"vkCreateDevice" => super::device::create_device::<F> as *const (),
+        _ => {
+            return super::device::lookup::<F>(name)
+                .or_else(|| super::generated::lookup::<F>(name, false));
+        }
     };
     Some(unsafe { core::mem::transmute::<*const (), unsafe extern "system" fn()>(pointer) })
 }
