@@ -7,19 +7,59 @@ use core::future::Future;
 use core::ptr;
 
 use crate::InstanceId;
+use crate::memory::{GuestResidency, SwapFaultError};
 use bytes::Bytes;
+use helios_hal::fs::{WritePosition, WriteProgress};
 use helios_hal::io::IoError;
+use helios_hal::pmm::PhysFrame;
+use helios_hal::vmm::{VirtAddr, VirtRange};
 use thiserror::Error;
 
+/// A guest's scattered read buffer, registered with the TCP stack so the
+/// bytes a stream received are copied out of its receive queue straight
+/// into guest memory, once.
+///
+/// # Concurrency
+///
+/// One task drives the buffer: the host call that registered it, whose
+/// every poll is a turn of the instance that owns the memory. Each copy
+/// into it runs synchronously inside such a poll, under the lock of the
+/// shard that holds the stream, and lands only on a page that the same
+/// synchronous step has just seen present. A page is detached only from
+/// an instance that is off every processor (see [`GuestResidency`]), so a
+/// page seen present stays present until the copy is done; the check and
+/// the copy never straddle an await.
+///
+/// A page that is out stops the copy in front of it. Whatever the stack
+/// could not hand over stays in the stream's receive queue,
+/// [`Self::awaits_page`] answers `true`, and [`Self::bring_in_next_page`]
+/// faults the page in. That await ends the turn, and the read that is
+/// retried afterwards checks every page again.
 pub struct RegisteredTcpReadBuffer<'a> {
     memory_base: usize,
+    /// `(offset, len)` spans of linear memory, in the order they fill.
     ranges: &'a [(usize, usize)],
     capacity: usize,
     written: usize,
+    /// `None` on a machine that cannot swap, where every page is present.
+    residency: Option<GuestResidency>,
 }
 
 impl<'a> RegisteredTcpReadBuffer<'a> {
-    pub fn new(memory_base: usize, ranges: &'a [(usize, usize)]) -> Self {
+    /// A buffer over the `ranges` of the linear memory at `memory_base`.
+    ///
+    /// # Safety
+    ///
+    /// Every range lies inside that linear memory, which stays mapped and
+    /// in place for as long as the buffer lives, and nothing else touches
+    /// those bytes meanwhile: the guest that owns them is suspended in the
+    /// host call that holds the buffer. `residency` is the machine's swap,
+    /// or `None` only where no guest page is ever absent.
+    pub(crate) unsafe fn new(
+        memory_base: usize,
+        ranges: &'a [(usize, usize)],
+        residency: Option<GuestResidency>,
+    ) -> Self {
         let capacity = ranges.iter().fold(0usize, |total, (_, len)| {
             total
                 .checked_add(*len)
@@ -30,6 +70,7 @@ impl<'a> RegisteredTcpReadBuffer<'a> {
             ranges,
             capacity,
             written: 0,
+            residency,
         }
     }
 
@@ -40,45 +81,115 @@ impl<'a> RegisteredTcpReadBuffer<'a> {
     pub const fn written(&self) -> usize {
         self.written
     }
+
+    /// Whether the page the next byte lands on is swapped out, so the
+    /// buffer takes nothing until [`Self::bring_in_next_page`] has run.
+    pub fn awaits_page(&self) -> bool {
+        self.next_page().is_some_and(|(residency, next)| {
+            residency.first_swapped(VirtRange::new(next, 1)).is_some()
+        })
+    }
+
+    /// Faults in the page the next byte lands on, if it is out. Present
+    /// once this resolves, and only then: the caller retries its read,
+    /// which checks again in the poll that copies.
+    pub async fn bring_in_next_page(&self) -> Result<(), SwapFaultError> {
+        let Some((residency, next)) = self.next_page() else {
+            return Ok(());
+        };
+        match residency.fault_in_first_swapped(VirtRange::new(next, 1)) {
+            Some(fault) => fault.await,
+            None => Ok(()),
+        }
+    }
+
+    /// The machine's swap and the host address of the next byte, while
+    /// the buffer has room on a machine that swaps.
+    fn next_page(&self) -> Option<(&GuestResidency, VirtAddr)> {
+        let residency = self.residency.as_ref()?;
+        let mut skip = self.written;
+        for &(start, len) in self.ranges {
+            if skip < len {
+                return Some((residency, VirtAddr::new(self.memory_base + start + skip)));
+            }
+            skip -= len;
+        }
+        None
+    }
+
+    /// Whether every page of the `len` bytes at host address `at` is
+    /// present.
+    fn present(&self, at: usize, len: usize) -> bool {
+        self.residency.as_ref().is_none_or(|residency| {
+            residency
+                .first_swapped(VirtRange::new(VirtAddr::new(at), len))
+                .is_none()
+        })
+    }
 }
 
 impl helios_netstack::TcpReceiveBuffer for RegisteredTcpReadBuffer<'_> {
+    /// No room while the next page is out, which is what makes the stack
+    /// leave its bytes queued.
     fn remaining_capacity(&self) -> usize {
+        if self.awaits_page() {
+            return 0;
+        }
         self.capacity - self.written
     }
 
+    /// Copies as much of `bytes` as fits, a page at a time, each page
+    /// checked present just before it is written, and stops in front of
+    /// the first page that is out.
     fn write_from(&mut self, bytes: &[u8]) -> usize {
-        let write_len = bytes.len().min(self.remaining_capacity());
-        let mut source_offset = 0usize;
-        let mut global_offset = self.written;
-        for (range_start, range_len) in self.ranges {
-            if source_offset == write_len {
+        let mut taken = 0usize;
+        let mut skip = self.written;
+        'ranges: for &(start, len) in self.ranges {
+            if taken == bytes.len() {
                 break;
             }
-            if global_offset >= *range_len {
-                global_offset -= *range_len;
+            if skip >= len {
+                skip -= len;
                 continue;
             }
-            let range_offset = global_offset;
-            let range_remaining = *range_len - range_offset;
-            let chunk_len = (write_len - source_offset).min(range_remaining);
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    bytes.as_ptr().add(source_offset),
-                    (self.memory_base as *mut u8).add(*range_start + range_offset),
-                    chunk_len,
-                );
+            let mut offset = skip;
+            skip = 0;
+            while offset < len && taken < bytes.len() {
+                let at = self.memory_base + start + offset;
+                let page_end = (at / PhysFrame::SIZE + 1) * PhysFrame::SIZE;
+                let span = (page_end - at).min(len - offset).min(bytes.len() - taken);
+                if !self.present(at, span) {
+                    break 'ranges;
+                }
+                // SAFETY: the span lies inside the linear memory the
+                // constructor's contract names, on a page this step has
+                // just seen present, and it is copied before anything can
+                // await (see the type's concurrency notes).
+                unsafe {
+                    ptr::copy_nonoverlapping(bytes.as_ptr().add(taken), at as *mut u8, span);
+                }
+                offset += span;
+                taken += span;
             }
-            source_offset += chunk_len;
-            global_offset = 0;
         }
-        assert_eq!(
-            source_offset, write_len,
-            "registered TCP receive buffer ranges did not cover their capacity"
-        );
-        self.written += write_len;
-        write_len
+        self.written += taken;
+        taken
     }
+}
+
+/// What a read into a [`RegisteredTcpReadBuffer`] came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpReadInto {
+    /// This many bytes landed in the buffer: fewer than it holds only
+    /// when the stream had fewer queued, and none only for a buffer with
+    /// no room.
+    Data(usize),
+    /// The peer's send side is done.
+    Eof,
+    /// Bytes were waiting, but the page they would land on could not be
+    /// brought back from swap: the guest's memory is gone. The bytes are
+    /// still queued on the stream.
+    PageLost(SwapFaultError),
 }
 
 #[derive(Clone, Debug)]
@@ -626,24 +737,45 @@ impl<Service> ComponentHostNetwork for Service where
 {
 }
 
-/// The queue-pair packet pump a network service runs per processor.
+/// The queue-pair packet pump a network service runs per processor, and
+/// the hand-off of a processor's pair when it goes offline or online.
 ///
 /// A queue pair's interrupt is routed to one processor, so the pump
-/// that drains the pair is pinned to it: every processor calls this
-/// once from its own run loop through `spawn_local_detached`, and the
-/// service either runs the pump for the pair the processor owns or
-/// returns at once. Which pair a processor owns is decided from the
-/// topology inside the service, never by which task got there first —
-/// with more processors than pairs, only the lowest processor mapped
-/// to each pair runs a pump.
+/// that drains the pair is pinned to it: every online processor runs
+/// one as a local task, which its network lifecycle step spawns on the
+/// way up and cancels on the way down. Which pair a processor owns is
+/// the service's routing table's answer, never which task got there
+/// first, and it changes only through the two hand-off calls below.
+///
+/// # Concurrency contract
+///
+/// `hand_off_queue_pair` and `take_up_queue_pair` run on the processor
+/// they name, from its lifecycle step, while the initiator of the
+/// transition holds the lifecycle's transition lock: at most one runs
+/// at a time, and never during a machine freeze. They are synchronous
+/// and take no lock a pump or a socket operation holds; the device
+/// command they issue is polled for its acknowledgement.
 pub trait NetworkPacketPump {
-    /// Runs the packet pump for the queue pair `processor` owns, for as
-    /// long as the interface lives — or completes immediately when the
-    /// processor owns no pair.
+    /// Runs the packet pump of `processor` for as long as the task is
+    /// not cancelled: it drains whichever pair the processor owns and
+    /// parks while it owns none.
     fn run_packet_pump(
         &self,
         processor: helios_hal::cpu::ProcessorId,
     ) -> impl Future<Output = ()> + Send + '_;
+
+    /// Hands the pair `departing` owns to an online processor, steering
+    /// its interrupt and the device's live pair count, before
+    /// `departing` leaves `online`.
+    fn hand_off_queue_pair(
+        &self,
+        departing: helios_hal::cpu::ProcessorId,
+        online: &crate::exec::OnlineSet,
+    );
+
+    /// Gives `arriving` a pair when the device has one that is not
+    /// live, after `arriving` restarted or refused to go offline.
+    fn take_up_queue_pair(&self, arriving: helios_hal::cpu::ProcessorId);
 }
 
 /// A network handle's stable numeric name.
@@ -864,30 +996,20 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         stream: Self::TcpStream,
     ) -> impl Future<Output = Result<(), TcpError>> + Send + '_;
 
+    /// Waits up to `timeout_nanos` for `stream` to have received bytes
+    /// and copies them out of its receive queue straight into `buffer`.
+    ///
+    /// The copy runs on the caller's own poll, a page of the buffer at a
+    /// time, each page checked present just before it is written (see
+    /// [`RegisteredTcpReadBuffer`]). A page that is out is faulted in and
+    /// the copy carried on within the same deadline; bytes that could not
+    /// be handed over stay queued.
     fn tcp_read_into<'a>(
         &'a self,
         stream: Self::TcpStream,
-        buffer: RegisteredTcpReadBuffer<'a>,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Option<usize>, TcpError>> + Send + 'a {
-        async move {
-            let capacity = u32::try_from(buffer.capacity()).unwrap_or(u32::MAX);
-            match self.tcp_read(stream, capacity, timeout_nanos).await? {
-                Some(bytes) => {
-                    let mut buffer = buffer;
-                    let written =
-                        helios_netstack::TcpReceiveBuffer::write_from(&mut buffer, bytes.as_ref());
-                    assert_eq!(
-                        written,
-                        bytes.len(),
-                        "registered TCP receive buffer truncated a read"
-                    );
-                    Ok(Some(written))
-                }
-                None => Ok(None),
-            }
-        }
-    }
+    ) -> impl Future<Output = Result<TcpReadInto, TcpError>> + Send + 'a;
 
     fn tcp_shutdown_send(
         &self,
@@ -1169,7 +1291,82 @@ pub enum HostShareRestore {
     SessionLost,
 }
 
+/// A host-share write [`HostFileSystem::prepare_write`] staged.
+///
+/// A write lands in rounds: each round's destinations are staged before
+/// its bytes, filled synchronously, and then sent. An implementation
+/// bounds a round by the destinations it can hold at once (the 9p
+/// client's request pool), never by the write's length; the rounds'
+/// lengths sum to the prepared length and land in order at consecutive
+/// offsets.
+///
+/// Dropping a staged or filled write before its submit returns what it
+/// holds (its destinations, its open file) and leaves the file as it
+/// was: the rounds already submitted have landed, this one has not.
+/// Dropping a submit's future part way may leave part of its round
+/// written.
+///
+/// Concurrency: a staged write is owned by the task that prepared it and
+/// moved, never shared; for its whole life it counts as an operation in
+/// flight on the share, so a snapshot hold waits for it.
+pub trait HostWrite: Send + Sized {
+    /// The round once its bytes are in.
+    type Filled: HostFilledWrite<Next = Self>;
+
+    /// The bytes this round stages.
+    fn staged_len(&self) -> usize;
+
+    /// Writes this round's bytes into its destinations. `fill` is called
+    /// once per destination region, in write order, with the region's
+    /// offset from the start of the whole write; the regions cover
+    /// [`Self::staged_len`] bytes exactly.
+    fn fill<F>(self, fill: F) -> Self::Filled
+    where
+        F: FnMut(usize, &mut [u8]);
+}
+
+/// A round of a [`HostWrite`] whose bytes are in, ready to send.
+pub trait HostFilledWrite: Send + Sized {
+    /// The staged write the next round continues as.
+    type Next;
+
+    /// Sends the round in order, checking that the host took every byte
+    /// of it, and resolves with the next round staged or, after the last,
+    /// the offset the whole write began at.
+    fn submit(self) -> impl Future<Output = Result<WriteProgress<Self::Next>, HostFsError>> + Send;
+}
+
+/// The write of a host filesystem that refuses every write before it is
+/// staged.
+impl HostWrite for core::convert::Infallible {
+    type Filled = Self;
+
+    fn staged_len(&self) -> usize {
+        match *self {}
+    }
+
+    fn fill<F>(self, _: F) -> Self
+    where
+        F: FnMut(usize, &mut [u8]),
+    {
+        match self {}
+    }
+}
+
+impl HostFilledWrite for core::convert::Infallible {
+    type Next = Self;
+
+    async fn submit(self) -> Result<WriteProgress<Self>, HostFsError> {
+        match self {}
+    }
+}
+
 pub trait HostFileSystem: Clone + Send + Sync + 'static {
+    /// The write [`Self::prepare_write`] stages.
+    type Write<'a>: HostWrite
+    where
+        Self: 'a;
+
     /// How this filesystem's caches have been serving the kernel, or
     /// `None` from an implementation that caches nothing.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
@@ -1224,20 +1421,17 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         offset: u64,
         max_bytes: u32,
     ) -> impl Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a;
-    fn write_file<'a>(
+    /// Stages a write of `len` bytes to `path` at `position`: opens the
+    /// file, resolves where the bytes land (an append reads the host's
+    /// current end of file, so concurrent growth is not overwritten) and
+    /// readies the destinations the first round of bytes goes into.
+    /// Nothing reaches the file until [`HostFilledWrite::submit`].
+    fn prepare_write<'a>(
         &'a self,
         path: &'a str,
-        offset: u64,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
-    /// Appends to the end of `path`, resolving the current end of file on the
-    /// host so concurrent growth is not overwritten. Resolves with the offset
-    /// the bytes were written at.
-    fn append_file<'a>(
-        &'a self,
-        path: &'a str,
-        bytes: &'a [u8],
-    ) -> impl Future<Output = Result<u64, HostFsError>> + Send + 'a;
+        position: WritePosition,
+        len: usize,
+    ) -> impl Future<Output = Result<Self::Write<'a>, HostFsError>> + Send + 'a;
     /// Flushes host-side buffers for `path` (9p `Tfsync`).
     fn sync_file<'a>(
         &'a self,

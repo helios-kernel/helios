@@ -26,6 +26,13 @@ use crate::vmm::HostedAddressSpace;
 /// it, through the same function the runtime adapter calls.
 const TEST_STORE_BYTES: usize = 4096;
 
+/// A registry for a test thread standing in for processor 0: registering
+/// an instance records the executing processor as its provisional home.
+fn registry_on_processor_zero() -> InstanceRegistry {
+    crate::cpu::set_current_processor(helios_hal::cpu::ProcessorId::new(0));
+    InstanceRegistry::new()
+}
+
 /// What one store costs the kernel heap.
 fn test_store_charge() -> u64 {
     store_kernel_heap_bytes(TEST_STORE_BYTES)
@@ -47,7 +54,7 @@ fn fully_resident(instances: &[&RegisteredInstance]) -> UserResidency {
 
 #[test]
 fn pick_skips_instances_with_zero_memory() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let idle = registry.register("idle", 0);
     assert!(
         registry
@@ -58,7 +65,7 @@ fn pick_skips_instances_with_zero_memory() {
 
 #[test]
 fn pick_chooses_largest_consumer_when_costs_match() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let small = registry.register("small", 0);
     let large = registry.register("large", 0);
     small.set_memory_bytes(64 * 1024 * 1024);
@@ -72,7 +79,7 @@ fn pick_chooses_largest_consumer_when_costs_match() {
 
 #[test]
 fn pick_prefers_low_restart_cost_per_byte() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let user = registry.register_with_policy("user-program", 0, OomPolicy::UserProgram);
     let plugin = registry.register_with_policy("compiler-plugin", 0, OomPolicy::KernelPlugin);
     // User holds half as much memory but has one-hundredth the
@@ -92,7 +99,7 @@ fn pick_prefers_low_restart_cost_per_byte() {
 /// not a candidate at any score.
 #[test]
 fn system_components_are_never_oom_victims() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let system = registry.register_with_policy("debugger", 0, OomPolicy::SystemComponent);
     system.set_memory_bytes(1024 * 1024 * 1024);
 
@@ -130,7 +137,7 @@ fn system_components_are_never_oom_victims() {
 
 #[test]
 fn request_kill_flips_flag_observable_to_pending_kill() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let instance = registry.register("victim", 0);
     instance.set_memory_bytes(128 * 1024 * 1024);
     assert_eq!(instance.pending_kill(), None);
@@ -147,7 +154,7 @@ fn request_kill_flips_flag_observable_to_pending_kill() {
 
 #[test]
 fn request_kill_is_idempotent() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let instance = registry.register("victim", 0);
     instance.set_memory_bytes(64 * 1024 * 1024);
     let residency = fully_resident(&[&instance]);
@@ -167,7 +174,7 @@ fn request_kill_is_idempotent() {
 
 #[test]
 fn condemned_instances_are_excluded_from_subsequent_picks() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let big = registry.register("big", 0);
     let small = registry.register("small", 0);
     big.set_memory_bytes(512 * 1024 * 1024);
@@ -192,7 +199,7 @@ fn condemned_instances_are_excluded_from_subsequent_picks() {
 
 #[test]
 fn kill_supervisor_restart_decodes_correctly() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let instance = registry.register("plugin", 0);
     instance.set_memory_bytes(1);
     assert_eq!(
@@ -220,7 +227,7 @@ fn one_shortfall_condemns_only_the_victims_that_cover_it() {
     const REQUESTED_BYTES: u64 = 1024 * 1024;
     const INSTANCES: usize = 32;
 
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     // The requester is the instance whose grow was refused; it holds no
     // memory of its own yet.
     let requester = registry.register("requester", 0);
@@ -278,7 +285,7 @@ fn one_shortfall_condemns_only_the_victims_that_cover_it() {
 /// its memory is back.
 #[test]
 fn reclaimed_memory_leaves_the_ledger() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let requester = registry.register("requester", 0);
     let victim = registry.register("victim", 0);
     victim.set_memory_bytes(8 * 1024 * 1024);
@@ -318,7 +325,7 @@ fn a_condemnation_stops_covering_when_its_grace_expires() {
     const REQUESTED_BYTES: u64 = 1024 * 1024;
     let grace = OOM_RECLAIM_GRACE.as_nanos() as u64;
 
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let requester = registry.register("requester", 0);
     let stuck = registry.register("stuck-in-a-host-call", 0);
     stuck.set_memory_bytes(8 * 1024 * 1024);
@@ -385,7 +392,7 @@ fn a_condemnation_stops_covering_when_its_grace_expires() {
 /// most memory takes the failure itself.
 #[test]
 fn the_requester_is_never_its_own_victim() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let requester = registry.register("hog", 0);
     requester.set_memory_bytes(512 * 1024 * 1024);
     let small = registry.register("small", 0);
@@ -419,7 +426,7 @@ fn a_spawner_condemned_mid_turn_ends_its_turn_and_stays_on_the_ledger() {
     const REQUESTED_BYTES: u64 = 1_114_112;
     const CHILDREN: usize = 100;
 
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let spawner = registry.register("/bin/procbench", 0);
     spawner.set_memory_bytes(SPAWNER_BYTES);
     let children: Vec<_> = (0..CHILDREN)
@@ -491,7 +498,7 @@ fn a_spawner_condemned_mid_turn_ends_its_turn_and_stays_on_the_ledger() {
 fn a_store_dropped_while_suspended_bills_nothing_further() {
     // A turn names its instance on the executing processor.
     crate::cpu::set_current_processor(helios_hal::cpu::ProcessorId::new(0));
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let instance = registry.register("cancelled", 0);
 
     let activity = InstanceActivity::new(instance.clone(), test_store_charge());
@@ -578,7 +585,7 @@ fn a_grow_is_charged_its_page_tables_not_its_pages() {
 fn a_kernel_heap_shortfall_condemns_the_largest_kernel_footprint() {
     const GUEST_THREADS: usize = 64;
 
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
 
     // One large linear memory on a single store.
     let hog = registry.register("/bin/big-memory", 0);
@@ -624,7 +631,7 @@ fn a_kernel_heap_shortfall_condemns_the_largest_kernel_footprint() {
 /// allocator cannot be asked who an allocation was for.
 #[test]
 fn a_dropped_store_returns_its_kernel_heap_to_the_instance() {
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let instance = registry.register("/bin/threaded", 0);
     let base = instance.kernel_heap_bytes();
 
@@ -646,7 +653,7 @@ fn a_dropped_store_returns_its_kernel_heap_to_the_instance() {
 fn the_ledger_counts_the_pool_the_shortfall_is_in() {
     const MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let requester = registry.register("requester", 0);
     let victim = registry.register("/bin/procbench", 0);
     victim.set_memory_bytes(MEMORY_BYTES);
@@ -707,7 +714,7 @@ fn the_ledger_counts_the_pool_the_shortfall_is_in() {
 fn a_mostly_swapped_out_instance_is_ranked_by_what_its_death_returns() {
     const MIB: u64 = 1024 * 1024;
 
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let requester = registry.register("requester", 0);
     let idle = registry.register("/bin/idle-and-swapped", 0);
     idle.set_memory_bytes(512 * MIB);
@@ -767,7 +774,7 @@ fn the_address_space_s_account_condemns_the_resident_instance() {
 
     crate::swap_tests::machine();
     let address_space = HostedAddressSpace::new();
-    let registry = InstanceRegistry::new();
+    let registry = registry_on_processor_zero();
     let requester = registry.register("requester", 0);
     let large = registry.register("/bin/large-and-swapped", 0);
     let small = registry.register("/bin/small-and-resident", 0);

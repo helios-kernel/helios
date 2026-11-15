@@ -32,7 +32,7 @@ use helios_hal::cpu::Cpu;
 use pin_project_lite::pin_project;
 
 use super::{ComponentRuntimeState, InstanceKilled, SocketRetirementQueue};
-use crate::{NotifyWaiter, ProfileScope, StoreTurns};
+use crate::{NotifyWaiter, StoreTurns};
 
 /// How a store's own stop, one that is not its instance's condemnation,
 /// wakes a turn whose guest is suspended.
@@ -180,12 +180,9 @@ where
         let output = work();
         let elapsed = turn.end(self.now_nanos());
         if self.runtime_state.profiling_enabled() {
-            self.runtime_state.record_profile_stack_parts_nanos(
-                ProfileScope::User,
-                "user;",
-                self.turns.instance().name(),
-                elapsed,
-            );
+            let instance = self.turns.instance();
+            self.runtime_state
+                .record_user_profile(instance.id(), instance.name(), elapsed);
         }
         self.epilogue.end_turn(&self.runtime_state);
         output
@@ -385,7 +382,7 @@ mod tests {
     /// memory it commits, nested in the turn of a store that does.
     #[test]
     fn a_turn_of_an_unowned_store_names_no_memory_owner() {
-        configure_user_memory_owner_processors(1);
+        configure_user_memory_owner_processors(crate::test_support::single_node_pool(1));
         let processor = current_processor();
         let registry = InstanceRegistry::new();
         let requester = registry.register("requester", 0);
@@ -431,7 +428,7 @@ mod tests {
     /// processor back to the parent.
     #[test]
     fn a_turn_names_its_instance_as_the_memory_owner() {
-        configure_user_memory_owner_processors(1);
+        configure_user_memory_owner_processors(crate::test_support::single_node_pool(1));
         let processor = current_processor();
         let registry = InstanceRegistry::new();
         let parent = registry.register("parent", 0);

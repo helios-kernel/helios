@@ -8,6 +8,7 @@ extern crate std;
 
 mod audio;
 mod bootfs;
+mod bring_up;
 mod buffer;
 mod component;
 #[cfg(feature = "wasmtime-runtime")]
@@ -21,7 +22,12 @@ mod host_fs;
 mod input;
 mod instance;
 mod io;
+#[cfg(feature = "wasmtime-runtime")]
+mod isa;
+#[cfg(feature = "wasmtime-runtime")]
+pub use isa::GuestIsa;
 mod kernel_exception;
+mod limine_tpm_event_log;
 mod log;
 mod machine;
 mod memory;
@@ -29,6 +35,7 @@ mod network;
 mod process;
 mod profiling;
 mod runtime;
+mod signing_key;
 mod surface;
 #[cfg(test)]
 mod test_support;
@@ -63,6 +70,7 @@ pub use audio::{
     PERIODS_IN_FLIGHT, PeriodRing, PeriodWriter, PlaybackFormat, install_audio_device,
 };
 pub use bootfs::{BootFs, BootfsBytes, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
+pub use bring_up::complete_device_future_at_bring_up;
 pub use buffer::{
     BYTES_PER_PIXEL, Buffer, BufferError, GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup,
     ViewId, ViewTable, WASM_PAGE_BYTES,
@@ -104,30 +112,34 @@ pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
     Executor, ExecutorRunStats, FoldedProfileSample, FreezeError, FrozenMachine, GUEST_TIME_SLICE,
-    IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle, Mutex, MutexGuard,
-    Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
-    OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
-    PressureLevel, ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged,
-    ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
-    RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner,
-    StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField, TraceFilter,
-    TraceHistory, TraceLevel, TraceValue, UptimeClock, YieldNow, elapsed_millis,
-    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, monotonic_nanos,
-    parse_console_text, wall_clock_offset_nanos, yield_now,
+    IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle,
+    MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, Mutex, MutexGuard, Notified, Notify,
+    NotifyWaiter, ObservationScope, OfflineError, OfflineRefusal, OnlineError, OnlineSet,
+    OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
+    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, PinnedTasks, PrefixSet,
+    PrefixSetError, PressureLevel, ProcessorControl, ProcessorLifecycle, ProfileFilter,
+    ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark, ProgressSignal,
+    RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock,
+    RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding,
+    Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue,
+    UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
+    matches_trace_filter, monotonic_nanos, online_processor_count, parse_console_text,
+    wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
-    ContextRecord, Gpu3dClaim, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
-    MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS, install_gpu3d_device,
+    ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
+    Gpu3dSession, MAX_EXECUTE_BYTES, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_GPU_VIEWS,
+    MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS, RingTimeline, SessionId, install_gpu3d_device,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
-    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, PacketBuffer, RxDrain,
-    RxFrame, RxFrameOffload, SegmentationOffload, TxFrameRef,
+    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, RxDrain, RxFrame,
+    RxFrameOffload, SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
-    HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats, HostFsClient,
-    HostFsTransport, UnsupportedHostFileSystem,
+    FilledHostFsWrite, HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats,
+    HostFsClient, HostFsTransport, HostFsWrite, UnsupportedHostFileSystem,
 };
 pub use input::{
     DeviceIndex, EVENT_QUEUE_DEPTH, EventBurst, InputClaim, InputDeviceSnapshot, InputEvents,
@@ -157,9 +169,11 @@ pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
 };
+pub use limine_tpm_event_log::LimineTpmEventLogRequest;
 pub use machine::{
-    AdvanceCause, DeviceResets, Generation, MachineGeneration, MachineGenerationHandle,
-    ResetDevice, UnhandledAdvances, install_generation_reactions,
+    AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
+    MachineGenerationHandle, ResetDevice, UnhandledAdvances, install_generation_reactions,
+    spawn_generation_probe,
 };
 pub use memory::{
     AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
@@ -170,14 +184,15 @@ pub use memory::{
     FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,
     IDLE_SWAP_AFTER, INCOMPRESSIBLE_BYTES, InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
-    KERNEL_HEAP_RESERVE_FRACTION, KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy,
-    NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation,
-    ReservationLookup, ReservationTracker, ResidencyVmHooks, RootEntropy, RootEntropyHandle,
-    SWAP_BATCH_BYTES, SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapHandle,
+    KERNEL_HEAP_RESERVE_FRACTION, LocalMemory, LocalSlice, Locality, MemoryNodeStats, MemoryOwner,
+    NoCryptographicEntropy, NoEntropyDevice, NodeLocalArena, NodeMemory, NodeRun, PerProcessor,
+    ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
+    ReservationTracker, ResidencyVmHooks, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
+    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapFaultIn, SwapHandle,
     SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
     USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
     UserMemoryPool, UserResidency, VaCursor, allocate_user_frame_uninit_on,
-    allocate_user_frame_zeroed, allocate_user_frame_zeroed_on, allocate_user_memory_pool,
+    allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
     allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
     current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
     deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
@@ -186,8 +201,8 @@ pub use memory::{
     install_swap_hooks, install_user_memory_pool, installed_swap_handle, installed_swap_hooks,
     kernel_reserve_for, largest_servable_user_bytes, page_fault_frame_reserve_bytes,
     ranges_outside, residency_vm_hooks, resolve_stack_fault, seed_root_entropy, swap_vm_hooks,
-    swapped_token, task_arena_bytes_for, user_heap_stats, user_mapping_kernel_heap_bytes,
-    validate_range,
+    swapped_token, task_arena_bytes_for, user_frame_node, user_heap_stats,
+    user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -201,19 +216,21 @@ pub use network::{
     validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
-    AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
-    DescriptorLimit, DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
+    AudioClaimCap, ClockAuthorityRights, CompileAuthority, ComponentStdioRefusal,
+    ControlProcessorsCap, DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable,
+    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuClaimCap,
+    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap,
     GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
-    LinkTargetDirectoryCap, MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap,
-    NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
-    ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState,
-    ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
-    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
-    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
-    ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
+    LinkTargetDirectoryCap, MachineAuthorityRights, MountAuthorityRights, MountCap, MulticastCap,
+    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap,
+    ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
+    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
+    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
+    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
+    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
+    UnbindableStdio, UnmountCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -224,11 +241,15 @@ pub use profiling::{
 pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostDirLimit, HostFileSystem,
-    HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, Ipv4Address, NetworkErrorDetail,
-    NetworkHandle, NetworkIpAddress, NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind,
-    PingReply, RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError,
-    TcpErrorKind, TcpListener, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram,
-    UdpError, UdpErrorKind,
+    HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite,
+    Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
+    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
+    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadInto,
+    TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+};
+pub use signing_key::{
+    CwasmSigningKey, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,
+    SigningKeyError, settle_signing_key,
 };
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
@@ -237,10 +258,12 @@ pub use surface::{
     SurfaceServiceError, SurfaceShared,
 };
 pub use vfs::{
-    BOOT_DEVICE, FileContents, Follow, HeldPath, HostShare, MAX_MOUNTS, MAX_SYMLINK_DEPTH,
-    MemoryFs, MountError, MountHold, MountRequestError, MountSource, MountTable, MountedFs,
-    Namespace, ROOT_LAYER_DEVICE, Resolved, RootFs, object_identity, request_mount,
-    request_unmount, symlink_target, within_directory,
+    AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow, HeldPath,
+    HostShare, HostShareWrite, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError,
+    MountHold, MountRequestError, MountSource, MountTable, MountedFs, MountedWrite, Namespace,
+    NoDisks, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, Storage,
+    UnsupportedStorage, object_identity, request_mount, request_unmount, symlink_target,
+    within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
@@ -270,7 +293,9 @@ use core::time::Duration;
 
 use arrayvec::ArrayVec;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
+use helios_hal::measured_boot::{MeasuredBoot, NoMeasuredBoot};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::{NodeId, NumaTopology};
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use talc::DefaultBinning;
@@ -841,17 +866,38 @@ const MAX_BOOT_MEMORY_REGIONS: usize = 128;
 /// user pool has already refused once.
 const KERNEL_HEAP_TOP_UP_BACKOFF: usize = 1024;
 
-pub struct Kernel<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone = NoWatchdog> {
+pub struct Kernel<
+    CpuImpl: Cpu + Clone,
+    WatchdogImpl: Watchdog + Clone = NoWatchdog,
+    MeasuredBootImpl: MeasuredBoot = NoMeasuredBoot,
+> {
     cpu: CpuImpl,
     executor: Executor,
     timer: Timer<CpuImpl>,
     watchdog: WatchdogImpl,
+    /// This processor's watchdog pet while it is online and the
+    /// watchdog is enabled; its lifecycle step spawns and cancels it.
+    watchdog_pet: core::cell::RefCell<Option<LocalJoinHandle<()>>>,
+    /// The platform's measured-boot device, on the bootstrap processor
+    /// until bring-up settles the compiler-signing key with it
+    /// ([`Self::take_measured_boot`]); empty on every other processor
+    /// and afterwards. The lock is taken once, by the one bring-up call
+    /// on the bootstrap processor, and no interrupt handler reaches it.
+    measured_boot: spin::Mutex<Option<MeasuredBootImpl>>,
     topology: ProcessorTopology,
     dma_model: DmaModel,
     devices: DeviceInventory,
 }
 
-impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, WatchdogImpl> {
+impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: MeasuredBoot>
+    Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>
+{
+    /// Hands the measured-boot device to the bring-up step that settles
+    /// the compiler-signing key; every later call answers `None`.
+    pub(crate) fn take_measured_boot(&self) -> Option<MeasuredBootImpl> {
+        self.measured_boot.lock().take()
+    }
+
     pub fn spawner(&self) -> Spawner<CpuImpl> {
         self.executor.spawner(self.cpu.clone())
     }
@@ -912,8 +958,10 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         self.timer.sleep_for(duration)
     }
 
-    /// Holds every processor still at a scheduler boundary, from this
-    /// one, until the returned [`FrozenMachine`] is dropped.
+    /// Holds every online processor still at a scheduler boundary, from
+    /// this one, until the returned [`FrozenMachine`] is dropped. An
+    /// offline or online in flight finishes first, and none runs until
+    /// the thaw.
     ///
     /// `arrival_deadline` is how long the caller lets the other
     /// processors take to reach a boundary: its policy for a host that
@@ -945,6 +993,21 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
     }
 
     pub fn run_until_stalled_with_stats(&self) -> KernelRunStats {
+        self.run_until_stalled_with_steps(&())
+    }
+
+    /// [`Self::run_until_stalled_with_stats`] for a run loop whose layer
+    /// owns per-processor state of its own: `steps` goes down first and
+    /// comes up last when this processor goes offline and back
+    /// (`exec::lifecycle`).
+    pub(crate) fn run_until_stalled_with_steps<Steps: exec::ProcessorStep>(
+        &self,
+        steps: &Steps,
+    ) -> KernelRunStats {
+        // Every run loop comes through here between tasks, holding
+        // nothing, which is where a processor asked to go offline tears
+        // itself down and stops.
+        self.service_lifecycle(steps);
         // The page-fault path that commits a fiber stack page takes its
         // frame from this processor's reserve and may not wait on the
         // pool's lock to refill it, so the refill happens here instead:
@@ -986,8 +1049,14 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
     }
 
     pub fn run(&self) -> ! {
+        self.run_with_steps(&())
+    }
+
+    /// [`Self::run`] for a run loop whose layer owns per-processor state
+    /// of its own, as [`Self::run_until_stalled_with_steps`] describes.
+    pub(crate) fn run_with_steps<Steps: exec::ProcessorStep>(&self, steps: &Steps) -> ! {
         loop {
-            if self.run_until_stalled() == 0 {
+            if self.run_until_stalled_with_steps(steps).progress_count() == 0 {
                 self.park_until_work();
             }
         }
@@ -1026,9 +1095,12 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         }
     }
 
-    fn spawn_watchdog_supervisor(&self) {
+    /// Spawns this processor's watchdog pet when the watchdog is
+    /// enabled: a silent local task that pets the watchdog whenever the
+    /// executor records progress, at most once per check interval.
+    fn spawn_watchdog_pet(&self) -> Option<LocalJoinHandle<()>> {
         if !self.watchdog.is_enabled() {
-            return;
+            return None;
         }
 
         let timeout = self.watchdog.timeout();
@@ -1053,10 +1125,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         let cpu = self.cpu.clone();
         let watchdog = self.watchdog.clone();
         let progress_notify = self.spawner().progress_notify();
-        if current_processor() == self.topology.bootstrap_processor {
-            watchdog.arm();
-        }
-        self.spawner().spawn_local_detached_silent(async move {
+        Some(self.spawner().spawn_local_silent(async move {
             let mut last_pet_at = cpu.now();
             loop {
                 progress_notify.notified().await;
@@ -1067,7 +1136,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
                 watchdog.pet();
                 last_pet_at = now;
             }
-        });
+        }))
     }
 
     #[cfg(helios_watchdog_self_test)]
@@ -1079,17 +1148,19 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         let timer = self.timer();
         let processor = current_processor().id();
         let delay = watchdog_self_test_delay();
-        self.spawner().spawn_local_detached_silent(async move {
-            timer.sleep_for(delay).await;
-            tracing::error!(
-                processor,
-                delay_ms = delay.as_millis() as u64,
-                "watchdog self-test hanging processor"
-            );
-            loop {
-                core::hint::spin_loop();
-            }
-        });
+        self.spawner()
+            .spawn_local_silent(async move {
+                timer.sleep_for(delay).await;
+                tracing::error!(
+                    processor,
+                    delay_ms = delay.as_millis() as u64,
+                    "watchdog self-test hanging processor"
+                );
+                loop {
+                    core::hint::spin_loop();
+                }
+            })
+            .detach();
     }
 }
 
@@ -1155,37 +1226,50 @@ impl<CpuImpl: Cpu + Clone> Wake for LocalFutureParker<CpuImpl> {
     }
 }
 
-pub fn init<Console, CpuImpl, Regions>(
-    platform: Platform<Console, CpuImpl, Regions>,
-) -> Kernel<CpuImpl>
+/// Brings the kernel up on the executing processor.
+///
+/// The bootstrap processor must have called
+/// [`prime_bootstrap_allocator`] first: memory enters the kernel through
+/// that one call, not through the platform.
+pub fn init<Console, CpuImpl, MeasuredBootImpl>(
+    platform: Platform<Console, CpuImpl, NoWatchdog, MeasuredBootImpl>,
+) -> Kernel<CpuImpl, NoWatchdog, MeasuredBootImpl>
 where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu + Clone,
-    Regions: IntoIterator<Item = MemoryRegion>,
+    MeasuredBootImpl: MeasuredBoot,
 {
     init_with_watchdog(platform)
 }
 
-pub fn init_with_watchdog<Console, CpuImpl, Regions, WatchdogImpl>(
-    platform: Platform<Console, CpuImpl, Regions, WatchdogImpl>,
-) -> Kernel<CpuImpl, WatchdogImpl>
+pub fn init_with_watchdog<Console, CpuImpl, WatchdogImpl, MeasuredBootImpl>(
+    platform: Platform<Console, CpuImpl, WatchdogImpl, MeasuredBootImpl>,
+) -> Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>
 where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu + Clone,
-    Regions: IntoIterator<Item = MemoryRegion>,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let Platform {
         console,
         cpu,
-        memory_regions,
         watchdog,
         topology,
         timer_frequency_hz,
         dma_model,
         devices,
+        measured_boot,
     } = platform;
     let current_processor = current_processor();
+    // The device is settled once, by the bootstrap processor's bring-up;
+    // a secondary that was handed one would hold a handle nothing uses.
+    assert!(
+        measured_boot.is_none() || current_processor == topology.bootstrap_processor,
+        "processor {} was handed a measured-boot device; only the bootstrap processor {} owns it",
+        current_processor.id(),
+        topology.bootstrap_processor.id()
+    );
     assert!(
         cpu.bootstrap_processor() == topology.bootstrap_processor,
         "platform topology bootstrap processor {} does not match CPU bootstrap processor {}",
@@ -1207,10 +1291,23 @@ where
 
     if current_processor == topology.bootstrap_processor {
         match BOOT_STATE.load(Ordering::Acquire) {
-            BOOT_UNINITIALIZED => {
-                bootstrap_init(console, memory_regions, &cpu, topology, dma_model, devices)
+            BOOT_INITIALIZING => {
+                assert!(
+                    memory::locality().processor_count() == topology.configured_processors,
+                    "NUMA description names {} processors but the platform topology has {}",
+                    memory::locality().processor_count(),
+                    topology.configured_processors
+                );
+                let primed_by = memory::user_memory_pool().bootstrap_processor();
+                assert!(
+                    primed_by == topology.bootstrap_processor,
+                    "the user pool was primed for bootstrap processor {} but the platform \
+                     topology names {}",
+                    primed_by.id(),
+                    topology.bootstrap_processor.id()
+                );
+                finish_bootstrap(console, &cpu, topology, dma_model, devices)
             }
-            BOOT_INITIALIZING => finish_bootstrap(console, &cpu, topology, dma_model, devices),
             state => panic!("bootstrap processor observed invalid boot state {state}"),
         }
     } else {
@@ -1222,12 +1319,26 @@ where
     } else {
         ProgressCounter::new()
     };
-    let executor = Executor::new(progress, topology.configured_processors, current_processor);
+    // The bootstrap processor asserted above that the locality names
+    // `topology.configured_processors`; secondaries start only after.
+    let executor = Executor::new(progress, memory::user_memory_pool(), current_processor);
+    if current_processor == topology.bootstrap_processor {
+        // Logged here and not with the memory policy: the task arenas,
+        // which are nearly all of it, exist only once the executor does.
+        // The tables built after this point (fiber-stack counters,
+        // network shards) are cache lines per processor.
+        tracing::info!(
+            "Per-processor memory per_processor_bytes={}",
+            memory::user_memory_pool().per_processor_bytes()
+        );
+    }
     let kernel = Kernel {
-        timer: executor.timer(cpu.clone()),
+        timer: executor.timer_handle(cpu.clone()),
         cpu,
         executor,
         watchdog,
+        watchdog_pet: core::cell::RefCell::new(None),
+        measured_boot: spin::Mutex::new(measured_boot),
         topology,
         dma_model,
         devices,
@@ -1238,11 +1349,23 @@ where
         "watchdog self-test requires an enabled hardware watchdog"
     );
 
+    if kernel.watchdog.is_enabled() && current_processor == topology.bootstrap_processor {
+        kernel.watchdog.arm();
+    }
+    kernel.bring_up();
     let processor_id = current_processor.id();
+    if current_processor == topology.bootstrap_processor {
+        // The possible set, of which the `Processor online` lines name
+        // the members that came up: a platform can list processors that
+        // are not present until a hot-add starts them.
+        let possible = topology.configured_processors;
+        kernel.spawn_detached(async move {
+            tracing::info!("Processor topology possible={possible}");
+        });
+    }
     kernel.spawn_detached(async move {
         tracing::info!("Processor online processor={processor_id}");
     });
-    kernel.spawn_watchdog_supervisor();
     #[cfg(helios_watchdog_self_test)]
     kernel.spawn_watchdog_self_test();
 
@@ -1258,19 +1381,35 @@ where
 /// that into the kernel's boot share and its reserve, and the second
 /// pass hands the regions out. See [`memory::policy`] for the policy
 /// itself and the evidence behind it.
-fn init_allocator<Regions>(
+///
+/// The second pass hands out the bootstrap processor's node first, so
+/// the kernel heap's boot share, which comes off the front, is local to
+/// the processor that runs the boot. Each node's user share then seeds
+/// that node's own buddy pool.
+fn init_allocator<Regions, Numa>(
     memory_regions: Regions,
-    processor_count: usize,
+    numa: &Numa,
+    bootstrap: ProcessorId,
 ) -> &'static memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
+    Numa: NumaTopology,
 {
-    let mut regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
-    for mut region in memory_regions {
-        let region = unsafe { region.as_mut() };
-        let start = region.as_mut_ptr() as usize;
+    let processor_count = numa.processor_count();
+    assert!(
+        usize::from(bootstrap.id()) < processor_count,
+        "bootstrap processor {} is outside the NUMA description's {processor_count} processors",
+        bootstrap.id()
+    );
+    let bootstrap_node = numa.processor_node(bootstrap);
+    let mut regions: ArrayVec<memory::NodeRun, MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
+    for region in memory_regions {
         regions
-            .try_push((start, start + region.len()))
+            .try_push(memory::NodeRun {
+                start: region.start(),
+                end: region.end(),
+                node: region.node(),
+            })
             .unwrap_or_else(|_| {
                 panic!(
                     "boot memory map described more than {MAX_BOOT_MEMORY_REGIONS} usable regions"
@@ -1280,42 +1419,36 @@ where
 
     let usable_bytes = regions
         .iter()
-        .map(|(start, end)| end.saturating_sub(*start))
+        .map(|region| region.end.saturating_sub(region.start))
         .sum();
     let plan = memory::BootMemoryPlan::for_usable_bytes(usable_bytes);
     ALLOCATOR.install_plan(plan);
     let mut splitter = plan.splitter();
 
-    let mut user_pool = None;
-    let mut user_regions: ArrayVec<(usize, usize), MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
-    for (start, end) in regions {
-        let shares = splitter.split(start, end);
+    // No heap exists yet, so the order is two walks rather than a sort.
+    let bootstrap_first = regions
+        .iter()
+        .filter(|region| region.node == bootstrap_node)
+        .chain(
+            regions
+                .iter()
+                .filter(|region| region.node != bootstrap_node),
+        );
+    let mut user_runs: ArrayVec<memory::NodeRun, MAX_BOOT_MEMORY_REGIONS> = ArrayVec::new();
+    for region in bootstrap_first {
+        let shares = splitter.split(region.start, region.end);
         if let Some(kernel) = shares.kernel {
             unsafe {
                 ALLOCATOR.add_to_heap(kernel.start, kernel.end);
             }
         }
-        // The pool is installed as soon as the kernel heap can allocate
-        // it, and before the first user region is added: every later
-        // region, and every byte the kernel heap later borrows back,
-        // goes through it.
-        let Some(user) = shares.user else {
-            continue;
-        };
-        user_pool.get_or_insert_with(|| {
-            let pool = memory::install_user_memory_pool(memory::allocate_user_memory_pool());
-            pool.configure_processors(processor_count);
-            // The swap policy asks which instance a committed page
-            // belongs to, and the answer is per-processor; size that
-            // table with the pool it describes.
-            memory::configure_user_memory_owner_processors(processor_count);
-            // And the frames the page-fault path is allowed to take,
-            // which come out of this same pool and are held per
-            // processor because a fault may not wait on its lock.
-            memory::configure_frame_reserve_processors(processor_count);
-            pool
-        });
-        user_regions.push((user.start, user.end));
+        if let Some(user) = shares.user {
+            user_runs.push(memory::NodeRun {
+                start: user.start,
+                end: user.end,
+                node: region.node,
+            });
+        }
     }
 
     assert_eq!(
@@ -1324,18 +1457,43 @@ where
         "the boot memory map is smaller than the kernel heap's boot share of {} bytes",
         plan.kernel_boot_bytes
     );
+    assert!(
+        !user_runs.is_empty(),
+        "bootstrap did not provide memory for user pool"
+    );
+    // The kernel heap now exists, which is what the pool's per-node and
+    // per-processor tables are allocated from. Until the pool is
+    // installed below the heap grows out of nothing but its boot share.
     let pool =
-        user_pool.unwrap_or_else(|| panic!("bootstrap did not provide memory for user pool"));
-    pool.initialize(&user_regions);
+        memory::install_user_memory_pool(memory::UserMemoryPool::new(numa, bootstrap, &user_runs));
+    // The swap policy asks which instance a committed page belongs to,
+    // and the answer is per-processor; build that table out of the pool
+    // it describes.
+    memory::configure_user_memory_owner_processors(pool);
+    // And the frames the page-fault path is allowed to take, which come
+    // out of this same pool and are held per processor because a fault
+    // may not wait on its lock.
+    memory::configure_frame_reserve(pool);
     pool
 }
 
-pub fn prime_bootstrap_allocator<Regions>(
+/// Hands the kernel the machine's usable memory and its locality, on the
+/// bootstrap processor before anything else runs.
+///
+/// This is the one way memory enters the kernel. `numa` is read here,
+/// once, and the kernel keeps its own copy of the answers. `bootstrap`
+/// is the processor making this call: the backend names it because
+/// [`helios_hal::cpu::current_processor`] is published only once the
+/// backend's processor runtime exists, which is after the heap this call
+/// creates. `init` checks it against the platform topology.
+pub fn prime_bootstrap_allocator<Regions, Numa>(
     memory_regions: Regions,
-    processor_count: usize,
+    numa: &Numa,
+    bootstrap: ProcessorId,
 ) -> &'static memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
+    Numa: NumaTopology,
 {
     match BOOT_STATE.compare_exchange(
         BOOT_UNINITIALIZED,
@@ -1343,25 +1501,9 @@ where
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
-        Ok(_) => init_allocator(memory_regions, processor_count),
+        Ok(_) => init_allocator(memory_regions, numa, bootstrap),
         Err(state) => panic!("bootstrap allocator observed invalid boot state {state}"),
     }
-}
-
-fn bootstrap_init<Console, CpuImpl, Regions>(
-    console: Console,
-    memory_regions: Regions,
-    cpu: &CpuImpl,
-    topology: ProcessorTopology,
-    dma_model: DmaModel,
-    devices: DeviceInventory,
-) where
-    Console: core::fmt::Write + Send + 'static,
-    CpuImpl: Cpu,
-    Regions: IntoIterator<Item = MemoryRegion>,
-{
-    prime_bootstrap_allocator(memory_regions, topology.configured_processors);
-    finish_bootstrap(console, cpu, topology, dma_model, devices);
 }
 
 fn finish_bootstrap<Console, CpuImpl>(
@@ -1384,6 +1526,21 @@ fn finish_bootstrap<Console, CpuImpl>(
         topology.configured_processors,
         topology.startup_policy
     );
+    let locality = memory::locality();
+    tracing::info!(
+        "NUMA topology nodes={} distances={}",
+        locality.node_count(),
+        locality.distances_display()
+    );
+    for node in 0..locality.node_count() {
+        let node = NodeId::new(node);
+        tracing::info!(
+            "NUMA node node={} memory_bytes={} processors={}",
+            node.index(),
+            locality.memory_bytes(node),
+            locality.processors_display(node)
+        );
+    }
     let user_heap = memory::user_heap_stats();
     let machine = machine_memory();
     tracing::info!(
