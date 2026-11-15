@@ -2180,6 +2180,7 @@ dependencies = [
  "zerocopy",
  "zrip-core",
  "zrip-decode",
+ "zrip-encode",
 ]
 
 [[package]]

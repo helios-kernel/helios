@@ -7,6 +7,9 @@
 //! fewer leaves the rest zero, which is how the kernel reads the tail of a
 //! file's last compressed extent.
 
+#[cfg(feature = "write")]
+pub(crate) mod write;
+
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;

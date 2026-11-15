@@ -17,6 +17,12 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[cfg(feature = "write")]
+    #[error(transparent)]
+    Encode(#[from] crate::compress::write::EncodeError),
+    #[error("compressed writes require data checksums")]
+    CompressionWithoutChecksums,
+
     #[error(
         "directory entry name must be 1..=255 bytes and contain no slash, NUL, dot or dot-dot component"
     )]

@@ -2,7 +2,7 @@
 //! mounted generation's reader pins; this module never reuses retired extents.
 
 mod extents;
-mod file;
+pub(crate) mod file;
 pub(crate) mod namespace;
 
 use core::num::NonZeroUsize;

@@ -9,6 +9,7 @@ use super::Transaction;
 use super::namespace::time;
 use crate::accounting::DataWrite;
 use crate::allocation::data::DataReference;
+use crate::compress::write::{Encoder, Plain};
 use crate::items::{FileExtent, INODE_NODATASUM, Metadata};
 use crate::ondisk::{
     MAX_COMPRESSED_EXTENT, RawFileExtentBody, RawFileExtentHead, RawHeader, RawInodeItem, RawItem,
@@ -16,20 +17,51 @@ use crate::ondisk::{
 };
 use crate::source::BlockSink;
 use crate::tree::write::WriteError;
-use crate::{Error, FileKind, Key, Timestamp};
+use crate::{Compression, Error, FileKind, Key, Timestamp};
 
 const HEAD_BYTES: usize = size_of::<RawFileExtentHead>();
 const REGULAR_BYTES: usize = HEAD_BYTES + size_of::<RawFileExtentBody>();
 
-fn regular(generation: u64, address: u64, length: u64) -> [u8; REGULAR_BYTES] {
+pub(crate) struct WriteOptions<E> {
+    pub(crate) when: Timestamp,
+    pub(crate) concurrency: NonZeroUsize,
+    pub(crate) encoder: E,
+}
+
+impl WriteOptions<Plain> {
+    pub(crate) fn plain(when: Timestamp, concurrency: NonZeroUsize) -> Self {
+        Self {
+            when,
+            concurrency,
+            encoder: Plain,
+        }
+    }
+}
+
+fn compression_code(algorithm: Option<Compression>) -> u8 {
+    match algorithm {
+        None => 0,
+        Some(Compression::Zlib) => 1,
+        Some(Compression::Lzo) => 2,
+        Some(Compression::Zstd) => 3,
+    }
+}
+
+fn regular(
+    generation: u64,
+    address: u64,
+    disk_length: u64,
+    length: u64,
+    algorithm: Option<Compression>,
+) -> [u8; REGULAR_BYTES] {
     let mut head = RawFileExtentHead::new_zeroed();
     head.generation.set(generation);
     head.ram_bytes.set(length);
+    head.compression = compression_code(algorithm);
     head.extent_type = 1; // BTRFS_FILE_EXTENT_REG.
     let mut body = RawFileExtentBody::new_zeroed();
     body.disk_bytenr.set(address);
-    body.disk_num_bytes
-        .set(if address == 0 { 0 } else { length });
+    body.disk_num_bytes.set(disk_length);
     body.num_bytes.set(length);
     let mut bytes = [0; REGULAR_BYTES];
     bytes[..HEAD_BYTES].copy_from_slice(head.as_bytes());
@@ -46,17 +78,19 @@ fn aligned_end(end: u64, sector: u64) -> Result<u64, WriteError> {
 }
 
 impl<S: BlockSink> Transaction<'_, S> {
-    pub(crate) async fn write_file(
+    pub(crate) async fn write_file<E: Encoder>(
         &mut self,
         tree: u64,
         inode: u64,
         offset: u64,
         data: &[u8],
-        when: Timestamp,
-        concurrency: NonZeroUsize,
+        mut options: WriteOptions<E>,
     ) -> Result<usize, WriteError> {
         let (mut raw, metadata) = self.file_inode(tree, inode).await?;
-        let when = time(tree, inode, when)?;
+        let when = time(tree, inode, options.when)?;
+        if metadata.flags & INODE_NODATASUM != 0 && E::ALGORITHM.is_some() {
+            return Err(WriteError::CompressionWithoutChecksums);
+        }
         let root = self.roots.get(tree)?;
         if data.is_empty() {
             return Ok(0);
@@ -93,6 +127,16 @@ impl<S: BlockSink> Transaction<'_, S> {
             let mut head = RawFileExtentHead::new_zeroed();
             head.generation.set(self.trees.generation());
             head.ram_bytes.set(size);
+            if let Some(encoded) = options
+                .encoder
+                .encode(&payload[HEAD_BYTES..], sector as usize)?
+                && encoded.bytes.len() < size as usize
+            {
+                head.compression = compression_code(Some(encoded.algorithm));
+                self.image.enable_compression(encoded.algorithm);
+                payload.truncate(HEAD_BYTES);
+                payload.extend_from_slice(encoded.bytes);
+            }
             payload[..HEAD_BYTES].copy_from_slice(head.as_bytes());
             let root = self
                 .trees
@@ -135,7 +179,7 @@ impl<S: BlockSink> Transaction<'_, S> {
                         .ok_or(WriteError::FileOverflow)?,
                 );
                 if !preserved.is_empty() {
-                    self.replace_chunk(tree, inode, 0, &preserved, &mut raw, concurrency)
+                    self.replace_chunk(tree, inode, 0, &preserved, &mut raw, &mut options)
                         .await?;
                 }
             }
@@ -148,7 +192,7 @@ impl<S: BlockSink> Transaction<'_, S> {
                 let tail = metadata.size - metadata.size % sector;
                 let mut preserved = vec![0; sector as usize];
                 self.read_file(tree, inode, tail, &mut preserved).await?;
-                self.replace_chunk(tree, inode, tail, &preserved, &mut raw, concurrency)
+                self.replace_chunk(tree, inode, tail, &preserved, &mut raw, &mut options)
                     .await?;
             }
             let mut position = start;
@@ -160,7 +204,7 @@ impl<S: BlockSink> Transaction<'_, S> {
                 let to = end.min(position + length);
                 window[(from - position) as usize..(to - position) as usize]
                     .copy_from_slice(&data[(from - offset) as usize..(to - offset) as usize]);
-                self.replace_chunk(tree, inode, position, &window, &mut raw, concurrency)
+                self.replace_chunk(tree, inode, position, &window, &mut raw, &mut options)
                     .await?;
                 position += length;
             }
@@ -185,6 +229,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         concurrency: NonZeroUsize,
     ) -> Result<(), WriteError> {
         let (mut raw, metadata) = self.file_inode(tree, inode).await?;
+        let mut options = WriteOptions::plain(when, concurrency);
         let when = time(tree, inode, when)?;
         let sector = u64::from(self.volume.superblock().sectorsize());
         let end = aligned_end(size, sector)?;
@@ -241,7 +286,7 @@ impl<S: BlockSink> Transaction<'_, S> {
                 );
             } else if !payload.is_empty() {
                 payload.resize(aligned_end(retained, sector)? as usize, 0);
-                self.replace_chunk(tree, inode, 0, &payload, &mut raw, concurrency)
+                self.replace_chunk(tree, inode, 0, &payload, &mut raw, &mut options)
                     .await?;
             }
         } else if size != metadata.size && size.min(metadata.size) % sector != 0 {
@@ -272,7 +317,7 @@ impl<S: BlockSink> Transaction<'_, S> {
                         &mut payload[..(boundary - start) as usize],
                     )
                     .await?;
-                    self.replace_chunk(tree, inode, start, &payload, &mut raw, concurrency)
+                    self.replace_chunk(tree, inode, start, &payload, &mut raw, &mut options)
                         .await?;
                 }
             }
@@ -349,16 +394,30 @@ impl<S: BlockSink> Transaction<'_, S> {
         Ok(())
     }
 
-    async fn replace_chunk(
+    async fn replace_chunk<E: Encoder>(
         &mut self,
         tree: u64,
         inode: u64,
         offset: u64,
         bytes: &[u8],
         raw: &mut RawInodeItem,
-        concurrency: NonZeroUsize,
+        options: &mut WriteOptions<E>,
     ) -> Result<(), WriteError> {
         let length = bytes.len() as u64;
+        let sector = u64::from(self.volume.superblock().sectorsize());
+        let encoded = options.encoder.encode(bytes, sector as usize)?;
+        let (stored, algorithm) = if let Some(encoded) = encoded
+            && aligned_end(encoded.bytes.len() as u64, sector)? < length
+        {
+            encoded
+                .bytes
+                .resize(aligned_end(encoded.bytes.len() as u64, sector)? as usize, 0);
+            self.image.enable_compression(encoded.algorithm);
+            (encoded.bytes.as_slice(), Some(encoded.algorithm))
+        } else {
+            (bytes, None)
+        };
+
         let removed = self
             .remove_regular_range(tree, inode, offset..offset + length)
             .await?;
@@ -369,7 +428,7 @@ impl<S: BlockSink> Transaction<'_, S> {
                 &mut self.trees,
                 &mut self.space,
                 DataWrite {
-                    bytes,
+                    bytes: stored,
                     reference: DataReference {
                         root: tree,
                         inode,
@@ -377,7 +436,7 @@ impl<S: BlockSink> Transaction<'_, S> {
                     },
                     checksummed: raw.flags.get() & INODE_NODATASUM == 0,
                 },
-                concurrency,
+                options.concurrency,
             )
             .await?;
         let root = self.roots.get(tree)?;
@@ -390,7 +449,9 @@ impl<S: BlockSink> Transaction<'_, S> {
                 Some(&regular(
                     self.trees.generation(),
                     allocation.objectid,
+                    allocation.offset,
                     length,
+                    algorithm,
                 )),
                 &mut self.space,
             )
@@ -484,7 +545,13 @@ impl<S: BlockSink> Transaction<'_, S> {
                     &self.volume,
                     root,
                     key,
-                    Some(&regular(self.trees.generation(), 0, end - position)),
+                    Some(&regular(
+                        self.trees.generation(),
+                        0,
+                        0,
+                        end - position,
+                        None,
+                    )),
                     &mut self.space,
                 )
                 .await?;

@@ -4,10 +4,10 @@
 use alloc::boxed::Box;
 use zerocopy::{FromZeros, IntoBytes};
 
-use crate::ChecksumType;
 use crate::ondisk::{RawRootBackup, RawSuperblock, SUPERBLOCK_BYTES, objectid, view};
 use crate::roots::Roots;
 use crate::tree::write::WriteError;
+use crate::{ChecksumType, Compression};
 
 pub(crate) struct CommitImage {
     pub(crate) bytes: Box<[u8; SUPERBLOCK_BYTES]>,
@@ -23,6 +23,17 @@ impl CommitImage {
             self.at(primary, algorithm),
             primary,
         )?)
+    }
+
+    pub(crate) fn enable_compression(&mut self, algorithm: Compression) {
+        let flag = match algorithm {
+            Compression::Zlib => 0,
+            Compression::Lzo => 1 << 3, // BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO.
+            Compression::Zstd => 1 << 4, // BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD.
+        };
+        let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
+        raw.incompat_flags.set(raw.incompat_flags.get() | flag);
+        self.bytes[..size_of::<RawSuperblock>()].copy_from_slice(raw.as_bytes());
     }
 
     pub(crate) fn prepare(&mut self, roots: &Roots, used: u64) -> Result<(), WriteError> {

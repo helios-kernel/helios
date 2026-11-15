@@ -7,7 +7,7 @@ edition.workspace = true
 cargo-fuzz = true
 
 [features]
-write = ["dep:futures"]
+write = ["dep:futures", "dep:zrip-encode", "lzokay/compress", "lzokay/alloc"]
 test-support = []
 fuzzing = ["test-support", "dep:libfuzzer-sys"]
 
@@ -28,6 +28,8 @@ zerocopy = { version = "0.8.57", default-features = false, features = ["derive"]
 # probe the processor at run time, which the kernel does through its `Cpu`.
 zrip-core = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
 zrip-decode = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
+
+zrip-encode = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }

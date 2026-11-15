@@ -1,6 +1,8 @@
 extern crate std;
 
 use alloc::collections::BTreeMap;
+#[cfg(feature = "write")]
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use std::fs::File;
@@ -14,6 +16,8 @@ use helios_hal::io::{IoError, IoResult};
 
 use super::Filesystem;
 use crate::source::BlockSource;
+#[cfg(feature = "write")]
+use crate::transaction::file::WriteOptions;
 use crate::tree::edit::{Header, Leaf};
 use crate::tree::write::{MetadataAllocator, Trees, WriteError};
 use crate::tree::{Expected, Node, TreeRoot};
@@ -300,11 +304,23 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
         .unwrap();
     let content = vec![0x37; 12307];
     edits
-        .write_file(tree, file, 0, &content, when, concurrency)
+        .write_file(
+            tree,
+            file,
+            0,
+            &content,
+            WriteOptions::plain(when, concurrency),
+        )
         .await
         .unwrap();
     edits
-        .write_file(tree, target, 0, b"replaced", when, concurrency)
+        .write_file(
+            tree,
+            target,
+            0,
+            b"replaced",
+            WriteOptions::plain(when, concurrency),
+        )
         .await
         .unwrap();
     edits
@@ -462,7 +478,13 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
         .unwrap();
     let content: Vec<_> = (0..12307).map(|index| (index % 251) as u8).collect();
     edits
-        .write_file(tree, inode, 0, &content, when, concurrency)
+        .write_file(
+            tree,
+            inode,
+            0,
+            &content,
+            WriteOptions::plain(when, concurrency),
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -670,7 +692,11 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
 #[test]
 fn file_writes_preserve_partial_sectors_and_transaction_visibility() {
     for no_holes in [true, false] {
-        block_on(exercise_file_writes(no_holes, |_| {}));
+        block_on(exercise_file_writes(
+            no_holes,
+            crate::compress::write::Plain,
+            |_, _| {},
+        ));
     }
 }
 
@@ -679,12 +705,71 @@ fn file_writes_preserve_partial_sectors_and_transaction_visibility() {
 #[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
 fn file_writes_pass_btrfs_check() {
     for no_holes in [true, false] {
-        block_on(exercise_file_writes(no_holes, assert_btrfs_check));
+        block_on(exercise_file_writes(
+            no_holes,
+            crate::compress::write::Plain,
+            assert_file_image,
+        ));
     }
 }
 
 #[cfg(feature = "write")]
-async fn exercise_file_writes(no_holes: bool, mut verify: impl FnMut(&std::path::Path)) {
+#[test]
+fn compressed_file_writes_preserve_overwrites_and_truncation() {
+    block_on(exercise_compressed_writes(|_, _| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn compressed_file_writes_pass_btrfs_check_and_restore() {
+    block_on(exercise_compressed_writes(assert_file_image));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_compressed_writes(mut verify: impl FnMut(&std::path::Path, &[u8])) {
+    use crate::compress::write::{Lzo, Zlib, Zstd};
+    use miniz_oxide::deflate::CompressionLevel;
+    for no_holes in [true, false] {
+        exercise_file_writes(
+            no_holes,
+            Zlib::new(CompressionLevel::DefaultLevel),
+            &mut verify,
+        )
+        .await;
+        exercise_file_writes(no_holes, Lzo::new(), &mut verify).await;
+        exercise_file_writes(no_holes, Zstd::new(3).unwrap(), &mut verify).await;
+    }
+}
+
+#[cfg(feature = "write")]
+fn assert_file_image(path: &std::path::Path, expected: &[u8]) {
+    assert_btrfs_check(path);
+    let directory = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new("btrfs")
+        .arg("restore")
+        .arg(path)
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "btrfs restore failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("data.bin")).unwrap(),
+        expected
+    );
+}
+
+#[cfg(feature = "write")]
+async fn exercise_file_writes<E: crate::compress::write::Encoder>(
+    no_holes: bool,
+    mut encoder: E,
+    mut verify: impl FnMut(&std::path::Path, &[u8]),
+) {
     use super::writer::Writer;
     let timestamp = Timestamp::from_secs(1_700_000_000);
     let named = tempfile::NamedTempFile::new().unwrap();
@@ -707,7 +792,7 @@ async fn exercise_file_writes(no_holes: bool, mut verify: impl FnMut(&std::path:
         named.reopen().unwrap(),
         options,
     ));
-    verify(named.path());
+    verify(named.path(), &[]);
     let mut writer = Writer::mount(Disk(named.reopen().unwrap())).await.unwrap();
     let initial = writer.snapshot().unwrap();
     let initial_inode = initial.resolve(b"/data.bin").await.unwrap();
@@ -717,6 +802,16 @@ async fn exercise_file_writes(no_holes: bool, mut verify: impl FnMut(&std::path:
         seconds: 1_700_000_100,
         nanoseconds: 123,
     };
+    // Hash successive counters into a deterministic, high-entropy full extent.
+    // Unlike the repeated-byte windows this should not save a disk sector.
+    let incompressible: Vec<u8> = (0..crate::ondisk::MAX_COMPRESSED_EXTENT / 8)
+        .flat_map(|index| {
+            use core::hash::Hasher;
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            hash.write_u64(index);
+            hash.finish().to_le_bytes()
+        })
+        .collect();
     for round in 0..2 {
         let previous = writer.snapshot().unwrap();
         let inode = previous.resolve(b"/data.bin").await.unwrap();
@@ -735,6 +830,7 @@ async fn exercise_file_writes(no_holes: bool, mut verify: impl FnMut(&std::path:
             (8190, vec![0x55; 12307]),
             (150003 + round * 10000, vec![0xa7; 31]),
             (0, vec![0x71; 13]),
+            (262144, incompressible.clone()),
         ] {
             let edits = transaction.edits();
             assert_eq!(
@@ -744,8 +840,11 @@ async fn exercise_file_writes(no_holes: bool, mut verify: impl FnMut(&std::path:
                         inode.number(),
                         offset as u64,
                         &bytes,
-                        when,
-                        concurrency
+                        WriteOptions {
+                            when,
+                            concurrency,
+                            encoder: &mut encoder
+                        }
                     )
                     .await
                     .unwrap(),
@@ -767,9 +866,59 @@ async fn exercise_file_writes(no_holes: bool, mut verify: impl FnMut(&std::path:
             .commit(|| panic!("valid fixture UUID"), concurrency)
             .await
             .unwrap();
-        verify(named.path());
+        verify(named.path(), &expected);
         let current = writer.snapshot().unwrap();
         let current_inode = current.resolve(b"/data.bin").await.unwrap();
+        if let Some(algorithm) = E::ALGORITHM {
+            let mut cursor = crate::tree::Cursor::ceiling(
+                &current.volume,
+                current_inode.root,
+                Key::new(
+                    current_inode.number(),
+                    crate::ondisk::item_type::EXTENT_DATA,
+                    0,
+                ),
+            )
+            .await
+            .unwrap();
+            let mut compressed = false;
+            while let Some(key) = cursor.key() {
+                if !key.is(
+                    current_inode.number(),
+                    crate::ondisk::item_type::EXTENT_DATA,
+                ) {
+                    break;
+                }
+                let extent = crate::items::FileExtent::parse(
+                    key,
+                    cursor.item().unwrap(),
+                    current.superblock().sectorsize(),
+                )
+                .unwrap();
+                if key.offset == 262144 {
+                    assert!(matches!(
+                        extent.data,
+                        crate::items::ExtentData::Regular {
+                            compression: None,
+                            ..
+                        }
+                    ));
+                }
+                compressed |= matches!(extent.data, crate::items::ExtentData::Regular { compression: Some(value), .. } if value == algorithm);
+                cursor.advance(&current.volume).await.unwrap();
+            }
+            assert!(
+                compressed,
+                "the repetitive file should have compressed extents"
+            );
+            let bit = match algorithm {
+                crate::Compression::Zlib => 0,
+                crate::Compression::Lzo => 1 << 3,
+                crate::Compression::Zstd => 1 << 4,
+            };
+            assert_eq!(current.superblock().incompat_flags() & bit, bit);
+        }
+
         assert_eq!(current_inode.metadata().mtime, when);
         let mut output = vec![0; expected.len()];
         assert_eq!(
@@ -815,7 +964,7 @@ async fn exercise_file_writes(no_holes: bool, mut verify: impl FnMut(&std::path:
             .commit(|| panic!("valid fixture UUID"), concurrency)
             .await
             .unwrap();
-        verify(named.path());
+        verify(named.path(), &expected);
         let current = writer.snapshot().unwrap();
         let current_inode = current.resolve(b"/data.bin").await.unwrap();
         output.fill(0xff);
