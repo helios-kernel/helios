@@ -18,5 +18,8 @@ name = "helios_gpu_test"
 path = "src/main.rs"
 crate-type = ["cdylib"]
 
+[build-dependencies]
+naga = { version = "30.0.2", default-features = false, features = ["wgsl-in", "spv-out"] }
+
 [lints]
 workspace = true

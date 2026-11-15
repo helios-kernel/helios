@@ -11,6 +11,8 @@ use helios_venus::protocol as vk;
 use helios_venus::ring::Layout;
 use helios_venus::transport::MappedBlob;
 
+mod compute;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -32,6 +34,12 @@ pub enum Error {
         offset: usize,
         expected: u8,
         found: u8,
+    },
+    #[error("compute output {index} was {found}, expected {expected}")]
+    ComputeReadback {
+        index: u32,
+        expected: u32,
+        found: u32,
     },
 }
 
@@ -203,6 +211,7 @@ pub fn run() -> Result<(), Error> {
         vk::vn_call_vkGetDeviceQueue2(&mut connection, device, &get_queue, &mut queue)?;
     }
     memory(&mut connection, physical, device)?;
+    compute::run(&mut connection, physical, device, queue, family)?;
     connection.wait_queue(1)?;
     // SAFETY: no device work or child allocations remain. The final close
     // waits for both destruction commands before any handle storage is freed.
