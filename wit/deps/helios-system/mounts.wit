@@ -19,6 +19,8 @@ interface mounts {
     /// The EROFS image on the disk that reported this serial. Always
     /// read-only.
     disk(string),
+    /// The btrfs image on the disk that reported this serial. Always read-only.
+    btrfs(string),
   }
 
   record mount-request {
