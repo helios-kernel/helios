@@ -73,6 +73,10 @@ No significant regression or improvement: no row has both disjoint confidence in
 {% endif %}
 {% endmacro %}
 ### Benchmark gate — lane `{{ lane }}`
+{% if not report.results and not report.cross_run_refused %}
+
+**Revision comparison not evaluated.** This standalone run has neither a paired Helios image nor a prior revision baseline. Its Linux/Wasmtime parity comparisons remain in the benchmark tables; no revision regression or improvement verdict is available.
+{% else %}
 {% if report.paired %}
 {{ table(report.paired) }}
 {% else %}
@@ -89,4 +93,5 @@ Refused: {{ report.cross_run_refused.reason }}. This comparison neither blocks n
 {% else %}
 
 No `dev` report exists for this lane yet, so there is no cross-run table.
+{% endif %}
 {% endif %}
