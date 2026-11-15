@@ -426,9 +426,9 @@ does.
 ## 7. Checks and CI
 
 Before a change is complete, run the recipes for every surface it can
-affect. `just check-target` and `just test-units` run `helios-cli
-kernel-prebuild` themselves and export the trusted-root public key file it
-writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY`, the only prebuild output the
+affect. Compile and lint recipes run `helios-cli kernel-keys`; tests that
+read a boot payload run `helios-cli kernel-prebuild`. They export the
+trusted-root public key file as `HELIOS_KERNEL_ROOT_PUBLIC_KEY`, the only prebuild output the
 kernel build tracks; a recipe that compiles the kernel's tests also exports
 `HELIOS_KERNEL_ROOT_SECRET_KEY`, which only a test build reads and no
 kernel image is given (the inspector's image build searches every image
@@ -484,8 +484,10 @@ and the lane is the heaviest job there is. A failed nightly run files a
 
 A pull request runs only the lanes whose surfaces its change touches
 (`.github/ci-lanes.json`), and a draft runs `lint-fmt` alone until it is
-marked ready for review. Only the host lanes keep a Rust cache, and only
-a `dev` push writes it.
+marked ready for review. Compile, lint and test lanes keep a Rust cache,
+written only by a `dev` push. Other shared caches are written only from
+the default branch. Guest wasm is built once per profile and reused by
+every test and smoke lane that runs a kernel prebuild.
 
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI

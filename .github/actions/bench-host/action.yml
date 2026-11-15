@@ -77,7 +77,7 @@ runs:
     - uses: taiki-e/install-action@v2
       with:
         tool: wasm-tools,cargo-zigbuild
-    - uses: mlugg/setup-zig@v2
+    - uses: ./helios/.github/actions/setup-zig
       with:
         version: 0.13.0
     - name: Stage Limine bootloader share
@@ -96,7 +96,7 @@ runs:
         make -C "$GITHUB_WORKSPACE/limine"
     - name: Restore WASI tooling artifacts
       id: artifact-cache
-      uses: actions/cache@v4
+      uses: ./helios/.github/actions/shared-cache
       with:
         path: |
           ${{ inputs.checkout-path }}/artifacts/wasi-tools
@@ -110,7 +110,7 @@ runs:
       run: tools/wasi-apps/build.sh
     - name: Restore pinned Fedora VM assets
       if: inputs.guest-arch != ''
-      uses: actions/cache@v4
+      uses: ./helios/.github/actions/shared-cache
       with:
         path: |
           ${{ inputs.checkout-path }}/target/perf-baselines/linux-vm/fedora-${{ inputs.guest-arch }}/*.qcow2

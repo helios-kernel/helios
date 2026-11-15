@@ -262,12 +262,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools,cargo-deny,nextest
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Restore WASI tooling artifacts
+        if: matrix.guest-wasm != ''
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
@@ -275,14 +276,12 @@ jobs:
             helios/artifacts/wasix
           key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
       - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        if: matrix.guest-wasm != '' && steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
-      # Only the host lanes nearly every pull request runs keep a Rust
-      # cache, and only a `dev` push writes it: the repository's cache
-      # quota holds these four and nothing more, and a pull request's
-      # entry is restorable from its own merge ref alone. Every other
-      # lane, workflow and action builds cold.
+      # Compile, lint and test lanes restore their default-branch Rust
+      # cache. Only a dev push writes one; other caches follow the same
+      # single-writer policy through shared-cache.
       # rust-cache hashes `rustc -vV` and `rustup run <t> rustc -vV` for
       # every installed toolchain (src/config.ts `getRustVersions`), run
       # from the checkout root where no `rust-toolchain.toml` applies. On
@@ -307,6 +306,10 @@ jobs:
           key: ${{ matrix.name }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       - uses: astral-sh/setup-uv@v6
+      - name: Build the prebuild tool while guest wasm builds
+        if: matrix.guest-wasm != ''
+        working-directory: helios
+        run: cargo build -p helios-cli
       - uses: ./helios/.github/actions/prebuilt-wasm
         if: matrix.guest-wasm != ''
         with:
@@ -354,12 +357,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
@@ -774,7 +777,7 @@ jobs:
           ls -la /dev/kvm || echo 'no /dev/kvm on this runner'
       - name: Restore the pinned QEMU install prefix
         id: qemu-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.QEMU_PREFIX }}
           # The configure flags are part of the key: a build made with
@@ -806,7 +809,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Stage Limine bootloader share
@@ -824,7 +827,7 @@ jobs:
           make -C "$GITHUB_WORKSPACE/limine"
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
@@ -1267,7 +1270,7 @@ jobs:
             swtpm
       - name: Restore the pinned QEMU install prefix
         id: qemu-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.QEMU_PREFIX }}
           key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
@@ -1361,7 +1364,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Stage Limine bootloader share
@@ -1379,7 +1382,7 @@ jobs:
           make -C "$GITHUB_WORKSPACE/limine"
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
@@ -2506,7 +2509,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Stage Limine bootloader share
@@ -2523,7 +2526,7 @@ jobs:
       # The host share the check fetches `curl.wasm` from.
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
@@ -2657,7 +2660,7 @@ jobs:
           echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
       - name: Restore the pinned virglrenderer install prefix
         id: virgl-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.VIRGL_PREFIX }}
           key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
@@ -2676,7 +2679,7 @@ jobs:
           ninja -C "virglrenderer-${VIRGL_VERSION}/build" install
       - name: Restore the pinned QEMU install prefix
         id: qemu-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.QEMU_PREFIX }}
           # QEMU links the virglrenderer above, so its key carries that
@@ -2712,7 +2715,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Stage Limine bootloader share
@@ -2724,7 +2727,7 @@ jobs:
       # under the key every lane shares.
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools

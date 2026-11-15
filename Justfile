@@ -11,7 +11,7 @@ default_profile := "debug"
 build_std_target := "aarch64-unknown-none"
 build_std_flag := "-Zbuild-std=core,alloc"
 
-# Generate the kernel-prebuild manifest for `target` and run `cargo check` against it.
+# Prepare the trusted root for `target` and check the kernel and backend.
 # helios-kernel is checked with the feature set the bare-metal backends select,
 # not its host defaults: `wasmtime-host` on a `target_os = "none"` target is a
 # configuration no backend ever builds, and wasmtime's pooling allocator needs
@@ -21,11 +21,7 @@ check-target target package:
     #!/usr/bin/env bash
     set -euo pipefail
     out_dir="{{repo_root}}/target/kernel-prebuild/{{target}}/{{default_profile}}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "{{target}}" \
-        --profile "{{default_profile}}" \
-        --cargo cargo
+    cargo run -p helios-cli --quiet -- kernel-keys --out-dir "${out_dir}"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     build_std="{{ if target == build_std_target { build_std_flag } else { "" } }}"
     # Unquoted on purpose: an empty value must expand to no argument.
@@ -68,11 +64,7 @@ clippy-host:
     # `clippy-programs`.
     target="$(rustc -vV | sed -n 's/^host: //p')"
     out_dir="{{repo_root}}/target/kernel-prebuild/${target}/{{default_profile}}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "${target}" \
-        --profile "{{default_profile}}" \
-        --cargo cargo
+    cargo run -p helios-cli --quiet -- kernel-keys --out-dir "${out_dir}"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     # `helios-venus` generates its protocol module from the pinned
@@ -196,18 +188,13 @@ test-erofs-mkfs:
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run -p helios-kernel --lib --run-ignored ignored-only -E 'test(/^vfs::erofs::tests::mkfs::/)'
 
-# Generate the kernel-prebuild manifest for `target` and run `cargo clippy`
-# against it, denying warnings.
+# Prepare the trusted root for `target` and lint the kernel and backend.
 # Usage: just clippy-target riscv64gc-unknown-none-elf helios-riscv
 clippy-target target package:
     #!/usr/bin/env bash
     set -euo pipefail
     out_dir="{{repo_root}}/target/kernel-prebuild/{{target}}/{{default_profile}}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "{{target}}" \
-        --profile "{{default_profile}}" \
-        --cargo cargo
+    cargo run -p helios-cli --quiet -- kernel-keys --out-dir "${out_dir}"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     # Two invocations, for the same reason `check-target` uses explicit
     # features: cargo would otherwise unify helios-kernel's host defaults with
@@ -268,11 +255,7 @@ check-host:
         exit 1
     fi
     out_dir="{{repo_root}}/target/kernel-prebuild/${target}/{{default_profile}}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "${target}" \
-        --profile "{{default_profile}}" \
-        --cargo cargo
+    cargo run -p helios-cli --quiet -- kernel-keys --out-dir "${out_dir}"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     cargo check -p helios-kernel
     cargo check -p helios-hosted

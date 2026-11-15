@@ -128,7 +128,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Stage Limine bootloader share
@@ -146,7 +146,7 @@ jobs:
           make -C "$GITHUB_WORKSPACE/limine"
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools

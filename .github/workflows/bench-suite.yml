@@ -333,7 +333,7 @@ jobs:
       - name: Verify the committed README and docs sections match their run's report
         working-directory: helios/tools/bench
         run: uv run helios-bench render check
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       # helios-compiler-host is a glibc binary for the Fedora guest, linked
