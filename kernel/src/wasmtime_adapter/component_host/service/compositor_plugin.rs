@@ -334,6 +334,63 @@ where
     StorageImpl: crate::Storage,
 {
     match request {
+        SurfaceRequest::CreateImage(create) => {
+            let SurfaceCreate {
+                id,
+                geometry,
+                reply,
+                ..
+            } = create;
+            if registry.lookup(id).is_none() {
+                let _ = reply.send(Err(SurfaceServiceError::Gone));
+                return Ok(());
+            }
+            let answer = guest
+                .desktop()
+                .call_create_image(
+                    accessor,
+                    desktop,
+                    id.raw(),
+                    exports::helios::system::compositor::Rect {
+                        x: 0,
+                        y: 0,
+                        width: geometry.width,
+                        height: geometry.height,
+                    },
+                )
+                .await?;
+            if registry.lookup(id).is_none() {
+                guest
+                    .desktop()
+                    .call_destroy(accessor, desktop, id.raw())
+                    .await?;
+                let _ = reply.send(Err(SurfaceServiceError::Gone));
+            } else {
+                let _ = reply.send(answer.map_err(from_guest_error));
+            }
+            Ok(())
+        }
+        SurfaceRequest::PresentImage {
+            id,
+            image,
+            retired,
+            reply,
+        } => {
+            if registry.lookup(id).is_none() {
+                let _ = reply.send(Err(SurfaceServiceError::Gone));
+                return Ok(());
+            }
+            let (image, retired) = accessor.with(|mut access| {
+                let data = access.get();
+                Ok::<_, wasmtime::Error>((data.table.push(image)?, data.table.push(retired)?))
+            })?;
+            let answer = guest
+                .desktop()
+                .call_present_image(accessor, desktop, id.raw(), image, retired)
+                .await?;
+            let _ = reply.send(answer.map_err(from_guest_error));
+            Ok(())
+        }
         SurfaceRequest::Create(create) => {
             serve_create(accessor, guest, desktop, registry, create).await
         }
@@ -500,6 +557,7 @@ const fn from_guest_error(
 ) -> SurfaceServiceError {
     use exports::helios::system::compositor::Error as GuestError;
     match error {
+        GuestError::RenderFailed => SurfaceServiceError::RenderFailed,
         GuestError::Unavailable => SurfaceServiceError::Unavailable,
         GuestError::NoCompositor => SurfaceServiceError::NoCompositor,
         GuestError::UnsupportedSize => SurfaceServiceError::UnsupportedSize,

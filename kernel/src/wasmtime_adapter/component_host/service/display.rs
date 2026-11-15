@@ -929,6 +929,48 @@ where
         Ok(outcome.map_err(to_wit_error))
     }
 
+    async fn activate(
+        accessor: &Accessor<U, Self>,
+        handle: Resource<SurfaceHandle>,
+    ) -> wasmtime::Result<Result<(), display_wit::Error>> {
+        let request = accessor.with(|mut access| {
+            let data = access.get();
+            let surface = data.table.get(&handle)?;
+            let (generation, source, scanout, mode) = (
+                surface.generation,
+                surface.source,
+                surface.scanout,
+                surface.mode,
+            );
+            Ok::<_, wasmtime::Error>((
+                data.display_sender(generation),
+                generation,
+                source,
+                scanout,
+                mode,
+            ))
+        })?;
+        let (sender, generation, surface, scanout, mode) = request;
+        let sender = match sender {
+            Ok(sender) => sender,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        let (reply, answer) = oneshot::channel();
+        Ok(sender
+            .control(
+                ControlRequest::ActivateSurface {
+                    generation,
+                    surface,
+                    scanout,
+                    mode,
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .map_err(to_wit_error))
+    }
+
     fn vsync(
         mut accessor: Access<'_, U, Self>,
         handle: Resource<SurfaceHandle>,

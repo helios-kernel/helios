@@ -444,6 +444,87 @@ fn a_surface_is_attached_when_it_is_created_and_a_present_flushes_it() {
 }
 
 #[test]
+fn a_retained_framebuffer_can_replace_an_image_without_reallocation() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::new();
+    let ownership = claimed(&shared);
+    with_server(&device, &shared, &control, async {
+        let framebuffer = create_surface(&ownership).await;
+        let blob = BlobId::new(9);
+        let layout = BlobScanout {
+            blob,
+            mode: SMALL,
+            format: PixelFormat::Bgrx8888,
+            offset: 0,
+            stride: SMALL.width * 4,
+        };
+        let held_blob = Arc::new(crate::gpu::BlobShared::new(
+            blob,
+            u64::from(layout.stride) * u64::from(SMALL.height),
+            Arc::new(crate::exec::Notify::new()),
+        ));
+        let claim = ownership.claim_ref().unwrap();
+        let sender = claim.sender();
+        let generation = claim.generation();
+        let (reply, answer) = oneshot::channel();
+        let image = sender
+            .control(
+                ControlRequest::CreateBlobSurface {
+                    generation,
+                    scanout: ScanoutId::new(0),
+                    layout,
+                    hold: BlobHold::new(&held_blob),
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .unwrap();
+        let (reply, answer) = oneshot::channel();
+        sender
+            .control(
+                ControlRequest::ActivateSurface {
+                    generation,
+                    surface: SurfaceSource::Framebuffer(framebuffer),
+                    scanout: ScanoutId::new(0),
+                    mode: SMALL,
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .unwrap();
+        sender
+            .control_oneway(ControlRequest::DestroySurface {
+                generation,
+                surface: image,
+            })
+            .await
+            .unwrap();
+        let (reply, answer) = oneshot::channel();
+        sender
+            .control(ControlRequest::Scanouts { generation, reply }, answer)
+            .await
+            .unwrap();
+        assert!(!held_blob.is_retained());
+        assert!(!device.calls().contains(&Call::Blank(ScanoutId::new(0))));
+        assert_eq!(
+            device
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, Call::Create(_, _)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            device.calls().last(),
+            Some(&Call::SetScanout(ScanoutId::new(0), framebuffer))
+        );
+    });
+}
+
+#[test]
 fn destroying_a_replaced_framebuffer_keeps_the_new_scanout() {
     test_hooks::install();
     let (shared, control, _cursor) = display_channels();

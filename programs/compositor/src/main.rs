@@ -37,7 +37,14 @@ use std::vec::Vec;
 
 use helios_api::bindings::wit_stream;
 use helios_api::channel::{Receiver, Sender, bounded};
-use helios_api::compositor::{BlockError, Error, Guest, GuestDesktop, Rect, Span};
+use helios_api::compositor::{
+    BlockError, Error, Guest, GuestDesktop, Image as RawImage, Rect,
+    SignalSource as RawSignalSource, Span,
+};
+use helios_api::image::Image;
+use helios_api::sync::{SignalSource, TimelineError};
+
+mod presentation;
 use helios_api::display::{Display, DisplayError, Mode, PixelFormat, Point};
 use helios_api::input::{Device, InputError, InputEvent, available, codes, ends_frame};
 use helios_api::programs::{
@@ -46,6 +53,7 @@ use helios_api::programs::{
 };
 use helios_api::surface;
 use helios_api::task::spawn;
+use presentation::Presentation;
 use thiserror::Error;
 
 use helios_compositor_render::damage::Region;
@@ -77,6 +85,8 @@ const SCANOUT: u32 = 0;
 /// Why the desktop gave up.
 #[derive(Debug, Error)]
 enum DesktopError {
+    #[error("frame retirement failed: {0}")]
+    Timeline(#[from] TimelineError),
     #[error("the display refused: {0}")]
     Display(#[from] DisplayError),
     #[error("the input service refused: {0}")]
@@ -97,7 +107,8 @@ impl DesktopError {
         match self {
             // The desktop could not be built or could not go on. From a
             // client's side that is one fact: there is no compositor.
-            Self::Display(_)
+            Self::Timeline(_)
+            | Self::Display(_)
             | Self::Input(_)
             | Self::Shell(_)
             | Self::NoInput
@@ -109,6 +120,17 @@ impl DesktopError {
 
 /// One thing that happened, to be folded into the next frame.
 enum Event {
+    CreateImage {
+        id: u64,
+        size: surface::Size,
+        reply: Sender<Result<(), Error>>,
+    },
+    PresentImage {
+        id: u64,
+        image: Image,
+        retired: SignalSource,
+        reply: Sender<Result<(), Error>>,
+    },
     /// An input device reported an event, with absolute axes already in
     /// scanout pixels.
     Input(InputEvent),
@@ -162,6 +184,37 @@ impl GuestDesktop for DesktopSession {
                 Err(error.as_wit())
             }
         }
+    }
+
+    async fn create_image(&self, id: u64, dimensions: Rect) -> Result<(), Error> {
+        let (reply, answer) = bounded(1);
+        self.ask(Event::CreateImage {
+            id,
+            size: surface::Size {
+                width: dimensions.width,
+                height: dimensions.height,
+            },
+            reply,
+        })
+        .await?;
+        answer.recv().await.map_err(|_| Error::NoCompositor)?
+    }
+
+    async fn present_image(
+        &self,
+        id: u64,
+        image: RawImage,
+        retired: RawSignalSource,
+    ) -> Result<(), Error> {
+        let (reply, answer) = bounded(1);
+        self.ask(Event::PresentImage {
+            id,
+            image: image.into(),
+            retired: retired.into(),
+            reply,
+        })
+        .await?;
+        answer.recv().await.map_err(|_| Error::NoCompositor)?
     }
 
     async fn create(&self, id: u64, dimensions: Rect) -> Result<Span, Error> {
@@ -243,7 +296,8 @@ async fn run_desktop(events: &Sender<Event>, queue: &Receiver<Event>) -> Result<
     // would take the shell down with it.
     let (_shell, mut keystrokes) = start_shell(events).await?;
 
-    serve(&mut desktop, queue, &mut keystrokes).await
+    let mut presentation = Presentation::new(display);
+    serve(&mut desktop, &mut presentation, queue, &mut keystrokes).await
 }
 
 /// Claim every input device and read it into the desktop's queue.
@@ -404,6 +458,7 @@ async fn read_shell(mut stream: helios_api::wit_bindgen::StreamReader<u8>, event
 /// The desktop's own loop: fold everything that happened into one frame.
 async fn serve(
     desktop: &mut Desktop,
+    presentation: &mut Presentation,
     queue: &Receiver<Event>,
     keystrokes: &mut helios_api::wit_bindgen::StreamWriter<u8>,
 ) -> Result<(), DesktopError> {
@@ -414,11 +469,27 @@ async fn serve(
         let Ok(event) = queue.recv().await else {
             return Err(DesktopError::Starved);
         };
-        let mut moved = handle(desktop, keystrokes, &mut keyboard, &mut frame, event).await?;
+        let mut moved = handle(
+            desktop,
+            presentation,
+            keystrokes,
+            &mut keyboard,
+            &mut frame,
+            event,
+        )
+        .await?;
         // Everything already queued belongs to this frame too: a burst
         // of shell output is one repaint, not one per chunk.
         while let Ok(event) = queue.try_recv() {
-            moved |= handle(desktop, keystrokes, &mut keyboard, &mut frame, event).await?;
+            moved |= handle(
+                desktop,
+                presentation,
+                keystrokes,
+                &mut keyboard,
+                &mut frame,
+                event,
+            )
+            .await?;
         }
         if moved {
             desktop.present_cursor().await?;
@@ -453,15 +524,36 @@ struct InputFrame {
 /// Fold one event into the desktop. Reports whether the pointer moved.
 async fn handle(
     desktop: &mut Desktop,
+    presentation: &mut Presentation,
     keystrokes: &mut helios_api::wit_bindgen::StreamWriter<u8>,
     keyboard: &mut Keyboard,
     frame: &mut InputFrame,
     event: Event,
 ) -> Result<bool, DesktopError> {
     match event {
+        Event::CreateImage { id, size, reply } => {
+            presentation.create(id, size);
+            let _ = reply.send(Ok(())).await;
+            Ok(false)
+        }
+        Event::PresentImage {
+            id,
+            image,
+            retired,
+            reply,
+        } => {
+            let answer = if presentation.holds(id) {
+                presentation.present(id, image, retired).await?;
+                Ok(())
+            } else {
+                Err(Error::Gone)
+            };
+            let _ = reply.send(answer).await;
+            Ok(false)
+        }
         Event::Input(event) => {
             if ends_frame(event) {
-                return apply_frame(desktop, keystrokes, keyboard, frame).await;
+                return apply_frame(desktop, presentation, keystrokes, keyboard, frame).await;
             }
             match (event.kind, event.code) {
                 (codes::EV_ABS, codes::ABS_X) => frame.x = Some(event.value.max(0) as u32),
@@ -508,7 +600,9 @@ async fn handle(
             Ok(false)
         }
         Event::Destroy { id, reply } => {
-            desktop.remove_client(id);
+            if !presentation.remove(id, desktop).await? {
+                desktop.remove_client(id);
+            }
             let _ = reply.send(()).await;
             Ok(false)
         }
@@ -533,6 +627,7 @@ const fn client_error(error: BlockError) -> Error {
 /// pointer never stopped in.
 async fn apply_frame(
     desktop: &mut Desktop,
+    presentation: &Presentation,
     keystrokes: &mut helios_api::wit_bindgen::StreamWriter<u8>,
     keyboard: &mut Keyboard,
     frame: &mut InputFrame,
@@ -548,6 +643,12 @@ async fn apply_frame(
     }
     frame.x = None;
     frame.y = None;
+
+    if let Some((id, pointer)) = presentation.focused(desktop) {
+        let report = translate_report(events, Some((pointer.x, pointer.y)));
+        let _ = surface::deliver(id, report).await;
+        return Ok(moved);
+    }
 
     match desktop.focus() {
         Focus::Desktop => {}
@@ -589,7 +690,10 @@ async fn apply_frame(
 /// are rewritten to the window's own pixel range, because a window is
 /// not a screen and a client has no way to know where its window sits.
 fn client_report(desktop: &Desktop, id: u64, events: Vec<InputEvent>) -> Vec<InputEvent> {
-    let local = desktop.pointer_in_client(id);
+    translate_report(events, desktop.pointer_in_client(id))
+}
+
+fn translate_report(events: Vec<InputEvent>, local: Option<(u32, u32)>) -> Vec<InputEvent> {
     events
         .into_iter()
         .map(|mut event| {

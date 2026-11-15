@@ -18,6 +18,6 @@
 //! the kernel is a forwarder, and this is what it forwards to.
 
 pub use crate::bindings::exports::helios::system::compositor::{
-    Error, Guest, GuestDesktop, Rect, SurfaceId,
+    Error, Guest, GuestDesktop, Image, Rect, SignalSource, SurfaceId,
 };
 pub use crate::memory::{Block, BlockError, Span};

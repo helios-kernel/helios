@@ -205,6 +205,27 @@ impl SignalPoint<'_> {
     }
 }
 
+impl From<host_sync::Timeline> for Timeline {
+    fn from(raw: host_sync::Timeline) -> Self {
+        Self { raw }
+    }
+}
+
+impl From<host_sync::SignalSource> for SignalSource {
+    fn from(raw: host_sync::SignalSource) -> Self {
+        Self { raw }
+    }
+}
+
+impl TimelinePoint<'_> {
+    pub(crate) fn raw(&self) -> host_sync::TimelinePoint<'_> {
+        host_sync::TimelinePoint {
+            timeline: &self.timeline.raw,
+            value: self.value,
+        }
+    }
+}
+
 impl SignalSource {
     pub fn new(initial: u64) -> Self {
         Self {

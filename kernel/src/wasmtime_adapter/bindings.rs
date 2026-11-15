@@ -199,6 +199,7 @@ pub mod surface {
                 // so it can build one against it; it returns the reader
                 // immediately rather than awaiting.
                 "helios:system/surface.[method]surface.events": store | trappable,
+                "helios:system/surface.[method]image-surface.events": store | trappable,
                 // `create`, `commit` and `deliver` all reach the
                 // compositor and are `async func` in the WIT, generated
                 // against the store on their own account. What is left —
@@ -208,6 +209,9 @@ pub mod surface {
                 default: trappable,
             },
             with: {
+                "helios:system/surface.image-surface": crate::wasmtime_adapter::component_host::ClientImageSurfaceHandle,
+                "helios:system/gpu": crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu,
+                "helios:system/sync": crate::wasmtime_adapter::bindings::debugger::bindings::helios::system::sync,
                 "helios:system/surface.surface":
                     crate::wasmtime_adapter::component_host::ClientSurfaceHandle,
             },
@@ -338,6 +342,10 @@ pub mod compositor {
         wasmtime::component::bindgen!({
             path: "../wit",
             world: "compositor-host",
+            with: {
+                "helios:system/gpu": crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu,
+                "helios:system/sync": crate::wasmtime_adapter::bindings::debugger::bindings::helios::system::sync,
+            },
             exports: { default: async | store },
             require_store_data_send: true,
         });

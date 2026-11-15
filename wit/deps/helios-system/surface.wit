@@ -33,12 +33,16 @@ package helios:system@0.1.0;
 /// it is handed while it has focus.
 interface surface {
   use input.{input-event};
+  use gpu.{image};
+  use sync.{timeline, timeline-point};
   use memory.{span};
 
   /// Why a surface request was refused.
   enum error {
     /// This kernel image ships no compositor plugin.
     unavailable,
+    /// Rendering failed or its producer closed before completing the image.
+    render-failed,
     /// The compositor died and has not come back yet. The surfaces it
     /// was composing died with it; a client makes a new one.
     no-compositor,
@@ -117,6 +121,18 @@ interface surface {
     events: func() -> stream<input-event>;
   }
 
+  /// A GPU-backed presentation surface managed by the compositor.
+  resource image-surface {
+    %size: func() -> size;
+    /// The image must match this surface's dimensions. Rendering is awaited
+    /// before presentation. Value 1 on the returned timeline means the image
+    /// has been replaced or detached and its storage may be reused.
+    present: async func(image: borrow<image>, ready: timeline-point) -> result<timeline, error>;
+    events: func() -> stream<input-event>;
+  }
+
+  create-image: async func(width: u32, height: u32) -> result<image-surface, error>;
+
   /// Ask the compositor for a window of `width` by `height` pixels,
   /// with its pixels shown at `buffer`.
   ///
@@ -158,6 +174,8 @@ interface surface {
 /// the client's pixels are to appear.
 interface compositor {
   use surface.{error, rect};
+  use gpu.{image};
+  use sync.{signal-source};
   use memory.{span};
 
   /// Stable identifier of one client surface, minted by the kernel.
@@ -167,6 +185,11 @@ interface compositor {
   /// The supervisor constructs it before dispatching concurrent calls.
   resource desktop {
     constructor();
+
+    create-image: async func(id: surface-id, dimensions: rect) -> result<_, error>;
+    /// The kernel has already awaited rendering. Signal value 1 only after
+    /// replacement or detachment; dropping the producer reports closure.
+    present-image: async func(id: surface-id, image: image, retired: signal-source) -> result<_, error>;
 
     /// Own the desktop until the machine goes down.
     ///

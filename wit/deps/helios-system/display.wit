@@ -139,6 +139,10 @@ interface display {
     /// The mode the surface was created at.
     resolution: func() -> mode;
 
+    /// Reattach this surface to its output. Resolves after the device has
+    /// stopped reading the surface it replaced; its storage can then be reused.
+    activate: async func() -> result<_, error>;
+
     /// Publish the pixels written into `region`.
     ///
     /// The returned future resolves when the display engine has taken

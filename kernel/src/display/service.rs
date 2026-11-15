@@ -145,6 +145,13 @@ pub(crate) enum ControlRequest {
         hold: BlobHold,
         reply: oneshot::Sender<Result<SurfaceSource, DisplayServiceError>>,
     },
+    ActivateSurface {
+        generation: u64,
+        surface: SurfaceSource,
+        scanout: ScanoutId,
+        mode: DisplayMode,
+        reply: oneshot::Sender<Result<(), DisplayServiceError>>,
+    },
     DestroySurface {
         generation: u64,
         surface: SurfaceSource,
@@ -178,6 +185,7 @@ impl ControlRequest {
             | Self::Modes { generation, .. }
             | Self::CreateSurface { generation, .. }
             | Self::CreateBlobSurface { generation, .. }
+            | Self::ActivateSurface { generation, .. }
             | Self::DestroySurface { generation, .. }
             | Self::Present { generation, .. }
             | Self::CreateCursor { generation, .. }

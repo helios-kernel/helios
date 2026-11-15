@@ -175,6 +175,11 @@ pub struct ImageSurface {
 }
 
 impl ImageSurface {
+    /// Display this image again, retiring the output's previous surface.
+    pub async fn activate(&self) -> Result<(), DisplayError> {
+        self.raw.activate().await.map_err(DisplayError::from)
+    }
+
     /// The mode this surface was created at.
     pub const fn mode(&self) -> Mode {
         self.mode
@@ -204,6 +209,15 @@ pub struct Surface {
 }
 
 impl Surface {
+    /// Display this framebuffer again, retiring the output's previous surface.
+    pub async fn activate(&self) -> Result<(), DisplayError> {
+        self.frame
+            .resource()
+            .activate()
+            .await
+            .map_err(DisplayError::from)
+    }
+
     /// The mode this surface was created at.
     pub const fn mode(&self) -> Mode {
         self.mode

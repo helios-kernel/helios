@@ -38,7 +38,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use futures::future::{Either, select};
 use helios_hal::cpu::Cpu;
 use helios_hal::display::{
-    BlobId, DisplayDevice, DisplayError, FramebufferId, MAX_SCANOUTS, Rect, ScanoutId,
+    BlobScanout, DisplayDevice, DisplayError, FramebufferId, MAX_SCANOUTS, Rect, ScanoutId,
 };
 use helios_hal::watchdog::Watchdog;
 use triomphe::Arc;
@@ -209,7 +209,7 @@ enum SurfaceResource {
     /// destroys. The record's hold keeps the gpu path from destroying
     /// the blob until the scanout has stopped reading it.
     Blob {
-        id: BlobId,
+        layout: BlobScanout,
         surface: BlobSurfaceId,
         hold: BlobHold,
     },
@@ -228,8 +228,10 @@ impl SurfaceResource {
     const fn source(&self) -> SurfaceSource {
         match self {
             Self::Framebuffer { id, .. } => SurfaceSource::Framebuffer(*id),
-            Self::Blob { id, surface, .. } => SurfaceSource::Blob {
-                blob: *id,
+            Self::Blob {
+                layout, surface, ..
+            } => SurfaceSource::Blob {
+                blob: layout.blob,
                 surface: *surface,
             },
         }
@@ -404,6 +406,39 @@ async fn serve_control_request<Device, CpuImpl>(
             let outcome = create_cursor(device, held, format, backing).await;
             let _ = reply.send(outcome);
         }
+        ControlRequest::ActivateSurface {
+            surface,
+            scanout,
+            mode,
+            reply,
+            ..
+        } => {
+            let outcome = match held.record(surface) {
+                Some(record) => match &record.resource {
+                    SurfaceResource::Framebuffer { id, .. } => {
+                        device.set_scanout(scanout, *id, Rect::of(mode)).await
+                    }
+                    SurfaceResource::Blob { layout, .. } => {
+                        device.set_scanout_blob(scanout, *layout).await
+                    }
+                }
+                .map_err(DisplayServiceError::from),
+                None => Err(DisplayServiceError::NotClaimed),
+            };
+            if outcome.is_ok() {
+                held.note_scanout(scanout);
+                held.record(surface)
+                    .expect("the activated surface remains registered")
+                    .scanout = Some(scanout);
+            } else if matches!(outcome, Err(DisplayServiceError::DeviceFault)) {
+                // An unanswered command may still attach this resource. Keep
+                // both possible owners associated until a confirmed detach.
+                if let Some(record) = held.record(surface) {
+                    record.scanout = Some(scanout);
+                }
+            }
+            let _ = reply.send(outcome);
+        }
         ControlRequest::DestroySurface { surface, .. } => {
             destroy_surface(device, held, surface).await;
         }
@@ -524,7 +559,7 @@ async fn create_blob_surface<Device: DisplayDevice>(
     held.note_scanout(scanout);
     held.surfaces.push(SurfaceRecord {
         resource: SurfaceResource::Blob {
-            id: layout.blob,
+            layout,
             surface,
             hold,
         },
