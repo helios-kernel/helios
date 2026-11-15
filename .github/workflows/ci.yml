@@ -61,8 +61,7 @@ jobs:
       # `true` when the change moves the kernel profile's format or the
       # compiler that reads it; `kernel-profile` then collects this run's.
       profile_format: ${{ steps.filter.outputs.profile_format || 'false' }}
-      # JSON array of the guest-program profiles the selected smoke lanes
-      # read, which `wasm-programs` builds.
+      # Guest-program profiles the selected checks and smoke lanes read.
       wasm_profiles: ${{ steps.select.outputs.wasm_profiles }}
     steps:
       - uses: actions/checkout@v4
@@ -162,10 +161,9 @@ jobs:
             to_entries
             | map(select(.value.command and (.key as $name | $lanes | index($name))))
             | map({name: .key, command: .value.command,
-                   "rust-cache": (.value["rust-cache"] // false)})' .github/ci-lanes.json)"
-          # The guest-wasm profile each selected lane boots, as its entry
-          # states it: what `wasm-programs` builds and the lane's
-          # `prebuilt-wasm` step waits for.
+                   "rust-cache": (.value["rust-cache"] // false),
+                   "guest-wasm": (.value["guest-wasm"] // "")})' .github/ci-lanes.json)"
+          # Every consumer declares the profile its prebuild reads.
           wasm_profiles="$(jq -c --argjson lanes "${lanes}" '
             [$lanes[] as $name | .[$name]["guest-wasm"] // empty] | unique' .github/ci-lanes.json)"
           {
@@ -187,10 +185,10 @@ jobs:
       contents: read
     uses: ./.github/workflows/kernel-profile.yml
 
-  # The wasm every smoke lane precompiles into its guest: the compiler
+  # The wasm every check and smoke lane precompiles: the compiler
   # plugin, `init` and every program under `programs/`. None of it depends
-  # on the target, so it is built once per run, in each profile a selected
-  # lane boots (`release` for the optimised kernels, `debug` for the debug
+  # on the target, so it is built once per run, in each requested profile
+  # (`release` for optimised kernels, `debug` for checks, the debug
   # inspector of `smoke-x86-64-venus` and the debug kernel of
   # `smoke-aarch64-cfi`). The lanes start beside this job rather than after
   # it, because their set-up outlasts most of the build: each downloads the
@@ -238,6 +236,9 @@ jobs:
     if: needs.changes.outputs.checks != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -306,8 +307,15 @@ jobs:
           key: ${{ matrix.name }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       - uses: astral-sh/setup-uv@v6
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        if: matrix.guest-wasm != ''
+        with:
+          profile: ${{ matrix.guest-wasm }}
+          path: helios/target/wasm-programs/${{ matrix.guest-wasm }}
       - name: ${{ matrix.name }}
         working-directory: helios
+        env:
+          HELIOS_PREBUILT_WASM: ${{ matrix.guest-wasm != '' && format('{0}/helios/target/wasm-programs', github.workspace) || '' }}
         run: ${{ matrix.command }}
 
   # Every smoke step that boots a guest carries a bound of its own, so a

@@ -1,10 +1,12 @@
 {
   "check-host": {
+    "guest-wasm": "debug",
     "command": "just check-host",
     "rust-cache": true,
     "surfaces": ["hosted", "host_tools", "programs"]
   },
   "test-embedded-debugger": {
+    "guest-wasm": "debug",
     "command": "just test-embedded-debugger",
     "rust-cache": true,
     "surfaces": ["hosted", "host_tools", "programs"]
@@ -14,23 +16,28 @@
     "surfaces": ["aarch64", "riscv", "x86", "hosted", "host_tools", "programs"]
   },
   "lint-host": {
+    "guest-wasm": "debug",
     "command": "just clippy-host && just clippy-programs",
     "rust-cache": true,
     "surfaces": ["hosted", "host_tools", "programs"]
   },
   "lint-aarch64": {
+    "guest-wasm": "debug",
     "command": "just clippy-target aarch64-unknown-none helios-aarch64",
     "surfaces": ["aarch64"]
   },
   "lint-riscv": {
+    "guest-wasm": "debug",
     "command": "just clippy-target riscv64gc-unknown-none-elf helios-riscv",
     "surfaces": ["riscv"]
   },
   "lint-x86": {
+    "guest-wasm": "debug",
     "command": "just clippy-target x86_64-unknown-none helios-x86",
     "surfaces": ["x86"]
   },
   "test-units": {
+    "guest-wasm": "debug",
     "command": "just test-units && just test-erofs-mkfs",
     "rust-cache": true,
     "surfaces": ["x86", "hosted", "host_tools", "programs"]
