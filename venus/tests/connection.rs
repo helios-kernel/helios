@@ -1,5 +1,5 @@
 use core::cell::{RefCell, UnsafeCell};
-use core::num::{NonZeroU32, NonZeroU64};
+use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::collections::BTreeMap;
@@ -65,6 +65,7 @@ struct Recorded {
     premature_completion: bool,
     reply_command: i32,
     reply: Vec<u8>,
+    blob_ids: Vec<u64>,
 }
 
 struct Recording(Rc<RefCell<Recorded>>);
@@ -77,13 +78,14 @@ impl Transport for Recording {
     type Error = Infallible;
     type Blob = Blob;
 
-    fn create_blob(&mut self, size: NonZeroU64, _blob_id: u64) -> Result<Blob, Infallible> {
+    fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Blob, Infallible> {
         let memory = Rc::new(Memory(
             (0..size.get().div_ceil(4))
                 .map(|_| UnsafeCell::new(0))
                 .collect(),
         ));
         let mut state = self.0.borrow_mut();
+        state.blob_ids.push(blob_id);
         state.next += 1;
         let id = state.next;
         state.blobs.insert(id, Rc::downgrade(&memory));
@@ -231,6 +233,24 @@ fn a_transport_acknowledgement_does_not_replace_ring_consumption() {
         connection.flush(),
         Err(Error::IncompleteWait { sequence: 4 })
     ));
+}
+
+#[test]
+fn memory_blobs_follow_allocation_consumption_and_use_its_object_id() {
+    let state = Rc::new(RefCell::new(Recorded::default()));
+    let mut connection = connection(state.clone());
+    connection.send(&[0xff; 4]).unwrap();
+    let blob = connection
+        .memory_blob(
+            helios_venus::protocol::VkDeviceMemory(77),
+            NonZeroUsize::new(64).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(state.borrow().consumed, [vec![0xff; 4]]);
+    assert_eq!(state.borrow().blob_ids, [0, 77]);
+    assert_eq!(blob.len(), 64);
+    drop(blob);
+    connection.close().unwrap();
 }
 
 #[test]

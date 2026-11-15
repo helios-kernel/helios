@@ -1,15 +1,15 @@
 //! Ordered command and reply streams for one Venus renderer context.
 
-use core::num::NonZeroU64;
+use core::num::{NonZeroU64, NonZeroUsize};
 use core::ptr::null;
 use core::time::Duration;
 
 use crate::capset::Capset;
 use crate::protocol::{
-    VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA, VkCommandStreamDescriptionMESA, VkRingCreateInfoMESA,
-    vn_encode_vkCreateRingMESA, vn_encode_vkDestroyRingMESA, vn_encode_vkExecuteCommandStreamsMESA,
-    vn_encode_vkNotifyRingMESA, vn_encode_vkSetReplyCommandStreamMESA,
-    vn_encode_vkWaitRingSeqnoMESA,
+    VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA, VkCommandStreamDescriptionMESA, VkDeviceMemory,
+    VkRingCreateInfoMESA, vn_encode_vkCreateRingMESA, vn_encode_vkDestroyRingMESA,
+    vn_encode_vkExecuteCommandStreamsMESA, vn_encode_vkNotifyRingMESA,
+    vn_encode_vkSetReplyCommandStreamMESA, vn_encode_vkWaitRingSeqnoMESA,
 };
 use crate::ring::{Layout, Ring, RingError};
 use crate::transport::{MappedBlob, Transport};
@@ -152,6 +152,24 @@ impl<T: Transport> Connection<T> {
         let id = self.next_object;
         self.next_object = id.checked_add(1).ok_or(Error::ObjectIds)?;
         Ok(id)
+    }
+
+    /// Create a persistently mapped host blob for a Vulkan allocation.
+    /// CPU consumption precedes resource creation so the renderer has
+    /// installed the memory object before it resolves the blob identifier.
+    /// The caller releases this blob before freeing its Vulkan memory.
+    pub fn memory_blob(
+        &mut self,
+        memory: VkDeviceMemory,
+        size: NonZeroUsize,
+    ) -> Result<T::Blob, Error<T::Error>> {
+        self.flush()?;
+        let blob = self
+            .transport
+            .create_blob(NonZeroU64::new(size.get() as u64).unwrap(), memory.0)
+            .map_err(Error::Transport)?;
+        check_size::<T>(&blob, size.get())?;
+        Ok(blob)
     }
 
     fn inline(

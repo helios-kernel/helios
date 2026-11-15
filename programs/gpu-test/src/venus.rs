@@ -1,6 +1,6 @@
 //! Vulkan bring-up through the synchronous canonical import boundary.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ use helios_venus::connection::Connection;
 use helios_venus::helios::Context;
 use helios_venus::protocol as vk;
 use helios_venus::ring::Layout;
+use helios_venus::transport::MappedBlob;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -24,6 +25,14 @@ pub enum Error {
     NoPhysicalDevices,
     #[error("the Venus physical device has no compute queue")]
     NoComputeQueue,
+    #[error("the Venus physical device has no host-visible coherent memory type")]
+    NoHostMemory,
+    #[error("Vulkan memory read back {found:#04x} at byte {offset}, expected {expected:#04x}")]
+    MemoryReadback {
+        offset: usize,
+        expected: u8,
+        found: u8,
+    },
 }
 
 fn success(command: &'static str, result: vk::VkResult) -> Result<(), Error> {
@@ -193,6 +202,7 @@ pub fn run() -> Result<(), Error> {
     unsafe {
         vk::vn_call_vkGetDeviceQueue2(&mut connection, device, &get_queue, &mut queue)?;
     }
+    memory(&mut connection, physical, device)?;
     connection.wait_queue(1)?;
     // SAFETY: no device work or child allocations remain. The final close
     // waits for both destruction commands before any handle storage is freed.
@@ -203,5 +213,69 @@ pub fn run() -> Result<(), Error> {
     connection.close()?;
     println!("gpu-test:venus device-queue ok devices={count} family={family}");
     println!("gpu-test:venus ring-reply ok api={version:#x}");
+    Ok(())
+}
+
+fn memory(
+    connection: &mut Connection<Context>,
+    physical: vk::VkPhysicalDevice,
+    device: vk::VkDevice,
+) -> Result<(), Error> {
+    // SAFETY: this output structure contains only integer fields, flags
+    // and fixed arrays of them; zero is a valid initialized representation.
+    let mut properties = unsafe { core::mem::zeroed::<vk::VkPhysicalDeviceMemoryProperties>() };
+    // SAFETY: the physical device is live and properties is writable.
+    unsafe {
+        vk::vn_call_vkGetPhysicalDeviceMemoryProperties(connection, physical, &mut properties)?;
+    }
+    let required = (vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0
+        | vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.0) as u32;
+    let memory_type = properties
+        .memoryTypes
+        .iter()
+        .take(properties.memoryTypeCount as usize)
+        .position(|memory| memory.propertyFlags & required == required)
+        .ok_or(Error::NoHostMemory)? as u32;
+    let allocate = vk::VkMemoryAllocateInfo {
+        sType: vk::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        pNext: null(),
+        allocationSize: super::PAGE_BYTES,
+        memoryTypeIndex: memory_type,
+    };
+    let mut memory = vk::VkDeviceMemory(connection.object_id()?);
+    // SAFETY: allocation metadata and the output object identifier are
+    // live, and the memory type came from this device's reported properties.
+    success("vkAllocateMemory", unsafe {
+        vk::vn_call_vkAllocateMemory(connection, device, &allocate, null(), &mut memory)?
+    })?;
+    let size = NonZeroUsize::new(super::PAGE_BYTES as usize).unwrap();
+    let blob = connection.memory_blob(memory, size)?;
+    let pointer = blob.pointer().as_ptr();
+    // A position-dependent test pattern exposes addressing mistakes.
+    let pattern = |offset: usize| (offset as u8).wrapping_mul(17);
+    for offset in 0..size.get() {
+        let expected = pattern(offset);
+        // SAFETY: this is newly allocated coherent host-visible memory;
+        // no GPU command uses it. Volatile accesses exercise the mapping.
+        unsafe { pointer.add(offset).write_volatile(expected) };
+    }
+    for offset in 0..size.get() {
+        let expected = pattern(offset);
+        // SAFETY: the same live mapping and bounds as the writes above.
+        let found = unsafe { pointer.add(offset).read_volatile() };
+        if found != expected {
+            return Err(Error::MemoryReadback {
+                offset,
+                expected,
+                found,
+            });
+        }
+    }
+    // Revoke the guest mapping and release the blob reference before
+    // enqueueing destruction of the renderer's Vulkan memory object.
+    drop(blob);
+    // SAFETY: no buffer, image or submitted work references this allocation.
+    unsafe { vk::vn_call_vkFreeMemory(connection, device, memory, null())? };
+    println!("gpu-test:venus memory-map ok bytes={}", size.get());
     Ok(())
 }
