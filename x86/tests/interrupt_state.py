@@ -18,9 +18,12 @@ def substitute_asm_operands(text, rust_source):
     )
     if invocation is None:
         raise SystemExit("x86/src/exceptions.rs has no global_asm! including exceptions.S")
+    text = text.replace("{native_users}", "0")
     for name, constant in re.findall(
         r"(\w+)\s*=\s*const\s+(\w+)", invocation.group("operands")
     ):
+        if name == "native_users":
+            continue
         definition = re.search(
             rf"const\s+{constant}\s*:\s*\w+\s*=\s*(0x[0-9a-fA-F_]+|[0-9_]+)\s*;",
             rust_source,
