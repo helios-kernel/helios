@@ -8,7 +8,7 @@ pub enum Error {
     Parse(#[from] object::Error),
     #[error("prototype requires a little-endian static x86-64 ET_EXEC image")]
     UnsupportedImage,
-    #[error("prototype cannot load an interpreter, dynamic relocations or TLS")]
+    #[error("prototype cannot load an interpreter or dynamic relocations")]
     UnsupportedSegment,
     #[error("invalid load segment range, alignment or permissions")]
     InvalidSegment,
@@ -25,6 +25,13 @@ pub struct Segment<'a> {
     pub bytes: &'a [u8],
     pub writable: bool,
     pub executable: bool,
+}
+
+/// Location of the ELF64 program headers in the process's mapped image.
+#[derive(Clone, Copy)]
+pub struct ProgramHeaders {
+    pub address: u64,
+    pub count: u64,
 }
 
 /// Validated static executable. Validation completes before the caller maps any
@@ -47,7 +54,41 @@ impl<'a> Image<'a> {
         let headers = file.elf_program_headers();
         for (index, header) in headers.iter().enumerate() {
             match header.p_type(endian) {
-                PT_INTERP | PT_DYNAMIC | PT_TLS => return Err(Error::UnsupportedSegment),
+                PT_INTERP | PT_DYNAMIC => return Err(Error::UnsupportedSegment),
+                PT_TLS => {
+                    let address = header.p_vaddr(endian);
+                    let size = header.p_filesz(endian);
+                    let align = header.p_align(endian);
+                    let end = address.checked_add(size).ok_or(Error::InvalidSegment)?;
+                    if size > header.p_memsz(endian)
+                        || address
+                            .checked_add(header.p_memsz(endian))
+                            .is_none_or(|end| end > 1 << 47)
+                        || (align > 1
+                            && (!align.is_power_of_two()
+                                || address % align != header.p_offset(endian) % align))
+                        || !headers.iter().any(|load| {
+                            load.p_type(endian) == PT_LOAD
+                                && load.p_flags(endian) & PF_R != 0
+                                && address >= load.p_vaddr(endian)
+                                && load
+                                    .p_offset(endian)
+                                    .checked_add(address - load.p_vaddr(endian))
+                                    == Some(header.p_offset(endian))
+                                && load
+                                    .p_vaddr(endian)
+                                    .checked_add(if size == 0 {
+                                        load.p_memsz(endian)
+                                    } else {
+                                        load.p_filesz(endian)
+                                    })
+                                    .is_some_and(|limit| end <= limit)
+                        })
+                    {
+                        return Err(Error::InvalidSegment);
+                    }
+                    continue;
+                }
                 PT_LOAD => {}
                 _ => continue,
             }
@@ -92,6 +133,31 @@ impl<'a> Image<'a> {
             return Err(Error::InvalidEntry);
         }
         Ok(Self { file })
+    }
+
+    pub fn program_headers(&self) -> Result<ProgramHeaders, Error> {
+        let endian = self.file.endian();
+        let offset = self.file.elf_header().e_phoff(endian);
+        let count = self.file.elf_program_headers().len() as u64;
+        // ELF64 program-header entries are 56 bytes (System V ABI).
+        let end = offset
+            .checked_add(count * 56)
+            .ok_or(Error::InvalidSegment)?;
+        for header in self.file.elf_program_headers() {
+            let start = header.p_offset(endian);
+            if header.p_type(endian) == PT_LOAD
+                && offset >= start
+                && start
+                    .checked_add(header.p_filesz(endian))
+                    .is_some_and(|limit| end <= limit)
+            {
+                return Ok(ProgramHeaders {
+                    address: header.p_vaddr(endian) + offset - start,
+                    count,
+                });
+            }
+        }
+        Err(Error::InvalidSegment)
     }
 
     pub fn entry(&self) -> u64 {

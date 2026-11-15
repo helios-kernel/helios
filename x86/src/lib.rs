@@ -170,6 +170,7 @@ pub trait BootHook {
         cpu: X86Cpu,
         spawner: helios_kernel::Spawner<X86Cpu>,
         payload: helios_kernel::BootPayload,
+        entropy: helios_kernel::RootEntropyHandle,
     );
 }
 
@@ -177,7 +178,13 @@ pub trait BootHook {
 struct NoBootHook;
 #[cfg(not(feature = "native-users"))]
 impl BootHook for NoBootHook {
-    fn start(_: X86Cpu, _: helios_kernel::Spawner<X86Cpu>, _: helios_kernel::BootPayload) {}
+    fn start(
+        _: X86Cpu,
+        _: helios_kernel::Spawner<X86Cpu>,
+        _: helios_kernel::BootPayload,
+        _: helios_kernel::RootEntropyHandle,
+    ) {
+    }
 }
 
 #[cfg(not(feature = "native-users"))]
@@ -494,7 +501,7 @@ fn x86_kernel_main<Hook: BootHook>() -> ! {
         sound_function,
         &block_functions,
         &debug_state,
-        root_entropy,
+        root_entropy.clone(),
     );
     // The SCI is routed with this processor's interrupts still masked,
     // after its latch is installed, so no delivery precedes its handler.
@@ -526,7 +533,7 @@ fn x86_kernel_main<Hook: BootHook>() -> ! {
             }
         }
     }
-    Hook::start(cpu.clone(), kernel.spawner(), payload);
+    Hook::start(cpu.clone(), kernel.spawner(), payload, root_entropy);
     run_current_processor(cpu, kernel, debug_state)
 }
 
