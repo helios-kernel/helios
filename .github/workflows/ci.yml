@@ -2641,7 +2641,7 @@ jobs:
     needs: changes
     if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-upstream')
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -2684,7 +2684,7 @@ jobs:
     needs: [changes, test-btrfs-upstream]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-fuzz')
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
