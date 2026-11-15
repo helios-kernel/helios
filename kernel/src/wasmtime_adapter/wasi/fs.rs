@@ -9,13 +9,14 @@
 //! them and only translate types.
 
 use helios_hal::fs::{
-    FileSystem, FsError as VfsError, FsResult, Metadata, NodeKind, OpenFlags, WritePosition,
+    FileSystem, FilledWrite, FsError as VfsError, FsResult, Metadata, NodeKind, OpenFlags,
+    PreparedWrite, WritePosition, WriteProgress,
 };
 use pin_project_lite::pin_project;
 
 use crate::{
-    ComponentHostNetwork, FileContents, Follow, HeldPath, MountHold, Namespace, Resolved,
-    object_identity,
+    ComponentHostNetwork, FileContents, Follow, HeldPath, MountHold, MountedWrite, Namespace,
+    Resolved, object_identity,
 };
 
 use super::*;
@@ -471,7 +472,7 @@ where
 
 /// Stages a write of `len` bytes at `position` through `resolved`, for a
 /// caller that fills each round itself straight from where its bytes are
-/// ([`helios_hal::fs::PreparedWrite::submit`]) and has to wait before a
+/// ([`helios_hal::fs::PreparedWrite::fill`]) and has to wait before a
 /// round for those bytes to be readable, as guest pages back from swap.
 /// The rounds land at consecutive offsets from the one the write begins
 /// at, which the last submit answers.
@@ -835,21 +836,26 @@ where
 /// What one bounded read resolves with.
 type ChunkReadResult = FsOpResult<Bytes>;
 
-/// What one write resolves with: the number of bytes handed over.
-type ChunkWriteResult = FsOpResult<usize>;
-
-/// One write of a stream's batch, as a future the consumer owns by value.
-async fn write_chunk<StorageImpl>(
-    held: HeldPath<StorageImpl>,
+/// Prepares destinations without taking bytes from the stream.
+async fn prepare_stream_write<S: crate::Storage>(
+    held: HeldPath<S>,
     mode: WritePosition,
-    bytes: Vec<u8>,
+    len: usize,
     now: u64,
-) -> ChunkWriteResult
-where
-    StorageImpl: crate::Storage,
-{
-    write_resolved(&held.resolved(), mode, &bytes, now).await?;
-    Ok(bytes.len())
+) -> FsOpResult<MountedWrite<S>> {
+    let resolved = held.resolved();
+    resolved
+        .writable()
+        .map_err(fs_error_code)?
+        .prepare_write(resolved.path(), mode, len, now)
+        .await
+        .map_err(fs_error_code)
+}
+
+async fn submit_stream_write<S: crate::Storage>(
+    filled: <MountedWrite<S> as PreparedWrite>::Filled,
+) -> FsOpResult<WriteProgress<MountedWrite<S>>> {
+    filled.submit().await.map_err(fs_error_code)
 }
 
 /// Answers the `future<result>` a `read-via-stream`, `write-via-stream`,
@@ -968,34 +974,43 @@ where
 }
 
 pin_project! {
-    /// The `write-via-stream` and `append-via-stream` sink for one file,
-    /// the mirror of [`FileReadStreamProducer`]. `mode` decides whether
-    /// each batch lands at the stream's own offset or at the end of file.
-    pub(super) struct FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
+    #[project = FileWriteStateProjection]
+    enum FileWriteState<Prepare, Submit> {
+        Idle,
+        Preparing { #[pin] future: Prepare },
+        Submitting { #[pin] future: Submit, len: usize },
+    }
+}
+
+pin_project! {
+    /// A file stream fills filesystem-owned destinations between awaits.
+    /// The held resolution keeps its mount busy throughout the stream.
+    pub(super) struct FileWriteConsumer<T, CpuImpl, Net, StorageImpl, W, Prepare, Submit>
     where
-        // `pin_project!` parses each where-clause bound as one path, so
-        // `Cpu` and `Clone` are two predicates here rather than `Cpu + Clone`.
         CpuImpl: Cpu,
         CpuImpl: Clone,
         Net: ComponentHostNetwork,
         StorageImpl: crate::Storage,
+        W: PreparedWrite,
     {
-        pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
-        pub(super) held: HeldPath<StorageImpl>,
-        pub(super) mode: WritePosition,
-        pub(super) start: fn(HeldPath<StorageImpl>, WritePosition, Vec<u8>, u64) -> Fut,
+        getter: fn(&mut T) -> &mut StoreData<CpuImpl, Net, StorageImpl>,
+        held: HeldPath<StorageImpl>,
+        mode: WritePosition,
+        prepare: fn(HeldPath<StorageImpl>, WritePosition, usize, u64) -> Prepare,
+        submit: fn(W::Filled) -> Submit,
         #[pin]
-        pub(super) pending: Option<Fut>,
-        pub(super) result: Option<oneshot::Sender<FsOpResult<()>>>,
+        state: FileWriteState<Prepare, Submit>,
+        result: Option<oneshot::Sender<FsOpResult<()>>>,
     }
 
-    impl<T, CpuImpl, Net, StorageImpl, Fut> PinnedDrop
-        for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
+    impl<T, CpuImpl, Net, StorageImpl, W, Prepare, Submit> PinnedDrop
+        for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, W, Prepare, Submit>
     where
         CpuImpl: Cpu,
         CpuImpl: Clone,
         Net: ComponentHostNetwork,
         StorageImpl: crate::Storage,
+        W: PreparedWrite,
     {
         fn drop(this: Pin<&mut Self>) {
             complete_file_transfer(this.project().result, Ok(()));
@@ -1009,13 +1024,7 @@ pub(super) fn file_write_consumer<T, CpuImpl, Net, StorageImpl>(
     held: HeldPath<StorageImpl>,
     mode: WritePosition,
     result: oneshot::Sender<FsOpResult<()>>,
-) -> FileWriteConsumer<
-    T,
-    CpuImpl,
-    Net,
-    StorageImpl,
-    impl core::future::Future<Output = ChunkWriteResult> + Send,
->
+) -> impl StreamConsumer<T, Item = u8>
 where
     T: 'static,
     CpuImpl: Cpu + Clone,
@@ -1026,19 +1035,22 @@ where
         getter,
         held,
         mode,
-        start: write_chunk::<StorageImpl>,
-        pending: None,
+        prepare: prepare_stream_write::<StorageImpl>,
+        submit: submit_stream_write::<StorageImpl>,
+        state: FileWriteState::Idle,
         result: Some(result),
     }
 }
 
-impl<T: 'static, CpuImpl, Net, StorageImpl, Fut> StreamConsumer<T>
-    for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, Fut>
+impl<T: 'static, CpuImpl, Net, StorageImpl, W, Prepare, Submit> StreamConsumer<T>
+    for FileWriteConsumer<T, CpuImpl, Net, StorageImpl, W, Prepare, Submit>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
-    Fut: core::future::Future<Output = ChunkWriteResult> + Send + 'static,
+    W: PreparedWrite + 'static,
+    Prepare: core::future::Future<Output = FsOpResult<W>> + Send + 'static,
+    Submit: core::future::Future<Output = FsOpResult<WriteProgress<W>>> + Send + 'static,
 {
     type Item = u8;
 
@@ -1046,42 +1058,84 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
-        mut source: Source<'_, Self::Item>,
-        _: bool,
+        source: Source<'_, Self::Item>,
+        finish: bool,
     ) -> Poll<Result<StreamResult>> {
         let mut this = self.project();
-        if this.pending.is_none() {
-            let available = source.remaining(&mut store);
-            if available == 0 {
-                return Poll::Ready(Ok(StreamResult::Completed));
-            }
-            let mut bytes = Vec::with_capacity(available);
-            source.read(&mut store, &mut bytes)?;
-            let now = (*this.getter)(store.data_mut()).now_nanos();
-            let write = (*this.start)(this.held.clone(), *this.mode, bytes, now);
-            this.pending.set(Some(write));
-        }
-        let written = match this.pending.as_mut().as_pin_mut() {
-            Some(pending) => match pending.poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(result) => result,
-            },
-            None => unreachable!("a write future was started above"),
-        };
-        this.pending.set(None);
-        match written {
-            Ok(written) => {
-                if let WritePosition::At(offset) = this.mode {
-                    *offset = offset.checked_add(written as u64).ok_or_else(|| {
-                        wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow)
-                    })?;
+        let now = (*this.getter)(store.data_mut()).now_nanos();
+        let mut source = source.as_direct(store);
+        loop {
+            let staged = match this.state.as_mut().project() {
+                FileWriteStateProjection::Idle => {
+                    if finish {
+                        return Poll::Ready(Ok(StreamResult::Cancelled));
+                    }
+                    let available = source.remaining().len();
+                    if available == 0 {
+                        return Poll::Ready(Ok(StreamResult::Completed));
+                    }
+                    let future = (*this.prepare)(this.held.clone(), *this.mode, available, now);
+                    this.state.set(FileWriteState::Preparing { future });
+                    continue;
                 }
-                Poll::Ready(Ok(StreamResult::Completed))
-            }
-            Err(error) => {
-                complete_file_transfer(this.result, Err(error));
-                Poll::Ready(Ok(StreamResult::Dropped))
-            }
+                FileWriteStateProjection::Preparing { future } => {
+                    if finish {
+                        this.state.set(FileWriteState::Idle);
+                        return Poll::Ready(Ok(StreamResult::Cancelled));
+                    }
+                    let result = match future.poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result,
+                    };
+                    this.state.set(FileWriteState::Idle);
+                    result
+                }
+                FileWriteStateProjection::Submitting { future, len } => {
+                    let result = match future.poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result,
+                    };
+                    let len = *len;
+                    this.state.set(FileWriteState::Idle);
+                    match result {
+                        Ok(progress) => {
+                            if let WritePosition::At(offset) = this.mode {
+                                *offset = offset.checked_add(len as u64).ok_or_else(|| {
+                                    wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow)
+                                })?;
+                            }
+                            match progress {
+                                WriteProgress::More(next) if !finish => Ok(next),
+                                // Cancellation completes the consumed round and drops any
+                                // unfilled next round without taking more guest bytes.
+                                _ => return Poll::Ready(Ok(StreamResult::Completed)),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            let staged = match staged {
+                Ok(staged) => staged,
+                Err(error) => {
+                    complete_file_transfer(this.result, Err(error));
+                    return Poll::Ready(Ok(StreamResult::Dropped));
+                }
+            };
+            let len = staged.staged_len();
+            let filled = {
+                let bytes = source.remaining();
+                let mut cursor = 0;
+                let filled = staged.fill(|_, destination| {
+                    let end = cursor + destination.len();
+                    destination.copy_from_slice(&bytes[cursor..end]);
+                    cursor = end;
+                });
+                source.mark_read(cursor);
+                filled
+            };
+            let future = (*this.submit)(filled);
+            this.state.set(FileWriteState::Submitting { future, len });
         }
     }
 }
@@ -1829,5 +1883,191 @@ pub(super) fn map_component_fs_path_error(
     match error {
         crate::ComponentFsPathError::InvalidBasePath => fs_types::ErrorCode::Invalid,
         crate::ComponentFsPathError::NotPermitted => fs_types::ErrorCode::NotPermitted,
+    }
+}
+
+#[cfg(test)]
+mod direct_write_tests {
+    use super::*;
+    use crate::UnsupportedStorage;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use crate::wasmtime_adapter::wasi::stream::test_source::{Reads, TrackedBuffer};
+    use core::sync::atomic::Ordering;
+    use futures_lite::future::{block_on, yield_now};
+    use std::sync::Arc;
+
+    type TestHeld = HeldPath<UnsupportedStorage>;
+
+    struct RoundWrite {
+        offset: usize,
+        len: usize,
+    }
+
+    struct FilledRound(RoundWrite);
+
+    impl PreparedWrite for RoundWrite {
+        type Filled = FilledRound;
+
+        fn staged_len(&self) -> usize {
+            // Two-byte test destinations force three rounds for the test source.
+            (self.len - self.offset).min(2)
+        }
+
+        fn fill<F>(mut self, mut fill: F) -> Self::Filled
+        where
+            F: FnMut(usize, &mut [u8]),
+        {
+            let mut destination = [0; 2];
+            let len = self.staged_len();
+            fill(self.offset, &mut destination[..len]);
+            assert_eq!(
+                &destination[..len],
+                &b"abcdef"[self.offset..self.offset + len]
+            );
+            self.offset += len;
+            FilledRound(self)
+        }
+    }
+
+    impl FilledWrite for FilledRound {
+        type Next = RoundWrite;
+
+        async fn submit(self) -> FsResult<WriteProgress<Self::Next>> {
+            yield_now().await;
+            Ok(if self.0.offset == self.0.len {
+                WriteProgress::Done(0)
+            } else {
+                WriteProgress::More(self.0)
+            })
+        }
+    }
+
+    async fn prepare_ready(
+        _: TestHeld,
+        _: WritePosition,
+        len: usize,
+        _: u64,
+    ) -> FsOpResult<RoundWrite> {
+        Ok(RoundWrite { offset: 0, len })
+    }
+
+    async fn prepare_pending(
+        held: TestHeld,
+        mode: WritePosition,
+        len: usize,
+        now: u64,
+    ) -> FsOpResult<RoundWrite> {
+        yield_now().await;
+        prepare_ready(held, mode, len, now).await
+    }
+
+    async fn submit(filled: FilledRound) -> FsOpResult<WriteProgress<RoundWrite>> {
+        filled.submit().await.map_err(fs_error_code)
+    }
+
+    pin_project! {
+        struct FinishAfterPending<C> {
+            #[pin]
+            consumer: C,
+            cancel: bool,
+            finish: bool,
+        }
+    }
+
+    impl<C: StreamConsumer<test_store::TestStoreData, Item = u8>>
+        StreamConsumer<test_store::TestStoreData> for FinishAfterPending<C>
+    {
+        type Item = u8;
+
+        fn poll_consume(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            store: wasmtime::StoreContextMut<'_, test_store::TestStoreData>,
+            source: Source<'_, u8>,
+            _: bool,
+        ) -> Poll<Result<StreamResult>> {
+            let this = self.project();
+            let result = this.consumer.poll_consume(cx, store, source, *this.finish);
+            match result {
+                Poll::Pending => {
+                    *this.finish = *this.cancel;
+                    Poll::Pending
+                }
+                Poll::Ready(Ok(result)) if *this.finish => {
+                    assert!(matches!(
+                        result,
+                        StreamResult::Cancelled | StreamResult::Completed
+                    ));
+                    Poll::Ready(Ok(StreamResult::Dropped))
+                }
+                result => result,
+            }
+        }
+    }
+
+    fn exercise<P>(
+        prepare: fn(TestHeld, WritePosition, usize, u64) -> P,
+        cancel: bool,
+        consumed: usize,
+    ) where
+        P: core::future::Future<Output = FsOpResult<RoundWrite>> + Send + 'static,
+    {
+        let mut config = wasmtime::Config::new();
+        config
+            .wasm_component_model(true)
+            .wasm_component_model_async(true);
+        let engine = wasmtime::Engine::new(&config).expect("stream engine");
+        let mut store = wasmtime::Store::new(&engine, test_store::store_data_with(|_| {}));
+        let held = store
+            .data()
+            .runtime_state
+            .root_namespace()
+            .resolve("/file")
+            .expect("resolution")
+            .held();
+        let (tx, rx) = oneshot::channel();
+        let consumer = FileWriteConsumer {
+            getter: |state| state,
+            held,
+            mode: WritePosition::At(0),
+            prepare,
+            submit,
+            state: FileWriteState::Idle,
+            result: Some(tx),
+        };
+        let consumer = FinishAfterPending {
+            consumer,
+            cancel,
+            finish: false,
+        };
+        let reads = Arc::new(Reads::default());
+        let source = TrackedBuffer {
+            bytes: b"abcdef",
+            reads: reads.clone(),
+        };
+        block_on(store.run_concurrent(async |accessor| {
+            accessor
+                .with(|mut store| StreamReader::new(&mut store, source)?.pipe(store, consumer))
+                .expect("connect stream");
+            rx.await.expect("completion sent").expect("write completed");
+        }))
+        .expect("stream event loop");
+        assert_eq!(reads.skipped.load(Ordering::Relaxed), consumed);
+        assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn pending_rounds_consume_each_source_byte_once() {
+        exercise(prepare_ready, false, 6);
+    }
+
+    #[test]
+    fn cancellation_while_preparing_leaves_source_unconsumed() {
+        exercise(prepare_pending, true, 0);
+    }
+
+    #[test]
+    fn cancellation_while_submitting_finishes_only_the_consumed_round() {
+        exercise(prepare_ready, true, 2);
     }
 }

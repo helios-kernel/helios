@@ -164,7 +164,7 @@ fn nanos(time: Timestamp) -> FsResult<u64> {
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<Device> {
-    type Write<'a> = Infallible;
+    type Write = Infallible;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.metadata(&self.inode(path).await?)
