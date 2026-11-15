@@ -112,7 +112,7 @@ impl GuestPages {
     }
     fn word(&self, offset: usize) -> &AtomicU64 {
         let frame = self.frames[offset / PhysFrame::SIZE];
-        let address = frame.phys_addr() + (offset % PhysFrame::SIZE & !7);
+        let address = frame.phys_addr() + ((offset % PhysFrame::SIZE) & !7);
         // SAFETY: frames are initialized, page-aligned and retained by self.
         // Every host access uses this same atomic width. No Rust slice or
         // exclusive reference is manufactured over concurrently running RAM.
