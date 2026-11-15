@@ -1136,6 +1136,49 @@ mod entry_tests {
     }
 
     #[test]
+    fn instance_extensions_are_guest_capabilities_not_renderer_wire_extensions() {
+        let entry = entry::<TestFactory>();
+        // SAFETY: all names and create-info arrays remain live for their calls.
+        unsafe {
+            let extensions = entry.enumerate_instance_extension_properties(None).unwrap();
+            assert_eq!(extensions.len(), 1);
+            assert_eq!(
+                extensions[0].extension_name_as_c_str().unwrap(),
+                ash::khr::get_physical_device_properties2::NAME
+            );
+            let names = [ash::khr::get_physical_device_properties2::NAME.as_ptr()];
+            let info = vk::InstanceCreateInfo::default().enabled_extension_names(&names);
+            let (transport, capset) = TestFactory::create().unwrap();
+            let recorded = transport.0.clone();
+            let config = TestFactory::configuration();
+            let connection =
+                Connection::new(transport, capset, config.layout, config.idle_timeout).unwrap();
+            let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
+                connection, &info, None,
+            )
+            .unwrap();
+            let state = recorded.lock().unwrap();
+            let name = ash::khr::get_physical_device_properties2::NAME.to_bytes();
+            assert!(
+                state
+                    .consumed
+                    .iter()
+                    .all(|command| !command.windows(name.len()).any(|bytes| bytes == name))
+            );
+            drop(state);
+            instance.destroy_instance(None);
+            let unsupported = [c"VK_MESA_venus_protocol".as_ptr()];
+            assert!(matches!(
+                entry.create_instance(
+                    &vk::InstanceCreateInfo::default().enabled_extension_names(&unsupported),
+                    None
+                ),
+                Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT)
+            ));
+        }
+    }
+
+    #[test]
     fn explicit_connection_is_used_for_instance_creation() {
         let (transport, capset) = TestFactory::create().unwrap();
         let recorded = transport.0.clone();

@@ -47,8 +47,11 @@ pub fn run() -> Result<(), Error> {
         let application = vk::ApplicationInfo::default()
             .application_name(c"helios-gpu-test")
             .api_version(version);
+        let extensions = [ash::khr::get_physical_device_properties2::NAME.as_ptr()];
         let instance = entry.create_instance(
-            &vk::InstanceCreateInfo::default().application_info(&application),
+            &vk::InstanceCreateInfo::default()
+                .application_info(&application)
+                .enabled_extension_names(&extensions),
             None,
         )?;
         let result = (|| {
@@ -67,7 +70,9 @@ pub fn run() -> Result<(), Error> {
                 .queue_priorities(&priorities)];
             let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut timeline);
-            instance.get_physical_device_features2(physical, &mut features);
+            let properties2 =
+                ash::khr::get_physical_device_properties2::Instance::new(&entry, &instance);
+            properties2.get_physical_device_features2(physical, &mut features);
             if timeline.timeline_semaphore == vk::FALSE {
                 return Err(Error::NoTimelineSemaphores);
             }

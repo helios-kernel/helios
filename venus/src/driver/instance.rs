@@ -190,7 +190,14 @@ unsafe extern "system" fn enumerate_version<F: Factory>(version: *mut u32) -> vk
     })
 }
 
-unsafe extern "system" fn enumerate_extensions<F: Factory>(
+fn supported_extensions() -> [(&'static CStr, u32); 1] {
+    [(
+        ash::khr::get_physical_device_properties2::NAME,
+        ash::khr::get_physical_device_properties2::SPEC_VERSION,
+    )]
+}
+
+unsafe extern "system" fn enumerate_extensions(
     layer: *const c_char,
     count: *mut u32,
     properties: *mut vk::ExtensionProperties,
@@ -199,18 +206,35 @@ unsafe extern "system" fn enumerate_extensions<F: Factory>(
     if !layer.is_null() {
         return vk::Result::ERROR_LAYER_NOT_PRESENT;
     }
-    global::<F>(|connection| {
-        // SAFETY: generated Vulkan structures have the C ABI layout, and
-        // the caller supplies count/capacity according to Vulkan enumeration.
-        unsafe {
-            wire::vn_call_vkEnumerateInstanceExtensionProperties(
-                connection,
-                layer,
-                count,
-                properties.cast(),
-            )
+    let extensions = supported_extensions();
+    // The renderer enumerates private wire extensions, not guest Vulkan
+    // extensions. These queries are core in the renderer's required Vulkan 1.1.
+    // SAFETY: Vulkan supplies a writable count and the declared output capacity.
+    unsafe {
+        if properties.is_null() {
+            *count = extensions.len() as u32;
+            return vk::Result::SUCCESS;
         }
-    })
+        let written = (*count as usize).min(extensions.len());
+        for (index, (name, version)) in extensions.iter().take(written).enumerate() {
+            let mut property = vk::ExtensionProperties::default();
+            for (slot, byte) in property
+                .extension_name
+                .iter_mut()
+                .zip(name.to_bytes_with_nul())
+            {
+                *slot = *byte as c_char;
+            }
+            property.spec_version = *version;
+            properties.add(index).write(property);
+        }
+        *count = written as u32;
+        if written < extensions.len() {
+            vk::Result::INCOMPLETE
+        } else {
+            vk::Result::SUCCESS
+        }
+    }
 }
 
 unsafe extern "system" fn enumerate_layers(
@@ -248,6 +272,24 @@ pub(super) unsafe fn create_on_connection<F: Factory>(
 ) -> vk::Result {
     // SAFETY: both callers supply writable output and Vulkan-valid inputs.
     unsafe { *output = vk::Instance::null() };
+    // Instance extensions are implemented in the guest. virglrenderer requires
+    // an empty extension list and enables its own host-side extensions.
+    let mut renderer_info = unsafe { *info };
+    if renderer_info.enabled_layer_count != 0 {
+        return vk::Result::ERROR_LAYER_NOT_PRESENT;
+    }
+    for index in 0..renderer_info.enabled_extension_count as usize {
+        // SAFETY: Vulkan requires enabled_extension_count live C-string pointers.
+        let name = unsafe { CStr::from_ptr(*renderer_info.pp_enabled_extension_names.add(index)) };
+        if !supported_extensions()
+            .iter()
+            .any(|(supported, _)| *supported == name)
+        {
+            return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+        }
+    }
+    renderer_info.enabled_extension_count = 0;
+    renderer_info.pp_enabled_extension_names = null();
     let allocator = unsafe { HostAllocator::new(allocator, vk::SystemAllocationScope::INSTANCE) };
     let owner = Arc::new(Exclusive::new(State::<F> {
         connection,
@@ -281,7 +323,12 @@ pub(super) unsafe fn create_on_connection<F: Factory>(
     // SAFETY: create-info and output satisfy Vulkan's contract; allocator
     // callbacks stay in the guest, while the renderer uses its own allocator.
     let result = unsafe {
-        wire::vn_call_vkCreateInstance(&mut state.connection, info.cast(), null(), &mut handle)
+        wire::vn_call_vkCreateInstance(
+            &mut state.connection,
+            (&raw const renderer_info).cast(),
+            null(),
+            &mut handle,
+        )
     };
     match result {
         Ok(result) if result == wire::VK_SUCCESS => {
@@ -417,7 +464,7 @@ pub(super) unsafe extern "system" fn get_instance_proc_addr<F: Factory>(
         b"vkGetInstanceProcAddr" => get_instance_proc_addr::<F> as *const (),
         b"vkCreateInstance" => create_instance::<F> as *const (),
         b"vkEnumerateInstanceVersion" => enumerate_version::<F> as *const (),
-        b"vkEnumerateInstanceExtensionProperties" => enumerate_extensions::<F> as *const (),
+        b"vkEnumerateInstanceExtensionProperties" => enumerate_extensions as *const (),
         b"vkEnumerateInstanceLayerProperties" => enumerate_layers as *const (),
         _ if instance == vk::Instance::null() => return None,
         b"vkDestroyInstance" => destroy_instance::<F> as *const (),
