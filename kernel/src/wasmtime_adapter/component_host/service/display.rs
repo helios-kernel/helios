@@ -726,7 +726,7 @@ where
         let (layout, hold) = accessor.with(|mut access| {
             Ok::<_, wasmtime::Error>(access.get().table.get(&image)?.clone().into_scanout())
         })?;
-        let (blob, mode, format) = (layout.blob, layout.mode, layout.format);
+        let (mode, format) = (layout.mode, layout.format);
         let (reply, answer) = oneshot::channel();
         let shown = sender
             .control(
@@ -740,16 +740,17 @@ where
                 answer,
             )
             .await;
-        if let Err(error) = shown {
-            return Ok(Err(to_wit_error(error)));
-        }
+        let source = match shown {
+            Ok(source) => source,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
         let surface = accessor.with(|mut access| {
             access.get().table.push(SurfaceHandle {
                 generation,
                 scanout,
                 mode,
                 format,
-                source: SurfaceSource::Blob { blob, scanout },
+                source,
                 view: None,
                 cursor: None,
                 vsync: Arc::new(SequenceSignal::new()),

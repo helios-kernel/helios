@@ -85,6 +85,10 @@ impl ClaimState {
     pub(super) const RELEASING: u8 = 2;
 }
 
+/// Identity of one blob surface within a display claim, independent of storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobSurfaceId(pub(super) u64);
+
 /// What a surface's pixels are read out of.
 ///
 /// Two kinds, because the display engine scans out two kinds of
@@ -94,11 +98,10 @@ impl ClaimState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceSource {
     Framebuffer(FramebufferId),
-    /// A blob on one scanout: one blob may be shown on several, one
-    /// surface each.
+    /// Distinct surfaces may retain the same blob on the same output.
     Blob {
         blob: BlobId,
-        scanout: ScanoutId,
+        surface: BlobSurfaceId,
     },
 }
 
@@ -140,7 +143,7 @@ pub(crate) enum ControlRequest {
         scanout: ScanoutId,
         layout: BlobScanout,
         hold: BlobHold,
-        reply: oneshot::Sender<Result<(), DisplayServiceError>>,
+        reply: oneshot::Sender<Result<SurfaceSource, DisplayServiceError>>,
     },
     DestroySurface {
         generation: u64,

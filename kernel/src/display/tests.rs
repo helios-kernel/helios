@@ -431,6 +431,122 @@ fn a_surface_is_attached_when_it_is_created_and_a_present_flushes_it() {
     );
 }
 
+#[test]
+fn destroying_a_replaced_framebuffer_keeps_the_new_scanout() {
+    test_hooks::install();
+    let (shared, control, _cursor) = display_channels();
+    let device = FakeDisplay::new();
+    let ownership = claimed(&shared);
+    with_server(&device, &shared, &control, async {
+        let first = create_surface(&ownership).await;
+        let second = create_surface(&ownership).await;
+        let claim = ownership.claim_ref().unwrap();
+        claim
+            .sender()
+            .control_oneway(ControlRequest::DestroySurface {
+                generation: claim.generation(),
+                surface: SurfaceSource::Framebuffer(first),
+            })
+            .await
+            .unwrap();
+        // A request/reply on the same control queue observes the destroy.
+        let (reply, answer) = oneshot::channel();
+        claim
+            .sender()
+            .control(
+                ControlRequest::Present {
+                    generation: claim.generation(),
+                    surface: SurfaceSource::Framebuffer(second),
+                    region: Rect::of(SMALL),
+                    vsync: Arc::new(crate::exec::SequenceSignal::new()),
+                    reply,
+                },
+                answer,
+            )
+            .await
+            .unwrap();
+        assert!(device.calls().contains(&Call::Destroy(first)));
+        assert!(!device.calls().contains(&Call::Blank(ScanoutId::new(0))));
+    });
+}
+
+#[test]
+fn repeated_blob_surfaces_have_distinct_identities_and_release_in_either_order() {
+    for newest_first in [false, true] {
+        test_hooks::install();
+        let (shared, control, _cursor) = display_channels();
+        let device = FakeDisplay::new();
+        let ownership = claimed(&shared);
+        let blob = BlobId::new(7);
+        let layout = BlobScanout {
+            blob,
+            mode: SMALL,
+            format: PixelFormat::Bgrx8888,
+            offset: 0,
+            stride: SMALL.width * 4,
+        };
+        let held_blob = Arc::new(crate::gpu::BlobShared::new(
+            blob,
+            u64::from(layout.stride) * u64::from(SMALL.height),
+            Arc::new(crate::exec::Notify::new()),
+        ));
+        with_server(&device, &shared, &control, async {
+            let claim = ownership.claim_ref().unwrap();
+            let sender = claim.sender();
+            let mut surfaces = Vec::new();
+            for _ in 0..2 {
+                let (reply, answer) = oneshot::channel();
+                surfaces.push(
+                    sender
+                        .control(
+                            ControlRequest::CreateBlobSurface {
+                                generation: claim.generation(),
+                                scanout: ScanoutId::new(0),
+                                layout,
+                                hold: BlobHold::new(&held_blob),
+                                reply,
+                            },
+                            answer,
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert_ne!(surfaces[0], surfaces[1]);
+            if newest_first {
+                surfaces.reverse();
+            }
+            for (index, surface) in surfaces.into_iter().enumerate() {
+                sender
+                    .control_oneway(ControlRequest::DestroySurface {
+                        generation: claim.generation(),
+                        surface,
+                    })
+                    .await
+                    .unwrap();
+                let (reply, answer) = oneshot::channel();
+                sender
+                    .control(
+                        ControlRequest::Scanouts {
+                            generation: claim.generation(),
+                            reply,
+                        },
+                        answer,
+                    )
+                    .await
+                    .unwrap();
+                let blanks = device
+                    .calls()
+                    .iter()
+                    .filter(|call| matches!(call, Call::Blank(_)))
+                    .count();
+                assert_eq!(blanks, usize::from(newest_first || index == 1));
+                assert_eq!(held_blob.is_retained(), index == 0);
+            }
+        });
+    }
+}
+
 /// A blob reaches its scanout once, through the blob scanout command, and
 /// every present after that is one flush of the blob's changed region.
 /// Releasing the claim blanks the output and destroys nothing: the blob
@@ -452,7 +568,6 @@ fn a_blob_surface_is_retained_once_and_each_present_flushes_the_blob() {
         stride: SMALL.width * 4,
     };
     let scanout = ScanoutId::new(0);
-    let surface = SurfaceSource::Blob { blob, scanout };
     // The gpu path's record of the blob, which the surface holds.
     let held_blob = Arc::new(crate::gpu::BlobShared::new(
         blob,
@@ -464,7 +579,7 @@ fn a_blob_surface_is_retained_once_and_each_present_flushes_the_blob() {
         let claim = ownership.claim_ref().expect("the claim is held");
         let (generation, sender) = (claim.generation(), claim.sender());
         let (reply, answer) = oneshot::channel();
-        sender
+        let surface = sender
             .control(
                 ControlRequest::CreateBlobSurface {
                     generation,

@@ -50,8 +50,8 @@ use crate::exec::monotonic_nanos;
 use crate::gpu::BlobHold;
 
 use super::service::{
-    ClaimState, ControlRequest, CursorRequest, DisplayService, DisplayShared, FrameToken,
-    REQUEST_QUEUE_DEPTH, SurfaceSource,
+    BlobSurfaceId, ClaimState, ControlRequest, CursorRequest, DisplayService, DisplayShared,
+    FrameToken, REQUEST_QUEUE_DEPTH, SurfaceSource,
 };
 use super::{DisplayServiceError, MAX_PINNED_FRAMES};
 
@@ -210,7 +210,7 @@ enum SurfaceResource {
     /// the blob until the scanout has stopped reading it.
     Blob {
         id: BlobId,
-        scanout: ScanoutId,
+        surface: BlobSurfaceId,
         hold: BlobHold,
     },
 }
@@ -219,9 +219,9 @@ impl SurfaceResource {
     const fn source(&self) -> SurfaceSource {
         match self {
             Self::Framebuffer { id, .. } => SurfaceSource::Framebuffer(*id),
-            Self::Blob { id, scanout, .. } => SurfaceSource::Blob {
+            Self::Blob { id, surface, .. } => SurfaceSource::Blob {
                 blob: *id,
-                scanout: *scanout,
+                surface: *surface,
             },
         }
     }
@@ -230,8 +230,8 @@ impl SurfaceResource {
 /// One surface the current claim created.
 struct SurfaceRecord {
     resource: SurfaceResource,
-    /// The output it was attached to, absent for a cursor plane's own
-    /// resource, which no scanout latches.
+    /// The output currently reading this resource; absent after replacement
+    /// or for a cursor plane, which no scanout latches.
     scanout: Option<ScanoutId>,
     /// How many frames it has published.
     sequence: u64,
@@ -244,6 +244,7 @@ struct SurfaceRecord {
 /// behind, and its resources are still here to be released.
 struct ClaimResources {
     generation: u64,
+    next_blob_surface: u64,
     surfaces: ArrayVec<SurfaceRecord, MAX_PINNED_FRAMES>,
     /// The outputs this claim pointed at something. Blanked before
     /// anything is destroyed, so the display engine is never reading a
@@ -255,14 +256,20 @@ impl ClaimResources {
     const fn new() -> Self {
         Self {
             generation: 0,
+            next_blob_surface: 0,
             surfaces: ArrayVec::new_const(),
             scanouts: ArrayVec::new_const(),
         }
     }
 
-    /// Remember that the claim pointed `scanout` at something, so the
-    /// release blanks it.
+    /// Transfer the active output away from its previous surface after the
+    /// device acknowledges replacement, and remember it for claim release.
     fn note_scanout(&mut self, scanout: ScanoutId) {
+        for record in &mut self.surfaces {
+            if record.scanout == Some(scanout) {
+                record.scanout = None;
+            }
+        }
         if !self.scanouts.contains(&scanout) && !self.scanouts.is_full() {
             self.scanouts.push(scanout);
         }
@@ -374,14 +381,11 @@ async fn serve_control_request<Device, CpuImpl>(
                 return;
             }
             let outcome = create_blob_surface(device, held, scanout, layout, hold).await;
-            if let Err(Ok(())) = reply.send(outcome) {
-                let surface = SurfaceSource::Blob {
-                    blob: layout.blob,
-                    scanout,
-                };
+            if let Err(Ok(surface)) = reply.send(outcome) {
                 destroy_surface(device, held, surface).await;
             }
         }
+
         ControlRequest::CreateCursor {
             format,
             backing,
@@ -467,6 +471,7 @@ async fn create_surface<Device: DisplayDevice>(
         release_framebuffer(device, framebuffer, backing).await;
         return Err(DisplayServiceError::from(error));
     }
+    held.note_scanout(scanout);
     held.surfaces.push(SurfaceRecord {
         resource: SurfaceResource::Framebuffer {
             id: framebuffer,
@@ -475,7 +480,6 @@ async fn create_surface<Device: DisplayDevice>(
         scanout: Some(scanout),
         sequence: 0,
     });
-    held.note_scanout(scanout);
     Ok(framebuffer)
 }
 
@@ -489,26 +493,35 @@ async fn create_blob_surface<Device: DisplayDevice>(
     scanout: ScanoutId,
     layout: helios_hal::display::BlobScanout,
     hold: BlobHold,
-) -> Result<(), DisplayServiceError> {
+) -> Result<SurfaceSource, DisplayServiceError> {
     debug_assert_eq!(hold.blob(), layout.blob, "the hold is on the blob shown");
     if held.surfaces.is_full() {
         return Err(DisplayServiceError::TooManySurfaces);
     }
+    let identity = held
+        .next_blob_surface
+        .checked_add(1)
+        .ok_or(DisplayServiceError::DeviceFault)?;
+    let surface = BlobSurfaceId(identity);
     device
         .set_scanout_blob(scanout, layout)
         .await
         .map_err(DisplayServiceError::from)?;
+    held.next_blob_surface = identity;
+    held.note_scanout(scanout);
     held.surfaces.push(SurfaceRecord {
         resource: SurfaceResource::Blob {
             id: layout.blob,
-            scanout,
+            surface,
             hold,
         },
         scanout: Some(scanout),
         sequence: 0,
     });
-    held.note_scanout(scanout);
-    Ok(())
+    Ok(SurfaceSource::Blob {
+        blob: layout.blob,
+        surface,
+    })
 }
 
 async fn create_cursor<Device: DisplayDevice>(
