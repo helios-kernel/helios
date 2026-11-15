@@ -432,9 +432,12 @@ Expected output contains:
   `helios_api::http_kit` (`wasi:sockets` and the monotonic clock); the
   plugin must be provisioned (`--boot-program http-client`) or
   `wasi:http/client` reports `configuration-error`. `https://` runs rustls
-  against the Mozilla roots compiled in (`webpki-roots`), checking validity
+  against the Mozilla roots compiled in (`webpki-roots`) plus the optional
+  PEM bundle at `/etc/ssl/certs/ca-certificates.crt`, checking validity
   against `wasi:clocks/wall-clock`; an untrusted, expired or mismatched
-  certificate is the typed `TLS-certificate-error`.
+  certificate is the typed `TLS-certificate-error`. CI supplies its own CA
+  through bootfs and serves valid, expired, wrong-host and self-signed
+  certificates on the runner with `tools/wasi-apps/tls-smoke.py`.
 - `tools/wasi-apps/extract-webc-wasm.pl` extracts the single raw wasm atom
   from the pinned Wasmer WEBc images. The build script validates both WEBc
   and raw wasm SHA-256 digests before staging.
