@@ -15,6 +15,16 @@ __helios_aarch64_cpu_resume:
     lsr x1, x1, #2
     cmp x1, #2
     b.ne 2f
+    ldr x1, [x0, #304]
+    cmp x1, #8
+    b.ne 1f
+    // Restore VHE before using the EL1 accessors that alias host EL2
+    // registers. The saved translation regime must stay at its owner EL.
+    ldr x1, [x0, #312]
+    msr hcr_el2, x1
+    isb
+    b 2f
+1:
     // Entered at EL2: configure it to run EL1 as AArch64 with the
     // generic timer, FP/SIMD and the identification registers visible,
     // then drop to EL1 at the next instruction.

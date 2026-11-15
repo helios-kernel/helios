@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "aarch64-paging"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33031af061bdc70425bc55be120e6ac1801d5613aeb84906a282febadf72176e"
+dependencies = [
+ "bitflags 2.13.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "acpi"
 version = "7.0.0-pre1"
 source = "git+https://github.com/lexoliu/acpi?branch=helios#a4207d9f8f7feccdc409232762953674a75f523d"
@@ -2056,11 +2066,13 @@ dependencies = [
 name = "helios-aarch64"
 version = "0.1.0"
 dependencies = [
+ "aarch64-paging",
  "acpi",
  "arm-gic",
  "arm-sysregs",
  "bytes",
  "critical-section",
+ "crossbeam-utils",
  "fdt",
  "helios-acpi",
  "helios-artifact",
