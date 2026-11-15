@@ -456,6 +456,8 @@ def helios_command(
     unit_order: dict[str, UnitOrder],
     profile_boot: bool,
     helios_pass: bool = False,
+    *,
+    build_images: bool,
 ) -> PlannedCommand:
     """The driver invocation that times the Helios image, and the baseline
     images beside it when the run is paired, under ``out_root``.
@@ -488,9 +490,9 @@ def helios_command(
             "--helios-accel",
             lane.accelerator,
             "--skip-linux",
-            # The driver's boots never build; this is also the build it
-            # does before them, which a prebuilt run has no host for.
-            *(["--helios-skip-build"] if options.prebuilt else []),
+            # Only the first pass builds. Repeat measurements keep the
+            # same artifacts, including each column's profile and tooling.
+            *([] if build_images else ["--helios-skip-build"]),
             *([] if profile_boot else ["--helios-no-profile-boot"]),
             "--helios-timeout-seconds",
             str(options.helios_timeout_seconds),
@@ -608,6 +610,7 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                         # The untimed profile boot is the first pass's artifact.
                         options.profile_boot and number == 1,
                         helios_pass=True,
+                        build_images=number == 1 and not options.prebuilt,
                     ),
                     side="helios",
                     round=number,
@@ -1271,6 +1274,7 @@ def retake_plan(
         f"measure {', '.join(names)} again on every Helios image: {reason}",
         unit_order,
         profile_boot=False,
+        build_images=False,
     )
 
 
@@ -1501,6 +1505,7 @@ def retry(
             f"the first pass's noise floor crossed the {result.floor_bound:.3f} bound",
             orders,
             profile_boot=False,
+            build_images=False,
         )
     )
     second_sides = read_sides(retry_options, thresholds)

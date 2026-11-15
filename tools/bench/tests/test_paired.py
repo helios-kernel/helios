@@ -297,7 +297,9 @@ def three_images(driver, tmp_path) -> list:
     return [*images, rebuild]
 
 
-def run_three(driver, tmp_path, images: list, unit_orders: dict[str, str] | None) -> list[str]:
+def run_three(
+    driver, tmp_path, images: list, unit_orders: dict[str, str] | None, *, skip_build=False
+) -> list[str]:
     driver.run_helios(
         Path("tools/wasi-apps/workloads.json"),
         images,
@@ -309,13 +311,26 @@ def run_three(driver, tmp_path, images: list, unit_orders: dict[str, str] | None
         timeout_seconds=60,
         side_timeout_seconds=600,
         build_timeout_seconds=60,
-        skip_build=False,
+        skip_build=skip_build,
         control_workload=None,
         keep_going=True,
         unit_orders=unit_orders,
         profile_boot=False,
     )
     return [guest for _, guest, _, _ in boot_order(tmp_path / "order")]
+
+
+def test_repeat_measurement_boots_the_same_three_images_without_building(driver, tmp_path, monkeypatch):
+    images = three_images(driver, tmp_path)
+    first_order = run_three(driver, tmp_path, images, None)
+    first_builds = (tmp_path / "builds").read_text()
+    assert first_builds.splitlines() == ["built"] * 3
+    artifacts = [driver.guest_artifact_digest(image, "x86-64", "kvm") for image in images]
+    monkeypatch.setattr(driver, "build_helios", lambda *args: pytest.fail("repeat pass rebuilt an image"))
+
+    assert run_three(driver, tmp_path, images, None, skip_build=True) == first_order * 2
+    assert (tmp_path / "builds").read_text() == first_builds
+    assert [driver.guest_artifact_digest(image, "x86-64", "kvm") for image in images] == artifacts
 
 
 def test_a_rebuilt_side_boots_three_images_with_the_baseline_in_the_middle(driver, tmp_path) -> None:
