@@ -169,8 +169,10 @@ impl Trees {
             if level >= MAX_LEVEL {
                 return Err(WriteError::Height { tree: root.tree });
             }
-            let branch = Branch::new(Header::for_level(&original_root, level), children);
-            children = Vec::new();
+            let branch = Branch::new(
+                Header::for_level(&original_root, level),
+                core::mem::take(&mut children),
+            );
             for range in branch.partitions() {
                 let first = branch.first_key(&range).expect("nonempty new root");
                 let fresh = allocator.allocate(root.tree, level, first)?;
