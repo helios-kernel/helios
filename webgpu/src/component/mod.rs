@@ -29,3 +29,5 @@ pub mod pipeline;
 pub mod capability;
 
 pub mod adapter;
+
+pub mod gpu;

@@ -17,6 +17,26 @@ pub struct Adapter {
     consumed: Cell<bool>,
 }
 
+impl wit::GuestGpuAdapter for Adapter {
+    fn features(&self) -> wit::GpuSupportedFeatures {
+        self.features()
+    }
+    fn limits(&self) -> wit::GpuSupportedLimits {
+        self.limits()
+    }
+    fn info(&self) -> wit::GpuAdapterInfo {
+        self.info()
+    }
+    async fn request_device(
+        &self,
+        descriptor: Option<wit::GpuDeviceDescriptor>,
+    ) -> Result<wit::GpuDevice, wit::RequestDeviceError> {
+        Adapter::request_device(self, descriptor)
+            .await
+            .map(wit::GpuDevice::new)
+    }
+}
+
 impl Adapter {
     /// Core WebGPU requires the default limits and every core downlevel flag.
     pub fn core(raw: Arc<instance::Adapter>) -> Option<Self> {

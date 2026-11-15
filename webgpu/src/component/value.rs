@@ -164,19 +164,12 @@ impl wit::GuestGpuSupportedFeatures for Features {
     }
 }
 
-pub struct LanguageFeatures(pub wgpu::WgslLanguageFeatures);
+pub struct LanguageFeatures;
 impl wit::GuestWgslLanguageFeatures for LanguageFeatures {
     fn has(&self, value: String) -> bool {
-        use wgpu::WgslLanguageFeatures as F;
-        let flag = match value.as_str() {
-            "readonly_and_readwrite_storage_textures" => F::ReadOnlyAndReadWriteStorageTextures,
-            "packed_4x8_integer_dot_product" => F::Packed4x8IntegerDotProduct,
-            "unrestricted_pointer_parameters" => F::UnrestrictedPointerParameters,
-            "pointer_composite_access" => F::PointerCompositeAccess,
-            "immediate_address_space" => F::ImmediateAddressSpace,
-            _ => return false,
-        };
-        self.0.contains(flag)
+        wgpu_core::naga::front::wgsl::ImplementedLanguageExtension::all()
+            .iter()
+            .any(|extension| extension.to_ident() == value)
     }
 }
 

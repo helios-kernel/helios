@@ -1,6 +1,6 @@
 //! Owned wgpu-core resources match the component's independently owned handles.
 
-use crate::runtime::{DeviceLoss, DeviceLost, open_instance};
+use crate::runtime::{DeviceLoss, open_instance};
 use helios_api::sync::{Timeline, TimelineError, wait_all};
 use helios_venus::helios;
 use std::sync::Arc;
@@ -58,8 +58,25 @@ impl Device {
         Ok(Self { raw, queue, loss })
     }
 
-    pub async fn lost(&self) -> DeviceLost {
-        self.loss.wait().await
+    pub(crate) fn loss(&self) -> DeviceLoss {
+        self.loss.clone()
+    }
+
+    pub async fn destroy(&self) -> Result<(), CompletionError> {
+        let completion = self.completion();
+        self.raw.destroy();
+        let completion = async {
+            let timeline = completion?;
+            wait_all(&[timeline.point(1)], None).await?;
+            Ok::<(), CompletionError>(())
+        }
+        .await;
+        // Poll even after a failed wait: native device loss can release its
+        // notification and mapping callbacks during maintenance.
+        let maintenance = self.raw.poll(wgpu_types::PollType::Poll);
+        completion?;
+        maintenance?;
+        Ok(())
     }
 
     pub fn completion(&self) -> Result<Timeline, CompletionError> {

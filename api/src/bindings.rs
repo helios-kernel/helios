@@ -91,6 +91,11 @@ crate::wit_bindgen::generate!({
 crate::wit_bindgen::generate!({
     path: "../wit",
     world: "webgpu-provider",
+    async: [
+        "export:wasi:webgpu/webgpu@0.3.0-rc.2#[method]gpu-device.lost",
+        "export:wasi:webgpu/webgpu@0.3.0-rc.2#[method]gpu-device.on-uncaptured-error",
+        "export:wasi:webgpu/webgpu@0.3.0-rc.2#[method]gpu-device.destroy",
+    ],
     generate_all,
     default_bindings_module: "bindings",
     pub_export_macro: true,

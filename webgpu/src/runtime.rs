@@ -151,7 +151,7 @@ impl Device {
         self.errors.clone()
     }
 
-    pub async fn lost(&self) -> DeviceLost {
+    pub async fn lost(&self) -> Result<DeviceLost, LossNotificationClosed> {
         self.loss.wait().await
     }
 
@@ -194,10 +194,15 @@ impl Device {
 }
 
 /// Closure of the notification channel broadcasts loss to every waiter.
+#[derive(Clone)]
 pub(crate) struct DeviceLoss {
     value: Arc<OnceLock<DeviceLost>>,
     wake: Receiver<()>,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("native device released its loss callback without a notification")]
+pub struct LossNotificationClosed;
 
 impl DeviceLoss {
     pub(crate) fn new() -> (
@@ -219,11 +224,52 @@ impl DeviceLoss {
         )
     }
 
-    pub(crate) async fn wait(&self) -> DeviceLost {
+    pub(crate) async fn wait(&self) -> Result<DeviceLost, LossNotificationClosed> {
         let _ = self.wake.recv().await;
-        self.value
-            .get()
-            .expect("device loss is published before notification closes")
-            .clone()
+        self.value.get().cloned().ok_or(LossNotificationClosed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    #[test]
+    fn loss_notification_reaches_current_and_later_waiters() {
+        let (loss, notify) = DeviceLoss::new();
+        let second = loss.clone();
+        let mut first_wait = pin!(loss.wait());
+        let mut second_wait = pin!(second.wait());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(first_wait.as_mut().poll(&mut cx).is_pending());
+        assert!(second_wait.as_mut().poll(&mut cx).is_pending());
+        notify(wgpu::DeviceLostReason::Destroyed, "retired".into());
+        for result in [
+            first_wait.as_mut().poll(&mut cx),
+            second_wait.as_mut().poll(&mut cx),
+            pin!(loss.wait()).as_mut().poll(&mut cx),
+        ] {
+            let Poll::Ready(Ok(info)) = result else {
+                panic!("loss notification was not delivered");
+            };
+            assert_eq!(info.reason, wgpu::DeviceLostReason::Destroyed);
+            assert_eq!(info.message, "retired");
+        }
+    }
+
+    #[test]
+    fn released_callback_returns_a_typed_error() {
+        let (loss, notify) = DeviceLoss::new();
+        drop(notify);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            pin!(loss.wait()).as_mut().poll(&mut cx),
+            Poll::Ready(Err(LossNotificationClosed))
+        ));
     }
 }

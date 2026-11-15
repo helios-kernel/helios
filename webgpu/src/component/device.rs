@@ -14,7 +14,7 @@ use super::{
     render::{BundleEncoder, RenderRecorder},
     resource::{QuerySet, Texture},
     state::DeviceState,
-    value::{CompilationMessage, Object, Shader},
+    value::{CompilationMessage, Features, Limits, Object, Shader},
     wit,
 };
 
@@ -397,6 +397,172 @@ impl Device {
             kind: descriptor.type_,
             count: descriptor.count,
         }))
+    }
+}
+
+macro_rules! create_resource {
+    ($name:ident, $descriptor:ty, $result:ty) => {
+        fn $name(&self, descriptor: $descriptor) -> $result {
+            Device::$name(self, descriptor)
+        }
+    };
+}
+
+impl wit::GuestGpuDevice for Device {
+    fn label(&self) -> String {
+        self.object.label()
+    }
+    fn set_label(&self, label: String) {
+        self.object.set_label(label);
+    }
+    fn features(&self) -> wit::GpuSupportedFeatures {
+        wit::GpuSupportedFeatures::new(Features {
+            raw: *self.object.owner.device.raw.features(),
+            core: true,
+        })
+    }
+    fn limits(&self) -> wit::GpuSupportedLimits {
+        let raw = &self.object.owner.device.raw;
+        wit::GpuSupportedLimits::new(Limits {
+            raw: raw.limits().clone(),
+            stages: raw.downlevel().flags,
+        })
+    }
+    fn adapter_info(&self) -> wit::GpuAdapterInfo {
+        wit::GpuAdapterInfo::new(super::resource::AdapterInfo(self.info.clone()))
+    }
+    fn queue(&self) -> wit::GpuQueue {
+        wit::GpuQueue::new(self.queue.clone())
+    }
+
+    async fn destroy(&self) {
+        if let Err(error) = self.object.owner.device.destroy().await {
+            self.object.owner.errors.report(crate::runtime::GpuError {
+                kind: crate::runtime::GpuErrorKind::Internal,
+                message: error.to_string(),
+                causes: Vec::new(),
+            });
+        }
+    }
+
+    create_resource!(create_buffer, wit::GpuBufferDescriptor, wit::GpuBuffer);
+    create_resource!(create_texture, wit::GpuTextureDescriptor, wit::GpuTexture);
+    create_resource!(
+        create_sampler,
+        Option<wit::GpuSamplerDescriptor>,
+        wit::GpuSampler
+    );
+    create_resource!(
+        create_bind_group_layout,
+        wit::GpuBindGroupLayoutDescriptor,
+        wit::GpuBindGroupLayout
+    );
+    create_resource!(
+        create_pipeline_layout,
+        wit::GpuPipelineLayoutDescriptor<'_>,
+        wit::GpuPipelineLayout
+    );
+    create_resource!(
+        create_bind_group,
+        wit::GpuBindGroupDescriptor<'_>,
+        wit::GpuBindGroup
+    );
+    create_resource!(
+        create_shader_module,
+        wit::GpuShaderModuleDescriptor<'_>,
+        wit::GpuShaderModule
+    );
+    create_resource!(
+        create_compute_pipeline,
+        wit::GpuComputePipelineDescriptor<'_>,
+        wit::GpuComputePipeline
+    );
+    create_resource!(
+        create_render_pipeline,
+        wit::GpuRenderPipelineDescriptor<'_>,
+        wit::GpuRenderPipeline
+    );
+    create_resource!(
+        create_command_encoder,
+        Option<wit::GpuCommandEncoderDescriptor>,
+        wit::GpuCommandEncoder
+    );
+    create_resource!(
+        create_render_bundle_encoder,
+        wit::GpuRenderBundleEncoderDescriptor,
+        wit::GpuRenderBundleEncoder
+    );
+    create_resource!(create_query_set, wit::GpuQuerySetDescriptor, Result<wit::GpuQuerySet, wit::CreateQuerySetError>);
+
+    async fn create_compute_pipeline_async(
+        &self,
+        descriptor: wit::GpuComputePipelineDescriptor<'_>,
+    ) -> Result<wit::GpuComputePipeline, wit::CreatePipelineError> {
+        Device::create_compute_pipeline_async(self, descriptor).await
+    }
+    async fn create_render_pipeline_async(
+        &self,
+        descriptor: wit::GpuRenderPipelineDescriptor<'_>,
+    ) -> Result<wit::GpuRenderPipeline, wit::CreatePipelineError> {
+        Device::create_render_pipeline_async(self, descriptor).await
+    }
+
+    fn push_error_scope(&self, filter: wit::GpuErrorFilter) {
+        use crate::runtime::GpuErrorKind;
+        self.object.owner.errors.push(match filter {
+            wit::GpuErrorFilter::Validation => GpuErrorKind::Validation,
+            wit::GpuErrorFilter::OutOfMemory => GpuErrorKind::OutOfMemory,
+            wit::GpuErrorFilter::Internal => GpuErrorKind::Internal,
+        });
+    }
+    async fn pop_error_scope(&self) -> Result<Option<wit::GpuError>, wit::PopErrorScopeError> {
+        self.object
+            .owner
+            .errors
+            .pop()
+            .map(|error| error.map(wit::GpuError::new))
+            .map_err(|error| wit::PopErrorScopeError {
+                kind: wit::PopErrorScopeErrorKind::OperationError,
+                message: error.to_string(),
+            })
+    }
+
+    async fn lost(&self) -> helios_api::wit_bindgen::FutureReader<wit::GpuDeviceLostInfo> {
+        use crate::runtime::DeviceLost;
+        // A cancelled producer must complete its canonical future. Cancellation
+        // ends this observer, so it reports an unknown reason rather than
+        // fabricating a successful device-destruction notification.
+        let (writer, reader) = helios_api::bindings::wit_future::new(|| {
+            wit::GpuDeviceLostInfo::new(DeviceLost {
+                reason: wgpu_types::DeviceLostReason::Unknown,
+                message: "device loss observation was cancelled".into(),
+            })
+        });
+        let loss = self.object.owner.device.loss();
+        helios_api::task::spawn(async move {
+            // This task owns only the notification channel, not the device.
+            // The component never replaces the callback: closure without a
+            // notification means that the native device has been released.
+            let lost = loss.wait().await.unwrap_or_else(|error| DeviceLost {
+                reason: wgpu_types::DeviceLostReason::Destroyed,
+                message: error.to_string(),
+            });
+            let _ = writer.write(wit::GpuDeviceLostInfo::new(lost)).await;
+        });
+        reader
+    }
+
+    async fn on_uncaptured_error(&self) -> helios_api::wit_bindgen::StreamReader<wit::GpuError> {
+        let events = self.object.owner.errors.events();
+        let (mut writer, reader) = helios_api::bindings::wit_stream::new();
+        helios_api::task::spawn(async move {
+            while let Ok(error) = events.recv().await {
+                if writer.write_one(wit::GpuError::new(error)).await.is_some() {
+                    break;
+                }
+            }
+        });
+        reader
     }
 }
 
