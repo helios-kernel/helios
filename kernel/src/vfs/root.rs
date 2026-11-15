@@ -226,7 +226,7 @@ impl RootFs {
 }
 
 /// A write to a namespace's root, staged at once like the tree it lands
-/// in. A boot-image file is copied up when the write is submitted, so a
+/// in. A boot-image file is copied up when the write is filled, so a
 /// write dropped before then leaves the boot layer serving the file.
 pub struct RootWrite<'a> {
     root: &'a RootFs,
@@ -272,17 +272,18 @@ impl<'a> RootWrite<'a> {
 }
 
 impl PreparedWrite for RootWrite<'_> {
+    type Filled = FsResult<WriteProgress<Self>>;
+
     fn staged_len(&self) -> usize {
         self.len
     }
 
-    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    fn fill<F>(self, fill: F) -> Self::Filled
     where
         F: FnMut(usize, &mut [u8]),
     {
-        // The copy-up and the write are done here; the future only reports
-        // them, so it holds nothing of `fill`.
-        core::future::ready(self.land(fill).map(WriteProgress::Done))
+        // Copy-up and writing finish before the source borrow ends.
+        self.land(fill).map(WriteProgress::Done)
     }
 }
 

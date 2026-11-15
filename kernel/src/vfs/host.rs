@@ -12,12 +12,11 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::future::Future;
 
 use bytes::Bytes;
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    DeviceId, DirCookie, DirEntry, FileSystem, FilledWrite, FsError, FsPath, FsResult, Metadata,
+    NodeId, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
 };
 
 use crate::{
@@ -101,21 +100,33 @@ pub struct HostShareWrite<W> {
 }
 
 impl<W: HostWrite> PreparedWrite for HostShareWrite<W> {
+    type Filled = FilledHostShareWrite<W::Filled>;
+
     fn staged_len(&self) -> usize {
         self.write.staged_len()
     }
 
-    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    fn fill<F>(self, fill: F) -> Self::Filled
     where
         F: FnMut(usize, &mut [u8]),
     {
-        // Filled here, so the future holds nothing of `fill`.
-        let filled = self.write.fill(fill);
-        async move {
-            match filled.submit().await.map_err(fs_error_from_host)? {
-                WriteProgress::More(write) => Ok(WriteProgress::More(Self { write })),
-                WriteProgress::Done(landed) => Ok(WriteProgress::Done(landed)),
-            }
+        FilledHostShareWrite(self.write.fill(fill))
+    }
+}
+
+/// A host-share round whose transport destinations contain their bytes.
+pub struct FilledHostShareWrite<W>(W);
+
+impl<W: HostFilledWrite> FilledWrite for FilledHostShareWrite<W>
+where
+    W::Next: HostWrite,
+{
+    type Next = HostShareWrite<W::Next>;
+
+    async fn submit(self) -> FsResult<WriteProgress<Self::Next>> {
+        match self.0.submit().await.map_err(fs_error_from_host)? {
+            WriteProgress::More(write) => Ok(WriteProgress::More(HostShareWrite { write })),
+            WriteProgress::Done(landed) => Ok(WriteProgress::Done(landed)),
         }
     }
 }

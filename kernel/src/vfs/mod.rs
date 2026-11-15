@@ -68,8 +68,8 @@ use bytes::{Bytes, BytesMut};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
-    Metadata, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FilledWrite, FsError, FsPath,
+    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -223,27 +223,36 @@ macro_rules! mount_kinds {
         }
 
         impl<'a, S: Storage> PreparedWrite for MountedWrite<'a, S> {
+            type Filled = MountedFilledWrite<'a, S>;
+
             fn staged_len(&self) -> usize {
                 match self { $(Self::$kind(write) => write.staged_len(),)+ }
             }
 
-            #[expect(
-                unreachable_code,
-                reason = "the boot image refuses every write, so its staged write is `Infallible` and its arm is never reached"
-            )]
-            fn submit<F>(
-                self,
-                fill: F,
-            ) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+            #[expect(unreachable_code, reason = "read-only filesystems cannot stage writes")]
+            fn fill<F>(self, fill: F) -> Self::Filled
             where
                 F: FnMut(usize, &mut [u8]),
             {
-                // Each kind runs `fill` in this call, so the dispatch must
-                // too: the arms' futures are carried in one enum rather
-                // than awaited in an async body that would hold `fill`.
+                match self {
+                    $(Self::$kind(write) => MountedFilledWrite::$kind(write.fill(fill)),)+
+                }
+            }
+        }
+
+        /// A filled round of the mounted filesystem, with no source borrow.
+        pub enum MountedFilledWrite<'a, S: Storage> {
+            $($kind(<<$fs as FileSystem>::Write<'a> as PreparedWrite>::Filled),)+
+        }
+
+        impl<'a, S: Storage> FilledWrite for MountedFilledWrite<'a, S> {
+            type Next = MountedWrite<'a, S>;
+
+            #[expect(unreachable_code, reason = "read-only filesystems cannot stage writes")]
+            fn submit(self) -> impl Future<Output = FsResult<WriteProgress<Self::Next>>> + Send {
                 match self {
                     $(Self::$kind(write) => MountedSubmit::$kind {
-                        future: write.submit(fill),
+                        future: write.submit(),
                         marker: PhantomData,
                     },)+
                 }

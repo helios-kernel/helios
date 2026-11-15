@@ -471,7 +471,7 @@ where
 
 /// Stages a write of `len` bytes at `position` through `resolved`, for a
 /// caller that fills each round itself straight from where its bytes are
-/// ([`helios_hal::fs::PreparedWrite::submit`]) and has to wait before a
+/// ([`helios_hal::fs::PreparedWrite::fill`]) and has to wait before a
 /// round for those bytes to be readable, as guest pages back from swap.
 /// The rounds land at consecutive offsets from the one the write begins
 /// at, which the last submit answers.
