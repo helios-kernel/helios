@@ -64,6 +64,15 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
             assert f"wasm-{catalog[name]['guest-wasm']}" in ci_jobs[name]["needs"]
 
 
+def test_every_selected_review_job_has_a_fifteen_minute_limit(ci_jobs, tmp_path):
+    selected = select_lanes(ci_jobs, tmp_path, changed=None, heavy=False)
+    jobs = {"changes", "checks", "tests", "gate"}
+    jobs.update(name for name in json.loads(selected["lanes"]) if name in ci_jobs)
+    jobs.update(f"wasm-{profile}" for profile in json.loads(selected["wasm_profiles"]))
+    for name in jobs:
+        assert int(ci_jobs[name]["timeout-minutes"]) <= 15, name
+
+
 @pytest.mark.parametrize(
     ("paths", "rust"),
     [
