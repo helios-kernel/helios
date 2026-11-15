@@ -81,6 +81,7 @@ runs:
         entry="$(uv run helios-bench lanes --select "${{ inputs.lane }}" --format github-matrix | jq -c '.[0]')"
         printf 'memory=%s\n' "$(printf '%s' "$entry" | jq -r '.memory')" >> "$GITHUB_OUTPUT"
         printf 'vcpus=%s\n' "$(printf '%s' "$entry" | jq -r '.vcpus')" >> "$GITHUB_OUTPUT"
+        printf 'rpc-transport=%s\n' "$(printf '%s' "$entry" | jq -r '.["rpc-transport"]')" >> "$GITHUB_OUTPUT"
     - name: Put llvm-profdata on PATH
       # The inspector merges the raw profile before it writes anything and
       # names this tool if it cannot find it; the toolchain's own copy is
@@ -105,6 +106,7 @@ runs:
         ./target/release/helios-inspector vm --arch x86-64 --profile-generate \
           --accel kvm --memory "${{ steps.lane.outputs.memory }}" \
           --smp "${{ steps.lane.outputs.vcpus }}" \
+          --rpc-transport "${{ steps.lane.outputs.rpc-transport }}" \
           --runtime-dir "${RUNNER_TEMP}/kernel-profile-raw/aot-runtime" \
           aot-bench artifacts/wasi-tools/curl.wasm --iterations 2 \
           --timeout-seconds "${{ inputs.workload-timeout-seconds }}" \
