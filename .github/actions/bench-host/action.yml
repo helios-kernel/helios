@@ -102,7 +102,7 @@ runs:
           ${{ inputs.checkout-path }}/artifacts/wasi-tools
           ${{ inputs.checkout-path }}/artifacts/python3-root
           ${{ inputs.checkout-path }}/artifacts/wasix
-        key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/tools/wasi-apps/**', inputs.checkout-path), format('{0}/Cargo.lock', inputs.checkout-path)) }}
+        key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/tools/wasi-apps/**', inputs.checkout-path), format('{0}/api/**', inputs.checkout-path), format('{0}/api-macro/**', inputs.checkout-path), format('{0}/wit/**', inputs.checkout-path), format('{0}/Cargo.toml', inputs.checkout-path), format('{0}/Cargo.lock', inputs.checkout-path), format('{0}/rust-toolchain.toml', inputs.checkout-path), format('{0}/.cargo/config.toml', inputs.checkout-path)) }}
     - name: Stage WASI tooling artifacts
       if: steps.artifact-cache.outputs.cache-hit != 'true'
       shell: bash
