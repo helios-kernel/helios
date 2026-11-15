@@ -140,8 +140,12 @@ impl Transport for Context {
     }
 
     fn execute(&mut self, commands: &[u8], ring: u8, fence: Option<u64>) -> Result<(), Error> {
+        let completion = fence.map(|fence| gpu::Completion {
+            fence,
+            signals: Vec::new(),
+        });
         self.context
-            .execute(commands, ring, fence)
+            .execute(commands, ring, completion.as_ref())
             .map_err(Error::from)
     }
 

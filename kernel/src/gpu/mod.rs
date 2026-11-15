@@ -103,7 +103,10 @@ pub use service::{
     BlobShared, ContextRecord, ContextShared, Gpu3dSender, Gpu3dService, Gpu3dSession,
     RingTimeline, ScanoutHold, SessionId,
 };
-pub(crate) use service::{BlobSpec, Gpu3dRequest, InlineCommands, SubmitCommands, SubmitRequest};
+pub(crate) use service::{
+    BlobSpec, CompletionSignal, Gpu3dRequest, InlineCommands, SubmitCommands, SubmitCompletion,
+    SubmitRequest,
+};
 
 /// Why a 3D request was refused.
 ///

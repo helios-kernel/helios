@@ -38,6 +38,13 @@ package helios:system@0.1.0;
 /// finished the work.
 interface gpu {
   use memory.{span};
+  use sync.{signal-point};
+
+  /// Signals advance only when this fence retires successfully.
+  record completion {
+    fence: u64,
+    signals: list<signal-point>,
+  }
 
   /// Why a request was refused.
   enum error {
@@ -174,7 +181,7 @@ interface gpu {
     commands: async func(buffer: span) -> result<command-buffer, error>;
 
     /// Hand the device `length` bytes of `commands` starting at
-    /// `offset`, on `ring`, fenced at `fence` when one is given.
+    /// `offset`, on `ring`, fenced at `completion.fence` when completion is requested.
     ///
     /// The returned future resolves when the command is on the device's
     /// queue, not when its fence retires; the pages stay referenced
@@ -186,9 +193,9 @@ interface gpu {
     ///
     /// A command the device refuses after this future has resolved
     /// faults the context: see `device-fault`.
-    submit: async func(commands: borrow<command-buffer>, offset: u64, length: u64, ring: u8, fence: option<u64>) -> result<_, error>;
+    submit: async func(commands: borrow<command-buffer>, offset: u64, length: u64, ring: u8, completion: option<completion>) -> result<_, error>;
 
-    /// Hand the device `commands` itself, on `ring`, fenced at `fence`
+    /// Hand the device `commands` itself, on `ring`, fenced at `completion.fence`
     /// when one is given: `submit` for the short streams a renderer
     /// sends outside its command buffers.
     ///
@@ -197,7 +204,7 @@ interface gpu {
     /// a buffer of that size — and refuses a longer list
     /// `out-of-bounds`. Resolves, fences and faults exactly as `submit`
     /// does.
-    execute: async func(commands: list<u8>, ring: u8, fence: option<u64>) -> result<_, error>;
+    execute: async func(commands: list<u8>, ring: u8, completion: option<completion>) -> result<_, error>;
 
     /// Every fence `ring` of this context retires, in order.
     ///

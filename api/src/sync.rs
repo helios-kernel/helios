@@ -189,10 +189,33 @@ pub struct TimelinePoint<'a> {
     pub value: u64,
 }
 
+/// A producer value to attach to an asynchronous operation.
+pub struct SignalPoint<'a> {
+    pub source: &'a SignalSource,
+    pub value: u64,
+}
+
+#[cfg(feature = "gpu")]
+impl SignalPoint<'_> {
+    pub(crate) fn raw(&self) -> host_sync::SignalPoint<'_> {
+        host_sync::SignalPoint {
+            source: &self.source.raw,
+            value: self.value,
+        }
+    }
+}
+
 impl SignalSource {
     pub fn new(initial: u64) -> Self {
         Self {
             raw: host_sync::SignalSource::new(initial),
+        }
+    }
+
+    pub fn point(&self, value: u64) -> SignalPoint<'_> {
+        SignalPoint {
+            source: self,
+            value,
         }
     }
 

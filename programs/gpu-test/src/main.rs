@@ -30,8 +30,10 @@ use std::env;
 mod timeline;
 mod venus;
 
-use helios_api::gpu::{BlobMemory, BlobUsage, CapsetInfo, Context, Gpu, GpuError};
+use helios_api::bindings::wasi::clocks::monotonic_clock;
+use helios_api::gpu::{BlobMemory, BlobUsage, CapsetInfo, Completion, Context, Gpu, GpuError};
 use helios_api::programs::{Child, DeviceClass, SpawnError, SpawnRequest, device_grant};
+use helios_api::sync::{SignalSource, wait_all};
 use helios_api::wit_bindgen::StreamReader;
 use thiserror::Error;
 
@@ -200,10 +202,32 @@ async fn fences_on_every_ring(context: &Context) -> Result<(), GpuTestError> {
         streams.push(context.fences(ring)?);
     }
     for ring in 0..RINGS {
+        let source = SignalSource::new(0);
+        let reader = source.reader();
+        let signals = [source.point(FENCE)];
         context
-            .submit(&buffer, 0, span.length, ring, Some(FENCE))
+            .submit(
+                &buffer,
+                0,
+                span.length,
+                ring,
+                Some(Completion {
+                    fence: FENCE,
+                    signals: &signals,
+                }),
+            )
             .await?;
+        drop(source);
+        // Bound completion waiting by the smoke operation's five-second budget.
+        let deadline = monotonic_clock::now() + 5_000_000_000;
+        if !wait_all(&[reader.point(FENCE)], Some(deadline))
+            .await
+            .map_err(timeline::Error::from)?
+        {
+            return Err(timeline::Error::Contract("GPU completion before its deadline").into());
+        }
         println!("gpu-test:submit ring={ring} fence={FENCE}");
+        println!("gpu-test:shared-gpu-timeline ring={ring} value={FENCE}");
     }
     for (ring, stream) in (0..RINGS).zip(&mut streams) {
         let fence = retired(stream, ring, FENCE).await?;
@@ -381,7 +405,18 @@ async fn child(gpu: &Gpu) -> Result<(), GpuTestError> {
     let length = buffer.span().length;
     buffer.bytes().fill(0);
     let mut fences = context.fences(0)?;
-    context.submit(&buffer, 0, length, 0, Some(FENCE)).await?;
+    context
+        .submit(
+            &buffer,
+            0,
+            length,
+            0,
+            Some(Completion {
+                fence: FENCE,
+                signals: &[],
+            }),
+        )
+        .await?;
     retired(&mut fences, 0, FENCE).await?;
     println!("{CHILD_DONE}");
     Ok(())

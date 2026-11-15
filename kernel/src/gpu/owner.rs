@@ -43,7 +43,7 @@ use helios_hal::cpu::Cpu;
 use helios_hal::device::DeviceRegion;
 use helios_hal::display::{
     BlobId, BlobMemory, BlobRequest, CapsetId, CapsetList, CommandStream, ContextId, ContextName,
-    Gpu3d, Gpu3dError, RingCount, Submission,
+    FenceId, Gpu3d, Gpu3dError, RingCount, RingIndex, Submission,
 };
 use helios_hal::pmm::PhysFrameRange;
 use helios_hal::watchdog::Watchdog;
@@ -56,7 +56,7 @@ use crate::exec::{InFlight, Notify, monotonic_nanos};
 
 use super::service::{
     BlobShared, BlobSpec, ContextShared, ControlMessage, Gpu3dRequest, Gpu3dService, Gpu3dShared,
-    InFlightSubmit, SessionState, SubmitCommands, SubmitMessage, SubmitRequest,
+    InFlightSubmit, SessionState, SubmitCommands, SubmitCompletion, SubmitMessage, SubmitRequest,
 };
 use super::{
     ContextRecord, Gpu3dServiceError, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS, MAX_MACHINE_GPU_BLOBS,
@@ -742,6 +742,41 @@ async fn advance_releases<Device: Gpu3d>(device: &Device, held: &mut Held) {
     }
 }
 
+/// Only the submit server accesses this set. Its capacity matches the
+/// in-flight window; signal lists are sized by the guest's submission.
+struct PendingCompletion {
+    context: ContextId,
+    ring: RingIndex,
+    completion: SubmitCompletion,
+}
+
+type PendingCompletions = ArrayVec<PendingCompletion, SUBMITS_IN_FLIGHT>;
+
+fn fail_completions(pending: &mut PendingCompletions, context: ContextId) {
+    pending.retain(|point| {
+        if point.context != context {
+            return true;
+        }
+        point.completion.fail();
+        false
+    });
+}
+
+fn signal_completion(
+    pending: &mut PendingCompletions,
+    context: ContextId,
+    ring: RingIndex,
+    fence: Option<FenceId>,
+) {
+    pending.retain(|point| {
+        if point.context != context || point.ring != ring || Some(point.completion.fence) != fence {
+            return true;
+        }
+        point.completion.signal();
+        false
+    });
+}
+
 /// What the submit server learns when one posted submission finishes.
 struct Finished {
     context: Arc<ContextShared>,
@@ -804,6 +839,7 @@ pub(super) async fn serve_submit<Device, CpuImpl>(
     // Raised by the server when it starts one, lowered by the driver's
     // `posted` signal or by the submission's end, whichever is first.
     let unposted = AtomicBool::new(false);
+    let mut completions = PendingCompletions::new();
     let mut running = pin!(InFlight::<_, SUBMITS_IN_FLIGHT>::new());
     let mut open = true;
     loop {
@@ -828,7 +864,7 @@ pub(super) async fn serve_submit<Device, CpuImpl>(
         };
         match event {
             SubmitEvent::Finished((in_flight, finished)) => {
-                settle(finished, cpu);
+                settle(finished, cpu, &mut completions);
                 // The session's tally drops only once the answer has been
                 // settled, so a release never runs between the two.
                 drop(in_flight);
@@ -847,6 +883,9 @@ pub(super) async fn serve_submit<Device, CpuImpl>(
                 // `CTX_DESTROY`.
                 let in_flight = InFlightSubmit::begin(session.clone());
                 if session.has_ended() {
+                    if let Some(completion) = &request.completion {
+                        completion.fail();
+                    }
                     // A submission that outlived its session is dropped
                     // rather than served, for the reason the control
                     // queue's are.
@@ -856,16 +895,26 @@ pub(super) async fn serve_submit<Device, CpuImpl>(
                     refuse_faulted(request, cpu);
                     continue;
                 }
+                let SubmitRequest {
+                    context,
+                    commands,
+                    ring,
+                    completion,
+                    reply,
+                } = request;
+                let fence = completion.as_ref().map(|completion| completion.fence);
+                if let Some(completion) = completion
+                    && !completion.signals.is_empty()
+                {
+                    completions.push(PendingCompletion {
+                        context: context.id(),
+                        ring,
+                        completion,
+                    });
+                }
                 unposted.store(true, Ordering::Release);
                 let unposted = &unposted;
                 running.as_mut().push(async move {
-                    let SubmitRequest {
-                        context,
-                        commands,
-                        ring,
-                        fence,
-                        reply,
-                    } = request;
                     let mut reply = Some(reply);
                     let stream = match &commands {
                         SubmitCommands::Pages { range, .. } => CommandStream::Pages(*range),
@@ -912,15 +961,18 @@ pub(super) async fn serve_submit<Device, CpuImpl>(
 /// A submission for a context the device has already faulted: refused,
 /// with its fence retired so no reader waits for it.
 fn refuse_faulted<CpuImpl: Cpu>(request: SubmitRequest, cpu: &CpuImpl) {
-    if let (Some(fence), Some(timeline)) = (request.fence, request.context.timeline(request.ring)) {
-        timeline.retire(fence.raw(), monotonic_nanos(cpu));
+    if let Some(completion) = &request.completion {
+        completion.fail();
+        if let Some(timeline) = request.context.timeline(request.ring) {
+            timeline.retire(completion.fence.raw(), monotonic_nanos(cpu));
+        }
     }
     let _ = request.reply.send(Err(Gpu3dServiceError::DeviceFault));
 }
 
 /// Settle one submission the device has answered, or refused before it
 /// reached the ring.
-fn settle<CpuImpl: Cpu>(finished: Finished, cpu: &CpuImpl) {
+fn settle<CpuImpl: Cpu>(finished: Finished, cpu: &CpuImpl, completions: &mut PendingCompletions) {
     let Finished {
         context,
         commands,
@@ -935,6 +987,11 @@ fn settle<CpuImpl: Cpu>(finished: Finished, cpu: &CpuImpl) {
         .expect("the store admitted the submission against one of the context's rings");
     let error = match outcome {
         Ok(()) => {
+            if context.is_faulted() {
+                fail_completions(completions, context.id());
+            } else {
+                signal_completion(completions, context.id(), ring, fence);
+            }
             if let Some(fence) = fence {
                 timeline.retire(fence.raw(), nanos);
             }
@@ -965,6 +1022,7 @@ fn settle<CpuImpl: Cpu>(finished: Finished, cpu: &CpuImpl) {
     // Fault before publishing retirement so a waiter cannot observe a
     // successful fence for a submission the device refused.
     context.fault(nanos);
+    fail_completions(completions, context.id());
     if let Some(reply) = reply {
         let _ = reply.send(Err(Gpu3dServiceError::from(error)));
     }

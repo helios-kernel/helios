@@ -243,6 +243,7 @@ pub mod gpu {
                 default: trappable,
             },
             with: {
+                "helios:system/sync": crate::wasmtime_adapter::bindings::debugger::bindings::helios::system::sync,
                 "helios:system/gpu.gpu":
                     crate::wasmtime_adapter::component_host::GpuHandle,
                 "helios:system/gpu.context":

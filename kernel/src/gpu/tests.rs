@@ -7,6 +7,7 @@
 //! `device::platform`'s test hooks install, so a test can also see when
 //! a buffer's run was taken, shown and given back.
 
+use crate::{SignalTimeline, Timeline, TimelineError, TimelineSource};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::pin;
@@ -36,8 +37,9 @@ use crate::test_support::TestCpu;
 
 use super::owner::{gpu3d_channels, serve_control, serve_submit};
 use super::service::{
-    BlobShared, BlobSpec, ContextShared, ControlMessage, Gpu3dRequest, Gpu3dSender, Gpu3dService,
-    Gpu3dShared, InlineCommands, ScanoutHold, SubmitCommands, SubmitMessage, SubmitRequest,
+    BlobShared, BlobSpec, CompletionSignal, ContextShared, ControlMessage, Gpu3dRequest,
+    Gpu3dSender, Gpu3dService, Gpu3dShared, InlineCommands, ScanoutHold, SubmitCommands,
+    SubmitCompletion, SubmitMessage, SubmitRequest,
 };
 use super::{
     ContextRecord, Gpu3dOwnership, Gpu3dServiceError, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS,
@@ -493,13 +495,24 @@ fn queue_submit(
     fence: Option<u64>,
     commands: SubmitCommands,
 ) -> Result<oneshot::Receiver<Result<(), Gpu3dServiceError>>, Gpu3dServiceError> {
+    queue_submit_with_signals(sender, context, ring, fence, commands, Vec::new())
+}
+
+fn queue_submit_with_signals(
+    sender: &Gpu3dSender,
+    context: &Arc<ContextShared>,
+    ring: u8,
+    fence: Option<u64>,
+    commands: SubmitCommands,
+    signals: Vec<CompletionSignal>,
+) -> Result<oneshot::Receiver<Result<(), Gpu3dServiceError>>, Gpu3dServiceError> {
     let (ring, fence, timeline) = context.admit(ring, fence)?;
     let (reply, answer) = oneshot::channel();
     let queued = sender.try_submit(SubmitRequest {
         context: context.clone(),
         commands,
         ring,
-        fence,
+        completion: fence.map(|fence| SubmitCompletion { fence, signals }),
         reply,
     })?;
     assert!(queued, "no test fills the submit queue");
@@ -2185,5 +2198,71 @@ fn faulting_a_context_does_not_report_its_retired_fences_as_successful() {
             sender.wait(&context, 0, 1).await,
             Err(Gpu3dServiceError::DeviceFault)
         );
+    });
+}
+
+#[test]
+fn a_submission_keeps_its_signal_source_alive_until_retirement() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let source = TimelineSource::new(0);
+        let reader = source.reader();
+        let (release, hold) = oneshot::channel();
+        *device.submit_hold.lock().unwrap() = Some(hold);
+        let answer = queue_submit_with_signals(
+            &sender(&ownership),
+            &context.shared,
+            0,
+            Some(1),
+            page_commands(),
+            alloc::vec![CompletionSignal {
+                source: source.clone(),
+                value: 7
+            }],
+        )
+        .unwrap();
+        drop(source);
+        assert_eq!(answer.await, Ok(Ok(())));
+        let mut wait = pin!(reader.wait(7));
+        assert!(poll_once(wait.as_mut()).await.is_none());
+        assert_eq!(reader.value(), Ok(0));
+        release.send(()).unwrap();
+        assert_eq!(wait.await, Ok(()));
+        assert_eq!(reader.wait(8).await, Err(TimelineError::Closed));
+    });
+}
+
+#[test]
+fn a_context_fault_fails_signals_while_an_earlier_submission_is_still_pending() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let source = TimelineSource::new(0);
+        let reader = source.reader();
+        let (release, hold) = oneshot::channel();
+        *device.submit_hold.lock().unwrap() = Some(hold);
+        let answer = queue_submit_with_signals(
+            &sender(&ownership),
+            &context.shared,
+            0,
+            Some(1),
+            page_commands(),
+            alloc::vec![CompletionSignal { source, value: 1 }],
+        )
+        .unwrap();
+        assert_eq!(answer.await, Ok(Ok(())));
+        *device.refuse_context.lock().unwrap() = Some(context.shared.id());
+        assert_eq!(submit_on(&ownership, &context, 0, Some(2)).await, Ok(()));
+        assert_eq!(reader.wait(1).await, Err(TimelineError::Failed));
+        release.send(()).unwrap();
+        settle().await;
+        assert_eq!(reader.value(), Err(TimelineError::Failed));
     });
 }

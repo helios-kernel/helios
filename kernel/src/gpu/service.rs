@@ -83,7 +83,7 @@ use triomphe::Arc;
 
 use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
-use crate::exec::{Notify, SequenceSignal};
+use crate::exec::{Notify, SequenceSignal, SignalTimeline, TimelineSource};
 use crate::process::GpuOpenCap;
 
 use super::{Gpu3dServiceError, MAX_EXECUTE_BYTES};
@@ -459,13 +459,42 @@ pub(crate) enum SubmitCommands {
     Inline(InlineCommands),
 }
 
+/// A producer retained until a submitted fence completes.
+#[derive(Clone)]
+pub(crate) struct CompletionSignal {
+    pub(crate) source: TimelineSource,
+    pub(crate) value: u64,
+}
+
+/// Signals are structurally tied to a fenced submission.
+pub(crate) struct SubmitCompletion {
+    pub(crate) fence: FenceId,
+    pub(crate) signals: Vec<CompletionSignal>,
+}
+
+impl SubmitCompletion {
+    pub(crate) fn fail(&self) {
+        for signal in &self.signals {
+            signal.source.fail();
+        }
+    }
+
+    pub(crate) fn signal(&self) {
+        for signal in &self.signals {
+            // Another producer may already have failed this timeline.
+            // Failure remains terminal; completion cannot revive it.
+            let _ = signal.source.signal(signal.value);
+        }
+    }
+}
+
 /// Work for the task that posts the command streams.
 pub(crate) struct SubmitRequest {
     /// The context the stream is for, whose ring the fence retires on.
     pub(crate) context: Arc<ContextShared>,
     pub(crate) commands: SubmitCommands,
     pub(crate) ring: RingIndex,
-    pub(crate) fence: Option<FenceId>,
+    pub(crate) completion: Option<SubmitCompletion>,
     /// Answered the moment the command is on the device's ring, or with
     /// the refusal that kept it off.
     pub(crate) reply: oneshot::Sender<Result<(), Gpu3dServiceError>>,
