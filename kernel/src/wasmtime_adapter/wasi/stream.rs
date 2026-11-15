@@ -362,55 +362,10 @@ impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
 mod direct_output_tests {
     use super::*;
     use crate::wasmtime_adapter::component_host::service::test_store;
-    use core::mem::MaybeUninit;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::Ordering;
     use std::sync::Arc;
-    use wasmtime::component::WriteBuffer;
 
-    #[derive(Default)]
-    struct Reads {
-        skipped: AtomicUsize,
-        moved: AtomicUsize,
-    }
-
-    #[derive(Default)]
-    struct TrackedBuffer {
-        bytes: &'static [u8],
-        reads: Arc<Reads>,
-    }
-
-    // SAFETY: take passes only initialized bytes and advances by exactly count.
-    unsafe impl WriteBuffer<u8> for TrackedBuffer {
-        fn remaining(&self) -> &[u8] {
-            self.bytes
-        }
-        fn skip(&mut self, count: usize) {
-            self.bytes = &self.bytes[count..];
-            self.reads.skipped.fetch_add(count, Ordering::Relaxed);
-        }
-        fn take(&mut self, count: usize, fun: &mut dyn FnMut(&[MaybeUninit<u8>])) {
-            let bytes = &self.bytes[..count];
-            // SAFETY: MaybeUninit<u8> has u8's layout and all bytes are initialized.
-            fun(unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) });
-            self.bytes = &self.bytes[count..];
-            self.reads.moved.fetch_add(count, Ordering::Relaxed);
-        }
-    }
-
-    impl StreamProducer<test_store::TestStoreData> for TrackedBuffer {
-        type Item = u8;
-        type Buffer = Self;
-        fn poll_produce<'a>(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-            _: wasmtime::StoreContextMut<'a, test_store::TestStoreData>,
-            mut destination: Destination<'a, u8, Self>,
-            _: bool,
-        ) -> Poll<Result<StreamResult>> {
-            destination.set_buffer(core::mem::take(self.get_mut()));
-            Poll::Ready(Ok(StreamResult::Dropped))
-        }
-    }
+    use super::test_source::{Reads, TrackedBuffer};
 
     #[test]
     fn local_output_consumes_source_without_moving_bytes() {
@@ -570,5 +525,60 @@ mod direct_output_tests {
         owner.join().expect("port owner completed");
         assert_eq!(reads.skipped.load(Ordering::Relaxed), bytes.len());
         assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_source {
+    use super::*;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use wasmtime::component::WriteBuffer;
+
+    #[derive(Default)]
+    pub(crate) struct Reads {
+        pub(crate) skipped: AtomicUsize,
+        pub(crate) moved: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct TrackedBuffer {
+        pub(crate) bytes: &'static [u8],
+        pub(crate) reads: Arc<Reads>,
+    }
+
+    // SAFETY: take passes only initialized bytes and advances by exactly count.
+    unsafe impl WriteBuffer<u8> for TrackedBuffer {
+        fn remaining(&self) -> &[u8] {
+            self.bytes
+        }
+        fn skip(&mut self, count: usize) {
+            self.bytes = &self.bytes[count..];
+            self.reads.skipped.fetch_add(count, Ordering::Relaxed);
+        }
+        fn take(&mut self, count: usize, fun: &mut dyn FnMut(&[MaybeUninit<u8>])) {
+            let bytes = &self.bytes[..count];
+            // SAFETY: MaybeUninit<u8> has u8's layout and all bytes are initialized.
+            fun(unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) });
+            self.bytes = &self.bytes[count..];
+            self.reads.moved.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    impl StreamProducer<test_store::TestStoreData> for TrackedBuffer {
+        type Item = u8;
+        type Buffer = Self;
+        fn poll_produce<'a>(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: wasmtime::StoreContextMut<'a, test_store::TestStoreData>,
+            mut destination: Destination<'a, u8, Self>,
+            _: bool,
+        ) -> Poll<Result<StreamResult>> {
+            destination.set_buffer(core::mem::take(self.get_mut()));
+            Poll::Ready(Ok(StreamResult::Dropped))
+        }
     }
 }

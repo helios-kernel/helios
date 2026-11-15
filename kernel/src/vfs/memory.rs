@@ -31,7 +31,7 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, WritePosition, WriteProgress,
 };
 use spin::Mutex;
 use triomphe::Arc;
@@ -469,20 +469,20 @@ impl MemoryState {
 /// A write to a [`MemoryFs`], staged at once: its one round is the whole
 /// write, and filling writes straight into the file's
 /// own storage under the tree's lock.
-pub struct MemoryWrite<'a> {
-    fs: &'a MemoryFs,
-    path: FsPath<'a>,
+pub struct MemoryWrite {
+    fs: MemoryFs,
+    path: OwnedFsPath,
     position: WritePosition,
     len: usize,
     now: u64,
 }
 
-impl<'a> MemoryWrite<'a> {
+impl MemoryWrite {
     /// Stages a write of `len` bytes to the regular file at `path`,
     /// refusing it at once when `path` names none.
     pub(super) fn prepare(
-        fs: &'a MemoryFs,
-        path: FsPath<'a>,
+        fs: &MemoryFs,
+        path: FsPath<'_>,
         position: WritePosition,
         len: usize,
         now: u64,
@@ -493,8 +493,8 @@ impl<'a> MemoryWrite<'a> {
             NodeKind::Symlink => return Err(FsError::Invalid),
         }
         Ok(Self {
-            fs,
-            path,
+            fs: fs.clone(),
+            path: path.into(),
             position,
             len,
             now,
@@ -506,7 +506,7 @@ impl<'a> MemoryWrite<'a> {
     /// the file may have changed in between.
     pub(super) fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<u64> {
         self.fs.write_now(
-            self.path,
+            self.path.as_path(),
             self.position,
             self.len,
             self.now,
@@ -515,7 +515,7 @@ impl<'a> MemoryWrite<'a> {
     }
 }
 
-impl PreparedWrite for MemoryWrite<'_> {
+impl PreparedWrite for MemoryWrite {
     type Filled = FsResult<WriteProgress<Self>>;
 
     fn staged_len(&self) -> usize {
@@ -534,7 +534,7 @@ impl PreparedWrite for MemoryWrite<'_> {
 impl MemoryFs {
     /// Writes `len` bytes at `position` at once: `fill` writes straight
     /// into the file's storage.
-    fn write_now(
+    pub(super) fn write_now(
         &self,
         path: FsPath<'_>,
         position: WritePosition,
@@ -563,7 +563,7 @@ impl MemoryFs {
 }
 
 impl FileSystem for MemoryFs {
-    type Write<'a> = MemoryWrite<'a>;
+    type Write = MemoryWrite;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.state.lock().metadata(self.device, path)
@@ -620,7 +620,7 @@ impl FileSystem for MemoryFs {
         position: WritePosition,
         len: usize,
         now: u64,
-    ) -> impl Future<Output = FsResult<MemoryWrite<'a>>> + Send + 'a {
+    ) -> impl Future<Output = FsResult<MemoryWrite>> + Send + 'a {
         core::future::ready(MemoryWrite::prepare(self, path, position, len, now))
     }
 
@@ -909,8 +909,17 @@ mod tests {
         let fs = tree();
         block_on(fs.open(path("f"), OpenFlags::CREATE, 0)).expect("creates");
         let source = "文件・ファイル・파일".as_bytes().to_vec();
-        let staged = block_on(fs.prepare_write(path("f"), WritePosition::At(0), source.len(), 1))
-            .expect("stages");
+        let staged = {
+            let preparing_fs = fs.clone();
+            let preparing_path = String::from("f");
+            block_on(preparing_fs.prepare_write(
+                path(&preparing_path),
+                WritePosition::At(0),
+                source.len(),
+                1,
+            ))
+            .expect("stages")
+        };
         let filled = staged.fill(|at, destination| {
             destination.copy_from_slice(&source[at..at + destination.len()]);
         });

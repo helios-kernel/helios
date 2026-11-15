@@ -1665,3 +1665,46 @@ fn a_create_lands_on_the_mount_that_owns_the_new_entry() {
         assert!(missing(&namespace, &alloc::format!("/mnt/{name}")));
     }
 }
+
+#[test]
+fn file_stream_fills_destinations_without_moving_source_bytes() {
+    use super::fs::file_write_consumer;
+    use super::stream::test_source::{Reads, TrackedBuffer};
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use core::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use wasmtime::component::StreamReader;
+
+    for (position, expected) in [
+        (WritePosition::At(0), "文件・ファイル・파일"),
+        (WritePosition::End, "prefix文件・ファイル・파일"),
+    ] {
+        let namespace = namespace();
+        let descriptor = create_file(&namespace, "stream", b"prefix");
+        let target = write_stream_target(&namespace, held(&descriptor)).expect("write target");
+        let bytes = "文件・ファイル・파일".as_bytes();
+        let reads = Arc::new(Reads::default());
+        let mut config = wasmtime::Config::new();
+        config
+            .wasm_component_model(true)
+            .wasm_component_model_async(true);
+        let engine = wasmtime::Engine::new(&config).expect("stream engine");
+        let mut store = wasmtime::Store::new(&engine, test_store::store_data_with(|_| {}));
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let consumer = file_write_consumer(|state| state, target, position, tx);
+        let source = TrackedBuffer {
+            bytes,
+            reads: reads.clone(),
+        };
+        block_on(store.run_concurrent(async |accessor| {
+            accessor
+                .with(|mut store| StreamReader::new(&mut store, source)?.pipe(store, consumer))
+                .expect("connect file stream");
+            rx.await.expect("completion sent").expect("write completed");
+        }))
+        .expect("stream event loop");
+        assert_eq!(reads.skipped.load(Ordering::Relaxed), bytes.len());
+        assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
+        assert_eq!(read_all(&namespace, &descriptor), expected.as_bytes());
+    }
+}

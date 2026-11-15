@@ -436,6 +436,22 @@ impl<'a> FsPath<'a> {
     }
 }
 
+/// An owned, normalized path for a transfer that outlives its prepare call.
+#[derive(Clone, Debug)]
+pub struct OwnedFsPath(String);
+
+impl From<FsPath<'_>> for OwnedFsPath {
+    fn from(path: FsPath<'_>) -> Self {
+        Self(String::from(path.as_str()))
+    }
+}
+
+impl OwnedFsPath {
+    pub fn as_path(&self) -> FsPath<'_> {
+        FsPath(&self.0)
+    }
+}
+
 /// One filesystem: the operations every mount kind implements.
 ///
 /// Mutating operations take `now`, the caller's wall-clock time in
@@ -468,9 +484,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = FsResult<Bytes>> + Send + 'a;
 
     /// The write [`Self::prepare_write`] stages.
-    type Write<'a>: PreparedWrite
-    where
-        Self: 'a;
+    type Write: PreparedWrite + 'static;
 
     /// Stages a write of `len` bytes at `position`: everything the write
     /// needs before its bytes (resolving the file, an append's offset,
@@ -486,7 +500,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         position: WritePosition,
         len: usize,
         now: u64,
-    ) -> impl Future<Output = FsResult<Self::Write<'a>>> + Send + 'a;
+    ) -> impl Future<Output = FsResult<Self::Write>> + Send + 'a;
 
     /// Truncates or zero-extends a regular file to `size` bytes.
     fn set_size<'a>(

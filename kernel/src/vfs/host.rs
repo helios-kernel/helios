@@ -132,7 +132,7 @@ where
 }
 
 impl<H: HostFileSystem> FileSystem for HostShare<H> {
-    type Write<'a> = HostShareWrite<H::Write<'a>>;
+    type Write = HostShareWrite<H::Write>;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.client
@@ -198,7 +198,7 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         position: WritePosition,
         len: usize,
         _now: u64,
-    ) -> FsResult<HostShareWrite<H::Write<'a>>> {
+    ) -> FsResult<HostShareWrite<H::Write>> {
         self.client
             .prepare_write(host_path(path), position, len)
             .await
