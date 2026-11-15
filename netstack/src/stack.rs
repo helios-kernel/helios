@@ -4569,14 +4569,10 @@ where
         turn
     }
 
-    /// Socket `index`'s turn on the wire, in the order a connection
-    /// needs its segments: a due retransmission, or else its handshake
-    /// and its next data segment; then the acknowledgements it still
-    /// owes. Data carries an acknowledgement, so a socket that sent data
-    /// owes one fewer afterwards.
-    ///
-    /// The first error ends the turn with the rest still pending on the
-    /// socket.
+    /// Send due retransmissions until the window or pacing schedule stops
+    /// them, then handshake, new data and the remaining acknowledgements.
+    /// The outbound queue bounds the turn; its first refusal leaves the
+    /// rest pending for a later drive.
     fn emit_tcp_turn(
         &mut self,
         index: usize,
@@ -4584,32 +4580,34 @@ where
         now: StackInstant,
     ) -> Result<(), StackError> {
         let (local, remote) = self.active_tcp_endpoints(index);
-        let socket = self.active_tcp_socket(index);
-        if let Some(segment) =
-            socket.pending_retransmission_with_mtu(now.nanos(), budget.wire_segment())
+        while let Some(segment) = self
+            .active_tcp_socket(index)
+            .pending_retransmission_with_mtu(now.nanos(), budget.wire_segment())
         {
-            self.emit_tcp_retransmission(index, &segment, now)?;
+            if !self.emit_tcp_retransmission(index, &segment, now)? {
+                return Ok(());
+            }
             // The retransmission limit closes the connection, and a
             // closed connection owes its peer nothing more.
             if self.active_tcp_socket(index).state() == crate::TcpState::Closed {
                 return Ok(());
             }
-        } else {
-            if let Some(header) = socket.pending_syn() {
-                let options = socket.pending_syn_options(now.nanos());
-                if self.queue_tcp_control(index, local, remote, header, options, now)? {
-                    self.active_tcp_socket_mut(index)
-                        .mark_syn_queued(now.nanos());
-                }
-            } else if let Some(header) = socket.pending_syn_ack() {
-                let options = socket.pending_syn_ack_options(now.nanos());
-                if self.queue_tcp_control(index, local, remote, header, options, now)? {
-                    self.active_tcp_socket_mut(index)
-                        .mark_syn_ack_queued(now.nanos());
-                }
-            }
-            self.emit_tcp_data(index, local, remote, budget, now)?;
         }
+        let socket = self.active_tcp_socket(index);
+        if let Some(header) = socket.pending_syn() {
+            let options = socket.pending_syn_options(now.nanos());
+            if self.queue_tcp_control(index, local, remote, header, options, now)? {
+                self.active_tcp_socket_mut(index)
+                    .mark_syn_queued(now.nanos());
+            }
+        } else if let Some(header) = socket.pending_syn_ack() {
+            let options = socket.pending_syn_ack_options(now.nanos());
+            if self.queue_tcp_control(index, local, remote, header, options, now)? {
+                self.active_tcp_socket_mut(index)
+                    .mark_syn_ack_queued(now.nanos());
+            }
+        }
+        self.emit_tcp_data(index, local, remote, budget, now)?;
         self.emit_tcp_acks(index, local, remote, now)
     }
 
@@ -4638,7 +4636,7 @@ where
         index: usize,
         segment: &TcpTransmitSegment,
         now: StackInstant,
-    ) -> Result<(), StackError> {
+    ) -> Result<bool, StackError> {
         let sequence = segment.header.sequence;
         let identification = segment.sequence_len as u16;
         let hop_limit = self.tcp_socket_hop_limit(index);
@@ -4657,8 +4655,10 @@ where
             self.active_tcp_socket_mut(index)
                 .mark_retransmission_queued(sequence, now.nanos());
             self.tcp_transmit_counters.retransmits_sent += 1;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     /// Queues a segment that has no payload and no sequence-space
@@ -21092,6 +21092,79 @@ mod tests {
         }
         assert_eq!(delivered[0], data[0]);
         assert_eq!(delivered[1], data[1]);
+    }
+
+    #[test]
+    fn a_turn_resends_every_loss_the_window_allows_before_new_data() {
+        const MSS: usize = crate::ETHERNET_FRAME_BYTES
+            - EthernetFrame::HEADER_LEN
+            - Ipv4Packet::MIN_HEADER_LEN
+            - TcpPacket::MIN_HEADER_LEN;
+        for slots in [1, MAX_OUTBOUND_FRAMES] {
+            let mut stack = Stack::new_with_congestion(
+                StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_ISN_SECRET),
+                NewReno::new(MSS as u32),
+            );
+            stack
+                .add_ipv4_address(Ipv4Cidr::new(FLOW_LOCAL, 24))
+                .unwrap();
+            stack.learn_neighbor(flow_peer_neighbor());
+            let socket = establish_flows(&mut stack, 1, false)[0];
+            let payload = vec![0x5a; 4 * MSS];
+            assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+            let original = settle(&mut stack, 2);
+            assert_eq!(original.len(), 4);
+
+            // Drop all four. The timeout's loss window admits one resend.
+            let expired = 2 + 2 * crate::tcp::TCP_INITIAL_RTO_NANOS;
+            stack.drive_tcp(at(expired)).unwrap();
+            let first = drain_flow_frames(&mut stack);
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].sequence, original[0].sequence);
+            flow_receive(
+                &mut stack,
+                0,
+                TcpFlags::ACK,
+                FLOW_PEER_SEQUENCE + 1,
+                original[1].sequence,
+                expired + 1,
+            );
+            // Slow start has room for two lost segments. New data waits
+            // behind the losses, even if the outbound queue fills midway.
+            assert_eq!(stack.tcp_send(socket, b"new data"), Ok(8));
+            for _ in slots..MAX_OUTBOUND_FRAMES {
+                stack
+                    .queue_arp_reply(FLOW_LOCAL, FLOW_PEER, PEER_MAC)
+                    .unwrap();
+            }
+            stack.drive_tcp(at(expired + 1)).unwrap();
+            let mut repaired = drain_flow_frames(&mut stack);
+            assert_eq!(repaired.len(), slots.min(2));
+            if slots == 1 {
+                stack.drive_tcp(at(expired + 1)).unwrap();
+                repaired.extend(drain_flow_frames(&mut stack));
+            }
+            assert_eq!(repaired.len(), 2);
+            for (actual, expected) in repaired.iter().zip(&original[1..3]) {
+                assert_eq!(actual.sequence, expected.sequence);
+                assert_eq!(actual.payload, expected.payload);
+            }
+            flow_receive(
+                &mut stack,
+                0,
+                TcpFlags::ACK,
+                FLOW_PEER_SEQUENCE + 1,
+                original[3].sequence,
+                expired + 2,
+            );
+            stack.drive_tcp(at(expired + 2)).unwrap();
+            let last = drain_flow_frames(&mut stack);
+            assert_eq!(last.len(), 2, "the last loss and new data share a turn");
+            assert_eq!(last[0].sequence, original[3].sequence);
+            assert_eq!(last[0].payload, original[3].payload);
+            assert_eq!(last[1].sequence, FLOW_LOCAL_NEXT + payload.len() as u32);
+            assert_eq!(last[1].payload, b"new data");
+        }
     }
 
     #[test]
