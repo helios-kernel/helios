@@ -2302,6 +2302,10 @@ struct AotBenchCommand {
     #[arg(long, default_value_t = 1)]
     iterations: u16,
 
+    /// Deadline for each guest RPC step, including upload and profile collection.
+    #[arg(long, default_value_t = DEFAULT_WORKLOAD_TIMEOUT_SECONDS)]
+    timeout_seconds: u32,
+
     /// Ask the guest compiler plugin to emit Wasmtime/Cranelift timing diagnostics.
     #[arg(long, default_value_t = false)]
     compiler_timing: bool,
@@ -3615,7 +3619,7 @@ fn connect_and_run(
                     crate::vsock::connect(guest_cid, helios_inspector_protocol::VSOCK_RPC_PORT)
                         .await?;
                 let mut client =
-                    helios_inspector_protocol::transport::Client::new(vsock_read, vsock_write);
+                    RpcClient::new(vsock_read, vsock_write).map_err(ConnectError::from)?;
                 crate::ready::wait_until_ready(&mut client)
                     .await
                     .map_err(ConnectError::from)?;
@@ -3847,17 +3851,7 @@ async fn serve_guest_requests(
         }
         core::future::pending().await
     };
-    // A session that asks the guest nothing reads nothing, and a guest
-    // that keeps talking into a transport nobody drains blocks on it —
-    // which for a compositor writing its own account of every frame
-    // means a desktop that stops after its first two lines. Holding the
-    // reader role for as long as the session lasts is what keeps it
-    // running.
-    let route = async {
-        let _ = client.route_frames().await;
-        core::future::pending().await
-    };
-    futures_lite::future::or(serve, route).await
+    serve.await
 }
 
 /// The `--run` program one host-side action is performed alongside.
@@ -4554,12 +4548,18 @@ fn run_aot_bench(
         if command.iterations == 0 {
             return Err(AotBenchError::ZeroIterations.into());
         }
-        debugger_fs::write(&client, &command.remote_path, &wasm, false)
-            .await
-            .map_err(|source| AotBenchError::Upload {
-                path: command.wasm.display().to_string(),
-                source,
-            })?;
+        let seconds = command.timeout_seconds;
+        guest_step_under_deadline("the AOT upload", seconds, &vcpus, async {
+            Ok::<_, VmSessionError>(
+                debugger_fs::write(&client, &command.remote_path, &wasm, false)
+                    .await
+                    .map_err(|source| AotBenchError::Upload {
+                        path: command.wasm.display().to_string(),
+                        source,
+                    })?,
+            )
+        })
+        .await?;
         let profile_filter = system_profiling::Filter {
             scope: None,
             stack_prefixes: Vec::new(),
@@ -4572,20 +4572,35 @@ fn run_aot_bench(
             || command.user_profile_output.is_some()
             || command.perf_metrics_output.is_some();
         let before_profile = if collect_profile {
-            profiling_control_step(
-                "clear remote profile samples",
-                system_profiling::clear(&client),
-            )
+            guest_step_under_deadline("the profile reset", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    profiling_control_step(
+                        "clear remote profile samples",
+                        system_profiling::clear(&client),
+                    )
+                    .await?,
+                )
+            })
             .await?;
-            profiling_control_step(
-                "enable remote profiling",
-                system_profiling::set_enabled(&client, true),
-            )
+            guest_step_under_deadline("the profiler hand-off", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    profiling_control_step(
+                        "enable remote profiling",
+                        system_profiling::set_enabled(&client, true),
+                    )
+                    .await?,
+                )
+            })
             .await?;
-            profiling_read_step(
-                "read initial remote profile samples",
-                system_profiling::folded(&client, &profile_filter, 0),
-            )
+            guest_step_under_deadline("the initial profile read", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    profiling_read_step(
+                        "read initial remote profile samples",
+                        system_profiling::folded(&client, &profile_filter, 0),
+                    )
+                    .await?,
+                )
+            })
             .await?
         } else {
             Vec::new()
@@ -4604,33 +4619,37 @@ fn run_aot_bench(
         }
         let instruction_profile_output = command.instruction_profile_output();
         if instruction_profile_output.is_some() {
-            instruction_profile::start(&client).await?;
+            guest_step_under_deadline("the instruction sampling start", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(instruction_profile::start(&client).await?)
+            })
+            .await?;
         }
         for iteration in 1..=command.iterations {
             let started = Instant::now();
-            let outcome = system_programs::aot(
-                &client,
-                &system_programs::AotRequest {
-                    source_path: command.remote_path.clone(),
-                    destination_path: command.destination_path.clone(),
-                    hint: system_programs::AotHint::Performance,
-                    profile: command.compiler_timing,
-                },
-            )
-            .await
-            .map_err(|source| AotBenchError::Compile { iteration, source })?;
+            let outcome =
+                guest_step_under_deadline("the AOT compilation", seconds, &vcpus, async {
+                    Ok::<_, VmSessionError>(
+                        system_programs::aot(
+                            &client,
+                            &system_programs::AotRequest {
+                                source_path: command.remote_path.clone(),
+                                destination_path: command.destination_path.clone(),
+                                hint: system_programs::AotHint::Performance,
+                                profile: command.compiler_timing,
+                            },
+                        )
+                        .await
+                        .map_err(|source| AotBenchError::Compile { iteration, source })?,
+                    )
+                })
+                .await?;
             let result = match outcome {
                 Ok(result) => result,
                 Err(error) => {
                     // Surface the guest-side error events before failing:
                     // the RPC error kind alone (e.g. `Internal`) does not
                     // say which runtime operation actually failed.
-                    print_recent_guest_errors(
-                        &mut client,
-                        DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
-                        &vcpus,
-                    )
-                    .await;
+                    print_recent_guest_errors(&mut client, seconds, &vcpus).await;
                     return Err(AotBenchError::Refused {
                         iteration,
                         kind: error.kind,
@@ -4650,31 +4669,64 @@ fn run_aot_bench(
             .map_err(|source| AotBenchError::Report { source })?;
         }
         if instruction_profile_output.is_some() {
-            instruction_profile::stop(&client).await?;
+            guest_step_under_deadline("the instruction sampling stop", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(instruction_profile::stop(&client).await?)
+            })
+            .await?;
         }
         if collect_profile {
-            profiling_control_step(
-                "disable remote profiling",
-                system_profiling::set_enabled(&client, false),
-            )
+            guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    profiling_control_step(
+                        "disable remote profiling",
+                        system_profiling::set_enabled(&client, false),
+                    )
+                    .await?,
+                )
+            })
             .await?;
-            let after_profile = profiling_read_step(
-                "read final remote profile samples",
-                system_profiling::folded(&client, &profile_filter, 0),
-            )
-            .await?;
-            let metrics = profiling_read_step(
-                "read final remote perf metrics",
-                system_profiling::metrics(&client, &metric_filter, 0),
-            )
-            .await?;
+            let after_profile =
+                guest_step_under_deadline("the final profile read", seconds, &vcpus, async {
+                    Ok::<_, VmSessionError>(
+                        profiling_read_step(
+                            "read final remote profile samples",
+                            system_profiling::folded(&client, &profile_filter, 0),
+                        )
+                        .await?,
+                    )
+                })
+                .await?;
+            let metrics =
+                guest_step_under_deadline("the final metrics read", seconds, &vcpus, async {
+                    Ok::<_, VmSessionError>(
+                        profiling_read_step(
+                            "read final remote perf metrics",
+                            system_profiling::metrics(&client, &metric_filter, 0),
+                        )
+                        .await?,
+                    )
+                })
+                .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
         if let Some(output) = instruction_profile_output {
-            instruction_profile::collect(&client, &kernel, output).await?;
+            guest_step_under_deadline(
+                "the instruction profile collection",
+                seconds,
+                &vcpus,
+                async {
+                    Ok::<_, VmSessionError>(
+                        instruction_profile::collect(&client, &kernel, output).await?,
+                    )
+                },
+            )
+            .await?;
         }
         if let Some(output) = command.llvm_raw_profile_output() {
-            raw_profile::collect_beside(&client, output).await?;
+            guest_step_under_deadline("the raw profile collection", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(raw_profile::collect_beside(&client, output).await?)
+            })
+            .await?;
         }
         Ok(())
     })
@@ -7282,6 +7334,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aot_bench_deadline_is_configurable() {
+        #[derive(clap::Parser)]
+        struct AotBenchLine {
+            #[command(flatten)]
+            command: AotBenchCommand,
+        }
+        let default = <AotBenchLine as clap::Parser>::try_parse_from(["aot-bench", "sample.wasm"])
+            .expect("default deadline");
+        assert_eq!(
+            default.command.timeout_seconds,
+            DEFAULT_WORKLOAD_TIMEOUT_SECONDS
+        );
+        let configured = <AotBenchLine as clap::Parser>::try_parse_from([
+            "aot-bench",
+            "sample.wasm",
+            "--timeout-seconds",
+            "900",
+        ])
+        .expect("configured deadline");
+        assert_eq!(configured.command.timeout_seconds, 900);
+    }
+
     /// A bench guest that stops answering is captured through QMP before
     /// QEMU is torn down, so every bench session asks for the socket
     /// although it drives no QMP action of its own.
@@ -7292,6 +7367,7 @@ mod tests {
             remote_path: "/aot-bench-input.wasm".to_owned(),
             destination_path: "/aot-bench-output.cwasm".to_owned(),
             iterations: 5,
+            timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
             compiler_timing: false,
             profile_output: None,
             kernel_profile_output: None,

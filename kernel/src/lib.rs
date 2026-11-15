@@ -19,6 +19,7 @@ mod embedded;
 mod exec;
 mod gpu;
 mod host_fs;
+pub mod hv;
 mod input;
 mod instance;
 mod io;

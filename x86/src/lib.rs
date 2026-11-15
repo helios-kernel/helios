@@ -1051,6 +1051,7 @@ impl Drop for X86WakeOnlyMask {
 }
 
 impl Cpu for X86Cpu {
+    type Hypervisor = core::convert::Infallible;
     // The local APIC timer runs in periodic mode at the scheduler tick;
     // `set_deadline` only starts it.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Periodic;
