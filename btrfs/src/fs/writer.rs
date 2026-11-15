@@ -4,16 +4,17 @@
 
 use alloc::sync::Arc;
 use core::num::NonZeroUsize;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::Filesystem;
 use crate::compress::write::Encoder;
 use crate::retirement::Retirements;
 use crate::source::BlockSink;
-use crate::transaction::Transaction;
 use crate::transaction::file::WriteOptions;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
+use crate::transaction::{Checkpoint, Transaction};
 use crate::tree::write::WriteError;
 use crate::{Error, FileKind, Metadata, Timestamp};
 
@@ -141,9 +142,9 @@ impl<S> Drop for Publication<'_, S> {
     }
 }
 
-/// Every mutation consumes this capability and returns it only on success.
-/// Dropping a pending mutation or returning an error discards all edits in the
-/// transaction. Reads borrow the capability and cannot publish its overlay.
+/// Each mutation borrows this capability exclusively. An error or cancellation
+/// restores its operation checkpoint, preserving earlier successful mutations.
+/// Dropping the transaction discards the whole batch; commit consumes it.
 #[must_use = "a transaction must be committed to publish its changes"]
 pub struct WriteTransaction<'a, S> {
     inner: Transaction<'a, Arc<S>>,
@@ -261,46 +262,52 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
     }
 
     pub async fn write_file<E: Encoder>(
-        mut self,
+        &mut self,
         file: &InodeHandle,
         offset: u64,
         data: &[u8],
         options: WriteOptions<E>,
-    ) -> Result<(Self, usize), WriteError> {
-        self.checked(file).await?;
+    ) -> Result<usize, WriteError> {
+        let mut operation = Mutation::new(self);
+        operation.checked(file).await?;
         let file = file.id;
-        self.inner.roots.check_writable(file.tree)?;
-        let written = self
+        operation.inner.roots.check_writable(file.tree)?;
+        let written = operation
             .inner
             .write_file(file.tree, file.inode, offset, data, options)
             .await?;
-        Ok((self, written))
+        operation.accept();
+        Ok(written)
     }
 
     pub async fn truncate_file(
-        mut self,
+        &mut self,
         file: &InodeHandle,
         size: u64,
         when: Timestamp,
         concurrency: NonZeroUsize,
-    ) -> Result<Self, WriteError> {
-        self.checked(file).await?;
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self);
+        operation.checked(file).await?;
         let file = file.id;
-        self.inner.roots.check_writable(file.tree)?;
-        self.inner
+        operation.inner.roots.check_writable(file.tree)?;
+        operation
+            .inner
             .truncate_file(file.tree, file.inode, size, when, concurrency)
             .await?;
-        Ok(self)
+        operation.accept();
+        Ok(())
     }
 
     pub async fn clone_range(
-        mut self,
+        &mut self,
         range: CloneRange<'_>,
         when: Timestamp,
         concurrency: NonZeroUsize,
-    ) -> Result<Self, WriteError> {
-        self.checked(range.source).await?;
-        self.checked(range.destination).await?;
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self);
+        operation.checked(range.source).await?;
+        operation.checked(range.destination).await?;
         let range = RawCloneRange {
             source: range.source.id,
             destination: range.destination.id,
@@ -308,125 +315,141 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
             destination_offset: range.destination_offset,
             length: range.length,
         };
-        self.inner.roots.check_writable(range.destination.tree)?;
-        self.inner.clone_range(range, when, concurrency).await?;
-        Ok(self)
+        operation
+            .inner
+            .roots
+            .check_writable(range.destination.tree)?;
+        operation
+            .inner
+            .clone_range(range, when, concurrency)
+            .await?;
+        operation.accept();
+        Ok(())
     }
 
     pub async fn set_times(
-        mut self,
+        &mut self,
         file: &InodeHandle,
         access: Option<Timestamp>,
         modified: Option<Timestamp>,
         changed: Timestamp,
-    ) -> Result<Self, WriteError> {
-        self.checked(file).await?;
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self);
+        operation.checked(file).await?;
         let file = file.id;
-        self.inner.roots.check_writable(file.tree)?;
-        self.inner
+        operation.inner.roots.check_writable(file.tree)?;
+        operation
+            .inner
             .set_times(file.tree, file.inode, access, modified, changed)
             .await?;
-        Ok(self)
+        operation.accept();
+        Ok(())
     }
 
     pub async fn create_file(
-        self,
+        &mut self,
         name: Name<'_>,
         attributes: Attributes,
         when: Timestamp,
-    ) -> Result<(Self, InodeHandle), WriteError> {
+    ) -> Result<InodeHandle, WriteError> {
         self.create(name, attributes.raw(0o100000)?, when).await
     }
 
     pub async fn create_directory(
-        self,
+        &mut self,
         name: Name<'_>,
         attributes: Attributes,
         when: Timestamp,
-    ) -> Result<(Self, InodeHandle), WriteError> {
+    ) -> Result<InodeHandle, WriteError> {
         self.create(name, attributes.raw(0o040000)?, when).await
     }
 
     async fn create(
-        mut self,
+        &mut self,
         name: Name<'_>,
         attributes: RawAttributes,
         when: Timestamp,
-    ) -> Result<(Self, InodeHandle), WriteError> {
-        let name = self.entry_name(name).await?;
-        self.inner.roots.check_writable(name.tree)?;
-        let inode = self.inner.create_node(name, attributes, when).await?;
-        let handle = self
+    ) -> Result<InodeHandle, WriteError> {
+        let mut operation = Mutation::new(self);
+        let name = operation.entry_name(name).await?;
+        operation.inner.roots.check_writable(name.tree)?;
+        let inode = operation.inner.create_node(name, attributes, when).await?;
+        let handle = operation
             .load_handle(FileId {
                 tree: name.tree,
                 inode,
             })
             .await?;
-        Ok((self, handle))
+        operation.accept();
+        Ok(handle)
     }
 
     pub async fn hard_link(
-        mut self,
+        &mut self,
         name: Name<'_>,
         file: &InodeHandle,
         when: Timestamp,
-    ) -> Result<Self, WriteError> {
-        self.checked(file).await?;
-        let name = self.entry_name(name).await?;
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self);
+        operation.checked(file).await?;
+        let name = operation.entry_name(name).await?;
         if file.tree() != name.tree {
             return Err(WriteError::CrossSubvolume);
         }
         let inode = file.number();
-        self.inner.roots.check_writable(name.tree)?;
-        self.inner.hard_link(name, inode, when).await?;
-        Ok(self)
+        operation.inner.roots.check_writable(name.tree)?;
+        operation.inner.hard_link(name, inode, when).await?;
+        operation.accept();
+        Ok(())
     }
 
     pub async fn symlink(
-        mut self,
+        &mut self,
         name: Name<'_>,
         target: &[u8],
         attributes: Attributes,
         when: Timestamp,
-    ) -> Result<(Self, InodeHandle), WriteError> {
-        let name = self.entry_name(name).await?;
-        self.inner.roots.check_writable(name.tree)?;
-        let inode = self
+    ) -> Result<InodeHandle, WriteError> {
+        let mut operation = Mutation::new(self);
+        let name = operation.entry_name(name).await?;
+        operation.inner.roots.check_writable(name.tree)?;
+        let inode = operation
             .inner
             .symlink(name, target, attributes.raw(0o120000)?, when)
             .await?;
-        let handle = self
+        let handle = operation
             .load_handle(FileId {
                 tree: name.tree,
                 inode,
             })
             .await?;
-        Ok((self, handle))
+        operation.accept();
+        Ok(handle)
     }
 
     pub async fn rename(
-        mut self,
+        &mut self,
         source: Name<'_>,
         destination: Name<'_>,
         when: Timestamp,
-    ) -> Result<Self, WriteError> {
-        let source = self.entry_name(source).await?;
-        let destination = self.entry_name(destination).await?;
-        self.inner.roots.check_writable(source.tree)?;
-        self.inner.roots.check_writable(destination.tree)?;
-        self.inner.rename(source, destination, when).await?;
-        Ok(self)
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self);
+        let source = operation.entry_name(source).await?;
+        let destination = operation.entry_name(destination).await?;
+        operation.inner.roots.check_writable(source.tree)?;
+        operation.inner.roots.check_writable(destination.tree)?;
+        operation.inner.rename(source, destination, when).await?;
+        operation.accept();
+        Ok(())
     }
 
-    pub async fn unlink_name(
-        mut self,
-        name: Name<'_>,
-        when: Timestamp,
-    ) -> Result<Self, WriteError> {
-        let name = self.entry_name(name).await?;
-        self.inner.roots.check_writable(name.tree)?;
-        self.inner.unlink_name(name, when).await?;
-        Ok(self)
+    pub async fn unlink_name(&mut self, name: Name<'_>, when: Timestamp) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self);
+        let name = operation.entry_name(name).await?;
+        operation.inner.roots.check_writable(name.tree)?;
+        operation.inner.unlink_name(name, when).await?;
+        operation.accept();
+        Ok(())
     }
 
     pub async fn commit(
@@ -450,5 +473,45 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         *publication.current = Some(current);
         creation.store(true, Ordering::Release);
         Ok(())
+    }
+}
+
+/// The mutation future owns this guard. Its drop restores the complete private
+/// state after the future's in-flight I/O has been dropped. No durable root has
+/// been published, and committed extents remain pinned throughout rollback.
+struct Mutation<'op, 'tx, S: BlockSink> {
+    transaction: &'op mut WriteTransaction<'tx, S>,
+    saved: Option<Checkpoint>,
+}
+
+impl<'op, 'tx, S: BlockSink> Mutation<'op, 'tx, S> {
+    fn new(transaction: &'op mut WriteTransaction<'tx, S>) -> Self {
+        let saved = Some(transaction.inner.checkpoint());
+        Self { transaction, saved }
+    }
+    fn accept(mut self) {
+        self.transaction.inner.space.accept_operation();
+        self.saved = None;
+    }
+}
+
+impl<'tx, S: BlockSink> Deref for Mutation<'_, 'tx, S> {
+    type Target = WriteTransaction<'tx, S>;
+    fn deref(&self) -> &Self::Target {
+        self.transaction
+    }
+}
+
+impl<S: BlockSink> DerefMut for Mutation<'_, '_, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.transaction
+    }
+}
+
+impl<S: BlockSink> Drop for Mutation<'_, '_, S> {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            self.transaction.inner.restore(saved);
+        }
     }
 }

@@ -2,16 +2,16 @@
 //! without a lock; dropping the final pin makes its retired ranges eligible
 //! for reuse at the next transaction boundary.
 
-use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use rpds::RedBlackTreeMapSync;
 
 use crate::fs::Snapshot;
 use crate::space::Space;
 
 struct Retired {
     generation: u64,
-    extents: BTreeMap<u64, u64>,
+    extents: RedBlackTreeMapSync<u64, u64>,
 }
 
 #[derive(Default)]
@@ -44,7 +44,11 @@ impl Retirements {
         }
     }
 
-    pub(crate) fn record(&mut self, generation: &Arc<Snapshot>, extents: BTreeMap<u64, u64>) {
+    pub(crate) fn record(
+        &mut self,
+        generation: &Arc<Snapshot>,
+        extents: RedBlackTreeMapSync<u64, u64>,
+    ) {
         if !extents.is_empty() {
             self.retired.push(Retired {
                 generation: generation.mapping.superblock.generation(),

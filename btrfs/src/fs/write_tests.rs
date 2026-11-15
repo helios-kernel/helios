@@ -1750,11 +1750,12 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
     };
     macro_rules! refused {
         ($tx:ident, $operation:expr) => {{
-            let $tx = writer.begin().await.unwrap();
+            let mut $tx = writer.begin().await.unwrap();
             assert!(matches!(
                 $operation.await,
                 Err(WriteError::InodeFlags { .. })
             ));
+            drop($tx);
             assert_eq!(writer.snapshot().unwrap().snapshot, base.snapshot);
         }};
     }
@@ -1836,45 +1837,40 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
             .is_none()
     );
     verify(named.path());
-    let (tx, _) = writer
-        .begin()
-        .await
-        .unwrap()
-        .write_file(
-            &ids["append"],
-            initial.len() as u64,
-            b" added",
-            WriteOptions::plain(when, concurrency),
-        )
-        .await
-        .unwrap();
-    let (tx, _) = tx
+    let mut tx = writer.begin().await.unwrap();
+    tx.write_file(
+        &ids["append"],
+        initial.len() as u64,
+        b" added",
+        WriteOptions::plain(when, concurrency),
+    )
+    .await
+    .unwrap();
+    let _ = tx
         .create_file(name(append_dir, b"new"), attributes(), when)
         .await
         .unwrap();
-    let tx = tx
-        .hard_link(name(append_dir, b"alias"), &ids["plain"], when)
+    tx.hard_link(name(append_dir, b"alias"), &ids["plain"], when)
         .await
         .unwrap();
-    let (tx, _) = tx
+    let _ = tx
         .symlink(name(append_dir, b"link"), b"child", attributes(), when)
         .await
         .unwrap();
     // Immutable sources may be cloned; the new file has independent flags.
-    let tx = tx
-        .clone_range(
-            CloneRange {
-                source: &ids["immutable"],
-                destination: &ids["plain"],
-                source_offset: 0,
-                destination_offset: 0,
-                length: initial.len() as u64,
-            },
-            when,
-            concurrency,
-        )
-        .await
-        .unwrap();
+    tx.clone_range(
+        CloneRange {
+            source: &ids["immutable"],
+            destination: &ids["plain"],
+            source_offset: 0,
+            destination_offset: 0,
+            length: initial.len() as u64,
+        },
+        when,
+        concurrency,
+    )
+    .await
+    .unwrap();
     tx.commit(|| panic!("valid fixture UUID"), concurrency)
         .await
         .unwrap();
@@ -1962,23 +1958,20 @@ fn reflink_from_readonly_subvolume_preserves_source() {
             nanoseconds: 0,
         };
         let concurrency = std::thread::available_parallelism().unwrap();
-        let tx = writer
-            .begin()
-            .await
-            .unwrap()
-            .clone_range(
-                CloneRange {
-                    source: &source_id,
-                    destination: &destination_id,
-                    source_offset: 0,
-                    destination_offset: 0,
-                    length: contents.len() as u64,
-                },
-                when,
-                concurrency,
-            )
-            .await
-            .unwrap();
+        let mut tx = writer.begin().await.unwrap();
+        tx.clone_range(
+            CloneRange {
+                source: &source_id,
+                destination: &destination_id,
+                source_offset: 0,
+                destination_offset: 0,
+                length: contents.len() as u64,
+            },
+            when,
+            concurrency,
+        )
+        .await
+        .unwrap();
         tx.commit(|| panic!("valid fixture UUID"), concurrency)
             .await
             .unwrap();
@@ -1992,18 +1985,15 @@ fn reflink_from_readonly_subvolume_preserves_source() {
         cloned.read(&cloned_inode, 0, &mut output).await.unwrap();
         assert_eq!(output, contents);
         let replacement = vec![0x82; contents.len()];
-        let (tx, _) = writer
-            .begin()
-            .await
-            .unwrap()
-            .write_file(
-                &destination_id,
-                0,
-                &replacement,
-                WriteOptions::plain(when, concurrency),
-            )
-            .await
-            .unwrap();
+        let mut tx = writer.begin().await.unwrap();
+        tx.write_file(
+            &destination_id,
+            0,
+            &replacement,
+            WriteOptions::plain(when, concurrency),
+        )
+        .await
+        .unwrap();
         tx.commit(|| panic!("valid fixture UUID"), concurrency)
             .await
             .unwrap();
@@ -2079,8 +2069,9 @@ fn owned_mutations_preserve_readonly_subvolumes() {
         let concurrency = std::thread::available_parallelism().unwrap();
         macro_rules! refused {
             ($tx:ident, $operation:expr) => {{
-                let $tx = writer.begin().await.unwrap();
+                let mut $tx = writer.begin().await.unwrap();
                 assert!(matches!($operation.await, Err(WriteError::ReadOnlySubvolume { tree: rejected }) if rejected == tree));
+                drop($tx);
                 assert_eq!(writer.snapshot().unwrap().snapshot, base.snapshot);
             }};
         }
@@ -2146,7 +2137,7 @@ fn handles_reject_foreign_mounts_and_aborted_creations() {
             seconds: 1_700_000_100,
             nanoseconds: 0,
         };
-        let tx = writer.begin().await.unwrap();
+        let mut tx = writer.begin().await.unwrap();
         let root = tx.root().await.unwrap();
         let attributes = || Attributes {
             permissions: 0o644,
@@ -2169,21 +2160,24 @@ fn handles_reject_foreign_mounts_and_aborted_creations() {
             .await,
             Err(WriteError::ForeignHandle)
         ));
+        drop(tx);
         assert_eq!(writer.snapshot().unwrap().snapshot, base.snapshot);
         let name = Name {
             parent: &root,
             bytes: b"file",
         };
-        let tx = writer.begin().await.unwrap();
-        let (tx, aborted) = tx.create_file(name, attributes(), when).await.unwrap();
-        // Failure consumes the transaction, including the first successful edit.
+        let mut tx = writer.begin().await.unwrap();
+        let aborted = tx.create_file(name, attributes(), when).await.unwrap();
+        // A rejected operation preserves the batch; dropping the transaction
+        // below explicitly aborts its earlier successful creation.
         assert!(matches!(
             tx.create_file(name, attributes(), when).await,
             Err(WriteError::Exists { .. })
         ));
+        drop(tx);
         assert_eq!(writer.snapshot().unwrap().snapshot, base.snapshot);
-        let tx = writer.begin().await.unwrap();
-        let (tx, replacement) = tx.create_file(name, attributes(), when).await.unwrap();
+        let mut tx = writer.begin().await.unwrap();
+        let replacement = tx.create_file(name, attributes(), when).await.unwrap();
         assert_eq!(aborted.number(), replacement.number());
         assert!(matches!(
             tx.metadata(&aborted).await,
@@ -2200,9 +2194,10 @@ fn handles_reject_foreign_mounts_and_aborted_creations() {
             .await,
             Err(WriteError::AbortedHandle)
         ));
+        drop(tx);
         assert_eq!(writer.snapshot().unwrap().snapshot, base.snapshot);
-        let tx = writer.begin().await.unwrap();
-        let (tx, committed) = tx.create_file(name, attributes(), when).await.unwrap();
+        let mut tx = writer.begin().await.unwrap();
+        let committed = tx.create_file(name, attributes(), when).await.unwrap();
         tx.commit(|| panic!("valid fixture UUID"), concurrency)
             .await
             .unwrap();
@@ -2232,7 +2227,7 @@ fn handles_follow_commits_but_reject_reused_inode_numbers() {
             nanoseconds: 0,
         };
         let concurrency = std::thread::available_parallelism().unwrap();
-        let tx = writer.begin().await.unwrap();
+        let mut tx = writer.begin().await.unwrap();
         let root = tx.root().await.unwrap();
         let name = Name {
             parent: &root,
@@ -2243,30 +2238,30 @@ fn handles_follow_commits_but_reject_reused_inode_numbers() {
             uid: 0,
             gid: 0,
         };
-        let (tx, original) = tx.create_file(name, attributes(), when).await.unwrap();
+        let original = tx.create_file(name, attributes(), when).await.unwrap();
         tx.commit(|| panic!("valid fixture UUID"), concurrency)
             .await
             .unwrap();
-        let tx = writer.begin().await.unwrap();
+        let mut tx = writer.begin().await.unwrap();
         let old_generation = tx.metadata(&original).await.unwrap().generation;
-        let (tx, _) = tx
+        let _ = tx
             .write_file(&original, 0, b"old", WriteOptions::plain(when, concurrency))
             .await
             .unwrap();
         tx.commit(|| panic!("valid fixture UUID"), concurrency)
             .await
             .unwrap();
-        let tx = writer.begin().await.unwrap();
+        let mut tx = writer.begin().await.unwrap();
         assert_eq!(
             tx.metadata(&original).await.unwrap().generation,
             old_generation
         );
-        let tx = tx.unlink_name(name, when).await.unwrap();
+        tx.unlink_name(name, when).await.unwrap();
         assert!(matches!(
             tx.metadata(&original).await,
             Err(WriteError::StaleHandle { .. })
         ));
-        let (tx, replacement) = tx.create_file(name, attributes(), when).await.unwrap();
+        let replacement = tx.create_file(name, attributes(), when).await.unwrap();
         assert_eq!(replacement.number(), original.number());
         assert_ne!(
             tx.metadata(&replacement).await.unwrap().generation,
@@ -2279,7 +2274,7 @@ fn handles_follow_commits_but_reject_reused_inode_numbers() {
         tx.commit(|| panic!("valid fixture UUID"), concurrency)
             .await
             .unwrap();
-        let tx = writer.begin().await.unwrap();
+        let mut tx = writer.begin().await.unwrap();
         assert!(matches!(
             tx.metadata(&original).await,
             Err(WriteError::StaleHandle { .. })
@@ -2289,12 +2284,12 @@ fn handles_follow_commits_but_reject_reused_inode_numbers() {
             tx.metadata(&resolved).await.unwrap(),
             tx.metadata(&replacement).await.unwrap()
         );
-        let tx = tx.unlink_name(name, when).await.unwrap();
-        let (tx, newer) = tx.create_file(name, attributes(), when).await.unwrap();
+        tx.unlink_name(name, when).await.unwrap();
+        let newer = tx.create_file(name, attributes(), when).await.unwrap();
         assert_eq!(newer.number(), replacement.number());
         // A second creation in this same generation must not reuse its identity.
-        let tx = tx.unlink_name(name, when).await.unwrap();
-        let (tx, newest) = tx.create_file(name, attributes(), when).await.unwrap();
+        tx.unlink_name(name, when).await.unwrap();
+        let newest = tx.create_file(name, attributes(), when).await.unwrap();
         assert_ne!(newest.number(), newer.number());
         assert!(matches!(
             tx.metadata(&newer).await,
@@ -2310,6 +2305,7 @@ fn handles_follow_commits_but_reject_reused_inode_numbers() {
             .await,
             Err(WriteError::StaleHandle { .. })
         ));
+        drop(tx);
         let current = writer.snapshot().unwrap();
         assert_eq!(current.resolve(b"/file").await.unwrap().metadata().size, 0);
     });
@@ -2331,7 +2327,7 @@ fn owned_mutations_commit_as_one_generation() {
             nanoseconds: 123,
         };
         let concurrency = std::thread::available_parallelism().unwrap();
-        let tx = writer.begin().await.unwrap();
+        let mut tx = writer.begin().await.unwrap();
         let root_handle = tx.root().await.unwrap();
         let name = |bytes| Name {
             parent: &root_handle,
@@ -2343,59 +2339,56 @@ fn owned_mutations_commit_as_one_generation() {
             gid: 1000,
         };
 
-        let (tx, source) = tx
+        let source = tx
             .create_file(name(b"source"), attributes(), when)
             .await
             .unwrap();
-        let (tx, removed) = tx
+        let removed = tx
             .create_file(name(b"temporary"), attributes(), when)
             .await
             .unwrap();
-        let tx = tx.unlink_name(name(b"temporary"), when).await.unwrap();
-        let (tx, replacement) = tx
+        tx.unlink_name(name(b"temporary"), when).await.unwrap();
+        let replacement = tx
             .create_file(name(b"temporary"), attributes(), when)
             .await
             .unwrap();
         assert!(replacement.number() > removed.number());
-        let tx = tx.unlink_name(name(b"temporary"), when).await.unwrap();
+        tx.unlink_name(name(b"temporary"), when).await.unwrap();
         let bytes = vec![0x53; 16384];
-        let (tx, count) = tx
+        let count = tx
             .write_file(&source, 0, &bytes, WriteOptions::plain(when, concurrency))
             .await
             .unwrap();
         assert_eq!(count, bytes.len());
-        let tx = tx
-            .truncate_file(&source, 8192, when, concurrency)
+        tx.truncate_file(&source, 8192, when, concurrency)
             .await
             .unwrap();
-        let (tx, destination) = tx
+        let destination = tx
             .create_file(name(b"clone"), attributes(), when)
             .await
             .unwrap();
-        let tx = tx
-            .clone_range(
-                CloneRange {
-                    source: &source,
-                    destination: &destination,
-                    source_offset: 0,
-                    destination_offset: 0,
-                    length: 8192,
-                },
-                when,
-                concurrency,
-            )
+        tx.clone_range(
+            CloneRange {
+                source: &source,
+                destination: &destination,
+                source_offset: 0,
+                destination_offset: 0,
+                length: 8192,
+            },
+            when,
+            concurrency,
+        )
+        .await
+        .unwrap();
+        tx.hard_link(name(b"alias"), &source, when).await.unwrap();
+        tx.rename(name(b"source"), name(b"renamed"), when)
             .await
             .unwrap();
-        let tx = tx.hard_link(name(b"alias"), &source, when).await.unwrap();
-        let tx = tx
-            .rename(name(b"source"), name(b"renamed"), when)
-            .await
-            .unwrap();
-        let (tx, _) = tx
+        let _ = tx
             .symlink(name(b"link"), b"renamed", attributes(), when)
             .await
             .unwrap();
-        let tx = tx.unlink_name(name(b"alias"), when).await.unwrap();
+        tx.unlink_name(name(b"alias"), when).await.unwrap();
         let access = crate::Timestamp {
             seconds: 1_600_000_000,
             nanoseconds: 456,
@@ -2404,12 +2397,10 @@ fn owned_mutations_commit_as_one_generation() {
             seconds: 1_650_000_000,
             nanoseconds: 789,
         };
-        let tx = tx
-            .set_times(&source, Some(access), None, when)
+        tx.set_times(&source, Some(access), None, when)
             .await
             .unwrap();
-        let tx = tx
-            .set_times(&destination, None, Some(modified), when)
+        tx.set_times(&destination, None, Some(modified), when)
             .await
             .unwrap();
         let mut output = vec![0; 8192];
@@ -2460,7 +2451,17 @@ fn owned_mutations_commit_as_one_generation() {
 
 #[cfg(feature = "write")]
 #[test]
-fn failed_and_canceled_mutations_discard_all_prior_edits() {
+fn failed_and_canceled_mutations_restore_only_their_operation() {
+    exercise_operation_rollback(|_| {});
+}
+
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn operation_rollback_passes_btrfs_check() {
+    exercise_operation_rollback(assert_btrfs_check);
+}
+
+fn exercise_operation_rollback(mut verify: impl FnMut(&std::path::Path)) {
     use super::writer::Attributes;
     use super::writer::{Name, Writer};
     use crate::source::BlockSink;
@@ -2488,8 +2489,9 @@ fn failed_and_canceled_mutations_discard_all_prior_edits() {
     impl BlockSink for InterruptedDisk {
         async fn stage(&self, block: u64, bytes: &[u8; 4096]) -> IoResult<()> {
             self.entered.fetch_add(1, Ordering::SeqCst);
+            self.disk.stage(block, bytes).await?;
             match self.stage_action.load(Ordering::SeqCst) {
-                0 => self.disk.stage(block, bytes).await,
+                0 => Ok(()),
                 1 => Err(IoError::DeviceFault),
                 2 => pending().await,
                 _ => panic!("unknown fixture stage action"),
@@ -2500,16 +2502,27 @@ fn failed_and_canceled_mutations_discard_all_prior_edits() {
         }
     }
     block_on(async {
-        for action in [1, 2] {
+        for (action, private) in [(1, false), (2, false), (1, true), (2, true)] {
             let stamp = Timestamp::from_secs(1_700_000_000);
-            let contents = "中文・日本語・한국어".as_bytes();
+            let original = "中文・日本語・한국어".as_bytes();
+            let contents = if private {
+                original.repeat(512)
+            } else {
+                original.to_vec()
+            };
             let tree = TreeBuilder::new().root(Metadata::new(0o755, stamp)).file(
                 "/data",
-                contents.to_vec(),
+                original.to_vec(),
                 Metadata::new(0o644, stamp),
             );
-            let (_, image) = filesystem_image_tree(true, true, tree);
-            let stage_action = Arc::new(AtomicUsize::new(action));
+            let named = tempfile::NamedTempFile::new().unwrap();
+            let (_, image) = filesystem_image_options(
+                tree,
+                named.reopen().unwrap(),
+                FormatOptions::new([0x53; 16], stamp),
+            );
+            verify(named.path());
+            let stage_action = Arc::new(AtomicUsize::new(0));
             let entered = Arc::new(AtomicUsize::new(0));
             let mut writer = Writer::mount(InterruptedDisk {
                 disk: Disk(image),
@@ -2519,7 +2532,6 @@ fn failed_and_canceled_mutations_discard_all_prior_edits() {
             .await
             .unwrap();
             let base = writer.snapshot().unwrap();
-            let inode = base.resolve(b"/data").await.unwrap();
             let handles = writer.begin().await.unwrap();
             let root_handle = handles.root().await.unwrap();
             let file = handles
@@ -2542,11 +2554,18 @@ fn failed_and_canceled_mutations_discard_all_prior_edits() {
                 uid: 1000,
                 gid: 1000,
             };
-            let tx = writer.begin().await.unwrap();
-            let (tx, _) = tx.create_file(name, attributes(), when).await.unwrap();
-            let payload = vec![0x71; 8192];
-            // A full overwrite first removes the inline mapping, then stages
-            // its replacement. Interrupt after that private mutation occurred.
+            let mut tx = writer.begin().await.unwrap();
+            let _ = tx.create_file(name, attributes(), when).await.unwrap();
+            if private {
+                tx.write_file(&file, 0, &contents, WriteOptions::plain(when, concurrency))
+                    .await
+                    .unwrap();
+            }
+            stage_action.store(action, Ordering::SeqCst);
+            entered.store(0, Ordering::SeqCst);
+            let payload = vec![0x71; contents.len().max(8192)];
+            // Fail after bytes reach storage, covering both inline promotion
+            // and replacement of an extent allocated earlier in this batch.
             if action == 1 {
                 assert!(
                     tx.write_file(&file, 0, &payload, WriteOptions::plain(when, concurrency))
@@ -2563,22 +2582,28 @@ fn failed_and_canceled_mutations_discard_all_prior_edits() {
                 assert!(poll_once(write.as_mut()).await.is_none());
             }
             assert!(entered.load(Ordering::SeqCst) > 0);
-            let restored = writer.snapshot().unwrap();
-            assert_eq!(restored.snapshot, base.snapshot);
-            assert!(
-                restored
-                    .lookup(&restored.root().await.unwrap(), b"pending")
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(tx.lookup(&root_handle, b"pending").await.unwrap().is_some());
             let mut output = vec![0; contents.len()];
-            restored.read(&inode, 0, &mut output).await.unwrap();
+            tx.read_file(&file, 0, &mut output).await.unwrap();
             assert_eq!(output, contents);
             stage_action.store(0, Ordering::SeqCst);
-            // The writer remains usable and the aborted name was not retained.
-            let tx = writer.begin().await.unwrap();
-            let (tx, _) = tx.create_file(name, attributes(), when).await.unwrap();
+            // A succeeding replacement must release the held private extent,
+            // while leaving allocation and free-space accounting consistent.
+            tx.write_file(&file, 0, &contents, WriteOptions::plain(when, concurrency))
+                .await
+                .unwrap();
+            // The earlier creation survived, and the same transaction remains
+            // usable after either an I/O error or cancellation mid-mutation.
+            tx.create_file(
+                Name {
+                    parent: &root_handle,
+                    bytes: b"after",
+                },
+                attributes(),
+                when,
+            )
+            .await
+            .unwrap();
             tx.commit(|| panic!("valid fixture UUID"), concurrency)
                 .await
                 .unwrap();
@@ -2599,6 +2624,7 @@ fn failed_and_canceled_mutations_discard_all_prior_edits() {
                 .await
                 .unwrap();
             assert_eq!(output, contents);
+            verify(named.path());
         }
     });
 }
@@ -3026,7 +3052,9 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
         let raw_space = Space::load(&current.volume, current.snapshot.root_tree)
             .await
             .unwrap();
-        let raw_free = raw_space.committed_free(&BTreeMap::new()).unwrap();
+        let raw_free = raw_space
+            .committed_free(&rpds::RedBlackTreeMapSync::new_sync())
+            .unwrap();
         {
             let mut transaction = Transaction::new(
                 current.volume.view(&current.snapshot.mapping),
@@ -3036,7 +3064,10 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
             .await
             .unwrap();
             // Excluding reader pins must not change on-disk free-space accounting.
-            let pinned_free = transaction.space.committed_free(&BTreeMap::new()).unwrap();
+            let pinned_free = transaction
+                .space
+                .committed_free(&rpds::RedBlackTreeMapSync::new_sync())
+                .unwrap();
             assert_eq!(raw_free.len(), pinned_free.len());
             for (raw, pinned) in raw_free.iter().zip(&pinned_free) {
                 assert_eq!(raw.range, pinned.range);
@@ -3471,7 +3502,10 @@ fn space_load_validates_formatted_file_data_references() {
         verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
         // Retired bytes appear in the next disk free-space tree, but remain
         // unavailable to this transaction's allocator.
-        for group in space.committed_free(&BTreeMap::new()).unwrap() {
+        for group in space
+            .committed_free(&rpds::RedBlackTreeMapSync::new_sync())
+            .unwrap()
+        {
             assert!(
                 group
                     .free
@@ -4476,7 +4510,10 @@ fn space_reservations_exclude_existing_extents_and_return_private_allocations() 
             records.insert(key, cursor.item().unwrap().to_vec());
             cursor.advance(&fs.volume).await.unwrap();
         }
-        for group in space.committed_free(&BTreeMap::new()).unwrap() {
+        for group in space
+            .committed_free(&rpds::RedBlackTreeMapSync::new_sync())
+            .unwrap()
+        {
             let key = Key::new(
                 group.range.start,
                 crate::ondisk::item_type::FREE_SPACE_INFO,

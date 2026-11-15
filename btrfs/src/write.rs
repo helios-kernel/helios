@@ -5,8 +5,9 @@
 //! through a committed [`crate::Filesystem`] snapshot remain concurrent and
 //! retain the generation they opened. No filesystem lock is held across I/O.
 //!
-//! Each mutation consumes [`WriteTransaction`] and returns it only on success.
-//! An error or cancellation drops all private changes. [`InodeHandle`] binds an
+//! Mutations exclusively borrow [`WriteTransaction`]. An error or cancellation
+//! restores that operation's checkpoint and preserves earlier successful edits.
+//! Commit consumes the transaction; dropping it discards the entire batch. [`InodeHandle`] binds an
 //! inode to its mount and creation generation; a handle for an uncommitted inode
 //! survives its transaction only after that transaction successfully commits.
 //! Directory lookup sees staged namespace changes, including subvolume entries.

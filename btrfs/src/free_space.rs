@@ -333,6 +333,7 @@ fn validate_range(
 /// The transaction's free-space tree and its last encoded record set. Tree edits
 /// can allocate more metadata, so the enclosing accounting loop calls `sync`
 /// until allocation, usage, and free-space records all stop changing.
+#[derive(Clone)]
 pub(crate) struct FreeTree {
     pub(crate) root: TreeRoot,
     records: BTreeMap<Key, Vec<u8>>,
@@ -401,7 +402,7 @@ impl FreeTree {
         volume: &Volume<S>,
         trees: &mut Trees,
         space: &mut Space,
-        retired: &BTreeMap<u64, u64>,
+        retired: &RedBlackTreeMapSync<u64, u64>,
     ) -> Result<bool, WriteError> {
         let mut desired = BTreeMap::new();
         for mut group in space.committed_free(retired)? {

@@ -101,7 +101,9 @@ pub trait BlockSink: BlockSource {
     /// bytes visible to reads but does not promise durable storage.
     ///
     /// Only newly allocated, unreachable CoW blocks may be staged. A
-    /// superblock must go through [`Self::commit`] instead.
+    /// superblock must go through [`Self::commit`] instead. Dropping a staging
+    /// future must leave no detached write that could later overwrite a newer
+    /// staging operation at the same address: aborted reservations are reused.
     fn stage(
         &self,
         block: u64,

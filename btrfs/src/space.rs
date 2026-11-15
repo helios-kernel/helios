@@ -3,7 +3,6 @@
 //! exclusively; it never holds a lock across I/O and never returns retired
 //! committed extents to this map before publication/read-side retirement.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -122,9 +121,25 @@ pub(crate) struct Space {
     sector: u64,
     metadata: RedBlackTreeMapSync<u64, MetadataReservation>,
     data: RedBlackTreeMapSync<u64, u64>,
+    protected_data: RedBlackTreeMapSync<u64, u64>,
+    deferred_data: RedBlackTreeMapSync<u64, u64>,
 }
 
 impl Space {
+    /// Prior private data remains reachable from the operation checkpoint.
+    /// Its addresses cannot be recycled until the operation is accepted.
+    pub(crate) fn begin_operation(&mut self) {
+        self.protected_data = self.data.clone();
+    }
+
+    pub(crate) fn accept_operation(&mut self) {
+        let deferred = core::mem::take(&mut self.deferred_data);
+        self.protected_data = RedBlackTreeMapSync::new_sync();
+        for (&address, &length) in &deferred {
+            self.release_private(address..address + length);
+        }
+    }
+
     /// Reader-pinned storage is free on disk but unavailable to this writer.
     #[cfg(feature = "write")]
     pub(crate) fn pin(&mut self, range: Range<u64>) {
@@ -197,6 +212,8 @@ impl Space {
             sector: u64::from(sb.sectorsize()),
             metadata: RedBlackTreeMapSync::new_sync(),
             data: RedBlackTreeMapSync::new_sync(),
+            protected_data: RedBlackTreeMapSync::new_sync(),
+            deferred_data: RedBlackTreeMapSync::new_sync(),
         };
         let mut cursor = Cursor::ceiling(volume, extent_root, Key::new(0, 0, 0)).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
@@ -316,7 +333,11 @@ impl Space {
             return false;
         };
         self.data.remove_mut(&address);
-        self.release_private(address..address + length);
+        if self.protected_data.contains_key(&address) {
+            self.deferred_data.insert_mut(address, length);
+        } else {
+            self.release_private(address..address + length);
+        }
         true
     }
 
@@ -337,7 +358,7 @@ impl Space {
     /// includes free superblock stripes and extents retired from the old roots.
     pub(crate) fn committed_free(
         &self,
-        retired: &BTreeMap<u64, u64>,
+        retired: &RedBlackTreeMapSync<u64, u64>,
     ) -> Result<Vec<FreeGroup>, SpaceError> {
         self.groups
             .iter()
@@ -373,7 +394,7 @@ impl Space {
     /// accounting but remains absent from the reusable free-range map.
     pub(crate) fn group_usage(
         &self,
-        retired: &BTreeMap<u64, u64>,
+        retired: &RedBlackTreeMapSync<u64, u64>,
     ) -> Result<Vec<(Key, u64)>, SpaceError> {
         self.groups
             .iter()

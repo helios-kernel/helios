@@ -122,11 +122,13 @@ impl<S: crate::source::BlockSink> Volume<S> {
             return Err(crate::tree::write::WriteError::StaleSnapshot);
         }
         Ok(crate::commit::CommitImage {
-            bytes: selected
-                .bytes
-                .into_boxed_slice()
-                .try_into()
-                .expect("selected superblock has fixed size"),
+            bytes: alloc::sync::Arc::new(
+                selected
+                    .bytes
+                    .as_slice()
+                    .try_into()
+                    .expect("selected superblock has fixed size"),
+            ),
         })
     }
 

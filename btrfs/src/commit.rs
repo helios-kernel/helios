@@ -1,7 +1,7 @@
 //! Superblock publication image. Preserve fields the transaction does not
 //! change, while rotating the typed backup roots and checksumming each mirror.
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 use zerocopy::{FromZeros, IntoBytes};
 
 use crate::ondisk::{RawRootBackup, RawSuperblock, SUPERBLOCK_BYTES, objectid, view};
@@ -9,8 +9,9 @@ use crate::roots::Roots;
 use crate::tree::write::WriteError;
 use crate::{ChecksumType, Compression};
 
+#[derive(Clone)]
 pub(crate) struct CommitImage {
-    pub(crate) bytes: Box<[u8; SUPERBLOCK_BYTES]>,
+    pub(crate) bytes: Arc<[u8; SUPERBLOCK_BYTES]>,
 }
 
 impl CommitImage {
@@ -33,7 +34,8 @@ impl CommitImage {
         };
         let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
         raw.incompat_flags.set(raw.incompat_flags.get() | flag);
-        self.bytes[..size_of::<RawSuperblock>()].copy_from_slice(raw.as_bytes());
+        Arc::make_mut(&mut self.bytes)[..size_of::<RawSuperblock>()]
+            .copy_from_slice(raw.as_bytes());
     }
 
     pub(crate) fn prepare(&mut self, roots: &Roots, used: u64) -> Result<(), WriteError> {
@@ -91,8 +93,9 @@ impl CommitImage {
         backup.device_level = device.level;
         backup.checksum_level = checksum.level;
         let start = offset + slot * size_of::<RawRootBackup>();
-        self.bytes[start..start + size_of::<RawRootBackup>()].copy_from_slice(backup.as_bytes());
-        self.bytes[..offset].copy_from_slice(raw.as_bytes());
+        Arc::make_mut(&mut self.bytes)[start..start + size_of::<RawRootBackup>()]
+            .copy_from_slice(backup.as_bytes());
+        Arc::make_mut(&mut self.bytes)[..offset].copy_from_slice(raw.as_bytes());
         Ok(())
     }
 
@@ -100,9 +103,11 @@ impl CommitImage {
         let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
         raw.bytenr.set(offset);
         raw.csum.fill(0);
-        self.bytes[..size_of::<RawSuperblock>()].copy_from_slice(raw.as_bytes());
+        Arc::make_mut(&mut self.bytes)[..size_of::<RawSuperblock>()]
+            .copy_from_slice(raw.as_bytes());
         let digest = algorithm.digest(&self.bytes[32..]);
-        self.bytes[..digest.as_bytes().len()].copy_from_slice(digest.as_bytes());
+        Arc::make_mut(&mut self.bytes)[..digest.as_bytes().len()]
+            .copy_from_slice(digest.as_bytes());
         &self.bytes
     }
 }

@@ -12,6 +12,7 @@ use crate::tree::TreeRoot;
 use crate::tree::write::{Trees, WriteError};
 use crate::volume::Volume;
 
+#[derive(Clone)]
 pub(crate) struct Checksums {
     pub(crate) root: TreeRoot,
 }

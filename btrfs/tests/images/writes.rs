@@ -46,7 +46,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
         let before = writer.snapshot().unwrap();
         let begin = writer.begin();
         assert_send(&begin);
-        let tx = begin.await.unwrap();
+        let mut tx = begin.await.unwrap();
         let root = tx.root().await.unwrap();
         let when = Timestamp {
             seconds: 1_700_000_100,
@@ -58,7 +58,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             uid: 1000,
             gid: 1000,
         };
-        let (tx, directory) = tx
+        let directory = tx
             .create_directory(
                 Name {
                     parent: &root,
@@ -73,7 +73,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             parent: &directory,
             bytes,
         };
-        let (tx, source) = tx
+        let source = tx
             .create_file(name(b"source"), attributes(0o640), when)
             .await
             .unwrap();
@@ -90,26 +90,25 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             },
         );
         assert_send(&write);
-        let (tx, count) = write.await.unwrap();
+        let count = write.await.unwrap();
         assert_eq!(count, data.len());
-        let (tx, destination) = tx
+        let destination = tx
             .create_file(name(b"clone"), attributes(0o640), when)
             .await
             .unwrap();
-        let tx = tx
-            .clone_range(
-                CloneRange {
-                    source: &source,
-                    destination: &destination,
-                    source_offset: 0,
-                    destination_offset: 0,
-                    length: data.len() as u64,
-                },
-                when,
-                concurrency,
-            )
-            .await
-            .unwrap();
+        tx.clone_range(
+            CloneRange {
+                source: &source,
+                destination: &destination,
+                source_offset: 0,
+                destination_offset: 0,
+                length: data.len() as u64,
+            },
+            when,
+            concurrency,
+        )
+        .await
+        .unwrap();
         let looked_up = tx.lookup(&directory, b"clone").await.unwrap().unwrap();
         assert_eq!(looked_up.number(), destination.number());
         assert_eq!(
@@ -140,8 +139,8 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             .resolve("/中文-日本語-한국어/source".as_bytes())
             .await
             .unwrap();
-        let tx = writer.begin().await.unwrap();
-        let (tx, _) = tx
+        let mut tx = writer.begin().await.unwrap();
+        let _ = tx
             .write_file(
                 &source,
                 0,
@@ -150,8 +149,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             )
             .await
             .unwrap();
-        let tx = tx
-            .rename(name(b"clone"), name(b"kept"), when)
+        tx.rename(name(b"clone"), name(b"kept"), when)
             .await
             .unwrap();
         tx.commit(|| panic!("fixture UUIDs are valid"), concurrency)

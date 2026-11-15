@@ -31,7 +31,7 @@
 //!
 //! # Writing
 //!
-//! The `write` feature exposes `write::Writer` and consuming transactions.
+//! The `write` feature exposes `write::Writer` and transactions with per-operation rollback.
 //! A transaction stages private CoW blocks and publishes a new immutable view
 //! only after its superblocks are durable. Existing readers retain the complete
 //! mapping and checksum roots for their generation; its retired blocks cannot

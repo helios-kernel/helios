@@ -32,6 +32,7 @@ pub(crate) fn key(uuid: [u8; 16], kind: u8) -> Key {
     )
 }
 
+#[derive(Clone)]
 pub(crate) struct UuidTree {
     pub(crate) root: TreeRoot,
     records: BTreeMap<Key, Vec<u8>>,

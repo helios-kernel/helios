@@ -2,8 +2,10 @@
 //! them: the root tree itself remains in the CoW overlay until superblock commit.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use rpds::RedBlackTreeMapSync;
 
 use zerocopy::IntoBytes;
 
@@ -17,6 +19,7 @@ use crate::uuid_tree::{self, UuidTree};
 use crate::volume::Volume;
 use crate::{Error, Key};
 
+#[derive(Clone)]
 struct RootItem {
     key: Key,
     root: TreeRoot,
@@ -90,10 +93,11 @@ impl RootItem {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Roots {
     pub(crate) root: TreeRoot,
-    entries: BTreeMap<u64, RootItem>,
-    uuid_tree: Option<UuidTree>,
+    entries: RedBlackTreeMapSync<u64, RootItem>,
+    uuid_tree: Option<Arc<UuidTree>>,
 }
 
 impl Roots {
@@ -101,13 +105,13 @@ impl Roots {
         volume: &Volume<S>,
         root: TreeRoot,
     ) -> Result<Self, WriteError> {
-        let mut entries = BTreeMap::new();
+        let mut entries = RedBlackTreeMapSync::new_sync();
         let mut cursor = Cursor::ceiling(volume, root, Key::new(0, 0, 0)).await?;
         while let (Some(key), Some(bytes)) = (cursor.key(), cursor.item()) {
             if key.item_type == item_type::ROOT_ITEM {
                 // Cursor order selects the newest root-item offset for a tree,
                 // matching the read path's find_root lookup.
-                entries.insert(
+                entries.insert_mut(
                     key.objectid,
                     RootItem::parse(key, bytes, volume.superblock().sectorsize())?,
                 );
@@ -115,7 +119,7 @@ impl Roots {
             cursor.advance(volume).await?;
         }
         let uuid_tree = if let Some(entry) = entries.get(&objectid::UUID_TREE) {
-            Some(UuidTree::load(volume, entry.root).await?)
+            Some(Arc::new(UuidTree::load(volume, entry.root).await?))
         } else {
             None
         };
@@ -200,7 +204,8 @@ impl Roots {
             changes.entry(block.tree).or_default().1 += size;
         }
         let mut changed = false;
-        for (&tree, entry) in &mut self.entries {
+        let entries = self.entries.clone();
+        for (&tree, entry) in &entries {
             let (added, removed) = changes.get(&tree).copied().unwrap_or_default();
             let used = entry
                 .initial_used
@@ -221,6 +226,7 @@ impl Roots {
             {
                 continue;
             }
+            let entry = self.entries.get_mut(&tree).expect("catalogued root");
             entry.encode(used, new_uuid);
             self.root = trees
                 .apply(volume, self.root, entry.key, Some(&entry.bytes), space)
@@ -233,12 +239,14 @@ impl Roots {
             let root = trees
                 .create(volume, self.root, objectid::UUID_TREE, space)
                 .await?;
-            self.entries.insert(root.tree, RootItem::internal(root));
-            self.uuid_tree = Some(UuidTree::empty(root));
+            self.entries.insert_mut(root.tree, RootItem::internal(root));
+            self.uuid_tree = Some(Arc::new(UuidTree::empty(root)));
             changed = true;
         }
         if let Some(index) = &mut self.uuid_tree {
-            changed |= index.sync(volume, trees, space, desired).await?;
+            changed |= Arc::make_mut(index)
+                .sync(volume, trees, space, desired)
+                .await?;
             self.entries
                 .get_mut(&objectid::UUID_TREE)
                 .expect("UUID tree has a root item")
@@ -296,7 +304,7 @@ mod tests {
                 generation: 42,
                 level: 0,
             },
-            entries: BTreeMap::new(),
+            entries: RedBlackTreeMapSync::new_sync(),
             uuid_tree: None,
         };
         for tree in [objectid::FS_TREE, objectid::FIRST_FREE] {
@@ -308,7 +316,7 @@ mod tests {
             tail.uuid = [1; 16];
             tail.received_uuid = [2; 16];
             entry.bytes[offset..].copy_from_slice(tail.as_bytes());
-            roots.entries.insert(tree, entry);
+            roots.entries.insert_mut(tree, entry);
         }
         let both: Vec<_> = [objectid::FS_TREE, objectid::FIRST_FREE]
             .into_iter()

@@ -45,7 +45,38 @@ pub(crate) struct Transaction<'a, S> {
     pub(crate) accounting: Accounting,
 }
 
+/// Private operation state. Inode allocation high-water marks deliberately
+/// remain outside rollback: a discarded creation cannot lend its identity to
+/// another inode in the same transaction generation.
+pub(crate) struct Checkpoint {
+    image: CommitImage,
+    roots: Roots,
+    trees: Trees,
+    space: Space,
+    accounting: Accounting,
+}
+
 impl<'a, S: BlockSink> Transaction<'a, S> {
+    pub(crate) fn checkpoint(&mut self) -> Checkpoint {
+        let saved = Checkpoint {
+            image: self.image.clone(),
+            roots: self.roots.clone(),
+            trees: self.trees.clone(),
+            space: self.space.clone(),
+            accounting: self.accounting.clone(),
+        };
+        self.space.begin_operation();
+        saved
+    }
+
+    pub(crate) fn restore(&mut self, saved: Checkpoint) {
+        self.image = saved.image;
+        self.roots = saved.roots;
+        self.trees = saved.trees;
+        self.space = saved.space;
+        self.accounting = saved.accounting;
+    }
+
     pub(crate) async fn inode_metadata(&self, file: FileId) -> Result<Metadata, WriteError> {
         self.inode_item(file.tree, file.inode)
             .await

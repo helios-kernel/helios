@@ -5,7 +5,9 @@
 mod cow;
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use rpds::RedBlackTreeMapSync;
 
 use crate::Key;
 use crate::allocation::data::{DataBackref, DataDefect, DataExtent, DataReference};
@@ -38,15 +40,16 @@ pub(crate) struct DataWrite<'a> {
     pub(crate) checksummed: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct Accounting {
     pub(crate) root: TreeRoot,
     nodesize: u64,
     groups: TreeRoot,
-    free_space: Option<FreeTree>,
+    free_space: Option<Arc<FreeTree>>,
     checksums: Checksums,
-    group_used: BTreeMap<Key, u64>,
-    retired_extents: BTreeMap<u64, u64>,
-    registered: BTreeMap<u64, MetadataReservation>,
+    group_used: RedBlackTreeMapSync<Key, u64>,
+    retired_extents: RedBlackTreeMapSync<u64, u64>,
+    registered: RedBlackTreeMapSync<u64, MetadataReservation>,
     processed_retired: usize,
 }
 
@@ -210,7 +213,7 @@ impl Accounting {
                 )
                 .await?;
             if !space.cancel_data(key.objectid) {
-                self.retired_extents.insert(key.objectid, key.offset);
+                self.retired_extents.insert_mut(key.objectid, key.offset);
             }
         }
         Ok(refs == 0)
@@ -223,7 +226,14 @@ impl Accounting {
         checksum_root: TreeRoot,
     ) -> Result<Self, WriteError> {
         let free_space = if let Some(root) = space.free_root() {
-            Some(FreeTree::load(volume, root, &space.committed_free(&BTreeMap::new())?).await?)
+            Some(Arc::new(
+                FreeTree::load(
+                    volume,
+                    root,
+                    &space.committed_free(&RedBlackTreeMapSync::new_sync())?,
+                )
+                .await?,
+            ))
         } else {
             None
         };
@@ -235,9 +245,9 @@ impl Accounting {
             checksums: Checksums {
                 root: checksum_root,
             },
-            group_used: BTreeMap::new(),
-            retired_extents: BTreeMap::new(),
-            registered: BTreeMap::new(),
+            group_used: RedBlackTreeMapSync::new_sync(),
+            retired_extents: RedBlackTreeMapSync::new_sync(),
+            registered: RedBlackTreeMapSync::new_sync(),
             processed_retired: 0,
         })
     }
@@ -257,7 +267,8 @@ impl Accounting {
         loop {
             self.sync_references(volume, trees, space).await?;
             let free_changed = if let Some(free) = &mut self.free_space {
-                free.sync(volume, trees, space, &self.retired_extents)
+                Arc::make_mut(free)
+                    .sync(volume, trees, space, &self.retired_extents)
                     .await?
             } else {
                 false
@@ -292,7 +303,7 @@ impl Accounting {
                         space,
                     )
                     .await?;
-                self.registered.remove(&address);
+                self.registered.remove_mut(&address);
             }
             for (address, record) in changed {
                 let extent = metadata_extent(trees.generation(), record, skinny);
@@ -307,7 +318,7 @@ impl Accounting {
                 self.root = trees
                     .apply(volume, self.root, key, Some(&extent.encode()), space)
                     .await?;
-                self.registered.insert(address, record);
+                self.registered.insert_mut(address, record);
             }
         }
     }
@@ -329,7 +340,7 @@ impl Accounting {
     }
 
     #[cfg(feature = "write")]
-    pub(crate) fn take_retired(&mut self) -> BTreeMap<u64, u64> {
+    pub(crate) fn take_retired(&mut self) -> RedBlackTreeMapSync<u64, u64> {
         core::mem::take(&mut self.retired_extents)
     }
 
@@ -379,7 +390,7 @@ impl Accounting {
                 }
                 changed = true;
             }
-            self.group_used.insert(key, used);
+            self.group_used.insert_mut(key, used);
         }
         Ok(changed)
     }
@@ -489,7 +500,8 @@ impl Accounting {
             .apply(volume, self.root, key, payload.as_deref(), allocator)
             .await?;
         if last {
-            self.retired_extents.insert(block.address, self.nodesize);
+            self.retired_extents
+                .insert_mut(block.address, self.nodesize);
         }
         Ok(last)
     }
