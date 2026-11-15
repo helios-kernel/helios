@@ -3610,7 +3610,7 @@ fn connect_and_run(
                     crate::vsock::connect(guest_cid, helios_inspector_protocol::VSOCK_RPC_PORT)
                         .await?;
                 let mut client =
-                    helios_inspector_protocol::transport::Client::new(vsock_read, vsock_write);
+                    RpcClient::new(vsock_read, vsock_write).map_err(ConnectError::from)?;
                 crate::ready::wait_until_ready(&mut client)
                     .await
                     .map_err(ConnectError::from)?;
@@ -3842,17 +3842,7 @@ async fn serve_guest_requests(
         }
         core::future::pending().await
     };
-    // A session that asks the guest nothing reads nothing, and a guest
-    // that keeps talking into a transport nobody drains blocks on it —
-    // which for a compositor writing its own account of every frame
-    // means a desktop that stops after its first two lines. Holding the
-    // reader role for as long as the session lasts is what keeps it
-    // running.
-    let route = async {
-        let _ = client.route_frames().await;
-        core::future::pending().await
-    };
-    futures_lite::future::or(serve, route).await
+    serve.await
 }
 
 /// The `--run` program one host-side action is performed alongside.

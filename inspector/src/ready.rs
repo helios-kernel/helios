@@ -20,6 +20,11 @@ use crate::serial::{RpcClient, RpcReader, SerialIo};
 /// probe that runs once the link is up.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BootError {
+    #[error("failed to start the RPC connection driver: {source}")]
+    Driver {
+        #[from]
+        source: io::Error,
+    },
     #[error("timed out waiting for the embedded debugger cold-start markers")]
     MarkersTimedOut,
     #[error("failed to read kernel boot markers from the debug serial link: {source}")]
@@ -89,7 +94,7 @@ fn boot_sync_timeout() -> Duration {
 pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient, BootError> {
     let (read, write) = io.into_split();
     let read = wait_for_boot(read).await?;
-    let mut client = helios_inspector_protocol::transport::Client::new(read, write);
+    let mut client = RpcClient::new(read, write)?;
     wait_until_ready(&mut client).await?;
     Ok(client)
 }
