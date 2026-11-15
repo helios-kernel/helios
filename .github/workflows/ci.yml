@@ -40,14 +40,9 @@ jobs:
   # candidate and runs `lint-fmt` alone; marking it ready for review runs
   # the rest.
   #
-  # It also says whether the change touches what fixes the kernel
-  # profile's format (the profdata header check, the guest's raw writer)
-  # or the compiler that reads it. The profile every x86-64 lane spends is
-  # the newest one collected on dev, by the compiler dev pinned then; a
-  # pull request that moves any of these cannot read it, and dev cannot
-  # collect another until the pull request merges (#731). Only a pull
-  # request is asked: a push to dev is what `kernel-profile.yml` collects
-  # on, and a dispatch has no change to speak of.
+  # Full runs collect their own kernel profile before x86-64 smoke uses
+  # it. An independent scheduled collection may still be running, and
+  # its previous artifact can predate a toolchain or profile-format change.
   changes:
     name: changes
     runs-on: ubuntu-24.04
@@ -62,9 +57,8 @@ jobs:
       # `checks` matrix.
       checks: ${{ steps.select.outputs.checks }}
       tests: ${{ steps.select.outputs.tests }}
-      # `true` when the change moves the kernel profile's format or the
-      # compiler that reads it; `kernel-profile` then collects this run's.
-      profile_format: ${{ steps.filter.outputs.profile_format || 'false' }}
+      # Full suites use this run's profile, including manually selected refs.
+      profile_format: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'true' || steps.filter.outputs.profile_format || 'false' }}
       # Guest-program profiles the selected checks and smoke lanes read.
       wasm_profiles: ${{ steps.select.outputs.wasm_profiles }}
     steps:
@@ -180,10 +174,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "${lanes}"
 
-  # The collection a `profile_format` change spends in place of dev's
-  # profile: the same workflow `bench-suite.yml` calls, on this run's
-  # commit, uploaded under the stable artifact name. `smoke-x86-64` is its
-  # only reader, so a run that skips that lane (a draft) skips this too.
+  # Collect on this run's commit and upload under the stable artifact name
+  # before the x86-64 smoke lanes fetch it. Ordinary PRs skip these lanes.
   kernel-profile:
     name: kernel-profile
     needs: changes
