@@ -291,6 +291,59 @@ where
     profile: Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>,
 }
 
+pub(crate) fn prepare_open<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
+    descriptor: Resource<FsDescriptor>,
+    path_flags: fs_types::PathFlags,
+    path: &str,
+    open_flags: fs_types::OpenFlags,
+    flags: fs_types::DescriptorFlags,
+) -> PreparedOpenAt<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let profile = component_fs_profile(store);
+    let now = store.now_nanos();
+    let target = descriptor_in(store, &descriptor).and_then(|(base, namespace)| {
+        let grant = base.prepare_open(open_flags)?;
+        let absolute = child_path(grant.base().descriptor(), path)?;
+        Ok((grant, namespace, absolute))
+    });
+    PreparedOpenAt {
+        target,
+        path_flags,
+        open_flags,
+        flags,
+        now,
+        profile,
+    }
+}
+
+pub(crate) async fn execute_open<CpuImpl, Net, StorageImpl>(
+    prepared: PreparedOpenAt<CpuImpl, Net, StorageImpl>,
+) -> FsOpResult<FsDescriptor>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let (grant, namespace, absolute) = prepared.target?;
+    let opened = open_prepared(
+        &namespace,
+        &grant,
+        prepared.path_flags,
+        &absolute,
+        prepared.open_flags,
+        prepared.flags,
+        prepared.now,
+    )
+    .await?;
+    record_component_fs_profile(prepared.profile, "open-at");
+    Ok(opened)
+}
+
 /// Creates the file `resolved` names, in the directory `_mutate` proves the
 /// guest may change.
 async fn create_file<StorageImpl>(
@@ -382,7 +435,7 @@ where
     profile: Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>,
 }
 
-fn prepare_stat<CpuImpl, Net, StorageImpl>(
+pub(crate) fn prepare_stat<CpuImpl, Net, StorageImpl>(
     store: &mut StoreData<CpuImpl, Net, StorageImpl>,
     descriptor: Resource<FsDescriptor>,
     path_flags: fs_types::PathFlags,
@@ -406,7 +459,7 @@ where
     }
 }
 
-async fn stat_prepared<CpuImpl, Net, StorageImpl>(
+pub(crate) async fn stat_prepared<CpuImpl, Net, StorageImpl>(
     prepared: PreparedStat<CpuImpl, Net, StorageImpl>,
     operation: &'static str,
 ) -> FsOpResult<Metadata>
@@ -1731,43 +1784,19 @@ where
         open_flags: fs_types::OpenFlags,
         flags: fs_types::DescriptorFlags,
     ) -> Result<Self::OpenAtPrepared> {
-        let profile = component_fs_profile(store);
-        let now = store.now_nanos();
-        let target = descriptor_in(store, &descriptor).and_then(|(base, namespace)| {
-            let grant = base.prepare_open(open_flags)?;
-            let absolute = child_path(grant.base().descriptor(), path)?;
-            Ok((grant, namespace, absolute))
-        });
-        Ok(PreparedOpenAt {
-            target,
-            path_flags,
-            open_flags,
-            flags,
-            now,
-            profile,
-        })
+        Ok(prepare_open(
+            store, descriptor, path_flags, path, open_flags, flags,
+        ))
     }
 
     async fn open_at(
         accessor: &Accessor<U, Self>,
         prepared: Self::OpenAtPrepared,
     ) -> Result<Resource<FsDescriptor>, FsError> {
-        let (grant, namespace, absolute) = prepared.target?;
-        let opened = open_prepared(
-            &namespace,
-            &grant,
-            prepared.path_flags,
-            &absolute,
-            prepared.open_flags,
-            prepared.flags,
-            prepared.now,
-        )
-        .await?;
-        let result = accessor
+        let opened = execute_open(prepared).await?;
+        accessor
             .with(|mut access| access.get().table.push(opened))
-            .map_err(FsError::trap);
-        record_component_fs_profile(prepared.profile, "open-at");
-        result
+            .map_err(FsError::trap)
     }
 
     async fn readlink_at(
@@ -2174,5 +2203,87 @@ mod direct_write_tests {
     #[test]
     fn cancellation_while_submitting_finishes_only_the_consumed_round() {
         exercise(prepare_ready, true, 2);
+    }
+}
+
+#[cfg(test)]
+mod borrowed_request_tests {
+    use super::*;
+    use crate::wasmtime_adapter::component_host::service::test_store;
+    use futures_lite::future::block_on;
+
+    #[test]
+    fn prepared_paths_own_resolved_names_and_preserve_directory_rights() {
+        let mut store = test_store::store_data_with(|_| {});
+        let root = store
+            .table
+            .push(FsDescriptor {
+                path: String::from("/"),
+                kind: FsNodeKind::Directory,
+                flags: fs_types::DescriptorFlags::READ
+                    | fs_types::DescriptorFlags::WRITE
+                    | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+                identity: None,
+                mount: None,
+            })
+            .unwrap();
+        let path = String::from("中文-日本語-한국어");
+        let request = prepare_open(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            &path,
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ,
+        );
+        drop(path);
+        let opened = block_on(execute_open(request)).unwrap();
+        assert_eq!(opened.path, "/中文-日本語-한국어");
+        let stat = prepare_stat(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            "中文-日本語-한국어",
+        );
+        assert_eq!(
+            object_identity(&block_on(stat_prepared(stat, "stat-at")).unwrap()),
+            opened.identity.unwrap()
+        );
+
+        let escaped = prepare_open(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            "../outside",
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ,
+        );
+        assert!(matches!(
+            block_on(execute_open(escaped)),
+            Err(fs_types::ErrorCode::NotPermitted)
+        ));
+        store.table.get_mut(&root).unwrap().flags = fs_types::DescriptorFlags::READ;
+        let denied = prepare_open(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            "refused",
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ,
+        );
+        assert!(matches!(
+            block_on(execute_open(denied)),
+            Err(fs_types::ErrorCode::ReadOnly)
+        ));
+        let absent = prepare_stat(
+            &mut store,
+            Resource::new_borrow(root.rep()),
+            fs_types::PathFlags::empty(),
+            "refused",
+        );
+        assert!(matches!(
+            block_on(stat_prepared(absent, "stat-at")),
+            Err(fs_types::ErrorCode::NoEntry)
+        ));
     }
 }

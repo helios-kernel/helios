@@ -5,13 +5,19 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/borrowed-host-inputs`):
+The local checkout must be at (branch `helios/borrowed-sync-wit-inputs`):
 
 ```text
-578de3c7598ded3a324f08cab7fb2d64e7e9401b
+6e4440eff80a35670c7622d4be28d422ab624461
 ```
 
-That revision adds scoped guest-memory borrowing to
+That revision extends borrowed-input preparation to synchronous WIT functions
+implemented by asynchronous Rust hosts. `func_wrap_async_prepare` and bindgen's
+`borrowed | async` option complete input validation and request construction
+before the host future starts, retaining only the owned request across suspension.
+
+`helios/borrowed-host-inputs` at
+`578de3c7598ded3a324f08cab7fb2d64e7e9401b` adds scoped guest-memory borrowing to
 `helios/data-host-task-fast-path` at
 `685697120ea7dcf237fb5b7ef6b08fc4456c6fab`. `func_wrap_data_memory` separates
 mutable host data from a read-only memory view that cannot reenter guest code.
