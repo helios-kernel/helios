@@ -34,33 +34,50 @@
     "command": "just clippy-target x86_64-unknown-none helios-x86",
     "surfaces": ["x86"]
   },
-  "test-units": {
+  "test-kernel": {
     "guest-wasm": "debug",
-    "command": "just test-units && just test-erofs-mkfs",
+    "command": "just test-kernel && just test-erofs-mkfs",
     "rust-cache": true,
     "surfaces": ["x86", "hosted", "host_tools", "programs"]
   },
+  "test-libraries": {
+    "command": "just test-libraries",
+    "rust-cache": true,
+    "surfaces": ["x86", "host_tools", "programs"]
+  },
+  "test-host-tools": {
+    "guest-wasm": "debug",
+    "command": "just test-host-tools",
+    "rust-cache": true,
+    "surfaces": ["hosted", "host_tools", "programs"]
+  },
   "smoke-riscv64": {
+    "heavy": true,
     "surfaces": ["riscv", "host_tools", "programs"],
     "guest-wasm": "release"
   },
   "smoke-aarch64": {
+    "heavy": true,
     "surfaces": ["aarch64", "host_tools", "programs"],
     "guest-wasm": "release"
   },
   "smoke-aarch64-cfi": {
+    "heavy": true,
     "surfaces": ["aarch64", "host_tools", "programs"],
     "guest-wasm": "debug"
   },
   "smoke-x86-64": {
+    "heavy": true,
     "surfaces": ["x86", "host_tools", "programs"],
     "guest-wasm": "release"
   },
   "smoke-x86-64-cpu-lifecycle": {
+    "heavy": true,
     "surfaces": ["x86", "host_tools", "programs"],
     "guest-wasm": "release"
   },
   "smoke-x86-64-venus": {
+    "heavy": true,
     "surfaces": ["gpu"],
     "exclusive": true,
     "guest-wasm": "debug"

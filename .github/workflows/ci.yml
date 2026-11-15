@@ -7,6 +7,8 @@ on:
   push:
     branches: [dev]
   workflow_dispatch:
+  schedule:
+    - cron: "37 3 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -32,8 +34,9 @@ jobs:
   # by path. A lane also runs on `shared` and `pin` changes unless it is
   # `exclusive`, which reads only its own surfaces. A skipped lane
   # reports as skipped, which a required check counts as passing; no
-  # ruleset on `dev` requires a lane of this workflow. A dispatch and a
-  # push to `dev` run every lane. A draft pull request is not a merge
+  # ruleset on `dev` requires a lane of this workflow. A dispatch and the
+  # nightly schedule run every lane; PR and dev pushes omit heavy suites.
+  # A draft pull request is not a merge
   # candidate and runs `lint-fmt` alone; marking it ready for review runs
   # the rest.
   #
@@ -48,7 +51,7 @@ jobs:
   changes:
     name: changes
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: read
@@ -149,13 +152,15 @@ jobs:
         env:
           CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
           DRAFT: ${{ github.event.pull_request.draft == true }}
+          HEAVY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
-          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" '
+          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --argjson heavy "${HEAVY}" '
             to_entries
             | map(select($changed == null
                 or (.value.surfaces + (if .value.exclusive then [] else ["shared", "pin"] end)
                     | any(. as $surface | $changed | index($surface)))))
+            | map(select($heavy or (.value.heavy != true)))
             | map(.key)
             | if $draft then map(select(. == "lint-fmt")) else . end' .github/ci-lanes.json)"
           checks="$(jq -c --argjson lanes "${lanes}" '
@@ -192,8 +197,8 @@ jobs:
   # on the target, so it is built once per run, in each requested profile
   # (`release` for optimised kernels, `debug` for checks, the debug
   # inspector of `smoke-x86-64-venus` and the debug kernel of
-  # `smoke-aarch64-cfi`). The lanes start beside this job rather than after
-  # it, because their set-up outlasts most of the build: each downloads the
+  # `smoke-aarch64-cfi`). Consumers start after their requested producer
+  # finishes and download the
   # result with the `prebuilt-wasm` action just before its first prebuild,
   # and reads it through `HELIOS_PREBUILT_WASM`, so a file missing from it
   # fails the lane's prebuild instead of being built there (#882).
@@ -202,7 +207,7 @@ jobs:
     needs: changes
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'debug')
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     strategy:
       matrix:
         profile: [debug]
@@ -235,7 +240,7 @@ jobs:
     needs: changes
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'release')
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     strategy:
       matrix:
         profile: [release]
@@ -247,7 +252,7 @@ jobs:
     # An empty matrix is an error, not a skip.
     if: needs.changes.outputs.checks != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
@@ -334,7 +339,7 @@ jobs:
     needs: [changes, wasm-debug]
     if: needs.changes.outputs.tests != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
@@ -356,7 +361,7 @@ jobs:
     needs: [changes, wasm-release]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-riscv64')
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 40
     # `actions: read` is what the prebuilt-wasm action lists the run's
     # artifacts and jobs with.
     permissions:
@@ -769,7 +774,7 @@ jobs:
     needs: [changes, wasm-release]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64')
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 300
+    timeout-minutes: 40
     permissions:
       contents: read
       actions: read
@@ -1266,7 +1271,7 @@ jobs:
     needs: [changes, wasm-debug]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64-cfi')
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 300
+    timeout-minutes: 40
     permissions:
       contents: read
       actions: read
@@ -1354,7 +1359,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    timeout-minutes: 180
+    timeout-minutes: 40
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
@@ -2506,7 +2511,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    timeout-minutes: 60
+    timeout-minutes: 40
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
@@ -2631,7 +2636,7 @@ jobs:
     needs: [changes, wasm-debug]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-venus')
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 40
     permissions:
       contents: read
       actions: read

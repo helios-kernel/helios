@@ -469,27 +469,27 @@ red lane names the surface that broke:
 | --- | --- | --- |
 | `check-host` | `ubuntu-24.04` | The host surfaces compile. |
 | `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
-| `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
+| `test-kernel`, `test-libraries`, `test-host-tools`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
 | `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot on one node and on two NUMA nodes, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures; under `swtpm`, the kernel's signing key kept across two boots, resealed after a changed payload, and a tampered payload refused. |
 | `smoke-x86-64-venus` | `ubuntu-24.04`, `--accel kvm` | `gpu-test` on a Venus `virtio-gpu-gl` device rendered through lavapipe: a virgl context's fence, host and guest blobs, two instances at once. It runs only on changes to the 3D path, against a pinned QEMU and virglrenderer it builds and caches. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, a two-node NUMA boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
 | `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, each on one node and on two NUMA nodes; under `swtpm`, the kernel's signing key kept across two ACPI boots, resealed after a changed payload, changed state detected across device-tree boots, and a tampered payload refused. Runs against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
 | `bench-x86-64-linux` | `ubuntu-24.04`, `--accel kvm`, multi-queue tap | The workload benchmarks of §3.6, with the negotiated virtio-net features reported. |
 
-The bench lane is the exception: it lives in `bench-lane.yml` and runs
-nightly against `dev` and on `workflow_dispatch` for any ref, never on a
-pull request, because one unpaired run is no performance evidence (§3.6)
-and the lane is the heaviest job there is. A failed nightly run files a
-`bench`/`bug` issue, or comments on the one already open.
+All smoke suites, the benchmark lanes and kernel-profile collection run
+nightly and on demand. They retain their full coverage outside the review
+loop. A nightly failure opens or reopens its suite's issue and records the
+failed run. Release-triggered benchmarks also remain enabled.
 
-A pull request runs only the lanes whose surfaces its change touches
+A pull request runs only non-heavy lanes whose surfaces its change touches
 (`.github/ci-lanes.json`), and a draft runs `lint-fmt` alone until it is
 marked ready for review. Compile, lint and test lanes keep a Rust cache,
 written only by a `dev` push. Other shared caches are written only from
 the default branch. Guest wasm is built once per profile and reused by
 every test and smoke lane that runs a kernel prebuild. Consumers start
 only after their wasm profile is ready; compile and lint remain independent.
-The CI result job requires every selected lane to succeed.
+The CI result job requires every selected lane to succeed. Every job run by
+a pull request or dev push has a 15-minute timeout.
 
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI
@@ -502,9 +502,8 @@ reason that says why the lint is wrong there. `clippy::manual_async_fn` is
 the gate for §3.2's `async fn` rule.
 
 `dep-check.yml` runs on a schedule and on demand. `kernel-profile.yml`
-collects the x86-64 kernel profile every release build spends, on every
-push to `dev` that touches the kernel image's inputs, on demand and
-monthly (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
+collects the x86-64 kernel profile every release build spends, nightly and
+on demand (`docs/pgo.md`); `bench-suite.yml`'s `profile-generate` job
 calls it. `release.yml` runs `release-plz` on every push to `main`: it
 owns version numbers, the changelog and tags, so commits follow the
 conventional format (`feat:`, `fix:`, `feat!:`, `BREAKING CHANGE:`) and

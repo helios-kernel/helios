@@ -15,7 +15,10 @@ def ci_jobs():
 
 @pytest.mark.parametrize("changed", [[], ["host_tools"], ["shared"], ["aarch64"], None])
 @pytest.mark.parametrize("draft", [False, True])
-def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(ci_jobs, tmp_path, changed, draft):
+@pytest.mark.parametrize("heavy", [False, True])
+def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
+    ci_jobs, tmp_path, changed, draft, heavy
+):
     select = next(step for step in ci_jobs["changes"]["steps"] if step.get("id") == "select")
     output = tmp_path / "outputs"
     subprocess.run(
@@ -25,6 +28,7 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(ci_jobs
             **os.environ,
             "CHANGED": json.dumps(changed),
             "DRAFT": json.dumps(draft),
+            "HEAVY": json.dumps(heavy),
             "GITHUB_OUTPUT": str(output),
         },
         check=True,
@@ -40,6 +44,10 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(ci_jobs
     }
     assert all(entry["guest-wasm"] == "" for entry in checks)
     assert all(entry["guest-wasm"] == "debug" for entry in tests)
+    if not heavy:
+        assert not any(catalog[name].get("heavy", False) for name in lanes)
+    if heavy and changed is None and not draft:
+        assert set(lanes) == set(catalog)
     if draft:
         assert set(lanes) <= {"lint-fmt"}
     if changed == []:
