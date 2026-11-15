@@ -5,13 +5,21 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/borrowed-host-inputs`):
+The local checkout must be at (branch `helios/register-component-hosts`):
 
 ```text
-578de3c7598ded3a324f08cab7fb2d64e7e9401b
+f45dafed30a8e58e0109481fc4b1b2075ab97f43
 ```
 
-That revision adds scoped guest-memory borrowing to
+That revision adds precompiled register trampolines for synchronous scalar and
+resource-handle host imports to `helios/borrowed-host-inputs` at
+`578de3c7598ded3a324f08cab7fb2d64e7e9401b`. Instantiation selects the specialized
+entry for typed synchronous hosts on supported native ABIs; dynamic, async and
+non-scalar imports retain the array entry. Host registration and AOT
+instantiation need no compiler. Canonical validation, resource scopes, call
+hooks and trap handling remain in the existing runtime helpers.
+
+`helios/borrowed-host-inputs` adds scoped guest-memory borrowing to
 `helios/data-host-task-fast-path` at
 `685697120ea7dcf237fb5b7ef6b08fc4456c6fab`. `func_wrap_data_memory` separates
 mutable host data from a read-only memory view that cannot reenter guest code.
