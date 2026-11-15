@@ -200,21 +200,32 @@ pub(crate) async fn open_at<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    let base = base.descriptor();
-    // Every right the flags need is proved before the path is resolved, so a
-    // refusal reaches no filesystem, a host share included, and holds
-    // whether or not the file exists.
-    let truncate = open_flags
-        .contains(fs_types::OpenFlags::TRUNCATE)
-        .then(|| Ok::<_, fs_types::ErrorCode>((base.grant()?, base.grant()?)))
-        .transpose()?;
-    let create = open_flags
-        .contains(fs_types::OpenFlags::CREATE)
-        .then(|| base.grant())
-        .transpose()?;
-    let absolute = child_path(base, path)?;
+    let grant = base.prepare_open(open_flags)?;
+    let absolute = child_path(grant.base().descriptor(), path)?;
+    open_prepared(
+        namespace, &grant, path_flags, &absolute, open_flags, requested, now,
+    )
+    .await
+}
+
+async fn open_prepared<StorageImpl, D>(
+    namespace: &Namespace<StorageImpl>,
+    grant: &OpenGrant<D>,
+    path_flags: fs_types::PathFlags,
+    absolute: &str,
+    open_flags: fs_types::OpenFlags,
+    requested: fs_types::DescriptorFlags,
+    now: u64,
+) -> FsOpResult<FsDescriptor>
+where
+    StorageImpl: crate::Storage,
+    D: core::borrow::Borrow<FsDescriptor>,
+{
+    let base = grant.base().descriptor();
+    let truncate = grant.truncate();
+    let create = grant.create();
     let resolved = namespace
-        .resolve_following(&absolute, follow_within(base, path_flags))
+        .resolve_following(absolute, follow_within(base, path_flags))
         .await
         .map_err(fs_error_code)?;
     let fs = resolved.fs();
@@ -264,6 +275,20 @@ where
         identity: Some(object_identity(&metadata)),
         mount: resolved.hold(),
     })
+}
+
+pub struct PreparedOpenAt<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    target: FsOpResult<(OpenGrant<FsDescriptor>, Namespace<StorageImpl>, String)>,
+    path_flags: fs_types::PathFlags,
+    open_flags: fs_types::OpenFlags,
+    flags: fs_types::DescriptorFlags,
+    now: u64,
+    profile: Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>,
 }
 
 /// Creates the file `resolved` names, in the directory `_mutate` proves the
@@ -344,6 +369,61 @@ where
     let base = base.descriptor();
     let absolute = child_path(base, path)?;
     stat_path(namespace, &absolute, follow_within(base, path_flags)).await
+}
+
+pub struct PreparedStat<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    target: FsOpResult<(FsDescriptor, Namespace<StorageImpl>, String)>,
+    path_flags: fs_types::PathFlags,
+    profile: Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>,
+}
+
+fn prepare_stat<CpuImpl, Net, StorageImpl>(
+    store: &mut StoreData<CpuImpl, Net, StorageImpl>,
+    descriptor: Resource<FsDescriptor>,
+    path_flags: fs_types::PathFlags,
+    path: &str,
+) -> PreparedStat<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let profile = component_fs_profile(store);
+    let target = descriptor_in(store, &descriptor).and_then(|(base, namespace)| {
+        let read = base.grant::<Directory, Read>()?;
+        let absolute = child_path(read.descriptor(), path)?;
+        Ok((base, namespace, absolute))
+    });
+    PreparedStat {
+        target,
+        path_flags,
+        profile,
+    }
+}
+
+async fn stat_prepared<CpuImpl, Net, StorageImpl>(
+    prepared: PreparedStat<CpuImpl, Net, StorageImpl>,
+    operation: &'static str,
+) -> FsOpResult<Metadata>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let (base, namespace, absolute) = prepared.target?;
+    let result = stat_path(
+        &namespace,
+        &absolute,
+        follow_within(&base, prepared.path_flags),
+    )
+    .await;
+    record_component_fs_profile(prepared.profile, operation);
+    result
 }
 
 /// The path below `base` that `path` names, refused when it names `base`
@@ -1567,20 +1647,22 @@ where
         Ok(result?)
     }
 
-    async fn stat_at(
-        accessor: &Accessor<U, Self>,
+    type StatAtPrepared = PreparedStat<CpuImpl, Net, StorageImpl>;
+
+    fn prepare_stat_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
-        path: String,
+        path: &str,
+    ) -> Result<Self::StatAtPrepared> {
+        Ok(prepare_stat(store, descriptor, path_flags, path))
+    }
+
+    async fn stat_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::StatAtPrepared,
     ) -> Result<fs_types::DescriptorStat, FsError> {
-        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
-            .await
-            .map(|metadata| descriptor_stat(&metadata));
-        record_component_fs_profile(profile, "stat-at");
-        Ok(result?)
+        Ok(descriptor_stat(&stat_prepared(prepared, "stat-at").await?))
     }
 
     async fn set_times_at(
@@ -1639,33 +1721,52 @@ where
         .await?)
     }
 
-    async fn open_at(
-        accessor: &Accessor<U, Self>,
+    type OpenAtPrepared = PreparedOpenAt<CpuImpl, Net, StorageImpl>;
+
+    fn prepare_open_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
-        path: String,
+        path: &str,
         open_flags: fs_types::OpenFlags,
         flags: fs_types::DescriptorFlags,
-    ) -> Result<Resource<FsDescriptor>, FsError> {
-        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        let (base, namespace, now) = accessor.with(|mut access| {
-            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
-        })?;
-        let opened = self::open_at(
-            &namespace,
-            base.grant()?,
+    ) -> Result<Self::OpenAtPrepared> {
+        let profile = component_fs_profile(store);
+        let now = store.now_nanos();
+        let target = descriptor_in(store, &descriptor).and_then(|(base, namespace)| {
+            let grant = base.prepare_open(open_flags)?;
+            let absolute = child_path(grant.base().descriptor(), path)?;
+            Ok((grant, namespace, absolute))
+        });
+        Ok(PreparedOpenAt {
+            target,
             path_flags,
-            &path,
             open_flags,
             flags,
             now,
+            profile,
+        })
+    }
+
+    async fn open_at(
+        accessor: &Accessor<U, Self>,
+        prepared: Self::OpenAtPrepared,
+    ) -> Result<Resource<FsDescriptor>, FsError> {
+        let (grant, namespace, absolute) = prepared.target?;
+        let opened = open_prepared(
+            &namespace,
+            &grant,
+            prepared.path_flags,
+            &absolute,
+            prepared.open_flags,
+            prepared.flags,
+            prepared.now,
         )
         .await?;
         let result = accessor
             .with(|mut access| access.get().table.push(opened))
             .map_err(FsError::trap);
-        record_component_fs_profile(profile, "open-at");
+        record_component_fs_profile(prepared.profile, "open-at");
         result
     }
 
@@ -1783,20 +1884,24 @@ where
         Ok(result?)
     }
 
-    async fn metadata_hash_at(
-        accessor: &Accessor<U, Self>,
+    type MetadataHashAtPrepared = PreparedStat<CpuImpl, Net, StorageImpl>;
+
+    fn prepare_metadata_hash_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
-        path: String,
+        path: &str,
+    ) -> Result<Self::MetadataHashAtPrepared> {
+        Ok(prepare_stat(store, descriptor, path_flags, path))
+    }
+
+    async fn metadata_hash_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::MetadataHashAtPrepared,
     ) -> Result<fs_types::MetadataHashValue, FsError> {
-        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = self::stat_at(&namespace, base.grant()?, path_flags, &path)
-            .await
-            .map(|metadata| self::metadata_hash(&metadata));
-        record_component_fs_profile(profile, "metadata-hash-at");
-        Ok(result?)
+        Ok(self::metadata_hash(
+            &stat_prepared(prepared, "metadata-hash-at").await?,
+        ))
     }
 }
 
