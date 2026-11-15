@@ -206,6 +206,11 @@ unsafe impl GuestVcpu for TestVcpu {
         Ok(accepted)
     }
     fn set_irq_window(&mut self, _: bool) {}
+    fn reset(&mut self) -> Result<(), HvError> {
+        self.registers = 0;
+        self.prepared = false;
+        Ok(())
+    }
     fn get_regs(&mut self) -> Result<TestRegisters, HvError> {
         Ok(TestRegisters(self.registers))
     }
@@ -744,4 +749,19 @@ fn cancelling_halt_releases_architectural_timer_wait() {
             .load(Ordering::Relaxed),
         0
     );
+}
+
+#[test]
+fn reset_discards_registers_pending_irqs_and_kicks_but_preserves_stop() {
+    let mut vm = vm([VmExit::Shutdown], 0);
+    let mut cpu = vcpu(&mut vm);
+    cpu.set_regs(&TestRegisters(99)).unwrap();
+    cpu.control().inject_irq(irq()).unwrap();
+    cpu.control().kick();
+    cpu.reset().unwrap();
+    assert_eq!(cpu.get_regs().unwrap(), TestRegisters(0));
+    assert_eq!(block_on(cpu.run_vcpu()), Ok(VmExit::Shutdown));
+    assert!(vm.shared.space.interrupts.with(|irqs| irqs.is_empty()));
+    vm.control().stop();
+    assert_eq!(cpu.reset(), Err(HvError::Stopped));
 }

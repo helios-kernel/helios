@@ -92,6 +92,9 @@ interface virtualization {
     /// Hardware enforces a time slice independently of guest interrupt masks.
     /// Other calls can kick or inject IRQs while this call is suspended.
     run: async func() -> result<vm-exit, hv-error>;
+    /// Reset all architectural state while detached. Returns busy during
+    /// run; discards pending interrupts and emulation completion state.
+    reset: func() -> result<_, hv-error>;
     get-regs: func(ids: list<register-id>) -> result<list<register-value>, hv-error>;
     /// Validate the entire snapshot before publishing any register update.
     set-regs: func(values: list<register-value>) -> result<_, hv-error>;

@@ -3,7 +3,7 @@
 //! detached before host IRQ dispatch or an executor suspension.
 
 use core::arch::asm;
-use helios_hal::hv::{HvError, IrqLevel, VirtualIrq};
+use helios_hal::hv::{HvError, IoAccess, IrqLevel, VirtualIrq};
 
 // GIC architecture: 16 List Registers at most, 1020 usable INTIDs in the
 // non-LPI range. INTIDs 1020..1023 are special CPU-interface responses.
@@ -57,6 +57,7 @@ register_bank!(read_ap1, write_ap1,
 pub(super) struct Capabilities {
     lrs: usize,
     aprs: usize,
+    priority_bits: usize,
 }
 
 impl Capabilities {
@@ -71,6 +72,7 @@ impl Capabilities {
         Self {
             lrs,
             aprs: 1 << (priority_bits - 5),
+            priority_bits,
         }
     }
 }
@@ -135,6 +137,23 @@ impl Vgic {
         Ok(true)
     }
 
+    /// ICC_CTLR is trapped with TC alongside SGIs. Keep its writable
+    /// CBPR/EOImode fields in ICH_VMCR, where the virtual interface uses them.
+    pub(super) fn control(&mut self, access: IoAccess) -> u64 {
+        match access {
+            IoAccess::Read { .. } => {
+                ((self.capabilities.priority_bits as u64 - 1) << 8)
+                    | ((self.vmcr >> 4) & 1)
+                    | (((self.vmcr >> 9) & 1) << 1)
+            }
+            IoAccess::Write { value, .. } => {
+                self.vmcr =
+                    (self.vmcr & !((1 << 4) | (1 << 9))) | ((value & 1) << 4) | ((value & 2) << 8);
+                0
+            }
+        }
+    }
+
     pub(super) fn set_window(&mut self, enabled: bool) {
         self.window = enabled;
     }
@@ -151,7 +170,12 @@ impl Vgic {
         }
         // En enables the virtual interface; UIE requests a maintenance exit
         // when the LR backlog drops far enough to accept queued interrupts.
-        write!(ich_hcr_el2, 1u64 | if self.window { 1 << 1 } else { 0 });
+        // TC traps ICC_SGI1R/ICC_CTLR so the VMM routes IPIs between its
+        // virtual redistributors instead of sending them to physical CPUs.
+        write!(
+            ich_hcr_el2,
+            1u64 | (1 << 10) | if self.window { 1 << 1 } else { 0 }
+        );
         unsafe {
             asm!("isb", options(nostack, preserves_flags));
         }

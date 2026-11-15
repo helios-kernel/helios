@@ -1,0 +1,12 @@
+#!/bin/busybox sh
+set -eu
+/bin/busybox --install -s
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+modprobe virtio_mmio
+modprobe virtio_blk
+hostname helios-vm
+exec </dev/hvc0 >/dev/hvc0 2>&1
+printf '\nHELIOS_LINUX_READY\n'
+exec setsid sh -i

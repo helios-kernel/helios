@@ -84,6 +84,9 @@ unsafe impl GuestVcpu for Infallible {
     fn set_irq_window(&mut self, _: bool) {
         match *self {}
     }
+    fn reset(&mut self) -> Result<(), HvError> {
+        match *self {}
+    }
     fn get_regs(&mut self) -> Result<Self, HvError> {
         match *self {}
     }

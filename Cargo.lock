@@ -2721,6 +2721,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-vmm"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "clap",
+ "futures-lite",
+ "helios-api",
+ "thiserror 2.0.21",
+ "vm-fdt",
+]
+
+[[package]]
 name = "helios-workspace-root"
 version = "0.1.0"
 dependencies = [
@@ -5891,6 +5903,12 @@ checksum = "3f1840b0acd2ffbeee7d732177d235901d9ff7af369ed3f964055a97eff2b7bd"
 dependencies = [
  "xml-rs",
 ]
+
+[[package]]
+name = "vm-fdt"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
 
 [[package]]
 name = "volatile"

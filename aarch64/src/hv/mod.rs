@@ -380,6 +380,38 @@ impl Vcpu {
                         .apply(&mut self.context.registers, value);
                     return Ok(VmExit::Preempted);
                 }
+                // MDSCR_EL1 is already banked with the guest context. TDA
+                // traps access so no guest can access host debug state.
+                if let VmExit::SysReg {
+                    register: 0x8012,
+                    access,
+                } = exit
+                {
+                    let value = match access {
+                        helios_hal::hv::IoAccess::Read { .. } => self.context.system.mdscr,
+                        helios_hal::hv::IoAccess::Write { value, .. } => {
+                            self.context.system.mdscr = value;
+                            0
+                        }
+                    };
+                    completion
+                        .expect("MDSCR trap carries completion")
+                        .apply(&mut self.context.registers, value);
+                    return Ok(VmExit::Preempted);
+                }
+                // Architectural encoding for ICC_CTLR_EL1. The CPU-interface
+                // state belongs to the backend; SGI routing belongs to the VMM.
+                if let VmExit::SysReg {
+                    register: 0xc664,
+                    access,
+                } = exit
+                {
+                    let value = self.vgic.control(access);
+                    completion
+                        .expect("ICC_CTLR trap carries completion")
+                        .apply(&mut self.context.registers, value);
+                    return Ok(VmExit::Preempted);
+                }
                 self.completion = completion;
                 Ok(exit)
             }
@@ -453,6 +485,16 @@ unsafe impl GuestVcpu for Vcpu {
     }
     fn set_irq_window(&mut self, enabled: bool) {
         self.vgic.set_window(enabled);
+    }
+    fn reset(&mut self) -> Result<(), HvError> {
+        self.context = Context::new(GUEST_HCR);
+        self.vgic = Vgic::new(self.space.lease.hardware.vgic);
+        self.prepared = None;
+        self.completion = None;
+        self.timer_signalled = [false; 2];
+        self.failed = false;
+        self.kick.pending.store(false, Ordering::Release);
+        Ok(())
     }
     fn get_regs(&mut self) -> Result<Registers, HvError> {
         if self.failed {

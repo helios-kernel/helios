@@ -1,0 +1,6 @@
+printf '\nHELIOS_ARCH_%s\n' "$(uname -m)"
+printf '\nHELIOS_CPUS_%s\n' "$(grep -c '^processor' /proc/cpuinfo)"
+printf 'helios-virtio-block\n' | dd of=/dev/vda bs=512 conv=sync
+sync
+test "$(dd if=/dev/vda bs=512 count=1 2>/dev/null | head -c 18)" = helios-virtio-block && printf '\nHELIOS_BLOCK_OK\n'
+poweroff -f
