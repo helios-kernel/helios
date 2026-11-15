@@ -398,6 +398,10 @@ async fn child(gpu: &Gpu) -> Result<(), GpuTestError> {
 /// Exercise the synchronous Vulkan boundary through canonical lowering
 /// while the program's exported entry point remains asynchronous.
 fn venus_protocol() -> Result<(), GpuTestError> {
+    // Atomics change wasm TLS relocations. Exercise std's thread-local
+    // hash seed so a build mixing atomics with the prebuilt non-atomic
+    // standard library traps here instead of in a later GPU consumer.
+    std::hint::black_box(std::hash::RandomState::new());
     let (transport, capset) = VenusContext::open(1, "venus-test")?;
     // The test uses one 64-KiB wasm page of command bytes; production
     // callers supply their own capacity and renderer idle timeout.

@@ -2203,6 +2203,8 @@ struct WasmMetadata {
 struct WasmRequirements {
     #[serde(default)]
     venus_protocol: bool,
+    #[serde(default)]
+    target_features: Vec<String>,
 }
 
 fn build_wasm_program(
@@ -2240,6 +2242,11 @@ fn build_wasm_program(
     }
     let target_dir = out_dir.join(target_dir_name);
     let mut command = Command::new(cargo);
+    if !requirements.target_features.is_empty() {
+        // Wasm atomics change TLS relocations. Every Rust object,
+        // including std, must use the same target features.
+        command.arg("-Zbuild-std=std,panic_abort");
+    }
     command
         .arg("build")
         .arg("--manifest-path")
@@ -2260,17 +2267,11 @@ fn build_wasm_program(
         command.env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1");
         command.env("CARGO_PROFILE_DEV_PANIC", "abort");
     }
-    command.env_remove("CARGO_ENCODED_RUSTFLAGS");
-    if let Some(flags) = wasm_rustflags(target_triple) {
-        command.env("RUSTFLAGS", flags);
-    } else {
-        // Keep Cargo's target flags, including the component target's
-        // atomics requirement. Profile settings do not override them.
-        command.env_remove("RUSTFLAGS");
-        command.env("CARGO_PROFILE_DEV_STRIP", "debuginfo");
-        command.env("CARGO_PROFILE_RELEASE_STRIP", "debuginfo");
-        command.env("CARGO_PROFILE_RELEASE_DEBUG", "0");
-    }
+    command.env_remove("RUSTFLAGS");
+    command.env(
+        "CARGO_ENCODED_RUSTFLAGS",
+        wasm_rustflags(target_triple, &requirements.target_features).join("\x1f"),
+    );
     // C code a program links (ring's, for one) is archived by `cc`, which
     // falls back to the host's `ar` for a wasm target; that archive carries
     // no symbol index wasm-ld can read, and the link then misses every C
@@ -2340,13 +2341,31 @@ fn rustc_print(query: &'static str) -> Result<String, WasmBuildError> {
         .to_owned())
 }
 
-fn wasm_rustflags(target_triple: &str) -> Option<String> {
-    match target_triple {
-        "wasm32-wasip1-threads" => Some(format!(
-            "-C debuginfo=0 -C strip=symbols -C link-arg=--no-entry -C link-arg=--export=__tls_base -C link-arg=--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"
-        )),
-        _ => None,
+fn wasm_rustflags(target_triple: &str, features: &[String]) -> Vec<String> {
+    let mut flags = vec!["-C".to_owned(), "debuginfo=0".to_owned(), "-C".to_owned()];
+    if target_triple == "wasm32-wasip1-threads" {
+        flags.push("strip=symbols".to_owned());
+        for argument in [
+            "--no-entry".to_owned(),
+            "--export=__tls_base".to_owned(),
+            format!("--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"),
+        ] {
+            flags.extend(["-C".to_owned(), format!("link-arg={argument}")]);
+        }
+    } else {
+        flags.push("strip=debuginfo".to_owned());
     }
+    if !features.is_empty() {
+        let features: Vec<_> = features
+            .iter()
+            .map(|feature| format!("+{feature}"))
+            .collect();
+        flags.extend([
+            "-C".to_owned(),
+            format!("target-feature={}", features.join(",")),
+        ]);
+    }
+    flags
 }
 
 /// Encodes one core module as a component, or passes a component through.
@@ -2871,24 +2890,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn component_builds_preserve_target_flags_and_threaded_plugins_keep_their_abi() {
-        assert!(wasm_rustflags("wasm32-wasip2").is_none());
-        let flags = wasm_rustflags("wasm32-wasip1-threads").unwrap();
-        assert!(flags.contains("--export=__tls_base"));
-        assert!(flags.contains("--no-entry"));
-        assert!(flags.contains(&format!(
-            "--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"
-        )));
-    }
-
-    #[test]
     fn gpu_test_requests_protocol_inputs_and_ordinary_programs_do_not() {
         let gpu: WasmBuildSettings =
             toml::from_str(include_str!("../../programs/gpu-test/Cargo.toml")).unwrap();
         assert!(gpu.package.metadata.helios.venus_protocol);
+        assert_eq!(gpu.package.metadata.helios.target_features, ["atomics"]);
         let init: WasmBuildSettings =
             toml::from_str(include_str!("../../programs/init/Cargo.toml")).unwrap();
         assert!(!init.package.metadata.helios.venus_protocol);
+        assert!(init.package.metadata.helios.target_features.is_empty());
+    }
+
+    #[test]
+    fn wasm_target_features_are_explicit_and_do_not_replace_threaded_link_arguments() {
+        let ordinary = wasm_rustflags("wasm32-wasip2", &[]);
+        assert!(
+            !ordinary
+                .iter()
+                .any(|flag| flag.starts_with("target-feature="))
+        );
+        let gpu = wasm_rustflags("wasm32-wasip2", &["atomics".to_owned()]);
+        assert!(gpu.iter().any(|flag| flag == "target-feature=+atomics"));
+        let threaded = wasm_rustflags("wasm32-wasip1-threads", &[]);
+        assert!(
+            threaded
+                .iter()
+                .any(|flag| flag == "link-arg=--export=__tls_base")
+        );
+        assert!(threaded.iter().any(|flag| flag
+            == &format!("link-arg=--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}")));
     }
 
     #[test]

@@ -6,6 +6,7 @@ autobins = false
 
 [package.metadata.helios]
 venus-protocol = true
+target-features = ["atomics"]
 
 [dependencies]
 helios-venus = { path = "../../venus", default-features = false, features = ["helios"] }
