@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -99,4 +101,6 @@ def collect_workloads(
                 if value is not None:
                     command.extend([flag, str(value)])
             driver.run_isolated(command, cwd=checkout, timeout_seconds=timeout_seconds, stdout=records)
+    with log.open() as records:
+        shutil.copyfileobj(records, sys.stdout)
     validate_workloads(log, workloads)
