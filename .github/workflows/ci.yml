@@ -35,8 +35,8 @@ jobs:
   # `exclusive`, which reads only its own surfaces. A skipped lane
   # reports as skipped, which a required check counts as passing; no
   # ruleset on `dev` requires a lane of this workflow. A dispatch and the
-  # nightly schedule run every lane; PR and dev pushes omit heavy suites.
-  # A draft pull request is not a merge
+  # nightly schedule run every lane; PR and dev pushes omit heavy suites,
+  # and Btrfs lanes filter pushes by surface. A draft pull request is not a merge
   # candidate and runs `lint-fmt` alone; marking it ready for review runs
   # the rest.
   #
@@ -68,8 +68,9 @@ jobs:
           sparse-checkout-cone-mode: false
       - uses: dorny/paths-filter@v4
         id: filter
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch'
         with:
+          base: ${{ github.event_name == 'pull_request' && github.base_ref || github.event.before }}
           # `shared` is everything no narrower surface claims, so a new
           # top-level path runs every lane until a surface claims it;
           # `docs/**` and Markdown run none, except the Wasmtime pin
@@ -138,6 +139,18 @@ jobs:
               - '.github/qemu/virglrenderer-meson.args'
               - '.github/ci-lanes.json'
               - '.github/workflows/ci.yml'
+            btrfs:
+              - 'btrfs/**'
+              - 'hal/**'
+              - 'tools/btrfs/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/ci-lanes.json'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/checkout-wasmtime/**'
+              - 'docs/wasmtime.md'
             profile_format:
               - 'rust-toolchain.toml'
               - 'profdata/**'
@@ -146,12 +159,14 @@ jobs:
         env:
           CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
           DRAFT: ${{ github.event.pull_request.draft == true }}
+          EVENT: ${{ github.event_name }}
           HEAVY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
-          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --argjson heavy "${HEAVY}" '
+          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --arg event "${EVENT:-}" --argjson heavy "${HEAVY}" '
             to_entries
             | map(select($changed == null
+                or ($event == "push" and (.key != "test-btrfs-upstream" and .key != "test-btrfs-fuzz"))
                 or (.value.surfaces + (if .value.exclusive then [] else ["shared", "pin"] end)
                     | any(. as $surface | $changed | index($surface)))))
             | map(select($heavy or (.value.heavy != true)))
@@ -2620,10 +2635,93 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  test-btrfs-upstream:
+    name: test-btrfs-upstream (${{ matrix.suite }})
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-upstream')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [btrfs, btrfs_single, btrfs_zlib, btrfs_lzo, btrfs_zstd, corpus]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install upstream test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs wamerican libclang-dev
+      - name: Build Helios upstream test adapters
+        working-directory: helios
+        run: cargo build --locked -p helios-btrfs --examples --features test-support
+      - name: Run independent reader assertions or malformed-image corpus
+        working-directory: helios
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          if [[ "$SUITE" == corpus ]]; then
+            python3 tools/btrfs/run.py corpus
+          else
+            python3 tools/btrfs/run.py grub "$SUITE"
+          fi
+      - name: Preserve results and populated fuzz seeds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-upstream-${{ matrix.suite }}
+          path: |
+            helios/target/btrfs-results
+            helios/target/btrfs-seeds
+          if-no-files-found: error
+          retention-days: 14
+
+  test-btrfs-fuzz:
+    name: test-btrfs-fuzz (${{ matrix.target }})
+    needs: [changes, test-btrfs-upstream]
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-fuzz')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [btrfs-image-fuzz, btrfs-record-fuzz]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: btrfs-upstream-*
+          path: helios/target
+          merge-multiple: true
+      - name: Fuzz Helios with upstream seeds and AddressSanitizer
+        working-directory: helios
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: python3 tools/btrfs/run.py fuzz "$FUZZ_TARGET"
+      - name: Preserve sanitizer output, corpus and reproducers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-fuzz-${{ matrix.target }}
+          path: |
+            helios/target/btrfs-results
+            helios/target/btrfs-crashes
+            helios/target/btrfs-seeds
+          if-no-files-found: error
+          retention-days: 14
+
   gate:
     name: CI result
     if: always()
-    needs: [changes, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus]
+    needs: [changes, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fuzz]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

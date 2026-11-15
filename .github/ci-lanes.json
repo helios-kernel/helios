@@ -2,43 +2,73 @@
   "check-host": {
     "command": "just check-host",
     "rust-cache": true,
-    "surfaces": ["hosted", "host_tools", "programs"]
+    "surfaces": [
+      "hosted",
+      "host_tools",
+      "programs"
+    ]
   },
   "test-embedded-debugger": {
     "guest-wasm": "debug",
     "command": "just test-embedded-debugger",
     "rust-cache": true,
-    "surfaces": ["hosted", "host_tools", "programs"]
+    "surfaces": [
+      "hosted",
+      "host_tools",
+      "programs"
+    ]
   },
   "lint-fmt": {
     "command": "just fmt-check && just deny-check",
-    "surfaces": ["aarch64", "riscv", "x86", "hosted", "host_tools", "programs"]
+    "surfaces": [
+      "aarch64",
+      "riscv",
+      "x86",
+      "hosted",
+      "host_tools",
+      "programs"
+    ]
   },
   "lint-host": {
     "command": "just clippy-host && just clippy-programs",
     "rust-cache": true,
-    "surfaces": ["hosted", "host_tools", "programs"]
+    "surfaces": [
+      "hosted",
+      "host_tools",
+      "programs"
+    ]
   },
   "lint-aarch64": {
     "rust-cache": true,
     "command": "just clippy-target aarch64-unknown-none helios-aarch64",
-    "surfaces": ["aarch64"]
+    "surfaces": [
+      "aarch64"
+    ]
   },
   "lint-riscv": {
     "rust-cache": true,
     "command": "just clippy-target riscv64gc-unknown-none-elf helios-riscv",
-    "surfaces": ["riscv"]
+    "surfaces": [
+      "riscv"
+    ]
   },
   "lint-x86": {
     "rust-cache": true,
     "command": "just clippy-target x86_64-unknown-none helios-x86",
-    "surfaces": ["x86"]
+    "surfaces": [
+      "x86"
+    ]
   },
   "test-kernel": {
     "guest-wasm": "debug",
     "command": "just test-kernel all",
     "rust-cache": true,
-    "surfaces": ["x86", "hosted", "host_tools", "programs"]
+    "surfaces": [
+      "x86",
+      "hosted",
+      "host_tools",
+      "programs"
+    ]
   },
   "test-libraries": {
     "command": "just test-libraries && just test-btrfs-mkfs",
@@ -81,5 +111,17 @@
     "surfaces": ["gpu"],
     "exclusive": true,
     "guest-wasm": "debug"
+  },
+  "test-btrfs-upstream": {
+    "surfaces": [
+      "btrfs"
+    ],
+    "exclusive": true
+  },
+  "test-btrfs-fuzz": {
+    "surfaces": [
+      "btrfs"
+    ],
+    "exclusive": true
   }
 }

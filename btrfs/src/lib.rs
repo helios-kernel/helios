@@ -65,3 +65,7 @@ pub use items::{EntryTarget, Metadata, Timestamp};
 pub use key::Key;
 pub use source::{BlockSource, READ_ALIGNMENT};
 pub use superblock::{MIRROR_OFFSETS, RootPointer, Superblock};
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod testing;
