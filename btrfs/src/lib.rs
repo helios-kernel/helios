@@ -53,6 +53,7 @@ mod fs;
 mod items;
 mod key;
 mod ondisk;
+mod roots;
 mod source;
 mod space;
 mod superblock;

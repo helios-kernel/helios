@@ -880,3 +880,109 @@ async fn verify_group_usage(
     }
     assert!(groups > 0);
 }
+
+#[test]
+fn root_publication_preparation_converges_with_allocation_accounting() {
+    use crate::accounting::Accounting;
+    use crate::ondisk::objectid;
+    use crate::roots::Roots;
+    use crate::space::Space;
+
+    block_on(async {
+        let fs = filesystem();
+        let mut roots = Roots::load(&fs.volume, fs.root_tree).await.unwrap();
+        let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+        let mut accounting = Accounting::new(
+            &fs.volume,
+            roots.get(objectid::EXTENT_TREE).unwrap(),
+            &space,
+        )
+        .await
+        .unwrap();
+        let mut trees = Trees::new(
+            fs.superblock().generation() + 1,
+            fs.superblock().csum_type(),
+        );
+        let size = u64::from(fs.superblock().nodesize());
+        let mut root = roots.get(objectid::FS_TREE).unwrap();
+        let payload = vec![0x37; size as usize - 101 - 25];
+        for shrink in [false, true] {
+            for index in 0..4 {
+                root = trees
+                    .apply(
+                        &fs.volume,
+                        root,
+                        Key::new(1000 + index, 24, 0),
+                        (!shrink).then_some(payload.as_slice()),
+                        &mut space,
+                    )
+                    .await
+                    .unwrap();
+            }
+            roots.set(root).unwrap();
+            loop {
+                accounting
+                    .sync_allocations(&fs.volume, &mut trees, &mut space)
+                    .await
+                    .unwrap();
+                roots.set(accounting.root).unwrap();
+                roots.set(accounting.group_root()).unwrap();
+                if let Some(root) = accounting.free_root() {
+                    roots.set(root).unwrap();
+                }
+                if !roots
+                    .sync(&fs.volume, &mut trees, &mut space, &mut || {
+                        panic!("fixture roots have valid extensions")
+                    })
+                    .await
+                    .unwrap()
+                {
+                    break;
+                }
+            }
+            assert_eq!(roots.uuid_updates().count(), 0);
+            for tree in [
+                objectid::FS_TREE,
+                objectid::EXTENT_TREE,
+                objectid::BLOCK_GROUP_TREE,
+                objectid::FREE_SPACE_TREE,
+            ] {
+                let cursor = crate::tree::Cursor::floor(
+                    &fs.volume,
+                    fs.root_tree,
+                    Key::new(tree, crate::ondisk::item_type::ROOT_ITEM, u64::MAX),
+                )
+                .await
+                .unwrap();
+                let key = cursor.key().unwrap();
+                let original = cursor.item().unwrap().to_vec();
+                let bytes = trees
+                    .get(&fs.volume, roots.root, key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let parsed = btrfs_disk::items::RootItem::parse(&bytes).unwrap();
+                let root = roots.get(tree).unwrap();
+                assert_eq!(parsed.bytenr, root.bytenr);
+                assert_eq!(parsed.level, root.level);
+                assert_eq!(parsed.generation, root.generation);
+                assert_eq!(parsed.generation_v2, root.generation);
+                let blocks = trees
+                    .blocks()
+                    .filter(|(_, bytes)| TreeBlock::parse(bytes).header().owner == tree)
+                    .count();
+                assert_eq!(parsed.bytes_used, blocks as u64 * size);
+                assert_eq!(
+                    parsed.uuid,
+                    btrfs_disk::items::RootItem::parse(&original).unwrap().uuid
+                );
+                assert_eq!(
+                    trees.get(&fs.volume, fs.root_tree, key).await.unwrap(),
+                    Some(original)
+                );
+            }
+            verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
+            assert_eq!(root.level, u8::from(!shrink));
+        }
+    });
+}

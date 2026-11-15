@@ -198,7 +198,7 @@ pub(crate) struct RawStripe {
 }
 
 /// `btrfs_timespec`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawTimespec {
     pub(crate) sec: U64,
@@ -206,7 +206,7 @@ pub(crate) struct RawTimespec {
 }
 
 /// `btrfs_inode_item`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawInodeItem {
     pub(crate) generation: U64,
@@ -230,7 +230,7 @@ pub(crate) struct RawInodeItem {
 
 /// The head of `btrfs_root_item` every format revision carries; later
 /// revisions append fields the read path does not consult.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawRootItem {
     pub(crate) inode: RawInodeItem,
@@ -245,6 +245,26 @@ pub(crate) struct RawRootItem {
     pub(crate) drop_progress: RawKey,
     pub(crate) drop_level: u8,
     pub(crate) level: u8,
+}
+
+/// The extension of `btrfs_root_item`, valid when its generation matches the
+/// head. Its layout is fixed by Linux's btrfs_tree.h.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+pub(crate) struct RawRootTail {
+    pub(crate) generation_v2: U64,
+    pub(crate) uuid: [u8; 16],
+    pub(crate) parent_uuid: [u8; 16],
+    pub(crate) received_uuid: [u8; 16],
+    pub(crate) ctransid: U64,
+    pub(crate) otransid: U64,
+    pub(crate) stransid: U64,
+    pub(crate) rtransid: U64,
+    pub(crate) ctime: RawTimespec,
+    pub(crate) otime: RawTimespec,
+    pub(crate) stime: RawTimespec,
+    pub(crate) rtime: RawTimespec,
+    pub(crate) reserved: [U64; 8],
 }
 
 /// `btrfs_dir_item`, without its trailing name and data.
@@ -301,6 +321,7 @@ const _: () = {
     assert!(size_of::<RawStripe>() == 32);
     assert!(size_of::<RawInodeItem>() == 160);
     assert!(size_of::<RawRootItem>() == 239);
+    assert!(size_of::<RawRootTail>() == 200);
     assert!(size_of::<RawDirItem>() == 30);
     assert!(size_of::<RawFileExtentHead>() == 21);
     assert!(size_of::<RawFileExtentBody>() == 32);

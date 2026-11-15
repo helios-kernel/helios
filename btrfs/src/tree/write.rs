@@ -33,6 +33,13 @@ pub(crate) enum WriteError {
         key: Key,
         defect: crate::allocation::AllocationDefect,
     },
+    #[error("tree {tree} metadata usage {used} cannot add {added} and remove {removed} bytes")]
+    RootUsage {
+        tree: u64,
+        used: u64,
+        added: u64,
+        removed: u64,
+    },
     #[error("metadata extent for block {address} at level {level} is missing")]
     MissingExtent { address: u64, level: u8 },
     #[error("no metadata space remains for tree {tree}")]
