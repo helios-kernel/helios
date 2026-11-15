@@ -15,6 +15,9 @@
 //! range its parent gives it, breaks that order and ends the walk with
 //! [`Error::TreeOrder`] instead of revisiting blocks.
 
+pub(crate) mod edit;
+pub(crate) mod write;
+
 use alloc::boxed::Box;
 use alloc::vec;
 
@@ -53,6 +56,7 @@ pub(crate) struct Expected {
 }
 
 /// A validated tree block.
+#[derive(Clone)]
 pub(crate) struct Node {
     bytes: Box<[u8]>,
     level: u8,

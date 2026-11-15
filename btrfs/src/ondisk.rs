@@ -10,7 +10,7 @@
 //! Layouts follow the kernel's `include/uapi/linux/btrfs_tree.h`.
 
 use zerocopy::little_endian::{U16, U32, U64};
-use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Bytes of the checksum field at the head of a superblock and a tree block.
 pub(crate) const CSUM_FIELD_BYTES: usize = 32;
@@ -60,7 +60,7 @@ pub(crate) mod item_type {
 }
 
 /// `btrfs_disk_key`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawKey {
     pub(crate) objectid: U64,
@@ -130,7 +130,7 @@ pub(crate) struct RawSuperblock {
 }
 
 /// `btrfs_header`, the head of every tree block.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawHeader {
     pub(crate) csum: [u8; CSUM_FIELD_BYTES],
@@ -145,7 +145,7 @@ pub(crate) struct RawHeader {
 }
 
 /// `btrfs_item`: a leaf's slot, pointing at its data.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawItem {
     pub(crate) key: RawKey,
@@ -154,7 +154,7 @@ pub(crate) struct RawItem {
 }
 
 /// `btrfs_key_ptr`: an internal node's slot, pointing at a child block.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawKeyPtr {
     pub(crate) key: RawKey,

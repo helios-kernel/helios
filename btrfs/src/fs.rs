@@ -824,3 +824,6 @@ async fn default_subvolume<S: BlockSource>(
     }
     Ok(tree)
 }
+
+#[cfg(test)]
+mod write_tests;
