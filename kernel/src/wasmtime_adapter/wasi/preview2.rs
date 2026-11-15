@@ -8,7 +8,7 @@ use helios_hal::cpu::Cpu;
 use helios_hal::fs::WritePosition;
 use helios_netstack::Ipv6Address;
 use thiserror::Error;
-use wasmtime::component::{HasSelf, Linker, Resource};
+use wasmtime::component::{Access, HasSelf, Linker, Resource};
 use wasmtime::{self, Result};
 use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::{DynPollable, Pollable, subscribe};
@@ -19,6 +19,9 @@ use wasmtime_wasi_io::{self};
 
 use super::bindings::clocks::system_clock::Instant as P3SystemInstant;
 use super::bindings::filesystem::types as p3fs;
+use super::fs::{
+    PreparedOpenAt, PreparedStat, execute_open, prepare_open, prepare_stat, stat_prepared,
+};
 use super::net::{TcpSocketInputStream, TcpSocketOutputStream};
 use super::{
     FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network, P2OutgoingDatagramStream,
@@ -179,8 +182,8 @@ pub(crate) mod filesystem_bindings {
             path: "../../wasmtime/crates/wasi/src/p2/wit",
             imports: {
                 "wasi:filesystem/types.[method]descriptor.stat": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.stat-at": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.open-at": async | trappable,
+                "wasi:filesystem/types.[method]descriptor.stat-at": borrowed | async | trappable,
+                "wasi:filesystem/types.[method]descriptor.open-at": borrowed | async | trappable,
                 "wasi:filesystem/types.[method]descriptor.read": async | trappable,
                 "wasi:filesystem/types.[method]descriptor.write": async | trappable,
                 "wasi:filesystem/types.[method]descriptor.read-directory": async | trappable,
@@ -197,7 +200,7 @@ pub(crate) mod filesystem_bindings {
                 "wasi:filesystem/types.[method]descriptor.remove-directory-at": async | trappable,
                 "wasi:filesystem/types.[method]descriptor.symlink-at": async | trappable,
                 "wasi:filesystem/types.[method]descriptor.metadata-hash": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.metadata-hash-at": async | trappable,
+                "wasi:filesystem/types.[method]descriptor.metadata-hash-at": borrowed | async | trappable,
                 default: trappable,
             },
             with: {
@@ -1176,6 +1179,92 @@ where
     }
 }
 
+impl<U: Send, CpuImpl, Net, StorageImpl> p2fs::HostDescriptorWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    type OpenAtPrepared = PreparedOpenAt<CpuImpl, Net, StorageImpl>;
+
+    fn prepare_open_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path_flags: p2fs::PathFlags,
+        path: &str,
+        open_flags: p2fs::OpenFlags,
+        flags: p2fs::DescriptorFlags,
+    ) -> Result<Self::OpenAtPrepared> {
+        Ok(prepare_open(
+            store,
+            descriptor,
+            path_flags_to_p3(path_flags),
+            path,
+            open_flags_to_p3(open_flags),
+            descriptor_flags_to_p3(flags),
+        ))
+    }
+
+    async fn open_at(
+        mut host: Access<'_, U, Self>,
+        prepared: Self::OpenAtPrepared,
+    ) -> Result<core::result::Result<Resource<FsDescriptor>, p2fs::ErrorCode>> {
+        match execute_open(prepared).await {
+            Ok(opened) => Ok(Ok(host.get().table.push(opened)?)),
+            Err(error) => Ok(Err(error_code_from_p3(error))),
+        }
+    }
+
+    type StatAtPrepared = PreparedStat<CpuImpl, Net, StorageImpl>;
+    fn prepare_stat_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path_flags: p2fs::PathFlags,
+        path: &str,
+    ) -> Result<Self::StatAtPrepared> {
+        Ok(prepare_stat(
+            store,
+            descriptor,
+            path_flags_to_p3(path_flags),
+            path,
+        ))
+    }
+    async fn stat_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::StatAtPrepared,
+    ) -> Result<core::result::Result<p2fs::DescriptorStat, p2fs::ErrorCode>> {
+        Ok(stat_prepared(prepared, "stat-at")
+            .await
+            .map(|metadata| descriptor_stat_from_p3(super::descriptor_stat(&metadata)))
+            .map_err(error_code_from_p3))
+    }
+
+    type MetadataHashAtPrepared = PreparedStat<CpuImpl, Net, StorageImpl>;
+    fn prepare_metadata_hash_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path_flags: p2fs::PathFlags,
+        path: &str,
+    ) -> Result<Self::MetadataHashAtPrepared> {
+        Ok(prepare_stat(
+            store,
+            descriptor,
+            path_flags_to_p3(path_flags),
+            path,
+        ))
+    }
+    async fn metadata_hash_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::MetadataHashAtPrepared,
+    ) -> Result<core::result::Result<p2fs::MetadataHashValue, p2fs::ErrorCode>> {
+        Ok(stat_prepared(prepared, "metadata-hash-at")
+            .await
+            .map(|metadata| metadata_hash_from_p3(super::metadata_hash(&metadata)))
+            .map_err(error_code_from_p3))
+    }
+}
+
 impl<CpuImpl, Net, StorageImpl> filesystem_bindings::filesystem::types::HostDescriptor
     for StoreData<CpuImpl, Net, StorageImpl>
 where
@@ -1418,28 +1507,6 @@ where
         .await)
     }
 
-    async fn stat_at(
-        &mut self,
-        descriptor: Resource<FsDescriptor>,
-        path_flags: p2fs::PathFlags,
-        path: String,
-    ) -> Result<core::result::Result<p2fs::DescriptorStat, p2fs::ErrorCode>> {
-        let target = self.p2_descriptor(&descriptor);
-        Ok(async {
-            let (base, namespace) = target?;
-            let metadata = super::stat_at(
-                &namespace,
-                base.grant().map_err(error_code_from_p3)?,
-                path_flags_to_p3(path_flags),
-                &path,
-            )
-            .await
-            .map_err(error_code_from_p3)?;
-            Ok(descriptor_stat_from_p3(super::descriptor_stat(&metadata)))
-        }
-        .await)
-    }
-
     async fn set_times_at(
         &mut self,
         descriptor: Resource<FsDescriptor>,
@@ -1504,37 +1571,6 @@ where
             .map_err(error_code_from_p3)
         }
         .await)
-    }
-
-    async fn open_at(
-        &mut self,
-        descriptor: Resource<FsDescriptor>,
-        path_flags: p2fs::PathFlags,
-        path: String,
-        open_flags: p2fs::OpenFlags,
-        flags: p2fs::DescriptorFlags,
-    ) -> Result<core::result::Result<Resource<FsDescriptor>, p2fs::ErrorCode>> {
-        let target = self.p2_descriptor(&descriptor);
-        let now = self.now_nanos();
-        let opened = async {
-            let (base, namespace) = target?;
-            super::open_at(
-                &namespace,
-                base.grant().map_err(error_code_from_p3)?,
-                path_flags_to_p3(path_flags),
-                &path,
-                open_flags_to_p3(open_flags),
-                descriptor_flags_to_p3(flags),
-                now,
-            )
-            .await
-            .map_err(error_code_from_p3)
-        }
-        .await;
-        match opened {
-            Ok(opened) => Ok(Ok(self.table.push(opened)?)),
-            Err(error) => Ok(Err(error)),
-        }
     }
 
     async fn readlink_at(
@@ -1662,28 +1698,6 @@ where
             let metadata = super::stat_path(&namespace, &descriptor.path, crate::Follow::No)
                 .await
                 .map_err(error_code_from_p3)?;
-            Ok(metadata_hash_from_p3(super::metadata_hash(&metadata)))
-        }
-        .await)
-    }
-
-    async fn metadata_hash_at(
-        &mut self,
-        descriptor: Resource<FsDescriptor>,
-        path_flags: p2fs::PathFlags,
-        path: String,
-    ) -> Result<core::result::Result<p2fs::MetadataHashValue, p2fs::ErrorCode>> {
-        let target = self.p2_descriptor(&descriptor);
-        Ok(async {
-            let (base, namespace) = target?;
-            let metadata = super::stat_at(
-                &namespace,
-                base.grant().map_err(error_code_from_p3)?,
-                path_flags_to_p3(path_flags),
-                &path,
-            )
-            .await
-            .map_err(error_code_from_p3)?;
             Ok(metadata_hash_from_p3(super::metadata_hash(&metadata)))
         }
         .await)

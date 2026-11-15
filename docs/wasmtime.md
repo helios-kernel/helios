@@ -8,18 +8,22 @@ at `../wasmtime/crates/wasmtime`.
 The local checkout must be at (branch `helios/register-component-hosts`):
 
 ```text
-f45dafed30a8e58e0109481fc4b1b2075ab97f43
+e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e
 ```
 
-That revision adds precompiled register trampolines for synchronous scalar and
-resource-handle host imports to `helios/borrowed-host-inputs` at
-`578de3c7598ded3a324f08cab7fb2d64e7e9401b`. Instantiation selects the specialized
-entry for typed synchronous hosts on supported native ABIs; dynamic, async and
-non-scalar imports retain the array entry. Host registration and AOT
-instantiation need no compiler. Canonical validation, resource scopes, call
-hooks and trap handling remain in the existing runtime helpers.
+This revision combines the register trampoline implementation with
+`helios/borrowed-sync-wit-inputs` at `6e4440eff80a35670c7622d4be28d422ab624461`.
+Typed synchronous scalar and resource-handle imports select precompiled native
+register trampolines; other imports retain the array ABI. Canonical validation,
+resource scopes, call hooks and traps remain in the existing runtime helpers.
 
-`helios/borrowed-host-inputs` adds scoped guest-memory borrowing to
+Borrowed-input preparation extends to synchronous WIT functions
+implemented by asynchronous Rust hosts. `func_wrap_async_prepare` and bindgen's
+`borrowed | async` option complete input validation and request construction
+before the host future starts, retaining only the owned request across suspension.
+
+`helios/borrowed-host-inputs` at
+`578de3c7598ded3a324f08cab7fb2d64e7e9401b` adds scoped guest-memory borrowing to
 `helios/data-host-task-fast-path` at
 `685697120ea7dcf237fb5b7ef6b08fc4456c6fab`. `func_wrap_data_memory` separates
 mutable host data from a read-only memory view that cannot reenter guest code.
