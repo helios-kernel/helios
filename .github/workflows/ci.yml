@@ -99,14 +99,19 @@ jobs:
             pin:
               - 'docs/wasmtime.md'
             aarch64:
+              - '!**/*.md'
               - 'aarch64/**'
             riscv:
+              - '!**/*.md'
               - 'riscv/**'
             x86:
+              - '!**/*.md'
               - 'x86/**'
             hosted:
+              - '!**/*.md'
               - 'hosted/**'
             host_tools:
+              - '!**/*.md'
               - 'inspector/**'
               - 'inspector-protocol/**'
               - 'cli/**'
@@ -114,6 +119,7 @@ jobs:
               - 'profdata/**'
               - 'workspace-root/**'
             programs:
+              - '!**/*.md'
               - 'programs/**'
               - 'api/**'
               - 'api-macro/**'
@@ -122,6 +128,7 @@ jobs:
             # definition. It overlaps `shared` rather than carving out of
             # it: a change here still runs every other lane `shared` does.
             gpu:
+              - '!**/*.md'
               - 'hal/src/display.rs'
               - 'hal/src/display/**'
               - 'hal/src/device.rs'
@@ -141,6 +148,7 @@ jobs:
               - '.github/ci-lanes.json'
               - '.github/workflows/ci.yml'
             btrfs:
+              - '!**/*.md'
               - 'btrfs/**'
               - 'hal/**'
               - 'tools/btrfs/**'
@@ -151,8 +159,8 @@ jobs:
               - '.github/ci-lanes.json'
               - '.github/workflows/ci.yml'
               - '.github/actions/checkout-wasmtime/**'
-              - 'docs/wasmtime.md'
             profile_format:
+              - '!**/*.md'
               - 'rust-toolchain.toml'
               - 'profdata/**'
               - 'kernel/src/profiling/**'
