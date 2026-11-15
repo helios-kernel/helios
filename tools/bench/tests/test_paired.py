@@ -1506,6 +1506,29 @@ def test_a_sampled_candidate_refuses_the_cross_run_table_and_keeps_the_paired_on
         evaluate(baseline_report, paired_regression_report)
 
 
+def test_standalone_gate_reports_no_revision_comparison(baseline_report: Report, tmp_path, capsys) -> None:
+    candidate = tmp_path / "candidate.json"
+    output = tmp_path / "gate.md"
+    save_report(baseline_report, candidate)
+    with pytest.raises(SystemExit) as result:
+        cli_main(["gate", "--candidate", str(candidate), "--out", str(output)])
+    assert result.value.code == 0
+    text = output.read_text(encoding="utf-8")
+    assert capsys.readouterr().out == text
+    assert "Revision comparison not evaluated" in text
+    assert "No significant regression" not in text
+
+
+def test_paired_regression_still_fails_without_dev_report(paired_regression_report: Report, tmp_path) -> None:
+    candidate = tmp_path / "candidate.json"
+    output = tmp_path / "gate.md"
+    save_report(paired_regression_report, candidate)
+    with pytest.raises(SystemExit) as result:
+        cli_main(["gate", "--candidate", str(candidate), "--out", str(output)])
+    assert result.value.code == 1
+    assert "Revision comparison not evaluated" not in output.read_text(encoding="utf-8")
+
+
 def test_an_unpaired_sampled_run_against_dev_is_refused(
     regressed_report: Report, baseline_report: Report, tmp_path
 ) -> None:
