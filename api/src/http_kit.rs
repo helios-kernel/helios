@@ -31,8 +31,8 @@ use http_kit_io::DialUnix;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use http_kit_io::splice::{FilledPipe, Pipe, Spliced};
 use http_kit_io::{
-    Answer, BufResult, Dial, IoBuf, IoBufMut, IoVectoredBuf, Read, ReadAhead, ReadOwned, Received,
-    Resolve, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions, Timer, Write,
+    Answer, BufResult, Dial, IoBuf, IoBufMut, IoVectoredBuf, NoBuf, Read, ReadAhead, ReadOwned,
+    Received, Resolve, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions, Timer, Write,
 };
 use thiserror::Error;
 use wit_bindgen::rt::async_support::{FutureReader, StreamReader, StreamWriter};
@@ -307,15 +307,15 @@ impl Read for ReadHalf {
 }
 
 impl ReadOwned for ReadHalf {
-    type Buf = Vec<u8>;
+    type Buf = NoBuf;
 
-    /// Lends the vector the stream read into, so no byte is copied.
-    async fn read_owned(&mut self) -> io::Result<Received<Vec<u8>>> {
+    /// Transfers the receive allocation so protocol bodies can retain it directly.
+    async fn read_owned(&mut self) -> io::Result<Received<NoBuf>> {
         let bytes = self.receive(RECEIVE_CHUNK_BYTES).await?;
         Ok(if bytes.is_empty() {
             Received::End
         } else {
-            Received::Lent(bytes)
+            Received::Owned(bytes.into())
         })
     }
 }
@@ -448,9 +448,9 @@ impl Read for TcpConnection {
 }
 
 impl ReadOwned for TcpConnection {
-    type Buf = Vec<u8>;
+    type Buf = NoBuf;
 
-    fn read_owned(&mut self) -> impl Future<Output = io::Result<Received<Vec<u8>>>> {
+    fn read_owned(&mut self) -> impl Future<Output = io::Result<Received<NoBuf>>> {
         self.reader.read_owned()
     }
 }

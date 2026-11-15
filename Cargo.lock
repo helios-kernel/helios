@@ -860,7 +860,7 @@ dependencies = [
 [[package]]
 name = "compio-buf"
 version = "0.8.3"
-source = "git+https://github.com/lexoliu/compio?branch=skyzen#e61491c7da76dd4ca71765e8cf2e5b1fa2ff6b6d"
+source = "git+https://github.com/lexoliu/compio?branch=skyzen#23ce721e472045310d6bf09894836698d8914ae9"
 dependencies = [
  "bytes",
  "libc",
@@ -2889,7 +2889,7 @@ dependencies = [
 [[package]]
 name = "http-kit"
 version = "0.8.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "bytes",
  "bytestr",
@@ -2910,7 +2910,7 @@ dependencies = [
 [[package]]
 name = "http-kit-h1"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "async-channel",
  "bytes",
@@ -2927,7 +2927,7 @@ dependencies = [
 [[package]]
 name = "http-kit-io"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "bytes",
  "compio-buf",
@@ -2940,7 +2940,7 @@ dependencies = [
 [[package]]
 name = "http-kit-tls"
 version = "0.4.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "futures-lite",
  "http-kit-io",
