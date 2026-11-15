@@ -149,7 +149,7 @@ test-host-tools:
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ -n "${HELIOS_PREBUILT_WASM:-}" ]]; then
-        plugin="${HELIOS_PREBUILT_WASM}/helios_compiler_plugin.wasm"
+        plugin="${HELIOS_PREBUILT_WASM}/{{ default_profile }}/helios_compiler_plugin.wasm"
     else
         target="$(rustc -vV | sed -n 's/^host: //p')"
         out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
@@ -162,7 +162,10 @@ test-host-tools:
     fi
     # These tools read no bootfs. The compiler-host test needs only the
     # original wasm, which CI's shared producer already built.
-    test -f "$plugin"
+    if [[ ! -f "$plugin" ]]; then
+        echo "compiler plugin wasm is missing: $plugin" >&2
+        exit 1
+    fi
     cargo nextest run -p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support
     HELIOS_COMPILER_PLUGIN_WASM="$plugin" cargo nextest run -p helios-compiler-host
 
