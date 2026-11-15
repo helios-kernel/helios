@@ -163,7 +163,7 @@ jobs:
           HEAVY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
-          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --arg event "${EVENT}" --argjson heavy "${HEAVY}" '
+          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --arg event "${EVENT:-}" --argjson heavy "${HEAVY}" '
             to_entries
             | map(select($changed == null
                 or ($event == "push" and (.key != "test-btrfs-upstream" and .key != "test-btrfs-fuzz"))
