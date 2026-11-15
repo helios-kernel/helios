@@ -808,6 +808,76 @@ mod entry_tests {
         }
     }
 
+    #[test]
+    fn freeing_memory_after_device_loss_releases_its_mapping() {
+        let (transport, capset) = TestFactory::create().unwrap();
+        let recorded = transport.0.clone();
+        let configuration = TestFactory::configuration();
+        let connection = Connection::new(
+            transport,
+            capset,
+            configuration.layout,
+            configuration.idle_timeout,
+        )
+        .unwrap();
+        // SAFETY: the test owns all objects and submits no GPU work using
+        // this allocation; a recorded transport fault exercises cleanup.
+        unsafe {
+            let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
+                connection,
+                &vk::InstanceCreateInfo::default(),
+                None,
+            )
+            .unwrap();
+            let physical = instance.enumerate_physical_devices().unwrap()[0];
+            let priorities = [1.0];
+            let queues = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(0)
+                .queue_priorities(&priorities)];
+            let device = instance
+                .create_device(
+                    physical,
+                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                    None,
+                )
+                .unwrap();
+            let memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(4096)
+                        .memory_type_index(0),
+                    None,
+                )
+                .unwrap();
+            device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .unwrap();
+            let mapping = {
+                let mut recorded = recorded.lock().unwrap();
+                let mapping = recorded.blobs[&recorded.next].clone();
+                recorded.premature_completion = true;
+                mapping
+            };
+            assert!(mapping.upgrade().is_some());
+            let error = device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(4096)
+                        .usage(vk::BufferUsageFlags::STORAGE_BUFFER),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error, vk::Result::ERROR_DEVICE_LOST);
+            device.free_memory(memory, None);
+            assert!(
+                mapping.upgrade().is_none(),
+                "device loss must not defer memory release to device destruction"
+            );
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
     #[derive(Default)]
     struct Allocations {
         live: Mutex<BTreeMap<usize, std::alloc::Layout>>,
