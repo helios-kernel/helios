@@ -44,7 +44,7 @@ mod request;
 mod root;
 mod storage;
 
-pub use btrfs::{BtrfsFs, BtrfsService, BtrfsWriteOptions};
+pub use btrfs::{BtrfsFs, BtrfsMountError, BtrfsService, BtrfsWriteOptions};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
 pub use memory::{MemoryFs, MemoryWrite};

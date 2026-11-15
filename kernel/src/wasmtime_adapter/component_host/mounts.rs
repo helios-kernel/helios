@@ -40,12 +40,14 @@ fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
             ..
         } => RefusalKind::InvalidFilesystem,
         MountRequestError::Btrfs {
-            error: helios_btrfs::Error::Io { .. },
+            error: crate::vfs::BtrfsMountError::Read(helios_btrfs::Error::Io { .. }),
             ..
         } => RefusalKind::Io,
-        MountRequestError::Btrfs { .. } | MountRequestError::BtrfsWrite { .. } => {
-            RefusalKind::InvalidFilesystem
-        }
+        MountRequestError::Btrfs {
+            error: crate::vfs::BtrfsMountError::Busy,
+            ..
+        } => RefusalKind::Busy,
+        MountRequestError::Btrfs { .. } => RefusalKind::InvalidFilesystem,
         MountRequestError::Mount(MountError::InvalidPoint(_) | MountError::RootKind) => {
             RefusalKind::InvalidPoint
         }

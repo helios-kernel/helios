@@ -39,8 +39,31 @@ pub struct BtrfsWriteOptions {
 }
 type Snapshot<Device> = Filesystem<SourceArc<Image<Device>>>;
 
+#[derive(Debug, thiserror::Error)]
+pub enum BtrfsMountError {
+    #[error("disk already has an incompatible mount")]
+    Busy,
+    #[error(transparent)]
+    Read(#[from] Error),
+    #[error(transparent)]
+    Write(#[from] WriteError),
+}
+
+// A writable mount excludes independent read snapshots: those snapshots have
+// no shared retirement accounting with its writer. Clones of this mount share
+// both the image lease and the library's generation pins.
+enum MountLease {
+    Read {
+        _lease: crate::OwnedRawRwLockReadLease,
+    },
+    Write {
+        _lease: crate::OwnedRawRwLockWriteLease,
+    },
+}
+
 struct Image<Device> {
     disk: CachedDisk<Device>,
+    _lease: MountLease,
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages>> BlockSource for Image<Device> {
@@ -121,9 +144,14 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
     pub async fn mount(
         disk: CachedDisk<Device>,
         mut allocate_device: impl FnMut() -> DeviceId + Send,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, BtrfsMountError> {
         let serial = disk.serial();
-        let reader = Filesystem::mount(SourceArc::new(Image { disk })).await?;
+        let lease = disk.read_mount().ok_or(BtrfsMountError::Busy)?;
+        let reader = Filesystem::mount(SourceArc::new(Image {
+            disk,
+            _lease: MountLease::Read { _lease: lease },
+        }))
+        .await?;
         let mut devices = BTreeMap::new();
         reader
             .subvolumes(|tree, root_inode| {
@@ -149,9 +177,14 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
         mut allocate_device: impl FnMut() -> DeviceId + Send,
         entropy: RootEntropyHandle,
         concurrency: NonZeroUsize,
-    ) -> Result<(Self, BtrfsService<Device>), WriteError> {
+    ) -> Result<(Self, BtrfsService<Device>), BtrfsMountError> {
         let serial = disk.serial();
-        let writer = Writer::mount(Image { disk }).await?;
+        let lease = disk.write_mount().ok_or(BtrfsMountError::Busy)?;
+        let writer = Writer::mount(Image {
+            disk,
+            _lease: MountLease::Write { _lease: lease },
+        })
+        .await?;
         let reader = writer.snapshot()?;
         let mut devices = BTreeMap::new();
         reader

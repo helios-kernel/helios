@@ -63,12 +63,7 @@ pub enum MountRequestError {
     #[error("the btrfs image on disk {serial:?} cannot be mounted: {error}")]
     Btrfs {
         serial: BlockSerial,
-        error: helios_btrfs::Error,
-    },
-    #[error("the btrfs image on disk {serial:?} cannot be mounted writable: {error}")]
-    BtrfsWrite {
-        serial: BlockSerial,
-        error: helios_btrfs::write::WriteError,
+        error: super::BtrfsMountError,
     },
     #[error(transparent)]
     Mount(#[from] MountError),
@@ -128,7 +123,7 @@ pub async fn request_mount<S: Storage>(
                     write.concurrency,
                 )
                 .await
-                .map_err(|error| MountRequestError::BtrfsWrite { serial, error })?;
+                .map_err(|error| MountRequestError::Btrfs { serial, error })?;
                 service = Some(task);
                 fs
             };

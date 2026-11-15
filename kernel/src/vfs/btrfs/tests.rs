@@ -186,6 +186,20 @@ fn writable_service_publishes_namespace_and_survives_remount() {
         )
         .await
         .expect("writable mount");
+        assert!(matches!(
+            BtrfsFs::mount(cache.disk(0), || DeviceId::new(102)).await,
+            Err(super::BtrfsMountError::Busy)
+        ));
+        assert!(matches!(
+            BtrfsFs::mount_writable(
+                cache.disk(0),
+                || DeviceId::new(103),
+                crate::test_support::test_root_entropy(),
+                core::num::NonZeroUsize::new(1).unwrap()
+            )
+            .await,
+            Err(super::BtrfsMountError::Busy)
+        ));
         let client = async move {
             fs.open(
                 path("created"),
