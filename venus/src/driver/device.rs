@@ -153,7 +153,7 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
         unsafe { *output = vk::Device::from_raw(pointer) };
         Ok(vk::Result::SUCCESS)
     })();
-    result.unwrap_or_else(|error| state.fail(error))
+    state.finish(result)
 }
 
 unsafe extern "system" fn destroy_device<F: Factory>(

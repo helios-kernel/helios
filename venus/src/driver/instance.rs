@@ -53,6 +53,17 @@ pub(super) unsafe fn shared<F: Factory>(object: *mut ObjectBase) -> Arc<Shared<F
 }
 
 impl<F: Factory> State<F> {
+    pub(super) fn finish(
+        &mut self,
+        result: Result<vk::Result, Error<TransportError<F>>>,
+    ) -> vk::Result {
+        match result {
+            Ok(vk::Result::ERROR_DEVICE_LOST) => self.fail(Error::DeviceLost),
+            Ok(result) => result,
+            Err(error) => self.fail(error),
+        }
+    }
+
     pub(super) fn fail(&mut self, error: Error<TransportError<F>>) -> vk::Result {
         tracing::error!(error = %error, "Venus connection failed");
         self.connection.fail_timelines();
@@ -89,12 +100,8 @@ pub(super) unsafe fn invoke_result<F: Factory>(
     // SAFETY: forwarded unchanged from the Vulkan entry point.
     match unsafe {
         invoke::<F, _>(object, |state| {
-            let result = call(state)?;
-            if result == wire::VK_ERROR_DEVICE_LOST {
-                Err(Error::DeviceLost)
-            } else {
-                Ok(result)
-            }
+            let result = call(state).map(|result| vk::Result::from_raw(result.0));
+            Ok(wire::VkResult(state.finish(result).as_raw()))
         })
     } {
         Ok(result) => result,
@@ -284,7 +291,7 @@ pub(super) unsafe fn create_on_connection<F: Factory>(
             unsafe { *output = vk::Instance::from_raw(pointer as usize as u64) };
             vk::Result::SUCCESS
         }
-        Ok(result) => vk::Result::from_raw(result.0),
+        Ok(result) => state.finish(Ok(vk::Result::from_raw(result.0))),
         Err(error) => state.fail(error),
     }
 }
@@ -337,7 +344,7 @@ unsafe extern "system" fn enumerate_physical_devices<F: Factory>(
         };
         match result {
             Ok(result) if result == wire::VK_SUCCESS => {}
-            Ok(result) => return vk::Result::from_raw(result.0),
+            Ok(result) => return state.finish(Ok(vk::Result::from_raw(result.0))),
             Err(error) => return state.fail(error),
         }
         let mut objects = Vec::with_capacity(total as usize);
@@ -371,7 +378,7 @@ unsafe extern "system" fn enumerate_physical_devices<F: Factory>(
             };
             match result {
                 Ok(result) if result == wire::VK_SUCCESS => {}
-                Ok(result) => return vk::Result::from_raw(result.0),
+                Ok(result) => return state.finish(Ok(vk::Result::from_raw(result.0))),
                 Err(error) => return state.fail(error),
             }
         }

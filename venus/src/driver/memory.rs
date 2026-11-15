@@ -73,7 +73,7 @@ unsafe extern "system" fn allocate<F: Factory>(
         unsafe { *output = vk::DeviceMemory::from_raw(handle.0) };
         Ok(vk::Result::SUCCESS)
     })();
-    result.unwrap_or_else(|error| state.fail(error))
+    state.finish(result)
 }
 
 unsafe extern "system" fn free<F: Factory>(

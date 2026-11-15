@@ -81,6 +81,8 @@ struct Recorded {
     blob_ids: Vec<u64>,
     #[cfg(feature = "driver")]
     scripted: bool,
+    #[cfg(feature = "driver")]
+    result_override: Option<(i32, i32)>,
 }
 
 struct Recording(Arc<Mutex<Recorded>>);
@@ -736,6 +738,11 @@ mod entry_tests {
         } else {
             panic!("unexpected scripted command {command}");
         }
+        if let Some((target, result)) = state.result_override
+            && command == target
+        {
+            words[1] = result as u32;
+        }
         state.reply_command = command;
         state.reply = words.into_iter().flat_map(u32::to_le_bytes).collect();
     }
@@ -1084,6 +1091,40 @@ mod entry_tests {
                         &vk::BufferCreateInfo::default()
                             .size(64)
                             .usage(vk::BufferUsageFlags::STORAGE_BUFFER),
+                        None
+                    ),
+                    Err(vk::Result::ERROR_DEVICE_LOST)
+                );
+                assert_eq!(waiting.join().unwrap(), Err(vk::Result::ERROR_DEVICE_LOST));
+            });
+            device.destroy_fence(fence, None);
+        }
+    }
+
+    #[test]
+    fn renderer_device_loss_during_allocation_wakes_a_fence_wait() {
+        let fixture = SyncDevice::new();
+        let device = &fixture.device;
+        // SAFETY: the failure is injected through the recording transport; cleanup still uses live handles.
+        unsafe {
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            let started = fixture.observe_latest_wait();
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| device.wait_for_fences(&[fence], true, 5_000_000_000));
+                started
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("fence wait is registered before failure");
+                fixture.recorded.lock().unwrap().result_override = Some((
+                    wire::VK_COMMAND_TYPE_vkAllocateMemory_EXT.0,
+                    vk::Result::ERROR_DEVICE_LOST.as_raw(),
+                ));
+                assert_eq!(
+                    device.allocate_memory(
+                        &vk::MemoryAllocateInfo::default()
+                            .allocation_size(4096)
+                            .memory_type_index(0),
                         None
                     ),
                     Err(vk::Result::ERROR_DEVICE_LOST)

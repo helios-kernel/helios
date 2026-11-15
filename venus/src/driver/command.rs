@@ -66,7 +66,7 @@ unsafe extern "system" fn create_pool<F: Factory>(
         unsafe { *output = vk::CommandPool::from_raw(handle.0) };
         Ok(vk::Result::SUCCESS)
     })();
-    result.unwrap_or_else(|error| state.fail(error))
+    state.finish(result)
 }
 
 unsafe extern "system" fn destroy_pool<F: Factory>(
@@ -168,7 +168,7 @@ unsafe extern "system" fn allocate_buffers<F: Factory>(
         }
         Ok(vk::Result::SUCCESS)
     })();
-    result.unwrap_or_else(|error| state.fail(error))
+    state.finish(result)
 }
 
 unsafe extern "system" fn free_buffers<F: Factory>(
