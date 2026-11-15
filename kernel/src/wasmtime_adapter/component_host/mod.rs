@@ -2654,13 +2654,18 @@ where
             })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_concurrent(
         "[method]tcp-stream.close",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
-            let socket = caller.data_mut().table.get_mut(&resource)?;
-            socket.resource.backend.close();
-            Ok((Ok::<(), debugger_wit::net::TcpError>(()),))
+            Box::pin(async move {
+                accessor.with(|mut access| {
+                    let socket = access.get().table.get_mut(&resource)?;
+                    socket.resource.backend.close();
+                    Ok::<_, wasmtime::Error>(())
+                })?;
+                Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::TcpError>(()),))
+            })
         },
     )?;
     instance.func_wrap_concurrent(
@@ -2718,13 +2723,18 @@ where
             })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_concurrent(
         "[method]udp-socket.close",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
-            let socket = caller.data_mut().table.get_mut(&resource)?;
-            socket.resource.backend.close();
-            Ok((Ok::<(), debugger_wit::net::UdpError>(()),))
+            Box::pin(async move {
+                accessor.with(|mut access| {
+                    let socket = access.get().table.get_mut(&resource)?;
+                    socket.resource.backend.close();
+                    Ok::<_, wasmtime::Error>(())
+                })?;
+                Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::UdpError>(()),))
+            })
         },
     )?;
     Ok(())
@@ -2981,13 +2991,18 @@ where
             })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_concurrent(
         "[method]tcp-stream.close",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
-            let socket = caller.data_mut().table.get_mut(&resource)?;
-            socket.resource.backend.close();
-            Ok((Ok::<(), program_wit::net::TcpError>(()),))
+            Box::pin(async move {
+                accessor.with(|mut access| {
+                    let socket = access.get().table.get_mut(&resource)?;
+                    socket.resource.backend.close();
+                    Ok::<_, wasmtime::Error>(())
+                })?;
+                Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::TcpError>(()),))
+            })
         },
     )?;
     instance.func_wrap_concurrent(
@@ -3045,13 +3060,18 @@ where
             })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_concurrent(
         "[method]udp-socket.close",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
-            let socket = caller.data_mut().table.get_mut(&resource)?;
-            socket.resource.backend.close();
-            Ok((Ok::<(), program_wit::net::UdpError>(()),))
+            Box::pin(async move {
+                accessor.with(|mut access| {
+                    let socket = access.get().table.get_mut(&resource)?;
+                    socket.resource.backend.close();
+                    Ok::<_, wasmtime::Error>(())
+                })?;
+                Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::UdpError>(()),))
+            })
         },
     )?;
     Ok(())

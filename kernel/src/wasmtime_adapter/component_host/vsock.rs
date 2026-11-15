@@ -21,7 +21,6 @@ use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
 use helios_hal::vsock::{VsockAddress, VsockShutdown};
-use wasmtime::StoreContextMut;
 use wasmtime::component::{Accessor, ComponentType, Lift, Linker, Lower, Resource, ResourceType};
 
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
@@ -249,34 +248,45 @@ where
             })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_concurrent(
         "guest-cid",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
-            let store = caller.data();
-            let cid = store
-                .debug_port()
-                .and_then(|()| store.runtime_state.vsock_service())
-                .map(|service| service.guest_cid());
-            Ok((cid,))
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
+            Box::pin(async move {
+                let cid = accessor.with(|mut access| {
+                    let store = access.get();
+                    Ok::<_, wasmtime::Error>(
+                        (store.debug_port().is_some())
+                            .then(|| store.runtime_state.vsock_service())
+                            .flatten()
+                            .map(|service| service.guest_cid()),
+                    )
+                })?;
+                Ok::<_, wasmtime::Error>((cid,))
+            })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_concurrent(
         "listen",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
-         (port, backlog): (u32, u32)| {
-            let service = match authorise::<Bindings, _, _, _>(caller.data()) {
-                Ok(service) => service,
-                Err(error) => return Ok((Err(error),)),
-            };
-            let listener = match service.listen(port, backlog as usize) {
-                Ok(listener) => listener,
-                Err(error) => return Ok((Err(convert_error::<Bindings>(error)),)),
-            };
-            let resource = caller
-                .data_mut()
-                .table
-                .push(ComponentVsockListener { service, listener })?;
-            Ok((Ok(resource),))
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>, (port, backlog): (u32, u32)| {
+            Box::pin(async move {
+                let response = accessor.with(|mut access| {
+                    let service = match authorise::<Bindings, _, _, _>(access.get()) {
+                        Ok(service) => service,
+                        Err(error) => return Ok::<_, wasmtime::Error>(Err(error)),
+                    };
+                    let listener = match service.listen(port, backlog as usize) {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            return Ok::<_, wasmtime::Error>(Err(convert_error::<Bindings>(error)));
+                        }
+                    };
+                    Ok(Ok(access
+                        .get()
+                        .table
+                        .push(ComponentVsockListener { service, listener })?))
+                })?;
+                Ok::<_, wasmtime::Error>((response,))
+            })
         },
     )?;
     instance.func_wrap_concurrent(
@@ -308,15 +318,22 @@ where
             })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_concurrent(
         "[method]vsock-listener.port",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
-            let listener = caller.data().table.get(&resource)?;
-            Ok((listener
-                .service
-                .listener_port(listener.listener)
-                .map_err(convert_error::<Bindings>),))
+            Box::pin(async move {
+                let response = accessor.with(|mut access| {
+                    let listener = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>(
+                        listener
+                            .service
+                            .listener_port(listener.listener)
+                            .map_err(convert_error::<Bindings>),
+                    )
+                })?;
+                Ok::<_, wasmtime::Error>((response,))
+            })
         },
     )?;
     instance.func_wrap_concurrent(
@@ -347,27 +364,41 @@ where
             })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_concurrent(
         "[method]vsock-listener.close",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
-            let listener = caller.data().table.get(&resource)?;
-            Ok((listener
-                .service
-                .close_listener(listener.listener)
-                .map_err(convert_error::<Bindings>),))
+            Box::pin(async move {
+                let response = accessor.with(|mut access| {
+                    let listener = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>(
+                        listener
+                            .service
+                            .close_listener(listener.listener)
+                            .map_err(convert_error::<Bindings>),
+                    )
+                })?;
+                Ok::<_, wasmtime::Error>((response,))
+            })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_concurrent(
         "[method]vsock-stream.peer",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockStream>,)| {
-            let stream = caller.data().table.get(&resource)?;
-            Ok((stream
-                .service
-                .peer(stream.stream)
-                .map(Bindings::address)
-                .map_err(convert_error::<Bindings>),))
+            Box::pin(async move {
+                let response = accessor.with(|mut access| {
+                    let stream = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>(
+                        stream
+                            .service
+                            .peer(stream.stream)
+                            .map(Bindings::address)
+                            .map_err(convert_error::<Bindings>),
+                    )
+                })?;
+                Ok::<_, wasmtime::Error>((response,))
+            })
         },
     )?;
     instance.func_wrap_concurrent(
