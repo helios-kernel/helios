@@ -83,7 +83,7 @@ where
         cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
         mut source: Source<'_, Self::Item>,
-        _: bool,
+        finish: bool,
     ) -> Poll<Result<StreamResult>> {
         let local_output = {
             let state = (self.getter)(store.data_mut());
@@ -98,6 +98,9 @@ where
             }
         };
         if let Some((sink, cpu, runtime, writer)) = local_output {
+            if finish {
+                return Poll::Ready(Ok(StreamResult::Cancelled));
+            }
             // Arm before trying the port. Unconsumed bytes remain owned by
             // the stream while it is parked; no guest borrow survives a poll.
             let wait = self
@@ -440,5 +443,132 @@ mod direct_output_tests {
             assert_eq!(reads.skipped.load(Ordering::Relaxed), bytes.len());
             assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
         }
+    }
+
+    /// Supplies a real stream source to the consumer's cancellation poll,
+    /// then closes the surrounding test stream without consuming its bytes.
+    struct CancelAtPoll<C>(C);
+
+    impl<T: 'static, C: StreamConsumer<T, Item = u8> + Unpin> StreamConsumer<T> for CancelAtPoll<C> {
+        type Item = u8;
+
+        fn poll_consume(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            store: wasmtime::StoreContextMut<'_, T>,
+            source: Source<'_, u8>,
+            _: bool,
+        ) -> Poll<Result<StreamResult>> {
+            assert!(matches!(
+                Pin::new(&mut self.get_mut().0).poll_consume(cx, store, source, true),
+                Poll::Ready(Ok(StreamResult::Cancelled))
+            ));
+            Poll::Ready(Ok(StreamResult::Dropped))
+        }
+    }
+
+    #[test]
+    fn cancelled_local_output_leaves_the_source_unconsumed() {
+        let reads = Arc::new(Reads::default());
+        let mut config = wasmtime::Config::new();
+        config
+            .wasm_component_model(true)
+            .wasm_component_model_async(true);
+        let engine = wasmtime::Engine::new(&config).expect("stream engine");
+        let mut store = wasmtime::Store::new(&engine, test_store::store_data_with(|_| {}));
+        let (tx, rx) = oneshot::channel();
+        let consumer = SerialStreamConsumer::new(|state| state, tx, OutputStreamKind::Stdout);
+        let source = TrackedBuffer {
+            bytes: "中文\n日本語\n한국어".as_bytes(),
+            reads: reads.clone(),
+        };
+        futures_lite::future::block_on(store.run_concurrent(async |accessor| {
+            accessor
+                .with(|mut store| {
+                    StreamReader::new(&mut store, source)?.pipe(store, CancelAtPoll(consumer))
+                })
+                .expect("connect stream");
+            rx.await
+                .expect("completion sent")
+                .expect("output completed");
+        }))
+        .expect("stream event loop");
+        assert_eq!(reads.skipped.load(Ordering::Relaxed), 0);
+        assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn busy_output_keeps_bytes_in_source_until_the_port_is_released() {
+        use crate::DebugSerialAccess;
+        use helios_hal::serial::ByteSerial;
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+
+        struct HeldPort {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl ByteSerial for HeldPort {
+            fn try_read_byte(&self) -> Option<u8> {
+                None
+            }
+            fn write_bytes(&self, _: &[u8]) {
+                self.entered.send(()).expect("announce occupied port");
+                self.release
+                    .lock()
+                    .expect("release channel")
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test releases the occupied port");
+            }
+            fn enable_receive_interrupt(&self) {}
+            fn disable_receive_interrupt(&self) {}
+        }
+
+        let bytes = "中文\n日本語\n한국어\ntail".as_bytes();
+        let reads = Arc::new(Reads::default());
+        let mut config = wasmtime::Config::new();
+        config
+            .wasm_component_model(true)
+            .wasm_component_model_async(true);
+        let engine = wasmtime::Engine::new(&config).expect("stream engine");
+        let mut store = wasmtime::Store::new(&engine, test_store::store_data_with(|_| {}));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let port = HeldPort {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            };
+            assert!(test_store::DiscardPort::console().try_write(&port, b"occupied"));
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("port became occupied");
+        let (tx, rx) = oneshot::channel();
+        let consumer = SerialStreamConsumer::new(|state| state, tx, OutputStreamKind::Stdout);
+        let source = TrackedBuffer {
+            bytes,
+            reads: reads.clone(),
+        };
+        let run = store.run_concurrent(async |accessor| {
+            accessor
+                .with(|mut store| StreamReader::new(&mut store, source)?.pipe(store, consumer))
+                .expect("connect stream");
+            rx.await
+                .expect("completion sent")
+                .expect("output completed");
+        });
+        let mut run = core::pin::pin!(run);
+        assert!(
+            futures_lite::future::block_on(futures_lite::future::poll_once(&mut run)).is_none()
+        );
+        assert_eq!(reads.skipped.load(Ordering::Relaxed), 0);
+        assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
+        release_tx.send(()).expect("release port");
+        futures_lite::future::block_on(run).expect("stream event loop");
+        owner.join().expect("port owner completed");
+        assert_eq!(reads.skipped.load(Ordering::Relaxed), bytes.len());
+        assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
     }
 }
