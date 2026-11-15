@@ -51,6 +51,21 @@ pub async fn run() -> Result<(), Error> {
             "completed values surviving producer closure",
         ));
     }
+    let failed = SignalSource::new(0);
+    let failed_reader = failed.reader();
+    task::spawn(async move {
+        task::yield_now().await;
+        failed.fail();
+    });
+    if !matches!(
+        wait_all(&[failed_reader.point(1)], Some(deadline)).await,
+        Err(TimelineError::Failed)
+    ) || !matches!(failed_reader.value(), Err(TimelineError::Failed))
+    {
+        return Err(Error::Contract(
+            "producer failure waking an unreachable point",
+        ));
+    }
     println!("gpu-test:shared-timelines ok");
     Ok(())
 }
