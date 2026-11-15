@@ -12,6 +12,8 @@
 //! C functions they mirror do, and are `unsafe` on the same terms: the
 //! pointers, array lengths and `pNext` chains describe live memory.
 
+pub mod capset;
+pub mod ring;
 pub mod runtime;
 
 pub use runtime::*;
