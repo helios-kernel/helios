@@ -28,7 +28,7 @@ fn irq() -> VirtualIrq {
 }
 
 #[derive(Default)]
-struct TestKick {
+pub(crate) struct TestKick {
     kicks: AtomicUsize,
 }
 impl VcpuKick for TestKick {
@@ -37,7 +37,7 @@ impl VcpuKick for TestKick {
     }
 }
 
-struct TestSpace {
+pub(crate) struct TestSpace {
     exits: IrqSafeMutex<VecDeque<VmExit>>,
     entries: IrqSafeMutex<Vec<(ProcessorId, Option<ProcessorId>, Duration)>>,
     interrupts: IrqSafeMutex<Vec<VirtualIrq>>,
@@ -115,15 +115,36 @@ unsafe impl Stage2Space for TestSpace {
         self.unmap_pages(range).await
     }
 }
-struct TestVcpu {
+pub(crate) struct TestVcpu {
     space: Arc<TestSpace>,
     kick: Arc<TestKick>,
     registers: u64,
     prepared: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TestRegisters(u64);
+
+impl helios_hal::hv::GuestRegisters for TestRegisters {
+    fn read(&self, register: helios_hal::hv::RegisterId) -> Result<u64, HvError> {
+        match register {
+            helios_hal::hv::RegisterId::Aarch64X(0) => Ok(self.0),
+            _ => Err(HvError::InvalidRegister),
+        }
+    }
+    fn write(&mut self, register: helios_hal::hv::RegisterId, value: u64) -> Result<(), HvError> {
+        match register {
+            helios_hal::hv::RegisterId::Aarch64X(0) => {
+                self.0 = value;
+                Ok(())
+            }
+            _ => Err(HvError::InvalidRegister),
+        }
+    }
+}
 // SAFETY: records bounded entry and restores detached state before every return.
 unsafe impl GuestVcpu for TestVcpu {
-    type Registers = u64;
+    type Registers = TestRegisters;
     type Kick = TestKick;
     fn kick_handle(&self) -> Arc<TestKick> {
         self.kick.clone()
@@ -167,11 +188,11 @@ unsafe impl GuestVcpu for TestVcpu {
         Ok(accepted)
     }
     fn set_irq_window(&mut self, _: bool) {}
-    fn get_regs(&mut self) -> Result<u64, HvError> {
-        Ok(self.registers)
+    fn get_regs(&mut self) -> Result<TestRegisters, HvError> {
+        Ok(TestRegisters(self.registers))
     }
-    fn set_regs(&mut self, registers: &u64) -> Result<(), HvError> {
-        self.registers = *registers;
+    fn set_regs(&mut self, registers: &TestRegisters) -> Result<(), HvError> {
+        self.registers = registers.0;
         Ok(())
     }
     fn complete_exit(&mut self, value: u64) -> Result<(), HvError> {
@@ -179,7 +200,10 @@ unsafe impl GuestVcpu for TestVcpu {
         Ok(())
     }
 }
-fn vm(exits: impl IntoIterator<Item = VmExit>, pages: usize) -> VirtualMachine<TestSpace> {
+pub(crate) fn vm(
+    exits: impl IntoIterator<Item = VmExit>,
+    pages: usize,
+) -> VirtualMachine<TestSpace> {
     VirtualMachine::new(
         TestSpace::new(exits),
         single_node_pool(2),
@@ -188,6 +212,67 @@ fn vm(exits: impl IntoIterator<Item = VmExit>, pages: usize) -> VirtualMachine<T
 }
 fn vcpu(vm: &mut VirtualMachine<TestSpace>) -> Vcpu<TestSpace> {
     vm.create_vcpu(0, NonZeroUsize::new(2).unwrap()).unwrap()
+}
+
+#[test]
+fn ioevent_completes_a_matching_write_before_notifying_and_resuming() {
+    use helios_hal::hv::IoAccess;
+
+    let address = GuestAddress(0x1000);
+    let write = VmExit::Mmio {
+        address,
+        access: IoAccess::Write {
+            width: IoWidth::Dword,
+            value: 4,
+        },
+    };
+    let mut vm = vm([write, VmExit::Shutdown], 0);
+    let event = vm
+        .register_ioevent(address, IoWidth::Dword, Some(4))
+        .unwrap();
+    let mut cpu = vcpu(&mut vm);
+    cpu.set_regs(&TestRegisters(99)).unwrap();
+    {
+        let mut run = core::pin::pin!(cpu.run_vcpu());
+        assert!(poll(run.as_mut()).is_pending());
+        assert_eq!(vm.shared.space.entries.with(|entries| entries.len()), 1);
+        assert_eq!(block_on(event.wait()), Ok(()));
+    }
+    assert_eq!(cpu.get_regs().unwrap(), TestRegisters(0));
+    assert_eq!(block_on(cpu.run_vcpu()), Ok(VmExit::Shutdown));
+}
+
+#[test]
+fn unregistered_ioevent_leaves_mmio_to_the_vmm() {
+    use helios_hal::hv::IoAccess;
+
+    let address = GuestAddress(0x1000);
+    let write = VmExit::Mmio {
+        address,
+        access: IoAccess::Write {
+            width: IoWidth::Dword,
+            value: 4,
+        },
+    };
+    let mut vm = vm([write], 0);
+    let event = vm.register_ioevent(address, IoWidth::Dword, None).unwrap();
+    let mut cpu = vcpu(&mut vm);
+    drop(event);
+    assert_eq!(block_on(cpu.run_vcpu()), Ok(write));
+}
+
+#[test]
+fn vm_control_stops_a_vcpu_while_the_vm_owner_is_leased() {
+    let mut vm = vm([VmExit::Halt], 0);
+    let mut cpu = vcpu(&mut vm);
+    let control = vm.control();
+    let slot = ResourceSlot::new(vm);
+    let lease = slot.take().unwrap();
+    let mut run = core::pin::pin!(cpu.run_vcpu());
+    assert!(poll(run.as_mut()).is_pending());
+    control.stop();
+    assert_eq!(poll(run.as_mut()), Poll::Ready(Ok(VmExit::Shutdown)));
+    drop(lease);
 }
 
 #[test]

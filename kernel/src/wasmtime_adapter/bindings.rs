@@ -290,6 +290,20 @@ pub mod audio {
     }
 }
 
+/// Hardware virtualization resources shared by both program worlds.
+pub mod hv {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "hv-host",
+            imports: { default: trappable },
+            require_store_data_send: true,
+        });
+    }
+}
+
 /// Bindings for the interface a program reaches the machine's processor
 /// lifecycle through.
 ///

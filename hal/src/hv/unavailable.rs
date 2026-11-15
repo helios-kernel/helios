@@ -45,6 +45,15 @@ impl VcpuKick for Infallible {
     }
 }
 
+impl GuestRegisters for Infallible {
+    fn read(&self, _: RegisterId) -> Result<u64, HvError> {
+        match *self {}
+    }
+    fn write(&mut self, _: RegisterId, _: u64) -> Result<(), HvError> {
+        match *self {}
+    }
+}
+
 // SAFETY: uninhabited; there is no guest execution or state to detach.
 unsafe impl GuestVcpu for Infallible {
     type Registers = Self;

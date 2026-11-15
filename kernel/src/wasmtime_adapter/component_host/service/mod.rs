@@ -26,6 +26,8 @@ pub(super) use surface::add_surface_to_linker;
 mod audio;
 pub use audio::PlaybackHandle;
 pub(super) use audio::add_audio_to_linker;
+mod hv;
+pub(super) use hv::add_hv_to_linker;
 mod processors;
 pub(super) use processors::add_processors_to_linker;
 mod compile_session;
