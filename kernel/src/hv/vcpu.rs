@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_utils::CachePadded;
 use futures::future::{Either, select};
 use helios_hal::cpu::{ProcessorId, current_processor};
-use helios_hal::hv::{GuestVcpu, HvError, Stage2Space, VcpuKick, VirtualIrq, VmExit};
+use helios_hal::hv::{GuestVcpu, HvError, IoAccess, Stage2Space, VcpuKick, VirtualIrq, VmExit};
 use triomphe::Arc;
 
 use super::{KickOf, VmShared};
@@ -59,6 +59,9 @@ impl<K: VcpuKick> Clone for VcpuControl<K> {
     }
 }
 impl<K: VcpuKick> VcpuControl<K> {
+    pub(super) fn from_signals(signals: Arc<VcpuSignals<K>>) -> Self {
+        Self { signals }
+    }
     pub fn inject_irq(&self, irq: VirtualIrq) -> Result<(), HvError> {
         self.signals.irqs.push(irq).map_err(|error| match error {
             PushError::Full(_) => HvError::InterruptQueueFull,
@@ -156,6 +159,21 @@ impl<S: Stage2Space> Vcpu<S> {
                 .prepare_run(processor, self.previous, GUEST_TIME_SLICE)?;
             self.previous = Some(processor);
             let exit = self.backend.run()?;
+            if let VmExit::Mmio {
+                address,
+                access: IoAccess::Write { width, value },
+            } = exit
+                && let Some(event) = self
+                    ._registration
+                    .shared
+                    .ioevents
+                    .matching(address, width, value)
+            {
+                self.backend.complete_exit(0)?;
+                event.complete();
+                yield_now().await;
+                continue;
+            }
             match exit {
                 VmExit::Preempted | VmExit::IrqWindow => yield_now().await,
                 VmExit::Halt => {

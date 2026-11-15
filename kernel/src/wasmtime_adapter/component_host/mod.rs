@@ -1971,6 +1971,7 @@ where
     service::add_gpu_to_linker(linker)?;
     service::add_audio_to_linker(linker)?;
     service::add_processors_to_linker(linker)?;
+    service::add_hv_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_snapshot_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
@@ -2176,6 +2177,7 @@ where
     service::add_gpu_to_linker(linker)?;
     service::add_audio_to_linker(linker)?;
     service::add_processors_to_linker(linker)?;
+    service::add_hv_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     program_profiling::add_to_linker(linker)?;
     Ok(())

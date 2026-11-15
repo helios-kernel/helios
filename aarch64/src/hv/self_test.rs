@@ -101,8 +101,9 @@ pub(crate) async fn run(cpu: crate::Aarch64Cpu, control: ProcessorControl<crate:
                 .add(index)
                 .write(instruction);
         }
-        asm!("dc cvau, {address}", "dsb ish", "ic ialluis", "dsb ish", "isb",
-            address = in(reg) address, options(nostack));
+        cpu.hv()
+            .expect("HV self-test requires EL2 VHE")
+            .synchronize_memory(&[PhysFrame::from_phys_addr(address)]);
     }
     let space = Arc::new(
         cpu.hv()

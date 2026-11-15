@@ -12,6 +12,9 @@ impl Hypervisor for Infallible {
     fn create_space(&self) -> Result<Self, HvError> {
         match *self {}
     }
+    unsafe fn synchronize_memory(&self, _: &[PhysFrame]) {
+        match *self {}
+    }
 }
 
 // SAFETY: no value of this type can exist, so none of these methods can execute.
@@ -41,6 +44,15 @@ unsafe impl Stage2Space for Infallible {
 
 impl VcpuKick for Infallible {
     fn kick(&self) {
+        match *self {}
+    }
+}
+
+impl GuestRegisters for Infallible {
+    fn read(&self, _: RegisterId) -> Result<u64, HvError> {
+        match *self {}
+    }
+    fn write(&mut self, _: RegisterId, _: u64) -> Result<(), HvError> {
         match *self {}
     }
 }

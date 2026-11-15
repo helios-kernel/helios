@@ -122,6 +122,24 @@ impl Hypervisor {
 }
 
 impl HypervisorContract for Hypervisor {
+    unsafe fn synchronize_memory(&self, frames: &[PhysFrame]) {
+        let line = crate::cache_line_bytes();
+        for frame in frames {
+            for offset in (0..PhysFrame::SIZE).step_by(line) {
+                let address = frame.phys_addr() + offset;
+                // Clean to PoC, as required for an EL1 Linux Image with its
+                // MMU disabled; PoU alone does not establish that contract.
+                unsafe {
+                    asm!("dc cvac, {address}", address = in(reg) address, options(nostack));
+                }
+            }
+        }
+        // Guest instruction addresses need not match the host aliases used
+        // above, so invalidate all inner-shareable instruction caches.
+        unsafe {
+            asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
+        }
+    }
     type Space = Space;
     fn capabilities(&self) -> HvCapabilities {
         self.hardware.capabilities

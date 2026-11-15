@@ -184,6 +184,29 @@ pub trait VcpuKick: Send + Sync + 'static {
     fn kick(&self);
 }
 
+/// Architectural names used by VMM boot loaders and exit emulation. The
+/// backend's snapshot keeps its native layout; names never encode pointers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterId {
+    Aarch64X(u8),
+    Aarch64Sp,
+    Aarch64Pc,
+    Aarch64Pstate,
+    X86Gpr(u8),
+    X86Rip,
+    X86Rflags,
+    X86Control(u8),
+    X86Msr(u32),
+}
+
+/// Access to a detached architectural snapshot. Failed writes leave the
+/// snapshot unchanged. The vCPU validates and publishes the whole snapshot
+/// through `set_regs`, so a batch cannot partially update hardware state.
+pub trait GuestRegisters: Send {
+    fn read(&self, register: RegisterId) -> Result<u64, HvError>;
+    fn write(&mut self, register: RegisterId, value: u64) -> Result<(), HvError>;
+}
+
 /// Single-owner architectural vCPU context. Registers stay typed per backend:
 /// x86 segment/control state and ARM system registers are not interchangeable.
 ///
@@ -198,7 +221,7 @@ pub trait VcpuKick: Send + Sync + 'static {
 /// through the space's shootdown protocol before storage can be reclaimed.
 /// Dropping a detached vCPU must never access another processor's active state.
 pub unsafe trait GuestVcpu: Send + 'static {
-    type Registers: Send;
+    type Registers: GuestRegisters;
     type Kick: VcpuKick;
 
     fn kick_handle(&self) -> Arc<Self::Kick>;
@@ -277,6 +300,13 @@ pub trait Hypervisor: Send + Sync + 'static {
     type Space: Stage2Space;
     fn capabilities(&self) -> HvCapabilities;
     fn create_space(&self) -> Result<Self::Space, HvError>;
+    /// Publish host writes to guest data and instruction fetch, including
+    /// aliases at a different guest virtual address, on every processor.
+    ///
+    /// # Safety
+    /// Frames remain owned, initialized normal RAM mapped in the host for
+    /// the entire call. The caller synchronizes writes before publication.
+    unsafe fn synchronize_memory(&self, frames: &[PhysFrame]);
 }
 
 #[cfg(test)]

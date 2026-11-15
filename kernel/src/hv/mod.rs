@@ -10,18 +10,25 @@
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 use helios_hal::cpu::Cpu;
-use helios_hal::hv::{GuestRange, GuestVcpu, HvError, Hypervisor, Stage2Space};
+use helios_hal::hv::{
+    GuestAddress, GuestRange, GuestVcpu, HvError, Hypervisor, IoWidth, Stage2Space, VirtualIrq,
+};
 use helios_hal::vmm::PageFlags;
 use thiserror::Error;
 use triomphe::Arc;
 
 use crate::memory::{IrqSafeMutex, UserMemoryPool};
 
+mod ioevent;
+mod lease;
 mod memory;
+pub use ioevent::IoEvent;
+use ioevent::IoEvents;
+pub use lease::{LeaseError, ResourceLease, ResourceSlot};
 mod shootdown;
 pub use shootdown::{Stage2Generation, Stage2Shootdown, Stage2Tracker};
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod vcpu;
 
 use memory::GuestPages;
@@ -46,6 +53,7 @@ struct VmShared<S: Stage2Space> {
     space: Arc<S>,
     regions: IrqSafeMutex<Vec<GuestMemoryRegion>>,
     vcpus: IrqSafeMutex<LiveVcpus<S>>,
+    ioevents: Arc<IoEvents>,
 }
 
 /// Unique VM control owner. Dropping it requests termination of all its vCPUs;
@@ -57,13 +65,48 @@ pub struct VirtualMachine<S: Stage2Space> {
     account: Arc<GuestMemoryAccount>,
 }
 
+pub struct VmControl<S: Stage2Space> {
+    shared: Arc<VmShared<S>>,
+}
+
+impl<S: Stage2Space> VmControl<S> {
+    pub fn stop(&self) {
+        self.shared.ioevents.stop();
+        self.shared.vcpus.with(|vcpus| {
+            for (_, signals) in vcpus {
+                signals.stop();
+            }
+        });
+    }
+
+    pub fn set_irq_line(&self, vcpu_id: u32, irq: VirtualIrq) -> Result<(), HvError> {
+        let signals = self
+            .shared
+            .vcpus
+            .with(|vcpus| {
+                vcpus
+                    .iter()
+                    .find(|(id, _)| *id == vcpu_id)
+                    .map(|(_, signals)| signals.clone())
+            })
+            .ok_or(HvError::InvalidVcpu)?;
+        VcpuControl::from_signals(signals).inject_irq(irq)
+    }
+}
+
 impl<S: Stage2Space> VirtualMachine<S> {
+    pub fn control(&self) -> VmControl<S> {
+        VmControl {
+            shared: self.shared.clone(),
+        }
+    }
     pub fn new(space: S, pool: &'static UserMemoryPool, memory_limit: usize) -> Self {
         Self {
             shared: Arc::new(VmShared {
                 space: Arc::new(space),
                 regions: IrqSafeMutex::new(Vec::new()),
                 vcpus: IrqSafeMutex::new(Vec::new()),
+                ioevents: Arc::new(IoEvents::new()),
             }),
             pool,
             account: Arc::new(GuestMemoryAccount::new(memory_limit)),
@@ -71,6 +114,19 @@ impl<S: Stage2Space> VirtualMachine<S> {
     }
     pub fn memory_account(&self) -> &Arc<GuestMemoryAccount> {
         &self.account
+    }
+
+    pub fn register_ioevent(
+        &self,
+        address: GuestAddress,
+        width: IoWidth,
+        value: Option<u64>,
+    ) -> Result<IoEvent, HvError> {
+        IoEvents::register(&self.shared.ioevents, address, width, value)
+    }
+
+    pub fn set_irq_line(&self, vcpu_id: u32, irq: VirtualIrq) -> Result<(), HvError> {
+        self.control().set_irq_line(vcpu_id, irq)
     }
 
     pub fn allocate_memory(
@@ -163,11 +219,7 @@ impl<S: Stage2Space> VirtualMachine<S> {
 
 impl<S: Stage2Space> Drop for VirtualMachine<S> {
     fn drop(&mut self) {
-        self.shared.vcpus.with(|vcpus| {
-            for (_, signals) in vcpus {
-                signals.stop();
-            }
-        });
+        self.control().stop();
     }
 }
 
