@@ -5,11 +5,15 @@ compile_error!("the Venus shared ring requires -Ctarget-feature=+atomics");
 
 use core::num::NonZeroU64;
 use core::ptr::NonNull;
+use core::time::Duration;
+use std::sync::Arc;
 
 use helios_api::memory::{Block, BlockError};
 
 use crate::capset::{self, Capset, CapsetError};
-use crate::transport::{MappedBlob, Transport, TransportFactory};
+use crate::transport::{
+    Completion, MappedBlob, SignalTimeline, Timeline, TimelinePoint, Transport, TransportFactory,
+};
 
 mod bindings {
     wit_bindgen::generate!({
@@ -20,16 +24,67 @@ mod bindings {
     });
 }
 
-use bindings::helios::system::{gpu, memory};
+use bindings::helios::system::{gpu, memory, sync};
+use bindings::wasi::clocks::monotonic_clock;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("GPU transport refused: {0}")]
     Gpu(#[from] gpu::Error),
+    #[error("completion timeline refused: {0}")]
+    Timeline(#[from] sync::Error),
     #[error(transparent)]
     Memory(#[from] BlockError),
     #[error(transparent)]
     Capset(#[from] CapsetError),
+}
+
+#[derive(Clone)]
+pub struct Signal(Arc<sync::SignalSource>);
+
+#[derive(Clone)]
+pub struct Reader(Arc<sync::Timeline>);
+
+impl SignalTimeline for Signal {
+    type Error = Error;
+    type Timeline = Reader;
+
+    fn new(initial: u64) -> Self {
+        Self(Arc::new(sync::SignalSource::new(initial)))
+    }
+    fn reader(&self) -> Reader {
+        Reader(Arc::new(self.0.reader()))
+    }
+    fn signal(&self, value: u64) -> Result<(), Error> {
+        self.0.signal(value).map_err(Error::from)
+    }
+}
+
+impl Timeline for Reader {
+    type Error = Error;
+
+    fn value(&self) -> Result<u64, Error> {
+        self.0.value().map_err(Error::from)
+    }
+
+    fn wait(
+        points: &[TimelinePoint<Self>],
+        wait_all: bool,
+        timeout: Option<Duration>,
+    ) -> Result<bool, Error> {
+        let deadline = timeout.map(|duration| {
+            monotonic_clock::now()
+                .saturating_add(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        });
+        let points: Vec<_> = points
+            .iter()
+            .map(|point| sync::TimelinePoint {
+                timeline: &point.timeline.0,
+                value: point.value,
+            })
+            .collect();
+        sync::wait(&points, wait_all, deadline).map_err(Error::from)
+    }
 }
 
 /// A Venus context. The context resource drops before the GPU session.
@@ -113,6 +168,7 @@ unsafe impl MappedBlob for Blob {
 impl Transport for Context {
     type Error = Error;
     type Blob = Blob;
+    type Signal = Signal;
 
     fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Blob, Error> {
         let mut mapping = Block::zeroed(size.get())?;
@@ -139,17 +195,25 @@ impl Transport for Context {
         })
     }
 
-    fn execute(&mut self, commands: &[u8], ring: u8, fence: Option<u64>) -> Result<(), Error> {
-        let completion = fence.map(|fence| gpu::Completion {
-            fence,
-            signals: Vec::new(),
+    fn execute(
+        &mut self,
+        commands: &[u8],
+        ring: u8,
+        completion: Option<Completion<'_, Signal>>,
+    ) -> Result<(), Error> {
+        let completion = completion.map(|completion| gpu::Completion {
+            fence: completion.fence,
+            signals: completion
+                .signals
+                .iter()
+                .map(|point| sync::SignalPoint {
+                    source: &point.source.0,
+                    value: point.value,
+                })
+                .collect(),
         });
         self.context
             .execute(commands, ring, completion.as_ref())
             .map_err(Error::from)
-    }
-
-    fn wait(&mut self, ring: u8, fence: u64) -> Result<(), Error> {
-        self.context.wait(ring, fence).map_err(Error::from)
     }
 }

@@ -7,7 +7,7 @@ use ash::vk::{self, Handle};
 
 use super::Factory;
 use super::allocator::HostAllocator;
-use super::instance::{Dispatch, TransportError, invoke_result, invoke_void, object, shared};
+use super::instance::{Dispatch, TransportError, invoke_void, object, shared, wait_for_points};
 use crate::connection::Error;
 use crate::protocol as wire;
 
@@ -244,29 +244,25 @@ unsafe extern "system" fn queue_wait_idle<F: Factory>(queue: vk::Queue) -> vk::R
     let pointer = object(queue);
     // SAFETY: queue owns this immutable timeline assignment until destruction.
     let ring = unsafe { (*pointer.cast::<Queue<F>>()).ring };
-    let result = unsafe {
-        invoke_result::<F>(pointer, |state| {
-            state.connection.wait_queue(ring)?;
-            Ok(wire::VK_SUCCESS)
+    unsafe {
+        wait_for_points::<F>(pointer, |state| {
+            state.connection.completion_points(1u64 << ring)
         })
-    };
-    vk::Result::from_raw(result.0)
+    }
 }
 
 unsafe extern "system" fn device_wait_idle<F: Factory>(device: vk::Device) -> vk::Result {
     // SAFETY: device is live and its dispatch header is immutable.
     let id = unsafe { (*object(device)).id };
-    let result = unsafe {
-        invoke_result::<F>(object(device), |state| {
+    unsafe {
+        wait_for_points::<F>(object(device), |state| {
             let timelines = state.devices[&id]
                 .queues
                 .iter()
                 .fold(0, |mask, queue| mask | (1u64 << queue.ring));
-            state.connection.wait_queues(timelines)?;
-            Ok(wire::VK_SUCCESS)
+            state.connection.completion_points(timelines)
         })
-    };
-    vk::Result::from_raw(result.0)
+    }
 }
 
 unsafe extern "system" fn get_device_proc_addr<F: Factory>(

@@ -11,7 +11,7 @@ use super::{Configuration, Factory};
 use crate::ObjectBase;
 use crate::connection::{Connection, Error};
 use crate::protocol as wire;
-use crate::transport::Transport;
+use crate::transport::{SignalTimeline, Timeline, Transport, WaitPoint};
 
 pub(super) type TransportError<F> =
     <<F as crate::transport::TransportFactory>::Transport as Transport>::Error;
@@ -81,6 +81,39 @@ pub(super) unsafe fn invoke_result<F: Factory>(
     match unsafe { invoke::<F, _>(object, call) } {
         Ok(result) => result,
         Err(result) => wire::VkResult(result.as_raw()),
+    }
+}
+
+/// Captures completion points while serializing submission, then suspends
+/// without the lock so other threads can submit future signals.
+pub(super) unsafe fn wait_for_points<F: Factory>(
+    object: *mut ObjectBase,
+    capture: impl FnOnce(
+        &mut State<F>,
+    ) -> Result<Vec<WaitPoint<F::Transport>>, Error<TransportError<F>>>,
+) -> vk::Result {
+    // SAFETY: the caller holds a live dispatchable object of this factory.
+    let owner = unsafe { shared::<F>(object) };
+    let points = {
+        let mut state = owner.lock();
+        if state.fault.is_some() {
+            return vk::Result::ERROR_DEVICE_LOST;
+        }
+        match capture(&mut state) {
+            Ok(points) => points,
+            Err(error) => return state.fail(error),
+        }
+    };
+    let result = <<F::Transport as Transport>::Signal as SignalTimeline>::Timeline::wait(
+        &points, true, None,
+    );
+    let mut state = owner.lock();
+    if state.fault.is_some() {
+        return vk::Result::ERROR_DEVICE_LOST;
+    }
+    match result {
+        Ok(_) => vk::Result::SUCCESS,
+        Err(error) => state.fail(Error::Transport(error)),
     }
 }
 

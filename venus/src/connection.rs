@@ -12,7 +12,10 @@ use crate::protocol::{
     vn_encode_vkSetReplyCommandStreamMESA, vn_encode_vkWaitRingSeqnoMESA,
 };
 use crate::ring::{Layout, Ring, RingError};
-use crate::transport::{MappedBlob, Transport};
+use crate::transport::{
+    Completion, MappedBlob, SignalPoint, SignalTimeline, Timeline, TimelinePoint, Transport,
+    WaitPoint,
+};
 use crate::{DecodeError, EncodeError, Encoder, RendererProtocol};
 
 /// Mesa reserves 256 bytes for its largest inline transport command,
@@ -64,6 +67,19 @@ pub enum Error<E: std::error::Error> {
     Timeline { ring: u8 },
 }
 
+struct QueueTimeline<S: SignalTimeline> {
+    source: S,
+    reader: S::Timeline,
+}
+
+impl<S: SignalTimeline> QueueTimeline<S> {
+    fn new() -> Self {
+        let source = S::new(0);
+        let reader = source.reader();
+        Self { source, reader }
+    }
+}
+
 /// Single owner of the renderer's command ring. The transport is destroyed
 /// before its mapped blobs, so dropping a connection ends the context even
 /// when a command failed. `close` additionally destroys the Venus ring and
@@ -78,6 +94,7 @@ pub struct Connection<T: Transport> {
     ring_id: u64,
     next_object: u64,
     fences: [u64; TIMELINES],
+    signals: [Option<QueueTimeline<T::Signal>>; TIMELINES],
 }
 
 impl<T: Transport> Connection<T> {
@@ -135,6 +152,7 @@ impl<T: Transport> Connection<T> {
             ring_id,
             next_object: ring_id + 1,
             fences: [0; TIMELINES],
+            signals: core::array::from_fn(|_| None),
         };
         let command = connection.inline(|encoder| {
             // SAFETY: all fields of info describe the owned ring mapping.
@@ -186,22 +204,43 @@ impl<T: Transport> Connection<T> {
         Ok(command)
     }
 
-    fn execute_fenced(&mut self, commands: &[u8], ring: u8) -> Result<u64, Error<T::Error>> {
+    fn execute_fenced(
+        &mut self,
+        commands: &[u8],
+        ring: u8,
+    ) -> Result<WaitPoint<T>, Error<T::Error>> {
         let fence = self
             .fences
             .get_mut(usize::from(ring))
             .ok_or(Error::Timeline { ring })?;
         *fence = fence.checked_add(1).ok_or(Error::FenceIds { ring })?;
         let fence = *fence;
+        let timeline = self.signals[usize::from(ring)].get_or_insert_with(QueueTimeline::new);
+        let signals = [SignalPoint {
+            source: &timeline.source,
+            value: fence,
+        }];
         self.transport
-            .execute(commands, ring, Some(fence))
+            .execute(
+                commands,
+                ring,
+                Some(Completion {
+                    fence,
+                    signals: &signals,
+                }),
+            )
             .map_err(Error::Transport)?;
-        Ok(fence)
+        Ok(TimelinePoint {
+            timeline: timeline.reader.clone(),
+            value: fence,
+        })
     }
 
     fn execute_and_wait(&mut self, commands: &[u8], ring: u8) -> Result<(), Error<T::Error>> {
-        let fence = self.execute_fenced(commands, ring)?;
-        self.transport.wait(ring, fence).map_err(Error::Transport)
+        let point = self.execute_fenced(commands, ring)?;
+        <T::Signal as SignalTimeline>::Timeline::wait(&[point], true, None)
+            .map(|_| ())
+            .map_err(Error::Transport)
     }
 
     fn publish(&mut self, commands: &[u8]) -> Result<u32, Error<T::Error>> {
@@ -291,6 +330,18 @@ impl<T: Transport> Connection<T> {
     /// All completion fences are submitted before the first wait, allowing
     /// independent GPU queues to retire concurrently.
     pub fn wait_queues(&mut self, timelines: u64) -> Result<(), Error<T::Error>> {
+        let points = self.completion_points(timelines)?;
+        <T::Signal as SignalTimeline>::Timeline::wait(&points, true, None)
+            .map(|_| ())
+            .map_err(Error::Transport)
+    }
+
+    /// Submit markers for prior work, then return read-only points which
+    /// remain valid after releasing the connection's submission lock.
+    pub fn completion_points(
+        &mut self,
+        timelines: u64,
+    ) -> Result<Vec<WaitPoint<T>>, Error<T::Error>> {
         let command = self.inline(|encoder| {
             // SAFETY: this command has only scalar parameters.
             unsafe {
@@ -302,22 +353,14 @@ impl<T: Transport> Connection<T> {
                 )
             };
         })?;
-        let mut fences = [0; TIMELINES];
+        let mut points = Vec::with_capacity(timelines.count_ones() as usize);
         let mut remaining = timelines;
         while remaining != 0 {
             let ring = remaining.trailing_zeros() as u8;
             remaining &= remaining - 1;
-            fences[usize::from(ring)] = self.execute_fenced(&command, ring)?;
+            points.push(self.execute_fenced(&command, ring)?);
         }
-        let mut remaining = timelines;
-        while remaining != 0 {
-            let ring = remaining.trailing_zeros() as u8;
-            remaining &= remaining - 1;
-            self.transport
-                .wait(ring, fences[usize::from(ring)])
-                .map_err(Error::Transport)?;
-        }
-        Ok(())
+        Ok(points)
     }
 
     /// Submit a reply-generating command and borrow its reply only after

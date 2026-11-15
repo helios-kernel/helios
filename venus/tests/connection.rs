@@ -3,7 +3,6 @@ use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -18,7 +17,9 @@ use helios_venus::protocol::{
     vn_call_vkEnumeratePhysicalDevices,
 };
 use helios_venus::ring::Layout;
-use helios_venus::transport::{MappedBlob, Transport};
+use helios_venus::transport::{
+    Completion, MappedBlob, SignalTimeline, Timeline, TimelinePoint, Transport,
+};
 use helios_venus::{ObjectBase, RendererProtocol, api_version};
 
 struct Memory(Box<[UnsafeCell<u32>]>);
@@ -72,6 +73,8 @@ struct Recorded {
     consumed: Vec<Vec<u8>>,
     pending: Option<u32>,
     premature_completion: bool,
+    #[cfg(feature = "driver")]
+    gpu_wait_hold: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     reply_command: i32,
     reply: Vec<u8>,
     blob_ids: Vec<u64>,
@@ -85,11 +88,159 @@ fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
-impl Transport for Recording {
-    type Error = Infallible;
-    type Blob = Blob;
+#[derive(Debug, thiserror::Error)]
+#[error("timeline producer closed")]
+struct TestError;
 
-    fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Blob, Infallible> {
+struct Binding {
+    recorded: Arc<Mutex<Recorded>>,
+    ring: u8,
+    fence: u64,
+    value: u64,
+}
+
+struct TimelineState {
+    value: u64,
+    producers: usize,
+    bindings: Vec<Binding>,
+    waiters: Vec<Weak<std::sync::mpsc::Sender<()>>>,
+}
+
+impl TimelineState {
+    fn notify(&mut self) {
+        self.waiters.retain(|waiter| {
+            let Some(waiter) = waiter.upgrade() else {
+                return false;
+            };
+            waiter.send(()).is_ok()
+        });
+    }
+}
+
+struct TestSignal(Arc<Mutex<TimelineState>>);
+
+#[derive(Clone)]
+struct TestReader(Arc<Mutex<TimelineState>>);
+
+impl Clone for TestSignal {
+    fn clone(&self) -> Self {
+        self.0.lock().unwrap().producers += 1;
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for TestSignal {
+    fn drop(&mut self) {
+        let mut state = self.0.lock().unwrap();
+        state.producers -= 1;
+        if state.producers == 0 {
+            state.notify();
+        }
+    }
+}
+
+impl SignalTimeline for TestSignal {
+    type Error = TestError;
+    type Timeline = TestReader;
+
+    fn new(value: u64) -> Self {
+        Self(Arc::new(Mutex::new(TimelineState {
+            value,
+            producers: 1,
+            bindings: Vec::new(),
+            waiters: Vec::new(),
+        })))
+    }
+
+    fn reader(&self) -> TestReader {
+        TestReader(self.0.clone())
+    }
+
+    fn signal(&self, value: u64) -> Result<(), TestError> {
+        let mut state = self.0.lock().unwrap();
+        state.value = state.value.max(value);
+        state.notify();
+        Ok(())
+    }
+}
+
+impl TestReader {
+    fn retire(&self) -> Result<(), TestError> {
+        let bindings = core::mem::take(&mut self.0.lock().unwrap().bindings);
+        for binding in bindings {
+            Recording(binding.recorded).retire(binding.ring, binding.fence)?;
+            let mut state = self.0.lock().unwrap();
+            state.value = state.value.max(binding.value);
+            state.producers -= 1;
+            state.notify();
+        }
+        Ok(())
+    }
+}
+
+impl Timeline for TestReader {
+    type Error = TestError;
+
+    fn value(&self) -> Result<u64, TestError> {
+        Ok(self.0.lock().unwrap().value)
+    }
+
+    fn wait(
+        points: &[TimelinePoint<Self>],
+        wait_all: bool,
+        timeout: Option<Duration>,
+    ) -> Result<bool, TestError> {
+        let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender = Arc::new(sender);
+        for point in points {
+            point
+                .timeline
+                .0
+                .lock()
+                .unwrap()
+                .waiters
+                .push(Arc::downgrade(&sender));
+        }
+        loop {
+            let mut completed = 0;
+            for point in points {
+                point.timeline.retire()?;
+                let state = point.timeline.0.lock().unwrap();
+                if state.value >= point.value {
+                    completed += 1;
+                } else if state.producers == 0 {
+                    return Err(TestError);
+                }
+            }
+            if if wait_all {
+                completed == points.len()
+            } else {
+                completed != 0
+            } {
+                return Ok(true);
+            }
+            if let Some(deadline) = deadline {
+                match receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(false),
+                    Err(error) => panic!("waiter's own sender remains alive: {error}"),
+                }
+            } else {
+                receiver.recv().expect("waiter's own sender remains alive");
+            }
+        }
+    }
+}
+
+impl Transport for Recording {
+    type Error = TestError;
+    type Blob = Blob;
+    type Signal = TestSignal;
+
+    fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Blob, TestError> {
         let memory = Arc::new(Memory(
             (0..size.get().div_ceil(4))
                 .map(|_| UnsafeCell::new(0))
@@ -103,7 +254,12 @@ impl Transport for Recording {
         Ok(Blob { id, memory })
     }
 
-    fn execute(&mut self, commands: &[u8], ring: u8, fence: Option<u64>) -> Result<(), Infallible> {
+    fn execute(
+        &mut self,
+        commands: &[u8],
+        ring: u8,
+        completion: Option<Completion<'_, TestSignal>>,
+    ) -> Result<(), TestError> {
         let mut state = self.0.lock().unwrap();
         let command = word(commands, 0) as i32;
         if command == VK_COMMAND_TYPE_vkCreateRingMESA_EXT.0 {
@@ -114,23 +270,39 @@ impl Transport for Recording {
             // Header and ring id precede the 64-bit sequence number.
             state.pending = Some(word(commands, 16));
         }
-        if let Some(fence) = fence {
+        if let Some(completion) = completion {
+            let fence = completion.fence;
             state.sequences.push(fence);
             state.submitted.push((ring, fence));
+            for signal in completion.signals {
+                let mut timeline = signal.source.0.lock().unwrap();
+                timeline.producers += 1;
+                timeline.bindings.push(Binding {
+                    recorded: self.0.clone(),
+                    ring,
+                    fence,
+                    value: signal.value,
+                });
+            }
         }
         Ok(())
     }
+}
 
-    fn wait(&mut self, ring: u8, fence: u64) -> Result<(), Infallible> {
+impl Recording {
+    fn retire(&mut self, ring: u8, fence: u64) -> Result<(), TestError> {
+        #[cfg(feature = "driver")]
+        if ring != 0 {
+            let hold = self.0.lock().unwrap().gpu_wait_hold.take();
+            if let Some((entered, release)) = hold {
+                entered.send(()).unwrap();
+                release
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test releases GPU completion within its deadline");
+            }
+        }
         let mut state = self.0.lock().unwrap();
-        assert_eq!(
-            state
-                .submitted
-                .iter()
-                .rev()
-                .find(|(submitted_ring, _)| *submitted_ring == ring),
-            Some(&(ring, fence))
-        );
+        assert!(state.submitted.contains(&(ring, fence)));
         state.waited.push((ring, fence));
         let count = state.submitted.len();
         state.submissions_at_wait.push(count);
@@ -553,7 +725,7 @@ mod entry_tests {
 
     impl TransportFactory for TestFactory {
         type Transport = Recording;
-        fn create() -> Result<(Recording, Capset), Infallible> {
+        fn create() -> Result<(Recording, Capset), TestError> {
             let transport = Recording(Arc::new(Mutex::new(Recorded {
                 scripted: true,
                 ..Recorded::default()
@@ -649,6 +821,78 @@ mod entry_tests {
             first.destroy_instance(None);
             assert_eq!(second.enumerate_physical_devices().unwrap().len(), 2);
             second.destroy_instance(None);
+        }
+    }
+
+    #[test]
+    fn gpu_idle_waits_release_the_submission_lock() {
+        let (transport, capset) = TestFactory::create().unwrap();
+        let recorded = transport.0.clone();
+        let configuration = TestFactory::configuration();
+        let connection = Connection::new(
+            transport,
+            capset,
+            configuration.layout,
+            configuration.idle_timeout,
+        )
+        .unwrap();
+        // SAFETY: the test owns every Vulkan object and joins both threads
+        // before destruction. Queue lookup does not externally synchronize
+        // with queue-idle or device-idle.
+        unsafe {
+            let instance = helios_venus::driver::instance_from_connection::<TestFactory>(
+                connection,
+                &vk::InstanceCreateInfo::default(),
+                None,
+            )
+            .unwrap();
+            let physical = instance.enumerate_physical_devices().unwrap()[0];
+            let priorities = [1.0];
+            let queues = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(0)
+                .queue_priorities(&priorities)];
+            let device = instance
+                .create_device(
+                    physical,
+                    &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                    None,
+                )
+                .unwrap();
+            let queue = device.get_device_queue(0, 0);
+            for device_wide in [false, true] {
+                let (entered, started) = std::sync::mpsc::channel();
+                let (release, held) = std::sync::mpsc::channel();
+                recorded.lock().unwrap().gpu_wait_hold = Some((entered, held));
+                std::thread::scope(|scope| {
+                    let waiting = scope.spawn(|| {
+                        if device_wide {
+                            device.device_wait_idle()
+                        } else {
+                            device.queue_wait_idle(queue)
+                        }
+                    });
+                    started
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("idle call enters its GPU wait");
+                    let (completed, progress) = std::sync::mpsc::channel();
+                    let lookup_device = &device;
+                    let lookup = scope.spawn(move || {
+                        completed
+                            .send(lookup_device.get_device_queue(0, 0))
+                            .unwrap()
+                    });
+                    let result = progress.recv_timeout(Duration::from_secs(1));
+                    release.send(()).unwrap();
+                    waiting.join().unwrap().unwrap();
+                    lookup.join().unwrap();
+                    assert_eq!(
+                        result.expect("queue lookup progresses while GPU completion is held"),
+                        queue
+                    );
+                });
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
         }
     }
 

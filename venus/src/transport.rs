@@ -7,6 +7,7 @@
 
 use core::num::NonZeroU64;
 use core::ptr::NonNull;
+use core::time::Duration;
 
 use crate::capset::Capset;
 
@@ -39,14 +40,60 @@ pub unsafe trait MappedBlob {
     }
 }
 
+/// A read-only timeline; waits own their points and need no connection lock.
+/// Host implementations suspend the caller through canonical lowering.
+pub trait Timeline: Clone + Send + Sync {
+    type Error: std::error::Error;
+    fn value(&self) -> Result<u64, Self::Error>;
+    /// Returns true for completion, false only when a supplied timeout expires.
+    /// With no timeout, success always means completion. Producer closure or
+    /// failure is an error; already-completed points take precedence over timeout.
+    fn wait(
+        points: &[TimelinePoint<Self>],
+        wait_all: bool,
+        timeout: Option<Duration>,
+    ) -> Result<bool, Self::Error>;
+}
+
+#[derive(Clone)]
+pub struct TimelinePoint<T: Timeline> {
+    pub timeline: T,
+    pub value: u64,
+}
+
+/// Producer ownership is distinct from read-only waits.
+pub trait SignalTimeline: Clone + Send + Sync {
+    type Error: std::error::Error;
+    type Timeline: Timeline<Error = Self::Error>;
+    fn new(initial: u64) -> Self;
+    fn reader(&self) -> Self::Timeline;
+    fn signal(&self, value: u64) -> Result<(), Self::Error>;
+}
+
+pub struct SignalPoint<'a, S: SignalTimeline> {
+    pub source: &'a S,
+    pub value: u64,
+}
+
+pub struct Completion<'a, S: SignalTimeline> {
+    pub fence: u64,
+    pub signals: &'a [SignalPoint<'a, S>],
+}
+
+pub type WaitPoint<T> = TimelinePoint<<<T as Transport>::Signal as SignalTimeline>::Timeline>;
+
 /// One renderer context. Calls are made in order by its single owner.
-/// `execute` acknowledges submission; only `wait` acknowledges retirement.
+/// `execute` acknowledges submission; attached timelines acknowledge retirement.
 pub trait Transport {
     type Error: std::error::Error;
     type Blob: MappedBlob;
+    type Signal: SignalTimeline<Error = Self::Error>;
 
     fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Self::Blob, Self::Error>;
-    fn execute(&mut self, commands: &[u8], ring: u8, fence: Option<u64>)
-    -> Result<(), Self::Error>;
-    fn wait(&mut self, ring: u8, fence: u64) -> Result<(), Self::Error>;
+    fn execute(
+        &mut self,
+        commands: &[u8],
+        ring: u8,
+        completion: Option<Completion<'_, Self::Signal>>,
+    ) -> Result<(), Self::Error>;
 }
