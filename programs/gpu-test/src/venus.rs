@@ -9,7 +9,7 @@ use helios_venus::connection::Connection;
 use helios_venus::helios::Context;
 use helios_venus::protocol as vk;
 use helios_venus::ring::Layout;
-use helios_venus::transport::MappedBlob;
+use helios_venus::transport::{MappedBlob, TransportFactory};
 
 mod compute;
 
@@ -61,7 +61,7 @@ pub fn run() -> Result<(), Error> {
     std::hint::black_box(std::hash::RandomState::new());
     // Ring zero tracks CPU command consumption; ring one tracks the
     // compute queue bound below with VkDeviceQueueTimelineInfoMESA.
-    let (transport, capset) = Context::open(2, "venus-test")?;
+    let (transport, capset) = Context::create()?;
     // One wasm page of command bytes; the test keeps the renderer's
     // idle period short enough to exercise notification as well.
     let layout = Layout::new(NonZeroU32::new(65536).unwrap())?;

@@ -8,6 +8,20 @@
 use core::num::NonZeroU64;
 use core::ptr::NonNull;
 
+use crate::capset::Capset;
+
+/// Constructs independent renderer contexts for Vulkan's global entry points.
+///
+/// The factory is selected by the entry table's type, not a global variable.
+/// Each call owns a fresh context and capability snapshot; concurrent calls
+/// must not share submission state. Instance commands subsequently recover
+/// their connection from the instance's dispatchable objects.
+pub trait TransportFactory {
+    type Transport: Transport;
+
+    fn create() -> Result<(Self::Transport, Capset), <Self::Transport as Transport>::Error>;
+}
+
 /// An owned, persistently mapped renderer blob.
 ///
 /// # Safety

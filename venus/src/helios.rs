@@ -9,7 +9,7 @@ use core::ptr::NonNull;
 use helios_api::memory::{Block, BlockError};
 
 use crate::capset::{self, Capset, CapsetError};
-use crate::transport::{MappedBlob, Transport};
+use crate::transport::{MappedBlob, Transport, TransportFactory};
 
 mod bindings {
     wit_bindgen::generate!({
@@ -44,6 +44,16 @@ impl Context {
         let capset = Capset::decode(&gpu.capset(capset::ID, capset::VERSION)?)?;
         let context = gpu.create_context(capset::ID, rings, name)?;
         Ok((Self { context, gpu }, capset))
+    }
+}
+
+impl TransportFactory for Context {
+    type Transport = Self;
+
+    fn create() -> Result<(Self, Capset), Error> {
+        // Linux's VIRTGPU_CONTEXT_PARAM_NUM_RINGS and Mesa's Venus
+        // max_timeline_count reserve 64 timelines, including CPU ring 0.
+        Self::open(64, "helios-venus")
     }
 }
 
