@@ -78,7 +78,10 @@ fn filesystem_image_tree(
 #[test]
 fn space_load_validates_formatted_file_data_references() {
     block_on(async {
-        use crate::allocation::data::DataExtent;
+        use crate::accounting::{Accounting, DataChange};
+        use crate::allocation::data::{
+            DataBackref, DataExtent, DataReference, SharedDataReference,
+        };
         use crate::ondisk::{item_type, objectid};
 
         let timestamp = Timestamp::from_secs(1_700_000_000);
@@ -91,7 +94,7 @@ fn space_load_validates_formatted_file_data_references() {
             );
         let (fs, _) = filesystem_image_tree(true, true, tree);
         let inode = fs.resolve(b"/data.bin").await.unwrap();
-        crate::space::Space::load(&fs.volume, fs.root_tree)
+        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
             .await
             .unwrap();
         let root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
@@ -101,7 +104,7 @@ fn space_load_validates_formatted_file_data_references() {
         let mut cursor = crate::tree::Cursor::ceiling(&fs.volume, root, Key::new(0, 0, 0))
             .await
             .unwrap();
-        let mut count = 0;
+        let mut allocations = Vec::new();
         while let (Some(key), Some(bytes)) = (cursor.key(), cursor.item()) {
             if key.item_type == item_type::EXTENT_ITEM
                 && u64::from_le_bytes(bytes[16..24].try_into().unwrap()) == 1
@@ -113,11 +116,188 @@ fn space_load_validates_formatted_file_data_references() {
                 assert_eq!(reference.root, objectid::FS_TREE);
                 assert_eq!(reference.inode, inode.number());
                 assert_eq!(*references, 1);
-                count += 1;
+                allocations.push((key, *reference));
             }
             cursor.advance(&fs.volume).await.unwrap();
         }
-        assert!(count > 0);
+        assert!(!allocations.is_empty());
+        let (key, original) = allocations[0];
+        assert!(key.offset > u64::from(fs.superblock().nodesize()));
+        let mut accounting = Accounting::new(&fs.volume, root, &space).await.unwrap();
+        let mut trees = Trees::new(
+            fs.superblock().generation() + 1,
+            fs.superblock().csum_type(),
+        );
+        // Fixed CRC32C collision with sector-aligned file offsets. Check the
+        // identities against the independent disk-format implementation too.
+        let other = DataReference {
+            root: 256,
+            inode: 218670021594820,
+            offset: 249879179472896,
+        };
+        let collision = DataReference {
+            root: 256,
+            inode: 125603394931414,
+            offset: 70811665399808,
+        };
+        assert_eq!(other.hash(), collision.hash());
+        assert_eq!(
+            other.hash(),
+            btrfs_disk::items::extent_data_ref_hash(
+                collision.root,
+                collision.inode,
+                collision.offset
+            )
+        );
+        let shared = SharedDataReference(fs.default_subvolume.root.bytenr);
+        assert!(
+            !accounting
+                .update_data(
+                    &fs.volume,
+                    &mut trees,
+                    &mut space,
+                    DataChange {
+                        key,
+                        reference: other,
+                        delta: 1
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !accounting
+                .update_data(
+                    &fs.volume,
+                    &mut trees,
+                    &mut space,
+                    DataChange {
+                        key,
+                        reference: collision,
+                        delta: 1
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        let displaced = Key::new(
+            key.objectid,
+            item_type::EXTENT_DATA_REF,
+            collision.hash() + 1,
+        );
+        assert!(
+            trees
+                .get(&fs.volume, accounting.root, displaced)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !accounting
+                .update_data(
+                    &fs.volume,
+                    &mut trees,
+                    &mut space,
+                    DataChange {
+                        key,
+                        reference: other,
+                        delta: -1
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            trees
+                .get(&fs.volume, accounting.root, other.key(key.objectid))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !accounting
+                .update_data(
+                    &fs.volume,
+                    &mut trees,
+                    &mut space,
+                    DataChange {
+                        key,
+                        reference: shared,
+                        delta: 2
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !accounting
+                .update_data(
+                    &fs.volume,
+                    &mut trees,
+                    &mut space,
+                    DataChange {
+                        key,
+                        reference: original,
+                        delta: -1
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !accounting
+                .update_data(
+                    &fs.volume,
+                    &mut trees,
+                    &mut space,
+                    DataChange {
+                        key,
+                        reference: shared,
+                        delta: -2
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            accounting
+                .update_data(
+                    &fs.volume,
+                    &mut trees,
+                    &mut space,
+                    DataChange {
+                        key,
+                        reference: collision,
+                        delta: -1
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            trees
+                .get(&fs.volume, accounting.root, key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        accounting
+            .sync_allocations(&fs.volume, &mut trees, &mut space)
+            .await
+            .unwrap();
+        verify_group_usage(&fs, &trees, &accounting, space.group_root()).await;
+        // Retired bytes appear in the next disk free-space tree, but remain
+        // unavailable to this transaction's allocator.
+        for group in space.committed_free(&BTreeMap::new()).unwrap() {
+            assert!(
+                group
+                    .free
+                    .iter()
+                    .all(|range| range.end <= key.objectid
+                        || range.start >= key.objectid + key.offset)
+            );
+        }
+        assert!(trees.get(&fs.volume, root, key).await.unwrap().is_some());
     });
 }
 
@@ -315,6 +495,26 @@ fn cow_insert_replace_delete_preserve_the_original_tree_and_collapse_the_root() 
         }
         assert!(root.level > 0);
         assert_eq!(contents(&trees, root), expected);
+        for (&query, _) in expected.iter().step_by(31) {
+            for key in [
+                query,
+                Key::new(query.objectid, query.item_type, query.offset + 1),
+            ] {
+                let wanted = expected
+                    .range(key..)
+                    .next()
+                    .map(|(&key, bytes)| (key, bytes.clone()));
+                assert_eq!(trees.ceiling(&fs.volume, root, key).await.unwrap(), wanted);
+            }
+        }
+        assert!(
+            trees
+                .ceiling(&fs.volume, root, Key::new(u64::MAX, u8::MAX, u64::MAX))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
         for index in (0..300).step_by(3) {
             let key = Key::new(1000 + index, 24, 0);
             let bytes = vec![0xa9; 7000];
@@ -445,10 +645,7 @@ fn space_reservations_exclude_existing_extents_and_return_private_allocations() 
             records.insert(key, cursor.item().unwrap().to_vec());
             cursor.advance(&fs.volume).await.unwrap();
         }
-        for group in space
-            .committed_free(&alloc::collections::BTreeSet::new())
-            .unwrap()
-        {
+        for group in space.committed_free(&BTreeMap::new()).unwrap() {
             let key = Key::new(
                 group.range.start,
                 crate::ondisk::item_type::FREE_SPACE_INFO,

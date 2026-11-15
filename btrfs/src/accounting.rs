@@ -2,10 +2,11 @@
 //! change references, never allocator availability: committed blocks stay pinned
 //! until publication and the last reader of their generation have completed.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::Key;
+use crate::allocation::data::{DataBackref, DataDefect, DataExtent};
 use crate::allocation::{AllocationDefect, MetadataExtent, MetadataReference};
 use crate::free_space::FreeTree;
 use crate::ondisk::{item_type, objectid};
@@ -21,24 +22,138 @@ pub(crate) struct MetadataBlock {
     pub(crate) level: u8,
 }
 
+pub(crate) struct DataChange<R> {
+    pub(crate) key: Key,
+    pub(crate) reference: R,
+    pub(crate) delta: i64,
+}
+
 pub(crate) struct Accounting {
     pub(crate) root: TreeRoot,
     nodesize: u64,
     groups: TreeRoot,
     free_space: Option<FreeTree>,
     group_used: BTreeMap<Key, u64>,
-    retired_metadata: BTreeSet<u64>,
+    retired_extents: BTreeMap<u64, u64>,
     registered: BTreeMap<u64, MetadataReservation>,
 }
 
 impl Accounting {
+    /// Change a counted data reference. The signed delta represents file extent
+    /// items, not bytes. A zero result retires the whole physical allocation;
+    /// it does not make that range reusable before commit/read-side retirement.
+    pub(crate) async fn update_data<S: BlockSource, R: DataBackref>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        change: DataChange<R>,
+    ) -> Result<bool, WriteError> {
+        let DataChange {
+            key,
+            reference,
+            delta,
+        } = change;
+        let defect = |defect| WriteError::Data { key, defect };
+        let bytes = trees
+            .get(volume, self.root, key)
+            .await?
+            .ok_or_else(|| defect(DataDefect::Missing))?;
+        let mut extent =
+            DataExtent::parse(key, &bytes, volume.superblock().sectorsize()).map_err(defect)?;
+        let inline = reference.inline(&extent);
+        let initial = reference.key(key.objectid);
+        let mut search = initial;
+        let mut vacant = initial;
+        let mut external = None;
+        // Deleting a colliding key can leave a hole before another matching
+        // reference. Search the remaining suffix rather than stopping at holes.
+        while let Some((found, bytes)) = trees.ceiling(volume, self.root, search).await? {
+            if found.objectid != initial.objectid || found.item_type != initial.item_type {
+                break;
+            }
+            if initial.item_type == item_type::SHARED_DATA_REF && found != initial {
+                break;
+            }
+            if found == vacant {
+                vacant.offset = vacant
+                    .offset
+                    .checked_add(1)
+                    .ok_or_else(|| defect(DataDefect::Count))?;
+            }
+            if let Some(count) = reference.decode(&bytes).map_err(defect)?
+                && external.replace((found, count)).is_some()
+            {
+                return Err(defect(DataDefect::Duplicate));
+            }
+            let Some(offset) = found.offset.checked_add(1) else {
+                break;
+            };
+            search.offset = offset;
+            if initial.item_type == item_type::SHARED_DATA_REF {
+                break;
+            }
+        }
+        if inline.is_some() && external.is_some() {
+            return Err(defect(DataDefect::Duplicate));
+        }
+        let old = inline.or(external.map(|(_, count)| count)).unwrap_or(0);
+        let inline_total: u64 = extent
+            .roots
+            .values()
+            .chain(extent.parents.values())
+            .map(|&count| u64::from(count))
+            .sum();
+        if inline_total + u64::from(external.map_or(0, |(_, count)| count)) > extent.refs {
+            return Err(defect(DataDefect::Count));
+        }
+        let count = i64::from(old)
+            .checked_add(delta)
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or_else(|| defect(DataDefect::Count))?;
+        let refs = extent
+            .refs
+            .checked_add_signed(delta)
+            .ok_or_else(|| defect(DataDefect::Count))?;
+        if delta == 0 {
+            return Ok(false);
+        }
+        if inline.is_some() {
+            reference.set_inline(&mut extent, count);
+        } else {
+            let reference_key = external.map_or(vacant, |(key, _)| key);
+            let payload = (count != 0).then(|| reference.encode(count));
+            self.root = trees
+                .apply(volume, self.root, reference_key, payload.as_deref(), space)
+                .await?;
+        }
+        extent.refs = refs;
+        if refs == 0 {
+            let first = Key::new(key.objectid, item_type::TREE_BLOCK_REF, 0);
+            if let Some((remaining, _)) = trees.ceiling(volume, self.root, first).await?
+                && remaining.objectid == key.objectid
+                    && remaining.item_type <= item_type::SHARED_DATA_REF
+                {
+                    return Err(defect(DataDefect::Count));
+                }
+        }
+        let payload = (refs != 0).then(|| extent.encode());
+        self.root = trees
+            .apply(volume, self.root, key, payload.as_deref(), space)
+            .await?;
+        if refs == 0 {
+            self.retired_extents.insert(key.objectid, key.offset);
+        }
+        Ok(refs == 0)
+    }
+
     pub(crate) async fn new<S: BlockSource>(
         volume: &Volume<S>,
         root: TreeRoot,
         space: &Space,
     ) -> Result<Self, WriteError> {
         let free_space = if let Some(root) = space.free_root() {
-            Some(FreeTree::load(volume, root, &space.committed_free(&BTreeSet::new())?).await?)
+            Some(FreeTree::load(volume, root, &space.committed_free(&BTreeMap::new())?).await?)
         } else {
             None
         };
@@ -48,7 +163,7 @@ impl Accounting {
             groups: space.group_root(),
             free_space,
             group_used: BTreeMap::new(),
-            retired_metadata: BTreeSet::new(),
+            retired_extents: BTreeMap::new(),
             registered: BTreeMap::new(),
         })
     }
@@ -67,7 +182,7 @@ impl Accounting {
         let skinny = volume.superblock().incompat_flags() & (1 << 8) != 0;
         loop {
             let free_changed = if let Some(free) = &mut self.free_space {
-                free.sync(volume, trees, space, &self.retired_metadata)
+                free.sync(volume, trees, space, &self.retired_extents)
                     .await?
             } else {
                 false
@@ -138,7 +253,7 @@ impl Accounting {
         space: &mut Space,
     ) -> Result<bool, WriteError> {
         let mut changed = false;
-        for (key, used) in space.group_usage(&self.retired_metadata)? {
+        for (key, used) in space.group_usage(&self.retired_extents)? {
             if self.group_used.get(&key) == Some(&used) {
                 continue;
             }
@@ -279,7 +394,7 @@ impl Accounting {
             .apply(volume, self.root, key, payload.as_deref(), allocator)
             .await?;
         if last {
-            self.retired_metadata.insert(block.address);
+            self.retired_extents.insert(block.address, self.nodesize);
         }
         Ok(last)
     }

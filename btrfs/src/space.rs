@@ -3,7 +3,7 @@
 //! exclusively; it never holds a lock across I/O and never returns retired
 //! committed extents to this map before publication/read-side retirement.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -282,7 +282,7 @@ impl Space {
     /// includes free superblock stripes and extents retired from the old roots.
     pub(crate) fn committed_free(
         &self,
-        retired: &BTreeSet<u64>,
+        retired: &BTreeMap<u64, u64>,
     ) -> Result<Vec<FreeGroup>, SpaceError> {
         self.groups
             .iter()
@@ -292,7 +292,7 @@ impl Space {
                 for returned in group.excluded_free.iter().chain(
                     retired
                         .range(range.clone())
-                        .map(|&address| address..address + self.nodesize),
+                        .map(|(&address, &length)| address..address + length),
                 ) {
                     free.release(returned)
                         .map_err(|defect| SpaceError::Corrupt {
@@ -314,18 +314,18 @@ impl Space {
         self.group_root
     }
 
-    /// Usage in the next committed generation. Retired metadata reduces disk
+    /// Usage in the next committed generation. Retired extents reduce disk
     /// accounting but remains absent from the reusable free-range map.
     pub(crate) fn group_usage(
         &self,
-        retired: &BTreeSet<u64>,
+        retired: &BTreeMap<u64, u64>,
     ) -> Result<Vec<(Key, u64)>, SpaceError> {
         self.groups
             .iter()
             .map(|group| {
                 let range = group.start..group.start + group.length;
                 let added = self.metadata.range(range.clone()).count() as u64 * self.nodesize;
-                let removed = retired.range(range).count() as u64 * self.nodesize;
+                let removed = retired.range(range).map(|(_, &length)| length).sum::<u64>();
                 let key = Key::new(group.start, item_type::BLOCK_GROUP_ITEM, group.length);
                 let used = group
                     .declared_used

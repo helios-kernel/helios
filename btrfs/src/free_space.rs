@@ -1,7 +1,7 @@
 //! Free-space-tree records. Logical free space includes superblock stripes;
 //! allocation policy excludes those stripes separately from this disk format.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -400,7 +400,7 @@ impl FreeTree {
         volume: &Volume<S>,
         trees: &mut Trees,
         space: &mut Space,
-        retired: &BTreeSet<u64>,
+        retired: &BTreeMap<u64, u64>,
     ) -> Result<bool, WriteError> {
         let mut desired = BTreeMap::new();
         for mut group in space.committed_free(retired)? {

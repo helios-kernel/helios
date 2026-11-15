@@ -30,6 +30,85 @@ impl DataReference {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SharedDataReference(pub(crate) u64);
+
+/// The two disk reference layouts share counted update semantics. Ordinary
+/// references can collide in their key hash; parent references cannot.
+pub(crate) trait DataBackref {
+    fn key(&self, address: u64) -> Key;
+    fn inline(&self, extent: &DataExtent) -> Option<u32>;
+    fn set_inline(&self, extent: &mut DataExtent, count: u32);
+    fn decode(&self, bytes: &[u8]) -> Result<Option<u32>, DataDefect>;
+    fn encode(&self, count: u32) -> Vec<u8>;
+}
+
+impl DataBackref for DataReference {
+    fn key(&self, address: u64) -> Key {
+        Key::new(address, item_type::EXTENT_DATA_REF, self.hash())
+    }
+    fn inline(&self, extent: &DataExtent) -> Option<u32> {
+        extent.roots.get(self).copied()
+    }
+    fn set_inline(&self, extent: &mut DataExtent, count: u32) {
+        if count == 0 {
+            extent.roots.remove(self);
+        } else {
+            extent.roots.insert(*self, count);
+        }
+    }
+    fn decode(&self, bytes: &[u8]) -> Result<Option<u32>, DataDefect> {
+        if bytes.len() != size_of::<RawDataRef>() {
+            return Err(DataDefect::Truncated);
+        }
+        let raw: &RawDataRef = view(bytes).expect("checked data ref size");
+        if raw.count.get() == 0 {
+            return Err(DataDefect::Count);
+        }
+        Ok((raw.root.get() == self.root
+            && raw.inode.get() == self.inode
+            && raw.offset.get() == self.offset)
+            .then_some(raw.count.get()))
+    }
+    fn encode(&self, count: u32) -> Vec<u8> {
+        RawDataRef {
+            root: self.root.into(),
+            inode: self.inode.into(),
+            offset: self.offset.into(),
+            count: count.into(),
+        }
+        .as_bytes()
+        .to_vec()
+    }
+}
+
+impl DataBackref for SharedDataReference {
+    fn key(&self, address: u64) -> Key {
+        Key::new(address, item_type::SHARED_DATA_REF, self.0)
+    }
+    fn inline(&self, extent: &DataExtent) -> Option<u32> {
+        extent.parents.get(&self.0).copied()
+    }
+    fn set_inline(&self, extent: &mut DataExtent, count: u32) {
+        if count == 0 {
+            extent.parents.remove(&self.0);
+        } else {
+            extent.parents.insert(self.0, count);
+        }
+    }
+    fn decode(&self, bytes: &[u8]) -> Result<Option<u32>, DataDefect> {
+        let raw: [u8; 4] = bytes.try_into().map_err(|_| DataDefect::Truncated)?;
+        let count = u32::from_le_bytes(raw);
+        if count == 0 {
+            return Err(DataDefect::Count);
+        }
+        Ok(Some(count))
+    }
+    fn encode(&self, count: u32) -> Vec<u8> {
+        count.to_le_bytes().to_vec()
+    }
+}
+
 #[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 struct RawDataRef {
@@ -60,6 +139,8 @@ pub(crate) enum DataDefect {
     Order,
     #[error("invalid data reference count")]
     Count,
+    #[error("data allocation record is missing")]
+    Missing,
 }
 
 pub(crate) struct DataExtent {

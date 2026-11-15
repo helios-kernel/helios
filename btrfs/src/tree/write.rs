@@ -38,6 +38,11 @@ pub(crate) enum WriteError {
         key: Key,
         defect: crate::allocation::AllocationDefect,
     },
+    #[error("data allocation item {key}: {defect}")]
+    Data {
+        key: Key,
+        defect: crate::allocation::data::DataDefect,
+    },
     #[error("tree {tree} metadata usage {used} cannot add {added} and remove {removed} bytes")]
     RootUsage {
         tree: u64,
@@ -161,6 +166,49 @@ impl Trees {
         let path = self.path(volume, root, key).await?;
         let (_, node, slot) = path.last().expect("path includes a leaf");
         Ok((node.nritems > 0 && node.key(*slot) == key).then(|| node.item(*slot).to_vec()))
+    }
+
+    /// First item at or above a key in the current transaction. Ascending to
+    /// the next sibling is necessary when the selected leaf ends below it.
+    pub(crate) async fn ceiling<S: BlockSource>(
+        &self,
+        volume: &Volume<S>,
+        root: TreeRoot,
+        key: Key,
+    ) -> Result<Option<(Key, Vec<u8>)>, WriteError> {
+        let mut path = self.path(volume, root, key).await?;
+        let (_, leaf, mut slot) = path.pop().expect("path includes leaf");
+        if leaf.nritems > 0 {
+            slot += usize::from(leaf.key(slot) < key);
+            if slot < leaf.nritems {
+                return Ok(Some((leaf.key(slot), leaf.item(slot).to_vec())));
+            }
+        }
+        while let Some((_, mut node, slot)) = path.pop() {
+            if slot + 1 == node.nritems {
+                continue;
+            }
+            let mut next = slot + 1;
+            loop {
+                let (address, generation) = node.child(next);
+                node = self
+                    .read(
+                        volume,
+                        address,
+                        Expected {
+                            level: node.level - 1,
+                            generation,
+                            first_key: Some(node.key(next)),
+                        },
+                    )
+                    .await?;
+                if node.level == 0 {
+                    return Ok(Some((node.key(0), node.item(0).to_vec())));
+                }
+                next = 0;
+            }
+        }
+        Ok(None)
     }
 
     /// Applies one insertion, replacement, or deletion. On error the owner
