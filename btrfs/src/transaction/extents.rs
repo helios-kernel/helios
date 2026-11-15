@@ -20,14 +20,36 @@ const HEAD_BYTES: usize = size_of::<RawFileExtentHead>();
 const ITEM_BYTES: usize = HEAD_BYTES + size_of::<RawFileExtentBody>();
 
 #[derive(Clone, Copy)]
-struct Mapping {
-    key: Key,
-    head: RawFileExtentHead,
-    body: RawFileExtentBody,
+pub(super) struct Mapping {
+    pub(super) key: Key,
+    pub(super) head: RawFileExtentHead,
+    pub(super) body: RawFileExtentBody,
 }
 
 impl Mapping {
-    fn slice(self, range: Range<u64>) -> Self {
+    pub(super) fn parse(
+        tree: u64,
+        key: Key,
+        bytes: &[u8],
+        sector: u32,
+    ) -> Result<Self, WriteError> {
+        FileExtent::parse(key, bytes, sector).map_err(|defect| Error::Item {
+            tree,
+            key,
+            defect,
+        })?;
+        let head = *view::<RawFileExtentHead>(bytes).expect("validated file extent header");
+        if key.item_type != item_type::EXTENT_DATA || head.extent_type == 0 {
+            return Err(WriteError::NotRegularExtent { key });
+        }
+        Ok(Self {
+            key,
+            head,
+            body: *view::<RawFileExtentBody>(&bytes[HEAD_BYTES..]).expect("validated extent body"),
+        })
+    }
+
+    pub(super) fn slice(self, range: Range<u64>) -> Self {
         let mut part = self;
         part.key.offset = range.start;
         let offset = if self.body.disk_bytenr.get() == 0 {
@@ -40,7 +62,7 @@ impl Mapping {
         part
     }
 
-    fn encode(&self) -> [u8; ITEM_BYTES] {
+    pub(super) fn encode(&self) -> [u8; ITEM_BYTES] {
         let mut bytes = [0; ITEM_BYTES];
         bytes[..HEAD_BYTES].copy_from_slice(self.head.as_bytes());
         bytes[HEAD_BYTES..].copy_from_slice(self.body.as_bytes());
@@ -75,17 +97,8 @@ impl<S: BlockSink> Transaction<'_, S> {
             .get(&self.volume, root, key)
             .await?
             .ok_or(WriteError::NotRegularExtent { key })?;
-        let extent = FileExtent::parse(key, &bytes, sector as u32)
-            .map_err(|defect| Error::Item { tree, key, defect })?;
-        let head = *view::<RawFileExtentHead>(&bytes).expect("validated file extent header");
-        if key.item_type != item_type::EXTENT_DATA || head.extent_type == 0 {
-            return Err(WriteError::NotRegularExtent { key });
-        }
-        let mapping = Mapping {
-            key,
-            head,
-            body: *view::<RawFileExtentBody>(&bytes[HEAD_BYTES..]).expect("validated extent body"),
-        };
+        let mapping = Mapping::parse(tree, key, &bytes, sector as u32)?;
+        let extent = key.offset..key.offset + mapping.body.num_bytes.get();
         let removed = range.start.max(extent.start)..range.end.min(extent.end);
         if removed.start >= removed.end {
             return Ok(0);

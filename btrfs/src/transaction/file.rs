@@ -69,7 +69,7 @@ fn regular(
     bytes
 }
 
-fn aligned_end(end: u64, sector: u64) -> Result<u64, WriteError> {
+pub(super) fn aligned_end(end: u64, sector: u64) -> Result<u64, WriteError> {
     Ok(end
         .checked_add(sector - 1)
         .ok_or(WriteError::FileOverflow)?
@@ -158,30 +158,15 @@ impl<S: BlockSink> Transaction<'_, S> {
             );
         } else {
             if let Some(inline_bytes) = inline {
-                // Preserve the inline payload before deleting its only mapping.
-                let mut preserved = if offset != 0 || end < metadata.size {
-                    vec![0; aligned_end(metadata.size, sector)? as usize]
-                } else {
-                    vec![]
-                };
-                if !preserved.is_empty() {
-                    self.read_file(tree, inode, 0, &mut preserved).await?;
-                }
-                let root = self
-                    .trees
-                    .apply(&self.volume, root, first_key, None, &mut self.space)
-                    .await?;
-                self.roots.set(root)?;
-                raw.nbytes.set(
-                    raw.nbytes
-                        .get()
-                        .checked_sub(inline_bytes)
-                        .ok_or(WriteError::FileOverflow)?,
-                );
-                if !preserved.is_empty() {
-                    self.replace_chunk(tree, inode, 0, &preserved, &mut raw, &mut options)
-                        .await?;
-                }
+                self.promote_inline(
+                    tree,
+                    inode,
+                    inline_bytes,
+                    offset..end,
+                    &mut raw,
+                    &mut options,
+                )
+                .await?;
             }
             let start = offset - offset % sector;
             if inline.is_none()
@@ -189,10 +174,7 @@ impl<S: BlockSink> Transaction<'_, S> {
                 && metadata.size % sector != 0
                 && metadata.size - metadata.size % sector < start
             {
-                let tail = metadata.size - metadata.size % sector;
-                let mut preserved = vec![0; sector as usize];
-                self.read_file(tree, inode, tail, &mut preserved).await?;
-                self.replace_chunk(tree, inode, tail, &preserved, &mut raw, &mut options)
+                self.zero_tail(tree, inode, metadata.size, &mut raw, &mut options)
                     .await?;
             }
             let mut position = start;
@@ -290,37 +272,8 @@ impl<S: BlockSink> Transaction<'_, S> {
                     .await?;
             }
         } else if size != metadata.size && size.min(metadata.size) % sector != 0 {
-            let boundary = size.min(metadata.size);
-            let start = boundary - boundary % sector;
-            let root = self.roots.get(tree)?;
-            // A sparse tail stays sparse; a preallocated tail already reads zero.
-            if let Some((key, bytes)) = self
-                .trees
-                .floor(
-                    &self.volume,
-                    root,
-                    Key::new(inode, item_type::EXTENT_DATA, start),
-                )
-                .await?
-                && key.is(inode, item_type::EXTENT_DATA)
-            {
-                let extent = FileExtent::parse(key, &bytes, sector as u32)
-                    .map_err(|defect| Error::Item { tree, key, defect })?;
-                if extent.end > start
-                    && matches!(extent.data, crate::items::ExtentData::Regular { .. })
-                {
-                    let mut payload = vec![0; sector as usize];
-                    self.read_file(
-                        tree,
-                        inode,
-                        start,
-                        &mut payload[..(boundary - start) as usize],
-                    )
-                    .await?;
-                    self.replace_chunk(tree, inode, start, &payload, &mut raw, &mut options)
-                        .await?;
-                }
-            }
+            self.zero_tail(tree, inode, size.min(metadata.size), &mut raw, &mut options)
+                .await?;
         }
         if size <= metadata.size {
             // Preallocation can extend beyond i_size. Remove every later mapping.
@@ -390,6 +343,95 @@ impl<S: BlockSink> Transaction<'_, S> {
                 .apply(&self.volume, root, key, None, &mut self.space)
                 .await?;
             self.roots.set(root)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn promote_inline<E: Encoder>(
+        &mut self,
+        tree: u64,
+        inode: u64,
+        inline_bytes: u64,
+        overwritten: Range<u64>,
+        raw: &mut RawInodeItem,
+        options: &mut WriteOptions<E>,
+    ) -> Result<(), WriteError> {
+        let sector = u64::from(self.volume.superblock().sectorsize());
+        // Inline data has no separately reference-counted allocation. Preserve
+        // its contents before replacing its sole item with regular mappings.
+        let mut preserved = if overwritten.start != 0 || overwritten.end < raw.size.get() {
+            vec![0; aligned_end(raw.size.get(), sector)? as usize]
+        } else {
+            vec![]
+        };
+        if !preserved.is_empty() {
+            self.read_file(tree, inode, 0, &mut preserved).await?;
+        }
+        let root = self.roots.get(tree)?;
+        let root = self
+            .trees
+            .apply(
+                &self.volume,
+                root,
+                Key::new(inode, item_type::EXTENT_DATA, 0),
+                None,
+                &mut self.space,
+            )
+            .await?;
+        self.roots.set(root)?;
+        raw.nbytes.set(
+            raw.nbytes
+                .get()
+                .checked_sub(inline_bytes)
+                .ok_or(WriteError::FileOverflow)?,
+        );
+        if !preserved.is_empty() {
+            self.replace_chunk(tree, inode, 0, &preserved, raw, options)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn zero_tail<E: Encoder>(
+        &mut self,
+        tree: u64,
+        inode: u64,
+        boundary: u64,
+        raw: &mut RawInodeItem,
+        options: &mut WriteOptions<E>,
+    ) -> Result<(), WriteError> {
+        let sector = u64::from(self.volume.superblock().sectorsize());
+        if boundary.is_multiple_of(sector) {
+            return Ok(());
+        }
+        let start = boundary - boundary % sector;
+        let root = self.roots.get(tree)?;
+        // Sparse and preallocated tails already read as zeroes.
+        if let Some((key, bytes)) = self
+            .trees
+            .floor(
+                &self.volume,
+                root,
+                Key::new(inode, item_type::EXTENT_DATA, start),
+            )
+            .await?
+            && key.is(inode, item_type::EXTENT_DATA)
+        {
+            let extent = FileExtent::parse(key, &bytes, sector as u32)
+                .map_err(|defect| Error::Item { tree, key, defect })?;
+            if extent.end > start && matches!(extent.data, crate::items::ExtentData::Regular { .. })
+            {
+                let mut payload = vec![0; sector as usize];
+                self.read_file(
+                    tree,
+                    inode,
+                    start,
+                    &mut payload[..(boundary - start) as usize],
+                )
+                .await?;
+                self.replace_chunk(tree, inode, start, &payload, raw, options)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -467,7 +509,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         Ok(())
     }
 
-    async fn remove_regular_range(
+    pub(super) async fn remove_regular_range(
         &mut self,
         tree: u64,
         inode: u64,
@@ -510,7 +552,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         Ok(removed)
     }
 
-    async fn fill_holes(
+    pub(super) async fn fill_holes(
         &mut self,
         tree: u64,
         inode: u64,
@@ -561,7 +603,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         Ok(())
     }
 
-    async fn store_file_inode(
+    pub(super) async fn store_file_inode(
         &mut self,
         tree: u64,
         inode: u64,

@@ -4,6 +4,7 @@
 mod extents;
 pub(crate) mod file;
 pub(crate) mod namespace;
+pub(crate) mod reflink;
 
 use core::num::NonZeroUsize;
 use futures::{

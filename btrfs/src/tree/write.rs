@@ -17,6 +17,15 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[error("clone offsets must be sector aligned and any partial sector must end both files")]
+    CloneAlignment,
+    #[error("clone source range extends beyond the file")]
+    CloneSourceRange,
+    #[error("clone ranges in one inode overlap")]
+    CloneOverlap,
+    #[error("clone source and destination have different data-checksum policies")]
+    CloneChecksumPolicy,
+
     #[cfg(feature = "write")]
     #[error(transparent)]
     Encode(#[from] crate::compress::write::EncodeError),

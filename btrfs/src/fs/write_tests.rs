@@ -228,6 +228,438 @@ fn writer_abort_commit_and_failed_publication_have_distinct_lifetimes() {
 
 #[cfg(feature = "write")]
 #[test]
+fn reflink_shares_allocations_and_isolates_later_mutations() {
+    block_on(exercise_reflink_matrix(|_, _| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn reflink_passes_btrfs_check_and_restore() {
+    block_on(exercise_reflink_matrix(assert_reflink_image));
+}
+
+#[cfg(feature = "write")]
+fn assert_reflink_image(path: &std::path::Path, expected: &BTreeMap<&str, Vec<u8>>) {
+    assert_btrfs_check(path);
+    let directory = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new("btrfs")
+        .arg("restore")
+        .arg(path)
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "btrfs restore failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (name, bytes) in expected {
+        assert_eq!(std::fs::read(directory.path().join(name)).unwrap(), *bytes);
+    }
+    assert_eq!(
+        std::fs::read_dir(directory.path()).unwrap().count(),
+        expected.len()
+    );
+}
+
+#[cfg(feature = "write")]
+async fn exercise_reflink_matrix(
+    mut verify: impl FnMut(&std::path::Path, &BTreeMap<&str, Vec<u8>>),
+) {
+    use crate::compress::write::{Lzo, Plain, Zlib, Zstd};
+    use miniz_oxide::deflate::CompressionLevel;
+    for no_holes in [true, false] {
+        exercise_reflink(no_holes, Plain, &mut verify).await;
+        exercise_reflink(
+            no_holes,
+            Zlib::new(CompressionLevel::DefaultLevel),
+            &mut verify,
+        )
+        .await;
+        exercise_reflink(no_holes, Lzo::new(), &mut verify).await;
+        exercise_reflink(no_holes, Zstd::new(3).unwrap(), &mut verify).await;
+    }
+}
+
+#[cfg(feature = "write")]
+async fn assert_reflink_contents<S: BlockSource>(
+    fs: &Filesystem<S>,
+    expected: &BTreeMap<&str, Vec<u8>>,
+) {
+    let root = fs.root().await.unwrap();
+    for (&name, bytes) in expected {
+        let inode = fs.lookup(&root, name.as_bytes()).await.unwrap().unwrap();
+        assert_eq!(inode.metadata().size, bytes.len() as u64);
+        let mut output = vec![0; bytes.len()];
+        assert_eq!(fs.read(&inode, 0, &mut output).await.unwrap(), bytes.len());
+        assert_eq!(&output, bytes, "file {name}");
+    }
+}
+
+#[cfg(feature = "write")]
+async fn disk_allocation<S: BlockSource>(
+    fs: &Filesystem<S>,
+    inode: &super::Inode,
+    offset: u64,
+) -> (u64, u64) {
+    use btrfs_disk::items::{FileExtentBody, FileExtentItem};
+    let volume = fs.volume.view(&inode.snapshot.mapping);
+    let cursor = crate::tree::Cursor::floor(
+        &volume,
+        inode.root,
+        Key::new(
+            inode.number(),
+            crate::ondisk::item_type::EXTENT_DATA,
+            offset,
+        ),
+    )
+    .await
+    .unwrap();
+    let FileExtentBody::Regular {
+        disk_bytenr,
+        disk_num_bytes,
+        ..
+    } = FileExtentItem::parse(cursor.item().unwrap()).unwrap().body
+    else {
+        panic!("regular extent expected");
+    };
+    (disk_bytenr, disk_num_bytes)
+}
+
+#[cfg(feature = "write")]
+async fn exercise_reflink<E: crate::compress::write::Encoder>(
+    no_holes: bool,
+    mut encoder: E,
+    mut verify: impl FnMut(&std::path::Path, &BTreeMap<&str, Vec<u8>>),
+) {
+    use super::writer::Writer;
+    use crate::transaction::namespace::Name;
+    use crate::transaction::reflink::{CloneRange, FileId};
+    let timestamp = Timestamp::from_secs(1_700_000_000);
+    let named = tempfile::NamedTempFile::new().unwrap();
+    let mut builder = TreeBuilder::new().root(Metadata::new(0o755, timestamp));
+    let mut expected = BTreeMap::new();
+    for name in [
+        "source",
+        "clone",
+        "small",
+        "small-clone",
+        "tail",
+        "prealloc-clone",
+    ] {
+        builder = builder.file(
+            alloc::format!("/{name}"),
+            Vec::new(),
+            Metadata::new(0o644, timestamp),
+        );
+        expected.insert(name, Vec::new());
+    }
+    let mut options = FormatOptions::new([0x53; 16], timestamp);
+    if !no_holes {
+        options.plan.incompat_flags = options
+            .plan
+            .incompat_flags
+            .without(ferrosys::btrfs::ondisk::IncompatFlags::NO_HOLES);
+        options.plan.compat_ro_flags = options
+            .plan
+            .compat_ro_flags
+            .without(ferrosys::btrfs::ondisk::CompatRoFlags::BLOCK_GROUP_TREE);
+    }
+    let (formatted, _) = filesystem_image_options(builder, named.reopen().unwrap(), options);
+    let parent = formatted.root().await.unwrap();
+    let last = crate::tree::Cursor::floor(
+        &formatted.volume,
+        parent.root,
+        Key::new(crate::ondisk::objectid::LAST_FREE, u8::MAX, u64::MAX),
+    )
+    .await
+    .unwrap()
+    .key()
+    .unwrap()
+    .objectid;
+    let index = crate::tree::Cursor::floor(
+        &formatted.volume,
+        parent.root,
+        Key::new(
+            parent.number(),
+            crate::ondisk::item_type::DIR_INDEX,
+            u64::MAX,
+        ),
+    )
+    .await
+    .unwrap()
+    .key()
+    .unwrap()
+    .offset
+        + 1;
+    let mut external =
+        btrfs_transaction::filesystem::Filesystem::open(named.reopen().unwrap()).unwrap();
+    let mut transaction =
+        btrfs_transaction::transaction::Transaction::start(&mut external).unwrap();
+    let timestamp = btrfs_disk::items::Timespec {
+        sec: 1_700_000_000,
+        nsec: 0,
+    };
+    let mut attributes = btrfs_transaction::inode::InodeArgs::new(transaction.transid, 0o100644)
+        .with_uniform_time(timestamp);
+    attributes.size = 32768;
+    transaction
+        .create_inode(&mut external, parent.tree(), last + 1, &attributes)
+        .unwrap();
+    transaction
+        .link_dir_entry(
+            &mut external,
+            parent.tree(),
+            parent.number(),
+            last + 1,
+            b"prealloc",
+            1,
+            index,
+            timestamp,
+        )
+        .unwrap();
+    let allocation = transaction
+        .reserve_data_extent(&mut external, 32768, parent.tree(), last + 1, 0)
+        .unwrap();
+    let mapping = btrfs_disk::items::FileExtentItem::to_bytes_regular(
+        transaction.transid,
+        32768,
+        btrfs_disk::items::CompressionType::None,
+        true,
+        allocation,
+        32768,
+        0,
+        32768,
+    );
+    transaction
+        .insert_file_extent(&mut external, parent.tree(), last + 1, 0, &mapping)
+        .unwrap();
+    transaction
+        .update_inode_nbytes(&mut external, parent.tree(), last + 1, 32768)
+        .unwrap();
+    transaction.commit(&mut external).unwrap();
+    drop(external);
+    drop(formatted);
+    expected.insert("prealloc", vec![0; 32768]);
+    let mut writer = Writer::mount(Disk(named.reopen().unwrap())).await.unwrap();
+    let base = writer.snapshot().unwrap();
+    let root = base.root().await.unwrap();
+    let mut ids = BTreeMap::new();
+    for name in expected.keys() {
+        let inode = base.lookup(&root, name.as_bytes()).await.unwrap().unwrap();
+        ids.insert(
+            *name,
+            FileId {
+                tree: inode.tree(),
+                inode: inode.number(),
+            },
+        );
+    }
+    let concurrency = std::thread::available_parallelism().unwrap();
+    let when = crate::Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 123,
+    };
+    expected.insert(
+        "source",
+        (0..32891).map(|index| (index % 251) as u8).collect(),
+    );
+    expected.insert("clone", vec![0xaa; 24576]);
+    expected.insert("small", "中文・日本語・한국어".as_bytes().to_vec());
+    expected.insert("tail", vec![0x5c; 8192]);
+    let mut tx = writer.begin().await.unwrap();
+    for (&name, bytes) in &expected {
+        if name == "prealloc" {
+            continue;
+        }
+        let id = ids[name];
+        tx.edits()
+            .write_file(
+                id.tree,
+                id.inode,
+                0,
+                bytes,
+                WriteOptions {
+                    when,
+                    concurrency,
+                    encoder: &mut encoder,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let tail = ids["tail"];
+    tx.edits()
+        .truncate_file(tail.tree, tail.inode, 17, when, concurrency)
+        .await
+        .unwrap();
+    expected.get_mut("tail").unwrap().truncate(17);
+    tx.commit(|| panic!("valid fixture UUID"), concurrency)
+        .await
+        .unwrap();
+    verify(named.path(), &expected);
+    assert_reflink_contents(&writer.snapshot().unwrap(), &expected).await;
+    let initial = writer.snapshot().unwrap();
+    let original_inode = initial.resolve(b"/source").await.unwrap();
+    let original_bytes = expected["source"].clone();
+    let original_allocation = disk_allocation(&initial, &original_inode, 0).await;
+    let old_tail = initial.resolve(b"/tail").await.unwrap();
+    let tail_allocation = disk_allocation(&initial, &old_tail, 0).await;
+    let mut tx = writer.begin().await.unwrap();
+    let edits = tx.edits();
+    for (source_offset, destination_offset, length, expected_error) in [
+        (0, 4096, 8192, WriteError::CloneOverlap),
+        (1, 65536, 4096, WriteError::CloneAlignment),
+        (0, 65537, 4096, WriteError::CloneAlignment),
+        (0, 65536, 17, WriteError::CloneAlignment),
+        (32768, 65536, 4096, WriteError::CloneSourceRange),
+    ] {
+        let error = edits
+            .clone_range(
+                CloneRange {
+                    source: ids["source"],
+                    destination: ids["source"],
+                    source_offset,
+                    destination_offset,
+                    length,
+                },
+                when,
+                concurrency,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            core::mem::discriminant(&error),
+            core::mem::discriminant(&expected_error)
+        );
+    }
+    let mut unchanged = vec![0; original_bytes.len()];
+    edits
+        .read_file(ids["source"].tree, ids["source"].inode, 0, &mut unchanged)
+        .await
+        .unwrap();
+    assert_eq!(unchanged, original_bytes);
+    for (source, destination, source_offset, destination_offset, length) in [
+        ("source", "clone", 8192, 0, 16384),
+        ("prealloc", "prealloc-clone", 4096, 0, 16384),
+        ("source", "clone", 32768, 65536, 123),
+        ("source", "source", 0, 65536, 8192),
+        ("small", "small-clone", 0, 0, expected["small"].len()),
+        ("tail", "tail", 0, 4096, 17),
+    ] {
+        let copied = expected[source][source_offset..source_offset + length].to_vec();
+        edits
+            .clone_range(
+                CloneRange {
+                    source: ids[source],
+                    destination: ids[destination],
+                    source_offset: source_offset as u64,
+                    destination_offset: destination_offset as u64,
+                    length: length as u64,
+                },
+                when,
+                concurrency,
+            )
+            .await
+            .unwrap();
+        let bytes = expected.get_mut(destination).unwrap();
+        bytes.resize(bytes.len().max(destination_offset + length), 0);
+        bytes[destination_offset..destination_offset + length].copy_from_slice(&copied);
+    }
+    tx.commit(|| panic!("valid fixture UUID"), concurrency)
+        .await
+        .unwrap();
+    verify(named.path(), &expected);
+    assert_reflink_contents(&writer.snapshot().unwrap(), &expected).await;
+    let cloned = writer.snapshot().unwrap();
+    let cloned_inode = cloned.resolve(b"/clone").await.unwrap();
+    assert_eq!(
+        disk_allocation(&cloned, &cloned_inode, 0).await,
+        original_allocation
+    );
+    assert_eq!(
+        disk_allocation(&cloned, &cloned_inode, 65536).await,
+        original_allocation
+    );
+    let preallocated = cloned.resolve(b"/prealloc-clone").await.unwrap();
+    assert_eq!(
+        disk_allocation(&cloned, &preallocated, 0).await,
+        (allocation, 32768)
+    );
+    let tail_inode = cloned.resolve(b"/tail").await.unwrap();
+    assert_eq!(
+        disk_allocation(&cloned, &tail_inode, 4096).await,
+        tail_allocation
+    );
+    let mut tx = writer.begin().await.unwrap();
+    for (name, offset, bytes) in [
+        ("source", 9000, vec![0x77; 2000]),
+        ("prealloc", 5000, vec![0x99; 256]),
+        ("clone", 1, vec![0x31; 31]),
+    ] {
+        let id = ids[name];
+        tx.edits()
+            .write_file(
+                id.tree,
+                id.inode,
+                offset as u64,
+                &bytes,
+                WriteOptions::plain(when, concurrency),
+            )
+            .await
+            .unwrap();
+        expected.get_mut(name).unwrap()[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    }
+    tx.commit(|| panic!("valid fixture UUID"), concurrency)
+        .await
+        .unwrap();
+    verify(named.path(), &expected);
+    assert_reflink_contents(&writer.snapshot().unwrap(), &expected).await;
+    for names in [
+        &["source", "small", "tail", "prealloc"][..],
+        &["clone", "small-clone", "prealloc-clone"][..],
+    ] {
+        let mut tx = writer.begin().await.unwrap();
+        for name in names {
+            tx.edits()
+                .unlink_name(
+                    Name {
+                        tree: root.tree(),
+                        parent: root.number(),
+                        bytes: name.as_bytes(),
+                    },
+                    when,
+                )
+                .await
+                .unwrap();
+            expected.remove(name);
+        }
+        tx.commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        verify(named.path(), &expected);
+        assert_reflink_contents(&writer.snapshot().unwrap(), &expected).await;
+        let current = writer.snapshot().unwrap();
+        for (&name, bytes) in &expected {
+            let inode = current
+                .lookup(&current.root().await.unwrap(), name.as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut output = vec![0; bytes.len()];
+            current.read(&inode, 0, &mut output).await.unwrap();
+            assert_eq!(&output, bytes);
+        }
+        let mut old = vec![0; original_bytes.len()];
+        current.read(&original_inode, 0, &mut old).await.unwrap();
+        assert_eq!(old, original_bytes);
+    }
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn rename_and_symlink_preserve_identity_and_reject_parent_cycles() {
     block_on(exercise_namespace_rename(|_| {}));
 }
