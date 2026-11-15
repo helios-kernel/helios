@@ -63,5 +63,5 @@ pub use error::{
 pub use fs::{DirEntry, DirPosition, Filesystem, Inode, MAX_SYMLINK_FOLLOWS};
 pub use items::{EntryTarget, Metadata, Timestamp};
 pub use key::Key;
-pub use source::{BlockSource, READ_ALIGNMENT};
+pub use source::{BlockSink, BlockSource, READ_ALIGNMENT};
 pub use superblock::{MIRROR_OFFSETS, RootPointer, Superblock};

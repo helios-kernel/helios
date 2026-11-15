@@ -10,7 +10,8 @@ use core::ops::ControlFlow;
 
 use bytes::{Bytes, BytesMut};
 use helios_btrfs::{
-    BlockSource, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Timestamp,
+    BlockSink, BlockSource, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode,
+    READ_ALIGNMENT, Timestamp,
 };
 use helios_hal::fs::{
     BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult,
@@ -31,18 +32,49 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BlockSource for Image<Device> {
     }
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
-        self.disk.read_at(offset, buf).await.map_err(|error| {
-            tracing::warn!(%error, serial = ?self.disk.serial(), "btrfs image read failed");
-            match error {
-                BlockCacheError::Device(error) => error,
-                BlockCacheError::OutOfRange { .. }
-                | BlockCacheError::ByteRangeOutOfRange { .. } => IoError::OutOfBounds,
-                BlockCacheError::ReadOnly => IoError::ReadOnly,
-                BlockCacheError::Aborted => IoError::DeviceFault,
-            }
-        })
+        self.disk
+            .read_at(offset, buf)
+            .await
+            .map_err(|error| self.io_error(error))
     }
 }
+
+impl<Device: BlockDevice<Buffer = BlockPages>> Image<Device> {
+    fn io_error(&self, error: BlockCacheError) -> IoError {
+        tracing::warn!(%error, serial = ?self.disk.serial(), "btrfs device operation failed");
+        match error {
+            BlockCacheError::Device(error) => error,
+            BlockCacheError::OutOfRange { .. } | BlockCacheError::ByteRangeOutOfRange { .. } => {
+                IoError::OutOfBounds
+            }
+            BlockCacheError::ReadOnly => IoError::ReadOnly,
+            BlockCacheError::Aborted => IoError::DeviceFault,
+        }
+    }
+}
+
+impl<Device: BlockDevice<Buffer = BlockPages>> BlockSink for Image<Device> {
+    async fn stage(&self, block: u64, bytes: &[u8; READ_ALIGNMENT as usize]) -> IoResult<()> {
+        let mut cached = self
+            .disk
+            .overwrite(block)
+            .await
+            .map_err(|error| self.io_error(error))?;
+        cached.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn commit(&self, block: u64, bytes: &[u8; READ_ALIGNMENT as usize]) -> IoResult<()> {
+        self.disk
+            .commit(block, |cached| cached.copy_from_slice(bytes))
+            .await
+            .map_err(|error| self.io_error(error))
+    }
+}
+
+// Both transports address complete cache blocks; no partial-block write can
+// accidentally make a superblock visible before its transaction is durable.
+const _: () = assert!(READ_ALIGNMENT as usize == CACHE_BLOCK_BYTES);
 
 /// A cloneable, read-only btrfs mount.
 pub struct BtrfsFs<Device: BlockDevice<Buffer = BlockPages>> {

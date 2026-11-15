@@ -40,3 +40,43 @@ pub trait BlockSource: Send + Sync {
     /// [`helios_hal::io::IoError::OutOfBounds`].
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> impl Future<Output = IoResult<()>> + Send;
 }
+
+/// Writable storage for copy-on-write transactions.
+///
+/// # Concurrency
+///
+/// Independent staging operations may run concurrently on any processor.
+/// The transaction owner serializes commits and awaits all of its staging
+/// operations before committing. It must not reuse blocks reachable from a
+/// published root until every reader of that root has released it.
+///
+/// The kernel implementation uses the block cache's dirty-block and commit
+/// paths. A host implementation must supply the same durability ordering;
+/// merely flushing a language-level output buffer is insufficient.
+pub trait BlockSink: BlockSource {
+    /// Stages one complete aligned block. `block` is an index in units of
+    /// [`READ_ALIGNMENT`], not a byte offset. A successful return makes the
+    /// bytes visible to reads but does not promise durable storage.
+    ///
+    /// Only newly allocated, unreachable CoW blocks may be staged. A
+    /// superblock must go through [`Self::commit`] instead.
+    fn stage(
+        &self,
+        block: u64,
+        bytes: &[u8; READ_ALIGNMENT as usize],
+    ) -> impl Future<Output = IoResult<()>> + Send;
+
+    /// Persists every previously staged block, then replaces the specified
+    /// superblock and persists it before returning. Neither cache eviction
+    /// nor writeback may publish this block ahead of the preceding flush.
+    ///
+    /// An I/O error or cancellation after commit starts poisons the sink:
+    /// subsequent staging and commits must fail until the device is reopened
+    /// and its durable state is recovered. The caller must not publish its
+    /// new in-memory roots unless this operation succeeds.
+    fn commit(
+        &self,
+        block: u64,
+        bytes: &[u8; READ_ALIGNMENT as usize],
+    ) -> impl Future<Output = IoResult<()>> + Send;
+}
