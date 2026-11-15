@@ -13,7 +13,7 @@ def ci_jobs():
     return yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)["jobs"]
 
 
-@pytest.mark.parametrize("changed", [[], ["host_tools"], ["shared"], ["aarch64"], None])
+@pytest.mark.parametrize("changed", [[], ["host_tools"], ["shared"], ["aarch64"], ["btrfs"], None])
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("heavy", [False, True])
 def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
@@ -52,11 +52,43 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
         assert set(lanes) <= {"lint-fmt"}
     if changed == []:
         assert lanes == []
+    if changed == ["btrfs"] and not draft:
+        assert "test-libraries" in lanes
     assert ci_jobs["checks"]["needs"] == "changes"
     assert ci_jobs["tests"]["needs"] == ["changes", "wasm-debug"]
     for name in lanes:
         if name.startswith("smoke-"):
             assert f"wasm-{catalog[name]['guest-wasm']}" in ci_jobs[name]["needs"]
+
+
+@pytest.mark.parametrize("lane", ["test-libraries", "test-kernel", "missing", "test-btrfs-fuzz"])
+def test_manual_command_lane_validates_selection_and_keeps_dependencies(ci_jobs, tmp_path, lane):
+    select = next(step for step in ci_jobs["changes"]["steps"] if step.get("id") == "select")
+    output = tmp_path / "outputs"
+    result = subprocess.run(
+        ["bash", "-c", select["run"]],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "CHANGED": "null",
+            "DRAFT": "false",
+            "HEAVY": "true",
+            "EVENT": "workflow_dispatch",
+            "CHECK_LANE": lane,
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+    )
+    if lane in {"missing", "test-btrfs-fuzz"}:
+        assert result.returncode != 0
+        assert b"Unknown command lane" in result.stderr
+        return
+    assert result.returncode == 0, result.stderr.decode()
+    selected = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert json.loads(selected["lanes"]) == [lane]
+    assert json.loads(selected["wasm_profiles"]) == (["debug"] if lane == "test-kernel" else [])
+    checks = json.loads(selected["checks"]) + json.loads(selected["tests"])
+    assert [check["name"] for check in checks] == [lane]
 
 
 @pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled"])
