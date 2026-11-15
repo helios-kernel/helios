@@ -49,8 +49,39 @@ pub(crate) enum AllocationDefect {
     Duplicate,
     #[error("metadata back-references are out of order")]
     ReferenceOrder,
+    #[error("metadata back-reference is missing")]
+    MissingReference,
+    #[error("external metadata back-reference has a nonempty payload")]
+    ExternalPayload,
     #[error("extent reference count does not cover its inline references")]
     References,
+}
+
+/// A metadata back-reference key: either a root identity or a parent block.
+#[derive(Clone, Copy)]
+pub(crate) struct MetadataReference {
+    kind: u8,
+    identity: u64,
+}
+
+impl MetadataReference {
+    pub(crate) fn root(tree: u64) -> Self {
+        Self {
+            kind: item_type::TREE_BLOCK_REF,
+            identity: tree,
+        }
+    }
+
+    pub(crate) fn parent(address: u64) -> Self {
+        Self {
+            kind: item_type::SHARED_BLOCK_REF,
+            identity: address,
+        }
+    }
+
+    pub(crate) fn key(self, address: u64) -> Key {
+        Key::new(address, self.kind, self.identity)
+    }
 }
 
 /// Metadata references count roots or parent tree blocks, once per identity.
@@ -119,6 +150,51 @@ impl MetadataExtent {
             return Err(AllocationDefect::References);
         }
         Ok(extent)
+    }
+
+    pub(crate) fn level(&self) -> u8 {
+        self.level
+    }
+
+    /// Remove exactly one reference, after the caller has looked up its external
+    /// key in the same transaction. An empty external item is a real reference;
+    /// absence and an empty payload must remain distinguishable.
+    pub(crate) fn remove(
+        &mut self,
+        reference: MetadataReference,
+        external: Option<&[u8]>,
+    ) -> Result<bool, AllocationDefect> {
+        if external.is_some_and(|bytes| !bytes.is_empty()) {
+            return Err(AllocationDefect::ExternalPayload);
+        }
+        let inline = if reference.kind == item_type::TREE_BLOCK_REF {
+            &mut self.roots
+        } else {
+            &mut self.parents
+        };
+        let found = inline.contains(&reference.identity);
+        if found && external.is_some() {
+            return Err(AllocationDefect::Duplicate);
+        }
+        if !found && external.is_none() {
+            return Err(AllocationDefect::MissingReference);
+        }
+        let remaining_inline = (self.roots.len() + self.parents.len()) as u64 - u64::from(found);
+        let remaining = self
+            .refs
+            .checked_sub(1)
+            .ok_or(AllocationDefect::References)?;
+        if remaining < remaining_inline {
+            return Err(AllocationDefect::References);
+        }
+        let inline = if reference.kind == item_type::TREE_BLOCK_REF {
+            &mut self.roots
+        } else {
+            &mut self.parents
+        };
+        inline.remove(&reference.identity);
+        self.refs = remaining;
+        Ok(remaining == 0)
     }
 
     /// A newly allocated tree block starts with its owning tree's reference.

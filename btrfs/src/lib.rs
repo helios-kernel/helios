@@ -42,6 +42,7 @@
 
 extern crate alloc;
 
+mod accounting;
 mod allocation;
 mod chunk;
 mod compress;

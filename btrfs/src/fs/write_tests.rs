@@ -75,6 +75,10 @@ struct Allocator {
 }
 
 impl MetadataAllocator for Allocator {
+    fn revise(&mut self, address: u64, _: Key) {
+        assert!(address < self.next);
+    }
+
     fn cancel(&mut self, _: u64) {
         self.remaining += 1;
     }
@@ -373,6 +377,7 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
         None
     );
     let key = Key::new(900, 1, 0);
+    let mut private_address = None;
     for revision in 0_u64..2048 {
         root = block_on(trees.apply(
             &fs.volume,
@@ -386,6 +391,7 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
             block_on(trees.get(&fs.volume, root, key)).unwrap(),
             Some(revision.to_le_bytes().to_vec())
         );
+        assert_eq!(*private_address.get_or_insert(root.bytenr), root.bytenr);
         assert_eq!(trees.blocks().count(), 1);
         assert_eq!(space.metadata().count(), 1);
         assert_eq!(
@@ -410,4 +416,134 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
     }
     assert_eq!(contents(&trees, root)[&key], 2047_u64.to_le_bytes());
     assert_eq!(root_node(&fs).level(), original.level);
+    loop {
+        match space.allocate(5, 0, Key::new(256, 1, 0)) {
+            Ok(_) => {}
+            Err(WriteError::Space(crate::space::SpaceError::Exhausted { .. })) => break,
+            Err(error) => panic!("unexpected allocation failure: {error}"),
+        }
+    }
+    assert_eq!(space.available_metadata(), 0);
+    let previous = root.bytenr;
+    root = block_on(trees.apply(
+        &fs.volume,
+        root,
+        key,
+        Some(&2048_u64.to_le_bytes()),
+        &mut space,
+    ))
+    .unwrap();
+    assert_eq!(root.bytenr, previous);
+    assert_eq!(contents(&trees, root)[&key], 2048_u64.to_le_bytes());
+}
+
+#[test]
+fn metadata_accounting_removes_inline_and_external_refs_without_releasing_committed_space() {
+    use crate::accounting::{Accounting, MetadataBlock};
+    use crate::allocation::MetadataReference;
+    use crate::ondisk::{item_type, objectid};
+    use crate::space::Space;
+
+    block_on(async {
+        let fs = filesystem();
+        let original_root = super::find_root(&fs.volume, fs.root_tree, objectid::EXTENT_TREE)
+            .await
+            .unwrap()
+            .root;
+        let block = MetadataBlock {
+            address: fs.default_subvolume.root.bytenr,
+            level: fs.default_subvolume.root.level,
+        };
+        let size = u64::from(fs.superblock().nodesize());
+        let mut trees = Trees::new(fs.superblock().generation() + 1, ChecksumType::Crc32c);
+        let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+        let mut key = Key::new(
+            block.address,
+            item_type::METADATA_ITEM,
+            u64::from(block.level),
+        );
+        let original = match trees.get(&fs.volume, original_root, key).await.unwrap() {
+            Some(bytes) => bytes,
+            None => {
+                key = Key::new(block.address, item_type::EXTENT_ITEM, size);
+                trees
+                    .get(&fs.volume, original_root, key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let mut bytes = original.clone();
+        assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 1);
+        bytes[..8].copy_from_slice(&2_u64.to_le_bytes());
+        let root = trees
+            .apply(&fs.volume, original_root, key, Some(&bytes), &mut space)
+            .await
+            .unwrap();
+        let parent = MetadataReference::parent(fs.root_tree.bytenr);
+        let parent_key = parent.key(block.address);
+        let root = trees
+            .apply(&fs.volume, root, parent_key, Some(&[]), &mut space)
+            .await
+            .unwrap();
+        let mut accounting = Accounting::new(root, size);
+        assert!(
+            !accounting
+                .remove_metadata(
+                    &fs.volume,
+                    &mut trees,
+                    &mut space,
+                    block,
+                    MetadataReference::root(objectid::FS_TREE)
+                )
+                .await
+                .unwrap()
+        );
+        let bytes = trees
+            .get(&fs.volume, accounting.root, key)
+            .await
+            .unwrap()
+            .unwrap();
+        let disk_key = btrfs_disk::tree::DiskKey {
+            objectid: key.objectid,
+            key_type: if key.item_type == item_type::METADATA_ITEM {
+                btrfs_disk::tree::KeyType::MetadataItem
+            } else {
+                btrfs_disk::tree::KeyType::ExtentItem
+            },
+            offset: key.offset,
+        };
+        let independent = btrfs_disk::items::ExtentItem::parse(&bytes, &disk_key).unwrap();
+        assert_eq!(independent.refs, 1);
+        assert!(independent.inline_refs.is_empty());
+        assert_eq!(
+            trees
+                .get(&fs.volume, accounting.root, parent_key)
+                .await
+                .unwrap(),
+            Some(Vec::new())
+        );
+        assert!(
+            accounting
+                .remove_metadata(&fs.volume, &mut trees, &mut space, block, parent)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            trees.get(&fs.volume, accounting.root, key).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            trees
+                .get(&fs.volume, accounting.root, parent_key)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            trees.get(&fs.volume, original_root, key).await.unwrap(),
+            Some(original)
+        );
+        assert!(!space.cancel_metadata(block.address));
+    });
 }

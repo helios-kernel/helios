@@ -23,6 +23,13 @@ pub(crate) enum WriteError {
     Space(#[from] crate::space::SpaceError),
     #[error(transparent)]
     Item(#[from] EditError),
+    #[error("allocation item {key}: {defect}")]
+    Allocation {
+        key: Key,
+        defect: crate::allocation::AllocationDefect,
+    },
+    #[error("metadata extent for block {address} at level {level} is missing")]
+    MissingExtent { address: u64, level: u8 },
     #[error("no metadata space remains for tree {tree}")]
     NoSpace { tree: u64 },
     #[error("tree {tree} cannot grow beyond {MAX_LEVEL} levels")]
@@ -33,6 +40,9 @@ pub(crate) enum WriteError {
 /// cleanup all follow the same transaction lifetime, including failed edits.
 pub(crate) trait MetadataAllocator {
     fn allocate(&mut self, tree: u64, level: u8, first: Key) -> Result<u64, WriteError>;
+
+    /// Update the first key of a block that remains private to this transaction.
+    fn revise(&mut self, address: u64, first: Key);
 
     /// Return an unpublished allocation after its overlay block is discarded.
     fn cancel(&mut self, address: u64);
@@ -157,11 +167,12 @@ impl Trees {
             None => {}
         }
         let mut children = Vec::new();
+        let mut reusable = self.blocks.contains_key(&address).then_some(address);
         for range in leaf.partitions() {
             let Some(first) = leaf.first_key(&range) else {
                 continue;
             };
-            let fresh = allocator.allocate(root.tree, 0, first)?;
+            let fresh = destination(&mut reusable, allocator, root.tree, 0, first)?;
             self.insert(leaf.encode(range, fresh, self.generation, self.checksum));
             children.push(Child {
                 key: first,
@@ -169,18 +180,24 @@ impl Trees {
                 generation: self.generation,
             });
         }
-        self.retire(root.tree, address, 0, allocator);
+        if children
+            .first()
+            .is_none_or(|child| child.address != address)
+        {
+            self.retire(root.tree, address, 0, allocator);
+        }
         let mut level = 0;
         while let Some((address, node, slot)) = path.pop() {
             level = node.level;
             let mut branch = Branch::from_node(&node);
             branch.replace(slot, &children);
             children.clear();
+            let mut reusable = self.blocks.contains_key(&address).then_some(address);
             for range in branch.partitions() {
                 let Some(first) = branch.first_key(&range) else {
                     continue;
                 };
-                let fresh = allocator.allocate(root.tree, level, first)?;
+                let fresh = destination(&mut reusable, allocator, root.tree, level, first)?;
                 self.insert(branch.encode(range, fresh, self.generation, self.checksum));
                 children.push(Child {
                     key: first,
@@ -188,7 +205,12 @@ impl Trees {
                     generation: self.generation,
                 });
             }
-            self.retire(root.tree, address, level, allocator);
+            if children
+                .first()
+                .is_none_or(|child| child.address != address)
+            {
+                self.retire(root.tree, address, level, allocator);
+            }
         }
         if children.is_empty() {
             let fresh = allocator.allocate(root.tree, 0, Key::new(0, 0, 0))?;
@@ -264,5 +286,23 @@ impl Trees {
 
     pub(crate) fn retired(&self) -> &[(u64, u64, u8)] {
         &self.retired
+    }
+}
+
+/// An overlay block is unreachable from every published root. Retaining its
+/// address lets allocation-tree accounting converge without changing the set of
+/// reservations on each edit. Splits still reserve their additional blocks.
+fn destination<A: MetadataAllocator>(
+    reusable: &mut Option<u64>,
+    allocator: &mut A,
+    tree: u64,
+    level: u8,
+    first: Key,
+) -> Result<u64, WriteError> {
+    if let Some(address) = reusable.take() {
+        allocator.revise(address, first);
+        Ok(address)
+    } else {
+        allocator.allocate(tree, level, first)
     }
 }

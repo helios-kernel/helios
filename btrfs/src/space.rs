@@ -313,6 +313,13 @@ impl Space {
 }
 
 impl MetadataAllocator for Space {
+    fn revise(&mut self, address: u64, first: Key) {
+        self.metadata
+            .get_mut(&address)
+            .expect("overlay block owns a reservation")
+            .first = first;
+    }
+
     fn cancel(&mut self, address: u64) {
         assert!(
             self.cancel_metadata(address),
