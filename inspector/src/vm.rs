@@ -1909,6 +1909,10 @@ pub(crate) struct VmCommand {
     #[arg(long = "enable-target", value_name = "TARGET")]
     enable_targets: Vec<String>,
 
+    /// Extra Cargo feature for the kernel image. Repeat to select several.
+    #[arg(long = "kernel-feature")]
+    kernel_features: Vec<String>,
+
     /// Restrict bootfs program prebuilds to a named program. Repeat for multiple programs.
     #[arg(long = "boot-program")]
     boot_programs: Vec<String>,
@@ -2534,6 +2538,7 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
 /// state (#179).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct KernelBuildSpec {
+    kernel_features: Vec<String>,
     profile: &'static VmProfile,
     kind: KernelBuildProfile,
     /// The merged profile a [`KernelBuildProfile::ProfileUse`] build
@@ -2762,6 +2767,7 @@ fn resolve_build(
         profile,
         kind,
         profile_use,
+        kernel_features: command.kernel_features.clone(),
         boot_programs,
         no_compiler_plugin,
         root_secret_key,
@@ -3353,6 +3359,9 @@ fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
 fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command {
     let mut cargo = cargo_build_command(repo_root, command.kind);
     cargo.args(command.profile.arch.build_std_arguments());
+    for feature in &command.kernel_features {
+        cargo.arg("--features").arg(feature);
+    }
     // The guest build alone moves. The host tools compiled beside it
     // read no profile and are looked up beside the running inspector,
     // so they stay in the two directories a host build ever uses
@@ -7782,6 +7791,7 @@ mod tests {
             profile: &X86_64_VM_PROFILE,
             kind,
             profile_use: None,
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: true,
             root_secret_key: None,
@@ -7830,6 +7840,7 @@ mod tests {
                     profile: arch.profile(),
                     kind,
                     profile_use: None,
+                    kernel_features: Vec::new(),
                     boot_programs: Vec::new(),
                     no_compiler_plugin: true,
                     root_secret_key: None,
@@ -8353,6 +8364,7 @@ mod tests {
             profile: &X86_64_VM_PROFILE,
             kind: KernelBuildProfile::Release,
             profile_use: None,
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             root_secret_key: Some(PathBuf::from("/run/release/root.key")),
@@ -8423,6 +8435,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             bootfs_root: None,
@@ -8494,6 +8507,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             bootfs_root: None,
@@ -9174,6 +9188,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             bootfs_root: None,
@@ -9220,6 +9235,39 @@ mod tests {
             })?;
         }
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires QEMU and a cross-compiled native-users kernel"]
+    fn native_linux_syscalls_x86() -> Result<(), GuestTestFailure> {
+        let root = repo_root()?;
+        let bootfs = root.join("target/native-linux-bootfs");
+        run_step(
+            "building Linux ABI fixtures",
+            Command::new("bash")
+                .current_dir(&root)
+                .arg("linux/tests/build-fixtures.sh")
+                .arg(&bootfs),
+        )?;
+        let mut command = guest_test_command(&X86_64_VM_PROFILE);
+        command.accel =
+            vec![std::env::var("HELIOS_NATIVE_TEST_ACCEL").unwrap_or_else(|_| "kvm".to_owned())];
+        command.cpu = default_cpu(command.profile, &command.accel).map(str::to_owned);
+        command.build.kernel_features = vec!["linux-prototype".to_owned()];
+        command.build.bootfs_root = Some(bootfs);
+        command.runtime_dir = Some(root.join("target/native-linux-runtime"));
+        command.keep_runtime_dir = true;
+        command.debug_serial_log = Some(root.join("target/native-linux-serial.log"));
+        build_self_test_kernel(&command, &[])?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let marker = b"native Linux prototype passed:";
+        let result = wait_for_console_matches(
+            runtime.socket_path(),
+            |line| line.windows(marker.len()).any(|window| window == marker),
+            1,
+        );
+        runtime.shutdown();
+        result
     }
 
     /// The aarch64 kernel built with `HELIOS_CFI_SELF_TEST` corrupts a signed
@@ -9299,12 +9347,10 @@ mod tests {
                 .arg("helios-cli"),
         )?;
         run_kernel_prebuild(&command.build)?;
-        let mut cargo = std::process::Command::new("cargo");
+        let mut cargo = kernel_build_command(&repo_root()?, &command.build);
         export_trusted_root_public_key(&mut cargo, &command.build)?;
         let status = cargo
             .current_dir(repo_root()?)
-            .arg("build")
-            .args(profile.arch.build_std_arguments())
             .arg("--target")
             .arg(profile.cargo_target)
             .arg("--bin")
@@ -9329,6 +9375,7 @@ mod tests {
             profile,
             kind: KernelBuildProfile::Debug,
             profile_use: None,
+            kernel_features: Vec::new(),
             boot_programs: vec!["debugger".to_owned()],
             no_compiler_plugin: true,
             root_secret_key: None,
@@ -9548,6 +9595,7 @@ mod tests {
             profile,
             kind: KernelBuildProfile::Release,
             profile_use: None,
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             root_secret_key: None,
@@ -9651,6 +9699,14 @@ mod tests {
         marker: &[u8],
         expected: usize,
     ) -> Result<(), GuestTestFailure> {
+        wait_for_console_matches(socket_path, |line| line == marker, expected)
+    }
+
+    fn wait_for_console_matches(
+        socket_path: &Path,
+        matches: impl Fn(&[u8]) -> bool,
+        expected: usize,
+    ) -> Result<(), GuestTestFailure> {
         let deadline = Instant::now() + WATCHDOG_STAGE_TIMEOUT;
         let mut serial = connect_serial_socket(socket_path)?;
         let mut line = Vec::new();
@@ -9683,7 +9739,7 @@ mod tests {
                                         observed_stages.remove(0);
                                     }
                                 }
-                                if line.as_slice() == marker {
+                                if matches(&line) {
                                     seen += 1;
                                     if seen == expected {
                                         return Ok(());

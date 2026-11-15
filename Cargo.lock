@@ -2047,8 +2047,11 @@ dependencies = [
  "helios-aarch64",
  "helios-hosted",
  "helios-inspector-protocol",
+ "helios-kernel",
+ "helios-linux",
  "helios-riscv",
  "helios-x86",
+ "tracing",
  "wasmtime",
 ]
 
@@ -2529,6 +2532,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-linux"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "helios-netstack"
 version = "0.1.0"
 dependencies = [
@@ -2725,6 +2736,7 @@ dependencies = [
  "limine 0.5.0",
  "pci_types",
  "spin 0.9.9",
+ "thiserror 2.0.21",
  "tracing",
  "x86",
  "x86_64",
