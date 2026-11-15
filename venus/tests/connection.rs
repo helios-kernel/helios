@@ -11,13 +11,15 @@ use helios_venus::capset::Capset;
 use helios_venus::connection::{Connection, Error};
 use helios_venus::protocol::{
     VK_COMMAND_TYPE_vkCreateRingMESA_EXT, VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT,
+    VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT,
     VK_COMMAND_TYPE_vkExecuteCommandStreamsMESA_EXT,
     VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT, VK_COMMAND_TYPE_vkWaitRingSeqnoMESA_EXT,
-    VK_SUCCESS, vn_call_vkEnumerateInstanceVersion,
+    VK_SUCCESS, VkInstance, VkPhysicalDevice, vn_call_vkEnumerateInstanceVersion,
+    vn_call_vkEnumeratePhysicalDevices,
 };
 use helios_venus::ring::Layout;
 use helios_venus::transport::{MappedBlob, Transport};
-use helios_venus::{RendererProtocol, api_version};
+use helios_venus::{ObjectBase, RendererProtocol, api_version};
 
 struct Memory(Box<[UnsafeCell<u32>]>);
 
@@ -61,6 +63,8 @@ struct Recorded {
     consumed: Vec<Vec<u8>>,
     pending: Option<u32>,
     premature_completion: bool,
+    reply_command: i32,
+    reply: Vec<u8>,
 }
 
 struct Recording(Rc<RefCell<Recorded>>);
@@ -147,23 +151,13 @@ impl Transport for Recording {
         } else if !commands.is_empty()
             && word(&commands, 0) as i32 == VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT.0
         {
-            assert_eq!(
-                word(&commands, 36) as i32,
-                VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT.0
-            );
+            assert_eq!(word(&commands, 36) as i32, state.reply_command);
             assert_eq!(word(&commands, 40), 1, "command requests a reply");
             let reply = state.blobs[&word(&commands, 16)]
                 .upgrade()
                 .expect("reply must remain mapped");
-            let expected = [
-                VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT.0 as u32,
-                0,
-                1,
-                0,
-                api_version(1, 3),
-            ];
-            let bytes: Vec<_> = expected.into_iter().flat_map(u32::to_le_bytes).collect();
-            assert_eq!(word(&commands, 28) as usize, bytes.len());
+            let bytes = &state.reply;
+            assert!(word(&commands, 28) as usize >= bytes.len());
             // SAFETY: the driver does not read until we publish head and
             // complete its CPU timeline wait.
             unsafe {
@@ -182,6 +176,10 @@ impl Transport for Recording {
 }
 
 fn connection(state: Rc<RefCell<Recorded>>) -> Connection<Recording> {
+    connection_with_capacity(state, 64)
+}
+
+fn connection_with_capacity(state: Rc<RefCell<Recorded>>, capacity: u32) -> Connection<Recording> {
     let capset = Capset {
         protocol: RendererProtocol::with_all_extensions(api_version(1, 3)),
         serialization_version: 1,
@@ -193,7 +191,7 @@ fn connection(state: Rc<RefCell<Recorded>>) -> Connection<Recording> {
     Connection::new(
         Recording(state),
         capset,
-        Layout::new(NonZeroU32::new(64).unwrap()).unwrap(),
+        Layout::new(NonZeroU32::new(capacity).unwrap()).unwrap(),
         Duration::from_millis(1),
     )
     .unwrap()
@@ -237,7 +235,20 @@ fn a_transport_acknowledgement_does_not_replace_ring_consumption() {
 
 #[test]
 fn generated_calls_select_a_reply_stream_and_decode_the_renderer_result() {
-    let state = Rc::new(RefCell::new(Recorded::default()));
+    let state = Rc::new(RefCell::new(Recorded {
+        reply_command: VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT.0,
+        reply: [
+            VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT.0 as u32,
+            0,
+            1,
+            0,
+            api_version(1, 3),
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect(),
+        ..Recorded::default()
+    }));
     let mut connection = connection(state);
     let mut version = 0;
     // SAFETY: version is live for request and reply processing.
@@ -245,5 +256,50 @@ fn generated_calls_select_a_reply_stream_and_decode_the_renderer_result() {
         unsafe { vn_call_vkEnumerateInstanceVersion(&mut connection, &mut version) }.unwrap();
     assert_eq!(result, VK_SUCCESS);
     assert_eq!(version, api_version(1, 3));
+    connection.close().unwrap();
+}
+
+#[test]
+fn enumeration_accepts_fewer_handles_than_the_reply_capacity() {
+    // Command, success, non-null count pointer, one returned device,
+    // one-element handle array, and its renderer object id.
+    let reply = [
+        VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT.0 as u32,
+        0,
+        1,
+        0,
+        1,
+        1,
+        0,
+        3,
+        0,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    let state = Rc::new(RefCell::new(Recorded {
+        reply_command: VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT.0,
+        reply,
+        ..Recorded::default()
+    }));
+    let mut connection = connection_with_capacity(state, 256);
+    let mut instance = ObjectBase { id: 2 };
+    let mut devices = [ObjectBase { id: 3 }, ObjectBase { id: 4 }];
+    let mut handles = devices.each_mut().map(|device| VkPhysicalDevice(device));
+    let mut count = 2;
+    // SAFETY: every handle has stable object storage, and the count
+    // describes the live output array for the duration of the call.
+    let result = unsafe {
+        vn_call_vkEnumeratePhysicalDevices(
+            &mut connection,
+            VkInstance(&mut instance),
+            &mut count,
+            handles.as_mut_ptr(),
+        )
+    }
+    .unwrap();
+    assert_eq!(result, VK_SUCCESS);
+    assert_eq!(count, 1);
+    assert_eq!(devices, [ObjectBase { id: 3 }, ObjectBase { id: 4 }]);
     connection.close().unwrap();
 }
