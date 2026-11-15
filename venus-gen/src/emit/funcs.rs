@@ -86,11 +86,36 @@ impl<'a> Wire<'a> {
             container: id,
             access: Access::Val,
         };
+        let (capacities, body) =
+            self.decode_outputs(frame, ty.variables[skip..].iter(), TokenStream::new())?;
+        Ok(quote!(#capacities #body))
+    }
+
+    fn decode_outputs<'v>(
+        &self,
+        frame: Frame,
+        variables: impl Iterator<Item = &'v Variable>,
+        failure_return: TokenStream,
+    ) -> Result<(TokenStream, TokenStream)> {
+        let mut capacities = TokenStream::new();
         let mut body = TokenStream::new();
-        for var in &ty.variables[skip..] {
+        for var in variables {
+            if let Some((capacity, value)) = self.reply_array_capacity(frame, var)? {
+                capacities.extend(quote!(let #capacity: u64 = #value;));
+                body.extend(quote! {
+                    let venus_found = peek_array_size(dec);
+                    if venus_found > #capacity {
+                        dec.fail(DecodeError::ArrayCapacity {
+                            capacity: #capacity,
+                            found: venus_found,
+                        });
+                        return #failure_return;
+                    }
+                });
+            }
             body.extend(self.decode_var(frame, var)?);
         }
-        Ok(body)
+        Ok((capacities, body))
     }
 
     fn struct_functions(&self, id: TypeId, variant: Variant) -> Result<TokenStream> {
@@ -599,29 +624,20 @@ impl<'a> Wire<'a> {
 
         let mut reply_encode_body = TokenStream::new();
         let mut reply_decode_body = TokenStream::new();
-        let mut reply_capacities = TokenStream::new();
-        let failure_return = ret_ty.as_ref().map(|_| quote!(ret));
+        let failure_return = ret_ty.as_ref().map(|_| quote!(ret)).unwrap_or_default();
         if let Some(var) = &ret_var {
             reply_encode_body.extend(self.encode_var(frame, var, Validity::Valid)?);
             reply_decode_body.extend(self.decode_var(frame, var)?);
         }
         for var in ty.variables.iter().filter(|v| v.attrs.var_out) {
             reply_encode_body.extend(self.encode_var(frame, var, Validity::Valid)?);
-            if let Some((capacity, value)) = self.reply_array_capacity(frame, var)? {
-                reply_capacities.extend(quote!(let #capacity: u64 = #value;));
-                reply_decode_body.extend(quote! {
-                    let venus_found = peek_array_size(dec);
-                    if venus_found > #capacity {
-                        dec.fail(DecodeError::ArrayCapacity {
-                            capacity: #capacity,
-                            found: venus_found,
-                        });
-                        return #failure_return;
-                    }
-                });
-            }
-            reply_decode_body.extend(self.decode_var(frame, var)?);
         }
+        let (reply_capacities, outputs) = self.decode_outputs(
+            frame,
+            ty.variables.iter().filter(|v| v.attrs.var_out),
+            failure_return,
+        )?;
+        reply_decode_body.extend(outputs);
 
         let ret_param = ret_ty.as_ref().map(|ret_ty| quote!(ret: #ret_ty,));
         let ret_arg = ret_ty.as_ref().map(|_| quote!(ret,));

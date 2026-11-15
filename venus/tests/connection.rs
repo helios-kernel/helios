@@ -357,3 +357,44 @@ fn enumeration_cannot_expand_the_callers_output_capacity() {
     );
     assert_eq!(devices[2].id, 5);
 }
+
+#[test]
+fn structure_reply_counts_cannot_expand_or_create_output_storage() {
+    use helios_venus::protocol::{
+        VkImageLayout, VkPhysicalDeviceHostImageCopyProperties,
+        vn_decode_VkPhysicalDeviceHostImageCopyProperties_self,
+    };
+    use helios_venus::{DecodeError, Decoder};
+
+    // A count of three followed by a three-element array. Decoding must
+    // stop at its prefix, before any array payload or later member.
+    let reply: Vec<_> = [3u32, 3, 0, 1, 2, 99]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    for capacity in [0, 2] {
+        let mut layouts = [VkImageLayout(7); 3];
+        // SAFETY: this C-layout structure consists of integer newtypes,
+        // integer arrays and nullable pointers, all admitting zero.
+        let mut properties: VkPhysicalDeviceHostImageCopyProperties =
+            unsafe { core::mem::zeroed() };
+        properties.copySrcLayoutCount = capacity;
+        if capacity != 0 {
+            properties.pCopySrcLayouts = layouts.as_mut_ptr();
+        }
+        let mut decoder = Decoder::new(&reply);
+        // SAFETY: the declared array capacity has live storage. This
+        // member decoder does not read the structure's sType or pNext.
+        unsafe {
+            vn_decode_VkPhysicalDeviceHostImageCopyProperties_self(&mut decoder, &mut properties);
+        }
+        assert_eq!(
+            decoder.finish(),
+            Err(DecodeError::ArrayCapacity {
+                capacity: u64::from(capacity),
+                found: 3,
+            })
+        );
+        assert_eq!(layouts, [VkImageLayout(7); 3]);
+    }
+}
