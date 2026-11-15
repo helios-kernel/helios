@@ -9,6 +9,7 @@ use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
     BlockSerial, DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags,
+    PreparedWrite, WritePosition, WriteProgress, write_with,
 };
 
 use super::BtrfsFs;
@@ -29,6 +30,25 @@ impl Storage for MemoryStorage {
     type Disk = MemoryDisk;
 }
 
+fn options(time: Timestamp) -> FormatOptions {
+    FormatOptions::new([0x51; 16], time)
+        .subvolume(SubvolumeRequest::new(b"/@home".to_vec(), [0x52; 16]))
+}
+
+fn formatted_image(tree: TreeBuilder, options: FormatOptions) -> crate::BlockCache<MemoryDisk> {
+    // ferrosys' default geometry requires a volume above 109 MiB.
+    let size = 128 << 20;
+    let mut image = tempfile::tempfile().expect("image file");
+    image.set_len(size).expect("image length");
+    format_to(&mut image, tree, size, options).expect("formats btrfs");
+    image.seek(SeekFrom::Start(0)).expect("rewinds");
+    let mut bytes = Vec::new();
+    image.read_to_end(&mut bytes).expect("reads image");
+    let disk = MemoryDisk::holding("btrfs-test", &bytes, false);
+    drop(bytes);
+    cache_over(&disk, 256, 1)
+}
+
 fn path(value: &str) -> FsPath<'_> {
     FsPath::new(value).expect("normalized path")
 }
@@ -45,19 +65,7 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
         .symlink("/link", "hello", Metadata::new(0o777, time))
         .directory("/@home", dir)
         .file("/@home/notes", b"subvolume\n", file);
-    // ferrosys' default geometry requires a volume above 109 MiB.
-    let size = 128 << 20;
-    let mut image = tempfile::tempfile().expect("image file");
-    image.set_len(size).expect("image length");
-    let options = FormatOptions::new([0x51; 16], time)
-        .subvolume(SubvolumeRequest::new(b"/@home".to_vec(), [0x52; 16]));
-    format_to(&mut image, tree, size, options).expect("formats btrfs");
-    image.seek(SeekFrom::Start(0)).expect("rewinds");
-    let mut bytes = Vec::new();
-    image.read_to_end(&mut bytes).expect("reads image");
-    let disk = MemoryDisk::holding("btrfs-test", &bytes, false);
-    drop(bytes);
-    let cache = cache_over(&disk, 256, 1);
+    let cache = formatted_image(tree, options(time));
     let mut next_device = 100;
     let fs = block_on(BtrfsFs::mount(cache.disk(0), || {
         next_device += 1;
@@ -137,7 +145,11 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
             serial: BlockSerial::new(b"btrfs-test").unwrap(),
         },
         "/mnt",
-        false,
+        true,
+        crate::vfs::BtrfsWriteOptions {
+            entropy: crate::test_support::test_root_entropy(),
+            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+        },
     ))
     .expect("mount request");
     let resolved = namespace.resolve("/mnt/hello").expect("mounted file");
@@ -154,4 +166,132 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
         block_on(followed.fs().read_at(followed.path(), 0, 99)).expect("read through symlink"),
         &b"hello btrfs\n"[..]
     );
+}
+
+#[test]
+fn writable_service_publishes_namespace_and_survives_remount() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, time)).file(
+        "/file",
+        b"durable contents",
+        Metadata::new(0o644, time),
+    );
+    let cache = formatted_image(tree, FormatOptions::new([0x61; 16], time));
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache.disk(0),
+            || DeviceId::new(100),
+            crate::test_support::test_root_entropy(),
+            core::num::NonZeroUsize::new(2).unwrap(),
+        )
+        .await
+        .expect("writable mount");
+        let client = async move {
+            fs.open(
+                path("created"),
+                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                1_000_000_000,
+            )
+            .await
+            .expect("create file");
+            assert_eq!(
+                fs.open(
+                    path("created"),
+                    OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                    1_000_000_000
+                )
+                .await,
+                Err(FsError::Exists)
+            );
+            let payload = alloc::vec![0x53; 19_000];
+            let start = write_with(
+                &fs,
+                path("created"),
+                WritePosition::At(0),
+                payload.len(),
+                1_000_000_001,
+                |offset, bytes| bytes.copy_from_slice(&payload[offset..offset + bytes.len()]),
+            )
+            .await
+            .expect("multiple rounds");
+            assert_eq!(start, 0);
+            assert_eq!(
+                fs.read_at(path("created"), 0, payload.len()).await.unwrap(),
+                payload.as_slice()
+            );
+            let staged = fs
+                .prepare_write(path("created"), WritePosition::End, 5, 1_000_000_002)
+                .await
+                .expect("stage without mutation");
+            drop(staged);
+            assert_eq!(
+                fs.stat(path("created")).await.unwrap().size,
+                payload.len() as u64
+            );
+            let first = fs
+                .prepare_write(path("created"), WritePosition::End, 3, 1_000_000_003)
+                .await
+                .unwrap();
+            let second = fs
+                .prepare_write(path("created"), WritePosition::End, 2, 1_000_000_004)
+                .await
+                .unwrap();
+            fs.rename(path("created"), path("renamed"), 1_000_000_005)
+                .await
+                .expect("rename prepared inode");
+            let (first, second) = futures::future::join(
+                first.submit(|_, bytes| bytes.fill(0x41)),
+                second.submit(|_, bytes| bytes.fill(0x42)),
+            )
+            .await;
+            assert!(matches!(first, Ok(WriteProgress::Done(19_000))));
+            assert!(matches!(second, Ok(WriteProgress::Done(19_003))));
+            assert_eq!(
+                fs.read_at(path("renamed"), 19_000, 5).await.unwrap(),
+                &b"AAABB"[..]
+            );
+            fs.create_directory(path("dir"), 2_000_000_000)
+                .await
+                .expect("mkdir");
+            fs.link(path("file"), path("dir/link"), 3_000_000_000)
+                .await
+                .expect("link");
+            fs.rename(path("dir/link"), path("dir/moved"), 4_000_000_000)
+                .await
+                .expect("rename");
+            fs.set_size(path("dir/moved"), 7, 5_000_000_000)
+                .await
+                .expect("truncate");
+            fs.symlink("moved", path("dir/symlink"), 6_000_000_000)
+                .await
+                .expect("symlink");
+            assert_eq!(
+                fs.remove_directory(path("dir")).await,
+                Err(FsError::NotEmpty)
+            );
+            assert_eq!(fs.unlink(path("dir")).await, Err(FsError::IsDirectory));
+            fs.sync(path("file")).await.expect("sync commit");
+            assert_eq!(
+                fs.read_at(path("file"), 0, 99).await.unwrap(),
+                &b"durable"[..]
+            );
+            drop(fs);
+        };
+        futures::future::join(client, service.run()).await;
+        let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened.read_at(path("dir/moved"), 0, 99).await.unwrap(),
+            &b"durable"[..]
+        );
+        assert_eq!(
+            reopened.read_at(path("renamed"), 19_000, 5).await.unwrap(),
+            &b"AAABB"[..]
+        );
+        assert_eq!(
+            reopened.read_link(path("dir/symlink")).await.unwrap(),
+            "moved"
+        );
+    });
 }

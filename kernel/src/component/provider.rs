@@ -191,7 +191,28 @@ impl<M> ProviderSender<M> {
     }
 }
 
+impl<M> ProviderSender<M> {
+    /// Close the queue after its owner's last client goes away. Queued work
+    /// remains available to the receiver; blocked producers observe closure.
+    pub fn close(&self) {
+        self.channel.queue.close();
+        self.channel.ready.notify_one();
+        self.channel.room.notify_all();
+    }
+}
+
 impl<M> ProviderReceiver<M> {
+    /// Take queued work without parking, for a service's bounded batch.
+    pub fn try_recv(&self) -> Result<M, ProviderError> {
+        match self.channel.queue.pop() {
+            Ok(message) => {
+                self.channel.room.notify_one();
+                Ok(message)
+            }
+            Err(PopError::Empty) => Err(ProviderError::Unavailable),
+            Err(PopError::Closed) => Err(ProviderError::Closed),
+        }
+    }
     /// Await the next message, or `None` once the queue is closed and drained.
     pub async fn recv(&self) -> Option<M> {
         loop {

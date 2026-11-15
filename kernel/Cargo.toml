@@ -33,7 +33,7 @@ wasmtime-bare-metal = [
 ]
 
 [dependencies]
-helios-btrfs = { path = "../btrfs", default-features = false }
+helios-btrfs = { path = "../btrfs", default-features = false, features = ["write"] }
 async-lock = { version = "3.4.2", default-features = false }
 async-task = { version = "4.7.1", default-features = false }
 atomic-waker = "1.1.2"

@@ -425,7 +425,12 @@ fn request(
         },
         "/mnt",
         false,
+        crate::vfs::BtrfsWriteOptions {
+            entropy: crate::test_support::test_root_entropy(),
+            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+        },
     ))
+    .map(drop)
 }
 
 #[test]

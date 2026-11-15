@@ -475,6 +475,10 @@ fn a_mount_request_without_mount_authority_is_refused() {
             crate::MountSource::Memory,
             "/mnt",
             false,
+            crate::vfs::BtrfsWriteOptions {
+                entropy: crate::test_support::test_root_entropy(),
+                concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+            },
         )),
         Err(crate::MountRequestError::Authority(
             crate::ProcessAuthorityError::MountGrantExceedsAuthority(
@@ -497,6 +501,10 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
         crate::MountSource::BootImage,
         "/mnt",
         false,
+        crate::vfs::BtrfsWriteOptions {
+            entropy: crate::test_support::test_root_entropy(),
+            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+        },
     ))
     .expect("root may mount the boot image");
     assert_eq!(read(&namespace, "/mnt/bin/tool"), b"tool");
@@ -517,6 +525,10 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
             crate::MountSource::HostShare,
             "/mnt",
             false,
+            crate::vfs::BtrfsWriteOptions {
+                entropy: crate::test_support::test_root_entropy(),
+                concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+            },
         )),
         Err(crate::MountRequestError::HostShareUnavailable)
     ));
@@ -529,7 +541,11 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
             crate::MountSource::Disk { serial },
             "/mnt",
             true,
-        )),
+        crate::vfs::BtrfsWriteOptions {
+            entropy: crate::test_support::test_root_entropy(),
+            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+        },
+    )),
         Err(crate::MountRequestError::DiskUnavailable { serial: refused }) if refused == serial
     ));
 

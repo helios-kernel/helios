@@ -25,7 +25,9 @@ use crate::{ComponentHostNetwork, ErofsError, MountError, MountRequestError, Mou
 /// The kind of refusal the guest sees, and the detail it reads.
 fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
     let kind = match error {
-        MountRequestError::Authority(_) => RefusalKind::PermissionDenied,
+        MountRequestError::Authority(_) | MountRequestError::ReadOnlyDisk { .. } => {
+            RefusalKind::PermissionDenied
+        }
         MountRequestError::HostShareUnavailable
         | MountRequestError::InvalidSerial(_)
         | MountRequestError::DiskUnavailable { .. } => RefusalKind::Unavailable,
@@ -41,7 +43,9 @@ fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
             error: helios_btrfs::Error::Io { .. },
             ..
         } => RefusalKind::Io,
-        MountRequestError::Btrfs { .. } => RefusalKind::InvalidFilesystem,
+        MountRequestError::Btrfs { .. } | MountRequestError::BtrfsWrite { .. } => {
+            RefusalKind::InvalidFilesystem
+        }
         MountRequestError::Mount(MountError::InvalidPoint(_) | MountError::RootKind) => {
             RefusalKind::InvalidPoint
         }
@@ -133,12 +137,18 @@ macro_rules! impl_mount_bindings {
                     accessor: &Accessor<U, Self>,
                     request: wit::MountRequest,
                 ) -> wasmtime::Result<Result<(), wit::MountError>> {
-                    let (authority, namespace, attached) = accessor.with(|mut access| {
+                    let (authority, namespace, attached, write, spawner) = accessor.with(|mut access| {
                         let store = access.get();
                         (
                             store.process_authority().clone(),
                             store.filesystem().clone(),
                             store.runtime_state.attached_storage(),
+                            crate::vfs::BtrfsWriteOptions {
+                                entropy: store.runtime_state.root_entropy_handle().clone(),
+                                concurrency: core::num::NonZeroUsize::new(store.cpu.processor_count())
+                                    .expect("a machine has at least one processor"),
+                            },
+                            store.spawner().launch_spawner().clone(),
                         )
                     });
                     let outcome = match mount_source(request.source) {
@@ -150,11 +160,15 @@ macro_rules! impl_mount_bindings {
                                 source,
                                 &request.path,
                                 request.read_only,
+                                write,
                             )
                             .await
                         }
                         Err(error) => Err(error),
                     };
+                    let outcome = outcome.map(|service| {
+                        if let Some(service) = service { spawner.spawn_detached(service.run()); }
+                    });
                     Ok(outcome.map_err(|error| {
                         tracing::debug!(%error, path = %request.path, "mount refused");
                         mount_error(&error)

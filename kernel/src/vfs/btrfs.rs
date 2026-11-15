@@ -1,11 +1,13 @@
-//! Btrfs over the block cache. Mounting assigns one device identity per
-//! subvolume; all later operations share immutable state and take no
-//! adapter lock. The cache supplies the concurrency contract for disk I/O.
+//! Btrfs over the block cache. Reads pin a published immutable snapshot under
+//! a short lock, released before I/O. A kernel task exclusively owns writable
+//! transactions; queued requests share durable commits. Per-inode write leases
+//! serialize write rounds without blocking unrelated files or the service.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc as SourceArc;
 use alloc::vec::Vec;
-use core::convert::Infallible;
+use core::num::NonZeroUsize;
 use core::ops::ControlFlow;
 
 use bytes::{Bytes, BytesMut};
@@ -20,7 +22,22 @@ use helios_hal::fs::{
 use helios_hal::io::{IoError, IoResult};
 use triomphe::Arc;
 
-use crate::{BlockCacheError, BlockPages, CACHE_BLOCK_BYTES, CachedDisk};
+use crate::{BlockCacheError, BlockPages, CACHE_BLOCK_BYTES, CachedDisk, RootEntropyHandle};
+use helios_btrfs::write::{WriteError, Writer};
+
+mod prepared;
+mod writer;
+pub use prepared::BtrfsWrite;
+pub use writer::BtrfsService;
+use writer::{Operation, Response};
+
+/// Runtime inputs for writable disk mounts.
+#[derive(Clone)]
+pub struct BtrfsWriteOptions {
+    pub entropy: RootEntropyHandle,
+    pub concurrency: NonZeroUsize,
+}
+type Snapshot<Device> = Filesystem<SourceArc<Image<Device>>>;
 
 struct Image<Device> {
     disk: CachedDisk<Device>,
@@ -76,15 +93,18 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BlockSink for Image<Device> {
 // accidentally make a superblock visible before its transaction is durable.
 const _: () = assert!(READ_ALIGNMENT as usize == CACHE_BLOCK_BYTES);
 
-/// A cloneable, read-only btrfs mount.
+/// A cloneable Btrfs mount with concurrent snapshot reads.
 pub struct BtrfsFs<Device: BlockDevice<Buffer = BlockPages>> {
     inner: Arc<Inner<Device>>,
 }
 
 struct Inner<Device: BlockDevice<Buffer = BlockPages>> {
-    reader: Filesystem<Image<Device>>,
+    reader: Arc<spin::Mutex<Snapshot<Device>>>,
+    writer: Option<writer::Client>,
     devices: BTreeMap<u64, (DeviceId, u64)>,
     serial: BlockSerial,
+    writes: prepared::Leases,
+    write_round: usize,
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages>> Clone for BtrfsFs<Device> {
@@ -103,7 +123,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
         mut allocate_device: impl FnMut() -> DeviceId + Send,
     ) -> Result<Self, Error> {
         let serial = disk.serial();
-        let reader = Filesystem::mount(Image { disk }).await?;
+        let reader = Filesystem::mount(SourceArc::new(Image { disk })).await?;
         let mut devices = BTreeMap::new();
         reader
             .subvolumes(|tree, root_inode| {
@@ -112,42 +132,100 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             .await?;
         Ok(Self {
             inner: Arc::new(Inner {
-                reader,
+                reader: Arc::new(spin::Mutex::new(reader)),
+                writer: None,
                 devices,
                 serial,
+                writes: Arc::new(spin::Mutex::new(BTreeMap::new())),
+                write_round: CACHE_BLOCK_BYTES,
             }),
         })
     }
 
-    async fn inode(&self, path: FsPath<'_>) -> FsResult<Inode> {
-        let mut inode = self
-            .inner
-            .reader
-            .root()
-            .await
-            .map_err(|e| self.fs_error(e))?;
-        if path.is_root() {
-            return Ok(inode);
-        }
-        // VFS already normalized the path and owns symlink traversal.
-        for name in path.as_str().split('/') {
-            inode = self
-                .inner
-                .reader
-                .lookup(&inode, name.as_bytes())
-                .await
-                .map_err(|e| self.fs_error(e))?
-                .ok_or(FsError::NoEntry)?;
+    /// Construct a writable mount and its single-owner service. The caller
+    /// runs the service on the kernel executor for the mount's lifetime.
+    pub async fn mount_writable(
+        disk: CachedDisk<Device>,
+        mut allocate_device: impl FnMut() -> DeviceId + Send,
+        entropy: RootEntropyHandle,
+        concurrency: NonZeroUsize,
+    ) -> Result<(Self, BtrfsService<Device>), WriteError> {
+        let serial = disk.serial();
+        let writer = Writer::mount(Image { disk }).await?;
+        let reader = writer.snapshot()?;
+        let mut devices = BTreeMap::new();
+        reader
+            .subvolumes(|tree, root_inode| {
+                devices.insert(tree, (allocate_device(), root_inode));
+            })
+            .await?;
+        let reader = Arc::new(spin::Mutex::new(reader));
+        let (client, receiver) = writer::channel(concurrency);
+        let service = BtrfsService {
+            writer,
+            receiver,
+            published: reader.clone(),
+            entropy,
+            concurrency,
+        };
+        Ok((
+            Self {
+                inner: Arc::new(Inner {
+                    reader,
+                    writer: Some(client),
+                    devices,
+                    serial,
+                    writes: Arc::new(spin::Mutex::new(BTreeMap::new())),
+                    write_round: CACHE_BLOCK_BYTES.saturating_mul(concurrency.get()),
+                }),
+            },
+            service,
+        ))
+    }
+
+    fn snapshot(&self) -> Snapshot<Device> {
+        self.inner.reader.lock().clone()
+    }
+
+    async fn inode(&self, reader: &Snapshot<Device>, path: FsPath<'_>) -> FsResult<Inode> {
+        let mut inode = reader.root().await.map_err(|e| self.fs_error(e))?;
+        if !path.is_root() {
+            // VFS already normalized the path and owns symlink traversal.
+            for name in path.as_str().split('/') {
+                inode = reader
+                    .lookup(&inode, name.as_bytes())
+                    .await
+                    .map_err(|e| self.fs_error(e))?
+                    .ok_or(FsError::NoEntry)?;
+            }
         }
         Ok(inode)
     }
 
+    async fn mutate(&self, path: FsPath<'_>, now: u64, operation: Operation) -> FsResult<()> {
+        self.inner
+            .writer
+            .as_ref()
+            .ok_or(FsError::ReadOnly)?
+            .execute(path.as_str(), now, operation)
+            .await
+            .map(drop)
+    }
+
     fn metadata(&self, inode: &Inode) -> FsResult<Metadata> {
-        let metadata = inode.metadata();
-        let device = self.inner.devices.get(&inode.tree()).ok_or(FsError::Io)?;
-        let kind = node_kind(inode.kind())?;
+        self.inode_metadata(inode.tree(), inode.number(), *inode.metadata())
+    }
+
+    fn inode_metadata(
+        &self,
+        tree: u64,
+        number: u64,
+        metadata: helios_btrfs::Metadata,
+    ) -> FsResult<Metadata> {
+        let device = self.inner.devices.get(&tree).ok_or(FsError::Io)?;
+        let kind = node_kind(metadata.kind)?;
         Ok(Metadata {
-            id: NodeId::new(device.0, inode.number()),
+            id: NodeId::new(device.0, number),
             kind,
             link_count: u64::from(metadata.nlink),
             size: if kind == NodeKind::Directory {
@@ -196,13 +274,26 @@ fn nanos(time: Timestamp) -> FsResult<u64> {
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<Device> {
-    type Write<'a> = Infallible;
+    type Write<'a> = BtrfsWrite<Device>;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
-        self.metadata(&self.inode(path).await?)
+        self.metadata(&self.inode(&self.snapshot(), path).await?)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _: u64) -> FsResult<Metadata> {
+    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
+        if let Some(writer) = &self.inner.writer {
+            return match writer
+                .execute(path.as_str(), now, Operation::Open { flags })
+                .await?
+            {
+                Response::Opened { inode, metadata } => {
+                    self.inode_metadata(inode.tree(), inode.number(), metadata)
+                }
+                Response::Done | Response::Written(_) => {
+                    unreachable!("open request returns inode metadata")
+                }
+            };
+        }
         let metadata = match self.stat(path).await {
             Ok(metadata) => metadata,
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
@@ -223,7 +314,8 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
-        let inode = self.inode(path).await?;
+        let reader = self.snapshot();
+        let inode = self.inode(&reader, path).await?;
         match node_kind(inode.kind())? {
             NodeKind::File => {}
             NodeKind::Directory => return Err(FsError::IsDirectory),
@@ -235,9 +327,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
             .saturating_sub(offset)
             .min(max_bytes as u64) as usize;
         let mut bytes = BytesMut::zeroed(len);
-        let count = self
-            .inner
-            .reader
+        let count = reader
             .read(&inode, offset, &mut bytes)
             .await
             .map_err(|e| self.fs_error(e))?;
@@ -253,11 +343,11 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         cookie: DirCookie,
         max_entries: usize,
     ) -> FsResult<Vec<DirEntry>> {
-        let inode = self.inode(path).await?;
+        let reader = self.snapshot();
+        let inode = self.inode(&reader, path).await?;
         let mut entries = Vec::new();
         let mut failure = None;
-        self.inner
-            .reader
+        reader
             .read_dir(&inode, DirPosition(cookie.raw()), |entry| {
                 if entries.len() == max_entries {
                     return ControlFlow::Break(());
@@ -299,7 +389,8 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
     }
 
     async fn read_link(&self, path: FsPath<'_>) -> FsResult<String> {
-        let inode = self.inode(path).await?;
+        let reader = self.snapshot();
+        let inode = self.inode(&reader, path).await?;
         if inode.kind() != FileKind::Symlink {
             return Err(FsError::Invalid);
         }
@@ -308,9 +399,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
             return Err(FsError::Io);
         }
         let mut target = alloc::vec![0; inode.metadata().size as usize];
-        let count = self
-            .inner
-            .reader
+        let count = reader
             .read_link(&inode, &mut target)
             .await
             .map_err(|e| self.fs_error(e))?;
@@ -320,48 +409,76 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
 
     async fn prepare_write(
         &self,
-        _: FsPath<'_>,
-        _: WritePosition,
-        _: usize,
-        _: u64,
-    ) -> FsResult<Infallible> {
-        Err(FsError::ReadOnly)
+        path: FsPath<'_>,
+        position: WritePosition,
+        len: usize,
+        now: u64,
+    ) -> FsResult<Self::Write<'_>> {
+        prepared::prepare(self, path, position, len, now).await
     }
-    async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+    async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
+        self.mutate(path, now, Operation::Truncate { size }).await
     }
     async fn set_times(
         &self,
-        _: FsPath<'_>,
-        _: Option<u64>,
-        _: Option<u64>,
-        _: u64,
+        path: FsPath<'_>,
+        access: Option<u64>,
+        modified: Option<u64>,
+        now: u64,
     ) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+        self.mutate(path, now, Operation::Times { access, modified })
+            .await
     }
-    async fn create_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+    async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.mutate(path, now, Operation::CreateDirectory).await
     }
-    async fn remove_directory(&self, _: FsPath<'_>) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
+        self.mutate(path, 0, Operation::Remove { directory: true })
+            .await
     }
-    async fn unlink(&self, _: FsPath<'_>) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
+        self.mutate(path, 0, Operation::Remove { directory: false })
+            .await
     }
-    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.mutate(
+            source,
+            now,
+            Operation::Rename {
+                destination: String::from(destination.as_str()),
+            },
+        )
+        .await
     }
-    async fn link(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+    async fn link(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.mutate(
+            source,
+            now,
+            Operation::Link {
+                destination: String::from(destination.as_str()),
+            },
+        )
+        .await
     }
-    async fn symlink(&self, _: &str, _: FsPath<'_>, _: u64) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+    async fn symlink(&self, target: &str, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.mutate(
+            path,
+            now,
+            Operation::Symlink {
+                target: String::from(target),
+            },
+        )
+        .await
     }
     async fn sync(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.inode(path).await.map(drop)
+        if self.inner.writer.is_some() {
+            self.mutate(path, 0, Operation::Sync).await
+        } else {
+            self.inode(&self.snapshot(), path).await.map(drop)
+        }
     }
     async fn sync_data(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.inode(path).await.map(drop)
+        self.sync(path).await
     }
 }
 
