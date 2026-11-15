@@ -246,6 +246,22 @@ fn validate(
     Ok(nritems)
 }
 
+/// Immutable node access for a committed tree or a transaction's CoW view.
+/// Reads are independent and may be polled concurrently on any processor.
+pub(crate) trait NodeSource: Sync {
+    fn read_node(
+        &self,
+        logical: u64,
+        expected: Expected,
+    ) -> impl core::future::Future<Output = Result<Node, Error>> + Send;
+}
+
+impl<S: BlockSource> NodeSource for Volume<S> {
+    async fn read_node(&self, logical: u64, expected: Expected) -> Result<Node, Error> {
+        Node::read(self, logical, expected).await
+    }
+}
+
 struct Level {
     node: Node,
     slot: usize,
@@ -263,22 +279,22 @@ pub(crate) struct Cursor {
 impl Cursor {
     /// A cursor on the last item whose key is at most `target`, or on the
     /// tree's first item when every key is above `target`.
-    pub(crate) async fn floor<S: BlockSource>(
-        volume: &Volume<S>,
+    pub(crate) async fn floor<R: NodeSource>(
+        source: &R,
         root: TreeRoot,
         target: Key,
     ) -> Result<Self, Error> {
         let mut path = ArrayVec::new();
-        let mut node = Node::read(
-            volume,
-            root.bytenr,
-            Expected {
-                level: root.level,
-                generation: root.generation,
-                first_key: None,
-            },
-        )
-        .await?;
+        let mut node = source
+            .read_node(
+                root.bytenr,
+                Expected {
+                    level: root.level,
+                    generation: root.generation,
+                    first_key: None,
+                },
+            )
+            .await?;
         loop {
             let slot = node.floor_slot(target);
             if node.level() == 0 {
@@ -290,21 +306,21 @@ impl Cursor {
                     exhausted,
                 });
             }
-            let child = read_child(volume, &node, slot).await?;
+            let child = read_child(source, &node, slot).await?;
             path.push(Level { node, slot });
             node = child;
         }
     }
 
     /// A cursor on the first item whose key is at least `target`.
-    pub(crate) async fn ceiling<S: BlockSource>(
-        volume: &Volume<S>,
+    pub(crate) async fn ceiling<R: NodeSource>(
+        source: &R,
         root: TreeRoot,
         target: Key,
     ) -> Result<Self, Error> {
-        let mut cursor = Self::floor(volume, root, target).await?;
+        let mut cursor = Self::floor(source, root, target).await?;
         if cursor.key().is_some_and(|key| key < target) {
-            cursor.advance(volume).await?;
+            cursor.advance(source).await?;
         }
         Ok(cursor)
     }
@@ -333,10 +349,7 @@ impl Cursor {
     }
 
     /// Moves to the next item in key order.
-    pub(crate) async fn advance<S: BlockSource>(
-        &mut self,
-        volume: &Volume<S>,
-    ) -> Result<(), Error> {
+    pub(crate) async fn advance<R: NodeSource>(&mut self, source: &R) -> Result<(), Error> {
         let Some(previous) = self.key() else {
             return Ok(());
         };
@@ -363,7 +376,7 @@ impl Cursor {
         while let Some(parent) = self.path.last()
             && parent.node.level() > 0
         {
-            let child = read_child(volume, &parent.node, parent.slot).await?;
+            let child = read_child(source, &parent.node, parent.slot).await?;
             self.path.push(Level {
                 node: child,
                 slot: 0,
@@ -381,20 +394,16 @@ impl Cursor {
     }
 }
 
-async fn read_child<S: BlockSource>(
-    volume: &Volume<S>,
-    parent: &Node,
-    slot: usize,
-) -> Result<Node, Error> {
+async fn read_child<R: NodeSource>(source: &R, parent: &Node, slot: usize) -> Result<Node, Error> {
     let (bytenr, generation) = parent.child(slot);
-    Node::read(
-        volume,
-        bytenr,
-        Expected {
-            level: parent.level() - 1,
-            generation,
-            first_key: Some(parent.key(slot)),
-        },
-    )
-    .await
+    source
+        .read_node(
+            bytenr,
+            Expected {
+                level: parent.level() - 1,
+                generation,
+                first_key: Some(parent.key(slot)),
+            },
+        )
+        .await
 }

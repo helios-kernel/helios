@@ -10,15 +10,13 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use crate::chunk::ChunkMap;
-use crate::compress::decompress;
 use crate::csum::name_hash;
 use crate::error::{Error, FileKind, ItemDefect};
 use crate::items::{
-    DirRecord, EntryTarget, ExtentData, FileExtent, INODE_NODATASUM, Metadata, RecordKind,
-    RootRecord, dir_index_record, dir_records,
+    DirRecord, EntryTarget, Metadata, RecordKind, RootRecord, dir_index_record, dir_records,
 };
 use crate::key::Key;
-use crate::ondisk::{MAX_COMPRESSED_EXTENT, NAME_MAX, SYMLINK_MAX, item_type, objectid};
+use crate::ondisk::{NAME_MAX, SYMLINK_MAX, item_type, objectid};
 use crate::source::BlockSource;
 use crate::superblock::{self, Superblock};
 use crate::tree::{Cursor, TreeRoot};
@@ -26,9 +24,6 @@ use crate::volume::{Mapping, Volume};
 
 /// Most symlinks one path resolution follows, as Linux's `MAXSYMLINKS`.
 pub const MAX_SYMLINK_FOLLOWS: usize = 40;
-
-/// Largest window of file data read and checksummed in one request.
-const DATA_WINDOW: u64 = MAX_COMPRESSED_EXTENT;
 
 /// A btrfs filesystem mounted read-only from one device.
 ///
@@ -119,10 +114,6 @@ impl Inode {
             });
         }
         Ok(())
-    }
-
-    fn is_checksummed(&self) -> bool {
-        self.metadata.flags & INODE_NODATASUM == 0
     }
 }
 
@@ -522,218 +513,22 @@ impl<S: BlockSource> Filesystem<S> {
         Ok(current)
     }
 
-    /// The file bytes at `offset`, through the inode's extents.
     async fn read_range(&self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         let volume = self.volume.view(&inode.snapshot.mapping);
-        let size = inode.metadata.size;
-        if offset >= size || buf.is_empty() {
-            return Ok(0);
-        }
-        let len = (size - offset).min(buf.len() as u64) as usize;
-        let buf = &mut buf[..len];
-        let end = offset + len as u64;
-        let first_extent = Key::new(inode.number, item_type::EXTENT_DATA, 0);
-        let mut cursor = Cursor::floor(
-            &volume,
-            inode.root,
-            Key::new(inode.number, item_type::EXTENT_DATA, offset),
-        )
-        .await?;
-        let mut position = offset;
-        let mut previous_end = 0;
-        while position < end {
-            let (Some(key), Some(item)) = (cursor.key(), cursor.item()) else {
-                break;
-            };
-            if key < first_extent {
-                cursor.advance(&volume).await?;
-                continue;
-            }
-            if !key.is(inode.number, item_type::EXTENT_DATA) {
-                break;
-            }
-            let item_error = |defect| Error::Item {
-                tree: inode.root.tree,
-                key,
-                defect,
-            };
-            let extent = FileExtent::parse(key, item, volume.superblock().sectorsize())
-                .map_err(item_error)?;
-            if extent.start < previous_end {
-                return Err(item_error(ItemDefect::ExtentOverlap(previous_end)));
-            }
-            previous_end = extent.end;
-            if extent.end > position {
-                if extent.start > position {
-                    // A hole the format leaves implicit.
-                    let gap_end = extent.start.min(end);
-                    buf[(position - offset) as usize..(gap_end - offset) as usize].fill(0);
-                    position = gap_end;
-                }
-                if position < end {
-                    let copy_end = extent.end.min(end);
-                    let out = &mut buf[(position - offset) as usize..(copy_end - offset) as usize];
-                    self.copy_extent(inode, &extent, position - extent.start, out)
-                        .await?;
-                    position = copy_end;
-                }
-            }
-            cursor.advance(&volume).await?;
-        }
-        // Past the last extent the file reads as zeroes up to its size.
-        buf[(position - offset) as usize..].fill(0);
-        Ok(len)
-    }
-
-    /// Copies the bytes of `extent` from `from`, relative to its start,
-    /// into `out`.
-    async fn copy_extent(
-        &self,
-        inode: &Inode,
-        extent: &FileExtent<'_>,
-        from: u64,
-        out: &mut [u8],
-    ) -> Result<(), Error> {
-        let sectorsize = inode.snapshot.mapping.superblock.sectorsize() as usize;
-        let decompress_error = |algorithm, defect| Error::Decompress {
-            algorithm,
-            tree: inode.root.tree,
-            inode: inode.number,
-            file_offset: extent.start,
-            defect,
-        };
-        match extent.data {
-            ExtentData::Zero => out.fill(0),
-            ExtentData::Inline {
-                data,
-                compression: None,
-            } => {
-                let from = from as usize;
-                out.copy_from_slice(&data[from..from + out.len()]);
-            }
-            ExtentData::Inline {
-                data,
-                compression: Some(algorithm),
-            } => {
-                // `FileExtent::parse` bounded this by the sector size.
-                let mut plain = vec![0_u8; extent.end as usize];
-                decompress(algorithm, data, &mut plain, sectorsize)
-                    .map_err(|defect| decompress_error(algorithm, defect))?;
-                let from = from as usize;
-                out.copy_from_slice(&plain[from..from + out.len()]);
-            }
-            ExtentData::Regular {
-                disk_bytenr,
+        crate::data::Reader::new(&volume, &volume, inode.snapshot.csum_tree)
+            .read(
+                crate::data::File {
+                    root: inode.root,
+                    number: inode.number,
+                    metadata: &inode.metadata,
+                },
                 offset,
-                compression: None,
-                ..
-            } => {
-                self.read_data(
-                    &inode.snapshot,
-                    disk_bytenr + offset + from,
-                    out,
-                    inode.is_checksummed(),
-                )
-                .await?;
-            }
-            ExtentData::Regular {
-                disk_bytenr,
-                disk_num_bytes,
-                offset,
-                ram_bytes,
-                compression: Some(algorithm),
-            } => {
-                // Both sizes were bounded by 128 KiB in `FileExtent::parse`.
-                let mut stored = vec![0_u8; disk_num_bytes as usize];
-                self.read_sectors(
-                    &inode.snapshot,
-                    disk_bytenr,
-                    &mut stored,
-                    inode.is_checksummed(),
-                )
-                .await?;
-                let mut plain = vec![0_u8; ram_bytes as usize];
-                decompress(algorithm, &stored, &mut plain, sectorsize)
-                    .map_err(|defect| decompress_error(algorithm, defect))?;
-                let from = (offset + from) as usize;
-                out.copy_from_slice(&plain[from..from + out.len()]);
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads data bytes at `logical`, which need not be sector aligned, in
-    /// windows of at most [`DATA_WINDOW`] bytes.
-    async fn read_data(
-        &self,
-        snapshot: &Arc<Snapshot>,
-        logical: u64,
-        out: &mut [u8],
-        checksummed: bool,
-    ) -> Result<(), Error> {
-        let sector = u64::from(snapshot.mapping.superblock.sectorsize());
-        let mut window = Vec::new();
-        let mut done = 0;
-        while done < out.len() {
-            let at = logical + done as u64;
-            let window_start = at - at % sector;
-            let wanted_end = at + (out.len() - done) as u64;
-            let window_end = wanted_end
-                .next_multiple_of(sector)
-                .min(window_start + DATA_WINDOW);
-            window.resize((window_end - window_start) as usize, 0);
-            self.read_sectors(snapshot, window_start, &mut window, checksummed)
-                .await?;
-            let skip = (at - window_start) as usize;
-            let count = (window.len() - skip).min(out.len() - done);
-            out[done..done + count].copy_from_slice(&window[skip..skip + count]);
-            done += count;
-        }
-        Ok(())
-    }
-
-    /// Reads whole sectors at `logical` and, for checksummed data, verifies
-    /// each against the checksum tree, falling back to the other copy of a
-    /// `dup` chunk when one fails.
-    async fn read_sectors(
-        &self,
-        snapshot: &Arc<Snapshot>,
-        logical: u64,
-        buf: &mut [u8],
-        checksummed: bool,
-    ) -> Result<(), Error> {
-        let volume = self.volume.view(&snapshot.mapping);
-        let sector = snapshot.mapping.superblock.sectorsize() as usize;
-        let csum_type = snapshot.mapping.superblock.csum_type();
-        let expected = if checksummed {
-            Some(self.lookup_checksums(snapshot, logical, buf.len()).await?)
-        } else {
-            None
-        };
-        volume
-            .read_verified(logical, buf, |data| {
-                let Some(expected) = &expected else {
-                    return Ok(());
-                };
-                let size = csum_type.size();
-                for (index, (sector_data, stored)) in data
-                    .chunks_exact(sector)
-                    .zip(expected.chunks_exact(size))
-                    .enumerate()
-                {
-                    if !csum_type.verifies(sector_data, stored) {
-                        return Err(Error::DataChecksum {
-                            logical: logical + (index * sector) as u64,
-                        });
-                    }
-                }
-                Ok(())
-            })
+                buf,
+            )
             .await
     }
 
-    /// The stored checksum of every sector of `[logical, logical + len)`,
-    /// concatenated.
+    #[cfg(test)]
     async fn lookup_checksums(
         &self,
         snapshot: &Arc<Snapshot>,
@@ -741,69 +536,9 @@ impl<S: BlockSource> Filesystem<S> {
         len: usize,
     ) -> Result<Vec<u8>, Error> {
         let volume = self.volume.view(&snapshot.mapping);
-        let sector = u64::from(snapshot.mapping.superblock.sectorsize());
-        let size = snapshot.mapping.superblock.csum_type().size();
-        let sectors = len / sector as usize;
-        let mut sums = vec![0_u8; sectors * size];
-        let mut filled = 0;
-        let first = Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, 0);
-        let mut cursor = Cursor::floor(
-            &volume,
-            snapshot.csum_tree,
-            Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, logical),
-        )
-        .await?;
-        while filled < sectors {
-            let (Some(key), Some(item)) = (cursor.key(), cursor.item()) else {
-                break;
-            };
-            if key < first {
-                cursor.advance(&volume).await?;
-                continue;
-            }
-            if !key.is(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM) {
-                break;
-            }
-            let item_error = |defect| Error::Item {
-                tree: cursor.tree(),
-                key,
-                defect,
-            };
-            if item.len() % size != 0 {
-                return Err(item_error(ItemDefect::ChecksumItem(item.len())));
-            }
-            if !key.offset.is_multiple_of(sector) {
-                return Err(item_error(ItemDefect::Unaligned {
-                    field: "checksum start",
-                    value: key.offset,
-                }));
-            }
-            let item_sectors = (item.len() / size) as u64;
-            let item_end = key
-                .offset
-                .checked_add(item_sectors * sector)
-                .ok_or(item_error(ItemDefect::ExtentOverflow))?;
-            let wanted = logical + filled as u64 * sector;
-            if item_end <= wanted {
-                cursor.advance(&volume).await?;
-                continue;
-            }
-            if key.offset > wanted {
-                break;
-            }
-            let skip = ((wanted - key.offset) / sector) as usize;
-            let count = (item_sectors as usize - skip).min(sectors - filled);
-            sums[filled * size..(filled + count) * size]
-                .copy_from_slice(&item[skip * size..(skip + count) * size]);
-            filled += count;
-            cursor.advance(&volume).await?;
-        }
-        if filled < sectors {
-            return Err(Error::MissingDataChecksum {
-                logical: logical + filled as u64 * sector,
-            });
-        }
-        Ok(sums)
+        crate::data::Reader::new(&volume, &volume, snapshot.csum_tree)
+            .lookup_checksums(logical, len)
+            .await
     }
 }
 

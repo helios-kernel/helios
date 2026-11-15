@@ -9,7 +9,7 @@ use arrayvec::ArrayVec;
 use thiserror::Error;
 
 use super::edit::{Branch, Child, EditError, Header, Leaf};
-use super::{Expected, Node, TreeRoot};
+use super::{Cursor, Expected, Node, NodeSource, TreeRoot};
 use crate::ondisk::{MAX_LEVEL, RawHeader, view};
 use crate::source::BlockSource;
 use crate::volume::Volume;
@@ -17,6 +17,8 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[error("file offset or inode byte accounting overflows")]
+    FileOverflow,
     #[error("file extent {key} is not a regular or preallocated mapping")]
     NotRegularExtent { key: Key },
     #[error("file range {start}..{end} must be nonempty and aligned to sector size {sector}")]
@@ -101,7 +103,25 @@ pub(crate) struct Trees {
     retired: Vec<RetiredBlock>,
 }
 
+pub(crate) struct Overlay<'a, S> {
+    volume: &'a Volume<S>,
+    trees: &'a Trees,
+}
+
+impl<S: BlockSource> NodeSource for Overlay<'_, S> {
+    async fn read_node(&self, logical: u64, expected: Expected) -> Result<Node, Error> {
+        self.trees.read(self.volume, logical, expected).await
+    }
+}
+
 impl Trees {
+    pub(crate) fn reader<'a, S: BlockSource>(&'a self, volume: &'a Volume<S>) -> Overlay<'a, S> {
+        Overlay {
+            volume,
+            trees: self,
+        }
+    }
+
     pub(crate) fn new(generation: u64, checksum: ChecksumType) -> Self {
         Self {
             generation,
@@ -116,11 +136,11 @@ impl Trees {
         volume: &Volume<S>,
         address: u64,
         expected: Expected,
-    ) -> Result<Node, WriteError> {
+    ) -> Result<Node, Error> {
         if let Some(node) = self.blocks.get(&address) {
             return Ok(node.clone());
         }
-        Ok(Node::read(volume, address, expected).await?)
+        Node::read(volume, address, expected).await
     }
 
     fn retire<A: MetadataAllocator>(
@@ -218,39 +238,11 @@ impl Trees {
         root: TreeRoot,
         key: Key,
     ) -> Result<Option<(Key, Vec<u8>)>, WriteError> {
-        let mut path = self.path(volume, root, key).await?;
-        let (_, leaf, mut slot) = path.pop().expect("path includes leaf");
-        if leaf.nritems > 0 {
-            slot += usize::from(leaf.key(slot) < key);
-            if slot < leaf.nritems {
-                return Ok(Some((leaf.key(slot), leaf.item(slot).to_vec())));
-            }
-        }
-        while let Some((_, mut node, slot)) = path.pop() {
-            if slot + 1 == node.nritems {
-                continue;
-            }
-            let mut next = slot + 1;
-            loop {
-                let (address, generation) = node.child(next);
-                node = self
-                    .read(
-                        volume,
-                        address,
-                        Expected {
-                            level: node.level - 1,
-                            generation,
-                            first_key: Some(node.key(next)),
-                        },
-                    )
-                    .await?;
-                if node.level == 0 {
-                    return Ok(Some((node.key(0), node.item(0).to_vec())));
-                }
-                next = 0;
-            }
-        }
-        Ok(None)
+        let cursor = Cursor::ceiling(&self.reader(volume), root, key).await?;
+        Ok(cursor
+            .key()
+            .zip(cursor.item())
+            .map(|(key, bytes)| (key, bytes.to_vec())))
     }
 
     /// Applies one insertion, replacement, or deletion. On error the owner

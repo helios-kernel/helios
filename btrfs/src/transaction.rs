@@ -2,6 +2,7 @@
 //! mounted generation's reader pins; this module never reuses retired extents.
 
 mod extents;
+mod file;
 
 use core::num::NonZeroUsize;
 use futures::{
@@ -11,14 +12,16 @@ use futures::{
 
 use crate::accounting::Accounting;
 use crate::commit::CommitImage;
+use crate::data::{File, Reader};
 use crate::fs::Snapshot;
-use crate::ondisk::objectid;
+use crate::ondisk::{item_type, objectid};
 use crate::retirement::Retirements;
 use crate::roots::Roots;
 use crate::source::BlockSink;
 use crate::space::Space;
 use crate::tree::write::{Trees, WriteError};
 use crate::volume::Volume;
+use crate::{Error, FileKind, Key, Metadata};
 use alloc::sync::Arc;
 
 /// Produced only once the new roots are durable, or for an unchanged view.
@@ -38,6 +41,49 @@ pub(crate) struct Transaction<'a, S> {
 }
 
 impl<'a, S: BlockSink> Transaction<'a, S> {
+    /// Read the transaction's current inode and extents, including staged data
+    /// and unpublished checksum items from earlier writes in this transaction.
+    pub(crate) async fn read_file(
+        &self,
+        tree: u64,
+        inode: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, WriteError> {
+        let root = self.roots.get(tree)?;
+        let key = Key::new(inode, item_type::INODE_ITEM, 0);
+        let bytes = self
+            .trees
+            .get(&self.volume, root, key)
+            .await?
+            .ok_or(Error::MissingInode { tree, inode })?;
+        let metadata =
+            Metadata::parse(&bytes).map_err(|defect| Error::Item { tree, key, defect })?;
+        if metadata.kind != FileKind::Regular {
+            return Err(Error::WrongKind {
+                tree,
+                inode,
+                expected: FileKind::Regular,
+                found: metadata.kind,
+            }
+            .into());
+        }
+        let nodes = self.trees.reader(&self.volume);
+        Ok(
+            Reader::new(&self.volume, &nodes, self.accounting.checksum_root())
+                .read(
+                    File {
+                        root,
+                        number: inode,
+                        metadata: &metadata,
+                    },
+                    offset,
+                    output,
+                )
+                .await?,
+        )
+    }
+
     pub(crate) async fn new(
         volume: Volume<S>,
         pin: Arc<Snapshot>,

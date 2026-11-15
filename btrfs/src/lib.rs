@@ -50,6 +50,7 @@ mod chunk;
 mod commit;
 mod compress;
 mod csum;
+mod data;
 mod error;
 mod free_space;
 mod fs;

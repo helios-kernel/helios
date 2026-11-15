@@ -31,6 +31,13 @@ pub(crate) struct DataChange<R> {
     pub(crate) delta: i64,
 }
 
+#[cfg(feature = "write")]
+pub(crate) struct DataWrite<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) reference: DataReference,
+    pub(crate) checksummed: bool,
+}
+
 pub(crate) struct Accounting {
     pub(crate) root: TreeRoot,
     nodesize: u64,
@@ -44,7 +51,7 @@ pub(crate) struct Accounting {
 }
 
 impl Accounting {
-    /// Stage newly allocated, checksummed data. Failure aborts the enclosing
+    /// Stage newly allocated data with the inode’s checksum policy. Failure aborts the enclosing
     /// transaction; no published root can reach the reservation yet.
     #[cfg(feature = "write")]
     pub(crate) async fn stage_data<S: crate::source::BlockSink>(
@@ -52,16 +59,22 @@ impl Accounting {
         volume: &Volume<S>,
         trees: &mut Trees,
         space: &mut Space,
-        bytes: &[u8],
-        reference: DataReference,
+        data: DataWrite<'_>,
         concurrency: core::num::NonZeroUsize,
     ) -> Result<Key, WriteError> {
+        let DataWrite {
+            bytes,
+            reference,
+            checksummed,
+        } = data;
         let key = self
             .allocate_data(volume, trees, space, bytes.len() as u64, reference)
             .await?;
-        self.checksums
-            .set(volume, trees, space, key.objectid, bytes)
-            .await?;
+        if checksummed {
+            self.checksums
+                .set(volume, trees, space, key.objectid, bytes)
+                .await?;
+        }
         volume.stage(key.objectid, bytes, concurrency).await?;
         Ok(key)
     }

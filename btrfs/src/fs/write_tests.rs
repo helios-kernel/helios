@@ -224,6 +224,159 @@ fn writer_abort_commit_and_failed_publication_have_distinct_lifetimes() {
 
 #[cfg(feature = "write")]
 #[test]
+fn file_writes_preserve_partial_sectors_and_transaction_visibility() {
+    block_on(exercise_file_writes(|_| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn file_writes_pass_btrfs_check() {
+    block_on(exercise_file_writes(assert_btrfs_check));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_file_writes(mut verify: impl FnMut(&std::path::Path)) {
+    use super::writer::Writer;
+    let timestamp = Timestamp::from_secs(1_700_000_000);
+    let named = tempfile::NamedTempFile::new().unwrap();
+    let tree = TreeBuilder::new()
+        .root(Metadata::new(0o755, timestamp))
+        .file("/data.bin", Vec::new(), Metadata::new(0o644, timestamp));
+    drop(filesystem_image_tree_file(
+        true,
+        true,
+        tree,
+        named.reopen().unwrap(),
+    ));
+    verify(named.path());
+    let mut writer = Writer::mount(Disk(named.reopen().unwrap())).await.unwrap();
+    let initial = writer.snapshot().unwrap();
+    let initial_inode = initial.resolve(b"/data.bin").await.unwrap();
+    let mut expected = Vec::new();
+    let concurrency = std::thread::available_parallelism().unwrap();
+    let when = crate::Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 123,
+    };
+    for round in 0..2 {
+        let previous = writer.snapshot().unwrap();
+        let inode = previous.resolve(b"/data.bin").await.unwrap();
+        let previous_bytes = expected.clone();
+        let mut transaction = writer.begin().await.unwrap();
+        for (offset, bytes) in [
+            (0, b"hello".to_vec()),
+            (2, "中文・日本語・한국어".as_bytes().to_vec()),
+            (300, vec![0x23; 71]),
+            (
+                4093,
+                (0..(128 * 1024 + 37))
+                    .map(|index| (index % 251) as u8)
+                    .collect(),
+            ),
+            (8190, vec![0x55; 12307]),
+            (150003 + round * 10000, vec![0xa7; 31]),
+            (0, vec![0x71; 13]),
+        ] {
+            let edits = transaction.edits();
+            assert_eq!(
+                edits
+                    .write_file(
+                        inode.tree(),
+                        inode.number(),
+                        offset as u64,
+                        &bytes,
+                        when,
+                        concurrency
+                    )
+                    .await
+                    .unwrap(),
+                bytes.len()
+            );
+            expected.resize(expected.len().max(offset + bytes.len()), 0);
+            expected[offset..offset + bytes.len()].copy_from_slice(&bytes);
+            let mut output = vec![0; expected.len() + 17];
+            assert_eq!(
+                edits
+                    .read_file(inode.tree(), inode.number(), 0, &mut output)
+                    .await
+                    .unwrap(),
+                expected.len()
+            );
+            assert_eq!(&output[..expected.len()], expected.as_slice());
+        }
+        transaction
+            .commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        verify(named.path());
+        let current = writer.snapshot().unwrap();
+        let current_inode = current.resolve(b"/data.bin").await.unwrap();
+        assert_eq!(current_inode.metadata().mtime, when);
+        let mut output = vec![0; expected.len()];
+        assert_eq!(
+            current.read(&current_inode, 0, &mut output).await.unwrap(),
+            expected.len()
+        );
+        assert_eq!(output, expected);
+        let mut old_output = vec![0; previous_bytes.len() + 1];
+        assert_eq!(
+            current.read(&inode, 0, &mut old_output).await.unwrap(),
+            previous_bytes.len()
+        );
+        assert_eq!(
+            &old_output[..previous_bytes.len()],
+            previous_bytes.as_slice()
+        );
+        assert_eq!(
+            current.read(&initial_inode, 0, &mut output).await.unwrap(),
+            0
+        );
+    }
+    for size in [8193, 150037, 300, 4097, 0, 17, 3, 0] {
+        let previous = writer.snapshot().unwrap();
+        let inode = previous.resolve(b"/data.bin").await.unwrap();
+        let old = expected.clone();
+        let mut transaction = writer.begin().await.unwrap();
+        let edits = transaction.edits();
+        edits
+            .truncate_file(inode.tree(), inode.number(), size as u64, when, concurrency)
+            .await
+            .unwrap();
+        expected.resize(size, 0);
+        let mut output = vec![0xff; size + 17];
+        assert_eq!(
+            edits
+                .read_file(inode.tree(), inode.number(), 0, &mut output)
+                .await
+                .unwrap(),
+            size
+        );
+        assert_eq!(&output[..size], expected.as_slice());
+        transaction
+            .commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        verify(named.path());
+        let current = writer.snapshot().unwrap();
+        let current_inode = current.resolve(b"/data.bin").await.unwrap();
+        output.fill(0xff);
+        assert_eq!(
+            current.read(&current_inode, 0, &mut output).await.unwrap(),
+            size
+        );
+        assert_eq!(&output[..size], expected.as_slice());
+        let mut old_output = vec![0; old.len()];
+        assert_eq!(
+            current.read(&inode, 0, &mut old_output).await.unwrap(),
+            old.len()
+        );
+        assert_eq!(old_output, old);
+    }
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn extent_cuts_preserve_sides_count_references_and_release_the_last_mapping() {
     use btrfs_disk::items::CompressionType;
     for compression in [
@@ -408,6 +561,16 @@ async fn exercise_extent_cuts(
                 references
             );
         }
+        expected[range.start as usize..range.end as usize].fill(0);
+        let mut preview = vec![0; content.len()];
+        assert_eq!(
+            edits
+                .read_file(inode.tree(), inode.number(), 0, &mut preview)
+                .await
+                .unwrap(),
+            content.len()
+        );
+        assert_eq!(preview, expected);
         transaction
             .commit(
                 || panic!("valid fixture UUID"),
@@ -416,7 +579,6 @@ async fn exercise_extent_cuts(
             .await
             .unwrap();
         verify(named.path());
-        expected[range.start as usize..range.end as usize].fill(0);
         let current = writer.snapshot().unwrap();
         let current_inode = current.resolve(b"/data.bin").await.unwrap();
         let mut output = vec![0; content.len()];
@@ -736,8 +898,11 @@ fn old_inodes_read_their_own_extent_and_checksum_generation() {
                 &fs.volume,
                 &mut transaction.trees,
                 &mut transaction.space,
-                &after,
-                reference,
+                crate::accounting::DataWrite {
+                    bytes: &after,
+                    reference,
+                    checksummed: true,
+                },
                 concurrency,
             )
             .await
@@ -767,6 +932,17 @@ fn old_inodes_read_their_own_extent_and_checksum_generation() {
             )
             .await
             .unwrap();
+        let mut preview = vec![0; after.len()];
+        assert_eq!(
+            transaction
+                .read_file(old_file.tree(), old_file.number(), 0, &mut preview)
+                .await
+                .unwrap(),
+            after.len()
+        );
+        assert_eq!(preview, after);
+        fs.read(&old_file, 0, &mut preview).await.unwrap();
+        assert_eq!(preview, before);
         transaction
             .commit(|| panic!("valid fixture UUID"), concurrency, || {})
             .await
@@ -1350,8 +1526,11 @@ fn data_staging_writes_all_copies_without_publishing_roots() {
                 &fs.volume,
                 &mut trees,
                 &mut space,
-                &bytes,
-                reference,
+                crate::accounting::DataWrite {
+                    bytes: &bytes,
+                    reference,
+                    checksummed: true,
+                },
                 concurrency,
             )
             .await
