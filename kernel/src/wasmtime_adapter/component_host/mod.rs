@@ -269,14 +269,11 @@ macro_rules! impl_program_bindings {
             Net: ComponentHostNetwork,
             StorageImpl: crate::Storage,
         {
-            async fn drop(
-                accessor: &Accessor<U, Self>,
+            fn drop(
+                mut access: Access<'_, U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<()> {
-                accessor.with(|mut access| {
-                    let _ = access.get().table.delete(child)?;
-                    Ok::<_, wasmtime::Error>(())
-                })?;
+                let _ = access.get().table.delete(child)?;
                 Ok(())
             }
 
@@ -3930,14 +3927,12 @@ where
         })
     }
 
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 
     async fn read(
@@ -4022,27 +4017,21 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    fn new(
-        mut access: Access<'_, U, Self>,
-    ) -> impl core::future::Future<Output = wasmtime::Result<Resource<SbiRawMutex>>> + Send {
-        // `Access` is not `Send`; do the table work synchronously and hand
-        // back a ready future that only captures the `Send` result.
+    fn new(mut access: Access<'_, U, Self>) -> wasmtime::Result<Resource<SbiRawMutex>> {
         let pushed = access.get().table.push(SbiRawMutex {
             resource: RawMutexResource {
                 inner: Arc::new(RawMutex::new()),
             },
         });
-        async move { Ok(pushed?) }
+        Ok(pushed?)
     }
 
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawMutex>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 
     async fn lock(
@@ -4077,14 +4066,12 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawMutexGuard>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 }
 
@@ -4104,25 +4091,21 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    fn new(
-        mut access: Access<'_, U, Self>,
-    ) -> impl core::future::Future<Output = wasmtime::Result<Resource<SbiRawRwLock>>> + Send {
+    fn new(mut access: Access<'_, U, Self>) -> wasmtime::Result<Resource<SbiRawRwLock>> {
         let pushed = access.get().table.push(SbiRawRwLock {
             resource: RawRwLockResource {
                 inner: Arc::new(RawRwLock::new()),
             },
         });
-        async move { Ok(pushed?) }
+        Ok(pushed?)
     }
 
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawRwLock>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 
     async fn read(
@@ -4172,14 +4155,12 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawRwLockReadGuard>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 }
 
@@ -4199,14 +4180,12 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn drop(
-        accessor: &Accessor<U, Self>,
+    fn drop(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiRawRwLockWriteGuard>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.delete(resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })
+        let _ = access.get().table.delete(resource)?;
+        Ok(())
     }
 }
 
