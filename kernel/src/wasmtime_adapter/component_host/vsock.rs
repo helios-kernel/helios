@@ -233,20 +233,16 @@ where
             })
         },
     )?;
-    instance.resource_concurrent(
+    instance.resource(
         "vsock-listener",
         ResourceType::host::<ComponentVsockListener>(),
-        |accessor, rep| {
-            Box::pin(async move {
-                let listener = accessor.with(|mut access| {
-                    let resource = Resource::<ComponentVsockListener>::new_own(rep);
-                    access.get().table.delete(resource)
-                })?;
-                if let Err(error) = listener.service.close_listener(listener.listener) {
-                    tracing::debug!(%error, "dropped vsock listener was already gone");
-                }
-                Ok::<_, wasmtime::Error>(())
-            })
+        |mut caller, rep| {
+            let resource = Resource::<ComponentVsockListener>::new_own(rep);
+            let listener = caller.data_mut().table.delete(resource)?;
+            if let Err(error) = listener.service.close_listener(listener.listener) {
+                tracing::debug!(%error, "dropped vsock listener was already gone");
+            }
+            Ok(())
         },
     )?;
     instance.func_wrap_concurrent_immediate(
