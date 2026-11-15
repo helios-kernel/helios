@@ -40,7 +40,7 @@ struct RawBlockRef {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub(crate) enum AllocationDefect {
+pub enum AllocationDefect {
     #[error("truncated extent record or back-reference")]
     Truncated,
     #[error("invalid metadata extent key, size, flags, or level")]

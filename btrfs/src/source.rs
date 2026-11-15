@@ -2,6 +2,10 @@
 
 use alloc::sync::Arc;
 use core::future::Future;
+#[cfg(feature = "write")]
+use core::num::NonZeroUsize;
+#[cfg(feature = "write")]
+use futures::stream::{FuturesUnordered, TryStreamExt};
 
 use helios_hal::io::IoResult;
 
@@ -117,4 +121,38 @@ pub trait BlockSink: BlockSource {
         block: u64,
         bytes: &[u8; READ_ALIGNMENT as usize],
     ) -> impl Future<Output = IoResult<()>> + Send;
+}
+
+/// Bounded, transaction-owned in-flight writes. Admission awaits a completion
+/// at the limit; finish drains every remaining write before publication.
+#[cfg(feature = "write")]
+pub(crate) struct PendingWrites<F> {
+    pending: FuturesUnordered<F>,
+    concurrency: NonZeroUsize,
+}
+
+#[cfg(feature = "write")]
+impl<F, E> PendingWrites<F>
+where
+    F: Future<Output = Result<(), E>> + Send,
+{
+    pub(crate) fn new(concurrency: NonZeroUsize) -> Self {
+        Self {
+            pending: FuturesUnordered::new(),
+            concurrency,
+        }
+    }
+
+    pub(crate) async fn push(&mut self, operation: F) -> Result<(), E> {
+        self.pending.push(operation);
+        if self.pending.len() == self.concurrency.get() {
+            self.pending.try_next().await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<(), E> {
+        while self.pending.try_next().await?.is_some() {}
+        Ok(())
+    }
 }

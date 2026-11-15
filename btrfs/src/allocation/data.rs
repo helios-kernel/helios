@@ -126,7 +126,7 @@ struct RawSharedRef {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub(crate) enum DataDefect {
+pub enum DataDefect {
     #[error("truncated data extent or reference")]
     Truncated,
     #[error("invalid data extent key, flags, or geometry")]

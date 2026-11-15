@@ -13,7 +13,7 @@ use zrip_encode::context::CompressContext;
 use crate::Compression;
 
 #[derive(Debug, Error)]
-pub(crate) enum EncodeError {
+pub enum EncodeError {
     #[error("zlib encoding stopped with {status:?} after consuming {consumed} of {length} bytes")]
     Zlib {
         status: TDEFLStatus,
@@ -26,12 +26,12 @@ pub(crate) enum EncodeError {
     Zstd(CompressError),
 }
 
-pub(crate) struct Encoded<'a> {
-    pub(crate) bytes: &'a mut Vec<u8>,
-    pub(crate) algorithm: Compression,
+pub struct Encoded<'a> {
+    pub bytes: &'a mut Vec<u8>,
+    pub algorithm: Compression,
 }
 
-pub(crate) trait Encoder: Send {
+pub trait Encoder: Send {
     const ALGORITHM: Option<Compression>;
     /// None means that this encoding cannot save space for the supplied input.
     fn encode(&mut self, input: &[u8], sector: usize) -> Result<Option<Encoded<'_>>, EncodeError>;
@@ -44,7 +44,7 @@ impl<E: Encoder> Encoder for &mut E {
     }
 }
 
-pub(crate) struct Plain;
+pub struct Plain;
 impl Encoder for Plain {
     const ALGORITHM: Option<Compression> = None;
     fn encode(&mut self, _: &[u8], _: usize) -> Result<Option<Encoded<'_>>, EncodeError> {
@@ -52,13 +52,13 @@ impl Encoder for Plain {
     }
 }
 
-pub(crate) struct Zlib {
+pub struct Zlib {
     state: Box<CompressorOxide>,
     output: Vec<u8>,
 }
 
 impl Zlib {
-    pub(crate) fn new(level: CompressionLevel) -> Self {
+    pub fn new(level: CompressionLevel) -> Self {
         let mut state = Box::<CompressorOxide>::default();
         state.set_format_and_level(DataFormat::Zlib, level as u8);
         Self {
@@ -92,19 +92,25 @@ impl Encoder for Zlib {
     }
 }
 
-pub(crate) struct Lzo {
+pub struct Lzo {
     dictionary: Box<lzokay::compress::Dict>,
     segment: Vec<u8>,
     output: Vec<u8>,
 }
 
 impl Lzo {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             dictionary: lzokay::compress::Dict::new(),
             segment: Vec::new(),
             output: Vec::new(),
         }
+    }
+}
+
+impl Default for Lzo {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -141,13 +147,13 @@ impl Encoder for Lzo {
     }
 }
 
-pub(crate) struct Zstd {
+pub struct Zstd {
     context: CompressContext,
     output: Vec<u8>,
 }
 
 impl Zstd {
-    pub(crate) fn new(level: i32) -> Result<Self, EncodeError> {
+    pub fn new(level: i32) -> Result<Self, EncodeError> {
         let mut context = CompressContext::new(level).map_err(EncodeError::Zstd)?;
         // Btrfs checksums the complete encoded sectors in its checksum tree.
         context.set_content_checksum(false);

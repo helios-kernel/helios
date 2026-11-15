@@ -164,9 +164,8 @@ impl<S: crate::source::BlockSink> Volume<S> {
         bytes: &[u8],
         concurrency: core::num::NonZeroUsize,
     ) -> Result<(), crate::tree::write::WriteError> {
-        use crate::source::READ_ALIGNMENT;
+        use crate::source::{PendingWrites, READ_ALIGNMENT};
         use crate::tree::write::WriteError;
-        use futures::stream::{self, StreamExt, TryStreamExt};
 
         if bytes.is_empty()
             || !logical.is_multiple_of(READ_ALIGNMENT)
@@ -178,28 +177,30 @@ impl<S: crate::source::BlockSink> Volume<S> {
             });
         }
         let copies = self.chunks().map(logical, bytes.len() as u64)?;
-        let requests = copies.into_iter().flat_map(|physical| {
-            bytes
+        let mut writes = PendingWrites::new(concurrency);
+        for physical in copies {
+            for (index, bytes) in bytes
                 .as_chunks::<{ READ_ALIGNMENT as usize }>()
                 .0
                 .iter()
                 .enumerate()
-                .map(move |(index, bytes)| (physical + index as u64 * READ_ALIGNMENT, bytes))
-        });
-        stream::iter(requests)
-            .map(|(physical, bytes)| async move {
-                self.source
-                    .stage(physical / READ_ALIGNMENT, bytes)
-                    .await
-                    .map_err(|source| Error::Io {
-                        offset: physical,
-                        len: bytes.len(),
-                        source,
+            {
+                let offset = physical + index as u64 * READ_ALIGNMENT;
+                writes
+                    .push(async move {
+                        self.source
+                            .stage(offset / READ_ALIGNMENT, bytes)
+                            .await
+                            .map_err(|source| Error::Io {
+                                offset,
+                                len: bytes.len(),
+                                source,
+                            })
                     })
-            })
-            .buffer_unordered(concurrency.get())
-            .try_for_each(|()| async { Ok(()) })
-            .await?;
+                    .await?;
+            }
+        }
+        writes.finish().await?;
         Ok(())
     }
 }

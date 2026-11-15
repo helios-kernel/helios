@@ -22,14 +22,14 @@ use crate::{Compression, Error, FileKind, Key, Timestamp};
 const HEAD_BYTES: usize = size_of::<RawFileExtentHead>();
 const REGULAR_BYTES: usize = HEAD_BYTES + size_of::<RawFileExtentBody>();
 
-pub(crate) struct WriteOptions<E> {
-    pub(crate) when: Timestamp,
-    pub(crate) concurrency: NonZeroUsize,
-    pub(crate) encoder: E,
+pub struct WriteOptions<E> {
+    pub when: Timestamp,
+    pub concurrency: NonZeroUsize,
+    pub encoder: E,
 }
 
 impl WriteOptions<Plain> {
-    pub(crate) fn plain(when: Timestamp, concurrency: NonZeroUsize) -> Self {
+    pub fn plain(when: Timestamp, concurrency: NonZeroUsize) -> Self {
         Self {
             when,
             concurrency,

@@ -15,7 +15,7 @@ use crate::ondisk::{RawHeader, RawItem, RawKey, RawKeyPtr, view};
 use crate::{ChecksumType, Key};
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub(crate) enum EditError {
+pub enum EditError {
     #[error("item {key} needs {bytes} bytes in a leaf with {capacity} usable bytes")]
     ItemTooLarge {
         key: Key,

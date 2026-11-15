@@ -28,7 +28,7 @@ const METADATA: u64 = 4;
 const BLOCK_GROUP_TREE: u64 = 1 << 3;
 
 #[derive(Debug, Error)]
-pub(crate) enum SpaceError {
+pub enum SpaceError {
     #[error(transparent)]
     Read(#[from] Error),
     #[error("allocation tree {tree}, item {key}: {defect}")]
@@ -44,7 +44,7 @@ pub(crate) enum SpaceError {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum SpaceDefect {
+pub enum SpaceDefect {
     #[error(transparent)]
     FreeSpace(#[from] FreeSpaceDefect),
     #[error(transparent)]
@@ -409,6 +409,7 @@ impl Space {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn available_metadata(&self) -> u64 {
         self.groups
             .iter()

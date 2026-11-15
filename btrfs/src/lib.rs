@@ -1,4 +1,4 @@
-//! Read-only btrfs for Helios.
+//! Btrfs for Helios, with immutable read views and optional CoW transactions.
 //!
 //! [`Filesystem::mount`] takes any [`BlockSource`] — in the kernel, the
 //! block cache in front of a virtio-blk disk — and reads a single-device
@@ -31,19 +31,21 @@
 //!
 //! # Writing
 //!
-//! The read path is shaped for the copy-on-write transactions that follow
-//! it. Every lookup starts from a tree root captured once — the
-//! superblock's roots at mount, an [`Inode`]'s subvolume root after — so a
-//! commit that publishes new roots and flips the superblock leaves readers
-//! of the previous commit consistent, as long as the blocks those roots
-//! reach are not reused while they are read.
+//! The `write` feature exposes `write::Writer` and consuming transactions.
+//! A transaction stages private CoW blocks and publishes a new immutable view
+//! only after its superblocks are durable. Existing readers retain the complete
+//! mapping and checksum roots for their generation; its retired blocks cannot
+//! be reused while any reader still reaches them.
 
 #![no_std]
 
 extern crate alloc;
 
+#[cfg(feature = "write")]
 mod accounting;
+#[cfg(feature = "write")]
 mod allocation;
+#[cfg(feature = "write")]
 mod checksums;
 mod chunk;
 #[cfg(feature = "write")]
@@ -52,6 +54,7 @@ mod compress;
 mod csum;
 mod data;
 mod error;
+#[cfg(feature = "write")]
 mod free_space;
 mod fs;
 mod items;
@@ -59,15 +62,20 @@ mod key;
 mod ondisk;
 #[cfg(feature = "write")]
 mod retirement;
+#[cfg(feature = "write")]
 mod roots;
 mod source;
+#[cfg(feature = "write")]
 mod space;
 mod superblock;
 #[cfg(feature = "write")]
 mod transaction;
 mod tree;
+#[cfg(feature = "write")]
 mod uuid_tree;
 mod volume;
+#[cfg(feature = "write")]
+pub mod write;
 
 pub use csum::{ChecksumType, Digest};
 pub use error::{

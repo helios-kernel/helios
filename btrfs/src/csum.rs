@@ -81,6 +81,7 @@ impl Digest {
 }
 
 /// Ordering hash for an extent's ordinary data references.
+#[cfg(feature = "write")]
 pub(crate) fn data_ref_hash(root: u64, inode: u64, offset: u64) -> u64 {
     // btrfs hash_extent_data_ref uses raw CRC32C registers seeded with ~0.
     let high = !CASTAGNOLI.checksum(&root.to_le_bytes());

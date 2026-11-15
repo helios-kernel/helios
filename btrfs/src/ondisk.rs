@@ -37,11 +37,16 @@ pub(crate) const STRIPE_LEN: u64 = 64 * 1024;
 /// Object ids with a fixed meaning.
 pub(crate) mod objectid {
     pub(crate) const ROOT_TREE: u64 = 1;
+    #[cfg(feature = "write")]
     pub(crate) const EXTENT_TREE: u64 = 2;
     pub(crate) const CHUNK_TREE: u64 = 3;
+    #[cfg(feature = "write")]
     pub(crate) const DEV_TREE: u64 = 4;
+    #[cfg(feature = "write")]
     pub(crate) const UUID_TREE: u64 = 9;
+    #[cfg(feature = "write")]
     pub(crate) const FREE_SPACE_TREE: u64 = 10;
+    #[cfg(feature = "write")]
     pub(crate) const BLOCK_GROUP_TREE: u64 = 11;
     pub(crate) const FS_TREE: u64 = 5;
     pub(crate) const ROOT_TREE_DIR: u64 = 6;
@@ -55,7 +60,9 @@ pub(crate) mod objectid {
 /// Item types the read path consults.
 pub(crate) mod item_type {
     pub(crate) const INODE_ITEM: u8 = 1;
+    #[cfg(feature = "write")]
     pub(crate) const INODE_REF: u8 = 12;
+    #[cfg(feature = "write")]
     pub(crate) const INODE_EXTREF: u8 = 13;
     pub(crate) const XATTR_ITEM: u8 = 24;
     pub(crate) const DIR_ITEM: u8 = 84;
@@ -63,18 +70,30 @@ pub(crate) mod item_type {
     pub(crate) const EXTENT_DATA: u8 = 108;
     pub(crate) const EXTENT_CSUM: u8 = 128;
     pub(crate) const ROOT_ITEM: u8 = 132;
+    #[cfg(feature = "write")]
     pub(crate) const EXTENT_ITEM: u8 = 168;
+    #[cfg(feature = "write")]
     pub(crate) const METADATA_ITEM: u8 = 169;
+    #[cfg(feature = "write")]
     pub(crate) const TREE_BLOCK_REF: u8 = 176;
+    #[cfg(feature = "write")]
     pub(crate) const EXTENT_DATA_REF: u8 = 178;
+    #[cfg(feature = "write")]
     pub(crate) const SHARED_BLOCK_REF: u8 = 182;
+    #[cfg(feature = "write")]
     pub(crate) const SHARED_DATA_REF: u8 = 184;
+    #[cfg(feature = "write")]
     pub(crate) const BLOCK_GROUP_ITEM: u8 = 192;
+    #[cfg(feature = "write")]
     pub(crate) const FREE_SPACE_INFO: u8 = 198;
+    #[cfg(feature = "write")]
     pub(crate) const FREE_SPACE_EXTENT: u8 = 199;
+    #[cfg(feature = "write")]
     pub(crate) const FREE_SPACE_BITMAP: u8 = 200;
     pub(crate) const CHUNK_ITEM: u8 = 228;
+    #[cfg(feature = "write")]
     pub(crate) const UUID_SUBVOL: u8 = 251;
+    #[cfg(feature = "write")]
     pub(crate) const UUID_RECEIVED: u8 = 252;
 }
 
@@ -318,6 +337,7 @@ pub(crate) struct RawDirItem {
 /// `btrfs_inode_ref`, followed by the name.
 #[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
+#[cfg(feature = "write")]
 pub(crate) struct RawInodeRef {
     pub(crate) index: U64,
     pub(crate) name_len: U16,
@@ -326,6 +346,7 @@ pub(crate) struct RawInodeRef {
 /// `btrfs_inode_extref`, followed by the name.
 #[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
+#[cfg(feature = "write")]
 pub(crate) struct RawInodeExtref {
     pub(crate) parent: U64,
     pub(crate) index: U64,

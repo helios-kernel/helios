@@ -15,7 +15,9 @@
 //! range its parent gives it, breaks that order and ends the walk with
 //! [`Error::TreeOrder`] instead of revisiting blocks.
 
+#[cfg(feature = "write")]
 pub(crate) mod edit;
+#[cfg(feature = "write")]
 pub(crate) mod write;
 
 use alloc::boxed::Box;
@@ -87,6 +89,7 @@ impl Node {
         })
     }
 
+    #[cfg(feature = "write")]
     pub(crate) fn owner(&self) -> u64 {
         view::<RawHeader>(&self.bytes)
             .expect("validated node")

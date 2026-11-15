@@ -26,7 +26,7 @@ const BITS_PER_BITMAP: u64 = BITMAP_BYTES * 8;
 const BITMAP_HYSTERESIS: u64 = 100;
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub(crate) enum FreeSpaceDefect {
+pub enum FreeSpaceDefect {
     #[error("free-space records disagree with allocated extents")]
     AllocationMismatch,
     #[error("invalid free-space info key, size, or flags")]

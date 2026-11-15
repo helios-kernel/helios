@@ -239,6 +239,7 @@ impl ChunkMap {
     }
 
     /// The on-disk block-group geometry must agree with its chunk item.
+    #[cfg(feature = "write")]
     pub(crate) fn matches_group(&self, logical: u64, length: u64, flags: u64) -> bool {
         self.find(logical).is_some_and(|chunk| {
             chunk.logical == logical && chunk.length == length && chunk.flags == flags
@@ -247,6 +248,7 @@ impl ChunkMap {
 
     /// Logical ranges whose physical copies intersect a superblock stripe.
     /// Btrfs reserves the whole 64 KiB stripe, not just the 4 KiB superblock.
+    #[cfg(feature = "write")]
     pub(crate) fn superblock_stripes(&self) -> Vec<core::ops::Range<u64>> {
         let mut ranges = Vec::new();
         for chunk in &self.chunks {

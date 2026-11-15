@@ -134,6 +134,15 @@ impl Roots {
     }
 
     #[cfg(feature = "write")]
+    pub(crate) fn root_directory(&self, tree: u64) -> Result<u64, WriteError> {
+        let entry = self.entries.get(&tree).ok_or(Error::MissingRoot { tree })?;
+        Ok(view::<RawRootItem>(&entry.bytes)
+            .expect("validated root item")
+            .root_dirid
+            .get())
+    }
+
+    #[cfg(feature = "write")]
     pub(crate) fn check_writable(&self, tree: u64) -> Result<(), WriteError> {
         let entry = self.entries.get(&tree).ok_or(Error::MissingRoot { tree })?;
         let head = view::<RawRootItem>(&entry.bytes).expect("validated root item");

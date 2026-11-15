@@ -14,7 +14,7 @@ use crate::ondisk::{
 };
 use crate::source::BlockSink;
 use crate::tree::write::WriteError;
-use crate::{Error, FileKind, ItemDefect, Key, Metadata, Timestamp};
+use crate::{EntryTarget, Error, FileKind, ItemDefect, Key, Metadata, Timestamp};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Name<'a> {
@@ -328,6 +328,17 @@ impl<S: BlockSink> Transaction<'_, S> {
     }
 
     async fn lookup_entry(&self, name: Name<'_>) -> Result<Option<(u64, FileKind)>, WriteError> {
+        match self.lookup_target(name).await? {
+            Some((EntryTarget::Inode(inode), kind)) => Ok(Some((inode, kind))),
+            Some((EntryTarget::Subvolume(_), _)) => Err(WriteError::SubvolumeLink),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) async fn lookup_target(
+        &self,
+        name: Name<'_>,
+    ) -> Result<Option<(EntryTarget, FileKind)>, WriteError> {
         validate_name(name.bytes)?;
         let (_, metadata) = self.inode_item(name.tree, name.parent).await?;
         if metadata.kind != FileKind::Directory {
@@ -351,10 +362,7 @@ impl<S: BlockSink> Transaction<'_, S> {
                 defect,
             })?;
             if record.name == name.bytes {
-                if record.location.item_type == item_type::ROOT_ITEM {
-                    return Err(WriteError::SubvolumeLink);
-                }
-                return Ok(Some((record.location.objectid, record.kind())));
+                return Ok(Some((record.target(), record.kind())));
             }
         }
         Ok(None)

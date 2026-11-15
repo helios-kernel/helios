@@ -7,11 +7,10 @@ pub(crate) mod namespace;
 pub(crate) mod reflink;
 
 use core::num::NonZeroUsize;
-use futures::{
-    future,
-    stream::{self, StreamExt, TryStreamExt},
-};
+use futures::future;
 
+use self::namespace::Name;
+use self::reflink::FileId;
 use crate::accounting::Accounting;
 use crate::commit::CommitImage;
 use crate::data::{File, Reader};
@@ -19,10 +18,11 @@ use crate::fs::Snapshot;
 use crate::ondisk::objectid;
 use crate::retirement::Retirements;
 use crate::roots::Roots;
-use crate::source::BlockSink;
+use crate::source::{BlockSink, PendingWrites, READ_ALIGNMENT};
 use crate::space::Space;
 use crate::tree::write::{Trees, WriteError};
 use crate::volume::Volume;
+use crate::{EntryTarget, Metadata};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
@@ -46,6 +46,30 @@ pub(crate) struct Transaction<'a, S> {
 }
 
 impl<'a, S: BlockSink> Transaction<'a, S> {
+    pub(crate) async fn inode_metadata(&self, file: FileId) -> Result<Metadata, WriteError> {
+        self.inode_item(file.tree, file.inode)
+            .await
+            .map(|(_, metadata)| metadata)
+    }
+
+    pub(crate) async fn lookup_file(&self, name: Name<'_>) -> Result<Option<FileId>, WriteError> {
+        Ok(match self.lookup_target(name).await? {
+            Some((EntryTarget::Inode(inode), _)) => Some(FileId {
+                tree: name.tree,
+                inode,
+            }),
+            Some((EntryTarget::Subvolume(tree), _)) => Some(FileId {
+                tree,
+                inode: self.roots.root_directory(tree)?,
+            }),
+            None => None,
+        })
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.trees.generation()
+    }
+
     /// Read the transaction's current inode and extents, including staged data
     /// and unpublished checksum items from earlier writes in this transaction.
     pub(crate) async fn read_file(
@@ -154,22 +178,19 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
             .record(&self.generation, self.accounting.take_retired());
         // Bound the total in-flight I/O by staging one block per concurrent
         // stream item. Volume::stage handles this block's physical copies.
-        let writes = self.trees.blocks().flat_map(|(logical, bytes)| {
-            bytes
-                .chunks(crate::source::READ_ALIGNMENT as usize)
-                .enumerate()
-                .map(move |(index, bytes)| {
-                    (
-                        logical + index as u64 * crate::source::READ_ALIGNMENT,
+        let mut writes = PendingWrites::new(concurrency);
+        for (logical, bytes) in self.trees.blocks() {
+            for (index, bytes) in bytes.chunks(READ_ALIGNMENT as usize).enumerate() {
+                writes
+                    .push(self.volume.stage(
+                        logical + index as u64 * READ_ALIGNMENT,
                         bytes,
-                    )
-                })
-        });
-        stream::iter(writes)
-            .map(|(logical, bytes)| self.volume.stage(logical, bytes, NonZeroUsize::MIN))
-            .buffer_unordered(concurrency.get())
-            .try_for_each(|()| async { Ok(()) })
-            .await?;
+                        NonZeroUsize::MIN,
+                    ))
+                    .await?;
+            }
+        }
+        writes.finish().await?;
         publishing();
         self.volume.publish(self.image).await?;
         Ok(Committed { snapshot })

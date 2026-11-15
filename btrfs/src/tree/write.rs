@@ -16,7 +16,19 @@ use crate::volume::Volume;
 use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
-pub(crate) enum WriteError {
+pub enum WriteError {
+    #[error("creation permissions {permissions:#o} include bits outside 07777")]
+    InvalidPermissions { permissions: u32 },
+    #[error("inode handle belongs to another mount")]
+    ForeignHandle,
+    #[error("inode handle was created by an aborted transaction")]
+    AbortedHandle,
+    #[error("inode {inode} in tree {tree} no longer has generation {generation}")]
+    StaleHandle {
+        tree: u64,
+        inode: u64,
+        generation: u64,
+    },
     #[error("inode {inode} in tree {tree} forbids this mutation with flags {flags:#x}")]
     InodeFlags { tree: u64, inode: u64, flags: u64 },
     #[error("read-write mount does not support compat-ro feature {name} ({bit:#x})")]

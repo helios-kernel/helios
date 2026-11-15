@@ -15,7 +15,7 @@ use crate::tree::{Cursor, TreeRoot};
 use crate::volume::Volume;
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub(crate) enum UuidDefect {
+pub enum UuidDefect {
     #[error("unsupported UUID index item type {0}")]
     Type(u8),
     #[error("UUID index payload has {0} bytes, expected a nonempty root-ID array")]

@@ -2,7 +2,7 @@
 //! extended attributes.
 
 #[cfg(feature = "write")]
-mod writer;
+pub(crate) mod writer;
 
 use alloc::sync::Arc;
 use alloc::vec;
@@ -528,7 +528,7 @@ impl<S: BlockSource> Filesystem<S> {
             .await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     async fn lookup_checksums(
         &self,
         snapshot: &Arc<Snapshot>,
@@ -641,5 +641,5 @@ async fn default_subvolume<S: BlockSource>(
     Ok(tree)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod write_tests;
