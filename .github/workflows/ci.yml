@@ -2670,6 +2670,9 @@ jobs:
           # nor rutabaga backs the device (hw/display/virtio-gpu.c), and
           # virgl hands guest blobs to virglrenderer as iovecs.
           sudo modprobe vgem
+          # Device rules may change the new node's owner and permissions.
+          # Complete them before granting the runner access.
+          sudo udevadm settle
           sudo chmod 666 /dev/kvm /dev/dri/renderD*
           ls -la /dev/kvm /dev/dri
           # lavapipe is the only Vulkan driver this runner can enumerate;
@@ -2732,6 +2735,11 @@ jobs:
           command -v qemu-system-x86_64
           qemu-system-x86_64 --version
           qemu-system-x86_64 -device virtio-gpu-gl-pci,help | grep -F venus
+          # Exercise the same EGL initialization before building any guest.
+          ls -la /dev/dri
+          jq -nc '{execute: "qmp_capabilities"}, {execute: "quit"}' | \
+            timeout 30 qemu-system-x86_64 -machine none -nodefaults -S \
+              -display egl-headless,gl=on -qmp stdio
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
