@@ -148,21 +148,23 @@ test-libraries:
 test-host-tools:
     #!/usr/bin/env bash
     set -euo pipefail
-    target="$(rustc -vV | sed -n 's/^host: //p')"
-    out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "${target}" \
-        --profile "{{ default_profile }}" \
-        --cargo cargo
-    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    # The host tools: QEMU arguments, network plans, the image audit, the
-    # signature trailer, the profile store, the root keypair.
+    if [[ -n "${HELIOS_PREBUILT_WASM:-}" ]]; then
+        plugin="${HELIOS_PREBUILT_WASM}/helios_compiler_plugin.wasm"
+    else
+        target="$(rustc -vV | sed -n 's/^host: //p')"
+        out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
+        cargo run -p helios-cli --quiet -- kernel-prebuild \
+            --out-dir "${out_dir}" \
+            --target "${target}" \
+            --profile "{{ default_profile }}" \
+            --cargo cargo
+        plugin="${out_dir}/compiler_plugin.wasm"
+    fi
+    # These tools read no bootfs. The compiler-host test needs only the
+    # original wasm, which CI's shared producer already built.
+    test -f "$plugin"
     cargo nextest run -p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support
-    # The compiler plugin the prebuild above built, hosted under Wasmtime on
-    # this host the way the bench's Linux + Wasmtime column hosts it.
-    HELIOS_COMPILER_PLUGIN_WASM="${out_dir}/compiler_plugin.wasm" cargo nextest run -p helios-compiler-host
+    HELIOS_COMPILER_PLUGIN_WASM="$plugin" cargo nextest run -p helios-compiler-host
 
 # Fetch the ACPI tables `acpi/tests/qemu-tables.sha256` pins — QEMU's own
 # expected tables for its q35 machine, from its `tests/data/acpi` at the
