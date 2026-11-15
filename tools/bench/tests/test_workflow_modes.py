@@ -524,7 +524,11 @@ def test_kernel_profile_collects_the_ref_it_is_asked_for():
     group = workflow["jobs"]["kernel-profile"]["concurrency"]["group"]
     assert "inputs.artifact" in group
     steps = workflow["jobs"]["kernel-profile"]["steps"]
-    checkout = next(step for step in steps if step.get("uses") == "actions/checkout@v4")
+    checkout = next(
+        step
+        for step in steps
+        if step.get("uses") == "actions/checkout@v4" and step["with"]["path"] == "helios"
+    )
     assert checkout["with"]["ref"] == "${{ inputs.ref || github.sha }}"
     upload = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
     assert "inputs.artifact" in upload["with"]["name"]
@@ -700,9 +704,9 @@ def test_every_vsock_boot_is_preceded_by_the_device_provisioning():
         (REPO_ROOT / ".github/actions/collect-kernel-profile/action.yml").read_text(),
         Loader=yaml.BaseLoader,
     )
-    boots = [step["run"] for step in collect["runs"]["steps"] if "workload-bench" in step.get("run", "")]
+    boots = [step["run"] for step in collect["runs"]["steps"] if "collect-profile" in step.get("run", "")]
     assert boots
-    assert all('--rpc-transport "${{ steps.lane.outputs.rpc-transport }}"' in run for run in boots)
+    assert all('--lane "${{ inputs.lane }}"' in run for run in boots)
 
 
 def test_the_baseline_builds_against_the_fork_its_commit_pins(jobs):
@@ -743,9 +747,15 @@ def test_the_baseline_builds_against_the_fork_its_commit_pins(jobs):
         by_uses["./helios/.github/actions/bench-host"]["with"]["checkout-path"] == "${{ env.CHECKOUT_PATH }}"
     )
     assert (
-        by_uses["./helios/.github/actions/collect-kernel-profile"]["with"]["checkout-path"]
+        by_uses["./profile-tooling/.github/actions/collect-kernel-profile"]["with"]["checkout-path"]
         == "${{ env.CHECKOUT_PATH }}"
     )
+    collect = by_uses["./profile-tooling/.github/actions/collect-kernel-profile"]["with"]
+    assert collect["tooling-path"] == "profile-tooling"
+    tooling = next(
+        step for step in job["steps"] if step.get("name") == "Check out the shared collection tools"
+    )
+    assert tooling["with"]["ref"] == "${{ github.sha }}"
 
 
 def evaluate(expression: str, event_name: str, action: str = "", labels=(), label: str = "") -> bool:
