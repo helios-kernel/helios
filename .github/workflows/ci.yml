@@ -724,7 +724,7 @@ jobs:
         id: guest-image
         # A lane that failed before it built the inspector has nothing
         # to build an image with.
-        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch riscv64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
@@ -1227,7 +1227,7 @@ jobs:
         id: guest-image
         # A lane that failed before it built the inspector has nothing
         # to build an image with.
-        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch aarch64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
@@ -2466,7 +2466,7 @@ jobs:
         id: guest-image
         # A lane that failed before it built the inspector has nothing
         # to build an image with.
-        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch x86-64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
