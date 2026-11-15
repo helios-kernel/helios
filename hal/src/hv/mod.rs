@@ -214,6 +214,10 @@ pub unsafe trait GuestVcpu: Send + 'static {
         slice: Duration,
     ) -> Result<(), HvError>;
     fn run(&mut self) -> Result<VmExit, HvError>;
+    /// Wait for an architectural wake source while detached (for example a
+    /// guest timer). The runtime races this against externally injected IRQs.
+    /// Cancellation must retain the deadline and all pending interrupt state.
+    fn wait_for_interrupt(&mut self) -> impl Future<Output = Result<(), HvError>> + Send + '_;
     /// `false` leaves ownership with the caller: retry at an IRQ-window exit.
     fn inject_irq(&mut self, irq: VirtualIrq) -> Result<bool, HvError>;
     fn set_irq_window(&mut self, enabled: bool);

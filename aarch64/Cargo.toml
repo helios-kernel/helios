@@ -4,10 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-default = ["embedded-debugger"]
+default = ["embedded-debugger", "hv"]
+hv = ["dep:aarch64-paging", "dep:crossbeam-utils"]
 embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
+aarch64-paging = { version = "0.12.3", optional = true, default-features = false, features = ["alloc"] }
 acpi = { workspace = true, features = ["aml"] }
 helios-acpi.workspace = true
 arm-gic = "0.9.1"
@@ -16,6 +18,7 @@ arm-gic = "0.9.1"
 arm-sysregs = { version = "0.4.0", default-features = false, features = ["el1"] }
 bytes = { version = "1.12.1", default-features = false }
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
+crossbeam-utils = { workspace = true, optional = true }
 fdt = { version = "0.1.5", default-features = false }
 helios-artifact.workspace = true
 helios-firmware = { workspace = true, features = ["acpi", "devicetree"] }

@@ -1,7 +1,9 @@
 use concurrent_queue::{ConcurrentQueue, PushError};
 use core::num::NonZeroUsize;
+use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_utils::CachePadded;
+use futures::future::{Either, select};
 use helios_hal::cpu::{ProcessorId, current_processor};
 use helios_hal::hv::{GuestVcpu, HvError, Stage2Space, VcpuKick, VirtualIrq, VmExit};
 use triomphe::Arc;
@@ -160,7 +162,12 @@ impl<S: Stage2Space> Vcpu<S> {
                     if !self.signals.interrupted()
                         && (self.pending.is_some() || self.signals.irqs.is_empty())
                     {
-                        wake.await;
+                        let hardware = pin!(self.backend.wait_for_interrupt());
+                        let wake = pin!(wake);
+                        match select(wake, hardware).await {
+                            Either::Left(_) => {}
+                            Either::Right((result, _)) => result?,
+                        }
                     } else {
                         yield_now().await;
                     }
