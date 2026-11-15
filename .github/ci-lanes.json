@@ -36,7 +36,7 @@
   },
   "test-kernel": {
     "guest-wasm": "debug",
-    "command": "just test-kernel && just test-erofs-mkfs",
+    "command": "just test-kernel all",
     "rust-cache": true,
     "surfaces": ["x86", "hosted", "host_tools", "programs"]
   },

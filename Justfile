@@ -100,7 +100,8 @@ clippy-programs:
 # Unit and integration tests that need no emulator.
 test-units: test-kernel test-libraries test-host-tools
 
-test-kernel:
+# `all` also mounts intact and corrupted mkfs.erofs images and needs erofs-utils.
+test-kernel run_ignored="default":
     #!/usr/bin/env bash
     set -euo pipefail
     target="$(rustc -vV | sed -n 's/^host: //p')"
@@ -112,7 +113,7 @@ test-kernel:
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel --lib
+    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel --lib --run-ignored "{{ run_ignored }}"
     cargo nextest run -p helios-kernel --test hal_layering
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and
@@ -203,22 +204,6 @@ acpi-tables-fetch:
         fi
         mv "${file}.part" "${file}"
     done < "{{ repo_root }}/acpi/tests/qemu-tables.sha256"
-
-# Mount the EROFS images `mkfs.erofs` builds, intact and corrupted. Needs
-# erofs-utils on PATH; the `erofs-rs` builder's images run in test-units.
-test-erofs-mkfs:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    target="$(rustc -vV | sed -n 's/^host: //p')"
-    out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
-        --out-dir "${out_dir}" \
-        --target "${target}" \
-        --profile "{{ default_profile }}" \
-        --cargo cargo
-    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    cargo nextest run -p helios-kernel --lib --run-ignored ignored-only -E 'test(/^vfs::erofs::tests::mkfs::/)'
 
 # Prepare the trusted root for `target` and lint the kernel and backend.
 # Usage: just clippy-target riscv64gc-unknown-none-elf helios-riscv
