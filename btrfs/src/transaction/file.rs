@@ -6,11 +6,11 @@ use core::{num::NonZeroUsize, ops::Range};
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
-use super::namespace::time;
+use super::namespace::{check_flags, time};
 use crate::accounting::DataWrite;
 use crate::allocation::data::DataReference;
 use crate::compress::write::{Encoder, Plain};
-use crate::items::{FileExtent, INODE_NODATASUM, Metadata};
+use crate::items::{FileExtent, INODE_APPEND, INODE_IMMUTABLE, INODE_NODATASUM, Metadata};
 use crate::ondisk::{
     MAX_COMPRESSED_EXTENT, RawFileExtentBody, RawFileExtentHead, RawHeader, RawInodeItem, RawItem,
     RawTimespec, item_type, view,
@@ -87,6 +87,17 @@ impl<S: BlockSink> Transaction<'_, S> {
         mut options: WriteOptions<E>,
     ) -> Result<usize, WriteError> {
         let (mut raw, metadata) = self.file_inode(tree, inode).await?;
+        check_flags(
+            tree,
+            inode,
+            metadata.flags,
+            INODE_IMMUTABLE
+                | if offset == metadata.size {
+                    0
+                } else {
+                    INODE_APPEND
+                },
+        )?;
         let when = time(tree, inode, options.when)?;
         if metadata.flags & INODE_NODATASUM != 0 && E::ALGORITHM.is_some() {
             return Err(WriteError::CompressionWithoutChecksums);
@@ -211,6 +222,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         concurrency: NonZeroUsize,
     ) -> Result<(), WriteError> {
         let (mut raw, metadata) = self.file_inode(tree, inode).await?;
+        check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
         let mut options = WriteOptions::plain(when, concurrency);
         let when = time(tree, inode, when)?;
         let sector = u64::from(self.volume.superblock().sectorsize());

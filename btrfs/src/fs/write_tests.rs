@@ -1643,6 +1643,262 @@ async fn exercise_extent_cuts(
 
 #[cfg(feature = "write")]
 #[test]
+fn inode_flags_preserve_immutable_and_append_only_semantics() {
+    block_on(exercise_inode_flags(|_| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn inode_flag_mutations_pass_btrfs_check() {
+    block_on(exercise_inode_flags(assert_btrfs_check));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
+    use super::writer::Writer;
+    use crate::transaction::namespace::{Attributes, Name};
+    use crate::transaction::reflink::{CloneRange, FileId};
+    use btrfs_disk::items::{InodeFlags, Timespec};
+    let stamp = Timestamp::from_secs(1_700_000_000);
+    let named = tempfile::NamedTempFile::new().unwrap();
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, stamp));
+    let (formatted, _) = filesystem_image_tree_file(true, true, tree, named.reopen().unwrap());
+    let root = formatted.root().await.unwrap();
+    let tree = root.tree();
+    let first = root.number() + 1;
+    drop(formatted);
+    let mut external =
+        btrfs_transaction::filesystem::Filesystem::open(named.reopen().unwrap()).unwrap();
+    let mut fixture = btrfs_transaction::transaction::Transaction::start(&mut external).unwrap();
+    let initial = b"initial";
+    let timestamp = Timespec {
+        sec: 1_700_000_000,
+        nsec: 0,
+    };
+    let mut ids = BTreeMap::new();
+    for (index, (name, mode, flags, parent)) in [
+        ("immutable", 0o100644, InodeFlags::IMMUTABLE, root.number()),
+        ("append", 0o100644, InodeFlags::APPEND, root.number()),
+        (
+            "immutable-dir",
+            0o040755,
+            InodeFlags::IMMUTABLE,
+            root.number(),
+        ),
+        ("append-dir", 0o040755, InodeFlags::APPEND, root.number()),
+        ("child", 0o100644, InodeFlags::empty(), first + 3),
+        ("plain", 0o100644, InodeFlags::empty(), root.number()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let inode = first + index as u64;
+        let directory = mode & 0o170000 == 0o040000;
+        let mut attributes = btrfs_transaction::inode::InodeArgs::new(fixture.transid, mode)
+            .with_uniform_time(timestamp);
+        attributes.flags = flags;
+        if !directory {
+            attributes.size = initial.len() as u64;
+            attributes.nbytes = initial.len() as u64;
+        }
+        fixture
+            .create_inode(&mut external, tree, inode, &attributes)
+            .unwrap();
+        if !directory {
+            fixture
+                .insert_inline_extent(&mut external, tree, inode, 0, initial, None)
+                .unwrap();
+        }
+        fixture
+            .link_dir_entry(
+                &mut external,
+                tree,
+                parent,
+                inode,
+                name.as_bytes(),
+                if directory { 2 } else { 1 },
+                index as u64 + 2,
+                timestamp,
+            )
+            .unwrap();
+        ids.insert(name, FileId { tree, inode });
+    }
+    fixture.commit(&mut external).unwrap();
+    drop(external);
+    verify(named.path());
+    let mut writer = Writer::mount(Disk(named.reopen().unwrap())).await.unwrap();
+    let base = writer.snapshot().unwrap();
+    let root = base.root().await.unwrap();
+    let when = crate::Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 123,
+    };
+    let concurrency = std::thread::available_parallelism().unwrap();
+    let name = |parent, bytes| Name {
+        tree,
+        parent,
+        bytes,
+    };
+    let attributes = || Attributes {
+        mode: 0o100644,
+        uid: 1000,
+        gid: 1000,
+    };
+    macro_rules! refused {
+        ($tx:ident, $operation:expr) => {{
+            let $tx = writer.begin().await.unwrap();
+            assert!(matches!(
+                $operation.await,
+                Err(WriteError::InodeFlags { .. })
+            ));
+            assert_eq!(writer.snapshot().unwrap().snapshot, base.snapshot);
+        }};
+    }
+    for label in ["immutable", "append"] {
+        let file = ids[label];
+        refused!(
+            tx,
+            tx.write_file(file, 0, b"replace", WriteOptions::plain(when, concurrency))
+        );
+        refused!(tx, tx.truncate_file(file, 0, when, concurrency));
+        refused!(tx, tx.set_times(file, Some(when), None, when));
+        refused!(
+            tx,
+            tx.hard_link(name(root.number(), b"alias"), file.inode, when)
+        );
+        refused!(
+            tx,
+            tx.unlink_name(name(root.number(), label.as_bytes()), when)
+        );
+        refused!(
+            tx,
+            tx.rename(
+                name(root.number(), label.as_bytes()),
+                name(root.number(), b"renamed"),
+                when
+            )
+        );
+        refused!(
+            tx,
+            tx.clone_range(
+                CloneRange {
+                    source: ids["plain"],
+                    destination: file,
+                    source_offset: 0,
+                    destination_offset: 0,
+                    length: initial.len() as u64
+                },
+                when,
+                concurrency
+            )
+        );
+    }
+    refused!(
+        tx,
+        tx.write_file(
+            ids["immutable"],
+            initial.len() as u64,
+            b"more",
+            WriteOptions::plain(when, concurrency)
+        )
+    );
+    let immutable_dir = ids["immutable-dir"].inode;
+    refused!(
+        tx,
+        tx.create_node(name(immutable_dir, b"new"), attributes(), when)
+    );
+    refused!(
+        tx,
+        tx.hard_link(name(immutable_dir, b"alias"), ids["plain"].inode, when)
+    );
+    refused!(
+        tx,
+        tx.symlink(name(immutable_dir, b"link"), b"target", attributes(), when)
+    );
+    let append_dir = ids["append-dir"].inode;
+    refused!(tx, tx.unlink_name(name(append_dir, b"child"), when));
+    refused!(
+        tx,
+        tx.rename(
+            name(append_dir, b"child"),
+            name(root.number(), b"moved"),
+            when
+        )
+    );
+    assert!(
+        writer
+            .snapshot()
+            .unwrap()
+            .lookup(&root, b"moved")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    verify(named.path());
+    let (tx, _) = writer
+        .begin()
+        .await
+        .unwrap()
+        .write_file(
+            ids["append"],
+            initial.len() as u64,
+            b" added",
+            WriteOptions::plain(when, concurrency),
+        )
+        .await
+        .unwrap();
+    let (tx, _) = tx
+        .create_node(name(append_dir, b"new"), attributes(), when)
+        .await
+        .unwrap();
+    let tx = tx
+        .hard_link(name(append_dir, b"alias"), ids["plain"].inode, when)
+        .await
+        .unwrap();
+    let (tx, _) = tx
+        .symlink(name(append_dir, b"link"), b"child", attributes(), when)
+        .await
+        .unwrap();
+    // Immutable sources may be cloned; the new file has independent flags.
+    let tx = tx
+        .clone_range(
+            CloneRange {
+                source: ids["immutable"],
+                destination: ids["plain"],
+                source_offset: 0,
+                destination_offset: 0,
+                length: initial.len() as u64,
+            },
+            when,
+            concurrency,
+        )
+        .await
+        .unwrap();
+    tx.commit(|| panic!("valid fixture UUID"), concurrency)
+        .await
+        .unwrap();
+    verify(named.path());
+    let current = writer.snapshot().unwrap();
+    let inode = current.resolve(b"/append").await.unwrap();
+    let mut output = [0; 13];
+    assert_eq!(
+        current.read(&inode, 0, &mut output).await.unwrap(),
+        output.len()
+    );
+    assert_eq!(&output, b"initial added");
+    let immutable = current.resolve(b"/immutable").await.unwrap();
+    assert_eq!(immutable.metadata().flags, InodeFlags::IMMUTABLE.bits());
+    let mut output = [0; 7];
+    current.read(&immutable, 0, &mut output).await.unwrap();
+    assert_eq!(&output, initial);
+    current.resolve(b"/append-dir/new").await.unwrap();
+    current.resolve(b"/append-dir/alias").await.unwrap();
+    assert!(base.lookup(&root, b"renamed").await.unwrap().is_none());
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn reader_accepts_compat_ro_features_that_the_writer_refuses() {
     use super::writer::Writer;
     use btrfs_disk::superblock::{read_superblock, write_superblock_all_mirrors};

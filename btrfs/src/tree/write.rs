@@ -17,6 +17,8 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[error("inode {inode} in tree {tree} forbids this mutation with flags {flags:#x}")]
+    InodeFlags { tree: u64, inode: u64, flags: u64 },
     #[error("read-write mount does not support compat-ro feature {name} ({bit:#x})")]
     UnsupportedCompatRo { name: &'static str, bit: u64 },
     #[error("subvolume {tree} is read-only")]

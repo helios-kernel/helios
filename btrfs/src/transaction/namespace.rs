@@ -7,7 +7,7 @@ use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
 use crate::csum::{inode_ref_hash, name_hash};
-use crate::items::{RecordKind, dir_index_record, dir_records};
+use crate::items::{INODE_APPEND, INODE_IMMUTABLE, RecordKind, dir_index_record, dir_records};
 use crate::ondisk::{
     NAME_MAX, RawDirItem, RawFileExtentHead, RawHeader, RawInodeExtref, RawInodeItem, RawInodeRef,
     RawItem, RawKey, RawTimespec, item_type, objectid, view,
@@ -37,6 +37,19 @@ fn validate_name(name: &[u8]) -> Result<(), WriteError> {
         || name.iter().any(|byte| *byte == 0 || *byte == b'/')
     {
         return Err(WriteError::InvalidName);
+    }
+    Ok(())
+}
+
+pub(super) fn check_flags(
+    tree: u64,
+    inode: u64,
+    flags: u64,
+    forbidden: u64,
+) -> Result<(), WriteError> {
+    let flags = flags & forbidden;
+    if flags != 0 {
+        return Err(WriteError::InodeFlags { tree, inode, flags });
     }
     Ok(())
 }
@@ -121,7 +134,8 @@ impl<S: BlockSink> Transaction<'_, S> {
         modified: Option<Timestamp>,
         changed: Timestamp,
     ) -> Result<(), WriteError> {
-        let (mut raw, _) = self.inode_item(tree, inode).await?;
+        let (mut raw, metadata) = self.inode_item(tree, inode).await?;
+        check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
         let changed = time(tree, inode, changed)?;
         if let Some(access) = access {
             raw.atime = time(tree, inode, access)?;
@@ -376,6 +390,12 @@ impl<S: BlockSink> Transaction<'_, S> {
         } = name;
         let timestamp = time(tree, parent, when)?;
         let (mut directory, parent_metadata) = self.inode_item(tree, parent).await?;
+        check_flags(
+            tree,
+            parent,
+            parent_metadata.flags,
+            INODE_IMMUTABLE | INODE_APPEND,
+        )?;
         if parent_metadata.kind != FileKind::Directory {
             return Err(Error::WrongKind {
                 tree,
@@ -412,6 +432,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         }
         let inode = location.objectid;
         let (mut raw, metadata) = self.inode_item(tree, inode).await?;
+        check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
         if metadata.kind != kind || raw.nlink.get() == 0 {
             return Err(WriteError::NamespaceMismatch {
                 tree,
@@ -574,6 +595,8 @@ impl<S: BlockSink> Transaction<'_, S> {
         } = name;
         let timestamp = time(tree, inode, when)?;
         let (mut directory, metadata) = self.inode_item(tree, parent).await?;
+        check_flags(tree, parent, metadata.flags, INODE_IMMUTABLE)?;
+        check_flags(tree, inode, raw.flags.get(), INODE_IMMUTABLE | INODE_APPEND)?;
         if metadata.kind != FileKind::Directory {
             return Err(Error::WrongKind {
                 tree,

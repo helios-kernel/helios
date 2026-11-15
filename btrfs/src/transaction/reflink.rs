@@ -9,10 +9,10 @@ use core::num::NonZeroUsize;
 use super::Transaction;
 use super::extents::Mapping;
 use super::file::{WriteOptions, aligned_end};
-use super::namespace::time;
+use super::namespace::{check_flags, time};
 use crate::accounting::DataChange;
 use crate::allocation::data::DataReference;
-use crate::items::{ExtentData, FileExtent, INODE_NODATASUM};
+use crate::items::{ExtentData, FileExtent, INODE_APPEND, INODE_IMMUTABLE, INODE_NODATASUM};
 use crate::ondisk::{MAX_COMPRESSED_EXTENT, item_type};
 use crate::source::BlockSink;
 use crate::tree::Cursor;
@@ -51,6 +51,12 @@ impl<S: BlockSink> Transaction<'_, S> {
         let (_, source_metadata) = self.file_inode(source.tree, source.inode).await?;
         let (mut raw, destination_metadata) =
             self.file_inode(destination.tree, destination.inode).await?;
+        check_flags(
+            destination.tree,
+            destination.inode,
+            destination_metadata.flags,
+            INODE_IMMUTABLE | INODE_APPEND,
+        )?;
         let timestamp = time(destination.tree, destination.inode, when)?;
         let source_end = source_offset
             .checked_add(length)
