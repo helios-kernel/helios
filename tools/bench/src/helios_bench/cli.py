@@ -14,6 +14,7 @@ from helios_bench.baseline import resolve as resolve_baseline
 from helios_bench.gate import gate_report
 from helios_bench.manifest import host_deviations, load_manifest
 from helios_bench.plots import plot_report
+from helios_bench.profile import collect_workloads
 from helios_bench.render import (
     marked_section,
     render_docs_results,
@@ -106,6 +107,19 @@ def command_lanes(args: argparse.Namespace) -> int:
     else:
         for lane in lanes:
             print(lane.name)
+    return 0
+
+
+def command_collect_profile(args: argparse.Namespace) -> int:
+    collect_workloads(
+        load_manifest().lane(args.lane),
+        args.checkout_path.resolve(),
+        args.output.resolve(),
+        args.net_ifname,
+        args.net_bridge,
+        args.net_queues,
+        args.timeout_seconds,
+    )
     return 0
 
 
@@ -227,6 +241,16 @@ def command_symbols(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="helios-bench", description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
+
+    profile = subcommands.add_parser("collect-profile", help="collect all workload instrumentation")
+    profile.add_argument("--lane", required=True)
+    profile.add_argument("--checkout-path", type=Path, required=True)
+    profile.add_argument("--output", type=Path, required=True)
+    profile.add_argument("--net-ifname", required=True)
+    profile.add_argument("--net-bridge", required=True)
+    profile.add_argument("--net-queues", type=int, required=True)
+    profile.add_argument("--timeout-seconds", type=int, required=True)
+    profile.set_defaults(func=command_collect_profile)
 
     run = subcommands.add_parser("run", help="time every side on one lane and write report.json")
     run.add_argument("--lane", required=True)
