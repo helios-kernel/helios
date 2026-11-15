@@ -72,6 +72,9 @@ unsafe impl GuestVcpu for Infallible {
     fn run(&mut self) -> Result<VmExit, HvError> {
         match *self {}
     }
+    async fn wait_for_interrupt(&mut self) -> Result<(), HvError> {
+        match *self {}
+    }
     fn inject_irq(&mut self, _: VirtualIrq) -> Result<bool, HvError> {
         match *self {}
     }

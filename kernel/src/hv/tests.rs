@@ -49,6 +49,8 @@ pub(crate) struct TestSpace {
     revocation_started: Notify,
     dropped: Arc<AtomicBool>,
     irq_on_exit: IrqSafeMutex<Option<VcpuControl<TestKick>>>,
+    architectural_wake: Notify,
+    architectural_waiters: AtomicUsize,
 }
 impl TestSpace {
     fn new(exits: impl IntoIterator<Item = VmExit>) -> Self {
@@ -64,6 +66,8 @@ impl TestSpace {
             revocation_started: Notify::new(),
             dropped: Arc::new(AtomicBool::new(false)),
             irq_on_exit: IrqSafeMutex::new(None),
+            architectural_wake: Notify::new(),
+            architectural_waiters: AtomicUsize::new(0),
         }
     }
 }
@@ -146,6 +150,20 @@ impl helios_hal::hv::GuestRegisters for TestRegisters {
 unsafe impl GuestVcpu for TestVcpu {
     type Registers = TestRegisters;
     type Kick = TestKick;
+    async fn wait_for_interrupt(&mut self) -> Result<(), HvError> {
+        struct Registration<'a>(&'a AtomicUsize);
+        impl Drop for Registration<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        self.space
+            .architectural_waiters
+            .fetch_add(1, Ordering::Relaxed);
+        let _registration = Registration(&self.space.architectural_waiters);
+        self.space.architectural_wake.notified().await;
+        Ok(())
+    }
     fn kick_handle(&self) -> Arc<TestKick> {
         self.kick.clone()
     }
@@ -622,5 +640,67 @@ fn masked_pending_irq_does_not_busy_reenter_a_halted_guest() {
     assert_eq!(
         vm.shared.space.interrupts.with(|irqs| irqs.clone()),
         vec![irq(), irq()]
+    );
+}
+
+#[test]
+fn architectural_timer_wakes_halted_vcpu() {
+    let mut vm = vm([VmExit::Halt, VmExit::Shutdown], 0);
+    let mut cpu = vcpu(&mut vm);
+    let mut run = core::pin::pin!(cpu.run_vcpu());
+    assert!(poll(run.as_mut()).is_pending());
+    assert!(poll(run.as_mut()).is_pending());
+    assert_eq!(vm.shared.space.entries.with(|entries| entries.len()), 1);
+    assert_eq!(
+        vm.shared
+            .space
+            .architectural_waiters
+            .load(Ordering::Relaxed),
+        1
+    );
+    vm.shared.space.architectural_wake.notify_all();
+    assert_eq!(poll(run.as_mut()), Poll::Ready(Ok(VmExit::Shutdown)));
+    assert_eq!(
+        vm.shared
+            .space
+            .architectural_waiters
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[test]
+fn cancelling_halt_releases_architectural_timer_wait() {
+    let mut vm = vm([VmExit::Halt, VmExit::Halt], 0);
+    let mut cpu = vcpu(&mut vm);
+    {
+        let mut run = core::pin::pin!(cpu.run_vcpu());
+        assert!(poll(run.as_mut()).is_pending());
+        assert_eq!(
+            vm.shared
+                .space
+                .architectural_waiters
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+    assert_eq!(
+        vm.shared
+            .space
+            .architectural_waiters
+            .load(Ordering::Relaxed),
+        0
+    );
+    let control = cpu.control();
+    let mut run = core::pin::pin!(cpu.run_vcpu());
+    assert!(poll(run.as_mut()).is_pending());
+    control.stop();
+    assert_eq!(poll(run.as_mut()), Poll::Ready(Ok(VmExit::Shutdown)));
+    assert_eq!(
+        vm.shared
+            .space
+            .architectural_waiters
+            .load(Ordering::Relaxed),
+        0
     );
 }
