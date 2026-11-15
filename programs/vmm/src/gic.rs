@@ -240,3 +240,55 @@ impl Gic {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_api::hv::IoWrite;
+
+    #[test]
+    fn sgi_routes_target_list_and_all_others() {
+        let mut gic = Gic::new(3);
+        gic.sgi(0, (5 << 24) | 0b110);
+        assert_eq!(gic.local[0].pending, 0);
+        assert_eq!(gic.local[1].pending, 1 << 5);
+        assert_eq!(gic.local[2].pending, 1 << 5);
+        gic.sgi(1, (1 << 40) | (7 << 24));
+        assert_eq!(gic.local[0].pending, 1 << 7);
+        assert_eq!(gic.local[1].pending, 1 << 5);
+        assert_eq!(gic.local[2].pending, (1 << 5) | (1 << 7));
+        // No CPUs in Aff1=1 exist in the advertised single-cluster topology.
+        gic.sgi(0, (9 << 24) | (1 << 16) | 0xffff);
+        assert!(gic.local.iter().all(|bank| bank.pending & (1 << 9) == 0));
+    }
+
+    #[test]
+    fn redistributors_have_distinct_affinity_and_last_flags() {
+        let mut gic = Gic::new(2);
+        let read = IoAccess::Read(IoWidth::Qword);
+        let first = gic.access(GICR + 8, read).unwrap();
+        let second = gic.access(GICR + 0x20000 + 8, read).unwrap();
+        assert_eq!(first >> 32, 0);
+        assert_eq!(second >> 32, 1);
+        assert_eq!(first & 16, 0);
+        assert_eq!(second & 16, 16);
+        gic.access(
+            GICR + 0x14,
+            IoAccess::Write(IoWrite {
+                width: IoWidth::Dword,
+                value: 0,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            gic.access(GICR + 0x14, IoAccess::Read(IoWidth::Dword))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            gic.access(GICR + 0x20000 + 0x14, IoAccess::Read(IoWidth::Dword))
+                .unwrap(),
+            6
+        );
+    }
+}

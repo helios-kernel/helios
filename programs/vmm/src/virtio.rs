@@ -449,6 +449,22 @@ mod tests {
         ram.write(u64::from(index) * 16, &bytes).unwrap();
     }
     #[test]
+    fn rejects_reconfiguring_an_enabled_ring() {
+        let (ram, queue) = ring();
+        let mut device = Device::console();
+        device.queues[0] = queue;
+        let write = IoAccess::Write(helios_api::hv::IoWrite {
+            width: IoWidth::Dword,
+            value: u64::MAX,
+        });
+        assert!(matches!(
+            device.access(0x080, write, 0, &ram),
+            Err(Error::Queue(_))
+        ));
+        assert_eq!(device.queues[0].descriptor, 0);
+    }
+
+    #[test]
     fn rejects_cyclic_and_out_of_ram_chains() {
         let (ram, mut queue) = ring();
         ram.write(130, &1u16.to_le_bytes()).unwrap();

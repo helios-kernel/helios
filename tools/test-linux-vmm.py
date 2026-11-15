@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--cpus", type=int, default=2)
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--acpi", action="store_true")
+    parser.add_argument("--gdb")
     args = parser.parse_args()
     if args.deadline_seconds <= 0 or args.cpus < 1:
         parser.error("deadline and cpus must be positive")
@@ -37,6 +38,8 @@ def main():
         command.append("--no-build")
     if args.acpi:
         command.append("--acpi")
+    if args.gdb:
+        command.extend(["--gdb", args.gdb])
     # Input is queued until Linux opens the virtio console; no sleep or
     # serial side channel is needed to guess when its shell becomes ready.
     script = Path(__file__).with_name("linux-vmm-commands").read_text()
@@ -69,6 +72,8 @@ def main():
             expected = ["HELIOS_LINUX_READY", "\nHELIOS_ARCH_aarch64\n",
                         f"\nHELIOS_CPUS_{args.cpus}\n", "\nHELIOS_BLOCK_OK\n",
                         "vmm: guest requested shutdown"]
+            if args.cpus > 1:
+                expected.append("\nHELIOS_CPU_HOTPLUG_OK\n")
             missing = [marker.strip() for marker in expected if marker not in text]
             if code != 0 or missing:
                 raise RuntimeError(f"Linux test exit={code}, missing={missing}; see {log.name}")

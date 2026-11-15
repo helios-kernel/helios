@@ -137,21 +137,53 @@ impl Vgic {
         Ok(true)
     }
 
-    /// ICC_CTLR is trapped with TC alongside SGIs. Keep its writable
-    /// CBPR/EOImode fields in ICH_VMCR, where the virtual interface uses them.
-    pub(super) fn control(&mut self, access: IoAccess) -> u64 {
-        match access {
-            IoAccess::Read { .. } => {
-                ((self.capabilities.priority_bits as u64 - 1) << 8)
-                    | ((self.vmcr >> 4) & 1)
-                    | (((self.vmcr >> 9) & 1) << 1)
+    /// TC traps the common CPU-interface registers alongside SGIs. Their
+    /// state is already banked in VMCR/APRs; IAR/EOIR/DIR stay in hardware.
+    pub(super) fn register(&mut self, encoding: u32, access: IoAccess) -> Option<u64> {
+        let (register, shift, mask) = match encoding {
+            0xc230 => (&mut self.vmcr, 24, 0xff), // ICC_PMR_EL1 / VPMR.
+            0xc643 => (&mut self.vmcr, 21, 7),    // ICC_BPR0_EL1 / VBPR0.
+            0xc663 => (&mut self.vmcr, 18, 7),    // ICC_BPR1_EL1 / VBPR1.
+            0xc666 => (&mut self.vmcr, 0, 1),     // ICC_IGRPEN0_EL1 / VENG0.
+            0xc667 => (&mut self.vmcr, 1, 1),     // ICC_IGRPEN1_EL1 / VENG1.
+            0xc644..=0xc64b => {
+                let index = (encoding & 3) as usize;
+                if index >= self.capabilities.aprs {
+                    // GICv3 APR banks beyond the implemented priority bits
+                    // are RAZ/WI, and are never installed on the hardware.
+                    return Some(0);
+                }
+                let bank = if encoding < 0xc648 {
+                    &mut self.ap0
+                } else {
+                    &mut self.ap1
+                };
+                (&mut bank[index], 0, u64::MAX)
             }
+            0xc664 => {
+                return Some(match access {
+                    IoAccess::Read { .. } => {
+                        ((self.capabilities.priority_bits as u64 - 1) << 8)
+                            | ((self.vmcr >> 4) & 1)
+                            | (((self.vmcr >> 9) & 1) << 1)
+                    }
+                    IoAccess::Write { value, .. } => {
+                        self.vmcr = (self.vmcr & !((1 << 4) | (1 << 9)))
+                            | ((value & 1) << 4)
+                            | ((value & 2) << 8);
+                        0
+                    }
+                });
+            }
+            _ => return None,
+        };
+        Some(match access {
+            IoAccess::Read { .. } => (*register >> shift) & mask,
             IoAccess::Write { value, .. } => {
-                self.vmcr =
-                    (self.vmcr & !((1 << 4) | (1 << 9))) | ((value & 1) << 4) | ((value & 2) << 8);
+                *register = (*register & !(mask << shift)) | ((value & mask) << shift);
                 0
             }
-        }
+        })
     }
 
     pub(super) fn set_window(&mut self, enabled: bool) {
