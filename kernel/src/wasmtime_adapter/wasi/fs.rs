@@ -698,19 +698,63 @@ where
 
 /// Sets the times of the object at `path` below `base`; `None` leaves one
 /// alone.
-pub(crate) async fn set_times_at<StorageImpl>(
+pub struct PreparedSetTimesAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedSetTimesAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Retime>,
+        path: &str,
+        access_nanos: Option<u64>,
+        modified_nanos: Option<u64>,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_path(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            access_nanos,
+            modified_nanos,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        set_times_of(
+            &self.namespace,
+            &self.absolute,
+            self.access_nanos,
+            self.modified_nanos,
+            self.now,
+        )
+        .await
+    }
+}
+
+pub(crate) async fn set_times_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Retime>,
     path: &str,
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_path(base.descriptor(), path)?;
-    set_times_of(namespace, &absolute, access_nanos, modified_nanos, now).await
+) -> FsOpResult<()> {
+    PreparedSetTimesAt::new(
+        namespace.clone(),
+        base,
+        path,
+        access_nanos,
+        modified_nanos,
+        now,
+    )?
+    .execute()
+    .await
 }
 
 async fn set_times_of<StorageImpl>(
@@ -759,145 +803,319 @@ where
     Ok(entries)
 }
 
-pub(crate) async fn create_directory_at<StorageImpl>(
+pub struct PreparedCreateDirectoryAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedCreateDirectoryAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Mutate>,
+        path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_path(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        let resolved = resolve(&self.namespace, &self.absolute)?;
+        if resolved.is_mount_root() {
+            return Err(fs_types::ErrorCode::Exist);
+        }
+        resolved
+            .writable()
+            .map_err(fs_error_code)?
+            .create_directory(resolved.path(), self.now)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn create_directory_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_path(base.descriptor(), path)?;
-    let resolved = resolve(namespace, &absolute)?;
-    if resolved.is_mount_root() {
-        return Err(fs_types::ErrorCode::Exist);
-    }
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .create_directory(resolved.path(), now)
+) -> FsOpResult<()> {
+    PreparedCreateDirectoryAt::new(namespace.clone(), base, path, now)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
-pub(crate) async fn remove_directory_at<StorageImpl>(
+pub struct PreparedRemoveDirectoryAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+}
+
+impl<StorageImpl: crate::Storage> PreparedRemoveDirectoryAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Mutate>,
+        path: &str,
+    ) -> FsOpResult<Self> {
+        let absolute = child_below(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        self.namespace
+            .remove_directory(&self.absolute)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn remove_directory_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_below(base.descriptor(), path)?;
-    namespace
-        .remove_directory(&absolute)
+) -> FsOpResult<()> {
+    PreparedRemoveDirectoryAt::new(namespace.clone(), base, path)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
-pub(crate) async fn unlink_file_at<StorageImpl>(
+pub struct PreparedUnlinkFileAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+}
+
+impl<StorageImpl: crate::Storage> PreparedUnlinkFileAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Mutate>,
+        path: &str,
+    ) -> FsOpResult<Self> {
+        let absolute = child_below(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        let resolved = resolve(&self.namespace, &self.absolute)?;
+        if resolved.is_mount_root() {
+            return Err(fs_types::ErrorCode::IsDirectory);
+        }
+        resolved
+            .writable()
+            .map_err(fs_error_code)?
+            .unlink(resolved.path())
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn unlink_file_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_below(base.descriptor(), path)?;
-    let resolved = resolve(namespace, &absolute)?;
-    if resolved.is_mount_root() {
-        return Err(fs_types::ErrorCode::IsDirectory);
-    }
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .unlink(resolved.path())
+) -> FsOpResult<()> {
+    PreparedUnlinkFileAt::new(namespace.clone(), base, path)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
 /// Renames within one mount; across two, `cross-device`. A rename is a link
 /// that also removes the source entry, so it follows the link's rule.
-pub(crate) async fn rename_at<StorageImpl>(
+pub struct PreparedRenameAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    destination: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedRenameAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        rename: RenameGrant<'_, '_>,
+        source_path: &str,
+        destination_path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_below(rename.source(), source_path)?;
+        let destination = child_below(rename.destination(), destination_path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            destination,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        self.namespace
+            .rename(&self.absolute, &self.destination, self.now)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn rename_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     rename: RenameGrant<'_, '_>,
     source_path: &str,
     destination_path: &str,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let source = child_below(rename.source(), source_path)?;
-    let destination = child_below(rename.destination(), destination_path)?;
-    namespace
-        .rename(&source, &destination, now)
-        .await
-        .map_err(fs_error_code)
+) -> FsOpResult<()> {
+    PreparedRenameAt::new(
+        namespace.clone(),
+        rename,
+        source_path,
+        destination_path,
+        now,
+    )?
+    .execute()
+    .await
 }
 
 /// Links within one mount; across two, `cross-device`.
-pub(crate) async fn link_at<StorageImpl>(
+pub struct PreparedLinkAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    destination: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedLinkAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        link: AliasGrant<'_, '_>,
+        source_path: &str,
+        destination_path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_path(link.source(), source_path)?;
+        let destination = child_path(link.destination(), destination_path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            destination,
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        self.namespace
+            .link(&self.absolute, &self.destination, self.now)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn link_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     link: AliasGrant<'_, '_>,
     source_path: &str,
     destination_path: &str,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let source = child_path(link.source(), source_path)?;
-    let destination = child_path(link.destination(), destination_path)?;
-    namespace
-        .link(&source, &destination, now)
+) -> FsOpResult<()> {
+    PreparedLinkAt::new(namespace.clone(), link, source_path, destination_path, now)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
 /// Creates a symbolic link at `path` below `base` whose target text is
 /// `target`. The target must name something inside the link's directory.
-pub(crate) async fn symlink_at<StorageImpl>(
+pub struct PreparedSymlinkAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+    target: String,
+    now: u64,
+}
+
+impl<StorageImpl: crate::Storage> PreparedSymlinkAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Mutate>,
+        target: &str,
+        path: &str,
+        now: u64,
+    ) -> FsOpResult<Self> {
+        let absolute = child_below(base.descriptor(), path)?;
+        crate::symlink_target(&absolute, target).map_err(fs_error_code)?;
+        Ok(Self {
+            namespace,
+            absolute,
+            target: target.to_owned(),
+            now,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<()> {
+        let resolved = resolve(&self.namespace, &self.absolute)?;
+        resolved
+            .writable()
+            .map_err(fs_error_code)?
+            .symlink(&self.target, resolved.path(), self.now)
+            .await
+            .map_err(fs_error_code)
+    }
+}
+
+pub(crate) async fn symlink_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     target: &str,
     path: &str,
     now: u64,
-) -> FsOpResult<()>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_below(base.descriptor(), path)?;
-    crate::symlink_target(&absolute, target).map_err(fs_error_code)?;
-    let resolved = resolve(namespace, &absolute)?;
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .symlink(target, resolved.path(), now)
+) -> FsOpResult<()> {
+    PreparedSymlinkAt::new(namespace.clone(), base, target, path, now)?
+        .execute()
         .await
-        .map_err(fs_error_code)
 }
 
 /// The target text of the symbolic link at `path` below `base`, refused
 /// when it would name something outside the link's directory.
-pub(crate) async fn readlink_at<StorageImpl>(
+pub struct PreparedReadlinkAt<StorageImpl: crate::Storage> {
+    namespace: Namespace<StorageImpl>,
+    absolute: String,
+}
+
+impl<StorageImpl: crate::Storage> PreparedReadlinkAt<StorageImpl> {
+    pub(crate) fn new(
+        namespace: Namespace<StorageImpl>,
+        base: Granted<'_, Directory, Read>,
+        path: &str,
+    ) -> FsOpResult<Self> {
+        let absolute = child_path(base.descriptor(), path)?;
+        Ok(Self {
+            namespace,
+            absolute,
+        })
+    }
+
+    pub(crate) async fn execute(self) -> FsOpResult<String> {
+        let resolved = resolve(&self.namespace, &self.absolute)?;
+        let target = resolved
+            .fs()
+            .read_link(resolved.path())
+            .await
+            .map_err(fs_error_code)?;
+        crate::symlink_target(resolved.absolute(), &target).map_err(fs_error_code)?;
+        Ok(target)
+    }
+}
+
+pub(crate) async fn readlink_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Read>,
     path: &str,
-) -> FsOpResult<String>
-where
-    StorageImpl: crate::Storage,
-{
-    let absolute = child_path(base.descriptor(), path)?;
-    let resolved = resolve(namespace, &absolute)?;
-    let target = resolved
-        .fs()
-        .read_link(resolved.path())
+) -> FsOpResult<String> {
+    PreparedReadlinkAt::new(namespace.clone(), base, path)?
+        .execute()
         .await
-        .map_err(fs_error_code)?;
-    crate::symlink_target(resolved.absolute(), &target).map_err(fs_error_code)?;
-    Ok(target)
 }
 
 /// Makes the descriptor's object durable: its data, and its metadata
@@ -1674,16 +1892,25 @@ where
         Ok(self::sync(&namespace, &descriptor, false).await?)
     }
 
-    async fn create_directory_at(
-        accessor: &Accessor<U, Self>,
+    type CreateDirectoryAtPrepared = FsOpResult<PreparedCreateDirectoryAt<StorageImpl>>;
+    fn prepare_create_directory_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
-        path: String,
+        path: &str,
+    ) -> Result<Self::CreateDirectoryAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace, now) = (|| {
+                let (base, namespace) = descriptor_in(store, &descriptor)?;
+                Ok::<_, fs_types::ErrorCode>((base, namespace, store.now_nanos()))
+            })()?;
+            PreparedCreateDirectoryAt::new(namespace, base.grant()?, path, now)
+        })())
+    }
+    async fn create_directory_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::CreateDirectoryAtPrepared,
     ) -> Result<(), FsError> {
-        let (base, namespace, now) = accessor.with(|mut access| {
-            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
-        })?;
-        Ok(self::create_directory_at(&namespace, base.grant()?, &path, now).await?)
+        Ok(prepared?.execute().await?)
     }
 
     async fn stat(
@@ -1718,60 +1945,75 @@ where
         Ok(descriptor_stat(&stat_prepared(prepared, "stat-at").await?))
     }
 
-    async fn set_times_at(
-        accessor: &Accessor<U, Self>,
+    type SetTimesAtPrepared = FsOpResult<PreparedSetTimesAt<StorageImpl>>;
+    fn prepare_set_times_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
         _: fs_types::PathFlags,
-        path: String,
+        path: &str,
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
-    ) -> Result<(), FsError> {
-        let (base, namespace, access_nanos, modified_nanos, now) =
-            accessor.with(|mut access| {
-                let now = access.get().system_time_nanos();
+    ) -> Result<Self::SetTimesAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace, access_nanos, modified_nanos, now) = (|| {
+                let now = store.system_time_nanos();
                 let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now)?;
                 let modified_nanos = p3_new_timestamp_nanos(data_modification_timestamp, now)?;
-                let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+                let (base, namespace) = descriptor_in(store, &descriptor)?;
                 Ok::<_, fs_types::ErrorCode>((base, namespace, access_nanos, modified_nanos, now))
-            })?;
-        Ok(self::set_times_at(
-            &namespace,
-            base.grant()?,
-            &path,
-            access_nanos,
-            modified_nanos,
-            now,
-        )
-        .await?)
+            })()?;
+            PreparedSetTimesAt::new(
+                namespace,
+                base.grant()?,
+                path,
+                access_nanos,
+                modified_nanos,
+                now,
+            )
+        })())
+    }
+    async fn set_times_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::SetTimesAtPrepared,
+    ) -> Result<(), FsError> {
+        Ok(prepared?.execute().await?)
     }
 
-    async fn link_at(
-        accessor: &Accessor<U, Self>,
+    type LinkAtPrepared = FsOpResult<PreparedLinkAt<StorageImpl>>;
+    fn prepare_link_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         source_descriptor: Resource<FsDescriptor>,
         _: fs_types::PathFlags,
-        source_path: String,
+        source_path: &str,
         destination_descriptor: Resource<FsDescriptor>,
-        destination_path: String,
+        destination_path: &str,
+    ) -> Result<Self::LinkAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (source_base, destination_base, namespace, now) = (|| {
+                let authority = store.process_authority();
+                if authority.derive_link_source_cap().is_err()
+                    || authority.derive_link_target_directory_cap().is_err()
+                {
+                    return Err(fs_types::ErrorCode::NotPermitted);
+                }
+                let (source, destination, namespace) =
+                    descriptor_pair_in(store, &source_descriptor, &destination_descriptor)?;
+                Ok((source, destination, namespace, store.now_nanos()))
+            })()?;
+            PreparedLinkAt::new(
+                namespace,
+                source_base.grant()?.alias_into(destination_base.grant()?)?,
+                source_path,
+                destination_path,
+                now,
+            )
+        })())
+    }
+    async fn link_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::LinkAtPrepared,
     ) -> Result<(), FsError> {
-        let (source_base, destination_base, namespace, now) = accessor.with(|mut access| {
-            let authority = access.get().process_authority();
-            if authority.derive_link_source_cap().is_err()
-                || authority.derive_link_target_directory_cap().is_err()
-            {
-                return Err(fs_types::ErrorCode::NotPermitted);
-            }
-            let (source, destination, namespace) =
-                descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
-            Ok((source, destination, namespace, access.get().now_nanos()))
-        })?;
-        Ok(self::link_at(
-            &namespace,
-            source_base.grant()?.alias_into(destination_base.grant()?)?,
-            &source_path,
-            &destination_path,
-            now,
-        )
-        .await?)
+        Ok(prepared?.execute().await?)
     }
 
     type OpenAtPrepared = PreparedOpenAt<CpuImpl, Net, StorageImpl>;
@@ -1799,89 +2041,125 @@ where
             .map_err(FsError::trap)
     }
 
+    type ReadlinkAtPrepared = FsOpResult<PreparedReadlinkAt<StorageImpl>>;
+    fn prepare_readlink_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path: &str,
+    ) -> Result<Self::ReadlinkAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace) = (|| {
+                if store.process_authority().derive_symlink_read_cap().is_err() {
+                    return Err(fs_types::ErrorCode::NotPermitted);
+                }
+                descriptor_in(store, &descriptor)
+            })()?;
+            PreparedReadlinkAt::new(namespace, base.grant()?, path)
+        })())
+    }
     async fn readlink_at(
-        accessor: &Accessor<U, Self>,
-        descriptor: Resource<FsDescriptor>,
-        path: String,
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::ReadlinkAtPrepared,
     ) -> Result<String, FsError> {
-        let (base, namespace) = accessor.with(|mut access| {
-            if access
-                .get()
-                .process_authority()
-                .derive_symlink_read_cap()
-                .is_err()
-            {
-                return Err(fs_types::ErrorCode::NotPermitted);
-            }
-            descriptor_in(access.get(), &descriptor)
-        })?;
-        Ok(self::readlink_at(&namespace, base.grant()?, &path).await?)
+        Ok(prepared?.execute().await?)
     }
 
+    type RemoveDirectoryAtPrepared = FsOpResult<PreparedRemoveDirectoryAt<StorageImpl>>;
+    fn prepare_remove_directory_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path: &str,
+    ) -> Result<Self::RemoveDirectoryAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace) = descriptor_in(store, &descriptor)?;
+            PreparedRemoveDirectoryAt::new(namespace, base.grant()?, path)
+        })())
+    }
     async fn remove_directory_at(
-        accessor: &Accessor<U, Self>,
-        descriptor: Resource<FsDescriptor>,
-        path: String,
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::RemoveDirectoryAtPrepared,
     ) -> Result<(), FsError> {
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::remove_directory_at(&namespace, base.grant()?, &path).await?)
+        Ok(prepared?.execute().await?)
     }
 
-    async fn rename_at(
-        accessor: &Accessor<U, Self>,
+    type RenameAtPrepared = FsOpResult<PreparedRenameAt<StorageImpl>>;
+    fn prepare_rename_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         source_descriptor: Resource<FsDescriptor>,
-        source_path: String,
+        source_path: &str,
         destination_descriptor: Resource<FsDescriptor>,
-        destination_path: String,
+        destination_path: &str,
+    ) -> Result<Self::RenameAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (source_base, destination_base, namespace, now) = (|| {
+                let (source, destination, namespace) =
+                    descriptor_pair_in(store, &source_descriptor, &destination_descriptor)?;
+                Ok::<_, fs_types::ErrorCode>((source, destination, namespace, store.now_nanos()))
+            })()?;
+            PreparedRenameAt::new(
+                namespace,
+                source_base
+                    .grant()?
+                    .alias_into(destination_base.grant()?)?
+                    .removing_source()?,
+                source_path,
+                destination_path,
+                now,
+            )
+        })())
+    }
+    async fn rename_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::RenameAtPrepared,
     ) -> Result<(), FsError> {
-        let (source_base, destination_base, namespace, now) = accessor.with(|mut access| {
-            let (source, destination, namespace) =
-                descriptor_pair_in(access.get(), &source_descriptor, &destination_descriptor)?;
-            Ok::<_, fs_types::ErrorCode>((source, destination, namespace, access.get().now_nanos()))
-        })?;
-        Ok(self::rename_at(
-            &namespace,
-            source_base
-                .grant()?
-                .alias_into(destination_base.grant()?)?
-                .removing_source()?,
-            &source_path,
-            &destination_path,
-            now,
-        )
-        .await?)
+        Ok(prepared?.execute().await?)
     }
 
+    type SymlinkAtPrepared = FsOpResult<PreparedSymlinkAt<StorageImpl>>;
+    fn prepare_symlink_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<Self::SymlinkAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace, now) = (|| {
+                if store
+                    .process_authority()
+                    .derive_symlink_create_cap()
+                    .is_err()
+                {
+                    return Err(fs_types::ErrorCode::NotPermitted);
+                }
+                let (base, namespace) = descriptor_in(store, &descriptor)?;
+                Ok((base, namespace, store.now_nanos()))
+            })()?;
+            PreparedSymlinkAt::new(namespace, base.grant()?, old_path, new_path, now)
+        })())
+    }
     async fn symlink_at(
-        accessor: &Accessor<U, Self>,
-        descriptor: Resource<FsDescriptor>,
-        old_path: String,
-        new_path: String,
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::SymlinkAtPrepared,
     ) -> Result<(), FsError> {
-        let (base, namespace, now) = accessor.with(|mut access| {
-            if access
-                .get()
-                .process_authority()
-                .derive_symlink_create_cap()
-                .is_err()
-            {
-                return Err(fs_types::ErrorCode::NotPermitted);
-            }
-            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
-            Ok((base, namespace, access.get().now_nanos()))
-        })?;
-        Ok(self::symlink_at(&namespace, base.grant()?, &old_path, &new_path, now).await?)
+        Ok(prepared?.execute().await?)
     }
 
-    async fn unlink_file_at(
-        accessor: &Accessor<U, Self>,
+    type UnlinkFileAtPrepared = FsOpResult<PreparedUnlinkFileAt<StorageImpl>>;
+    fn prepare_unlink_file_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
-        path: String,
+        path: &str,
+    ) -> Result<Self::UnlinkFileAtPrepared> {
+        Ok((|| -> FsOpResult<_> {
+            let (base, namespace) = descriptor_in(store, &descriptor)?;
+            PreparedUnlinkFileAt::new(namespace, base.grant()?, path)
+        })())
+    }
+    async fn unlink_file_at(
+        _accessor: &Accessor<U, Self>,
+        prepared: Self::UnlinkFileAtPrepared,
     ) -> Result<(), FsError> {
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::unlink_file_at(&namespace, base.grant()?, &path).await?)
+        Ok(prepared?.execute().await?)
     }
 
     async fn is_same_object(
@@ -2211,6 +2489,186 @@ mod borrowed_request_tests {
     use super::*;
     use crate::wasmtime_adapter::component_host::service::test_store;
     use futures_lite::future::block_on;
+
+    #[test]
+    fn prepared_mutations_own_names_and_preserve_link_semantics() {
+        let store = test_store::store_data_with(|_| {});
+        let namespace = store.filesystem().clone();
+        let root = FsDescriptor {
+            path: String::from("/"),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        let directory = String::from("中文-日本語-한국어");
+        let create =
+            PreparedCreateDirectoryAt::new(namespace.clone(), root.grant().unwrap(), &directory, 1)
+                .unwrap();
+        drop(directory);
+        block_on(create.execute()).unwrap();
+        let opened = block_on(open_at(
+            &namespace,
+            root.grant().unwrap(),
+            fs_types::PathFlags::empty(),
+            "中文-日本語-한국어/file",
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ,
+            2,
+        ))
+        .unwrap();
+        let source = String::from("中文-日本語-한국어/file");
+        let destination = String::from("中文-日本語-한국어/linked");
+        let link = PreparedLinkAt::new(
+            namespace.clone(),
+            root.grant()
+                .unwrap()
+                .alias_into(root.grant().unwrap())
+                .unwrap(),
+            &source,
+            &destination,
+            3,
+        )
+        .unwrap();
+        drop(source);
+        drop(destination);
+        block_on(link.execute()).unwrap();
+        let rename = PreparedRenameAt::new(
+            namespace.clone(),
+            root.grant()
+                .unwrap()
+                .alias_into(root.grant().unwrap())
+                .unwrap()
+                .removing_source()
+                .unwrap(),
+            "中文-日本語-한국어/linked",
+            "中文-日本語-한국어/renamed",
+            4,
+        )
+        .unwrap();
+        block_on(rename.execute()).unwrap();
+        let metadata = block_on(stat_path(
+            &namespace,
+            "/中文-日本語-한국어/renamed",
+            Follow::No,
+        ))
+        .unwrap();
+        assert_eq!(object_identity(&metadata), opened.identity.unwrap());
+        let times = PreparedSetTimesAt::new(
+            namespace.clone(),
+            root.grant().unwrap(),
+            "中文-日本語-한국어/renamed",
+            Some(5),
+            Some(6),
+            7,
+        )
+        .unwrap();
+        block_on(times.execute()).unwrap();
+        let target = String::from("renamed");
+        let path = String::from("中文-日本語-한국어/symbolic");
+        let symbolic =
+            PreparedSymlinkAt::new(namespace.clone(), root.grant().unwrap(), &target, &path, 8)
+                .unwrap();
+        drop(target);
+        drop(path);
+        block_on(symbolic.execute()).unwrap();
+        let readlink = PreparedReadlinkAt::new(
+            namespace.clone(),
+            root.grant().unwrap(),
+            "中文-日本語-한국어/symbolic",
+        )
+        .unwrap();
+        assert_eq!(block_on(readlink.execute()).unwrap(), "renamed");
+        for path in [
+            "中文-日本語-한국어/file",
+            "中文-日本語-한국어/renamed",
+            "中文-日本語-한국어/symbolic",
+        ] {
+            block_on(
+                PreparedUnlinkFileAt::new(namespace.clone(), root.grant().unwrap(), path)
+                    .unwrap()
+                    .execute(),
+            )
+            .unwrap();
+        }
+        block_on(
+            PreparedRemoveDirectoryAt::new(
+                namespace.clone(),
+                root.grant().unwrap(),
+                "中文-日本語-한국어",
+            )
+            .unwrap()
+            .execute(),
+        )
+        .unwrap();
+        assert!(matches!(
+            block_on(stat_path(&namespace, "/中文-日本語-한국어", Follow::No)),
+            Err(fs_types::ErrorCode::NoEntry)
+        ));
+    }
+
+    #[test]
+    fn cancelling_prepared_mutations_does_not_modify_the_namespace() {
+        let store = test_store::store_data_with(|_| {});
+        let namespace = store.filesystem().clone();
+        let root = FsDescriptor {
+            path: String::from("/"),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        drop(
+            PreparedCreateDirectoryAt::new(
+                namespace.clone(),
+                root.grant().unwrap(),
+                "cancelled",
+                1,
+            )
+            .unwrap(),
+        );
+        drop(
+            PreparedSymlinkAt::new(
+                namespace.clone(),
+                root.grant().unwrap(),
+                "target",
+                "cancelled-link",
+                1,
+            )
+            .unwrap(),
+        );
+        for path in ["/cancelled", "/cancelled-link"] {
+            assert!(matches!(
+                block_on(stat_path(&namespace, path, Follow::No)),
+                Err(fs_types::ErrorCode::NoEntry)
+            ));
+        }
+        assert!(matches!(
+            PreparedCreateDirectoryAt::new(
+                namespace.clone(),
+                root.grant().unwrap(),
+                "../outside",
+                1
+            ),
+            Err(fs_types::ErrorCode::NotPermitted)
+        ));
+        assert!(matches!(
+            PreparedSymlinkAt::new(namespace, root.grant().unwrap(), "../outside", "link", 1),
+            Err(fs_types::ErrorCode::NotPermitted)
+        ));
+        let readonly = FsDescriptor {
+            flags: fs_types::DescriptorFlags::READ,
+            ..root
+        };
+        assert!(matches!(
+            readonly.grant::<Directory, Mutate>(),
+            Err(fs_types::ErrorCode::ReadOnly)
+        ));
+    }
 
     #[test]
     fn prepared_paths_own_resolved_names_and_preserve_directory_rights() {

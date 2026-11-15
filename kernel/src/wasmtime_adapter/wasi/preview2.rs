@@ -189,16 +189,16 @@ pub(crate) mod filesystem_bindings {
                 "wasi:filesystem/types.[method]descriptor.read-directory": async | trappable,
                 "wasi:filesystem/types.[method]descriptor.set-size": async | trappable,
                 "wasi:filesystem/types.[method]descriptor.set-times": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.set-times-at": async | trappable,
+                "wasi:filesystem/types.[method]descriptor.set-times-at": borrowed | async | trappable,
                 "wasi:filesystem/types.[method]descriptor.sync": async | trappable,
                 "wasi:filesystem/types.[method]descriptor.sync-data": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.create-directory-at": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.link-at": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.readlink-at": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.unlink-file-at": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.rename-at": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.remove-directory-at": async | trappable,
-                "wasi:filesystem/types.[method]descriptor.symlink-at": async | trappable,
+                "wasi:filesystem/types.[method]descriptor.create-directory-at": borrowed | async | trappable,
+                "wasi:filesystem/types.[method]descriptor.link-at": borrowed | async | trappable,
+                "wasi:filesystem/types.[method]descriptor.readlink-at": borrowed | async | trappable,
+                "wasi:filesystem/types.[method]descriptor.unlink-file-at": borrowed | async | trappable,
+                "wasi:filesystem/types.[method]descriptor.rename-at": borrowed | async | trappable,
+                "wasi:filesystem/types.[method]descriptor.remove-directory-at": borrowed | async | trappable,
+                "wasi:filesystem/types.[method]descriptor.symlink-at": borrowed | async | trappable,
                 "wasi:filesystem/types.[method]descriptor.metadata-hash": async | trappable,
                 "wasi:filesystem/types.[method]descriptor.metadata-hash-at": borrowed | async | trappable,
                 default: trappable,
@@ -1186,6 +1186,270 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    type CreateDirectoryAtPrepared =
+        core::result::Result<super::PreparedCreateDirectoryAt<StorageImpl>, p2fs::ErrorCode>;
+    fn prepare_create_directory_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path: &str,
+    ) -> Result<Self::CreateDirectoryAtPrepared> {
+        let target = store.p2_descriptor(&descriptor);
+        let now = store.now_nanos();
+        Ok((|| {
+            let (base, namespace) = target?;
+            super::PreparedCreateDirectoryAt::new(
+                namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                path,
+                now,
+            )
+            .map_err(error_code_from_p3)
+        })())
+    }
+    async fn create_directory_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::CreateDirectoryAtPrepared,
+    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        Ok(match prepared {
+            Ok(request) => request.execute().await.map_err(error_code_from_p3),
+            Err(error) => Err(error),
+        })
+    }
+    type SetTimesAtPrepared =
+        core::result::Result<super::PreparedSetTimesAt<StorageImpl>, p2fs::ErrorCode>;
+    fn prepare_set_times_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        _: p2fs::PathFlags,
+        path: &str,
+        data_access_timestamp: p2fs::NewTimestamp,
+        data_modification_timestamp: p2fs::NewTimestamp,
+    ) -> Result<Self::SetTimesAtPrepared> {
+        let target = store
+            .p2_descriptor(&descriptor)
+            .and_then(|(base, namespace)| {
+                let (access_nanos, modified_nanos, now) =
+                    store.p2_timestamps(data_access_timestamp, data_modification_timestamp)?;
+                Ok((base, namespace, access_nanos, modified_nanos, now))
+            });
+        Ok((|| {
+            let (base, namespace, access_nanos, modified_nanos, now) = target?;
+            super::PreparedSetTimesAt::new(
+                namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                path,
+                access_nanos,
+                modified_nanos,
+                now,
+            )
+            .map_err(error_code_from_p3)
+        })())
+    }
+    async fn set_times_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::SetTimesAtPrepared,
+    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        Ok(match prepared {
+            Ok(request) => request.execute().await.map_err(error_code_from_p3),
+            Err(error) => Err(error),
+        })
+    }
+    type LinkAtPrepared = core::result::Result<super::PreparedLinkAt<StorageImpl>, p2fs::ErrorCode>;
+    fn prepare_link_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        source_descriptor: Resource<FsDescriptor>,
+        _: p2fs::PathFlags,
+        source_path: &str,
+        destination_descriptor: Resource<FsDescriptor>,
+        destination_path: &str,
+    ) -> Result<Self::LinkAtPrepared> {
+        let authority = store.process_authority();
+        if authority.derive_link_source_cap().is_err()
+            || authority.derive_link_target_directory_cap().is_err()
+        {
+            return Ok(Err(p2fs::ErrorCode::NotPermitted));
+        }
+        let target = super::descriptor_pair_in(store, &source_descriptor, &destination_descriptor)
+            .map_err(error_code_from_p3);
+        let now = store.now_nanos();
+        Ok((|| {
+            let (source_base, destination_base, namespace) = target?;
+            super::PreparedLinkAt::new(
+                namespace,
+                source_base
+                    .grant()
+                    .and_then(|source| source.alias_into(destination_base.grant()?))
+                    .map_err(error_code_from_p3)?,
+                source_path,
+                destination_path,
+                now,
+            )
+            .map_err(error_code_from_p3)
+        })())
+    }
+    async fn link_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::LinkAtPrepared,
+    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        Ok(match prepared {
+            Ok(request) => request.execute().await.map_err(error_code_from_p3),
+            Err(error) => Err(error),
+        })
+    }
+    type ReadlinkAtPrepared =
+        core::result::Result<super::PreparedReadlinkAt<StorageImpl>, p2fs::ErrorCode>;
+    fn prepare_readlink_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path: &str,
+    ) -> Result<Self::ReadlinkAtPrepared> {
+        if store.process_authority().derive_symlink_read_cap().is_err() {
+            return Ok(Err(p2fs::ErrorCode::NotPermitted));
+        }
+        let target = store.p2_descriptor(&descriptor);
+        Ok((|| {
+            let (base, namespace) = target?;
+            super::PreparedReadlinkAt::new(
+                namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                path,
+            )
+            .map_err(error_code_from_p3)
+        })())
+    }
+    async fn readlink_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::ReadlinkAtPrepared,
+    ) -> Result<core::result::Result<String, p2fs::ErrorCode>> {
+        Ok(match prepared {
+            Ok(request) => request.execute().await.map_err(error_code_from_p3),
+            Err(error) => Err(error),
+        })
+    }
+    type RemoveDirectoryAtPrepared =
+        core::result::Result<super::PreparedRemoveDirectoryAt<StorageImpl>, p2fs::ErrorCode>;
+    fn prepare_remove_directory_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path: &str,
+    ) -> Result<Self::RemoveDirectoryAtPrepared> {
+        let target = store.p2_descriptor(&descriptor);
+        Ok((|| {
+            let (base, namespace) = target?;
+            super::PreparedRemoveDirectoryAt::new(
+                namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                path,
+            )
+            .map_err(error_code_from_p3)
+        })())
+    }
+    async fn remove_directory_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::RemoveDirectoryAtPrepared,
+    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        Ok(match prepared {
+            Ok(request) => request.execute().await.map_err(error_code_from_p3),
+            Err(error) => Err(error),
+        })
+    }
+    type RenameAtPrepared =
+        core::result::Result<super::PreparedRenameAt<StorageImpl>, p2fs::ErrorCode>;
+    fn prepare_rename_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        source_descriptor: Resource<FsDescriptor>,
+        source_path: &str,
+        destination_descriptor: Resource<FsDescriptor>,
+        destination_path: &str,
+    ) -> Result<Self::RenameAtPrepared> {
+        let target = super::descriptor_pair_in(store, &source_descriptor, &destination_descriptor)
+            .map_err(error_code_from_p3);
+        let now = store.now_nanos();
+        Ok((|| {
+            let (source_base, destination_base, namespace) = target?;
+            let rename = source_base
+                .grant()
+                .and_then(|source| source.alias_into(destination_base.grant()?))
+                .and_then(|alias| alias.removing_source())
+                .map_err(error_code_from_p3)?;
+            super::PreparedRenameAt::new(namespace, rename, source_path, destination_path, now)
+                .map_err(error_code_from_p3)
+        })())
+    }
+    async fn rename_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::RenameAtPrepared,
+    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        Ok(match prepared {
+            Ok(request) => request.execute().await.map_err(error_code_from_p3),
+            Err(error) => Err(error),
+        })
+    }
+    type SymlinkAtPrepared =
+        core::result::Result<super::PreparedSymlinkAt<StorageImpl>, p2fs::ErrorCode>;
+    fn prepare_symlink_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<Self::SymlinkAtPrepared> {
+        if store
+            .process_authority()
+            .derive_symlink_create_cap()
+            .is_err()
+        {
+            return Ok(Err(p2fs::ErrorCode::NotPermitted));
+        }
+        let target = store.p2_descriptor(&descriptor);
+        let now = store.now_nanos();
+        Ok((|| {
+            let (base, namespace) = target?;
+            super::PreparedSymlinkAt::new(
+                namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                old_path,
+                new_path,
+                now,
+            )
+            .map_err(error_code_from_p3)
+        })())
+    }
+    async fn symlink_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::SymlinkAtPrepared,
+    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        Ok(match prepared {
+            Ok(request) => request.execute().await.map_err(error_code_from_p3),
+            Err(error) => Err(error),
+        })
+    }
+    type UnlinkFileAtPrepared =
+        core::result::Result<super::PreparedUnlinkFileAt<StorageImpl>, p2fs::ErrorCode>;
+    fn prepare_unlink_file_at(
+        store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
+        descriptor: Resource<FsDescriptor>,
+        path: &str,
+    ) -> Result<Self::UnlinkFileAtPrepared> {
+        let target = store.p2_descriptor(&descriptor);
+        Ok((|| {
+            let (base, namespace) = target?;
+            super::PreparedUnlinkFileAt::new(
+                namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                path,
+            )
+            .map_err(error_code_from_p3)
+        })())
+    }
+    async fn unlink_file_at(
+        _host: Access<'_, U, Self>,
+        prepared: Self::UnlinkFileAtPrepared,
+    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        Ok(match prepared {
+            Ok(request) => request.execute().await.map_err(error_code_from_p3),
+            Err(error) => Err(error),
+        })
+    }
     type OpenAtPrepared = PreparedOpenAt<CpuImpl, Net, StorageImpl>;
 
     fn prepare_open_at(
@@ -1471,27 +1735,6 @@ where
         .await)
     }
 
-    async fn create_directory_at(
-        &mut self,
-        descriptor: Resource<FsDescriptor>,
-        path: String,
-    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        let target = self.p2_descriptor(&descriptor);
-        let now = self.now_nanos();
-        Ok(async {
-            let (base, namespace) = target?;
-            super::create_directory_at(
-                &namespace,
-                base.grant().map_err(error_code_from_p3)?,
-                &path,
-                now,
-            )
-            .await
-            .map_err(error_code_from_p3)
-        }
-        .await)
-    }
-
     async fn stat(
         &mut self,
         descriptor: Resource<FsDescriptor>,
@@ -1503,174 +1746,6 @@ where
                 .await
                 .map_err(error_code_from_p3)?;
             Ok(descriptor_stat_from_p3(super::descriptor_stat(&metadata)))
-        }
-        .await)
-    }
-
-    async fn set_times_at(
-        &mut self,
-        descriptor: Resource<FsDescriptor>,
-        _: p2fs::PathFlags,
-        path: String,
-        data_access_timestamp: p2fs::NewTimestamp,
-        data_modification_timestamp: p2fs::NewTimestamp,
-    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        let target = self
-            .p2_descriptor(&descriptor)
-            .and_then(|(base, namespace)| {
-                let (access_nanos, modified_nanos, now) =
-                    self.p2_timestamps(data_access_timestamp, data_modification_timestamp)?;
-                Ok((base, namespace, access_nanos, modified_nanos, now))
-            });
-        Ok(async {
-            let (base, namespace, access_nanos, modified_nanos, now) = target?;
-            super::set_times_at(
-                &namespace,
-                base.grant().map_err(error_code_from_p3)?,
-                &path,
-                access_nanos,
-                modified_nanos,
-                now,
-            )
-            .await
-            .map_err(error_code_from_p3)
-        }
-        .await)
-    }
-
-    async fn link_at(
-        &mut self,
-        source_descriptor: Resource<FsDescriptor>,
-        _: p2fs::PathFlags,
-        source_path: String,
-        destination_descriptor: Resource<FsDescriptor>,
-        destination_path: String,
-    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        let authority = self.process_authority();
-        if authority.derive_link_source_cap().is_err()
-            || authority.derive_link_target_directory_cap().is_err()
-        {
-            return Ok(Err(p2fs::ErrorCode::NotPermitted));
-        }
-        let target = super::descriptor_pair_in(self, &source_descriptor, &destination_descriptor)
-            .map_err(error_code_from_p3);
-        let now = self.now_nanos();
-        Ok(async {
-            let (source_base, destination_base, namespace) = target?;
-            super::link_at(
-                &namespace,
-                source_base
-                    .grant()
-                    .and_then(|source| source.alias_into(destination_base.grant()?))
-                    .map_err(error_code_from_p3)?,
-                &source_path,
-                &destination_path,
-                now,
-            )
-            .await
-            .map_err(error_code_from_p3)
-        }
-        .await)
-    }
-
-    async fn readlink_at(
-        &mut self,
-        descriptor: Resource<FsDescriptor>,
-        path: String,
-    ) -> Result<core::result::Result<String, p2fs::ErrorCode>> {
-        if self.process_authority().derive_symlink_read_cap().is_err() {
-            return Ok(Err(p2fs::ErrorCode::NotPermitted));
-        }
-        let target = self.p2_descriptor(&descriptor);
-        Ok(async {
-            let (base, namespace) = target?;
-            super::readlink_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
-                .await
-                .map_err(error_code_from_p3)
-        }
-        .await)
-    }
-
-    async fn remove_directory_at(
-        &mut self,
-        descriptor: Resource<FsDescriptor>,
-        path: String,
-    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        let target = self.p2_descriptor(&descriptor);
-        Ok(async {
-            let (base, namespace) = target?;
-            super::remove_directory_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
-                .await
-                .map_err(error_code_from_p3)
-        }
-        .await)
-    }
-
-    async fn rename_at(
-        &mut self,
-        source_descriptor: Resource<FsDescriptor>,
-        source_path: String,
-        destination_descriptor: Resource<FsDescriptor>,
-        destination_path: String,
-    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        let target = super::descriptor_pair_in(self, &source_descriptor, &destination_descriptor)
-            .map_err(error_code_from_p3);
-        let now = self.now_nanos();
-        Ok(async {
-            let (source_base, destination_base, namespace) = target?;
-            let rename = source_base
-                .grant()
-                .and_then(|source| source.alias_into(destination_base.grant()?))
-                .and_then(|alias| alias.removing_source())
-                .map_err(error_code_from_p3)?;
-            super::rename_at(&namespace, rename, &source_path, &destination_path, now)
-                .await
-                .map_err(error_code_from_p3)
-        }
-        .await)
-    }
-
-    async fn symlink_at(
-        &mut self,
-        descriptor: Resource<FsDescriptor>,
-        old_path: String,
-        new_path: String,
-    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        if self
-            .process_authority()
-            .derive_symlink_create_cap()
-            .is_err()
-        {
-            return Ok(Err(p2fs::ErrorCode::NotPermitted));
-        }
-        let target = self.p2_descriptor(&descriptor);
-        let now = self.now_nanos();
-        Ok(async {
-            let (base, namespace) = target?;
-            super::symlink_at(
-                &namespace,
-                base.grant().map_err(error_code_from_p3)?,
-                &old_path,
-                &new_path,
-                now,
-            )
-            .await
-            .map_err(error_code_from_p3)
-        }
-        .await)
-    }
-
-    async fn unlink_file_at(
-        &mut self,
-        descriptor: Resource<FsDescriptor>,
-        path: String,
-    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        let target = self.p2_descriptor(&descriptor);
-        Ok(async {
-            let (base, namespace) = target?;
-            super::unlink_file_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
-                .await
-                .map_err(error_code_from_p3)
         }
         .await)
     }
@@ -3541,13 +3616,12 @@ mod tests {
             .expect("write-via-stream must open on a writable file");
         // Remove the file under the open stream so the batch has nowhere to land.
         let root = store.table.push(root).expect("the root must fit");
-        block_on(HostDescriptor::unlink_file_at(
-            &mut store,
-            root,
-            String::from("doomed"),
-        ))
+        let prepared = <wasmtime::component::HasSelf<_> as super::p2fs::HostDescriptorWithStore<
+            (),
+        >>::prepare_unlink_file_at(&mut &mut store, root, "doomed")
         .expect("unlink-file-at must not trap")
-        .expect("the file must unlink");
+        .expect("the unlink request must prepare");
+        block_on(prepared.execute()).expect("the file must unlink");
         let stream = store
             .table
             .get_mut::<DynOutputStream>(&stream)
