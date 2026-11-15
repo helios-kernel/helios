@@ -1,0 +1,19 @@
+name: Install Zig with a shared build cache
+description: Keep one content-keyed build cache per job and architecture, written by the default branch.
+inputs:
+  version:
+    description: Zig version to install.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ inputs.version }}
+        # The upstream action saves a fresh build cache for every run.
+        # It still installs Zig and exports both cache directories here.
+        use-cache: false
+    - uses: ./helios/.github/actions/shared-cache
+      with:
+        path: ${{ github.workspace }}/.zig-cache
+        key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ github.job }}-${{ hashFiles('helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/tools/bench/native/**', 'helios/tools/wasi-apps/**') }}

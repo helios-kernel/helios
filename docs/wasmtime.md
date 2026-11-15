@@ -5,13 +5,31 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/guest-memory-residency`):
+The local checkout must be at (branch `helios/data-host-task-fast-path`):
 
 ```text
-d10291f68ec29a00ec0261fb72d42069be198770
+685697120ea7dcf237fb5b7ef6b08fc4456c6fab
 ```
 
-That revision is `helios/next-solver-bindgen` at
+That revision adds data-only synchronous host registration to
+`helios/immediate-wit-imports` at
+`dd02866a754619ca217201a91a32d2a1f0bdb08b`. `func_wrap_data` exposes only
+store data to the callback, preventing same-store guest reentry. Synchronous
+lowering skips the HostTask lifecycle when parameter and result types do not
+access resource/task state and the result does not require guest realloc.
+Generated synchronous imports without Store access use this registration;
+resource-bearing, reallocating, Store-taking and async calls retain their
+existing lifecycle.
+
+`helios/immediate-wit-imports` adds immediate host implementations of async WIT imports to
+`helios/guest-memory-residency` at
+`d10291f68ec29a00ec0261fb72d42069be198770`. The
+`func_wrap_concurrent_immediate` registration and bindgen's `immediate` import
+flag retain async WIT typing and canonical lowering while returning directly,
+without a host future allocation. Resource scopes and reentry checks use the
+existing completed-result path.
+
+`helios/guest-memory-residency` is `helios/next-solver-bindgen` at
 `18b428e6becfb6138b877a3fe70afb08bf5724ba` plus one additive commit (#537):
 a store may register a `GuestMemoryResidency`
 (`Store::set_guest_memory_residency`), which the component event loop asks,

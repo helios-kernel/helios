@@ -3,7 +3,15 @@ name = "helios-btrfs"
 version = "0.1.0"
 edition.workspace = true
 
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+test-support = []
+fuzzing = ["test-support", "dep:libfuzzer-sys"]
+
 [dependencies]
+libfuzzer-sys = { version = "0.4.13", default-features = false, features = ["link_libfuzzer"], optional = true }
 arrayvec = { version = "0.7.6", default-features = false }
 blake2 = { version = "0.11.0", default-features = false }
 crc = { version = "3.4.0", default-features = false }
@@ -20,6 +28,7 @@ zrip-core = { git = "https://github.com/lexoliu/zrip", branch = "compress-contex
 zrip-decode = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 btrfs-disk = { version = "0.13.0", default-features = false }
 btrfs-transaction = { version = "0.13.0", default-features = false }
 ferrosys = { version = "0.8.0", default-features = false, features = ["btrfs"] }
@@ -29,3 +38,21 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "btrfs-image-fuzz"
+path = "fuzz/image.rs"
+required-features = ["fuzzing"]
+test = false
+bench = false
+
+[[bin]]
+name = "btrfs-record-fuzz"
+path = "fuzz/record.rs"
+required-features = ["fuzzing"]
+test = false
+bench = false
+
+[[example]]
+name = "btrfs-corpus"
+required-features = ["test-support"]
