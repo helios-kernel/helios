@@ -599,12 +599,27 @@ impl<'a> Wire<'a> {
 
         let mut reply_encode_body = TokenStream::new();
         let mut reply_decode_body = TokenStream::new();
+        let mut reply_capacities = TokenStream::new();
+        let failure_return = ret_ty.as_ref().map(|_| quote!(ret));
         if let Some(var) = &ret_var {
             reply_encode_body.extend(self.encode_var(frame, var, Validity::Valid)?);
             reply_decode_body.extend(self.decode_var(frame, var)?);
         }
         for var in ty.variables.iter().filter(|v| v.attrs.var_out) {
             reply_encode_body.extend(self.encode_var(frame, var, Validity::Valid)?);
+            if let Some((capacity, value)) = self.reply_array_capacity(frame, var)? {
+                reply_capacities.extend(quote!(let #capacity: u64 = #value;));
+                reply_decode_body.extend(quote! {
+                    let venus_found = peek_array_size(dec);
+                    if venus_found > #capacity {
+                        dec.fail(DecodeError::ArrayCapacity {
+                            capacity: #capacity,
+                            found: venus_found,
+                        });
+                        return #failure_return;
+                    }
+                });
+            }
             reply_decode_body.extend(self.decode_var(frame, var)?);
         }
 
@@ -652,6 +667,7 @@ impl<'a> Wire<'a> {
             }
             pub unsafe fn #decode_reply(dec: &mut Decoder<'_>, #(#params),*) #decode_return {
                 unsafe {
+                    #reply_capacities
                     let mut command_type = VkCommandTypeEXT(0);
                     decode_scalar::<VkCommandTypeEXT>(dec, &mut command_type);
                     if command_type != #command_const {

@@ -303,3 +303,57 @@ fn enumeration_accepts_fewer_handles_than_the_reply_capacity() {
     assert_eq!(devices, [ObjectBase { id: 3 }, ObjectBase { id: 4 }]);
     connection.close().unwrap();
 }
+
+#[test]
+fn enumeration_cannot_expand_the_callers_output_capacity() {
+    use helios_venus::protocol::vn_decode_vkEnumeratePhysicalDevices_reply;
+    use helios_venus::{DecodeError, Decoder};
+
+    let reply: Vec<_> = [
+        VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT.0 as u32,
+        0,
+        1,
+        0,
+        3,
+        3,
+        0,
+        3,
+        0,
+        4,
+        0,
+        99,
+        0,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    let mut instance = ObjectBase { id: 2 };
+    // The third slot is a canary outside the declared capacity. Keeping
+    // it allocated makes a regression observable without test-side UB.
+    let mut devices = [
+        ObjectBase { id: 3 },
+        ObjectBase { id: 4 },
+        ObjectBase { id: 5 },
+    ];
+    let mut handles = devices.each_mut().map(|device| VkPhysicalDevice(device));
+    let mut count = 2;
+    let mut decoder = Decoder::new(&reply);
+    // SAFETY: two writable output slots are declared, with live object
+    // storage; the renderer-controlled wire count is the decoder's input.
+    unsafe {
+        vn_decode_vkEnumeratePhysicalDevices_reply(
+            &mut decoder,
+            VkInstance(&mut instance),
+            &mut count,
+            handles.as_mut_ptr(),
+        );
+    }
+    assert_eq!(
+        decoder.finish(),
+        Err(DecodeError::ArrayCapacity {
+            capacity: 2,
+            found: 3
+        })
+    );
+    assert_eq!(devices[2].id, 5);
+}
