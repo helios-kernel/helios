@@ -70,6 +70,7 @@ clippy-host:
     # `helios-venus` generates its protocol module from the pinned
     # venus-protocol inputs when it builds.
     cargo run -p helios-cli --quiet -- venus-protocol-fetch
+    cargo clippy -p helios-linux --all-targets --features runtime -- -D warnings
     cargo clippy \
         --workspace --all-targets \
         --exclude helios \
@@ -123,6 +124,7 @@ test-kernel run_ignored="default":
 test-libraries:
     #!/usr/bin/env bash
     set -euo pipefail
+    cargo nextest run -p helios-linux --features runtime
     cargo nextest run -p helios-firmware
     cargo nextest run -p helios-workspace-root --lib
     # The TPM driver: both interfaces against register models that
@@ -224,6 +226,9 @@ clippy-target target package:
         --target "{{ target }}" -- -D warnings
     cargo clippy ${build_std} \
         -p "{{ package }}" --target "{{ target }}" -- -D warnings
+    if [[ "{{ package }}" == helios-x86 ]]; then
+        cargo clippy -p helios --features linux-prototype --target "{{ target }}" -- -D warnings
+    fi
 
 # Build the instrumented kernel image of docs/pgo.md for `arch` (aarch64,
 # riscv64, x86-64) and stop there.
