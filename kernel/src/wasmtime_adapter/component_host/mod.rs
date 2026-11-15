@@ -2657,18 +2657,13 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]tcp-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let socket = access.get().table.get_mut(&resource)?;
-                    socket.resource.backend.close();
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::TcpError>(()),))
-            })
+            let socket = caller.data_mut().table.get_mut(&resource)?;
+            socket.resource.backend.close();
+            Ok((Ok::<(), debugger_wit::net::TcpError>(()),))
         },
     )?;
     instance.func_wrap_concurrent(
@@ -2726,18 +2721,13 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]udp-socket.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let socket = access.get().table.get_mut(&resource)?;
-                    socket.resource.backend.close();
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>((Ok::<(), debugger_wit::net::UdpError>(()),))
-            })
+            let socket = caller.data_mut().table.get_mut(&resource)?;
+            socket.resource.backend.close();
+            Ok((Ok::<(), debugger_wit::net::UdpError>(()),))
         },
     )?;
     Ok(())
@@ -2994,18 +2984,13 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]tcp-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let socket = access.get().table.get_mut(&resource)?;
-                    socket.resource.backend.close();
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::TcpError>(()),))
-            })
+            let socket = caller.data_mut().table.get_mut(&resource)?;
+            socket.resource.backend.close();
+            Ok((Ok::<(), program_wit::net::TcpError>(()),))
         },
     )?;
     instance.func_wrap_concurrent(
@@ -3063,18 +3048,13 @@ where
             })
         },
     )?;
-    instance.func_wrap_concurrent(
+    instance.func_wrap_concurrent_immediate(
         "[method]udp-socket.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
-            Box::pin(async move {
-                accessor.with(|mut access| {
-                    let socket = access.get().table.get_mut(&resource)?;
-                    socket.resource.backend.close();
-                    Ok::<_, wasmtime::Error>(())
-                })?;
-                Ok::<_, wasmtime::Error>((Ok::<(), program_wit::net::UdpError>(()),))
-            })
+            let socket = caller.data_mut().table.get_mut(&resource)?;
+            socket.resource.backend.close();
+            Ok((Ok::<(), program_wit::net::UdpError>(()),))
         },
     )?;
     Ok(())
@@ -3888,15 +3868,15 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn debug_port(
-        accessor: &Accessor<U, Self>,
+    fn debug_port(
+        mut access: Access<'_, U, Self>,
     ) -> wasmtime::Result<Option<Resource<SbiSerialPort>>> {
-        accessor.with(|mut access| match access.get().debug_port() {
+        match access.get().debug_port() {
             Some(()) => Ok(Some(access.get().table.push(SbiSerialPort {
                 _resource: SerialPortResource,
             })?)),
             None => Ok(None),
-        })
+        }
     }
 }
 
@@ -3916,18 +3896,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn rights(
-        accessor: &Accessor<U, Self>,
+    fn rights(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<debugger_wit::serial::SerialRights> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.get(&resource)?;
-            Ok::<_, wasmtime::Error>(
-                debugger_wit::serial::SerialRights::READ
-                    | debugger_wit::serial::SerialRights::WRITE
-                    | debugger_wit::serial::SerialRights::FLUSH,
-            )
-        })
+        let _ = access.get().table.get(&resource)?;
+        Ok(debugger_wit::serial::SerialRights::READ
+            | debugger_wit::serial::SerialRights::WRITE
+            | debugger_wit::serial::SerialRights::FLUSH)
     }
 
     async fn drop(
@@ -3986,14 +3962,11 @@ where
         }
     }
 
-    async fn flush(
-        accessor: &Accessor<U, Self>,
+    fn flush(
+        mut access: Access<'_, U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<()> {
-        accessor.with(|mut access| {
-            let _ = access.get().table.get(&resource)?;
-            Ok::<_, wasmtime::Error>(())
-        })?;
+        let _ = access.get().table.get(&resource)?;
         Ok(())
     }
 }
