@@ -1,6 +1,8 @@
 //! A single-owner transaction. Its owner serializes writers and retains the
 //! mounted generation's reader pins; this module never reuses retired extents.
 
+mod extents;
+
 use core::num::NonZeroUsize;
 use futures::{
     future,

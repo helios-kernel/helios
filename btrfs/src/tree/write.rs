@@ -17,6 +17,10 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[error("file extent {key} is not a regular or preallocated mapping")]
+    NotRegularExtent { key: Key },
+    #[error("file range {start}..{end} must be nonempty and aligned to sector size {sector}")]
+    FileRange { start: u64, end: u64, sector: u64 },
     #[error("writer must be reopened after an interrupted durable commit")]
     WriterPoisoned,
     #[error("transaction superblock: {0}")]

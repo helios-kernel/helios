@@ -224,6 +224,224 @@ fn writer_abort_commit_and_failed_publication_have_distinct_lifetimes() {
 
 #[cfg(feature = "write")]
 #[test]
+fn extent_cuts_preserve_sides_count_references_and_release_the_last_mapping() {
+    use btrfs_disk::items::CompressionType;
+    for compression in [
+        None,
+        Some(CompressionType::Zlib),
+        Some(CompressionType::Lzo),
+        Some(CompressionType::Zstd),
+    ] {
+        block_on(exercise_extent_cuts(compression, false, |_| {}));
+    }
+    block_on(exercise_extent_cuts(None, true, |_| {}));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_extent_cuts(
+    compression: Option<btrfs_disk::items::CompressionType>,
+    preallocated: bool,
+    mut verify: impl FnMut(&std::path::Path),
+) {
+    use super::writer::Writer;
+    use crate::ondisk::{RawFileExtentBody, RawFileExtentHead, RawInodeItem, item_type, view};
+    use zerocopy::IntoBytes;
+
+    let content: Vec<_> = (0..32768)
+        .map(|index| if preallocated { 0 } else { (index % 251) as u8 })
+        .collect();
+    let timestamp = Timestamp::from_secs(1_700_000_000);
+    let named = tempfile::NamedTempFile::new().unwrap();
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, timestamp));
+    let (base, _) = filesystem_image_tree_file(true, true, tree, named.reopen().unwrap());
+    let root_inode = base.root().await.unwrap().number();
+    let tree_id = base.default_subvolume();
+    drop(base);
+    let mut external =
+        btrfs_transaction::filesystem::Filesystem::open(named.reopen().unwrap()).unwrap();
+    let mut tx = btrfs_transaction::transaction::Transaction::start(&mut external).unwrap();
+    // The first regular inode follows the root inode in this empty tree.
+    let inode = root_inode + 1;
+    let when = btrfs_disk::items::Timespec {
+        sec: 1_700_000_000,
+        nsec: 0,
+    };
+    let mut args =
+        btrfs_transaction::inode::InodeArgs::new(tx.transid, 0o100_644).with_uniform_time(when);
+    args.size = content.len() as u64;
+    tx.create_inode(&mut external, tree_id, inode, &args)
+        .unwrap();
+    // Directory indices 0 and 1 are reserved for dot and dot-dot.
+    tx.link_dir_entry(
+        &mut external,
+        tree_id,
+        root_inode,
+        inode,
+        b"data.bin",
+        1,
+        2,
+        when,
+    )
+    .unwrap();
+    if preallocated {
+        let length = content.len() as u64;
+        let logical = tx
+            .reserve_data_extent(&mut external, length, tree_id, inode, 0)
+            .unwrap();
+        let item = btrfs_disk::items::FileExtentItem::to_bytes_regular(
+            tx.transid,
+            length,
+            btrfs_disk::items::CompressionType::None,
+            true,
+            logical,
+            length,
+            0,
+            length,
+        );
+        tx.insert_file_extent(&mut external, tree_id, inode, 0, &item)
+            .unwrap();
+        tx.update_inode_nbytes(&mut external, tree_id, inode, length as i64)
+            .unwrap();
+    } else {
+        tx.write_file_data(
+            &mut external,
+            tree_id,
+            inode,
+            0,
+            &content,
+            false,
+            compression,
+        )
+        .unwrap();
+    }
+    tx.commit(&mut external).unwrap();
+    drop(external);
+    verify(named.path());
+    let mut writer = Writer::mount(Disk(named.reopen().unwrap())).await.unwrap();
+    let old = writer.snapshot().unwrap();
+    let inode = old.resolve(b"/data.bin").await.unwrap();
+    let mut expected = content.clone();
+    let mut data_key = None;
+    for (offset, range, references) in [
+        (0, 8192..16384, 2),
+        (0, 0..8192, 1),
+        (16384, 24576..32768, 1),
+        (16384, 16384..24576, 0),
+    ] {
+        let current = writer.snapshot().unwrap();
+        let mut transaction = writer.begin().await.unwrap();
+        let edits = transaction.edits();
+        let root = edits.roots.get(inode.tree()).unwrap();
+        let key = Key::new(inode.number(), item_type::EXTENT_DATA, offset);
+        let bytes = edits
+            .trees
+            .get(&current.volume, root, key)
+            .await
+            .unwrap()
+            .unwrap();
+        let head = view::<RawFileExtentHead>(&bytes).unwrap();
+        assert_eq!(head.extent_type, if preallocated { 2 } else { 1 });
+        assert_eq!(
+            head.compression,
+            match compression {
+                None => 0,
+                Some(btrfs_disk::items::CompressionType::Zlib) => 1,
+                Some(btrfs_disk::items::CompressionType::Lzo) => 2,
+                Some(btrfs_disk::items::CompressionType::Zstd) => 3,
+                _ => panic!("fixture compression"),
+            }
+        );
+        let body = view::<RawFileExtentBody>(&bytes[size_of::<RawFileExtentHead>()..]).unwrap();
+        let allocation = Key::new(
+            body.disk_bytenr.get(),
+            item_type::EXTENT_ITEM,
+            body.disk_num_bytes.get(),
+        );
+        assert_eq!(*data_key.get_or_insert(allocation), allocation);
+        let removed = edits
+            .cut_regular_extent(inode.tree(), key, range.clone())
+            .await
+            .unwrap();
+        assert_eq!(removed, range.end - range.start);
+        let root = edits.roots.get(inode.tree()).unwrap();
+        let inode_key = Key::new(inode.number(), item_type::INODE_ITEM, 0);
+        let bytes = edits
+            .trees
+            .get(&current.volume, root, inode_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut raw = *view::<RawInodeItem>(&bytes).unwrap();
+        raw.nbytes.set(raw.nbytes.get() - removed);
+        raw.transid.set(edits.trees.generation());
+        let root = edits
+            .trees
+            .apply(
+                &current.volume,
+                root,
+                inode_key,
+                Some(raw.as_bytes()),
+                &mut edits.space,
+            )
+            .await
+            .unwrap();
+        edits.roots.set(root).unwrap();
+        let allocation_bytes = edits
+            .trees
+            .get(&current.volume, edits.accounting.root, allocation)
+            .await
+            .unwrap();
+        if references == 0 {
+            assert!(allocation_bytes.is_none());
+        } else {
+            assert_eq!(
+                btrfs_disk::items::ExtentItem::parse(
+                    &allocation_bytes.unwrap(),
+                    &btrfs_disk::tree::DiskKey {
+                        objectid: allocation.objectid,
+                        key_type: btrfs_disk::tree::KeyType::ExtentItem,
+                        offset: allocation.offset
+                    }
+                )
+                .unwrap()
+                .refs,
+                references
+            );
+        }
+        transaction
+            .commit(
+                || panic!("valid fixture UUID"),
+                std::thread::available_parallelism().unwrap(),
+            )
+            .await
+            .unwrap();
+        verify(named.path());
+        expected[range.start as usize..range.end as usize].fill(0);
+        let current = writer.snapshot().unwrap();
+        let current_inode = current.resolve(b"/data.bin").await.unwrap();
+        let mut output = vec![0; content.len()];
+        assert_eq!(
+            current.read(&current_inode, 0, &mut output).await.unwrap(),
+            content.len()
+        );
+        assert_eq!(output, expected);
+        assert_eq!(
+            current.read(&inode, 0, &mut output).await.unwrap(),
+            content.len()
+        );
+        assert_eq!(output, content);
+    }
+    let current = writer.snapshot().unwrap();
+    assert!(matches!(
+        current
+            .lookup_checksums(&current.snapshot, data_key.unwrap().objectid, content.len())
+            .await,
+        Err(crate::Error::MissingDataChecksum { .. })
+    ));
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn canceling_staging_restores_the_writer_but_canceling_publication_poisons_it() {
     use super::writer::Writer;
     use crate::source::BlockSink;
@@ -405,9 +623,39 @@ fn transaction_io_failures_recover_a_complete_generation() {
 #[cfg(feature = "write")]
 #[test]
 #[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn extent_cuts_pass_btrfs_check() {
+    use btrfs_disk::items::CompressionType;
+    for compression in [
+        None,
+        Some(CompressionType::Zlib),
+        Some(CompressionType::Lzo),
+        Some(CompressionType::Zstd),
+    ] {
+        block_on(exercise_extent_cuts(compression, false, assert_btrfs_check));
+    }
+    block_on(exercise_extent_cuts(None, true, assert_btrfs_check));
+}
+
+#[cfg(feature = "write")]
+fn assert_btrfs_check(path: &std::path::Path) {
+    let output = std::process::Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(path)
+        .output()
+        .expect("btrfs-progs must be installed");
+    assert!(
+        output.status.success(),
+        "btrfs check\n{}\n{}",
+        std::string::String::from_utf8_lossy(&output.stdout),
+        std::string::String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
 fn committed_transaction_passes_btrfs_check() {
     use std::io::{Seek, SeekFrom};
-    use std::process::Command;
 
     block_on(async {
         for (separate, free_tree) in [(true, true), (false, true), (false, false)] {
@@ -422,17 +670,7 @@ fn committed_transaction_passes_btrfs_check() {
                         .unwrap();
                     change_root_mode(&fs).await.unwrap();
                 }
-                let output = Command::new("btrfs")
-                    .args(["check", "--readonly"])
-                    .arg(named.path())
-                    .output()
-                    .expect("btrfs-progs must be installed");
-                assert!(
-                    output.status.success(),
-                    "btrfs check: separate={separate}, free_tree={free_tree}, committed={commit}\n{}\n{}",
-                    std::string::String::from_utf8_lossy(&output.stdout),
-                    std::string::String::from_utf8_lossy(&output.stderr)
-                );
+                assert_btrfs_check(named.path());
             }
         }
     });
@@ -725,7 +963,15 @@ fn filesystem_image_tree(
     free_tree: bool,
     tree: TreeBuilder,
 ) -> (Filesystem<Disk>, File) {
-    let mut file = tempfile::tempfile().unwrap();
+    filesystem_image_tree_file(separate, free_tree, tree, tempfile::tempfile().unwrap())
+}
+
+fn filesystem_image_tree_file(
+    separate: bool,
+    free_tree: bool,
+    tree: TreeBuilder,
+    mut file: File,
+) -> (Filesystem<Disk>, File) {
     // ferrosys' default single-device geometry needs at least 109 MiB.
     let size = 128 << 20;
     file.set_len(size).unwrap();
