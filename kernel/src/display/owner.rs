@@ -216,6 +216,15 @@ enum SurfaceResource {
 }
 
 impl SurfaceResource {
+    /// Device detachment was not acknowledged. Storage cannot return to an
+    /// allocator while the device may still read it, even after store teardown.
+    fn retain_on_fault(self) {
+        match self {
+            Self::Framebuffer { backing, .. } => backing.leak(),
+            Self::Blob { hold, .. } => core::mem::forget(hold),
+        }
+    }
+
     const fn source(&self) -> SurfaceSource {
         match self {
             Self::Framebuffer { id, .. } => SurfaceSource::Framebuffer(*id),
@@ -503,10 +512,14 @@ async fn create_blob_surface<Device: DisplayDevice>(
         .checked_add(1)
         .ok_or(DisplayServiceError::DeviceFault)?;
     let surface = BlobSurfaceId(identity);
-    device
-        .set_scanout_blob(scanout, layout)
-        .await
-        .map_err(DisplayServiceError::from)?;
+    if let Err(error) = device.set_scanout_blob(scanout, layout).await {
+        if matches!(&error, DisplayError::Transport(_)) {
+            tracing::error!(%error, scanout = scanout.index(), blob = layout.blob.raw(),
+                "the device did not acknowledge blob scanout; its storage remains retained");
+            core::mem::forget(hold);
+        }
+        return Err(DisplayServiceError::from(error));
+    }
     held.next_blob_surface = identity;
     held.note_scanout(scanout);
     held.surfaces.push(SurfaceRecord {
@@ -605,8 +618,10 @@ async fn destroy_surface<Device: DisplayDevice>(
         tracing::warn!(
             %error,
             scanout = scanout.index(),
-            "the display engine would not blank a scanout whose surface is going away"
+            "the display engine would not blank a scanout whose surface is going away; its storage remains retained"
         );
+        record.resource.retain_on_fault();
+        return;
     }
     release_resource(device, record.resource).await;
 }
@@ -660,6 +675,7 @@ async fn release_framebuffer<Device: DisplayDevice>(
 /// whose frames had gone back to a pool would put another instance's
 /// memory on the screen.
 async fn release_claim<Device: DisplayDevice>(device: &Device, held: &mut ClaimResources) {
+    let mut unconfirmed = ArrayVec::<ScanoutId, MAX_SCANOUTS>::new();
     for scanout in &held.scanouts {
         if let Err(error) = device.hide_cursor(*scanout).await {
             tracing::warn!(
@@ -672,14 +688,22 @@ async fn release_claim<Device: DisplayDevice>(device: &Device, held: &mut ClaimR
             tracing::warn!(
                 %error,
                 scanout = scanout.index(),
-                "the display engine would not blank a released scanout"
+                "the display engine would not blank a released scanout; its storage remains retained"
             );
+            unconfirmed.push(*scanout);
         }
     }
     let records = core::mem::take(&mut held.surfaces);
     let surfaces = records.len();
     for record in records {
-        release_resource(device, record.resource).await;
+        if record
+            .scanout
+            .is_some_and(|scanout| unconfirmed.contains(&scanout))
+        {
+            record.resource.retain_on_fault();
+        } else {
+            release_resource(device, record.resource).await;
+        }
     }
     tracing::info!(
         surfaces,
