@@ -1,5 +1,5 @@
 use core::cell::UnsafeCell;
-use core::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use core::num::{NonZeroU32, NonZeroU64};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::collections::BTreeMap;
@@ -18,7 +18,7 @@ use helios_venus::protocol::{
 };
 use helios_venus::ring::Layout;
 use helios_venus::transport::{
-    Completion, MappedBlob, SignalTimeline, Timeline, TimelinePoint, Transport,
+    Completion, MappedBlob, MemoryResource, SignalTimeline, Timeline, TimelinePoint, Transport,
 };
 use helios_venus::{ObjectBase, RendererProtocol, api_version};
 
@@ -61,6 +61,21 @@ unsafe impl MappedBlob for Blob {
     }
 }
 
+struct ExportedMemory {
+    blob: Blob,
+    recorded: Arc<Mutex<Recorded>>,
+}
+
+// SAFETY: test allocations are aligned and retained for the resource lifetime.
+unsafe impl MemoryResource for ExportedMemory {
+    type Error = TestError;
+
+    fn map(&mut self) -> Result<NonNull<u8>, TestError> {
+        self.recorded.lock().unwrap().mapped.push(self.blob.id);
+        Ok(self.blob.pointer())
+    }
+}
+
 #[derive(Default)]
 struct Recorded {
     next: u32,
@@ -79,6 +94,8 @@ struct Recorded {
     reply_command: i32,
     reply: Vec<u8>,
     blob_ids: Vec<u64>,
+    memory_exports: Vec<(u64, bool)>,
+    mapped: Vec<u32>,
     #[cfg(feature = "driver")]
     scripted: bool,
     #[cfg(feature = "driver")]
@@ -249,6 +266,7 @@ impl Timeline for TestReader {
 impl Transport for Recording {
     type Error = TestError;
     type Blob = Blob;
+    type Memory = ExportedMemory;
     type Signal = TestSignal;
 
     fn timeline(&self, value: u64) -> TestSignal {
@@ -280,6 +298,23 @@ impl Transport for Recording {
         let id = state.next;
         state.blobs.insert(id, Arc::downgrade(&memory));
         Ok(Blob { id, memory })
+    }
+
+    fn export_memory(
+        &mut self,
+        size: NonZeroU64,
+        blob_id: u64,
+        host_visible: bool,
+    ) -> Result<ExportedMemory, TestError> {
+        self.0
+            .lock()
+            .unwrap()
+            .memory_exports
+            .push((blob_id, host_visible));
+        Ok(ExportedMemory {
+            blob: self.create_blob(size, blob_id)?,
+            recorded: self.0.clone(),
+        })
     }
 
     fn execute(
@@ -482,21 +517,30 @@ fn a_transport_acknowledgement_does_not_replace_ring_consumption() {
 }
 
 #[test]
-fn memory_blobs_follow_allocation_consumption_and_use_its_object_id() {
-    let state = Arc::new(Mutex::new(Recorded::default()));
-    let mut connection = connection(state.clone());
-    connection.send(&[0xff; 4]).unwrap();
-    let blob = connection
-        .memory_blob(
-            helios_venus::protocol::VkDeviceMemory(77),
-            NonZeroUsize::new(64).unwrap(),
-        )
-        .unwrap();
-    assert_eq!(state.lock().unwrap().consumed, [vec![0xff; 4]]);
-    assert_eq!(state.lock().unwrap().blob_ids, [0, 77]);
-    assert_eq!(blob.len(), 64);
-    drop(blob);
-    connection.close().unwrap();
+fn memory_resources_export_once_and_map_only_on_request() {
+    for host_visible in [false, true] {
+        let state = Arc::new(Mutex::new(Recorded::default()));
+        let mut connection = connection(state.clone());
+        connection.send(&[0xff; 4]).unwrap();
+        let mut resource = connection
+            .memory_resource(
+                helios_venus::protocol::VkDeviceMemory(77),
+                NonZeroU64::new(64).unwrap(),
+                host_visible,
+            )
+            .unwrap();
+        assert_eq!(state.lock().unwrap().consumed, [vec![0xff; 4]]);
+        assert_eq!(resource.blob.len(), 64);
+        assert!(state.lock().unwrap().mapped.is_empty());
+        if host_visible {
+            let pointer = resource.map().unwrap();
+            assert_eq!(pointer, resource.map().unwrap());
+        }
+        assert_eq!(state.lock().unwrap().blob_ids, [0, 77]);
+        assert_eq!(state.lock().unwrap().memory_exports, [(77, host_visible)]);
+        drop(resource);
+        connection.close().unwrap();
+    }
 }
 
 #[test]
@@ -715,6 +759,13 @@ mod entry_tests {
         .contains(&command)
         {
             // These commands return only VkResult.
+        } else if command == wire::VK_COMMAND_TYPE_vkGetPhysicalDeviceMemoryProperties_EXT.0 {
+            words.truncate(1);
+            // Present output pointer, one host-visible memory type, one heap.
+            words.extend([1, 0, 1, 32, 0, 6, 0]);
+            words.extend([0; 31 * 2]);
+            words.extend([1, 16, 0, 1024 * 1024, 0, 0]);
+            words.extend([0; 15 * 3]);
         } else if command == wire::VK_COMMAND_TYPE_vkGetDeviceQueue2_EXT.0 {
             // Void-returning commands omit VkResult from their reply.
             words.truncate(1);

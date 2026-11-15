@@ -10,11 +10,14 @@ use super::allocator::HostAllocator;
 use super::instance::{Dispatch, TransportError, invoke_void, object, shared, wait_for_points};
 use crate::connection::Error;
 use crate::protocol as wire;
+#[cfg(feature = "helios")]
+use crate::transport::{SignalPoint, Transport};
 
 #[repr(C)]
 pub(super) struct Device<F: Factory> {
     dispatch: Dispatch<F>,
     pub(super) allocator: HostAllocator,
+    pub(super) memory_properties: vk::PhysicalDeviceMemoryProperties,
     queues: Vec<Box<Queue<F>, HostAllocator>>,
     pub(super) memories: BTreeMap<u64, Box<super::memory::Memory<F::Transport>, HostAllocator>>,
     pub(super) fences: BTreeMap<u64, Box<super::sync::Fence<F::Transport>, HostAllocator>>,
@@ -32,6 +35,35 @@ pub(super) struct Queue<F: Factory> {
     pub(super) device: u64,
 }
 
+/// Mark all prior work on a live Vulkan queue with a fresh completion source.
+///
+/// # Safety
+/// The queue belongs to F and remains live throughout the call.
+#[cfg(feature = "helios")]
+pub(crate) unsafe fn completion<F: Factory>(
+    queue: vk::Queue,
+) -> Result<<F::Transport as Transport>::Signal, vk::Result> {
+    // SAFETY: the caller supplies a live queue from this factory.
+    let owner = unsafe { shared::<F>(object(queue)) };
+    let ring = unsafe { (*object(queue).cast::<Queue<F>>()).ring };
+    let mut state = owner.lock();
+    if state.fault.is_some() {
+        return Err(vk::Result::ERROR_DEVICE_LOST);
+    }
+    let source = state.connection.timeline(0);
+    state
+        .connection
+        .signal_queue(
+            ring,
+            &[SignalPoint {
+                source: &source,
+                value: 1,
+            }],
+        )
+        .map_err(|error| state.fail(error))?;
+    Ok(source)
+}
+
 pub(super) unsafe extern "system" fn create_device<F: Factory>(
     physical: vk::PhysicalDevice,
     info: *const vk::DeviceCreateInfo<'_>,
@@ -47,6 +79,15 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
     }
     let allocator = unsafe { HostAllocator::new(allocator, vk::SystemAllocationScope::DEVICE) };
     let result = (|| -> Result<vk::Result, Error<TransportError<F>>> {
+        let mut memory_properties = vk::PhysicalDeviceMemoryProperties::default();
+        // SAFETY: the physical device is live and output has the Vulkan ABI layout.
+        unsafe {
+            wire::vn_call_vkGetPhysicalDeviceMemoryProperties(
+                &mut state.connection,
+                wire::VkPhysicalDevice(object(physical)),
+                (&raw mut memory_properties).cast(),
+            )
+        }?;
         let id = state.connection.object_id()?;
         let mut device = match Box::try_new_in(
             Device::<F> {
@@ -55,6 +96,7 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
                     shared: Arc::downgrade(&owner),
                 },
                 allocator,
+                memory_properties,
                 queues: Vec::new(),
                 memories: BTreeMap::new(),
                 pools: BTreeMap::new(),

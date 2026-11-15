@@ -167,7 +167,7 @@ async fn main() -> Result<(), GpuTestError> {
         .iter()
         .any(|info| info.id == helios_venus::capset::ID)
     {
-        venus::run()?;
+        venus::run().await?;
     }
     Ok(())
 }

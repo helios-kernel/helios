@@ -11,6 +11,8 @@ mod webgpu;
 pub enum Error {
     #[error("Vulkan returned {0}")]
     Vulkan(#[from] vk::Result),
+    #[error("queue completion failed: {0}")]
+    Timeline(#[from] helios_api::sync::TimelineError),
     #[error(transparent)]
     WebGpu(#[from] wgpu_hal::InstanceError),
     #[error(transparent)]
@@ -41,7 +43,7 @@ pub enum Error {
     },
 }
 
-pub fn run() -> Result<(), Error> {
+pub async fn run() -> Result<(), Error> {
     // Exercise atomic std TLS before GPU consumers use randomized maps.
     std::hint::black_box(std::hash::RandomState::new());
     let entry = entry::<Context>();
@@ -61,7 +63,7 @@ pub fn run() -> Result<(), Error> {
                 .enabled_extension_names(&extensions),
             None,
         )?;
-        let result = (|| {
+        let result = async {
             let physical_devices = instance.enumerate_physical_devices()?;
             let physical = *physical_devices.first().ok_or(Error::NoPhysicalDevices)?;
             let families = instance.get_physical_device_queue_family_properties(physical);
@@ -91,8 +93,11 @@ pub fn run() -> Result<(), Error> {
                 None,
             )?;
             let queue = device.get_device_queue(family, 0);
-            let result = memory(&instance, physical, &device)
-                .and_then(|()| compute::run(&instance, physical, &device, queue, family));
+            let result = async {
+                memory(&instance, physical, &device)?;
+                compute::run(&instance, physical, &device, queue, family).await
+            }
+            .await;
             device.destroy_device(None);
             result?;
             println!(
@@ -101,7 +106,8 @@ pub fn run() -> Result<(), Error> {
             );
             println!("gpu-test:venus ring-reply ok api={version:#x}");
             Ok(())
-        })();
+        }
+        .await;
         instance.destroy_instance(None);
         result?;
         webgpu::run()

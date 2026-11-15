@@ -40,6 +40,17 @@ pub unsafe trait MappedBlob {
     }
 }
 
+/// A retained Vulkan allocation export, with an optional coherent CPU mapping.
+///
+/// # Safety
+/// `map` returns an aligned pointer valid for the allocation's full size until
+/// this owner drops. Repeated calls return the same mapping. Destruction revokes
+/// device mappings before returning guest addresses to the allocator.
+pub unsafe trait MemoryResource {
+    type Error: std::error::Error;
+    fn map(&mut self) -> Result<NonNull<u8>, Self::Error>;
+}
+
 /// A read-only timeline; waits own their points and need no connection lock.
 /// Host implementations suspend the caller through canonical lowering.
 pub trait Timeline: Clone + Send + Sync {
@@ -87,11 +98,18 @@ pub type WaitPoint<T> = TimelinePoint<<<T as Transport>::Signal as SignalTimelin
 pub trait Transport {
     type Error: std::error::Error;
     type Blob: MappedBlob;
+    type Memory: MemoryResource<Error = Self::Error> + Send;
     type Signal: SignalTimeline<Error = Self::Error>;
 
     fn timeline(&self, initial: u64) -> Self::Signal;
 
     fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Self::Blob, Self::Error>;
+    fn export_memory(
+        &mut self,
+        size: NonZeroU64,
+        blob_id: u64,
+        host_visible: bool,
+    ) -> Result<Self::Memory, Self::Error>;
     fn execute(
         &mut self,
         commands: &[u8],

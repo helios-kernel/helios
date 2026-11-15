@@ -1,6 +1,6 @@
 //! Ordered command and reply streams for one Venus renderer context.
 
-use core::num::{NonZeroU64, NonZeroUsize};
+use core::num::NonZeroU64;
 use core::ptr::null;
 use core::time::Duration;
 
@@ -175,22 +175,18 @@ impl<T: Transport> Connection<T> {
         Ok(id)
     }
 
-    /// Create a persistently mapped host blob for a Vulkan allocation.
-    /// CPU consumption precedes resource creation so the renderer has
-    /// installed the memory object before it resolves the blob identifier.
-    /// The caller releases this blob before freeing its Vulkan memory.
-    pub fn memory_blob(
+    /// Export an allocation once, after the renderer consumes its creation.
+    /// The returned owner retains storage without requiring a CPU mapping.
+    pub fn memory_resource(
         &mut self,
         memory: VkDeviceMemory,
-        size: NonZeroUsize,
-    ) -> Result<T::Blob, Error<T::Error>> {
+        size: NonZeroU64,
+        host_visible: bool,
+    ) -> Result<T::Memory, Error<T::Error>> {
         self.flush()?;
-        let blob = self
-            .transport
-            .create_blob(NonZeroU64::new(size.get() as u64).unwrap(), memory.0)
-            .map_err(Error::Transport)?;
-        check_size::<T>(&blob, size.get())?;
-        Ok(blob)
+        self.transport
+            .export_memory(size, memory.0, host_visible)
+            .map_err(Error::Transport)
     }
 
     fn inline(

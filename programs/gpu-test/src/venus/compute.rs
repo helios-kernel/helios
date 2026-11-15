@@ -44,7 +44,7 @@ impl Drop for Resources<'_> {
     }
 }
 
-pub(super) fn run(
+pub(super) async fn run(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     device: &ash::Device,
@@ -232,6 +232,13 @@ pub(super) fn run(
         resources.pending = true;
         // Ten seconds bounds this one-page functional smoke, including CI scheduling.
         let timeout = std::time::Duration::from_secs(10).as_nanos() as u64;
+        let completion = helios_venus::helios::queue_completion(queue)?;
+        let deadline = helios_api::bindings::wasi::clocks::monotonic_clock::now() + timeout;
+        if !helios_api::sync::wait_all(&[completion.point(1)], Some(deadline)).await? {
+            return Err(Error::Synchronization(
+                "queue completion timeline timed out",
+            ));
+        }
         device.wait_semaphores(
             &vk::SemaphoreWaitInfo::default()
                 .semaphores(&semaphores)
@@ -268,6 +275,7 @@ pub(super) fn run(
         device.wait_for_fences(&fences, true, timeout)?;
         resources.pending = false;
     }
+    println!("gpu-test:venus sdk-queue-completion ok");
     println!("gpu-test:venus synchronization ok cpu-signal=1 gpu-signal=2 fence-reset=1");
     println!("gpu-test:venus compute-readback ok words={count}");
     Ok(())

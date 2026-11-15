@@ -14,6 +14,8 @@ mod memory;
 mod sync;
 
 #[cfg(feature = "helios")]
+pub(crate) use device::completion;
+#[cfg(feature = "helios")]
 pub(crate) use memory::with_blob;
 
 #[expect(

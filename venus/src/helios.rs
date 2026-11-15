@@ -8,11 +8,16 @@ use core::ptr::NonNull;
 use core::time::Duration;
 use std::sync::Arc;
 
+use helios_api::bindings::helios::system::sync::{
+    Error as TimelineError, SignalPoint as RawSignalPoint, SignalSource as RawSignalSource,
+    Timeline as RawTimeline, TimelinePoint as RawTimelinePoint,
+};
 use helios_api::memory::{Block, BlockError};
 
 use crate::capset::{self, Capset, CapsetError};
 use crate::transport::{
-    Completion, MappedBlob, SignalTimeline, Timeline, TimelinePoint, Transport, TransportFactory,
+    Completion, MappedBlob, MemoryResource, SignalTimeline, Timeline, TimelinePoint, Transport,
+    TransportFactory,
 };
 
 mod bindings {
@@ -21,7 +26,21 @@ mod bindings {
         world: "venus-host",
         generate_all,
         async: false,
+        // Resource methods come from the SDK; only suspension-capable imports
+        // need this Vulkan ABI's synchronous lowering.
+        skip: [
+            "[method]timeline.value",
+            "[constructor]signal-source",
+            "[method]signal-source.reader",
+            "[method]signal-source.signal",
+            "[method]signal-source.fail",
+        ],
         with: {
+            "helios:system/sync@0.1.0/timeline-point": helios_api::bindings::helios::system::sync::TimelinePoint,
+            "helios:system/sync@0.1.0/signal-point": helios_api::bindings::helios::system::sync::SignalPoint,
+            "helios:system/sync@0.1.0/signal-source": helios_api::bindings::helios::system::sync::SignalSource,
+            "helios:system/sync@0.1.0/timeline": helios_api::bindings::helios::system::sync::Timeline,
+            "helios:system/sync@0.1.0/error": helios_api::bindings::helios::system::sync::Error,
             "helios:system/gpu@0.1.0/image": helios_api::bindings::helios::system::gpu::Image,
             "helios:system/gpu@0.1.0/image-layout": helios_api::image::ImageLayout,
             "helios:system/gpu@0.1.0/pixel-format": helios_api::image::PixelFormat,
@@ -37,7 +56,7 @@ pub enum Error {
     #[error("GPU transport refused: {0}")]
     Gpu(#[from] gpu::Error),
     #[error("completion timeline refused: {0}")]
-    Timeline(#[from] sync::Error),
+    Timeline(#[from] TimelineError),
     #[error(transparent)]
     Memory(#[from] BlockError),
     #[error(transparent)]
@@ -45,10 +64,10 @@ pub enum Error {
 }
 
 #[derive(Clone)]
-pub struct Signal(Arc<sync::SignalSource>);
+pub struct Signal(Arc<RawSignalSource>);
 
 #[derive(Clone)]
-pub struct Reader(Arc<sync::Timeline>);
+pub struct Reader(Arc<RawTimeline>);
 
 impl SignalTimeline for Signal {
     type Error = Error;
@@ -83,7 +102,7 @@ impl Timeline for Reader {
         });
         let points: Vec<_> = points
             .iter()
-            .map(|point| sync::TimelinePoint {
+            .map(|point| RawTimelinePoint {
                 timeline: &point.timeline.0,
                 value: point.value,
             })
@@ -120,9 +139,43 @@ impl TransportFactory for Context {
 /// The resource drops before the guest pages, restoring their ordinary
 /// backing before the allocator can reuse the virtual address range.
 pub struct Blob {
+    memory: DeviceMemory,
+}
+
+/// Renderer storage remains owned even when no CPU address is needed.
+pub struct DeviceMemory {
     resource: gpu::Blob,
-    mapping: Block,
+    size: u64,
+    mapping: Option<CpuMapping>,
+}
+
+struct CpuMapping {
+    block: Block,
     pointer: NonNull<u8>,
+}
+
+// SAFETY: ownership transfers the resource and its exclusive mapping together.
+unsafe impl Send for DeviceMemory {}
+
+// SAFETY: the resource is destroyed before mapping pages return to the allocator.
+// The coherent pointer is derived before device ownership and never reborrowed.
+unsafe impl MemoryResource for DeviceMemory {
+    type Error = Error;
+
+    fn map(&mut self) -> Result<NonNull<u8>, Error> {
+        if let Some(mapping) = &self.mapping {
+            return Ok(mapping.pointer);
+        }
+        let mut block = Block::zeroed(self.size)?;
+        let pointer = NonNull::new(block.bytes_mut().as_mut_ptr()).expect("Block is nonempty");
+        let span = block.span();
+        self.resource.map_blob(memory::Span {
+            offset: span.offset,
+            length: span.length,
+        })?;
+        self.mapping = Some(CpuMapping { block, pointer });
+        Ok(pointer)
+    }
 }
 
 // SAFETY: Blob exclusively owns its mapping and resource. Moving it to
@@ -158,49 +211,58 @@ impl crate::driver::Factory for Context {
 // once, before renderer ownership; no slice is subsequently made here.
 unsafe impl MappedBlob for Blob {
     fn resource_id(&self) -> u32 {
-        self.resource.resource_id()
+        self.memory.resource.resource_id()
     }
 
     fn pointer(&self) -> NonNull<u8> {
-        self.pointer
+        self.memory.mapping.as_ref().unwrap().pointer
     }
 
     fn len(&self) -> usize {
-        self.mapping.len()
+        self.memory.mapping.as_ref().unwrap().block.len()
     }
 }
 
 impl Transport for Context {
     type Error = Error;
     type Blob = Blob;
+    type Memory = DeviceMemory;
     type Signal = Signal;
 
     fn timeline(&self, initial: u64) -> Signal {
-        Signal(Arc::new(sync::SignalSource::new(initial)))
+        Signal(Arc::new(RawSignalSource::new(initial)))
     }
 
     fn create_blob(&mut self, size: NonZeroU64, blob_id: u64) -> Result<Blob, Error> {
-        let mut mapping = Block::zeroed(size.get())?;
-        // Derive the pointer before device memory replaces these pages.
-        let pointer = NonNull::new(mapping.bytes_mut().as_mut_ptr()).expect("Block is nonempty");
-        let span = mapping.span();
+        let mut memory = self.export_memory(size, blob_id, true)?;
+        memory.map()?;
+        Ok(Blob { memory })
+    }
+
+    fn export_memory(
+        &mut self,
+        size: NonZeroU64,
+        blob_id: u64,
+        host_visible: bool,
+    ) -> Result<DeviceMemory, Error> {
+        let usage = if host_visible {
+            gpu::BlobUsage::MAPPABLE
+        } else {
+            gpu::BlobUsage::empty()
+        };
         let resource = self.gpu.create_blob(
             &self.context,
             gpu::BlobMemory::Host3d,
-            gpu::BlobUsage::MAPPABLE,
+            usage,
             size.get(),
             blob_id,
             None,
         )?;
         self.context.attach(&resource)?;
-        resource.map_blob(memory::Span {
-            offset: span.offset,
-            length: span.length,
-        })?;
-        Ok(Blob {
+        Ok(DeviceMemory {
             resource,
-            mapping,
-            pointer,
+            size: size.get(),
+            mapping: None,
         })
     }
 
@@ -215,7 +277,7 @@ impl Transport for Context {
             signals: completion
                 .signals
                 .iter()
-                .map(|point| sync::SignalPoint {
+                .map(|point| RawSignalPoint {
                     source: &point.source.0,
                     value: point.value,
                 })
@@ -251,4 +313,21 @@ pub unsafe fn export_image(
                 .map_err(Error::from)
         })
     }
+}
+
+/// Submit a completion marker for all prior work on a Vulkan queue.
+///
+/// The returned timeline reaches 1 after rendering completes and can be passed
+/// to `ImageSurface::present`. This Vulkan transport operation may suspend the
+/// guest stack through canonical lowering; waiting on the result uses the SDK.
+///
+/// # Safety
+/// `queue` must be live and originate from this module's `Context` factory.
+#[cfg(feature = "driver")]
+pub unsafe fn queue_completion(
+    queue: ash::vk::Queue,
+) -> Result<helios_api::sync::Timeline, ash::vk::Result> {
+    // SAFETY: the caller supplies a live queue from Context's entry table.
+    let source = unsafe { crate::driver::completion::<Context>(queue) }?;
+    Ok(source.0.reader().into())
 }

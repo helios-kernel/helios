@@ -217,6 +217,7 @@ impl From<host_sync::SignalSource> for SignalSource {
     }
 }
 
+#[cfg(feature = "surface")]
 impl TimelinePoint<'_> {
     pub(crate) fn raw(&self) -> host_sync::TimelinePoint<'_> {
         host_sync::TimelinePoint {
