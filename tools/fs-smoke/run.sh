@@ -19,9 +19,9 @@ mkfs.btrfs -q -f --rootdir "$runtime/tree" "$runtime/image.btrfs"
   --runtime-dir "$runtime" --keep-runtime-dir \
   --bootfs-root "$runtime/bootfs" \
   --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
-  --disk "$runtime/image.btrfs,serial=btrfs-smoke,readonly" \
+  --disk "$runtime/image.btrfs,serial=btrfs-smoke" \
   --boot-program dash --boot-program debugger \
-  --boot-program ls --boot-program cat --boot-program init \
+  --boot-program ls --boot-program cat --boot-program init --boot-program python3 \
   --no-compiler-plugin \
   shell -c init 2>&1 > "$runtime/guest.out" | tee "$runtime/inspector.log"
 cat "$runtime/guest.out"
@@ -37,3 +37,12 @@ done
 for line in '你好，世界' 'こんにちは世界' '안녕하세요 세계'; do
   grep -Fqx "$line" "$runtime/guest.out"
 done
+
+grep -Fqx 'btrfs:guest-write-synced' "$runtime/guest.out"
+btrfs check --readonly "$runtime/image.btrfs" 2>&1 | tee "$runtime/btrfs-check.log"
+mkdir -p "$runtime/linux-mount"
+sudo mount -t btrfs -o loop,ro "$runtime/image.btrfs" "$runtime/linux-mount"
+trap 'sudo umount "$runtime/linux-mount"' EXIT
+python3 tools/fs-smoke/bootfs/etc/btrfs-write.py verify "$runtime/linux-mount"   | tee "$runtime/linux-readback.log"
+sudo umount "$runtime/linux-mount"
+trap - EXIT

@@ -13,8 +13,8 @@
 //!
 //! Sources are `memory`, `boot-image`, `host-share`, `disk:<serial>`
 //! for EROFS, and `btrfs:<serial>` for btrfs. Disk sources use the serial
-//! the device reported. The mode defaults to `rw`; the boot image and disks are
-//! read-only whatever it says. A line init cannot parse, or a mount the
+//! the device reported. The mode defaults to `rw`; the boot image and EROFS
+//! disks remain read-only. A line init cannot parse, or a mount the
 //! kernel refuses, fails init.
 
 use std::fs;
