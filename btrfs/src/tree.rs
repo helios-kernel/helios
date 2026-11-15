@@ -20,8 +20,8 @@ pub(crate) mod edit;
 #[cfg(feature = "write")]
 pub(crate) mod write;
 
-use alloc::boxed::Box;
-use alloc::vec;
+use alloc::sync::Arc;
+use core::iter::repeat_n;
 
 use arrayvec::ArrayVec;
 
@@ -60,7 +60,7 @@ pub(crate) struct Expected {
 /// A validated tree block.
 #[derive(Clone)]
 pub(crate) struct Node {
-    bytes: Box<[u8]>,
+    bytes: Arc<[u8]>,
     level: u8,
     nritems: usize,
 }
@@ -75,12 +75,16 @@ impl Node {
     ) -> Result<Self, Error> {
         let superblock = volume.superblock();
         let nodesize = superblock.nodesize() as usize;
-        let mut bytes = vec![0_u8; nodesize].into_boxed_slice();
+        let mut bytes = Arc::<[u8]>::from_iter(repeat_n(0, nodesize));
         let nritems = volume
-            .read_verified(logical, &mut bytes, |block| {
-                validate(block, logical, expected, superblock)
-                    .map_err(|defect| Error::TreeBlock { logical, defect })
-            })
+            .read_verified(
+                logical,
+                Arc::get_mut(&mut bytes).expect("unpublished node"),
+                |block| {
+                    validate(block, logical, expected, superblock)
+                        .map_err(|defect| Error::TreeBlock { logical, defect })
+                },
+            )
             .await?;
         Ok(Self {
             bytes,

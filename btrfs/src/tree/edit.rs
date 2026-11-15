@@ -3,8 +3,9 @@
 //! an address already published by a committed root.
 
 use alloc::boxed::Box;
-use alloc::vec;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::iter::repeat_n;
 use core::ops::Range;
 
 use thiserror::Error;
@@ -54,8 +55,8 @@ impl Header {
         }
     }
 
-    fn block(&self, address: u64, generation: u64, owner: u64, count: usize) -> Box<[u8]> {
-        let mut bytes = vec![0; self.size].into_boxed_slice();
+    fn block(&self, address: u64, generation: u64, owner: u64, count: usize) -> Arc<[u8]> {
+        let mut bytes = Arc::<[u8]>::from_iter(repeat_n(0, self.size));
         let mut raw = self.raw;
         raw.csum.fill(0);
         raw.bytenr.set(address);
@@ -66,7 +67,8 @@ impl Header {
         // BTRFS_HEADER_FLAG_RELOC (bit 1), and set WRITTEN (bit 0).
         raw.flags
             .set((raw.flags.get() & !((0xff_u64 << 56) | 2)) | (1_u64 << 56) | 1);
-        bytes[..HEADER_BYTES].copy_from_slice(raw.as_bytes());
+        Arc::get_mut(&mut bytes).expect("unpublished node")[..HEADER_BYTES]
+            .copy_from_slice(raw.as_bytes());
         bytes
     }
 
@@ -181,10 +183,11 @@ impl Leaf {
         generation: u64,
         owner: u64,
         kind: ChecksumType,
-    ) -> Box<[u8]> {
+    ) -> Arc<[u8]> {
         let items = &self.items[range];
         let mut bytes = self.header.block(address, generation, owner, items.len());
-        let mut end = bytes.len();
+        let output = Arc::get_mut(&mut bytes).expect("unpublished node");
+        let mut end = output.len();
         for (slot, item) in items.iter().enumerate() {
             end -= item.data.len();
             let raw = RawItem {
@@ -193,10 +196,10 @@ impl Leaf {
                 size: (item.data.len() as u32).into(),
             };
             let start = HEADER_BYTES + slot * ITEM_BYTES;
-            bytes[start..start + ITEM_BYTES].copy_from_slice(raw.as_bytes());
-            bytes[end..end + item.data.len()].copy_from_slice(&item.data);
+            output[start..start + ITEM_BYTES].copy_from_slice(raw.as_bytes());
+            output[end..end + item.data.len()].copy_from_slice(&item.data);
         }
-        checksum(&mut bytes, kind);
+        checksum(output, kind);
         bytes
     }
 }
@@ -265,11 +268,12 @@ impl Branch {
         generation: u64,
         owner: u64,
         kind: ChecksumType,
-    ) -> Box<[u8]> {
+    ) -> Arc<[u8]> {
         let children = &self.children[range];
         let mut bytes = self
             .header
             .block(address, generation, owner, children.len());
+        let output = Arc::get_mut(&mut bytes).expect("unpublished node");
         for (slot, child) in children.iter().enumerate() {
             let raw = RawKeyPtr {
                 key: raw_key(child.key),
@@ -277,9 +281,9 @@ impl Branch {
                 generation: child.generation.into(),
             };
             let start = HEADER_BYTES + slot * KEY_PTR_BYTES;
-            bytes[start..start + KEY_PTR_BYTES].copy_from_slice(raw.as_bytes());
+            output[start..start + KEY_PTR_BYTES].copy_from_slice(raw.as_bytes());
         }
-        checksum(&mut bytes, kind);
+        checksum(output, kind);
         bytes
     }
 }

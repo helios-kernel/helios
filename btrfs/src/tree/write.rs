@@ -3,6 +3,7 @@
 //! during device I/O. Publication and reclamation belong to the transaction.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use arrayvec::ArrayVec;
@@ -223,7 +224,7 @@ impl Trees {
         }
     }
 
-    fn insert(&mut self, bytes: alloc::boxed::Box<[u8]>) {
+    fn insert(&mut self, bytes: Arc<[u8]>) {
         let header: &RawHeader = view(&bytes).expect("encoded header");
         self.blocks.insert(
             header.bytenr.get(),
