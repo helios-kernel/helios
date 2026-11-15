@@ -37,6 +37,11 @@ fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
             error: ErofsError::Checksum { .. } | ErofsError::Format(_),
             ..
         } => RefusalKind::InvalidFilesystem,
+        MountRequestError::Btrfs {
+            error: helios_btrfs::Error::Io { .. },
+            ..
+        } => RefusalKind::Io,
+        MountRequestError::Btrfs { .. } => RefusalKind::InvalidFilesystem,
         MountRequestError::Mount(MountError::InvalidPoint(_) | MountError::RootKind) => {
             RefusalKind::InvalidPoint
         }
@@ -101,6 +106,11 @@ macro_rules! impl_mount_bindings {
                     wit::MountSource::BootImage => MountSource::BootImage,
                     wit::MountSource::HostShare => MountSource::HostShare,
                     wit::MountSource::Disk(serial) => return disk_source(serial),
+                    wit::MountSource::Btrfs(serial) => {
+                        let parsed = BlockSerial::new(serial.as_bytes())
+                            .ok_or(MountRequestError::InvalidSerial(serial))?;
+                        MountSource::Btrfs { serial: parsed }
+                    },
                 })
             }
 

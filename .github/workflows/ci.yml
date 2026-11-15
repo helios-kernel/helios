@@ -267,7 +267,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs libclang-dev
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools,cargo-deny,nextest
@@ -371,7 +371,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils \
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
             qemu-system-misc opensbi
           qemu-system-riscv64 --version
       - uses: taiki-e/install-action@v2
@@ -502,48 +502,13 @@ jobs:
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
-      - name: Mount an EROFS disk from init
+      - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
         working-directory: helios
         env:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
-        run: |
-          set -o pipefail
-          # A read-only disk with a serial other than the scratch disk's
-          # is a mount source. The session runs init, which mounts it from
-          # /etc/fstab; mounts belong to a process tree, so the reads run
-          # from /etc/rc, under init (#511).
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
-          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
-          printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
-          printf '中文\n' > "$runtime/tree/docs/中文.txt"
-          printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
-          printf '한국어\n' > "$runtime/tree/docs/한국어.txt"
-          mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
-          printf 'helios init: erofs smoke\n' > "$runtime/bootfs/init.txt"
-          printf 'disk:erofs-smoke /image ro\n' > "$runtime/bootfs/etc/fstab"
-          printf 'cat /image/hello.txt\nls /image/docs\n' > "$runtime/bootfs/etc/rc"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
-            --accel tcg \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --bootfs-root "$runtime/bootfs" \
-            --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
-            --boot-program dash --boot-program debugger \
-            --boot-program ls --boot-program cat --boot-program init \
-            --no-compiler-plugin \
-            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
-          cat erofs-smoke.out
-          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
-          grep -Fqx 'helios init: listing /image' erofs-smoke.out
-          grep -Fqx 'dir docs' erofs-smoke.out
-          grep -Fqx 'file hello.txt' erofs-smoke.out
-          # The rest is /etc/rc: cat and ls, children of init, reading
-          # through the mount.
-          grep -Fqx 'erofs:ok' erofs-smoke.out
-          grep -Fqx '中文.txt' erofs-smoke.out
-          grep -Fqx '日本語.txt' erofs-smoke.out
-          grep -Fqx '한국어.txt' erofs-smoke.out
+        run: bash tools/fs-smoke/run.sh riscv64 tcg
       - name: Run CPython
         timeout-minutes: 5
         shell: bash
@@ -642,63 +607,12 @@ jobs:
           grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
           grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
           grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
-      - name: Fetch over virtio-net with curl
+      - name: Fetch HTTP and verify TLS certificates with curl
         timeout-minutes: 5
-        shell: bash
         working-directory: helios
-        env:
-          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
-          # Without this the step reports tee's status, not the
-          # command's, and a runner script that fails is invisible.
-          set -o pipefail
-          # curl speaks wasi:http, which the kernel forwards to the
-          # http-client plugin, so both boot programs are required. curl is
-          # invoked by bare name so dash resolves it through PATH and execs
-          # it with argv[0] == "curl", which is the shape that regressed in
-          # issue #35; tools/wasi-apps/smoke.sh covers the bootfs-path shape.
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl"
-          mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
-            --accel tcg \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --boot-program dash --boot-program debugger \
-            --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl http://detectportal.firefox.com/success.txt' 2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
-          cat curl-smoke.out
-          grep -Fqx success curl-smoke.out
-      - name: Fetch over TLS with curl
-        shell: bash
-        working-directory: helios
-        env:
-          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
-        run: |
-          # Without this the step reports tee's status, not the
-          # command's, and a runner script that fails is invisible.
-          set -o pipefail
-          # The same fetch through the plugin's TLS transport: the
-          # handshake, the certificate chain against the compiled-in
-          # roots, and the validity window against the wall clock the
-          # platform RTC seeded. The same boot then fetches from three
-          # origins that each present a bad certificate (expired, issued
-          # for another name, self-signed), which must each fail as
-          # `tls-certificate-error`; the trailing `true` keeps the last
-          # failed fetch's exit status from failing the step before the
-          # log is read.
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
-          mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
-            --accel tcg \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --boot-program dash --boot-program debugger \
-            --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl https://detectportal.firefox.com/success.txt; curl https://expired.badssl.com/; curl https://wrong.host.badssl.com/; curl https://self-signed.badssl.com/; true' 2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
-          cat curl-https-smoke.out
-          grep -Fqx success curl-https-smoke.out
-          # curl prints the error code through its Debug form
-          # (`ErrorCode::TlsCertificateError`), on whichever stream the
-          # inspector relays the guest's stderr to.
-          test "$(cat curl-https-smoke.out "$runtime/inspector.log" | grep -Fc 'http request failed: ErrorCode::TlsCertificateError')" -eq 3
+          python3 tools/wasi-apps/tls-smoke.py --arch riscv64 --accel tcg \
+            --runtime-dir "$GITHUB_WORKSPACE/smoke-runtime/curl-https"
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -787,7 +701,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils \
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
             python3-venv pkg-config flex bison \
             libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev \
             swtpm
@@ -987,7 +901,7 @@ jobs:
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
-      - name: Mount an EROFS disk from init
+      - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
         working-directory: helios
@@ -995,42 +909,7 @@ jobs:
           HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
           HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
-        run: |
-          set -o pipefail
-          # A read-only disk with a serial other than the scratch disk's
-          # is a mount source. The session runs init, which mounts it from
-          # /etc/fstab; mounts belong to a process tree, so the reads run
-          # from /etc/rc, under init (#511).
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
-          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
-          printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
-          printf '中文\n' > "$runtime/tree/docs/中文.txt"
-          printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
-          printf '한국어\n' > "$runtime/tree/docs/한국어.txt"
-          mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
-          printf 'helios init: erofs smoke\n' > "$runtime/bootfs/init.txt"
-          printf 'disk:erofs-smoke /image ro\n' > "$runtime/bootfs/etc/fstab"
-          printf 'cat /image/hello.txt\nls /image/docs\n' > "$runtime/bootfs/etc/rc"
-          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
-            --accel tcg \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --bootfs-root "$runtime/bootfs" \
-            --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
-            --boot-program dash --boot-program debugger \
-            --boot-program ls --boot-program cat --boot-program init \
-            --no-compiler-plugin \
-            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
-          cat erofs-smoke.out
-          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
-          grep -Fqx 'helios init: listing /image' erofs-smoke.out
-          grep -Fqx 'dir docs' erofs-smoke.out
-          grep -Fqx 'file hello.txt' erofs-smoke.out
-          # The rest is /etc/rc: cat and ls, children of init, reading
-          # through the mount.
-          grep -Fqx 'erofs:ok' erofs-smoke.out
-          grep -Fqx '中文.txt' erofs-smoke.out
-          grep -Fqx '日本語.txt' erofs-smoke.out
-          grep -Fqx '한국어.txt' erofs-smoke.out
+        run: bash tools/fs-smoke/run.sh aarch64 tcg
       - name: Take a wasm trap on aarch64
         timeout-minutes: 10
         shell: bash
@@ -1371,7 +1250,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils \
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
             qemu-system-x86 ovmf swtpm
           qemu-system-x86_64 --version
           swtpm --version
@@ -1637,46 +1516,11 @@ jobs:
           grep -Fqx 'suberr:usage: date' coreutils-smoke.out
           grep -Fqx 'usage: date' coreutils-smoke.out
           grep -Fqx after:ok coreutils-smoke.out
-      - name: Mount an EROFS disk from init
+      - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
         working-directory: helios
-        run: |
-          set -o pipefail
-          # A read-only disk with a serial other than the scratch disk's
-          # is a mount source. The session runs init, which mounts it from
-          # /etc/fstab; mounts belong to a process tree, so the reads run
-          # from /etc/rc, under init (#511).
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/erofs"
-          mkdir -p "$runtime/tree/docs" "$runtime/bootfs/etc" "$runtime/bootfs/image"
-          printf 'erofs:ok\n' > "$runtime/tree/hello.txt"
-          printf '中文\n' > "$runtime/tree/docs/中文.txt"
-          printf '日本語\n' > "$runtime/tree/docs/日本語.txt"
-          printf '한국어\n' > "$runtime/tree/docs/한국어.txt"
-          mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
-          printf 'helios init: erofs smoke\n' > "$runtime/bootfs/init.txt"
-          printf 'disk:erofs-smoke /image ro\n' > "$runtime/bootfs/etc/fstab"
-          printf 'cat /image/hello.txt\nls /image/docs\n' > "$runtime/bootfs/etc/rc"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
-            --accel kvm \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --bootfs-root "$runtime/bootfs" \
-            --disk "$runtime/image.erofs,serial=erofs-smoke,readonly" \
-            --boot-program dash --boot-program debugger \
-            --boot-program ls --boot-program cat --boot-program init \
-            --no-compiler-plugin \
-            shell -c init 2>&1 > erofs-smoke.out | tee "$runtime/inspector.log"
-          cat erofs-smoke.out
-          grep -Fqx 'helios init: mounted disk:erofs-smoke at /image' erofs-smoke.out
-          grep -Fqx 'helios init: listing /image' erofs-smoke.out
-          grep -Fqx 'dir docs' erofs-smoke.out
-          grep -Fqx 'file hello.txt' erofs-smoke.out
-          # The rest is /etc/rc: cat and ls, children of init, reading
-          # through the mount.
-          grep -Fqx 'erofs:ok' erofs-smoke.out
-          grep -Fqx '中文.txt' erofs-smoke.out
-          grep -Fqx '日本語.txt' erofs-smoke.out
-          grep -Fqx '한국어.txt' erofs-smoke.out
+        run: bash tools/fs-smoke/run.sh x86-64 kvm
       - name: Run CPython twice and record its launch phases
         timeout-minutes: 5
         shell: bash
@@ -2028,56 +1872,12 @@ jobs:
           [[ -n "$main_status" && "$main_status" != 0 && "$main_status" != 1 ]]
           [[ "$thread_status" == "$main_status" ]]
           ! grep -Fq 'Kernel panic' "$runtime/guest.log"
-      - name: Fetch over virtio-net with curl
+      - name: Fetch HTTP and verify TLS certificates with curl
         timeout-minutes: 5
-        shell: bash
         working-directory: helios
         run: |
-          # Without this the step reports tee's status, not the
-          # command's, and a runner script that fails is invisible.
-          set -o pipefail
-          # The counterpart of smoke-riscv64's curl step, and what #86
-          # died in twice over: nothing here drove the NIC, because the
-          # balloon service had wedged the bootstrap processor's
-          # executor, and once it did drive the NIC the transmit queue's
-          # MSI-X message landed on a vector the routing table did not
-          # know. Both are x86-only, and neither is visible from any
-          # step that does not move a packet.
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl"
-          mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
-            --accel kvm \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --boot-program dash --boot-program debugger \
-            --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl http://detectportal.firefox.com/success.txt' \
-            2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
-          cat curl-smoke.out
-          grep -Fqx success curl-smoke.out
-      - name: Fetch over TLS with curl
-        shell: bash
-        working-directory: helios
-        run: |
-          # Without this the step reports tee's status, not the
-          # command's, and a runner script that fails is invisible.
-          set -o pipefail
-          # The counterpart of smoke-riscv64's TLS step, under KVM, with the
-          # same three bad-certificate fetches.
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
-          mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
-            --accel kvm \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --boot-program dash --boot-program debugger \
-            --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl https://detectportal.firefox.com/success.txt; curl https://expired.badssl.com/; curl https://wrong.host.badssl.com/; curl https://self-signed.badssl.com/; true' \
-            2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
-          cat curl-https-smoke.out
-          grep -Fqx success curl-https-smoke.out
-          # curl prints the error code through its Debug form
-          # (`ErrorCode::TlsCertificateError`), on whichever stream the
-          # inspector relays the guest's stderr to.
-          test "$(cat curl-https-smoke.out "$runtime/inspector.log" | grep -Fc 'http request failed: ErrorCode::TlsCertificateError')" -eq 3
+          python3 tools/wasi-apps/tls-smoke.py --arch x86-64 --accel kvm \
+            --runtime-dir "$GITHUB_WORKSPACE/smoke-runtime/curl-https"
       - name: Draw on the display and capture the scanout
         timeout-minutes: 5
         shell: bash

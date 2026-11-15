@@ -33,6 +33,7 @@ wasmtime-bare-metal = [
 ]
 
 [dependencies]
+helios-btrfs = { path = "../btrfs", default-features = false }
 async-lock = { version = "3.4.2", default-features = false }
 async-task = { version = "4.7.1", default-features = false }
 atomic-waker = "1.1.2"
@@ -84,6 +85,7 @@ frame-alloc = { version = "=0.1.0", default-features = false, features = ["stats
 zrip = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+ferrosys = { version = "0.8.0", default-features = false, features = ["btrfs"] }
 critical-section = { version = "1.2.0", features = ["std"] }
 # The image builder writes the EROFS fixtures that run on every host;
 # `mkfs.erofs` writes the ones CI runs (see `vfs/erofs/tests.rs`).

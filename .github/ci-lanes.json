@@ -41,7 +41,7 @@
     "surfaces": ["x86", "hosted", "host_tools", "programs"]
   },
   "test-libraries": {
-    "command": "just test-libraries",
+    "command": "just test-libraries && just test-btrfs-mkfs",
     "rust-cache": true,
     "surfaces": ["x86", "host_tools", "programs"]
   },

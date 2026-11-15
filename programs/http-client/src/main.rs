@@ -25,6 +25,7 @@ mod fields;
 mod request;
 mod response;
 
+use std::io::ErrorKind;
 use std::time::Duration;
 
 use futures_channel::oneshot;
@@ -49,6 +50,9 @@ mod bindings {
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The system's optional PEM bundle, added to Mozilla's built-in roots.
+const SYSTEM_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
 struct HttpClient;
 
@@ -110,10 +114,23 @@ async fn exchange(
     outcome: &BodyOutcome,
 ) -> Result<types::Response, ErrorCode> {
     // No proxy: a guest reaches the network directly.
-    let transport = Transport::builder()
-        .proxy(Proxy::none())
-        .build()
-        .map_err(|error| code(&error, outcome))?;
+    let mut transport = Transport::builder().proxy(Proxy::none());
+    if matches!(scheme, Scheme::Https) {
+        match helios_api::fs::read(SYSTEM_CA_BUNDLE).await {
+            Ok(pem) => {
+                transport = transport
+                    .extra_root_certificates_pem(&pem)
+                    .map_err(|error| code(&error, outcome))?;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ErrorCode::InternalError(Some(format!(
+                    "reading {SYSTEM_CA_BUNDLE}: {error}"
+                ))));
+            }
+        }
+    }
+    let transport = transport.build().map_err(|error| code(&error, outcome))?;
     let mut backend =
         NativeBackend::on_current_thread(transport, HeliosNet, HeliosNet, &HeliosExecutor);
     let response = backend

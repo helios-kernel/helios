@@ -18,7 +18,7 @@ never depends on anything above it.
 | Layer | Crates | Contents |
 | --- | --- | --- |
 | Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
-| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/`, `firmware/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; `firmware/` turns the platform description a backend hands it (the device tree's NUMA properties, the ACPI SRAT and SLIT) into `hal/` values; all five depend on `hal/` and none on the kernel. |
+| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/`, `firmware/`, `btrfs/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; `firmware/` turns the platform description a backend hands it (the device tree's NUMA properties, the ACPI SRAT and SLIT) into `hal/` values; all six depend on `hal/` and none on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
 | Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
@@ -454,7 +454,7 @@ just test-units
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
 `just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `firmware`, `kernel`,
-`inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
+`inspector-protocol` and `workspace-root` unit tests, every `btrfs` and `hosted` test,
 and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
 in the same change or it never runs.
@@ -469,7 +469,7 @@ red lane names the surface that broke:
 | --- | --- | --- |
 | `check-host` | `ubuntu-24.04` | The host surfaces compile. |
 | `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
-| `test-kernel`, `test-libraries`, `test-host-tools`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
+| `test-kernel`, `test-libraries`, `test-host-tools`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests, the btrfs reader against `mkfs.btrfs` images, and the embedded debugger. |
 | `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot on one node and on two NUMA nodes, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures; under `swtpm`, the kernel's signing key kept across two boots, resealed after a changed payload, and a tampered payload refused. |
 | `smoke-x86-64-venus` | `ubuntu-24.04`, `--accel kvm` | `gpu-test` on a Venus `virtio-gpu-gl` device rendered through lavapipe: a virgl context's fence, host and guest blobs, two instances at once. It runs only on changes to the 3D path, against a pinned QEMU and virglrenderer it builds and caches. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, a two-node NUMA boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
