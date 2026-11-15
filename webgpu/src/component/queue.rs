@@ -1,3 +1,4 @@
+use super::backend;
 use core::cell::RefCell;
 use std::rc::Rc;
 
@@ -11,7 +12,7 @@ use super::{
 };
 use crate::runtime::{GpuError, GpuErrorKind};
 
-pub struct CommandBuffer(pub Object<RefCell<Option<wgpu::CommandBuffer>>>);
+pub struct CommandBuffer(pub Object<RefCell<Option<backend::CommandBuffer>>>);
 
 impl wit::GuestGpuCommandBuffer for CommandBuffer {
     fn label(&self) -> String {
@@ -22,16 +23,17 @@ impl wit::GuestGpuCommandBuffer for CommandBuffer {
     }
 }
 
+#[derive(Clone)]
 pub struct Queue {
     pub owner: Rc<DeviceState>,
-    label: RefCell<String>,
+    label: Rc<RefCell<String>>,
 }
 
 impl Queue {
     pub fn new(owner: Rc<DeviceState>, label: Option<String>) -> Self {
         Self {
             owner,
-            label: RefCell::new(label.unwrap_or_default()),
+            label: Rc::new(RefCell::new(label.unwrap_or_default())),
         }
     }
 }
@@ -64,8 +66,13 @@ impl wit::GuestGpuQueue for Queue {
         }
         // A submission consumes every command buffer, even when validation fails.
         if valid {
-            self.owner
-                .native(|| self.owner.device.queue().submit(commands));
+            self.owner.native(|| {
+                self.owner
+                    .device
+                    .queue
+                    .submit(&commands)
+                    .map_err(|(_, error)| error)
+            });
         }
     }
 
@@ -77,7 +84,6 @@ impl wit::GuestGpuQueue for Queue {
                 causes: Vec::new(),
             });
         }
-        self.owner.drain();
     }
 
     fn write_buffer_with_copy(
@@ -107,8 +113,8 @@ impl wit::GuestGpuQueue for Queue {
         }
         if let Some(raw) = buffer.object.get() {
             self.owner.native(|| {
-                self.owner.device.queue().write_buffer(
-                    raw,
+                self.owner.device.queue.write_buffer(
+                    raw.clone(),
                     buffer_offset,
                     &data[selected.start as usize..selected.end as usize],
                 )
@@ -133,8 +139,8 @@ impl wit::GuestGpuQueue for Queue {
         let Some(raw) = texture.object.get() else {
             return;
         };
-        let destination = wgpu::TexelCopyTextureInfo {
-            texture: raw,
+        let destination = wgpu_types::TexelCopyTextureInfo {
+            texture: raw.clone(),
             mip_level: destination.mip_level.unwrap_or(0),
             origin: destination.origin.map(Convert::convert).unwrap_or_default(),
             aspect: destination
@@ -143,11 +149,11 @@ impl wit::GuestGpuQueue for Queue {
                 .unwrap_or(wgpu::TextureAspect::All),
         };
         self.owner.native(|| {
-            self.owner.device.queue().write_texture(
+            self.owner.device.queue.write_texture(
                 destination,
                 &data,
-                data_layout.convert(),
-                size.convert(),
+                &data_layout.convert(),
+                &size.convert(),
             )
         });
     }

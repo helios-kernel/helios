@@ -1,3 +1,4 @@
+use super::backend;
 use super::convert::Convert;
 use super::value::Object;
 use super::wit;
@@ -41,7 +42,7 @@ macro_rules! pipeline {
                 let layout = match self.get() {
                     Some(raw) => Object::new(
                         self.owner.clone(),
-                        self.owner.native(|| raw.get_bind_group_layout(index)),
+                        self.owner.created(raw.get_bind_group_layout(index)),
                         None,
                     ),
                     None => Object::invalid(self.owner.clone(), None),
@@ -51,18 +52,18 @@ macro_rules! pipeline {
         }
     };
 }
-pipeline!(GuestGpuComputePipeline, wgpu::ComputePipeline);
-pipeline!(GuestGpuRenderPipeline, wgpu::RenderPipeline);
+pipeline!(GuestGpuComputePipeline, backend::ComputePipeline);
+pipeline!(GuestGpuRenderPipeline, backend::RenderPipeline);
 
 pub struct QuerySet {
-    pub object: Object<wgpu::QuerySet>,
+    pub object: Object<backend::QuerySet>,
     pub kind: wit::GpuQueryType,
     pub count: u32,
 }
 impl wit::GuestGpuQuerySet for QuerySet {
     fn destroy(&self) {
         if let Some(raw) = &self.object.raw {
-            self.object.owner.native(|| raw.destroy());
+            raw.destroy();
         }
     }
     fn type_(&self) -> wit::GpuQueryType {
@@ -80,7 +81,7 @@ impl wit::GuestGpuQuerySet for QuerySet {
 }
 
 pub struct Texture {
-    pub object: Object<wgpu::Texture>,
+    pub object: Object<backend::Texture>,
     pub descriptor: wit::GpuTextureDescriptor,
 }
 
@@ -91,7 +92,7 @@ impl wit::GuestGpuTexture for Texture {
     ) -> wit::GpuTextureView {
         let label = descriptor.as_ref().and_then(|d| d.label.clone());
         let invalid = || {
-            wit::GpuTextureView::new(Object::<wgpu::TextureView>::invalid(
+            wit::GpuTextureView::new(Object::<backend::TextureView>::invalid(
                 self.object.owner.clone(),
                 label.clone(),
             ))
@@ -99,7 +100,7 @@ impl wit::GuestGpuTexture for Texture {
         let Some(raw) = self.object.get() else {
             return invalid();
         };
-        let mut view = wgpu::TextureViewDescriptor::default();
+        let mut view = wgpu_core::resource::TextureViewDescriptor::default();
         if let Some(descriptor) = &descriptor {
             if descriptor
                 .swizzle
@@ -111,25 +112,25 @@ impl wit::GuestGpuTexture for Texture {
                     .invalid("texture-component-swizzle was not enabled on this device");
                 return invalid();
             }
-            view.label = descriptor.label.as_deref();
+            view.label = descriptor.label.as_deref().map(Into::into);
             view.format = descriptor.format.map(Convert::convert);
             view.dimension = descriptor.dimension.map(Convert::convert);
             view.usage = descriptor.usage.map(Convert::convert);
-            view.aspect = descriptor
+            view.range.aspect = descriptor
                 .aspect
                 .map(Convert::convert)
                 .unwrap_or(wgpu::TextureAspect::All);
-            view.base_mip_level = descriptor.base_mip_level.unwrap_or(0);
-            view.mip_level_count = descriptor.mip_level_count;
-            view.base_array_layer = descriptor.base_array_layer.unwrap_or(0);
-            view.array_layer_count = descriptor.array_layer_count;
+            view.range.base_mip_level = descriptor.base_mip_level.unwrap_or(0);
+            view.range.mip_level_count = descriptor.mip_level_count;
+            view.range.base_array_layer = descriptor.base_array_layer.unwrap_or(0);
+            view.range.array_layer_count = descriptor.array_layer_count;
         }
-        let raw = self.object.owner.native(|| raw.create_view(&view));
+        let raw = self.object.owner.created(raw.create_view(&view));
         wit::GpuTextureView::new(Object::new(self.object.owner.clone(), raw, label))
     }
     fn destroy(&self) {
         if let Some(raw) = &self.object.raw {
-            self.object.owner.native(|| raw.destroy());
+            raw.destroy();
         }
     }
     fn width(&self) -> u32 {

@@ -3,7 +3,9 @@
 use async_channel::{Receiver, Sender};
 use core::cell::RefCell;
 
-use crate::runtime::{Device, GpuError, GpuErrorKind};
+use super::backend::Device;
+use crate::runtime::{GpuError, GpuErrorKind};
+use wgpu_types::error::{ErrorType, WebGpuError};
 
 struct Scope {
     filter: GpuErrorKind,
@@ -82,16 +84,41 @@ impl DeviceState {
         }
     }
 
-    pub fn drain(&self) {
-        while let Ok(error) = self.device.errors().try_recv() {
-            self.errors.report(error);
+    pub fn report(&self, error: &impl WebGpuError) {
+        let kind = match error.webgpu_error_type() {
+            ErrorType::Validation => GpuErrorKind::Validation,
+            ErrorType::OutOfMemory => GpuErrorKind::OutOfMemory,
+            ErrorType::Internal => GpuErrorKind::Internal,
+            ErrorType::DeviceLost => return,
+        };
+        let mut causes = Vec::new();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            causes.push(cause.to_string());
+            source = cause.source();
         }
+        self.errors.report(GpuError {
+            kind,
+            message: error.to_string(),
+            causes,
+        });
     }
 
-    pub fn native<T>(&self, call: impl FnOnce() -> T) -> T {
-        let value = call();
-        self.drain();
+    pub fn created<T, E: WebGpuError>(&self, (value, error): (T, Option<E>)) -> T {
+        if let Some(error) = error {
+            self.report(&error);
+        }
         value
+    }
+
+    pub fn native<T, E: WebGpuError>(&self, call: impl FnOnce() -> Result<T, E>) -> Option<T> {
+        match call() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.report(&error);
+                None
+            }
+        }
     }
 
     pub fn invalid(&self, message: impl Into<String>) {

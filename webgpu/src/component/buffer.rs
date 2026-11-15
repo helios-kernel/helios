@@ -1,5 +1,7 @@
 //! Mapped views are copied at the component boundary and never survive a call.
 
+use super::backend;
+
 use core::cell::{Cell, RefCell};
 use core::future::{Future, poll_fn};
 use core::ops::Range;
@@ -58,7 +60,7 @@ impl MappingSlot {
 }
 
 pub struct Buffer {
-    pub object: Object<wgpu::Buffer>,
+    pub object: Object<backend::Buffer>,
     pub size: u64,
     pub usage: wit::GpuBufferUsage,
     mapping: MappingSlot,
@@ -66,7 +68,7 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn new(object: Object<wgpu::Buffer>, descriptor: &wit::GpuBufferDescriptor) -> Self {
+    pub fn new(object: Object<backend::Buffer>, descriptor: &wit::GpuBufferDescriptor) -> Self {
         let mapping = MappingSlot::default();
         if descriptor.mapped_at_creation.unwrap_or(false) && object.raw.is_some() {
             let (cancel, _) = async_channel::bounded(1);
@@ -198,7 +200,7 @@ impl wit::GuestGpuBuffer for Buffer {
             wgpu::MapMode::Read => wgpu::BufferUsages::MAP_READ,
             wgpu::MapMode::Write => wgpu::BufferUsages::MAP_WRITE,
         };
-        if !raw.usage().contains(required) {
+        if !super::convert::Convert::convert(self.usage).contains(required) {
             return Err(invalid(
                 "buffer usage does not permit the requested map mode".into(),
             ));
@@ -215,7 +217,37 @@ impl wit::GuestGpuBuffer for Buffer {
             buffer: self,
             mapping,
         };
-        let mut operation = pin!(self.object.owner.device.map(raw, mode, requested));
+        let (answer, receive) = async_channel::bounded(1);
+        let host = match mode {
+            wgpu::MapMode::Read => wgpu_core::device::HostMap::Read,
+            wgpu::MapMode::Write => wgpu_core::device::HostMap::Write,
+        };
+        if let Err(error) = raw.map_async(
+            requested.start,
+            Some(requested.end - requested.start),
+            wgpu_core::resource::BufferMapOperation {
+                host,
+                callback: Some(Box::new(move |result| {
+                    let _ = answer.try_send(result);
+                })),
+            },
+        ) {
+            self.object.owner.report(&error);
+            return Err(wit::MapAsyncError {
+                kind: wit::MapAsyncErrorKind::OperationError,
+                message: error.to_string(),
+            });
+        }
+        let mut operation = pin!(async {
+            self.object
+                .owner
+                .device
+                .submitted_work_done()
+                .await
+                .map_err(|e| e.to_string())?;
+            let result = receive.recv().await.map_err(|e| e.to_string())?;
+            result.map_err(|e| e.to_string())
+        });
         let mut cancelled = pin!(cancelled.recv());
         let result = poll_fn(|cx| {
             if cancelled.as_mut().poll(cx).is_ready() {
@@ -232,7 +264,6 @@ impl wit::GuestGpuBuffer for Buffer {
             })
         })
         .await;
-        self.object.owner.drain();
         if result.is_ok() {
             pending.mapping.pending.set(false);
         }
@@ -250,14 +281,27 @@ impl wit::GuestGpuBuffer for Buffer {
             .raw
             .as_ref()
             .expect("mapped buffers own a native resource");
-        let view =
-            raw.slice(requested)
-                .get_mapped_range()
-                .map_err(|e| wit::GetMappedRangeError {
-                    kind: wit::GetMappedRangeErrorKind::OperationError,
-                    message: e.to_string(),
-                })?;
-        Ok(view.to_vec())
+        let (pointer, length) = raw
+            .get_mapped_range(requested.start, Some(requested.end - requested.start))
+            .map_err(|e| wit::GetMappedRangeError {
+                kind: wit::GetMappedRangeErrorKind::OperationError,
+                message: e.to_string(),
+            })?;
+        let length = usize::try_from(length).map_err(|e| wit::GetMappedRangeError {
+            kind: wit::GetMappedRangeErrorKind::RangeError,
+            message: e.to_string(),
+        })?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(length)
+            .map_err(|e| wit::GetMappedRangeError {
+                kind: wit::GetMappedRangeErrorKind::RangeError,
+                message: e.to_string(),
+            })?;
+        // SAFETY: core validates the mapped range; this single-owner resource
+        // cannot be unmapped during this synchronous call. Reservation also
+        // establishes the slice length is within Rust's addressable range.
+        data.extend_from_slice(unsafe { core::slice::from_raw_parts(pointer.as_ptr(), length) });
+        Ok(data)
     }
 
     fn get_mapped_range_set_with_copy(
@@ -278,14 +322,17 @@ impl wit::GuestGpuBuffer for Buffer {
             .raw
             .as_ref()
             .expect("mapped buffers own a native resource");
-        let mut view =
-            raw.slice(requested)
-                .get_mapped_range_mut()
-                .map_err(|e| wit::GetMappedRangeError {
-                    kind: wit::GetMappedRangeErrorKind::OperationError,
-                    message: e.to_string(),
-                })?;
-        view.copy_from_slice(&data);
+        let (pointer, _) = raw
+            .get_mapped_range(requested.start, Some(requested.end - requested.start))
+            .map_err(|e| wit::GetMappedRangeError {
+                kind: wit::GetMappedRangeErrorKind::OperationError,
+                message: e.to_string(),
+            })?;
+        // SAFETY: the component owns both allocations; their lengths match,
+        // they do not overlap, and no await can release the mapped buffer.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), pointer.as_ptr(), data.len());
+        }
         Ok(())
     }
 
@@ -297,7 +344,7 @@ impl wit::GuestGpuBuffer for Buffer {
         self.unmap();
         self.destroyed.set(true);
         if let Some(raw) = &self.object.raw {
-            self.object.owner.native(|| raw.destroy());
+            raw.destroy();
         }
     }
 }

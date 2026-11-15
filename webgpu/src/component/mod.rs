@@ -15,3 +15,13 @@ pub mod buffer;
 pub mod queue;
 
 pub mod recording;
+
+pub mod backend;
+
+pub mod render;
+
+pub mod encoder;
+
+pub mod device;
+
+pub mod pipeline;

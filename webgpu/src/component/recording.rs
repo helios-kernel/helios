@@ -1,5 +1,7 @@
 //! Recorders have one owner; pass resources share their encoder's invalidation.
 
+use super::backend;
+
 use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -33,18 +35,46 @@ impl<T> Recorder<T> {
         self.object.owner.invalid(message);
     }
 
-    pub fn with<R>(&self, record: impl FnOnce(&mut T) -> R) -> Option<R> {
-        let mut raw = self
+    fn access<R>(&self, call: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let mut state = self
             .object
             .raw
             .as_ref()
             .expect("recorders own their state")
             .borrow_mut();
-        let Some(raw) = raw.as_mut() else {
+        let Some(raw) = state.as_mut() else {
             self.reject("command recorder is invalid or has already ended");
             return None;
         };
-        Some(self.object.owner.native(|| record(raw)))
+        Some(call(raw))
+    }
+
+    pub fn with<R, E: wgpu_types::error::WebGpuError>(
+        &self,
+        record: impl FnOnce(&mut T) -> Result<R, E>,
+    ) -> Option<R> {
+        self.access(|raw| {
+            let result = self.object.owner.native(|| record(raw));
+            if result.is_none() {
+                self.invalid.set(true);
+            }
+            result
+        })
+        .flatten()
+    }
+
+    pub fn created<R, E: wgpu_types::error::WebGpuError>(
+        &self,
+        record: impl FnOnce(&mut T) -> (R, Option<E>),
+    ) -> Option<R> {
+        self.access(|raw| {
+            let (value, error) = record(raw);
+            if let Some(error) = error {
+                self.invalid.set(true);
+                self.object.owner.report(&error);
+            }
+            value
+        })
     }
 
     pub fn take(&self) -> Option<T> {
@@ -104,16 +134,7 @@ impl<T> Recorder<T> {
     }
 }
 
-impl<T> Drop for Recorder<T> {
-    fn drop(&mut self) {
-        // Dropping a pass ends it in wgpu and can produce validation errors.
-        if let Some(raw) = &self.object.raw {
-            self.object.owner.native(|| drop(raw.borrow_mut().take()));
-        }
-    }
-}
-
-pub struct ComputePass(pub Recorder<wgpu::ComputePass<'static>>);
+pub struct ComputePass(pub Recorder<wgpu_core::command::ComputePass>);
 
 impl wit::GuestGpuComputePassEncoder for ComputePass {
     fn label(&self) -> String {
@@ -123,23 +144,24 @@ impl wit::GuestGpuComputePassEncoder for ComputePass {
         self.0.object.set_label(label);
     }
     fn end(&self) {
-        self.0.object.owner.native(|| drop(self.0.take()));
+        self.0.with(|raw| raw.end());
+        self.0.take();
     }
     fn push_debug_group(&self, label: String) {
-        self.0.with(|raw| raw.push_debug_group(&label));
+        self.0.with(|raw| raw.push_debug_group(&label, 0));
     }
     fn pop_debug_group(&self) {
         self.0.with(|raw| raw.pop_debug_group());
     }
     fn insert_debug_marker(&self, label: String) {
-        self.0.with(|raw| raw.insert_debug_marker(&label));
+        self.0.with(|raw| raw.insert_debug_marker(&label, 0));
     }
     fn set_pipeline(&self, pipeline: wit::GpuComputePipelineBorrow<'_>) {
         if let Some(pipeline) = self
             .0
-            .resource(pipeline.get::<Object<wgpu::ComputePipeline>>())
+            .resource(pipeline.get::<Object<backend::ComputePipeline>>())
         {
-            self.0.with(|raw| raw.set_pipeline(pipeline));
+            self.0.with(|raw| raw.set_pipeline(pipeline.clone()));
         }
     }
     fn dispatch_workgroups(&self, x: u32, y: Option<u32>, z: Option<u32>) {
@@ -149,7 +171,7 @@ impl wit::GuestGpuComputePassEncoder for ComputePass {
     fn dispatch_workgroups_indirect(&self, buffer: wit::GpuBufferBorrow<'_>, offset: u64) {
         if let Some(buffer) = self.0.resource(&buffer.get::<Buffer>().object) {
             self.0
-                .with(|raw| raw.dispatch_workgroups_indirect(buffer, offset));
+                .with(|raw| raw.dispatch_workgroups_indirect(buffer.clone(), offset));
         }
     }
     fn set_bind_group(
@@ -162,14 +184,14 @@ impl wit::GuestGpuComputePassEncoder for ComputePass {
     ) -> Result<(), wit::SetBindGroupError> {
         let offsets = self.0.offsets(offsets, start, count)?;
         let group = match group.as_ref() {
-            Some(group) => match self.0.resource(group.get::<Object<wgpu::BindGroup>>()) {
+            Some(group) => match self.0.resource(group.get::<Object<backend::BindGroup>>()) {
                 Some(group) => Some(group),
                 None => return Ok(()),
             },
             None => None,
         };
         self.0
-            .with(|raw| raw.set_bind_group(index, group, &offsets));
+            .with(|raw| raw.set_bind_group(index, group.cloned(), &offsets));
         Ok(())
     }
     fn set_immediates(

@@ -2818,7 +2818,9 @@ dependencies = [
  "indexmap",
  "thiserror 2.0.21",
  "wgpu",
+ "wgpu-core",
  "wgpu-hal",
+ "wgpu-types",
 ]
 
 [[package]]

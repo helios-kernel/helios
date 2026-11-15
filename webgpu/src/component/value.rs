@@ -1,3 +1,4 @@
+use super::backend;
 use super::state::DeviceState;
 use core::cell::RefCell;
 use indexmap::IndexMap;
@@ -56,15 +57,24 @@ macro_rules! labeled {
 }
 
 labeled! {
-    GuestGpuBindGroup => wgpu::BindGroup,
-    GuestGpuBindGroupLayout => wgpu::BindGroupLayout,
-    GuestGpuPipelineLayout => wgpu::PipelineLayout,
-    GuestGpuRenderBundle => wgpu::RenderBundle,
-    GuestGpuSampler => wgpu::Sampler,
-    GuestGpuTextureView => wgpu::TextureView,
+    GuestGpuBindGroup => backend::BindGroup,
+    GuestGpuBindGroupLayout => backend::BindGroupLayout,
+    GuestGpuPipelineLayout => backend::PipelineLayout,
+    GuestGpuSampler => backend::Sampler,
+    GuestGpuTextureView => backend::TextureView,
 }
 
 pub struct Dictionary<T>(RefCell<IndexMap<String, T>>);
+
+impl<T: Copy> Dictionary<T> {
+    pub fn entries(&self) -> Vec<(String, T)> {
+        self.0
+            .borrow()
+            .iter()
+            .map(|(key, value)| (key.clone(), *value))
+            .collect()
+    }
+}
 
 macro_rules! dictionary {
     ($guest:ident, $value:ty) => {
@@ -91,11 +101,7 @@ macro_rules! dictionary {
                 self.0.borrow().values().copied().collect()
             }
             fn entries(&self) -> Vec<(String, $value)> {
-                self.0
-                    .borrow()
-                    .iter()
-                    .map(|(key, value)| (key.clone(), *value))
-                    .collect()
+                self.entries()
             }
         }
     };
@@ -243,8 +249,8 @@ impl wit::GuestGpuSupportedLimits for Limits {
 }
 
 pub struct Shader {
-    pub object: Object<wgpu::ShaderModule>,
-    pub source: String,
+    pub object: Object<backend::ShaderModule>,
+    pub diagnostics: Vec<CompilationMessage>,
 }
 
 pub struct CompilationInfo(pub Vec<CompilationMessage>);
@@ -293,26 +299,9 @@ impl CompilationMessage {
 
 impl wit::GuestGpuShaderModule for Shader {
     async fn get_compilation_info(&self) -> wit::GpuCompilationInfo {
-        let Some(raw) = self.object.get() else {
-            return wit::GpuCompilationInfo::new(CompilationInfo(vec![
-                CompilationMessage::from_wgpu(
-                    wgpu::CompilationMessage {
-                        message: "shader module is invalid".into(),
-                        message_type: wgpu::CompilationMessageType::Error,
-                        location: None,
-                    },
-                    &self.source,
-                ),
-            ]));
-        };
-        let info = raw.get_compilation_info().await;
-        wit::GpuCompilationInfo::new(CompilationInfo(
-            info.messages
-                .into_iter()
-                .map(|message| CompilationMessage::from_wgpu(message, &self.source))
-                .collect(),
-        ))
+        wit::GpuCompilationInfo::new(CompilationInfo(self.diagnostics.clone()))
     }
+
     fn label(&self) -> String {
         self.object.label()
     }

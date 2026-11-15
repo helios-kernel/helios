@@ -69,28 +69,29 @@ impl From<wgpu::Error> for GpuError {
     }
 }
 
+pub(crate) fn open_instance() -> Result<wgpu_hal::vulkan::Instance, wgpu_hal::InstanceError> {
+    let descriptor = wgpu_hal::InstanceDescriptor {
+        name: "helios-webgpu",
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: Default::default(),
+        backend_options: Default::default(),
+        telemetry: None,
+        display: None,
+    };
+    // SAFETY: the Venus factory gives every instance an independent
+    // context. wgpu owns the HAL instance and its complete object tree.
+    unsafe {
+        wgpu_hal::vulkan::Instance::init_from_entry(driver::entry::<helios::Context>(), &descriptor)
+    }
+}
+
 pub struct Runtime {
     instance: wgpu::Instance,
 }
 
 impl Runtime {
     pub async fn open() -> Result<Self, Error> {
-        let descriptor = wgpu_hal::InstanceDescriptor {
-            name: "helios-webgpu",
-            flags: wgpu::InstanceFlags::default(),
-            memory_budget_thresholds: Default::default(),
-            backend_options: Default::default(),
-            telemetry: None,
-            display: None,
-        };
-        // SAFETY: the Venus factory gives every instance an independent
-        // context. wgpu owns the HAL instance and its complete object tree.
-        let hal = unsafe {
-            wgpu_hal::vulkan::Instance::init_from_entry(
-                driver::entry::<helios::Context>(),
-                &descriptor,
-            )?
-        };
+        let hal = open_instance()?;
         let instance = unsafe { wgpu::Instance::from_hal::<wgpu_hal::api::Vulkan>(hal) };
         Ok(Self { instance })
     }
@@ -114,8 +115,7 @@ pub struct Device {
     raw: wgpu::Device,
     queue: wgpu::Queue,
     errors: Receiver<GpuError>,
-    lost: Arc<OnceLock<DeviceLost>>,
-    lost_wake: Receiver<()>,
+    loss: DeviceLoss,
 }
 
 impl Device {
@@ -129,20 +129,13 @@ impl Device {
             // Closure means the component no longer observes this device.
             let _ = error_sender.try_send(GpuError::from(error));
         }));
-        let lost = Arc::new(OnceLock::new());
-        let (wake, lost_wake) = async_channel::bounded(1);
-        let state = lost.clone();
-        raw.set_device_lost_callback(move |reason, message| {
-            let _ = state.set(DeviceLost { reason, message });
-            // Channel closure broadcasts to existing and future waiters.
-            wake.close();
-        });
+        let (loss, notify) = DeviceLoss::new();
+        raw.set_device_lost_callback(notify);
         Ok(Self {
             raw,
             queue,
             errors,
-            lost,
-            lost_wake,
+            loss,
         })
     }
 
@@ -159,11 +152,7 @@ impl Device {
     }
 
     pub async fn lost(&self) -> DeviceLost {
-        let _ = self.lost_wake.recv().await;
-        self.lost
-            .get()
-            .expect("device loss is published before notification closes")
-            .clone()
+        self.loss.wait().await
     }
 
     /// Mark prior submissions without waiting or retaining a HAL guard.
@@ -201,5 +190,40 @@ impl Device {
             .await
             .map_err(|_| Error::MappingCallbackClosed)??;
         Ok(())
+    }
+}
+
+/// Closure of the notification channel broadcasts loss to every waiter.
+pub(crate) struct DeviceLoss {
+    value: Arc<OnceLock<DeviceLost>>,
+    wake: Receiver<()>,
+}
+
+impl DeviceLoss {
+    pub(crate) fn new() -> (
+        Self,
+        impl Fn(wgpu::DeviceLostReason, String) + Send + Sync + 'static,
+    ) {
+        let value = Arc::new(OnceLock::new());
+        let (wake, receive) = async_channel::bounded(1);
+        let state = value.clone();
+        (
+            Self {
+                value,
+                wake: receive,
+            },
+            move |reason, message| {
+                let _ = state.set(DeviceLost { reason, message });
+                wake.close();
+            },
+        )
+    }
+
+    pub(crate) async fn wait(&self) -> DeviceLost {
+        let _ = self.wake.recv().await;
+        self.value
+            .get()
+            .expect("device loss is published before notification closes")
+            .clone()
     }
 }
