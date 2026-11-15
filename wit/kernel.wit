@@ -175,6 +175,12 @@ world gpu-host {
   import helios:system/gpu@0.1.0;
 }
 
+/// Imports used by Vulkan's synchronous canonical ABI boundary.
+world venus-host {
+  include gpu-host;
+  import helios:system/sync@0.1.0;
+}
+
 /// World the kernel generates the compositor plugin's *export* bindings
 /// from, the way `http-host` carries `wasi:http/handler`.
 world compositor-host {

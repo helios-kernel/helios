@@ -2622,7 +2622,7 @@ jobs:
           # blobs written and read back, and the second instance.
           for line in 'gpu-test:opened' 'gpu-test:fence ring=0' \
               'gpu-test:host-blob ok' 'gpu-test:guest-blob ok' \
-              'gpu-test:instances=2'; do
+              'gpu-test:instances=2' 'gpu-test:venus ring-reply ok'; do
             grep -Fq "$line" venus-smoke.out
           done
       - name: Upload the inspector runtime directory

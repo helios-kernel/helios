@@ -119,7 +119,7 @@ pub(super) fn display_channels() -> (
         claim: AtomicU8::new(ClaimState::FREE),
         generation: AtomicU64::new(0),
         release: crate::exec::Notify::new(),
-        changes: Arc::new(super::SequenceSignal::new()),
+        changes: Arc::new(crate::exec::SequenceSignal::new()),
         scanout_count: AtomicU32::new(0),
     });
     (shared, control_rx, cursor_rx)

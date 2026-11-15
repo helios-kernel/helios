@@ -38,6 +38,13 @@ package helios:system@0.1.0;
 /// finished the work.
 interface gpu {
   use memory.{span};
+  use sync.{signal-point};
+
+  /// Signals advance only when this fence retires successfully.
+  record completion {
+    fence: u64,
+    signals: list<signal-point>,
+  }
 
   /// Why a request was refused.
   enum error {
@@ -88,6 +95,8 @@ interface gpu {
     /// and a fence that would go backwards is a defect the device is
     /// not asked to carry.
     stale-fence,
+    /// A wait names a point beyond the newest submitted fence on its ring.
+    unsubmitted-fence,
     /// The span is not whole pages inside this instance's memory, is not
     /// the length the request needs, overlaps something already shown,
     /// or was given for a blob that has no pages of its own (or left
@@ -172,7 +181,7 @@ interface gpu {
     commands: async func(buffer: span) -> result<command-buffer, error>;
 
     /// Hand the device `length` bytes of `commands` starting at
-    /// `offset`, on `ring`, fenced at `fence` when one is given.
+    /// `offset`, on `ring`, fenced at `completion.fence` when completion is requested.
     ///
     /// The returned future resolves when the command is on the device's
     /// queue, not when its fence retires; the pages stay referenced
@@ -184,9 +193,9 @@ interface gpu {
     ///
     /// A command the device refuses after this future has resolved
     /// faults the context: see `device-fault`.
-    submit: async func(commands: borrow<command-buffer>, offset: u64, length: u64, ring: u8, fence: option<u64>) -> result<_, error>;
+    submit: async func(commands: borrow<command-buffer>, offset: u64, length: u64, ring: u8, completion: option<completion>) -> result<_, error>;
 
-    /// Hand the device `commands` itself, on `ring`, fenced at `fence`
+    /// Hand the device `commands` itself, on `ring`, fenced at `completion.fence`
     /// when one is given: `submit` for the short streams a renderer
     /// sends outside its command buffers.
     ///
@@ -195,7 +204,7 @@ interface gpu {
     /// a buffer of that size — and refuses a longer list
     /// `out-of-bounds`. Resolves, fences and faults exactly as `submit`
     /// does.
-    execute: async func(commands: list<u8>, ring: u8, fence: option<u64>) -> result<_, error>;
+    execute: async func(commands: list<u8>, ring: u8, completion: option<completion>) -> result<_, error>;
 
     /// Every fence `ring` of this context retires, in order.
     ///
@@ -206,6 +215,13 @@ interface gpu {
     /// the newest answers for all that came before it on that ring, and
     /// for nothing on any other.
     fences: func(ring: u8) -> result<stream<u64>, error>;
+
+    /// Wait until this ring has retired `fence`, including a fence that
+    /// retired before this call. Zero is the initially completed point.
+    /// Refused `unsubmitted-fence` beyond the newest submitted point,
+    /// `device-fault` when the context faults, or `session-ended` when
+    /// the GPU session ends. Cancelling a wait leaves submissions intact.
+    wait: async func(ring: u8, fence: u64) -> result<_, error>;
 
     /// Make `blob` reachable from this context's command stream.
     attach: async func(blob: borrow<blob>) -> result<_, error>;

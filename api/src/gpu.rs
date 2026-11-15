@@ -26,6 +26,7 @@ use thiserror::Error;
 
 use crate::bindings::helios::system::gpu as raw;
 use crate::memory::{Backed, Block, BlockError};
+use crate::sync::SignalPoint;
 use crate::wit_bindgen::StreamReader;
 
 pub use crate::bindings::helios::system::gpu::{BlobMemory, BlobUsage, CapsetInfo};
@@ -34,6 +35,21 @@ pub use crate::memory::Span;
 /// Bytes [`Context::execute`] carries: the kernel's bound on an inline
 /// command stream (see the `execute` contract in `helios:system/gpu`).
 pub const MAX_EXECUTE_BYTES: usize = 256;
+
+/// A ring fence and the shared timeline values completed by its retirement.
+pub struct Completion<'a> {
+    pub fence: u64,
+    pub signals: &'a [SignalPoint<'a>],
+}
+
+impl Completion<'_> {
+    fn raw(&self) -> raw::Completion<'_> {
+        raw::Completion {
+            fence: self.fence,
+            signals: self.signals.iter().map(SignalPoint::raw).collect(),
+        }
+    }
+}
 
 /// Why a 3D request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -68,6 +84,8 @@ pub enum GpuError {
     BadRing,
     #[error("a fence must come after every fence already submitted on its ring")]
     StaleFence,
+    #[error("the fence has not been submitted on this ring")]
+    UnsubmittedFence,
     #[error("the pages are not a whole-page run of this program's memory, or do not suit the blob")]
     BadSpan,
     #[error("the blob's host storage is already shown in this program's memory")]
@@ -100,6 +118,7 @@ impl From<raw::Error> for GpuError {
             raw::Error::OutOfBounds => Self::OutOfBounds,
             raw::Error::BadRing => Self::BadRing,
             raw::Error::StaleFence => Self::StaleFence,
+            raw::Error::UnsubmittedFence => Self::UnsubmittedFence,
             raw::Error::BadSpan => Self::BadSpan,
             raw::Error::AlreadyMapped => Self::AlreadyMapped,
             raw::Error::NotMapped => Self::NotMapped,
@@ -229,7 +248,7 @@ impl Context {
     }
 
     /// Hand the device `length` bytes of `commands` starting at
-    /// `offset`, on `ring`, fenced at `fence` when one is given.
+    /// `offset`, on `ring`, fenced at `completion.fence` when completion is requested.
     ///
     /// Resolves when the command is on the device's queue; the fence
     /// retires on [`Context::fences`] for `ring` when the device has
@@ -243,28 +262,44 @@ impl Context {
         offset: u64,
         length: u64,
         ring: u8,
-        fence: Option<u64>,
+        completion: Option<Completion<'_>>,
     ) -> Result<(), GpuError> {
         self.raw
-            .submit(commands.pages.resource(), offset, length, ring, fence)
+            .submit(
+                commands.pages.resource(),
+                offset,
+                length,
+                ring,
+                completion.as_ref().map(Completion::raw),
+            )
             .await
             .map_err(GpuError::from)
     }
 
     /// Hand the device `commands` itself, at most
-    /// [`MAX_EXECUTE_BYTES`] of them, on `ring`, fenced at `fence` when
+    /// [`MAX_EXECUTE_BYTES`] of them, on `ring`, fenced at `completion.fence` when
     /// one is given: [`Context::submit`] for the short streams a
     /// renderer sends outside its command buffers.
     pub async fn execute(
         &self,
         commands: &[u8],
         ring: u8,
-        fence: Option<u64>,
+        completion: Option<Completion<'_>>,
     ) -> Result<(), GpuError> {
         self.raw
-            .execute(commands.to_vec(), ring, fence)
+            .execute(
+                commands.to_vec(),
+                ring,
+                completion.as_ref().map(Completion::raw),
+            )
             .await
             .map_err(GpuError::from)
+    }
+
+    /// Wait for a submitted fence, including one already retired.
+    /// A faulted context or ended GPU session returns an error.
+    pub async fn wait(&self, ring: u8, fence: u64) -> Result<(), GpuError> {
+        self.raw.wait(ring, fence).await.map_err(GpuError::from)
     }
 
     /// Every fence `ring` of this context retires, in order.

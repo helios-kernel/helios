@@ -49,9 +49,9 @@ use wasmtime::component::{
 use crate::ComponentHostNetwork;
 use crate::buffer::{Buffer, Span, ViewId};
 use crate::display::{
-    ControlRequest, CursorRequest, DisplaySender, DisplayServiceError, SequenceSignal,
-    SurfaceSource,
+    ControlRequest, CursorRequest, DisplaySender, DisplayServiceError, SurfaceSource,
 };
+use crate::exec::SequenceSignal;
 use crate::gpu::ScanoutHold;
 use crate::wasmtime_adapter::bindings::display::bindings::helios::system::display as display_wit;
 use crate::wasmtime_adapter::component_host::BlobHandle;

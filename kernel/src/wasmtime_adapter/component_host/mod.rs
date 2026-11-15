@@ -90,6 +90,7 @@ mod observation;
 mod pending;
 pub(crate) use pending::PendingReply;
 pub mod service;
+mod timeline;
 mod topology;
 mod views;
 mod vsock;
@@ -2352,7 +2353,7 @@ where
             })
         },
     )?;
-    Ok(())
+    timeline::add_to_linker(&mut instance)
 }
 
 fn add_stats_to_linker<CpuImpl, Net, StorageImpl>(

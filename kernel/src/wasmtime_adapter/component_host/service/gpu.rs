@@ -40,8 +40,8 @@ use core::task::{Context, Poll};
 use futures::channel::oneshot;
 use helios_hal::device::DeviceRegion;
 use helios_hal::display::{
-    BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, MAX_CONTEXT_NAME, RingCount,
-    RingIndex,
+    BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, FenceId, MAX_CONTEXT_NAME,
+    RingCount, RingIndex,
 };
 use helios_hal::iommu::PhysicalRange;
 use triomphe::Arc;
@@ -54,8 +54,9 @@ use wasmtime::component::{
 use crate::ComponentHostNetwork;
 use crate::buffer::{Buffer, GuestMemory, Span, ViewError, ViewGroup, ViewId, ViewTable};
 use crate::gpu::{
-    BlobShared, BlobSpec, ContextShared, Gpu3dRequest, Gpu3dSender, Gpu3dServiceError,
-    InlineCommands, MAX_EXECUTE_BYTES, SessionId, SubmitCommands, SubmitRequest,
+    BlobShared, BlobSpec, CompletionSignal, ContextShared, Gpu3dRequest, Gpu3dSender,
+    Gpu3dServiceError, InlineCommands, MAX_EXECUTE_BYTES, SessionId, SubmitCommands,
+    SubmitCompletion, SubmitRequest,
 };
 use crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu as gpu_wit;
 
@@ -145,6 +146,7 @@ fn to_wit_error(error: Gpu3dServiceError) -> gpu_wit::Error {
         Gpu3dServiceError::OutOfBounds => gpu_wit::Error::OutOfBounds,
         Gpu3dServiceError::BadRing => gpu_wit::Error::BadRing,
         Gpu3dServiceError::StaleFence => gpu_wit::Error::StaleFence,
+        Gpu3dServiceError::UnsubmittedFence => gpu_wit::Error::UnsubmittedFence,
         Gpu3dServiceError::BadSpan(_) | Gpu3dServiceError::BlobSpanMismatch => {
             gpu_wit::Error::BadSpan
         }
@@ -600,7 +602,7 @@ async fn queue_submission<U, CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<ContextHandle>,
     ring: u8,
-    fence: Option<u64>,
+    completion: Option<gpu_wit::Completion>,
     mut commands: impl FnMut(
         &mut StoreData<CpuImpl, Net, StorageImpl>,
         SessionId,
@@ -614,6 +616,7 @@ where
 {
     // The sender whose room this call was last woken for: a call that
     // then queues nothing passes its turn on.
+    let fence = completion.as_ref().map(|completion| completion.fence);
     let mut woken: Option<Gpu3dSender> = None;
     loop {
         let step = accessor.with(|mut access| -> wasmtime::Result<SubmitStep> {
@@ -632,12 +635,31 @@ where
                 Ok(commands) => commands,
                 Err(error) => return Ok(SubmitStep::Refused(error)),
             };
+            let completion = completion
+                .as_ref()
+                .map(|completion| {
+                    let signals = completion
+                        .signals
+                        .iter()
+                        .map(|signal| {
+                            Ok(CompletionSignal {
+                                source: data.table.get(&signal.source)?.clone(),
+                                value: signal.value,
+                            })
+                        })
+                        .collect::<wasmtime::Result<Vec<_>>>()?;
+                    Ok::<_, wasmtime::Error>(SubmitCompletion {
+                        fence: FenceId::new(completion.fence),
+                        signals,
+                    })
+                })
+                .transpose()?;
             let (reply, answer) = oneshot::channel();
             let request = SubmitRequest {
                 context: shared.clone(),
                 commands,
                 ring,
-                fence,
+                completion,
                 reply,
             };
             Ok(match sender.try_submit(request) {
@@ -1008,9 +1030,9 @@ where
         offset: u64,
         length: u64,
         ring: u8,
-        fence: Option<u64>,
+        completion: Option<gpu_wit::Completion>,
     ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
-        queue_submission(accessor, &handle, ring, fence, |data, session| {
+        queue_submission(accessor, &handle, ring, completion, |data, session| {
             data.command_range(&commands, offset, length, session)
         })
         .await
@@ -1021,7 +1043,7 @@ where
         handle: Resource<ContextHandle>,
         commands: Vec<u8>,
         ring: u8,
-        fence: Option<u64>,
+        completion: Option<gpu_wit::Completion>,
     ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
         let Ok(inline) = InlineCommands::try_from(commands.as_slice()) else {
             // Longer than the kernel carries inline: such a stream
@@ -1029,10 +1051,34 @@ where
             debug_assert!(commands.len() > MAX_EXECUTE_BYTES);
             return Ok(Err(gpu_wit::Error::OutOfBounds));
         };
-        queue_submission(accessor, &handle, ring, fence, |_, _| {
+        queue_submission(accessor, &handle, ring, completion, |_, _| {
             Ok(Ok(SubmitCommands::Inline(inline.clone())))
         })
         .await
+    }
+
+    async fn wait(
+        accessor: &Accessor<U, Self>,
+        handle: Resource<ContextHandle>,
+        ring: u8,
+        fence: u64,
+    ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
+        let held = accessor.with(|mut access| {
+            let data = access.get();
+            let context = data.table.get(&handle)?;
+            Ok::<_, wasmtime::Error>(
+                data.gpu_sender(context.session)
+                    .map(|sender| (sender, context.shared.clone())),
+            )
+        })?;
+        let (sender, context) = match held {
+            Ok(held) => held,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        Ok(sender
+            .wait(&context, ring, fence)
+            .await
+            .map_err(to_wit_error))
     }
 
     fn fences(

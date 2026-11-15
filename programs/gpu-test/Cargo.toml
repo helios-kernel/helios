@@ -4,14 +4,24 @@ version = "0.1.0"
 edition.workspace = true
 autobins = false
 
+[package.metadata.helios]
+venus-protocol = true
+target-features = ["atomics"]
+
 [dependencies]
-helios-api = { path = "../../api", default-features = false, features = ["gpu", "programs", "task"] }
+ash = { version = "0.38.0", default-features = false, features = ["std"] }
+helios-venus = { path = "../../venus", default-features = false, features = ["helios", "driver"] }
+helios-api = { path = "../../api", default-features = false, features = ["gpu", "programs", "sync", "task"] }
 thiserror = { version = "2.0.20", default-features = false }
+wgpu-hal = { git = "https://github.com/lexoliu/wgpu", branch = "feat/helios-wasi-vulkan", default-features = false, features = ["vulkan"] }
 
 [lib]
 name = "helios_gpu_test"
 path = "src/main.rs"
 crate-type = ["cdylib"]
+
+[build-dependencies]
+naga = { version = "30.0.2", default-features = false, features = ["wgsl-in", "spv-out"] }
 
 [lints]
 workspace = true
