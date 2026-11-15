@@ -113,6 +113,28 @@ impl<S: BlockSink> Transaction<'_, S> {
         Ok(())
     }
 
+    pub(crate) async fn set_times(
+        &mut self,
+        tree: u64,
+        inode: u64,
+        access: Option<Timestamp>,
+        modified: Option<Timestamp>,
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let (mut raw, _) = self.inode_item(tree, inode).await?;
+        let changed = time(tree, inode, changed)?;
+        if let Some(access) = access {
+            raw.atime = time(tree, inode, access)?;
+        }
+        if let Some(modified) = modified {
+            raw.mtime = time(tree, inode, modified)?;
+        }
+        raw.ctime = changed;
+        raw.transid.set(self.trees.generation());
+        raw.sequence.set(raw.sequence.get().wrapping_add(1));
+        self.put_inode(tree, inode, raw).await
+    }
+
     pub(crate) async fn create_node(
         &mut self,
         name: Name<'_>,

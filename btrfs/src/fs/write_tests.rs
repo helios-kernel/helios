@@ -1643,6 +1643,284 @@ async fn exercise_extent_cuts(
 
 #[cfg(feature = "write")]
 #[test]
+fn owned_mutations_commit_as_one_generation() {
+    use super::writer::Writer;
+    use crate::transaction::namespace::{Attributes, Name};
+    use crate::transaction::reflink::CloneRange;
+
+    block_on(async {
+        let (_, image) = filesystem_image();
+        let mut writer = Writer::mount(Disk(image)).await.unwrap();
+        let base = writer.snapshot().unwrap();
+        let root = base.root().await.unwrap();
+        let when = crate::Timestamp {
+            seconds: 1_700_000_100,
+            nanoseconds: 123,
+        };
+        let concurrency = std::thread::available_parallelism().unwrap();
+        let name = |bytes| Name {
+            tree: root.tree(),
+            parent: root.number(),
+            bytes,
+        };
+        let attributes = || Attributes {
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+        };
+        let tx = writer.begin().await.unwrap();
+        let (tx, source) = tx
+            .create_node(name(b"source"), attributes(), when)
+            .await
+            .unwrap();
+        let bytes = vec![0x53; 16384];
+        let (tx, count) = tx
+            .write_file(source, 0, &bytes, WriteOptions::plain(when, concurrency))
+            .await
+            .unwrap();
+        assert_eq!(count, bytes.len());
+        let tx = tx
+            .truncate_file(source, 8192, when, concurrency)
+            .await
+            .unwrap();
+        let (tx, destination) = tx
+            .create_node(name(b"clone"), attributes(), when)
+            .await
+            .unwrap();
+        let tx = tx
+            .clone_range(
+                CloneRange {
+                    source,
+                    destination,
+                    source_offset: 0,
+                    destination_offset: 0,
+                    length: 8192,
+                },
+                when,
+                concurrency,
+            )
+            .await
+            .unwrap();
+        let tx = tx
+            .hard_link(name(b"alias"), source.inode, when)
+            .await
+            .unwrap();
+        let tx = tx
+            .rename(name(b"source"), name(b"renamed"), when)
+            .await
+            .unwrap();
+        let (tx, _) = tx
+            .symlink(name(b"link"), b"renamed", attributes(), when)
+            .await
+            .unwrap();
+        let tx = tx.unlink_name(name(b"alias"), when).await.unwrap();
+        let access = crate::Timestamp {
+            seconds: 1_600_000_000,
+            nanoseconds: 456,
+        };
+        let modified = crate::Timestamp {
+            seconds: 1_650_000_000,
+            nanoseconds: 789,
+        };
+        let tx = tx
+            .set_times(source, Some(access), None, when)
+            .await
+            .unwrap();
+        let tx = tx
+            .set_times(destination, None, Some(modified), when)
+            .await
+            .unwrap();
+        let mut output = vec![0; 8192];
+        assert_eq!(
+            tx.read_file(destination, 0, &mut output).await.unwrap(),
+            output.len()
+        );
+        assert_eq!(output, bytes[..8192]);
+        tx.commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        let current = writer.snapshot().unwrap();
+        assert_eq!(
+            current.superblock().generation(),
+            base.superblock().generation() + 1
+        );
+        for path in [b"/renamed".as_slice(), b"/clone".as_slice()] {
+            let inode = current.resolve(path).await.unwrap();
+            current.read(&inode, 0, &mut output).await.unwrap();
+            assert_eq!(output, bytes[..8192]);
+        }
+        let source_metadata = *current.resolve(b"/renamed").await.unwrap().metadata();
+        let clone_metadata = *current.resolve(b"/clone").await.unwrap().metadata();
+        assert_eq!(source_metadata.atime, access);
+        assert_eq!(source_metadata.mtime, when);
+        assert_eq!(source_metadata.ctime, when);
+        assert_eq!(clone_metadata.atime, when);
+        assert_eq!(clone_metadata.mtime, modified);
+        assert_eq!(clone_metadata.ctime, when);
+        let link = current
+            .lookup(&current.root().await.unwrap(), b"link")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut target = [0; 7];
+        assert_eq!(current.read_link(&link, &mut target).await.unwrap(), 7);
+        assert_eq!(&target, b"renamed");
+        assert!(base.lookup(&root, b"renamed").await.unwrap().is_none());
+        assert!(
+            current
+                .lookup(&current.root().await.unwrap(), b"alias")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn failed_and_canceled_mutations_discard_all_prior_edits() {
+    use super::writer::Writer;
+    use crate::source::BlockSink;
+    use crate::transaction::namespace::{Attributes, Name};
+    use crate::transaction::reflink::FileId;
+    use core::future::pending;
+    use futures_lite::future::poll_once;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct InterruptedDisk {
+        disk: Disk,
+        stage_action: Arc<AtomicUsize>,
+        entered: Arc<AtomicUsize>,
+    }
+    impl BlockSource for InterruptedDisk {
+        fn size_bytes(&self) -> u64 {
+            self.disk.size_bytes()
+        }
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+            self.disk.read_at(offset, buf).await
+        }
+    }
+    impl BlockSink for InterruptedDisk {
+        async fn stage(&self, block: u64, bytes: &[u8; 4096]) -> IoResult<()> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            match self.stage_action.load(Ordering::SeqCst) {
+                0 => self.disk.stage(block, bytes).await,
+                1 => Err(IoError::DeviceFault),
+                2 => pending().await,
+                _ => panic!("unknown fixture stage action"),
+            }
+        }
+        async fn commit(&self, block: u64, bytes: &[u8; 4096]) -> IoResult<()> {
+            self.disk.commit(block, bytes).await
+        }
+    }
+    block_on(async {
+        for action in [1, 2] {
+            let stamp = Timestamp::from_secs(1_700_000_000);
+            let contents = "中文・日本語・한국어".as_bytes();
+            let tree = TreeBuilder::new().root(Metadata::new(0o755, stamp)).file(
+                "/data",
+                contents.to_vec(),
+                Metadata::new(0o644, stamp),
+            );
+            let (_, image) = filesystem_image_tree(true, true, tree);
+            let stage_action = Arc::new(AtomicUsize::new(action));
+            let entered = Arc::new(AtomicUsize::new(0));
+            let mut writer = Writer::mount(InterruptedDisk {
+                disk: Disk(image),
+                stage_action: stage_action.clone(),
+                entered: entered.clone(),
+            })
+            .await
+            .unwrap();
+            let base = writer.snapshot().unwrap();
+            let root = base.root().await.unwrap();
+            let inode = base.resolve(b"/data").await.unwrap();
+            let file = FileId {
+                tree: inode.tree(),
+                inode: inode.number(),
+            };
+            let when = crate::Timestamp {
+                seconds: 1_700_000_100,
+                nanoseconds: 123,
+            };
+            let concurrency = std::thread::available_parallelism().unwrap();
+            let name = Name {
+                tree: root.tree(),
+                parent: root.number(),
+                bytes: b"pending",
+            };
+            let attributes = || Attributes {
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+            };
+            let tx = writer.begin().await.unwrap();
+            let (tx, _) = tx.create_node(name, attributes(), when).await.unwrap();
+            let payload = vec![0x71; 8192];
+            // A full overwrite first removes the inline mapping, then stages
+            // its replacement. Interrupt after that private mutation occurred.
+            if action == 1 {
+                assert!(
+                    tx.write_file(file, 0, &payload, WriteOptions::plain(when, concurrency))
+                        .await
+                        .is_err()
+                );
+            } else {
+                let mut write = core::pin::pin!(tx.write_file(
+                    file,
+                    0,
+                    &payload,
+                    WriteOptions::plain(when, concurrency)
+                ));
+                assert!(poll_once(write.as_mut()).await.is_none());
+            }
+            assert!(entered.load(Ordering::SeqCst) > 0);
+            let restored = writer.snapshot().unwrap();
+            assert_eq!(restored.snapshot, base.snapshot);
+            assert!(
+                restored
+                    .lookup(&restored.root().await.unwrap(), b"pending")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let mut output = vec![0; contents.len()];
+            restored.read(&inode, 0, &mut output).await.unwrap();
+            assert_eq!(output, contents);
+            stage_action.store(0, Ordering::SeqCst);
+            // The writer remains usable and the aborted name was not retained.
+            let tx = writer.begin().await.unwrap();
+            let (tx, _) = tx.create_node(name, attributes(), when).await.unwrap();
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+            let current = writer.snapshot().unwrap();
+            assert_eq!(
+                current.superblock().generation(),
+                base.superblock().generation() + 1
+            );
+            assert!(
+                current
+                    .lookup(&current.root().await.unwrap(), b"pending")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            current
+                .read(&current.resolve(b"/data").await.unwrap(), 0, &mut output)
+                .await
+                .unwrap();
+            assert_eq!(output, contents);
+        }
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn canceling_staging_restores_the_writer_but_canceling_publication_poisons_it() {
     use super::writer::Writer;
     use crate::source::BlockSink;
