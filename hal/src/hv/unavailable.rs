@@ -12,6 +12,9 @@ impl Hypervisor for Infallible {
     fn create_space(&self) -> Result<Self, HvError> {
         match *self {}
     }
+    unsafe fn synchronize_memory(&self, _: &[PhysFrame]) {
+        match *self {}
+    }
 }
 
 // SAFETY: no value of this type can exist, so none of these methods can execute.

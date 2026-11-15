@@ -300,6 +300,13 @@ pub trait Hypervisor: Send + Sync + 'static {
     type Space: Stage2Space;
     fn capabilities(&self) -> HvCapabilities;
     fn create_space(&self) -> Result<Self::Space, HvError>;
+    /// Publish host writes to guest data and instruction fetch, including
+    /// aliases at a different guest virtual address, on every processor.
+    ///
+    /// # Safety
+    /// Frames remain owned, initialized normal RAM mapped in the host for
+    /// the entire call. The caller synchronizes writes before publication.
+    unsafe fn synchronize_memory(&self, frames: &[PhysFrame]);
 }
 
 #[cfg(test)]

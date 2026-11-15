@@ -207,3 +207,13 @@ world processors-host {
 world hv-host {
   import helios:hv/virtualization@0.1.0;
 }
+
+/// Interfaces whose values cross the inspector's serialized RPC transport.
+world inspector-system {
+  import helios:system/programs@0.1.0;
+  import helios:system/stats@0.1.0;
+  import helios:system/tracing@0.1.0;
+  import helios:system/profiling@0.1.0;
+  import helios:system/instances@0.1.0;
+  import helios:system/processors@0.1.0;
+}

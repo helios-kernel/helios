@@ -83,6 +83,9 @@ interface virtualization {
   resource memory-region {
     read: func(offset: u64, length: u32) -> result<list<u8>, hv-error>;
     write: func(offset: u64, bytes: list<u8>) -> result<_, hv-error>;
+    /// Publish completed writes before guest instruction fetch. Required
+    /// after loading code or restoring a memory image, before running vCPUs.
+    publish: func(offset: u64, length: u64) -> result<_, hv-error>;
   }
 
   resource vcpu {

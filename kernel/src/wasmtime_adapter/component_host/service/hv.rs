@@ -402,6 +402,21 @@ impl<C: Cpu + Clone, N: ComponentHostNetwork, S: Storage, U: 'static> wire::Host
 impl<C: Cpu + Clone, N: ComponentHostNetwork, S: Storage> wire::HostMemoryRegion
     for StoreData<C, N, S>
 {
+    fn publish(
+        &mut self,
+        handle: Resource<wire::MemoryRegion>,
+        offset: u64,
+        length: u64,
+    ) -> wasmtime::Result<Result<(), wire::HvError>> {
+        let region = self.table.get(&typed::<_, GuestMemoryRegion>(handle))?;
+        let Some(hardware) = self.cpu.hv() else {
+            return Ok(Err(wire::HvError::Unavailable));
+        };
+        let (Ok(offset), Ok(length)) = (usize::try_from(offset), usize::try_from(length)) else {
+            return Ok(Err(wire::HvError::Bounds));
+        };
+        Ok(region.publish(hardware, offset, length).map_err(Into::into))
+    }
     fn read(
         &mut self,
         handle: Resource<wire::MemoryRegion>,

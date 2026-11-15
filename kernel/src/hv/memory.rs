@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use crossbeam_utils::CachePadded;
-use helios_hal::hv::GuestRange;
+use helios_hal::hv::{GuestRange, Hypervisor};
 use helios_hal::pmm::{PhysFrame, PhysFrameAllocator, PhysFrameRange};
 use thiserror::Error;
 use triomphe::Arc;
@@ -143,6 +143,26 @@ pub struct GuestSlice {
 }
 
 impl GuestMemoryRegion {
+    pub fn publish(
+        &self,
+        hardware: &impl Hypervisor,
+        offset: usize,
+        len: usize,
+    ) -> Result<(), GuestMemoryError> {
+        self.validate(offset, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        let first = offset / PhysFrame::SIZE;
+        let end = (offset + len).div_ceil(PhysFrame::SIZE);
+        // SAFETY: this handle retains initialized user-domain pages. The
+        // caller's preceding copies have finished; no Rust reference aliases
+        // guest access. Cache maintenance includes whole boundary pages.
+        unsafe {
+            hardware.synchronize_memory(&self.pages.frames[first..end]);
+        }
+        Ok(())
+    }
     pub fn range(&self) -> GuestRange {
         self.range
     }

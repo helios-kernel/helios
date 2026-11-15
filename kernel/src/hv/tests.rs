@@ -228,6 +228,47 @@ pub(crate) fn vm(
         pages * PhysFrame::SIZE,
     )
 }
+struct TestHypervisor {
+    published: IrqSafeMutex<Vec<PhysFrame>>,
+}
+
+impl Hypervisor for TestHypervisor {
+    type Space = TestSpace;
+    fn capabilities(&self) -> HvCapabilities {
+        TestSpace::new([]).capabilities()
+    }
+    fn create_space(&self) -> Result<TestSpace, HvError> {
+        Ok(TestSpace::new([]))
+    }
+    unsafe fn synchronize_memory(&self, frames: &[PhysFrame]) {
+        self.published
+            .with(|published| published.extend_from_slice(frames));
+    }
+}
+
+#[test]
+fn memory_publication_validates_bounds_before_synchronizing_covered_pages() {
+    let mut vm = vm([], 2);
+    let region = vm
+        .allocate_memory(range(2), PageFlags::READ | PageFlags::WRITE)
+        .unwrap();
+    let hardware = TestHypervisor {
+        published: IrqSafeMutex::new(Vec::new()),
+    };
+    region.publish(&hardware, PhysFrame::SIZE + 1, 1).unwrap();
+    hardware
+        .published
+        .with(|frames| assert_eq!(frames, &region.pages.frames()[1..2]));
+    assert_eq!(
+        region.publish(&hardware, usize::MAX, 1),
+        Err(GuestMemoryError::Bounds)
+    );
+    region.publish(&hardware, 0, 0).unwrap();
+    hardware
+        .published
+        .with(|frames| assert_eq!(frames.len(), 1));
+}
+
 fn vcpu(vm: &mut VirtualMachine<TestSpace>) -> Vcpu<TestSpace> {
     vm.create_vcpu(0, NonZeroUsize::new(2).unwrap()).unwrap()
 }

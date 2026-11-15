@@ -4,6 +4,7 @@
 
 use core::arch::global_asm;
 use core::mem::{offset_of, size_of};
+use helios_hal::hv::{GuestRegisters, HvError, RegisterId};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -23,6 +24,45 @@ impl Default for Registers {
             pstate: 0x3c5,
             sp: 0,
         }
+    }
+}
+
+impl GuestRegisters for Registers {
+    fn read(&self, register: RegisterId) -> Result<u64, HvError> {
+        match register {
+            RegisterId::Aarch64X(index) => self
+                .x
+                .get(usize::from(index))
+                .copied()
+                .ok_or(HvError::InvalidRegister),
+            RegisterId::Aarch64Sp => Ok(self.sp),
+            RegisterId::Aarch64Pc => Ok(self.pc),
+            RegisterId::Aarch64Pstate => Ok(self.pstate),
+            RegisterId::X86Gpr(_)
+            | RegisterId::X86Rip
+            | RegisterId::X86Rflags
+            | RegisterId::X86Control(_)
+            | RegisterId::X86Msr(_) => Err(HvError::InvalidRegister),
+        }
+    }
+
+    fn write(&mut self, register: RegisterId, value: u64) -> Result<(), HvError> {
+        let destination = match register {
+            RegisterId::Aarch64X(index) => self
+                .x
+                .get_mut(usize::from(index))
+                .ok_or(HvError::InvalidRegister)?,
+            RegisterId::Aarch64Sp => &mut self.sp,
+            RegisterId::Aarch64Pc => &mut self.pc,
+            RegisterId::Aarch64Pstate => &mut self.pstate,
+            RegisterId::X86Gpr(_)
+            | RegisterId::X86Rip
+            | RegisterId::X86Rflags
+            | RegisterId::X86Control(_)
+            | RegisterId::X86Msr(_) => return Err(HvError::InvalidRegister),
+        };
+        *destination = value;
+        Ok(())
     }
 }
 
