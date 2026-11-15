@@ -123,7 +123,9 @@ fn space_load_validates_formatted_file_data_references() {
         assert!(!allocations.is_empty());
         let (key, original) = allocations[0];
         assert!(key.offset > u64::from(fs.superblock().nodesize()));
-        let mut accounting = Accounting::new(&fs.volume, root, &space).await.unwrap();
+        let mut accounting = Accounting::new(&fs.volume, root, &space, fs.csum_tree)
+            .await
+            .unwrap();
         let mut trees = Trees::new(
             fs.superblock().generation() + 1,
             fs.superblock().csum_type(),
@@ -281,6 +283,21 @@ fn space_load_validates_formatted_file_data_references() {
                 .unwrap()
                 .is_none()
         );
+        let checksum_key = crate::checksums::key(key.objectid);
+        assert!(
+            trees
+                .get(&fs.volume, fs.csum_tree, checksum_key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            trees
+                .get(&fs.volume, accounting.checksum_root(), checksum_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
         accounting
             .sync_allocations(&fs.volume, &mut trees, &mut space)
             .await
@@ -313,6 +330,234 @@ fn root_node(fs: &Filesystem<Disk>) -> Node {
         },
     ))
     .unwrap()
+}
+
+#[test]
+fn checksum_deletion_splits_items_preserves_neighbors_and_crosses_holes() {
+    block_on(async {
+        use crate::checksums::{Checksums, key};
+        let fs = filesystem();
+        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+            .await
+            .unwrap();
+        let mut trees = Trees::new(
+            fs.superblock().generation() + 1,
+            fs.superblock().csum_type(),
+        );
+        let mut checksums = Checksums { root: fs.csum_tree };
+        let sector = u64::from(fs.superblock().sectorsize());
+        let start = 16 << 20;
+        let digests: Vec<_> = (0..20)
+            .map(|index| {
+                fs.superblock()
+                    .csum_type()
+                    .digest(&vec![index; sector as usize])
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect();
+        for range in [0..8, 12..16, 16..20] {
+            let bytes = digests[range.clone()].concat();
+            checksums.root = trees
+                .apply(
+                    &fs.volume,
+                    checksums.root,
+                    key(start + range.start as u64 * sector),
+                    Some(&bytes),
+                    &mut space,
+                )
+                .await
+                .unwrap();
+        }
+        checksums
+            .remove(
+                &fs.volume,
+                &mut trees,
+                &mut space,
+                start + 2 * sector..start + 5 * sector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trees
+                .get(&fs.volume, checksums.root, key(start))
+                .await
+                .unwrap()
+                .unwrap(),
+            digests[0..2].concat()
+        );
+        assert_eq!(
+            trees
+                .get(&fs.volume, checksums.root, key(start + 5 * sector))
+                .await
+                .unwrap()
+                .unwrap(),
+            digests[5..8].concat()
+        );
+        checksums
+            .remove(
+                &fs.volume,
+                &mut trees,
+                &mut space,
+                start + 7 * sector..start + 17 * sector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            contents(&trees, checksums.root),
+            BTreeMap::from([
+                (key(start), digests[0..2].concat()),
+                (key(start + 5 * sector), digests[5..7].concat()),
+                (key(start + 17 * sector), digests[17..20].concat()),
+            ])
+        );
+        // Removing a missing checksum range is valid and does not allocate.
+        let address = checksums.root.bytenr;
+        checksums
+            .remove(
+                &fs.volume,
+                &mut trees,
+                &mut space,
+                start + 8 * sector..start + 12 * sector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(checksums.root.bytenr, address);
+        let replacement = vec![0x91; 17 * sector as usize];
+        checksums
+            .set(
+                &fs.volume,
+                &mut trees,
+                &mut space,
+                start + sector,
+                &replacement,
+            )
+            .await
+            .unwrap();
+        let digest = fs
+            .superblock()
+            .csum_type()
+            .digest(&replacement[..sector as usize]);
+        assert_eq!(
+            contents(&trees, checksums.root),
+            BTreeMap::from([
+                (key(start), digests[0].clone()),
+                (key(start + sector), digest.as_bytes().repeat(17)),
+                (key(start + 18 * sector), digests[18..20].concat()),
+            ])
+        );
+        checksums
+            .remove(
+                &fs.volume,
+                &mut trees,
+                &mut space,
+                start..start + 20 * sector,
+            )
+            .await
+            .unwrap();
+        assert!(contents(&trees, checksums.root).is_empty());
+        assert!(
+            trees
+                .ceiling(&fs.volume, fs.csum_tree, key(0))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn checksum_deletion_rejects_overlapping_or_partial_digest_items() {
+    block_on(async {
+        use crate::checksums::{Checksums, key};
+        for overlap in [false, true] {
+            let fs = filesystem();
+            let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+                .await
+                .unwrap();
+            let mut trees = Trees::new(
+                fs.superblock().generation() + 1,
+                fs.superblock().csum_type(),
+            );
+            let mut checksums = Checksums { root: fs.csum_tree };
+            let sector = u64::from(fs.superblock().sectorsize());
+            let start = 16 << 20;
+            let width = fs.superblock().csum_type().size();
+            let bytes = vec![0; if overlap { width * 4 } else { width + 1 }];
+            checksums.root = trees
+                .apply(
+                    &fs.volume,
+                    checksums.root,
+                    key(start),
+                    Some(&bytes),
+                    &mut space,
+                )
+                .await
+                .unwrap();
+            if overlap {
+                checksums.root = trees
+                    .apply(
+                        &fs.volume,
+                        checksums.root,
+                        key(start + sector),
+                        Some(&vec![0; width]),
+                        &mut space,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(
+                checksums
+                    .remove(
+                        &fs.volume,
+                        &mut trees,
+                        &mut space,
+                        start..start + 4 * sector
+                    )
+                    .await,
+                Err(WriteError::Checksum { .. })
+            ));
+        }
+    });
+}
+
+#[test]
+fn checksum_writes_span_full_leaf_items() {
+    block_on(async {
+        use crate::checksums::Checksums;
+        let fs = filesystem();
+        let mut space = crate::space::Space::load(&fs.volume, fs.root_tree)
+            .await
+            .unwrap();
+        let mut trees = Trees::new(
+            fs.superblock().generation() + 1,
+            fs.superblock().csum_type(),
+        );
+        let mut checksums = Checksums { root: fs.csum_tree };
+        let sector = fs.superblock().sectorsize() as usize;
+        let algorithm = fs.superblock().csum_type();
+        // Enough digests to fill a complete node before accounting for headers.
+        let sectors = fs.superblock().nodesize() as usize / algorithm.size();
+        let bytes = vec![0x37; sector * sectors];
+        let start = 16 << 20;
+        checksums
+            .set(&fs.volume, &mut trees, &mut space, start, &bytes)
+            .await
+            .unwrap();
+        assert!(checksums.root.level > 0);
+        let mut expected = start;
+        let digest = algorithm.digest(&bytes[..sector]);
+        for (key, payload) in contents(&trees, checksums.root) {
+            assert_eq!(key.offset, expected);
+            assert!(
+                payload
+                    .chunks_exact(algorithm.size())
+                    .all(|stored| stored == digest.as_bytes())
+            );
+            expected += (payload.len() / algorithm.size() * sector) as u64;
+        }
+        assert_eq!(expected, start + bytes.len() as u64);
+    });
 }
 
 #[test]
@@ -806,7 +1051,7 @@ fn metadata_accounting_removes_inline_and_external_refs_without_releasing_commit
         let size = u64::from(fs.superblock().nodesize());
         let mut trees = Trees::new(fs.superblock().generation() + 1, ChecksumType::Crc32c);
         let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
-        let mut accounting = Accounting::new(&fs.volume, original_root, &space)
+        let mut accounting = Accounting::new(&fs.volume, original_root, &space, fs.csum_tree)
             .await
             .unwrap();
         let mut key = Key::new(
@@ -932,7 +1177,7 @@ fn metadata_registration_converges_across_extent_tree_growth_and_cancellation() 
                 fs.superblock().csum_type(),
             );
             let size = u64::from(fs.superblock().nodesize());
-            let mut accounting = Accounting::new(&fs.volume, extent_root, &space)
+            let mut accounting = Accounting::new(&fs.volume, extent_root, &space, fs.csum_tree)
                 .await
                 .unwrap();
             assert_eq!(accounting.free_root().is_some(), free_tree);
@@ -1206,6 +1451,7 @@ fn root_publication_preparation_converges_with_allocation_accounting() {
             &fs.volume,
             roots.get(objectid::EXTENT_TREE).unwrap(),
             &space,
+            fs.csum_tree,
         )
         .await
         .unwrap();
@@ -1236,6 +1482,7 @@ fn root_publication_preparation_converges_with_allocation_accounting() {
                     .await
                     .unwrap();
                 roots.set(accounting.root).unwrap();
+                roots.set(accounting.checksum_root()).unwrap();
                 roots.set(accounting.group_root()).unwrap();
                 if let Some(root) = accounting.free_root() {
                     roots.set(root).unwrap();

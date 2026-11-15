@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use crate::Key;
 use crate::allocation::data::{DataBackref, DataDefect, DataExtent};
 use crate::allocation::{AllocationDefect, MetadataExtent, MetadataReference};
+use crate::checksums::Checksums;
 use crate::free_space::FreeTree;
 use crate::ondisk::{item_type, objectid};
 use crate::source::BlockSource;
@@ -33,6 +34,7 @@ pub(crate) struct Accounting {
     nodesize: u64,
     groups: TreeRoot,
     free_space: Option<FreeTree>,
+    checksums: Checksums,
     group_used: BTreeMap<Key, u64>,
     retired_extents: BTreeMap<u64, u64>,
     registered: BTreeMap<u64, MetadataReservation>,
@@ -132,16 +134,24 @@ impl Accounting {
             let first = Key::new(key.objectid, item_type::TREE_BLOCK_REF, 0);
             if let Some((remaining, _)) = trees.ceiling(volume, self.root, first).await?
                 && remaining.objectid == key.objectid
-                    && remaining.item_type <= item_type::SHARED_DATA_REF
-                {
-                    return Err(defect(DataDefect::Count));
-                }
+                && remaining.item_type <= item_type::SHARED_DATA_REF
+            {
+                return Err(defect(DataDefect::Count));
+            }
         }
         let payload = (refs != 0).then(|| extent.encode());
         self.root = trees
             .apply(volume, self.root, key, payload.as_deref(), space)
             .await?;
         if refs == 0 {
+            self.checksums
+                .remove(
+                    volume,
+                    trees,
+                    space,
+                    key.objectid..key.objectid + key.offset,
+                )
+                .await?;
             self.retired_extents.insert(key.objectid, key.offset);
         }
         Ok(refs == 0)
@@ -151,6 +161,7 @@ impl Accounting {
         volume: &Volume<S>,
         root: TreeRoot,
         space: &Space,
+        checksum_root: TreeRoot,
     ) -> Result<Self, WriteError> {
         let free_space = if let Some(root) = space.free_root() {
             Some(FreeTree::load(volume, root, &space.committed_free(&BTreeMap::new())?).await?)
@@ -162,6 +173,9 @@ impl Accounting {
             nodesize: u64::from(volume.superblock().nodesize()),
             groups: space.group_root(),
             free_space,
+            checksums: Checksums {
+                root: checksum_root,
+            },
             group_used: BTreeMap::new(),
             retired_extents: BTreeMap::new(),
             registered: BTreeMap::new(),
@@ -236,6 +250,10 @@ impl Accounting {
 
     pub(crate) fn free_root(&self) -> Option<TreeRoot> {
         self.free_space.as_ref().map(|free| free.root)
+    }
+
+    pub(crate) fn checksum_root(&self) -> TreeRoot {
+        self.checksums.root
     }
 
     pub(crate) fn group_root(&self) -> TreeRoot {

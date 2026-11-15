@@ -43,6 +43,8 @@ pub(crate) enum WriteError {
         key: Key,
         defect: crate::allocation::data::DataDefect,
     },
+    #[error("checksum item {key} has an invalid sector range or digest payload")]
+    Checksum { key: Key },
     #[error("tree {tree} metadata usage {used} cannot add {added} and remove {removed} bytes")]
     RootUsage {
         tree: u64,
@@ -166,6 +168,18 @@ impl Trees {
         let path = self.path(volume, root, key).await?;
         let (_, node, slot) = path.last().expect("path includes a leaf");
         Ok((node.nritems > 0 && node.key(*slot) == key).then(|| node.item(*slot).to_vec()))
+    }
+
+    pub(crate) async fn floor<S: BlockSource>(
+        &self,
+        volume: &Volume<S>,
+        root: TreeRoot,
+        key: Key,
+    ) -> Result<Option<(Key, Vec<u8>)>, WriteError> {
+        let path = self.path(volume, root, key).await?;
+        let (_, leaf, slot) = path.last().expect("path includes leaf");
+        Ok((leaf.nritems > 0 && leaf.key(*slot) <= key)
+            .then(|| (leaf.key(*slot), leaf.item(*slot).to_vec())))
     }
 
     /// First item at or above a key in the current transaction. Ascending to
