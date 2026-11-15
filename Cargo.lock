@@ -2815,6 +2815,7 @@ dependencies = [
  "async-channel",
  "helios-api",
  "helios-venus",
+ "indexmap",
  "thiserror 2.0.21",
  "wgpu",
  "wgpu-hal",

@@ -5,3 +5,6 @@ pub mod runtime;
 
 #[cfg(feature = "runtime")]
 pub use wgpu;
+
+#[cfg(feature = "component")]
+pub mod component;

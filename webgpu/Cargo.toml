@@ -4,9 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
+component = ["dep:indexmap", "runtime", "helios-api/webgpu-provider"]
 runtime = ["dep:ash", "dep:async-channel", "dep:helios-api", "dep:helios-venus", "dep:thiserror", "dep:wgpu", "dep:wgpu-hal"]
 
 [dependencies]
+indexmap = { version = "2.14.2", default-features = false, features = ["std"], optional = true }
 ash = { version = "0.38.0", default-features = false, features = ["std"], optional = true }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"], optional = true }
 helios-api = { path = "../api", default-features = false, features = ["gpu", "surface", "sync"], optional = true }

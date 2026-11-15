@@ -207,3 +207,13 @@ world audio-host {
 world processors-host {
   import helios:system/processors@0.1.0;
 }
+
+/// A per-program WebGPU library, composed into its consumer's store.
+world webgpu-provider {
+  include wasi:cli/imports@0.3.0;
+  import helios:system/gpu@0.1.0;
+  import helios:system/surface@0.1.0;
+  import helios:system/sync@0.1.0;
+  import helios:system/tracing@0.1.0;
+  export wasi:webgpu/webgpu@0.3.0-rc.2;
+}
