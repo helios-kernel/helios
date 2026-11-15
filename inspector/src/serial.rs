@@ -140,7 +140,30 @@ impl<T> RpcWrite for T where T: AsyncWrite + Unpin + Send {}
 
 pub(crate) type RpcReader = Box<dyn RpcRead>;
 pub(crate) type RpcWriter = Box<dyn RpcWrite>;
-pub(crate) type RpcClient = helios_inspector_protocol::transport::Client<RpcReader, RpcWriter>;
+#[derive(Clone)]
+pub(crate) struct RpcClient {
+    client: helios_inspector_protocol::transport::Client<RpcReader, RpcWriter>,
+    _driver: std::sync::Arc<crate::frame_reader::FrameReader>,
+}
+
+impl RpcClient {
+    pub(crate) fn new(read: RpcReader, write: RpcWriter) -> io::Result<Self> {
+        let client = helios_inspector_protocol::transport::Client::new(read, write);
+        let driver = crate::frame_reader::FrameReader::start(&client)?;
+        Ok(Self {
+            client,
+            _driver: std::sync::Arc::new(driver),
+        })
+    }
+}
+
+impl std::ops::Deref for RpcClient {
+    type Target = helios_inspector_protocol::transport::Client<RpcReader, RpcWriter>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
 
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_CONNECT_POLL: Duration = Duration::from_millis(50);
@@ -319,9 +342,9 @@ fn is_unix_socket(device: &str) -> Result<bool, SerialError> {
 }
 
 impl SerialIo {
-    pub(crate) fn into_client(self) -> RpcClient {
+    pub(crate) fn into_client(self) -> io::Result<RpcClient> {
         let (read, write) = self.into_split();
-        helios_inspector_protocol::transport::Client::new(read, write)
+        RpcClient::new(read, write)
     }
 
     pub(crate) fn into_split(self) -> (RpcReader, RpcWriter) {

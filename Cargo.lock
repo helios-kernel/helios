@@ -2439,6 +2439,7 @@ dependencies = [
  "object",
  "ratatui",
  "rustc-demangle",
+ "rustix",
  "rustyline",
  "serde",
  "serde_json",
