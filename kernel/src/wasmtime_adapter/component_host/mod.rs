@@ -2364,9 +2364,7 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(STATS_INSTANCE)?;
-    instance.func_wrap("snapshot", |caller, (): ()| {
-        Ok((snapshot_sample(caller.data()),))
-    })?;
+    instance.func_wrap_data("snapshot", |data, (): ()| Ok((snapshot_sample(data),)))?;
     instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
         let period = stats_period(period)?;
         let reader = StreamReader::new(&mut caller, StatsStreamProducer::new(period))?;
@@ -3066,17 +3064,18 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
-    instance.func_wrap(
+    instance.func_wrap_data(
         "set-target-enabled",
-        |caller, (target, enabled): (String, bool)| {
-            let result = observation::set_target_enabled(caller.data(), &target, enabled).map_err(
-                |refusal| match refusal {
-                    TargetRefusal::Denied => debugger_wit::tracing::TargetError::Denied,
-                    TargetRefusal::Unknown(error) => {
-                        debugger_wit::tracing::TargetError::UnknownTarget(error)
+        |data, (target, enabled): (String, bool)| {
+            let result =
+                observation::set_target_enabled(data, &target, enabled).map_err(|refusal| {
+                    match refusal {
+                        TargetRefusal::Denied => debugger_wit::tracing::TargetError::Denied,
+                        TargetRefusal::Unknown(error) => {
+                            debugger_wit::tracing::TargetError::UnknownTarget(error)
+                        }
                     }
-                },
-            );
+                });
             Ok((result,))
         },
     )?;
@@ -3147,13 +3146,13 @@ macro_rules! impl_profiling_bindings {
                 // need the right to observe the machine; the folded and
                 // metric reads are answered for every caller, within the
                 // scope its authority selects. See `observation`.
-                instance.func_wrap("set-enabled", |caller, (enabled,): (bool,)| {
-                    let result = observation::set_profiling_enabled(caller.data(), enabled)
+                instance.func_wrap_data("set-enabled", |data, (enabled,): (bool,)| {
+                    let result = observation::set_profiling_enabled(data, enabled)
                         .map_err(|Denied| $wit::profiling::ControlError::Denied);
                     Ok((result,))
                 })?;
-                instance.func_wrap("clear", |caller, (): ()| {
-                    let result = observation::clear_profile(caller.data())
+                instance.func_wrap_data("clear", |data, (): ()| {
+                    let result = observation::clear_profile(data)
                         .map_err(|Denied| $wit::profiling::ControlError::Denied);
                     Ok((result,))
                 })?;
@@ -3187,26 +3186,29 @@ macro_rules! impl_profiling_bindings {
                         Ok((samples,))
                     },
                 )?;
-                instance.func_wrap("set-instruction-sampling", |caller, (enabled,): (bool,)| {
-                    let result = observation::set_instruction_sampling(caller.data(), enabled)
-                        .map_err(convert_instruction_profile_refusal);
-                    Ok((result,))
-                })?;
-                instance.func_wrap("instruction-samples", |caller, (): ()| {
-                    let profile = observation::instruction_samples(caller.data())?
+                instance.func_wrap_data(
+                    "set-instruction-sampling",
+                    |data, (enabled,): (bool,)| {
+                        let result = observation::set_instruction_sampling(data, enabled)
+                            .map_err(convert_instruction_profile_refusal);
+                        Ok((result,))
+                    },
+                )?;
+                instance.func_wrap_data("instruction-samples", |data, (): ()| {
+                    let profile = observation::instruction_samples(data)?
                         .map(convert_instruction_profile)
                         .map_err(convert_instruction_profile_refusal);
                     Ok((profile,))
                 })?;
-                instance.func_wrap("raw-profile-size", |caller, (): ()| {
-                    let size = observation::raw_profile_size(caller.data())
-                        .map_err(convert_raw_profile_refusal);
+                instance.func_wrap_data("raw-profile-size", |data, (): ()| {
+                    let size =
+                        observation::raw_profile_size(data).map_err(convert_raw_profile_refusal);
                     Ok((size,))
                 })?;
-                instance.func_wrap(
+                instance.func_wrap_data(
                     "raw-profile-read",
-                    |caller, (offset, length): (u64, u32)| {
-                        let window = observation::raw_profile_read(caller.data(), offset, length)
+                    |data, (offset, length): (u64, u32)| {
+                        let window = observation::raw_profile_read(data, offset, length)
                             .map_err(convert_raw_profile_refusal);
                         Ok((window,))
                     },
@@ -3364,8 +3366,8 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(STATS_INSTANCE)?;
-    instance.func_wrap("snapshot", |caller, (): ()| {
-        Ok((snapshot_program_sample(caller.data()),))
+    instance.func_wrap_data("snapshot", |data, (): ()| {
+        Ok((snapshot_program_sample(data),))
     })?;
     instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
         let period = stats_period(period)?;
@@ -3384,17 +3386,18 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
-    instance.func_wrap(
+    instance.func_wrap_data(
         "set-target-enabled",
-        |caller, (target, enabled): (String, bool)| {
-            let result = observation::set_target_enabled(caller.data(), &target, enabled).map_err(
-                |refusal| match refusal {
-                    TargetRefusal::Denied => program_wit::tracing::TargetError::Denied,
-                    TargetRefusal::Unknown(error) => {
-                        program_wit::tracing::TargetError::UnknownTarget(error)
+        |data, (target, enabled): (String, bool)| {
+            let result =
+                observation::set_target_enabled(data, &target, enabled).map_err(|refusal| {
+                    match refusal {
+                        TargetRefusal::Denied => program_wit::tracing::TargetError::Denied,
+                        TargetRefusal::Unknown(error) => {
+                            program_wit::tracing::TargetError::UnknownTarget(error)
+                        }
                     }
-                },
-            );
+                });
             Ok((result,))
         },
     )?;
@@ -3776,29 +3779,26 @@ where
     StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(INSTANCES_INSTANCE)?;
-    instance.func_wrap("snapshot", |caller, (): ()| {
-        Ok((caller
-            .data()
+    instance.func_wrap_data("snapshot", |data, (): ()| {
+        Ok((data
             .instance_registry
-            .snapshot(caller.data().now_nanos())
+            .snapshot(data.now_nanos())
             .into_iter()
             .map(convert_instance)
             .collect::<Vec<_>>(),))
     })?;
-    instance.func_wrap("kill", |caller, (id,): (u64,)| {
-        let now = caller.data().now_nanos();
+    instance.func_wrap_data("kill", |data, (id,): (u64,)| {
+        let now = data.now_nanos();
         let victim = InstanceId::from_raw(id);
         // The flag and the interruption are all this does: the victim
         // unwinds at its next check, and whoever owns it — a plugin
         // supervisor, or nobody — decides what happens after.
-        let outcome =
-            caller
-                .data()
-                .instance_registry
-                .request_kill(victim, KillReason::Operator, now);
+        let outcome = data
+            .instance_registry
+            .request_kill(victim, KillReason::Operator, now);
         Ok((match outcome {
             KillOutcome::Requested => {
-                deliver_kill(&caller.data().runtime_state, victim);
+                deliver_kill(&data.runtime_state, victim);
                 Ok(())
             }
             KillOutcome::AlreadyStopping => {
@@ -3838,10 +3838,10 @@ where
             })
         },
     )?;
-    instance.func_wrap(
+    instance.func_wrap_data(
         "finished",
-        |caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
-            if let Some(host_fs) = caller.data().runtime_state.host_fs_service() {
+        |data: &mut StoreData<CpuImpl, Net, StorageImpl>, (): ()| {
+            if let Some(host_fs) = data.runtime_state.host_fs_service() {
                 host_fs.snapshot_finished();
             }
             Ok(())
