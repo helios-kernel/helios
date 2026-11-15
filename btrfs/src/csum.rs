@@ -102,6 +102,14 @@ pub(crate) fn name_hash(name: &[u8]) -> u64 {
     u64::from(!digest.finalize())
 }
 
+/// Linux btrfs_extref_hash seeds the raw register with the parent inode.
+#[cfg(feature = "write")]
+pub(crate) fn inode_ref_hash(parent: u64, name: &[u8]) -> u64 {
+    let mut digest = CASTAGNOLI.digest_with_initial((parent as u32).reverse_bits());
+    digest.update(name);
+    u64::from(!digest.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

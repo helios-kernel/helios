@@ -6,6 +6,7 @@ use core::{num::NonZeroUsize, ops::Range};
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
+use super::namespace::time;
 use crate::accounting::DataWrite;
 use crate::allocation::data::DataReference;
 use crate::items::{FileExtent, INODE_NODATASUM, Metadata};
@@ -15,7 +16,7 @@ use crate::ondisk::{
 };
 use crate::source::BlockSink;
 use crate::tree::write::WriteError;
-use crate::{Error, FileKind, ItemDefect, Key, Timestamp};
+use crate::{Error, FileKind, Key, Timestamp};
 
 const HEAD_BYTES: usize = size_of::<RawFileExtentHead>();
 const REGULAR_BYTES: usize = HEAD_BYTES + size_of::<RawFileExtentBody>();
@@ -55,6 +56,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         concurrency: NonZeroUsize,
     ) -> Result<usize, WriteError> {
         let (mut raw, metadata) = self.file_inode(tree, inode).await?;
+        let when = time(tree, inode, when)?;
         let root = self.roots.get(tree)?;
         if data.is_empty() {
             return Ok(0);
@@ -183,6 +185,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         concurrency: NonZeroUsize,
     ) -> Result<(), WriteError> {
         let (mut raw, metadata) = self.file_inode(tree, inode).await?;
+        let when = time(tree, inode, when)?;
         let sector = u64::from(self.volume.superblock().sectorsize());
         let end = aligned_end(size, sector)?;
         let root = self.roots.get(tree)?;
@@ -295,23 +298,12 @@ impl<S: BlockSink> Transaction<'_, S> {
         self.store_file_inode(tree, inode, raw, when).await
     }
 
-    async fn file_inode(
+    pub(super) async fn file_inode(
         &self,
         tree: u64,
         inode: u64,
     ) -> Result<(RawInodeItem, Metadata), WriteError> {
-        let root = self.roots.get(tree)?;
-        let inode_key = Key::new(inode, item_type::INODE_ITEM, 0);
-        let bytes = self
-            .trees
-            .get(&self.volume, root, inode_key)
-            .await?
-            .ok_or(Error::MissingInode { tree, inode })?;
-        let metadata = Metadata::parse(&bytes).map_err(|defect| Error::Item {
-            tree,
-            key: inode_key,
-            defect,
-        })?;
+        let (raw, metadata) = self.inode_item(tree, inode).await?;
         if metadata.kind != FileKind::Regular {
             return Err(Error::WrongKind {
                 tree,
@@ -321,10 +313,40 @@ impl<S: BlockSink> Transaction<'_, S> {
             }
             .into());
         }
-        Ok((
-            *view::<RawInodeItem>(&bytes).expect("validated inode"),
-            metadata,
-        ))
+        Ok((raw, metadata))
+    }
+
+    /// Remove all records belonging to an unlinked inode, retiring every data
+    /// allocation only after the final mapping reference has been removed.
+    pub(super) async fn remove_inode(&mut self, tree: u64, inode: u64) -> Result<(), WriteError> {
+        loop {
+            let root = self.roots.get(tree)?;
+            let Some((key, bytes)) = self
+                .trees
+                .ceiling(&self.volume, root, Key::new(inode, 0, 0))
+                .await?
+            else {
+                break;
+            };
+            if key.objectid != inode {
+                break;
+            }
+            if key.item_type == item_type::EXTENT_DATA {
+                let extent = FileExtent::parse(key, &bytes, self.volume.superblock().sectorsize())
+                    .map_err(|defect| Error::Item { tree, key, defect })?;
+                if !matches!(extent.data, crate::items::ExtentData::Inline { .. }) {
+                    self.cut_regular_extent(tree, key, extent.start..extent.end)
+                        .await?;
+                    continue;
+                }
+            }
+            let root = self
+                .trees
+                .apply(&self.volume, root, key, None, &mut self.space)
+                .await?;
+            self.roots.set(root)?;
+        }
+        Ok(())
     }
 
     async fn replace_chunk(
@@ -477,35 +499,12 @@ impl<S: BlockSink> Transaction<'_, S> {
         tree: u64,
         inode: u64,
         mut raw: RawInodeItem,
-        when: Timestamp,
+        when: RawTimespec,
     ) -> Result<(), WriteError> {
-        let key = Key::new(inode, item_type::INODE_ITEM, 0);
-        if when.nanoseconds >= 1_000_000_000 {
-            return Err(Error::Item {
-                tree,
-                key,
-                defect: ItemDefect::Nanoseconds(when.nanoseconds),
-            }
-            .into());
-        }
         raw.transid.set(self.trees.generation());
         raw.sequence.set(raw.sequence.get().wrapping_add(1));
-        raw.mtime = RawTimespec {
-            sec: (when.seconds as u64).into(),
-            nsec: when.nanoseconds.into(),
-        };
-        raw.ctime = raw.mtime;
-        let root = self.roots.get(tree)?;
-        let root = self
-            .trees
-            .apply(
-                &self.volume,
-                root,
-                key,
-                Some(raw.as_bytes()),
-                &mut self.space,
-            )
-            .await?;
-        self.roots.set(root)
+        raw.mtime = when;
+        raw.ctime = when;
+        self.put_inode(tree, inode, raw).await
     }
 }

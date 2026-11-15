@@ -224,6 +224,287 @@ fn writer_abort_commit_and_failed_publication_have_distinct_lifetimes() {
 
 #[cfg(feature = "write")]
 #[test]
+fn namespace_creation_and_hard_links_publish_together() {
+    block_on(exercise_namespace_links(|_| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn namespace_links_pass_btrfs_check() {
+    block_on(exercise_namespace_links(assert_btrfs_check));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
+    use super::writer::Writer;
+    use crate::transaction::namespace::{Attributes, Name};
+    let timestamp = Timestamp::from_secs(1_700_000_000);
+    let named = tempfile::NamedTempFile::new().unwrap();
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, timestamp));
+    drop(filesystem_image_tree_file(
+        true,
+        true,
+        tree,
+        named.reopen().unwrap(),
+    ));
+    verify(named.path());
+    let mut writer = Writer::mount(Disk(named.reopen().unwrap())).await.unwrap();
+    let old = writer.snapshot().unwrap();
+    let parent = old.root().await.unwrap();
+    let tree = parent.tree();
+    let concurrency = std::thread::available_parallelism().unwrap();
+    let when = crate::Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 123,
+    };
+    let mut tx = writer.begin().await.unwrap();
+    let edits = tx.edits();
+    let mut directories = Vec::new();
+    for name in ["中文", "日本語", "한국어"] {
+        let inode = edits
+            .create_node(
+                Name {
+                    tree,
+                    parent: parent.number(),
+                    bytes: name.as_bytes(),
+                },
+                Attributes {
+                    mode: 0o040755,
+                    uid: 1000,
+                    gid: 1000,
+                },
+                when,
+            )
+            .await
+            .unwrap();
+        directories.push(inode);
+    }
+    let name = Name {
+        tree,
+        parent: directories[0],
+        bytes: b"data.bin",
+    };
+    let inode = edits
+        .create_node(
+            name,
+            Attributes {
+                mode: 0o100640,
+                uid: 1000,
+                gid: 1000,
+            },
+            when,
+        )
+        .await
+        .unwrap();
+    let content: Vec<_> = (0..12307).map(|index| (index % 251) as u8).collect();
+    edits
+        .write_file(tree, inode, 0, &content, when, concurrency)
+        .await
+        .unwrap();
+    assert!(matches!(
+        edits.hard_link(name, inode, when).await,
+        Err(WriteError::Exists { .. })
+    ));
+    let mut links = Vec::new();
+    // Long names exceed one leaf's ordinary INODE_REF capacity, exercising
+    // EXTENDED_IREF and multileaf directory indices without huge fixtures.
+    for index in 0..100 {
+        let name = alloc::format!("{index:03}-{}", "x".repeat(196));
+        edits
+            .hard_link(
+                Name {
+                    tree,
+                    parent: directories[0],
+                    bytes: name.as_bytes(),
+                },
+                inode,
+                when,
+            )
+            .await
+            .unwrap();
+        links.push(name);
+    }
+    for &directory in &directories[1..] {
+        edits
+            .hard_link(
+                Name {
+                    tree,
+                    parent: directory,
+                    bytes: b"alias",
+                },
+                inode,
+                when,
+            )
+            .await
+            .unwrap();
+    }
+    let root = edits.roots.get(tree).unwrap();
+    let reference = edits
+        .trees
+        .ceiling(
+            &old.volume,
+            root,
+            Key::new(inode, crate::ondisk::item_type::INODE_EXTREF, 0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        reference
+            .0
+            .is(inode, crate::ondisk::item_type::INODE_EXTREF)
+    );
+    tx.commit(|| panic!("valid fixture UUID"), concurrency)
+        .await
+        .unwrap();
+    verify(named.path());
+    let current = writer.snapshot().unwrap();
+    for path in ["/中文/data.bin", "/日本語/alias", "/한국어/alias"] {
+        let file = current.resolve(path.as_bytes()).await.unwrap();
+        assert_eq!(file.number(), inode);
+        assert_eq!(file.metadata().nlink, 103);
+        assert_eq!((file.metadata().uid, file.metadata().gid), (1000, 1000));
+        let mut output = vec![0; content.len()];
+        assert_eq!(
+            current.read(&file, 0, &mut output).await.unwrap(),
+            content.len()
+        );
+        assert_eq!(output, content);
+    }
+    let directory = current.resolve("/中文".as_bytes()).await.unwrap();
+    for name in &links {
+        assert_eq!(
+            current
+                .lookup(&directory, name.as_bytes())
+                .await
+                .unwrap()
+                .unwrap()
+                .number(),
+            inode
+        );
+    }
+    assert!(
+        old.lookup(&parent, "中文".as_bytes())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let old_file = current.resolve("/中文/data.bin".as_bytes()).await.unwrap();
+    for stage in 0..3 {
+        let mut tx = writer.begin().await.unwrap();
+        let edits = tx.edits();
+        if stage == 0 {
+            assert!(matches!(
+                edits
+                    .unlink_name(
+                        Name {
+                            tree,
+                            parent: parent.number(),
+                            bytes: "中文".as_bytes()
+                        },
+                        when
+                    )
+                    .await,
+                Err(WriteError::NotEmpty { .. })
+            ));
+            edits
+                .unlink_name(
+                    Name {
+                        tree,
+                        parent: directories[0],
+                        bytes: b"data.bin",
+                    },
+                    when,
+                )
+                .await
+                .unwrap();
+        }
+        if stage < 2 {
+            for name in &links[stage * 50..(stage + 1) * 50] {
+                edits
+                    .unlink_name(
+                        Name {
+                            tree,
+                            parent: directories[0],
+                            bytes: name.as_bytes(),
+                        },
+                        when,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if stage == 1 {
+                edits
+                    .unlink_name(
+                        Name {
+                            tree,
+                            parent: directories[1],
+                            bytes: b"alias",
+                        },
+                        when,
+                    )
+                    .await
+                    .unwrap();
+            }
+        } else {
+            edits
+                .unlink_name(
+                    Name {
+                        tree,
+                        parent: directories[2],
+                        bytes: b"alias",
+                    },
+                    when,
+                )
+                .await
+                .unwrap();
+            for name in ["中文", "日本語", "한국어"] {
+                edits
+                    .unlink_name(
+                        Name {
+                            tree,
+                            parent: parent.number(),
+                            bytes: name.as_bytes(),
+                        },
+                        when,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        tx.commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        verify(named.path());
+        let view = writer.snapshot().unwrap();
+        if stage < 2 {
+            let remaining = view.resolve("/한국어/alias".as_bytes()).await.unwrap();
+            assert_eq!(remaining.metadata().nlink, if stage == 0 { 52 } else { 1 });
+            let mut output = vec![0; content.len()];
+            view.read(&remaining, 0, &mut output).await.unwrap();
+            assert_eq!(output, content);
+        } else {
+            let root = view.root().await.unwrap();
+            assert_eq!(root.metadata().size, 0);
+            assert!(
+                view.lookup(&root, "中文".as_bytes())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut output = vec![0; content.len()];
+        assert_eq!(
+            view.read(&old_file, 0, &mut output).await.unwrap(),
+            content.len()
+        );
+        assert_eq!(output, content);
+    }
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn file_writes_preserve_partial_sectors_and_transaction_visibility() {
     for no_holes in [true, false] {
         block_on(exercise_file_writes(no_holes, |_| {}));

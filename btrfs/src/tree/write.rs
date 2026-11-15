@@ -17,6 +17,27 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[error(
+        "directory entry name must be 1..=255 bytes and contain no slash, NUL, dot or dot-dot component"
+    )]
+    InvalidName,
+    #[error("directory {parent} in tree {tree} already contains this name")]
+    Exists { tree: u64, parent: u64 },
+    #[error("inode or directory index space is exhausted in tree {tree}")]
+    IdentifierExhausted { tree: u64 },
+    #[error("inode {inode} in tree {tree} cannot have another hard link")]
+    LinkLimit { tree: u64, inode: u64 },
+    #[error("directory entry is missing from parent {parent} in tree {tree}")]
+    NoEntry { tree: u64, parent: u64 },
+    #[error("directory {inode} in tree {tree} is not empty")]
+    NotEmpty { tree: u64, inode: u64 },
+    #[error("namespace item {key} in tree {tree} disagrees with its directory link")]
+    NamespaceMismatch { tree: u64, key: Key },
+    #[error("subvolume links require a subvolume operation")]
+    SubvolumeLink,
+    #[error("directory hard links are not permitted")]
+    DirectoryLink,
+
     #[error("file offset or inode byte accounting overflows")]
     FileOverflow,
     #[error("file extent {key} is not a regular or preallocated mapping")]

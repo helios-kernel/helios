@@ -3,6 +3,7 @@
 
 mod extents;
 mod file;
+pub(crate) mod namespace;
 
 use core::num::NonZeroUsize;
 use futures::{
@@ -14,14 +15,13 @@ use crate::accounting::Accounting;
 use crate::commit::CommitImage;
 use crate::data::{File, Reader};
 use crate::fs::Snapshot;
-use crate::ondisk::{item_type, objectid};
+use crate::ondisk::objectid;
 use crate::retirement::Retirements;
 use crate::roots::Roots;
 use crate::source::BlockSink;
 use crate::space::Space;
 use crate::tree::write::{Trees, WriteError};
 use crate::volume::Volume;
-use crate::{Error, FileKind, Key, Metadata};
 use alloc::sync::Arc;
 
 /// Produced only once the new roots are durable, or for an unchanged view.
@@ -51,23 +51,7 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         output: &mut [u8],
     ) -> Result<usize, WriteError> {
         let root = self.roots.get(tree)?;
-        let key = Key::new(inode, item_type::INODE_ITEM, 0);
-        let bytes = self
-            .trees
-            .get(&self.volume, root, key)
-            .await?
-            .ok_or(Error::MissingInode { tree, inode })?;
-        let metadata =
-            Metadata::parse(&bytes).map_err(|defect| Error::Item { tree, key, defect })?;
-        if metadata.kind != FileKind::Regular {
-            return Err(Error::WrongKind {
-                tree,
-                inode,
-                expected: FileKind::Regular,
-                found: metadata.kind,
-            }
-            .into());
-        }
+        let (_, metadata) = self.file_inode(tree, inode).await?;
         let nodes = self.trees.reader(&self.volume);
         Ok(
             Reader::new(&self.volume, &nodes, self.accounting.checksum_root())

@@ -21,6 +21,7 @@ struct RootItem {
     key: Key,
     root: TreeRoot,
     initial_used: u64,
+    dirty: bool,
     bytes: Vec<u8>,
 }
 
@@ -34,6 +35,7 @@ impl RootItem {
             key: Key::new(root.tree, item_type::ROOT_ITEM, 0),
             root,
             initial_used: 0,
+            dirty: false,
             bytes,
         }
     }
@@ -49,6 +51,7 @@ impl RootItem {
             key,
             root: record.root,
             initial_used: head.bytes_used.get(),
+            dirty: false,
             bytes: bytes.to_vec(),
         })
     }
@@ -138,6 +141,26 @@ impl Roots {
         Ok(())
     }
 
+    #[cfg(feature = "write")]
+    pub(crate) fn directory_size(
+        &mut self,
+        tree: u64,
+        inode: u64,
+        size: u64,
+    ) -> Result<(), WriteError> {
+        let entry = self
+            .entries
+            .get_mut(&tree)
+            .ok_or(Error::MissingRoot { tree })?;
+        let mut head = *view::<RawRootItem>(&entry.bytes).expect("validated root item");
+        if head.root_dirid.get() == inode && head.inode.size.get() != size {
+            head.inode.size.set(size);
+            entry.bytes[..size_of::<RawRootItem>()].copy_from_slice(head.as_bytes());
+            entry.dirty = true;
+        }
+        Ok(())
+    }
+
     /// Root bytes_used counts tree blocks reachable through that root, including
     /// shared blocks. A replaced committed node stops contributing even while
     /// its physical extent remains pinned for another root or an older reader.
@@ -170,7 +193,8 @@ impl Roots {
                     removed,
                 })?;
             let head: &RawRootItem = view(&entry.bytes).expect("validated root item");
-            if head.bytenr.get() == entry.root.bytenr
+            if !entry.dirty
+                && head.bytenr.get() == entry.root.bytenr
                 && head.generation.get() == entry.root.generation
                 && head.level == entry.root.level
                 && head.bytes_used.get() == used
@@ -181,6 +205,7 @@ impl Roots {
             self.root = trees
                 .apply(volume, self.root, entry.key, Some(&entry.bytes), space)
                 .await?;
+            entry.dirty = false;
             changed = true;
         }
         let desired = self.uuid_records();

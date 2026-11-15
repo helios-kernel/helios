@@ -55,6 +55,8 @@ pub(crate) mod objectid {
 /// Item types the read path consults.
 pub(crate) mod item_type {
     pub(crate) const INODE_ITEM: u8 = 1;
+    pub(crate) const INODE_REF: u8 = 12;
+    pub(crate) const INODE_EXTREF: u8 = 13;
     pub(crate) const XATTR_ITEM: u8 = 24;
     pub(crate) const DIR_ITEM: u8 = 84;
     pub(crate) const DIR_INDEX: u8 = 96;
@@ -303,7 +305,7 @@ pub(crate) struct RawRootTail {
 }
 
 /// `btrfs_dir_item`, without its trailing name and data.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawDirItem {
     pub(crate) location: RawKey,
@@ -311,6 +313,23 @@ pub(crate) struct RawDirItem {
     pub(crate) data_len: U16,
     pub(crate) name_len: U16,
     pub(crate) entry_type: u8,
+}
+
+/// `btrfs_inode_ref`, followed by the name.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+pub(crate) struct RawInodeRef {
+    pub(crate) index: U64,
+    pub(crate) name_len: U16,
+}
+
+/// `btrfs_inode_extref`, followed by the name.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+pub(crate) struct RawInodeExtref {
+    pub(crate) parent: U64,
+    pub(crate) index: U64,
+    pub(crate) name_len: U16,
 }
 
 /// The head of `btrfs_file_extent_item` every extent type carries. An
