@@ -7,6 +7,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+use rpds::{RedBlackTreeMapSync, VectorSync};
 use thiserror::Error;
 
 use crate::allocation::data::{DataDefect, DataExtent};
@@ -69,6 +70,7 @@ pub enum SpaceDefect {
     UsedBytes { declared: u64, found: u64 },
 }
 
+#[derive(Clone)]
 struct Group {
     start: u64,
     length: u64,
@@ -111,21 +113,23 @@ pub(crate) struct MetadataReservation {
     pub(crate) first: Key,
 }
 
+#[derive(Clone)]
 pub(crate) struct Space {
-    groups: Vec<Group>,
+    groups: VectorSync<Group>,
     group_root: TreeRoot,
     free_root: Option<TreeRoot>,
     nodesize: u64,
     sector: u64,
-    metadata: BTreeMap<u64, MetadataReservation>,
-    data: BTreeMap<u64, u64>,
+    metadata: RedBlackTreeMapSync<u64, MetadataReservation>,
+    data: RedBlackTreeMapSync<u64, u64>,
 }
 
 impl Space {
     /// Reader-pinned storage is free on disk but unavailable to this writer.
     #[cfg(feature = "write")]
     pub(crate) fn pin(&mut self, range: Range<u64>) {
-        for group in &mut self.groups {
+        for index in 0..self.groups.len() {
+            let group = &mut self.groups[index];
             group.exclude(&range);
         }
     }
@@ -186,13 +190,13 @@ impl Space {
             cursor.advance(volume).await?;
         }
         let mut space = Self {
-            groups,
+            groups: groups.into_iter().collect(),
             group_root,
             free_root,
             nodesize: u64::from(sb.nodesize()),
             sector: u64::from(sb.sectorsize()),
-            metadata: BTreeMap::new(),
-            data: BTreeMap::new(),
+            metadata: RedBlackTreeMapSync::new_sync(),
+            data: RedBlackTreeMapSync::new_sync(),
         };
         let mut cursor = Cursor::ceiling(volume, extent_root, Key::new(0, 0, 0)).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
@@ -238,11 +242,12 @@ impl Space {
                     return Err(defect(SpaceDefect::Range));
                 }
                 let range = key.objectid..end;
-                let group = space
+                let index = space
                     .groups
-                    .iter_mut()
-                    .find(|group| group.contains(&range))
+                    .iter()
+                    .position(|group| group.contains(&range))
                     .ok_or_else(|| defect(SpaceDefect::ExtentOverlap))?;
+                let group = &mut space.groups[index];
                 if !group.free.occupy(range) {
                     return Err(defect(SpaceDefect::ExtentOverlap));
                 }
@@ -251,7 +256,8 @@ impl Space {
             cursor.advance(volume).await?;
         }
         let excluded = volume.chunks().superblock_stripes();
-        for group in &mut space.groups {
+        for index in 0..space.groups.len() {
+            let group = &mut space.groups[index];
             if group.declared_used != group.found_used {
                 return Err(SpaceError::Corrupt {
                     tree: group_root.tree,
@@ -270,7 +276,8 @@ impl Space {
     }
 
     fn reserve(&mut self, length: u64, flags: u64) -> Result<u64, SpaceError> {
-        for group in &mut self.groups {
+        for index in 0..self.groups.len() {
+            let group = &self.groups[index];
             if group.flags & flags == 0 {
                 continue;
             }
@@ -280,7 +287,7 @@ impl Space {
                 .find(|range| range.end - range.start >= length)
                 .map(|range| range.start);
             if let Some(start) = found {
-                assert!(group.free.occupy(start..start + length));
+                assert!(self.groups[index].free.occupy(start..start + length));
                 return Ok(start);
             }
         }
@@ -298,26 +305,28 @@ impl Space {
             });
         }
         let address = self.reserve(length, DATA)?;
-        self.data.insert(address, length);
+        self.data.insert_mut(address, length);
         Ok(address)
     }
 
     /// Only unpublished allocations can be canceled. A committed extent must
     /// stay pinned for readers even after its final reference is removed.
     pub(crate) fn cancel_data(&mut self, address: u64) -> bool {
-        let Some(length) = self.data.remove(&address) else {
+        let Some(length) = self.data.get(&address).copied() else {
             return false;
         };
+        self.data.remove_mut(&address);
         self.release_private(address..address + length);
         true
     }
 
     fn release_private(&mut self, range: Range<u64>) {
-        let group = self
+        let index = self
             .groups
-            .iter_mut()
-            .find(|group| group.contains(&range))
+            .iter()
+            .position(|group| group.contains(&range))
             .expect("reservation belongs to its block group");
+        let group = &mut self.groups[index];
         group
             .free
             .release(range)
@@ -402,7 +411,7 @@ impl Space {
     /// Cancel only allocations owned by this transaction. Published extents
     /// have no entry here and cannot accidentally become reusable this way.
     pub(crate) fn cancel_metadata(&mut self, address: u64) -> bool {
-        if self.metadata.remove(&address).is_none() {
+        if !self.metadata.remove_mut(&address) {
             return false;
         }
         self.release_private(address..address + self.nodesize);
@@ -443,7 +452,7 @@ impl MetadataAllocator for Space {
         };
         let address = self.reserve(self.nodesize, flags)?;
         self.metadata
-            .insert(address, MetadataReservation { tree, level, first });
+            .insert_mut(address, MetadataReservation { tree, level, first });
         Ok(address)
     }
 }

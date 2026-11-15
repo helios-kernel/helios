@@ -4560,6 +4560,9 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
     let mut private_address = None;
     for revision in 0_u64..2048 {
         let checkpoint = trees.clone();
+        let checkpoint_space = space.clone();
+        let checkpoint_available = space.available_metadata();
+        let checkpoint_reservations = space.metadata().collect::<Vec<_>>();
         let checkpoint_root = root;
         root = block_on(trees.apply(
             &fs.volume,
@@ -4572,6 +4575,11 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
         assert_eq!(
             block_on(trees.get(&fs.volume, root, key)).unwrap(),
             Some(revision.to_le_bytes().to_vec())
+        );
+        assert_eq!(checkpoint_space.available_metadata(), checkpoint_available);
+        assert_eq!(
+            checkpoint_space.metadata().collect::<Vec<_>>(),
+            checkpoint_reservations
         );
         // The live overlay reuses its private address, while the retained
         // version must still resolve that address to its earlier contents.

@@ -6,6 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+use rpds::RedBlackTreeMapSync;
 use thiserror::Error;
 use zerocopy::little_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -48,11 +49,11 @@ pub enum FreeSpaceDefect {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Intervals(BTreeMap<u64, u64>);
+pub(crate) struct Intervals(RedBlackTreeMapSync<u64, u64>);
 
 impl Intervals {
     pub(crate) fn whole(range: Range<u64>) -> Self {
-        Self(BTreeMap::from([(range.start, range.end)]))
+        Self([(range.start, range.end)].into_iter().collect())
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = Range<u64>> + '_ {
@@ -67,12 +68,12 @@ impl Intervals {
         if range.start >= range.end || range.end > end {
             return false;
         }
-        self.0.remove(&start);
+        self.0.remove_mut(&start);
         if start < range.start {
-            self.0.insert(start, range.start);
+            self.0.insert_mut(start, range.start);
         }
         if range.end < end {
-            self.0.insert(range.end, end);
+            self.0.insert_mut(range.end, end);
         }
         true
     }
@@ -100,16 +101,16 @@ impl Intervals {
         if let Some((start, end)) = before
             && end == range.start
         {
-            self.0.remove(&start);
+            self.0.remove_mut(&start);
             range.start = start;
         }
         if let Some((start, end)) = after
             && start == range.end
         {
-            self.0.remove(&start);
+            self.0.remove_mut(&start);
             range.end = end;
         }
-        self.0.insert(range.start, range.end);
+        self.0.insert_mut(range.start, range.end);
         Ok(())
     }
 }
@@ -206,10 +207,10 @@ impl FreeGroup {
         if bitmaps && bitmap_end != range.end {
             return Err(FreeSpaceDefect::BitmapCoverage);
         }
-        if free.0.len() != info.extent_count.get() as usize {
+        if free.0.size() != info.extent_count.get() as usize {
             return Err(FreeSpaceDefect::Count {
                 declared: info.extent_count.get(),
-                found: free.0.len(),
+                found: free.0.size(),
             });
         }
         Ok(Self {
@@ -229,7 +230,7 @@ impl FreeGroup {
         let high =
             count * (BITMAP_BYTES + size_of::<RawItem>() as u64) / size_of::<RawItem>() as u64;
         let low = high.saturating_sub(BITMAP_HYSTERESIS);
-        let extents = self.free.0.len() as u64;
+        let extents = self.free.0.size() as u64;
         self.bitmaps = if self.bitmaps {
             extents >= low
         } else {
@@ -237,7 +238,7 @@ impl FreeGroup {
         };
         let count = u32::try_from(extents).map_err(|_| FreeSpaceDefect::Count {
             declared: u32::MAX,
-            found: self.free.0.len(),
+            found: self.free.0.size(),
         })?;
         let mut records = BTreeMap::new();
         records.insert(
