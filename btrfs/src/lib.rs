@@ -46,6 +46,8 @@ mod accounting;
 mod allocation;
 mod checksums;
 mod chunk;
+#[cfg(feature = "write")]
+mod commit;
 mod compress;
 mod csum;
 mod error;
@@ -58,6 +60,8 @@ mod roots;
 mod source;
 mod space;
 mod superblock;
+#[cfg(feature = "write")]
+mod transaction;
 mod tree;
 mod uuid_tree;
 mod volume;

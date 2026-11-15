@@ -17,6 +17,10 @@ use crate::{ChecksumType, Error, Key};
 
 #[derive(Debug, Error)]
 pub(crate) enum WriteError {
+    #[error("filesystem changed after this snapshot was mounted")]
+    StaleSnapshot,
+    #[error("filesystem generation cannot be incremented")]
+    GenerationOverflow,
     #[error("staging range at {logical} with {bytes} bytes is empty or not block-aligned")]
     StagingRange { logical: u64, bytes: usize },
     #[error(transparent)]

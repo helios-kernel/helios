@@ -177,7 +177,7 @@ test-host-tools:
 # Mount the images `mkfs.btrfs --rootdir` builds, one per checksum type and
 # node size. Needs btrfs-progs on PATH; CI's test-libraries lane installs it.
 test-btrfs-mkfs:
-    cargo nextest run -p helios-btrfs --run-ignored ignored-only
+    cargo nextest run -p helios-btrfs --features write --run-ignored ignored-only
 # Fetch the ACPI tables `acpi/tests/qemu-tables.sha256` pins — QEMU's own
 # expected tables for its q35 machine, from its `tests/data/acpi` at the
 # v9.2.0 commit — into `target/acpi-tables` (or `$HELIOS_ACPI_TABLES_DIR`).

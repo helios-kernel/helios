@@ -39,6 +39,7 @@ pub(crate) mod objectid {
     pub(crate) const ROOT_TREE: u64 = 1;
     pub(crate) const EXTENT_TREE: u64 = 2;
     pub(crate) const CHUNK_TREE: u64 = 3;
+    pub(crate) const DEV_TREE: u64 = 4;
     pub(crate) const UUID_TREE: u64 = 9;
     pub(crate) const FREE_SPACE_TREE: u64 = 10;
     pub(crate) const BLOCK_GROUP_TREE: u64 = 11;
@@ -85,7 +86,7 @@ pub(crate) struct RawKey {
 }
 
 /// `btrfs_dev_item`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawDevItem {
     pub(crate) devid: U64,
@@ -105,7 +106,7 @@ pub(crate) struct RawDevItem {
 }
 
 /// The head of `btrfs_super_block`, through the bootstrap chunk array.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawSuperblock {
     pub(crate) csum: [u8; CSUM_FIELD_BYTES],
@@ -143,6 +144,35 @@ pub(crate) struct RawSuperblock {
     pub(crate) nr_global_roots: U64,
     pub(crate) reserved: [u8; 216],
     pub(crate) sys_chunk_array: [u8; SYS_CHUNK_ARRAY_BYTES],
+}
+
+/// One of the four `btrfs_root_backup` records after the system chunk array.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+pub(crate) struct RawRootBackup {
+    pub(crate) tree: U64,
+    pub(crate) tree_generation: U64,
+    pub(crate) chunk: U64,
+    pub(crate) chunk_generation: U64,
+    pub(crate) extent: U64,
+    pub(crate) extent_generation: U64,
+    pub(crate) fs: U64,
+    pub(crate) fs_generation: U64,
+    pub(crate) device: U64,
+    pub(crate) device_generation: U64,
+    pub(crate) checksum: U64,
+    pub(crate) checksum_generation: U64,
+    pub(crate) total_bytes: U64,
+    pub(crate) bytes_used: U64,
+    pub(crate) devices: U64,
+    pub(crate) unused: [U64; 4],
+    pub(crate) tree_level: u8,
+    pub(crate) chunk_level: u8,
+    pub(crate) extent_level: u8,
+    pub(crate) fs_level: u8,
+    pub(crate) device_level: u8,
+    pub(crate) checksum_level: u8,
+    pub(crate) padding: [u8; 10],
 }
 
 /// `btrfs_header`, the head of every tree block.
@@ -319,6 +349,7 @@ const _: () = {
     assert!(size_of::<RawKey>() == 17);
     assert!(size_of::<RawDevItem>() == 98);
     assert!(size_of::<RawSuperblock>() == SYS_CHUNK_ARRAY_OFFSET + SYS_CHUNK_ARRAY_BYTES);
+    assert!(size_of::<RawRootBackup>() == 168);
     assert!(size_of::<RawHeader>() == 101);
     assert!(size_of::<RawItem>() == 25);
     assert!(size_of::<RawKeyPtr>() == 33);

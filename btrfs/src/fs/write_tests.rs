@@ -21,6 +21,240 @@ use crate::{ChecksumType, Key};
 
 struct Disk(File);
 
+#[cfg(feature = "write")]
+struct FaultDisk {
+    disk: Disk,
+    fail_at: usize,
+    operations: std::sync::Arc<std::sync::Mutex<Vec<(bool, u64)>>>,
+    poisoned: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "write")]
+impl FaultDisk {
+    fn operation(&self, commit: bool, block: u64) -> IoResult<()> {
+        use std::sync::atomic::Ordering;
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(IoError::DeviceFault);
+        }
+        let mut operations = self.operations.lock().unwrap();
+        operations.push((commit, block));
+        if operations.len() == self.fail_at {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(IoError::DeviceFault);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "write")]
+impl BlockSource for FaultDisk {
+    fn size_bytes(&self) -> u64 {
+        self.disk.size_bytes()
+    }
+
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+        self.disk.read_at(offset, buf).await
+    }
+}
+
+#[cfg(feature = "write")]
+impl crate::source::BlockSink for FaultDisk {
+    async fn stage(&self, block: u64, bytes: &[u8; 4096]) -> IoResult<()> {
+        self.operation(false, block)?;
+        self.disk.stage(block, bytes).await
+    }
+
+    async fn commit(&self, block: u64, bytes: &[u8; 4096]) -> IoResult<()> {
+        self.operation(true, block)?;
+        self.disk.commit(block, bytes).await
+    }
+}
+
+#[cfg(feature = "write")]
+async fn change_root_mode<S: crate::source::BlockSink>(
+    fs: &Filesystem<S>,
+) -> Result<TreeRoot, WriteError> {
+    use crate::ondisk::{RawInodeItem, item_type, objectid, view};
+    use crate::transaction::Transaction;
+    use zerocopy::IntoBytes;
+
+    let inode = fs.resolve(b"/").await?;
+    let mut transaction = Transaction::new(&fs.volume, fs.root_tree).await?;
+    let root = transaction.roots.get(objectid::FS_TREE)?;
+    let key = Key::new(inode.number(), item_type::INODE_ITEM, 0);
+    let bytes = transaction.trees.get(&fs.volume, root, key).await?.unwrap();
+    let mut raw = *view::<RawInodeItem>(&bytes).unwrap();
+    raw.mode.set((raw.mode.get() & !0o777) | 0o700);
+    raw.transid.set(fs.superblock().generation() + 1);
+    let root = transaction
+        .trees
+        .apply(
+            &fs.volume,
+            root,
+            key,
+            Some(raw.as_bytes()),
+            &mut transaction.space,
+        )
+        .await?;
+    transaction.roots.set(root)?;
+    transaction
+        .commit(
+            || panic!("formatted fixture already has valid UUIDs"),
+            std::thread::available_parallelism().unwrap(),
+        )
+        .await?;
+    Ok(root)
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn transaction_io_failures_recover_a_complete_generation() {
+    block_on(async {
+        // First record the complete write sequence, then fail each boundary.
+        let mut count = 0;
+        let mut first_commit = 0;
+        for fail_at in core::iter::once(usize::MAX).chain(1..) {
+            if fail_at != usize::MAX && fail_at > count {
+                break;
+            }
+            let (_, image) = filesystem_image();
+            let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let fs = Filesystem::mount(FaultDisk {
+                disk: Disk(image.try_clone().unwrap()),
+                fail_at,
+                operations: operations.clone(),
+                poisoned: std::sync::atomic::AtomicBool::new(false),
+            })
+            .await
+            .unwrap();
+            let generation = fs.superblock().generation();
+            let result = change_root_mode(&fs).await;
+            let operations = operations.lock().unwrap().clone();
+            if fail_at == usize::MAX {
+                result.unwrap();
+                count = operations.len();
+                first_commit = operations.iter().position(|(commit, _)| *commit).unwrap() + 1;
+                assert!(
+                    operations[..first_commit - 1]
+                        .iter()
+                        .all(|(commit, _)| !commit)
+                );
+                let published: Vec<_> = operations[first_commit - 1..]
+                    .iter()
+                    .map(|(commit, block)| {
+                        assert!(*commit);
+                        block * crate::source::READ_ALIGNMENT
+                    })
+                    .collect();
+                assert_eq!(published, vec![64 << 20, 64 << 10]);
+            } else {
+                assert!(result.is_err(), "operation {fail_at}");
+                assert_eq!(operations.len(), fail_at);
+            }
+            let recovered = Filesystem::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            let published = fail_at == usize::MAX;
+            assert_eq!(
+                recovered.superblock().generation(),
+                generation + u64::from(published)
+            );
+            assert_eq!(
+                recovered
+                    .resolve(b"/")
+                    .await
+                    .unwrap()
+                    .metadata()
+                    .permissions,
+                if published { 0o700 } else { 0o755 }
+            );
+            // A torn primary selects the newest valid backup. If its commit
+            // completed before failure, all of that generation must be readable.
+            image
+                .write_all_at(&[0; 4096], crate::superblock::MIRROR_OFFSETS[0])
+                .unwrap();
+            let recovered = Filesystem::mount(Disk(image)).await.unwrap();
+            let backup_published = fail_at == usize::MAX || fail_at > first_commit;
+            assert_eq!(
+                recovered.superblock().generation(),
+                generation + u64::from(backup_published)
+            );
+            assert_eq!(
+                recovered
+                    .resolve(b"/")
+                    .await
+                    .unwrap()
+                    .metadata()
+                    .permissions,
+                if backup_published { 0o700 } else { 0o755 }
+            );
+        }
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn committed_transaction_passes_btrfs_check() {
+    use std::io::{Seek, SeekFrom};
+    use std::process::Command;
+
+    block_on(async {
+        for (separate, free_tree) in [(true, true), (false, true), (false, false)] {
+            let (_, mut image) = filesystem_image_with_features(separate, free_tree);
+            let mut named = tempfile::NamedTempFile::new().unwrap();
+            image.seek(SeekFrom::Start(0)).unwrap();
+            std::io::copy(&mut image, named.as_file_mut()).unwrap();
+            for commit in [false, true] {
+                if commit {
+                    let fs = Filesystem::mount(Disk(named.reopen().unwrap()))
+                        .await
+                        .unwrap();
+                    change_root_mode(&fs).await.unwrap();
+                }
+                let output = Command::new("btrfs")
+                    .args(["check", "--readonly"])
+                    .arg(named.path())
+                    .output()
+                    .expect("btrfs-progs must be installed");
+                assert!(
+                    output.status.success(),
+                    "btrfs check: separate={separate}, free_tree={free_tree}, committed={commit}\n{}\n{}",
+                    std::string::String::from_utf8_lossy(&output.stdout),
+                    std::string::String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn empty_transaction_does_not_publish() {
+    block_on(async {
+        let (_, image) = filesystem_image();
+        let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fs = Filesystem::mount(FaultDisk {
+            disk: Disk(image),
+            fail_at: usize::MAX,
+            operations: operations.clone(),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        })
+        .await
+        .unwrap();
+        crate::transaction::Transaction::new(&fs.volume, fs.root_tree)
+            .await
+            .unwrap()
+            .commit(
+                || panic!("no new UUID required"),
+                core::num::NonZeroUsize::MIN,
+            )
+            .await
+            .unwrap();
+        assert!(operations.lock().unwrap().is_empty());
+    });
+}
+
 impl BlockSource for Disk {
     fn size_bytes(&self) -> u64 {
         self.0.metadata().unwrap().len()
@@ -87,6 +321,62 @@ fn filesystem_image_tree(
     format_to(&mut file, tree, size, options).unwrap();
     let reference = file.try_clone().unwrap();
     (block_on(Filesystem::mount(Disk(file))).unwrap(), reference)
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn transaction_publishes_roots_and_preserves_previous_generation() {
+    use crate::transaction::Transaction;
+    use btrfs_disk::superblock::{
+        read_superblock_at, read_superblock_bytes_at, superblock_is_valid,
+    };
+
+    block_on(async {
+        for (separate, free_tree) in [(true, true), (false, true), (false, false)] {
+            let (fs, mut image) = filesystem_image_with_features(separate, free_tree);
+            let generation = fs.superblock().generation();
+            let root = change_root_mode(&fs).await.unwrap();
+
+            let mounted = Filesystem::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            assert_eq!(mounted.superblock().generation(), generation + 1);
+            assert_eq!(
+                mounted.resolve(b"/").await.unwrap().metadata().permissions,
+                0o700
+            );
+            assert_eq!(
+                fs.resolve(b"/").await.unwrap().metadata().permissions,
+                0o755
+            );
+            assert!(matches!(
+                Transaction::new(&fs.volume, fs.root_tree).await,
+                Err(WriteError::StaleSnapshot)
+            ));
+            for offset in crate::superblock::MIRROR_OFFSETS {
+                if offset + 4096 > image.metadata().unwrap().len() {
+                    continue;
+                }
+                let bytes = read_superblock_bytes_at(&mut image, offset).unwrap();
+                assert!(superblock_is_valid(&bytes));
+                let disk = read_superblock_at(&mut image, offset).unwrap();
+                assert_eq!(disk.bytenr, offset);
+                assert_eq!(disk.generation, generation + 1);
+                assert_eq!(disk.root, mounted.root_tree.bytenr);
+                let backup = disk
+                    .backup_roots
+                    .iter()
+                    .find(|backup| backup.tree_root_gen == generation + 1)
+                    .unwrap();
+                assert_eq!(backup.tree_root, disk.root);
+                assert_eq!(backup.fs_root, root.bytenr);
+                assert_eq!(backup.fs_root_gen, root.generation);
+                assert_eq!(backup.csum_root, mounted.csum_tree.bytenr);
+                assert_eq!(backup.bytes_used, disk.bytes_used);
+                assert_eq!(backup.total_bytes, disk.total_bytes);
+            }
+        }
+    });
 }
 
 #[test]

@@ -78,6 +78,48 @@ impl<S: BlockSource> Volume<S> {
 
 #[cfg(feature = "write")]
 impl<S: crate::source::BlockSink> Volume<S> {
+    pub(crate) async fn commit_image(
+        &self,
+    ) -> Result<crate::commit::CommitImage, crate::tree::write::WriteError> {
+        let selected = crate::superblock::select(&self.source).await?;
+        if selected.superblock != self.superblock {
+            return Err(crate::tree::write::WriteError::StaleSnapshot);
+        }
+        Ok(crate::commit::CommitImage {
+            bytes: selected
+                .bytes
+                .into_boxed_slice()
+                .try_into()
+                .expect("selected superblock has fixed size"),
+        })
+    }
+
+    /// Mirrors are ordered: each sink commit flushes the staged tree blocks,
+    /// and the primary becomes authoritative only after the backups persist.
+    pub(crate) async fn publish(
+        &self,
+        mut image: crate::commit::CommitImage,
+    ) -> Result<(), crate::tree::write::WriteError> {
+        use crate::source::READ_ALIGNMENT;
+        for offset in crate::superblock::MIRROR_OFFSETS.into_iter().rev() {
+            if offset + crate::ondisk::SUPERBLOCK_BYTES as u64 > self.source.size_bytes() {
+                continue;
+            }
+            self.source
+                .commit(
+                    offset / READ_ALIGNMENT,
+                    image.at(offset, self.superblock.csum_type()),
+                )
+                .await
+                .map_err(|source| Error::Io {
+                    offset,
+                    len: crate::ondisk::SUPERBLOCK_BYTES,
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
     /// Stage every physical copy of an unreachable allocation. The caller owns
     /// the allocation and supplies the maximum number of in-flight block writes.
     pub(crate) async fn stage(

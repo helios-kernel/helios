@@ -307,6 +307,14 @@ impl Accounting {
         self.checksums.root
     }
 
+    pub(crate) fn bytes_used(&self, space: &Space) -> Result<u64, WriteError> {
+        Ok(space
+            .group_usage(&self.retired_extents)?
+            .into_iter()
+            .map(|(_, used)| used)
+            .sum())
+    }
+
     pub(crate) fn group_root(&self) -> TreeRoot {
         if self.groups.tree == objectid::EXTENT_TREE {
             self.root
