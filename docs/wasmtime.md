@@ -5,13 +5,19 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/borrowed-sync-wit-inputs`):
+The local checkout must be at (branch `helios/register-component-hosts`):
 
 ```text
-6e4440eff80a35670c7622d4be28d422ab624461
+e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e
 ```
 
-That revision extends borrowed-input preparation to synchronous WIT functions
+This revision combines the register trampoline implementation with
+`helios/borrowed-sync-wit-inputs` at `6e4440eff80a35670c7622d4be28d422ab624461`.
+Typed synchronous scalar and resource-handle imports select precompiled native
+register trampolines; other imports retain the array ABI. Canonical validation,
+resource scopes, call hooks and traps remain in the existing runtime helpers.
+
+Borrowed-input preparation extends to synchronous WIT functions
 implemented by asynchronous Rust hosts. `func_wrap_async_prepare` and bindgen's
 `borrowed | async` option complete input validation and request construction
 before the host future starts, retaining only the owned request across suspension.
