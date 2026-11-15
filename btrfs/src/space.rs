@@ -122,6 +122,14 @@ pub(crate) struct Space {
 }
 
 impl Space {
+    /// Reader-pinned storage is free on disk but unavailable to this writer.
+    #[cfg(feature = "write")]
+    pub(crate) fn pin(&mut self, range: Range<u64>) {
+        for group in &mut self.groups {
+            group.exclude(&range);
+        }
+    }
+
     pub(crate) async fn load<S: BlockSource>(
         volume: &Volume<S>,
         roots: TreeRoot,

@@ -10,6 +10,7 @@ use futures::{
 use crate::accounting::Accounting;
 use crate::commit::CommitImage;
 use crate::ondisk::objectid;
+use crate::retirement::{Generation, Retirements};
 use crate::roots::Roots;
 use crate::source::BlockSink;
 use crate::space::Space;
@@ -20,6 +21,8 @@ use crate::tree::{
 use crate::volume::Volume;
 
 pub(crate) struct Transaction<'a, S> {
+    generation: &'a Generation,
+    retirements: &'a mut Retirements,
     volume: &'a Volume<S>,
     image: CommitImage,
     pub(crate) roots: Roots,
@@ -29,17 +32,23 @@ pub(crate) struct Transaction<'a, S> {
 }
 
 impl<'a, S: BlockSink> Transaction<'a, S> {
-    pub(crate) async fn new(volume: &'a Volume<S>, root: TreeRoot) -> Result<Self, WriteError> {
+    pub(crate) async fn new(
+        volume: &'a Volume<S>,
+        root: TreeRoot,
+        pin: &'a Generation,
+        retirements: &'a mut Retirements,
+    ) -> Result<Self, WriteError> {
         let image = volume.commit_image().await?;
         let generation = volume
             .superblock()
             .generation()
             .checked_add(1)
             .ok_or(WriteError::GenerationOverflow)?;
-        let (roots, space) = future::try_join(Roots::load(volume, root), async {
+        let (roots, mut space) = future::try_join(Roots::load(volume, root), async {
             Space::load(volume, root).await.map_err(WriteError::from)
         })
         .await?;
+        retirements.protect(pin, &mut space);
         let accounting = Accounting::new(
             volume,
             roots.get(objectid::EXTENT_TREE)?,
@@ -48,6 +57,8 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         )
         .await?;
         Ok(Self {
+            generation: pin,
+            retirements,
             volume,
             image,
             roots,
@@ -87,6 +98,10 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         }
         self.image
             .prepare(&self.roots, self.accounting.bytes_used(&self.space)?)?;
+        // Register before the first await that can publish the new generation.
+        // Cancellation or a failed mirror write must not lose these pins.
+        self.retirements
+            .record(self.generation, self.accounting.take_retired());
         // Bound the total in-flight I/O by staging one block per concurrent
         // stream item. Volume::stage handles this block's physical copies.
         let writes = self.trees.blocks().flat_map(|(logical, bytes)| {

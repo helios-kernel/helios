@@ -43,6 +43,8 @@ const DATA_WINDOW: u64 = MAX_COMPRESSED_EXTENT;
 /// An [`Inode`] records the tree root of the commit it was read from, so
 /// operations on it see that commit's state whatever happens afterwards.
 pub struct Filesystem<S> {
+    #[cfg(feature = "write")]
+    generation: crate::retirement::Generation,
     volume: Volume<S>,
     root_tree: TreeRoot,
     csum_tree: TreeRoot,
@@ -52,6 +54,8 @@ pub struct Filesystem<S> {
 /// An inode, as of the commit it was read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inode {
+    #[cfg(feature = "write")]
+    generation: crate::retirement::Generation,
     root: TreeRoot,
     number: u64,
     metadata: Metadata,
@@ -153,6 +157,8 @@ impl<S: BlockSource> Filesystem<S> {
         let default_tree = default_subvolume(&volume, root_tree).await?;
         let default_subvolume = find_root(&volume, root_tree, default_tree).await?;
         Ok(Self {
+            #[cfg(feature = "write")]
+            generation: crate::retirement::Generation::new(root_tree.generation),
             volume,
             root_tree,
             csum_tree,
@@ -240,6 +246,8 @@ impl<S: BlockSource> Filesystem<S> {
             defect,
         })?;
         Ok(Inode {
+            #[cfg(feature = "write")]
+            generation: self.generation.clone(),
             root,
             number,
             metadata,

@@ -315,6 +315,11 @@ impl Accounting {
             .sum())
     }
 
+    #[cfg(feature = "write")]
+    pub(crate) fn take_retired(&mut self) -> BTreeMap<u64, u64> {
+        core::mem::take(&mut self.retired_extents)
+    }
+
     pub(crate) fn group_root(&self) -> TreeRoot {
         if self.groups.tree == objectid::EXTENT_TREE {
             self.root

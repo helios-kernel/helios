@@ -74,12 +74,21 @@ impl crate::source::BlockSink for FaultDisk {
 async fn change_root_mode<S: crate::source::BlockSink>(
     fs: &Filesystem<S>,
 ) -> Result<TreeRoot, WriteError> {
+    change_root_mode_with_retirements(fs, &mut crate::retirement::Retirements::default()).await
+}
+
+#[cfg(feature = "write")]
+async fn change_root_mode_with_retirements<S: crate::source::BlockSink>(
+    fs: &Filesystem<S>,
+    retirements: &mut crate::retirement::Retirements,
+) -> Result<TreeRoot, WriteError> {
     use crate::ondisk::{RawInodeItem, item_type, objectid, view};
     use crate::transaction::Transaction;
     use zerocopy::IntoBytes;
 
     let inode = fs.resolve(b"/").await?;
-    let mut transaction = Transaction::new(&fs.volume, fs.root_tree).await?;
+    let mut transaction =
+        Transaction::new(&fs.volume, fs.root_tree, &fs.generation, retirements).await?;
     let root = transaction.roots.get(objectid::FS_TREE)?;
     let key = Key::new(inode.number(), item_type::INODE_ITEM, 0);
     let bytes = transaction.trees.get(&fs.volume, root, key).await?.unwrap();
@@ -230,6 +239,87 @@ fn committed_transaction_passes_btrfs_check() {
 
 #[cfg(feature = "write")]
 #[test]
+fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
+    use crate::retirement::Retirements;
+    use crate::space::Space;
+    use crate::transaction::Transaction;
+
+    fn allocates(space: &mut Space, wanted: u64, nodesize: u64) -> bool {
+        let count = space.available_metadata() / nodesize;
+        let mut found = false;
+        for _ in 0..count {
+            let address = space
+                .allocate(crate::ondisk::objectid::FS_TREE, 0, Key::new(0, 0, 0))
+                .unwrap();
+            found |= address == wanted;
+        }
+        found
+    }
+
+    block_on(async {
+        let (first, image) = filesystem_image();
+        let inode = first.root().await.unwrap();
+        let clone = inode.clone();
+        let old_block = inode.root.bytenr;
+        let mut retirements = Retirements::default();
+        change_root_mode_with_retirements(&first, &mut retirements)
+            .await
+            .unwrap();
+        drop(first);
+        drop(inode);
+        let second = Filesystem::mount(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        change_root_mode_with_retirements(&second, &mut retirements)
+            .await
+            .unwrap();
+        drop(second);
+        let current = Filesystem::mount(Disk(image)).await.unwrap();
+        let raw_space = Space::load(&current.volume, current.root_tree)
+            .await
+            .unwrap();
+        let raw_free = raw_space.committed_free(&BTreeMap::new()).unwrap();
+        {
+            let mut transaction = Transaction::new(
+                &current.volume,
+                current.root_tree,
+                &current.generation,
+                &mut retirements,
+            )
+            .await
+            .unwrap();
+            // Excluding reader pins must not change on-disk free-space accounting.
+            let pinned_free = transaction.space.committed_free(&BTreeMap::new()).unwrap();
+            assert_eq!(raw_free.len(), pinned_free.len());
+            for (raw, pinned) in raw_free.iter().zip(&pinned_free) {
+                assert_eq!(raw.range, pinned.range);
+                assert_eq!(raw.free, pinned.free);
+            }
+            assert!(!allocates(
+                &mut transaction.space,
+                old_block,
+                u64::from(current.superblock().nodesize())
+            ));
+        }
+        drop(clone);
+        let mut transaction = Transaction::new(
+            &current.volume,
+            current.root_tree,
+            &current.generation,
+            &mut retirements,
+        )
+        .await
+        .unwrap();
+        assert!(allocates(
+            &mut transaction.space,
+            old_block,
+            u64::from(current.superblock().nodesize())
+        ));
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn empty_transaction_does_not_publish() {
     block_on(async {
         let (_, image) = filesystem_image();
@@ -242,15 +332,20 @@ fn empty_transaction_does_not_publish() {
         })
         .await
         .unwrap();
-        crate::transaction::Transaction::new(&fs.volume, fs.root_tree)
-            .await
-            .unwrap()
-            .commit(
-                || panic!("no new UUID required"),
-                core::num::NonZeroUsize::MIN,
-            )
-            .await
-            .unwrap();
+        crate::transaction::Transaction::new(
+            &fs.volume,
+            fs.root_tree,
+            &fs.generation,
+            &mut crate::retirement::Retirements::default(),
+        )
+        .await
+        .unwrap()
+        .commit(
+            || panic!("no new UUID required"),
+            core::num::NonZeroUsize::MIN,
+        )
+        .await
+        .unwrap();
         assert!(operations.lock().unwrap().is_empty());
     });
 }
@@ -350,7 +445,13 @@ fn transaction_publishes_roots_and_preserves_previous_generation() {
                 0o755
             );
             assert!(matches!(
-                Transaction::new(&fs.volume, fs.root_tree).await,
+                Transaction::new(
+                    &fs.volume,
+                    fs.root_tree,
+                    &fs.generation,
+                    &mut crate::retirement::Retirements::default()
+                )
+                .await,
                 Err(WriteError::StaleSnapshot)
             ));
             for offset in crate::superblock::MIRROR_OFFSETS {

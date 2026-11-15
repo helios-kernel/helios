@@ -56,6 +56,8 @@ mod fs;
 mod items;
 mod key;
 mod ondisk;
+#[cfg(feature = "write")]
+mod retirement;
 mod roots;
 mod source;
 mod space;
