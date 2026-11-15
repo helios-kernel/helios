@@ -5,13 +5,21 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/guest-memory-residency`):
+The local checkout must be at (branch `helios/immediate-wit-imports`):
 
 ```text
-d10291f68ec29a00ec0261fb72d42069be198770
+dd02866a754619ca217201a91a32d2a1f0bdb08b
 ```
 
-That revision is `helios/next-solver-bindgen` at
+That revision adds immediate host implementations of async WIT imports to
+`helios/guest-memory-residency` at
+`d10291f68ec29a00ec0261fb72d42069be198770`. The
+`func_wrap_concurrent_immediate` registration and bindgen's `immediate` import
+flag retain async WIT typing and canonical lowering while returning directly,
+without a host future allocation. Resource scopes and reentry checks use the
+existing completed-result path.
+
+`helios/guest-memory-residency` is `helios/next-solver-bindgen` at
 `18b428e6becfb6138b877a3fe70afb08bf5724ba` plus one additive commit (#537):
 a store may register a `GuestMemoryResidency`
 (`Store::set_guest_memory_residency`), which the component event loop asks,
