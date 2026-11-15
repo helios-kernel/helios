@@ -2,6 +2,8 @@
 //! by its owner retains explicit parent references for its outgoing pointers;
 //! the writing tree retains or acquires its own implicit references.
 
+use alloc::vec::Vec;
+
 use core::cmp::Reverse;
 
 use super::{Accounting, DataChange, MetadataBlock};
@@ -60,7 +62,13 @@ impl Accounting {
     ) -> Result<(), WriteError> {
         while self.processed_retired < trees.retired().len() {
             let end = trees.retired().len();
-            let mut batch = trees.retired()[self.processed_retired..end].to_vec();
+            let mut batch: Vec<_> = trees
+                .retired()
+                .iter()
+                .skip(self.processed_retired)
+                .take(end - self.processed_retired)
+                .copied()
+                .collect();
             batch.sort_by_key(|block| Reverse(block.level));
             for retired in batch {
                 let block = MetadataBlock {

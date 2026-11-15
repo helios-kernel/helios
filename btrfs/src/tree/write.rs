@@ -2,11 +2,11 @@
 //! reads through a published root never observe this overlay. No lock is held
 //! during device I/O. Publication and reclamation belong to the transaction.
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use arrayvec::ArrayVec;
+use rpds::{RedBlackTreeMapSync, VectorSync};
 use thiserror::Error;
 
 use super::edit::{Branch, Child, EditError, Header, Leaf};
@@ -157,11 +157,15 @@ pub(crate) struct RetiredBlock {
     pub(crate) generation: u64,
 }
 
+/// Retained overlay versions share immutable nodes and persistent collection
+/// roots. Updating an address copies only its collection path; readers of the
+/// prior version retain the prior block even when the address is reused.
+#[derive(Clone)]
 pub(crate) struct Trees {
     generation: u64,
     checksum: ChecksumType,
-    blocks: BTreeMap<u64, Node>,
-    retired: Vec<RetiredBlock>,
+    blocks: RedBlackTreeMapSync<u64, Node>,
+    retired: VectorSync<RetiredBlock>,
 }
 
 pub(crate) struct Overlay<'a, S> {
@@ -187,8 +191,8 @@ impl Trees {
         Self {
             generation,
             checksum,
-            blocks: BTreeMap::new(),
-            retired: Vec::new(),
+            blocks: RedBlackTreeMapSync::new_sync(),
+            retired: VectorSync::new_sync(),
         }
     }
 
@@ -211,11 +215,11 @@ impl Trees {
         node: &Node,
         allocator: &mut A,
     ) {
-        if self.blocks.remove(&address).is_some() {
+        if self.blocks.remove_mut(&address) {
             allocator.cancel(address);
         } else {
             let header: &RawHeader = view(&node.bytes).expect("validated retired node");
-            self.retired.push(RetiredBlock {
+            self.retired.push_back_mut(RetiredBlock {
                 tree,
                 address,
                 level: node.level,
@@ -226,7 +230,7 @@ impl Trees {
 
     fn insert(&mut self, bytes: Arc<[u8]>) {
         let header: &RawHeader = view(&bytes).expect("encoded header");
-        self.blocks.insert(
+        self.blocks.insert_mut(
             header.bytenr.get(),
             Node {
                 level: header.level,
@@ -477,7 +481,7 @@ impl Trees {
             .map(|(&address, node)| (address, &*node.bytes))
     }
 
-    pub(crate) fn retired(&self) -> &[RetiredBlock] {
+    pub(crate) fn retired(&self) -> &VectorSync<RetiredBlock> {
         &self.retired
     }
 }

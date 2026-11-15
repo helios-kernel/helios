@@ -4559,6 +4559,8 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
     let key = Key::new(900, 1, 0);
     let mut private_address = None;
     for revision in 0_u64..2048 {
+        let checkpoint = trees.clone();
+        let checkpoint_root = root;
         root = block_on(trees.apply(
             &fs.volume,
             root,
@@ -4571,6 +4573,14 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
             block_on(trees.get(&fs.volume, root, key)).unwrap(),
             Some(revision.to_le_bytes().to_vec())
         );
+        // The live overlay reuses its private address, while the retained
+        // version must still resolve that address to its earlier contents.
+        assert_eq!(
+            block_on(checkpoint.get(&fs.volume, checkpoint_root, key)).unwrap(),
+            revision
+                .checked_sub(1)
+                .map(|value| value.to_le_bytes().to_vec())
+        );
         assert_eq!(*private_address.get_or_insert(root.bytenr), root.bytenr);
         assert_eq!(trees.blocks().count(), 1);
         assert_eq!(space.metadata().count(), 1);
@@ -4579,7 +4589,7 @@ fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
             available - u64::from(fs.volume.superblock().nodesize())
         );
         assert_eq!(
-            trees.retired(),
+            trees.retired().iter().copied().collect::<Vec<_>>(),
             &[crate::tree::write::RetiredBlock {
                 tree: original.tree,
                 address: original.bytenr,
