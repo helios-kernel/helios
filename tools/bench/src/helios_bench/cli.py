@@ -43,6 +43,10 @@ def parse_sides(raw: str) -> frozenset[Side]:
 def command_run(args: argparse.Namespace) -> int:
     manifest = load_manifest()
     lane = manifest.lane(args.lane)
+    if args.memory is not None:
+        lane = lane.model_copy(
+            update={"memory": args.memory, "linux_vm_memory": args.memory, "memory_differs_because": None}
+        )
     ref = MERGE_BASE if args.baseline_merge_base else args.baseline_ref
     baseline = resolve_baseline(ref) if ref else None
     sides = parse_sides(args.sides)
@@ -238,6 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--sides", default="helios,linux_native,linux_wasmtime")
     run.add_argument("--workload", dest="workloads", action="append", default=[])
     run.add_argument("--iterations", type=int)
+    run.add_argument("--memory", help="guest memory for both Helios and Linux (defaults to the lane)")
     run.add_argument(
         "--rounds",
         type=int,
