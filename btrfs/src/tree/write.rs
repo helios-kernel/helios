@@ -35,6 +35,12 @@ pub(crate) enum WriteError {
     NamespaceMismatch { tree: u64, key: Key },
     #[error("subvolume links require a subvolume operation")]
     SubvolumeLink,
+    #[error("rename across subvolumes is not permitted")]
+    CrossSubvolume,
+    #[error("directory move would create a parent cycle")]
+    DirectoryCycle,
+    #[error("symlink target is empty, contains NUL, or exceeds {maximum} bytes (got {length})")]
+    SymlinkTarget { length: usize, maximum: usize },
     #[error("directory hard links are not permitted")]
     DirectoryLink,
 

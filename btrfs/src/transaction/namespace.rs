@@ -1,6 +1,7 @@
 //! Namespace edits share a transaction with inode and extent changes. Names,
 //! directory indices and backward references become visible in one commit.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use zerocopy::{FromZeros, IntoBytes};
 
@@ -8,8 +9,8 @@ use super::Transaction;
 use crate::csum::{inode_ref_hash, name_hash};
 use crate::items::{RecordKind, dir_index_record, dir_records};
 use crate::ondisk::{
-    NAME_MAX, RawDirItem, RawHeader, RawInodeExtref, RawInodeItem, RawInodeRef, RawItem, RawKey,
-    RawTimespec, item_type, objectid, view,
+    NAME_MAX, RawDirItem, RawFileExtentHead, RawHeader, RawInodeExtref, RawInodeItem, RawInodeRef,
+    RawItem, RawKey, RawTimespec, item_type, objectid, view,
 };
 use crate::source::BlockSink;
 use crate::tree::write::WriteError;
@@ -168,11 +169,183 @@ impl<S: BlockSink> Transaction<'_, S> {
         self.attach(name, inode, raw, metadata.kind, when).await
     }
 
+    pub(crate) async fn symlink(
+        &mut self,
+        name: Name<'_>,
+        target: &[u8],
+        mut attributes: Attributes,
+        when: Timestamp,
+    ) -> Result<u64, WriteError> {
+        // Linux PATH_MAX includes the terminating NUL; an inline symlink must
+        // also fit in one leaf alongside its item and extent headers.
+        let maximum = 4095.min(
+            self.volume.superblock().nodesize() as usize
+                - size_of::<RawHeader>()
+                - size_of::<RawItem>()
+                - size_of::<RawFileExtentHead>(),
+        );
+        if target.is_empty() || target.len() > maximum || target.contains(&0) {
+            return Err(WriteError::SymlinkTarget {
+                length: target.len(),
+                maximum,
+            });
+        }
+        attributes.mode = (attributes.mode & 0o7777) | 0o120000;
+        let inode = self.create_node(name, attributes, when).await?;
+        let mut head = RawFileExtentHead::new_zeroed();
+        head.generation.set(self.trees.generation());
+        head.ram_bytes.set(target.len() as u64);
+        let mut bytes = Vec::from(head.as_bytes());
+        bytes.extend_from_slice(target);
+        let root = self.roots.get(name.tree)?;
+        let root = self
+            .trees
+            .apply(
+                &self.volume,
+                root,
+                Key::new(inode, item_type::EXTENT_DATA, 0),
+                Some(&bytes),
+                &mut self.space,
+            )
+            .await?;
+        self.roots.set(root)?;
+        let (mut raw, _) = self.inode_item(name.tree, inode).await?;
+        raw.size.set(target.len() as u64);
+        raw.nbytes.set(target.len() as u64);
+        self.put_inode(name.tree, inode, raw).await?;
+        Ok(inode)
+    }
+
+    pub(crate) async fn rename(
+        &mut self,
+        source: Name<'_>,
+        destination: Name<'_>,
+        when: Timestamp,
+    ) -> Result<(), WriteError> {
+        if source.tree != destination.tree {
+            return Err(WriteError::CrossSubvolume);
+        }
+        let (inode, kind) = self
+            .lookup_entry(source)
+            .await?
+            .ok_or(WriteError::NoEntry {
+                tree: source.tree,
+                parent: source.parent,
+            })?;
+        let existing = self.lookup_entry(destination).await?;
+        if existing.is_some_and(|(other, _)| other == inode) {
+            return Ok(());
+        }
+        if kind == FileKind::Directory {
+            self.check_directory_move(source.tree, inode, destination.parent)
+                .await?;
+        }
+        if let Some((_, other_kind)) = existing {
+            if (kind == FileKind::Directory) != (other_kind == FileKind::Directory) {
+                return Err(Error::WrongKind {
+                    tree: destination.tree,
+                    inode,
+                    expected: kind,
+                    found: other_kind,
+                }
+                .into());
+            }
+            self.unlink_name(destination, when).await?;
+        }
+        let (raw, _) = self.inode_item(source.tree, inode).await?;
+        self.attach(destination, inode, raw, kind, when).await?;
+        self.detach_name(source, when).await
+    }
+
+    async fn check_directory_move(
+        &self,
+        tree: u64,
+        inode: u64,
+        mut parent: u64,
+    ) -> Result<(), WriteError> {
+        let root = self.roots.get(tree)?;
+        let mut visited = BTreeSet::new();
+        loop {
+            if parent == inode || !visited.insert(parent) {
+                return Err(WriteError::DirectoryCycle);
+            }
+            let key = Key::new(parent, item_type::INODE_REF, 0);
+            let reference = self
+                .trees
+                .ceiling(&self.volume, root, key)
+                .await?
+                .ok_or(WriteError::NamespaceMismatch { tree, key })?;
+            if !reference.0.is(parent, item_type::INODE_REF) {
+                return Err(WriteError::NamespaceMismatch { tree, key });
+            }
+            // A subvolume root's sole parent reference points to itself.
+            if reference.0.offset == parent {
+                return Ok(());
+            }
+            parent = reference.0.offset;
+        }
+    }
+
+    async fn lookup_entry(&self, name: Name<'_>) -> Result<Option<(u64, FileKind)>, WriteError> {
+        validate_name(name.bytes)?;
+        let (_, metadata) = self.inode_item(name.tree, name.parent).await?;
+        if metadata.kind != FileKind::Directory {
+            return Err(Error::WrongKind {
+                tree: name.tree,
+                inode: name.parent,
+                expected: FileKind::Directory,
+                found: metadata.kind,
+            }
+            .into());
+        }
+        let root = self.roots.get(name.tree)?;
+        let key = Key::new(name.parent, item_type::DIR_ITEM, name_hash(name.bytes));
+        let Some(bytes) = self.trees.get(&self.volume, root, key).await? else {
+            return Ok(None);
+        };
+        for record in dir_records(&bytes, RecordKind::Entry) {
+            let record = record.map_err(|defect| Error::Item {
+                tree: name.tree,
+                key,
+                defect,
+            })?;
+            if record.name == name.bytes {
+                if record.location.item_type == item_type::ROOT_ITEM {
+                    return Err(WriteError::SubvolumeLink);
+                }
+                return Ok(Some((record.location.objectid, record.kind())));
+            }
+        }
+        Ok(None)
+    }
+
     pub(crate) async fn unlink_name(
         &mut self,
         name: Name<'_>,
         when: Timestamp,
     ) -> Result<(), WriteError> {
+        let (inode, kind) = self.lookup_entry(name).await?.ok_or(WriteError::NoEntry {
+            tree: name.tree,
+            parent: name.parent,
+        })?;
+        if kind == FileKind::Directory {
+            let root = self.roots.get(name.tree)?;
+            if let Some((key, _)) = self
+                .trees
+                .ceiling(&self.volume, root, Key::new(inode, item_type::DIR_ITEM, 0))
+                .await?
+                && key.is(inode, item_type::DIR_ITEM)
+            {
+                return Err(WriteError::NotEmpty {
+                    tree: name.tree,
+                    inode,
+                });
+            }
+        }
+        self.detach_name(name, when).await
+    }
+
+    async fn detach_name(&mut self, name: Name<'_>, when: Timestamp) -> Result<(), WriteError> {
         validate_name(name.bytes)?;
         let Name {
             tree,
@@ -222,15 +395,6 @@ impl<S: BlockSink> Transaction<'_, S> {
                 tree,
                 key: hash_key,
             });
-        }
-        if kind == FileKind::Directory
-            && let Some((key, _)) = self
-                .trees
-                .ceiling(&self.volume, root, Key::new(inode, item_type::DIR_ITEM, 0))
-                .await?
-            && key.is(inode, item_type::DIR_ITEM)
-        {
-            return Err(WriteError::NotEmpty { tree, inode });
         }
         let (reference_key, index, reference) =
             self.without_reference(tree, parent, inode, name).await?;

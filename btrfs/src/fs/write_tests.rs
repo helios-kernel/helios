@@ -224,6 +224,169 @@ fn writer_abort_commit_and_failed_publication_have_distinct_lifetimes() {
 
 #[cfg(feature = "write")]
 #[test]
+fn rename_and_symlink_preserve_identity_and_reject_parent_cycles() {
+    block_on(exercise_namespace_rename(|_| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn rename_and_symlink_pass_btrfs_check() {
+    block_on(exercise_namespace_rename(assert_btrfs_check));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
+    use super::writer::Writer;
+    use crate::transaction::namespace::{Attributes, Name};
+    let timestamp = Timestamp::from_secs(1_700_000_000);
+    let named = tempfile::NamedTempFile::new().unwrap();
+    let builder = TreeBuilder::new().root(Metadata::new(0o755, timestamp));
+    drop(filesystem_image_tree_file(
+        true,
+        true,
+        builder,
+        named.reopen().unwrap(),
+    ));
+    let mut writer = Writer::mount(Disk(named.reopen().unwrap())).await.unwrap();
+    let base = writer.snapshot().unwrap();
+    let root = base.root().await.unwrap();
+    let tree = root.tree();
+    let root_number = root.number();
+    let concurrency = std::thread::available_parallelism().unwrap();
+    let when = crate::Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 123,
+    };
+    let name = |parent, bytes| Name {
+        tree,
+        parent,
+        bytes,
+    };
+    let attributes = |mode| Attributes {
+        mode,
+        uid: 1000,
+        gid: 1000,
+    };
+    let mut tx = writer.begin().await.unwrap();
+    let edits = tx.edits();
+    let first = edits
+        .create_node(
+            name(root_number, "中文".as_bytes()),
+            attributes(0o040755),
+            when,
+        )
+        .await
+        .unwrap();
+    let second = edits
+        .create_node(
+            name(root_number, "日本語".as_bytes()),
+            attributes(0o040755),
+            when,
+        )
+        .await
+        .unwrap();
+    let child = edits
+        .create_node(name(first, "한국어".as_bytes()), attributes(0o040755), when)
+        .await
+        .unwrap();
+    let file = edits
+        .create_node(name(first, b"file"), attributes(0o100644), when)
+        .await
+        .unwrap();
+    let target = edits
+        .create_node(name(second, b"target"), attributes(0o100644), when)
+        .await
+        .unwrap();
+    let content = vec![0x37; 12307];
+    edits
+        .write_file(tree, file, 0, &content, when, concurrency)
+        .await
+        .unwrap();
+    edits
+        .write_file(tree, target, 0, b"replaced", when, concurrency)
+        .await
+        .unwrap();
+    edits
+        .symlink(name(first, b"link"), b"../target", attributes(0o777), when)
+        .await
+        .unwrap();
+    edits
+        .hard_link(name(second, b"alias"), file, when)
+        .await
+        .unwrap();
+    tx.commit(|| panic!("valid fixture UUID"), concurrency)
+        .await
+        .unwrap();
+    verify(named.path());
+    let previous = writer.snapshot().unwrap();
+    let replaced = previous.resolve("/日本語/target".as_bytes()).await.unwrap();
+    let mut tx = writer.begin().await.unwrap();
+    let edits = tx.edits();
+    assert!(matches!(
+        edits
+            .rename(
+                name(root_number, "中文".as_bytes()),
+                name(child, b"loop"),
+                when
+            )
+            .await,
+        Err(WriteError::DirectoryCycle)
+    ));
+    // Renaming two links to the same inode leaves both names intact.
+    edits
+        .rename(name(first, b"file"), name(second, b"alias"), when)
+        .await
+        .unwrap();
+    edits
+        .rename(name(first, b"file"), name(second, b"target"), when)
+        .await
+        .unwrap();
+    edits
+        .rename(
+            name(root_number, "中文".as_bytes()),
+            name(second, b"moved"),
+            when,
+        )
+        .await
+        .unwrap();
+    tx.commit(|| panic!("valid fixture UUID"), concurrency)
+        .await
+        .unwrap();
+    verify(named.path());
+    let current = writer.snapshot().unwrap();
+    let moved = current.resolve("/日本語/moved".as_bytes()).await.unwrap();
+    assert_eq!(moved.number(), first);
+    assert_eq!(
+        current
+            .resolve("/日本語/moved/한국어".as_bytes())
+            .await
+            .unwrap()
+            .number(),
+        child
+    );
+    assert!(
+        current
+            .lookup(&current.root().await.unwrap(), "中文".as_bytes())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for path in ["/日本語/target", "/日本語/alias", "/日本語/moved/link"] {
+        let inode = current.resolve(path.as_bytes()).await.unwrap();
+        assert_eq!(inode.number(), file);
+        assert_eq!(inode.metadata().nlink, 2);
+        let mut output = vec![0; content.len()];
+        current.read(&inode, 0, &mut output).await.unwrap();
+        assert_eq!(output, content);
+    }
+    let mut old_bytes = [0; 8];
+    current.read(&replaced, 0, &mut old_bytes).await.unwrap();
+    assert_eq!(&old_bytes, b"replaced");
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn namespace_creation_and_hard_links_publish_together() {
     block_on(exercise_namespace_links(|_| {}));
 }
