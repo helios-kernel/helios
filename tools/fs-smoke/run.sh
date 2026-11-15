@@ -9,7 +9,7 @@ mkdir -p "$runtime"
 cp -R tools/fs-smoke/tree "$runtime/tree"
 cp -R tools/fs-smoke/bootfs "$runtime/bootfs"
 mkdir -p "$runtime/bootfs/image" "$runtime/bootfs/btrfs"
-ln -s ../hello.txt "$runtime/tree/docs/hello"
+ln -s hello.txt "$runtime/tree/hello-link"
 mkfs.erofs -zlz4 "$runtime/image.erofs" "$runtime/tree"
 # mkfs.btrfs' default single-device geometry requires at least 114294784 bytes.
 truncate -s 128M "$runtime/image.btrfs"

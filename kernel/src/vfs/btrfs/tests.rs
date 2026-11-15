@@ -13,7 +13,9 @@ use helios_hal::fs::{
 
 use super::BtrfsFs;
 use crate::io::{MemoryDisk, cache_over};
-use crate::vfs::{AttachedStorage, BOOT_DEVICE, MountSource, MountTable, Namespace, Storage};
+use crate::vfs::{
+    AttachedStorage, BOOT_DEVICE, Follow, MountSource, MountTable, Namespace, Storage,
+};
 use crate::{
     BootFs, EmbeddedBootDirectory, EmbeddedBootFs, ProcessAuthority, UnsupportedHostFileSystem,
     request_mount,
@@ -143,6 +145,13 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
     assert_eq!(resolved.writable().map(drop), Err(FsError::ReadOnly));
     assert_eq!(
         block_on(resolved.fs().read_at(resolved.path(), 0, 99)).expect("read through mount"),
+        &b"hello btrfs\n"[..]
+    );
+    let followed = block_on(namespace.resolve_following("/mnt/link", Follow::Within("/mnt")))
+        .expect("follows the mounted symlink");
+    assert_eq!(followed.absolute(), "/mnt/hello");
+    assert_eq!(
+        block_on(followed.fs().read_at(followed.path(), 0, 99)).expect("read through symlink"),
         &b"hello btrfs\n"[..]
     );
 }
