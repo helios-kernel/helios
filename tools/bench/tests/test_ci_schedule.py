@@ -33,6 +33,28 @@ def select_lanes(ci_jobs, tmp_path, changed, draft=False, heavy=False):
     return dict(line.split("=", 1) for line in output.read_text().splitlines())
 
 
+def path_matches(path, pattern):
+    # A leading globstar also matches zero directories in paths-filter.
+    return fnmatchcase(path, pattern) or (
+        pattern.startswith("**/") and fnmatchcase(path, pattern.removeprefix("**/"))
+    )
+
+
+def changed_surfaces(ci_jobs, paths):
+    filtering = next(step for step in ci_jobs["changes"]["steps"] if step.get("id") == "filter")
+    assert filtering["with"]["predicate-quantifier"] == "some-with-excludes"
+    filters = yaml.safe_load(filtering["with"]["filters"])
+    return [
+        name
+        for name, patterns in filters.items()
+        if any(
+            any(path_matches(path, pattern) for pattern in patterns if not pattern.startswith("!"))
+            and all(not path_matches(path, pattern[1:]) for pattern in patterns if pattern.startswith("!"))
+            for path in paths
+        )
+    ]
+
+
 @pytest.mark.parametrize("changed", [[], ["host_tools"], ["shared"], ["aarch64"], None])
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("heavy", [False, True])
@@ -83,18 +105,7 @@ def test_every_selected_review_job_has_a_fifteen_minute_limit(ci_jobs, tmp_path)
     ],
 )
 def test_benchmark_inputs_select_tooling_without_unrelated_rust(ci_jobs, tmp_path, paths, rust):
-    filtering = next(step for step in ci_jobs["changes"]["steps"] if step.get("id") == "filter")
-    assert filtering["with"]["predicate-quantifier"] == "some-with-excludes"
-    filters = yaml.safe_load(filtering["with"]["filters"])
-    changed = [
-        name
-        for name, patterns in filters.items()
-        if any(
-            any(fnmatchcase(path, pattern) for pattern in patterns if not pattern.startswith("!"))
-            and all(not fnmatchcase(path, pattern[1:]) for pattern in patterns if pattern.startswith("!"))
-            for path in paths
-        )
-    ]
+    changed = changed_surfaces(ci_jobs, paths)
     selected = select_lanes(ci_jobs, tmp_path, changed)
     lanes = json.loads(selected["lanes"])
     assert ("test-kernel" in lanes) == rust
@@ -123,3 +134,62 @@ def test_ci_gate_rejects_failed_or_cancelled_dependencies(ci_jobs, result):
         capture_output=True,
     )
     assert (completed.returncode == 0) == (result in {"success", "skipped"})
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "README.md",
+        "AGENTS.md",
+        "docs/networking.md",
+        "api/README.md",
+        "api-macro/README.md",
+        "programs/init/README.md",
+        "compiler-plugin/README.md",
+        "aarch64/README.md",
+        "riscv/README.md",
+        "x86/README.md",
+        "hosted/README.md",
+        "inspector/README.md",
+        "inspector-protocol/README.md",
+        "cli/README.md",
+        "compiler-support/README.md",
+        "profdata/README.md",
+        "workspace-root/README.md",
+        "hal/README.md",
+        "kernel/README.md",
+        "btrfs/README.md",
+        "tools/btrfs/README.md",
+        "tools/bench/README.md",
+        "programs/gpu-test/README.md",
+        "kernel/src/profiling/README.md",
+        ".github/actions/checkout-wasmtime/README.md",
+    ],
+)
+def test_prose_selects_no_build_lanes(ci_jobs, tmp_path, path):
+    changed = changed_surfaces(ci_jobs, [path])
+    assert changed == []
+    selected = select_lanes(ci_jobs, tmp_path, changed)
+    assert json.loads(selected["lanes"]) == []
+    assert json.loads(selected["wasm_profiles"]) == []
+
+
+def test_wasmtime_pin_keeps_every_existing_consumer(ci_jobs, tmp_path):
+    changed = changed_surfaces(ci_jobs, ["docs/wasmtime.md"])
+    assert changed == ["pin"]
+    selected = select_lanes(ci_jobs, tmp_path, changed, heavy=True)
+    catalog = json.loads((REPO_ROOT / ".github/ci-lanes.json").read_text())
+    assert set(json.loads(selected["lanes"])) == set(catalog) - {"smoke-x86-64-venus"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["api/src/lib.rs", "aarch64/src/lib.rs", "inspector/src/main.rs", "btrfs/src/lib.rs"],
+)
+def test_mixed_prose_and_code_keeps_code_selection(ci_jobs, tmp_path, path):
+    code = changed_surfaces(ci_jobs, [path])
+    mixed = changed_surfaces(ci_jobs, ["api/README.md", "btrfs/README.md", path])
+    assert mixed == code
+    assert code
+    selected = select_lanes(ci_jobs, tmp_path, mixed)
+    assert json.loads(selected["lanes"])
