@@ -12,15 +12,18 @@ mod exceptions;
 mod extended_state;
 mod gpu;
 mod host_fs;
+mod hotplug;
 mod input;
 mod ioapic;
 mod iommu;
 mod memory_type;
+mod mtrr;
 mod net;
 mod pci;
 mod rtc;
 mod smp;
 mod snd;
+mod tpm;
 mod vmgenid;
 mod vsock;
 mod watchdog;
@@ -29,16 +32,20 @@ mod debug_state {
     /// The network service this machine's virtio-net function backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::X86Cpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::X86Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::X86Cpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::X86Cpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::X86Cpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::X86VirtioBlockDevice;
+    }
 }
 
 use alloc::sync::Arc;
@@ -268,15 +275,25 @@ fn x86_kernel_main() -> ! {
     // may publish, and that has to be settled before the first ring is
     // allocated.
     let iommu_topology = iommu::discover(rsdp_address, physical_memory_offset);
-    let network_function = net::discover(&pci);
-    let host_share_function = host_fs::discover(&pci);
-    let entropy_function = entropy::discover(&pci);
-    let balloon_function = balloon::discover(&pci);
-    let vsock_function = vsock::discover(&pci);
-    let display_function = gpu::discover(&pci);
-    let input_functions = input::discover(&pci);
-    let sound_function = snd::discover(&pci);
-    let block_functions = block::discover(&pci);
+    let virtio = pci.virtio_functions();
+    let network_function = net::discover(&virtio);
+    let host_share_function = host_fs::discover(&virtio);
+    let entropy_function = entropy::discover(&virtio);
+    let balloon_function = balloon::discover(&virtio);
+    let vsock_function = vsock::discover(&virtio);
+    let display_function = gpu::discover(&virtio);
+    let input_functions = input::discover(&virtio);
+    let sound_function = snd::discover(&virtio);
+    let block_functions = block::discover(&virtio);
+    // The TPM is checked before the kernel exists, because whether the
+    // kernel is handed one is part of the platform it is built from; the
+    // outcome is reported once the logger is up.
+    let (measured_boot, measured_boot_discovery) = tpm::discover(
+        rsdp_address,
+        physical_memory_offset,
+        cpu.clone(),
+        handoff.tables.measurement_log,
+    );
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
         devices = devices.with_network();
@@ -306,7 +323,8 @@ fn x86_kernel_main() -> ! {
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
             .with_dma_model(DmaModel::Translated)
-            .with_devices(devices),
+            .with_devices(devices)
+            .with_measured_boot(measured_boot),
     );
     smp::current_runtime().install_timer(kernel.timer());
     // The first line the logger can carry. The bootloader decides where
@@ -319,6 +337,11 @@ fn x86_kernel_main() -> ! {
         physical_base = format_args!("{:#x}", handoff.kernel.physical_base),
         "kernel image loaded"
     );
+    if measured_boot_discovery.is_refusal() {
+        tracing::warn!("{measured_boot_discovery}");
+    } else {
+        tracing::info!("{measured_boot_discovery}");
+    }
     let (xsave_standard_bytes, xsave_max_bytes) = extended_state::xsave_sizes();
     let supervisor_state = extended_state::supervisor_state_support();
     tracing::info!(
@@ -347,14 +370,21 @@ fn x86_kernel_main() -> ! {
     // through an ACPI SSDT. It is found before the root DRBG is seeded so
     // that the identifier the machine boots with is the one every later
     // observation is compared against.
-    let vmgenid_window = vmgenid::discover(
-        smp::PhysicalOffsetAcpiHandler {
-            physical_memory_offset,
-            tsc_base,
-            timebase,
-        },
-        rsdp_address,
-    );
+    // The machine's one AML namespace: vmgenid is found in it here, and
+    // the processor-hotplug task owns it once the SCI is routed.
+    let acpi_handler = smp::PhysicalOffsetAcpiHandler {
+        physical_memory_offset,
+        tsc_base,
+        timebase,
+    };
+    // SAFETY: the RSDP address comes from the bootloader's handoff and the
+    // handler maps through the direct map it left in place.
+    let acpi_tables = unsafe { acpi::AcpiTables::from_rsdp(acpi_handler.clone(), rsdp_address) }
+        .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
+    let acpi_recorder = helios_acpi::NotifyRecorder::new(acpi_handler);
+    let acpi_namespace = helios_acpi::load_namespace(&acpi_tables, &acpi_recorder)
+        .unwrap_or_else(|error| panic!("x86 ACPI: {error}"));
+    let vmgenid_window = vmgenid::discover(&acpi_namespace, physical_memory_offset);
     let machine_generation =
         helios_kernel::MachineGeneration::new(vmgenid_window.map(|found| found.window));
     match vmgenid_window {
@@ -418,8 +448,14 @@ fn x86_kernel_main() -> ! {
         &debug_state,
         root_entropy,
     );
+    // The SCI is routed with this processor's interrupts still masked,
+    // after its latch is installed, so no delivery precedes its handler.
+    let processor_hotplug = hotplug::install(&cpu, &acpi_tables, acpi_namespace, acpi_recorder);
     smp::join_shootdown_targets();
     x86_64::instructions::interrupts::enable();
+    if let Some(firmware) = processor_hotplug {
+        kernel.spawn_processor_hotplug(firmware);
+    }
     let program_service = helios_kernel::install_component_host_program_service(
         &kernel,
         &cpu,
@@ -435,7 +471,11 @@ fn x86_kernel_main() -> ! {
             cpu.processor_count(),
             cpu.bootstrap_processor(),
         ) {
-            cpu.start_processor(processor);
+            // A possible processor that is not present stays offline: its
+            // slot is built, and `ProcessorControl::online` starts it.
+            if cpu.state.present_at_boot(processor) {
+                cpu.start_processor(processor);
+            }
         }
     }
     run_current_processor(cpu, kernel, debug_state)
@@ -454,9 +494,9 @@ fn x86_kernel_main() -> ! {
 /// an interrupt from a device the kernel never claimed fails loudly
 /// instead of being silently acknowledged.
 #[allow(clippy::too_many_arguments)]
-fn install_pci_devices<WatchdogImpl>(
+fn install_pci_devices<WatchdogImpl, MeasuredBootImpl>(
     cpu: &X86Cpu,
-    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &pci::PciRoot,
     physical_memory_offset: usize,
     iommu_topology: Option<iommu::IommuTopology>,
@@ -474,6 +514,7 @@ fn install_pci_devices<WatchdogImpl>(
     root_entropy: helios_kernel::RootEntropyHandle,
 ) where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let destination_apic_id = cpu.bootstrap_apic_id();
     let mut routes = exceptions::DeviceInterruptRoutes::new();
@@ -665,22 +706,19 @@ fn install_pci_devices<WatchdogImpl>(
         DebugSerial::console().interrupt_handler::<DebugSerial>(),
     );
     cpu.platform_state().install_device_interrupts(routes);
-    cpu.platform_state().io_apic().program_redirection(
+    cpu.platform_state().io_apics().program_redirection(
+        ioapic::COM1,
         exceptions::DEBUG_SERIAL_INTERRUPT_VECTOR,
         destination_apic_id,
     );
 }
 
-/// Counts usable processors from the MADT. Runs before the bootstrap
-/// allocator is primed (the count sizes the allocator's per-processor
-/// structures), so it must not allocate: iterate MADT entries directly
-/// instead of building `AcpiPlatform` processor info.
+/// Counts the possible processors the MADT lists, present or not. Runs
+/// before the bootstrap allocator is primed (the count sizes the
+/// allocator's per-processor structures), so it must not allocate: it
+/// iterates the MADT entries directly.
 fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
-    use acpi::sdt::madt::{Madt, MadtEntry};
-
-    const LAPIC_ENABLED: u32 = 1 << 0;
-    const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
-    const LAPIC_USABLE: u32 = LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE;
+    use acpi::sdt::madt::Madt;
 
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
@@ -694,16 +732,8 @@ fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize 
     let madt = tables
         .find_table::<Madt>()
         .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
-    let count = madt
-        .get()
-        .entries()
-        .filter(|entry| match entry {
-            MadtEntry::LocalApic(apic) => apic.flags & LAPIC_USABLE != 0,
-            MadtEntry::LocalX2Apic(apic) => apic.flags & LAPIC_USABLE != 0,
-            _ => false,
-        })
-        .count();
-    assert!(count > 0, "MADT did not list any usable processors");
+    let count = smp::possible_processors(madt.get()).count();
+    assert!(count > 0, "MADT did not list any possible processors");
     count
 }
 
@@ -1029,6 +1059,23 @@ impl Cpu for X86Cpu {
             .start_processor(processor, secondary_start_rust as *const () as usize);
     }
 
+    /// Saves the callee-saved context, leaves the shootdown set, masks the
+    /// local APIC timer and halts with interrupts masked until
+    /// [`Cpu::restart_processor`] sends INIT/SIPI; the handshake and what
+    /// is re-seeded on the way back are in `smp::stop_current_processor`.
+    fn stop_current(&self) {
+        smp::stop_current_processor();
+    }
+
+    /// May land at any point after the kernel published the stop: the
+    /// restart waits for the processor to reach its halt, then claims the
+    /// stop with a compare-exchange, so it restarts the processor exactly
+    /// once (`smp::X86PlatformState::restart_processor`).
+    fn restart_processor(&self, processor: ProcessorId) {
+        self.state
+            .restart_processor(processor, smp::resume_current_rust as *const () as usize);
+    }
+
     fn wake_processor(&self, processor: ProcessorId) {
         // Publish before signalling: `park_current` masks interrupts
         // around its own test, so a target on its way into HLT either
@@ -1127,13 +1174,14 @@ fn rdrand64() -> u64 {
     unsafe { rdrand64_enabled() }.expect("x86 RDRAND failed after retries")
 }
 
-fn run_current_processor<WatchdogImpl>(
+fn run_current_processor<WatchdogImpl, MeasuredBootImpl>(
     cpu: X86Cpu,
-    kernel: helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    kernel: helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     debug_state: debug_state::RuntimeState,
 ) -> !
 where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     helios_kernel::run_component_host_processor_forever(
         cpu,
@@ -1168,6 +1216,9 @@ extern "C" fn secondary_start_rust(
     // The same page-attribute table the bootstrap processor runs with,
     // before this processor can touch a write-combined mapping.
     memory_type::program_page_attribute_table();
+    // And the bootstrap processor's MTRRs, which a started processor
+    // leaves reset without.
+    boot.mtrrs().apply();
     // Guest code is compiled once for the ISA level the bootstrap processor
     // satisfies and runs on any processor, so every processor must answer
     // every level feature the same way. XCR0 is programmed, which the AVX

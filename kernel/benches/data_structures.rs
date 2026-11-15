@@ -15,9 +15,9 @@ use helios_kernel::{
     FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
-    ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadProgress,
-    TcpWriteProgress, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
-    byte_channel,
+    ProcessMemoryIdentity, RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind,
+    TcpListener, TcpReadInto, TcpReadProgress, TcpWriteProgress, TryRead, TryWrite, UdpBinding,
+    UdpDatagram, UdpError, UdpErrorKind, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -719,6 +719,17 @@ impl ComponentNetworkService for BenchNetworkService {
         Ok(TcpReadProgress::Data(self.payload.clone()))
     }
 
+    async fn tcp_read_into<'a>(
+        &'a self,
+        _stream: Self::TcpStream,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        _timeout_nanos: u64,
+    ) -> Result<TcpReadInto, TcpError> {
+        Ok(TcpReadInto::Data(
+            helios_netstack::TcpReceiveBuffer::write_from(buffer, &self.payload),
+        ))
+    }
+
     fn tcp_send_room(&self, _stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError> {
         Ok(TcpWriteProgress::Room(usize::MAX))
     }
@@ -828,6 +839,14 @@ impl Cpu for BenchCpu {
     fn start_processor(&self, _processor: ProcessorId) {}
 
     fn wake_processor(&self, _processor: ProcessorId) {}
+
+    fn stop_current(&self) {
+        panic!("bench CPU never stops a processor")
+    }
+
+    fn restart_processor(&self, _processor: ProcessorId) {
+        panic!("bench CPU never restarts a processor")
+    }
 
     fn now(&self) -> Instant {
         Instant::new(0)

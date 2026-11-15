@@ -1,22 +1,22 @@
 use super::*;
 
-pub(super) struct Preview1ProgramStore<CpuImpl, Net, HostFs>
+pub(super) struct Preview1ProgramStore<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     pub(super) cpu: CpuImpl,
     pub(super) timer: crate::Timer<CpuImpl>,
     pub(super) spawner: crate::InstanceSpawner<CpuImpl>,
-    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+    pub(super) runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     /// The interrupt routes of the engine this store runs on, which its
     /// threads' stores register with too.
     pub(super) interrupts: Arc<GuestInterrupts>,
     activity: crate::InstanceActivity,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
-    pub(super) filesystem: Namespace<HostFs>,
-    pub(super) clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, HostFs>>,
+    pub(super) filesystem: Namespace<StorageImpl>,
+    pub(super) clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>,
     pub(super) wall_clock_cap: Option<crate::SetWallClockCap>,
     pub(super) cwd: Option<Preview1Cwd>,
     pub(super) arguments: Vec<String>,
@@ -51,23 +51,23 @@ where
     pub(super) children: Vec<WasixChildProcess>,
     pub(super) thread_id: u32,
     /// The threads of this store's process, shared by every store of it.
-    pub(super) threads: WasixImageThreads<CpuImpl, Net, HostFs>,
+    pub(super) threads: WasixImageThreads<CpuImpl, Net, StorageImpl>,
     pub(super) requested_exit: Option<u32>,
-    pub(super) exec_replacement: Option<WasixExecReplacement<CpuImpl, Net, HostFs>>,
+    pub(super) exec_replacement: Option<WasixExecReplacement<CpuImpl, Net, StorageImpl>>,
 }
 
-impl<CpuImpl, Net, HostFs> Preview1ProgramStore<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> Preview1ProgramStore<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         cpu: CpuImpl,
         timer: crate::Timer<CpuImpl>,
         spawner: crate::InstanceSpawner<CpuImpl>,
-        runtime_state: HostRuntimeState<CpuImpl, Net, HostFs>,
+        runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
         interrupts: Arc<GuestInterrupts>,
         instance: crate::RegisteredInstance,
         parent_instance_id: Option<crate::InstanceId>,
@@ -78,14 +78,14 @@ where
         read_serial: crate::SerialReader,
         write_serial: crate::DebugSerialWriter,
         imported_memory: Option<SharedMemory>,
-        filesystem: Option<Namespace<HostFs>>,
+        filesystem: Option<Namespace<StorageImpl>>,
         descriptors: Option<Preview1DescriptorTable<Net>>,
         signal_state: WasixSignalState,
         thread_signals: WasixSignalState,
         signal_dispositions: Vec<WasixSignalDisposition>,
         current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
         wasix_abi: bool,
-        threads: WasixImageThreads<CpuImpl, Net, HostFs>,
+        threads: WasixImageThreads<CpuImpl, Net, StorageImpl>,
     ) -> Self {
         let filesystem = filesystem.unwrap_or_else(|| runtime_state.root_namespace().descend());
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
@@ -269,14 +269,14 @@ where
 
     pub(super) fn request_exec_replacement(
         &mut self,
-        replacement: WasixExecReplacement<CpuImpl, Net, HostFs>,
+        replacement: WasixExecReplacement<CpuImpl, Net, StorageImpl>,
     ) {
         self.exec_replacement = Some(replacement);
     }
 
     pub(super) fn take_exec_replacement(
         &mut self,
-    ) -> Option<WasixExecReplacement<CpuImpl, Net, HostFs>> {
+    ) -> Option<WasixExecReplacement<CpuImpl, Net, StorageImpl>> {
         self.exec_replacement.take()
     }
 
@@ -298,7 +298,7 @@ where
         preview1_process_end(error, self.requested_exit.take())
     }
 
-    pub(super) fn exec_context(&self) -> ProgramExecContext<CpuImpl, Net, HostFs> {
+    pub(super) fn exec_context(&self) -> ProgramExecContext<CpuImpl, Net, StorageImpl> {
         ProgramExecContext {
             cpu: self.cpu.clone(),
             timer: self.timer.clone(),
@@ -324,7 +324,7 @@ where
         &self,
     ) -> crate::component::GuestTurns<
         CpuImpl,
-        HostRuntimeState<CpuImpl, Net, HostFs>,
+        HostRuntimeState<CpuImpl, Net, StorageImpl>,
         WasixStoreSignals,
     > {
         crate::component::GuestTurns::new(
@@ -796,19 +796,19 @@ where
     }
 }
 
-pub(super) fn add_wasi_p1_imports<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_wasi_p1_imports<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "random_get",
-            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
              ptr: i32,
              len: i32|
              -> i32 {
@@ -831,7 +831,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "clock_time_get",
-            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
              _id: i32,
              _precision: i64,
              ptr: i32|
@@ -848,7 +848,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_write",
-            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              iovs: i32,
              iovs_len: i32,
@@ -878,7 +878,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "environ_get",
-            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
              environ: i32,
              buf: i32|
              -> i32 { compiler_environ_get(caller, environ as u32, buf as u32) },
@@ -888,7 +888,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "environ_sizes_get",
-            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
              count: i32,
              size: i32|
              -> i32 {
@@ -905,7 +905,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_fdstat_get",
-            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>,
+            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              stat: i32|
              -> i32 { compiler_fd_fdstat_get(caller, fd, stat as u32) },
@@ -915,9 +915,9 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_close",
-            |mut caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>, fd: i32| -> i32 {
-                caller.data_mut().preview1_descriptors.close(fd)
-            },
+            |mut caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
+             fd: i32|
+             -> i32 { caller.data_mut().preview1_descriptors.close(fd) },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -942,19 +942,21 @@ where
     Ok(())
 }
 
-pub(super) fn add_wasi_thread_spawn<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_wasi_thread_spawn<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     linker
         .func_wrap(
             "wasi",
             "thread-spawn",
-            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, HostFs>>, start_arg: i32| -> i32 {
+            |caller: Caller<'_, CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
+             start_arg: i32|
+             -> i32 {
                 let context = caller.data().context.clone();
                 let next = context.shared.next_thread_id.try_update(
                     AtomicOrdering::Relaxed,
@@ -1033,13 +1035,13 @@ where
 /// Installs the store's interrupt callback, registers the store for
 /// kills and makes it the target of its process's signals, for as long as
 /// the returned registration lives.
-pub(super) fn configure_preview1_program_store<CpuImpl, Net, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn configure_preview1_program_store<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> StoreInterrupts<CpuImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     // No call hook: see `store_with_state`. Turns are accounted where
     // the call that drives this store is polled, and signals and kills
@@ -1058,32 +1060,32 @@ where
     registration
 }
 
-pub(super) fn preview1_program_linker<CpuImpl, Net, HostFs>(
+pub(super) fn preview1_program_linker<CpuImpl, Net, StorageImpl>(
     engine: &wasmtime::Engine,
-) -> Result<CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>, ProgramExecError>
+) -> Result<CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut linker = CoreLinker::new(engine);
     add_preview1_program_imports(&mut linker)?;
     Ok(linker)
 }
 
-pub(super) fn add_preview1_program_imports<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_preview1_program_imports<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "args_sizes_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              argc: i32,
              argv_buf_size: i32|
              -> i32 {
@@ -1095,7 +1097,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "args_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              argv: i32,
              argv_buf: i32|
              -> i32 { p1_args_get(&mut caller, argv as u32, argv_buf as u32) },
@@ -1105,7 +1107,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "environ_sizes_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              count: i32,
              size: i32|
              -> i32 { p1_environ_sizes_get(&mut caller, count as u32, size as u32) },
@@ -1115,7 +1117,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "environ_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              environ: i32,
              environ_buf: i32|
              -> i32 { p1_environ_get(&mut caller, environ as u32, environ_buf as u32) },
@@ -1125,7 +1127,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "clock_res_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              id: i32,
              resolution: i32|
              -> i32 { p1_clock_res_get(&mut caller, id, resolution as u32) },
@@ -1135,7 +1137,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "clock_time_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              id: i32,
              _precision: i64,
              timestamp: i32|
@@ -1146,7 +1148,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "sched_yield",
-            |_caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, ()| {
+            |_caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
                 Box::new(async move {
                     crate::yield_now().await;
                     p1::errno::SUCCESS
@@ -1158,7 +1160,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "random_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              ptr: i32,
              len: i32|
              -> i32 { p1_random_get(&mut caller, ptr as u32, len as u32) },
@@ -1168,17 +1170,19 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_write",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nwritten): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_fd_write(
-                        &mut caller,
-                        fd,
-                        iovs as u32,
-                        iovs_len as u32,
-                        nwritten as u32,
+                    p1_reply(
+                        p1_fd_write(
+                            &mut caller,
+                            fd,
+                            iovs as u32,
+                            iovs_len as u32,
+                            nwritten as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1187,10 +1191,13 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_read",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nread): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_fd_read(&mut caller, fd, iovs as u32, iovs_len as u32, nread as u32).await
+                    p1_reply(
+                        p1_fd_read(&mut caller, fd, iovs as u32, iovs_len as u32, nread as u32)
+                            .await,
+                    )
                 })
             },
         )
@@ -1199,16 +1206,16 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_close",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, fd: i32| -> i32 {
-                caller.data_mut().descriptors.close(fd)
-            },
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+             fd: i32|
+             -> i32 { caller.data_mut().descriptors.close(fd) },
         )
         .map_err(map_program_runtime_error)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_prestat_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              buf: i32|
              -> i32 { p1_fd_prestat_get(&mut caller, fd, buf as u32) },
@@ -1218,7 +1225,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_prestat_dir_name",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              path: i32,
              len: i32|
@@ -1231,7 +1238,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_fdstat_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              stat: i32|
              -> i32 { p1_fd_fdstat_get(&mut caller, fd, stat as u32) },
@@ -1241,7 +1248,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_fdstat_set_flags",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              fdflags: i32|
              -> i32 { p1_fd_fdstat_set_flags(&mut caller, fd, fdflags as u16) },
@@ -1251,7 +1258,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_fdstat_set_rights",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              rights_base: i64,
              rights_inheriting: i64|
@@ -1269,9 +1276,11 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_filestat_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, stat): (i32, i32)| {
-                Box::new(async move { p1_fd_filestat_get(&mut caller, fd, stat as u32).await })
+                Box::new(
+                    async move { p1_reply(p1_fd_filestat_get(&mut caller, fd, stat as u32).await) },
+                )
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -1279,7 +1288,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_filestat_set_size",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, size): (i32, i64)| {
                 Box::new(async move { p1_fd_filestat_set_size(&mut caller, fd, size as u64).await })
             },
@@ -1289,7 +1298,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_filestat_set_times",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, atim, mtim, fstflags): (i32, i64, i64, i32)| {
                 Box::new(async move {
                     p1_fd_filestat_set_times(
@@ -1308,7 +1317,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_advise",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              _offset: i64,
              _len: i64,
@@ -1320,7 +1329,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_allocate",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, offset, len): (i32, i64, i64)| {
                 Box::new(
                     async move { p1_fd_allocate(&mut caller, fd, offset as u64, len as u64).await },
@@ -1332,7 +1341,8 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_datasync",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, (fd,): (i32,)| {
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+             (fd,): (i32,)| {
                 Box::new(async move { p1_fd_datasync(&mut caller, fd).await })
             },
         )
@@ -1341,7 +1351,8 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_sync",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, (fd,): (i32,)| {
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+             (fd,): (i32,)| {
                 Box::new(async move { p1_fd_sync(&mut caller, fd).await })
             },
         )
@@ -1350,18 +1361,20 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_pread",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, offset, nread): (i32, i32, i32, i64, i32)| {
                 Box::new(async move {
-                    p1_fd_pread(
-                        &mut caller,
-                        fd,
-                        iovs as u32,
-                        iovs_len as u32,
-                        offset as u64,
-                        nread as u32,
+                    p1_reply(
+                        p1_fd_pread(
+                            &mut caller,
+                            fd,
+                            iovs as u32,
+                            iovs_len as u32,
+                            offset as u64,
+                            nread as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1370,18 +1383,20 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_pwrite",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, offset, nwritten): (i32, i32, i32, i64, i32)| {
                 Box::new(async move {
-                    p1_fd_pwrite(
-                        &mut caller,
-                        fd,
-                        iovs as u32,
-                        iovs_len as u32,
-                        offset as u64,
-                        nwritten as u32,
+                    p1_reply(
+                        p1_fd_pwrite(
+                            &mut caller,
+                            fd,
+                            iovs as u32,
+                            iovs_len as u32,
+                            offset as u64,
+                            nwritten as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1390,18 +1405,20 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_readdir",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, buf, buf_len, cookie, bufused): (i32, i32, i32, i64, i32)| {
                 Box::new(async move {
-                    p1_fd_readdir(
-                        &mut caller,
-                        fd,
-                        buf as u32,
-                        buf_len as u32,
-                        cookie as u64,
-                        bufused as u32,
+                    p1_reply(
+                        p1_fd_readdir(
+                            &mut caller,
+                            fd,
+                            buf as u32,
+                            buf_len as u32,
+                            cookie as u64,
+                            bufused as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1410,7 +1427,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_renumber",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              from: i32,
              to: i32|
              -> i32 { p1_fd_renumber(&mut caller, from, to) },
@@ -1420,10 +1437,12 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_seek",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, offset, whence, new_offset): (i32, i64, i32, i32)| {
                 Box::new(async move {
-                    p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32).await
+                    p1_reply(
+                        p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32).await,
+                    )
                 })
             },
         )
@@ -1432,7 +1451,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_tell",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              offset: i32|
              -> i32 { p1_fd_tell(&mut caller, fd, offset as u32) },
@@ -1442,7 +1461,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_open",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (
                 fd,
                 dirflags,
@@ -1455,18 +1474,20 @@ where
                 opened_fd,
             ): (i32, i32, i32, i32, i32, i64, i64, i32, i32)| {
                 Box::new(async move {
-                    p1_path_open(
-                        &mut caller,
-                        fd,
-                        dirflags as u32,
-                        path as u32,
-                        path_len as u32,
-                        oflags as u16,
-                        fs_rights_base as u64,
-                        fdflags as u16,
-                        opened_fd as u32,
+                    p1_reply(
+                        p1_path_open(
+                            &mut caller,
+                            fd,
+                            dirflags as u32,
+                            path as u32,
+                            path_len as u32,
+                            oflags as u16,
+                            fs_rights_base as u64,
+                            fdflags as u16,
+                            opened_fd as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1477,7 +1498,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "proc_exit",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              code: i32|
              -> wasmtime::Result<()> {
                 caller.data_mut().request_exit(code as u32);
@@ -1491,22 +1512,25 @@ where
     Ok(())
 }
 
-pub(super) fn add_preview1_program_remaining_imports<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_preview1_program_remaining_imports<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     linker
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_create_directory",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, path, path_len): (i32, i32, i32)| {
                 Box::new(async move {
-                    p1_path_create_directory(&mut caller, fd, path as u32, path_len as u32).await
+                    p1_reply(
+                        p1_path_create_directory(&mut caller, fd, path as u32, path_len as u32)
+                            .await,
+                    )
                 })
             },
         )
@@ -1515,18 +1539,20 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_filestat_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, flags, path, path_len, stat): (i32, i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_path_filestat_get(
-                        &mut caller,
-                        fd,
-                        flags as u32,
-                        path as u32,
-                        path_len as u32,
-                        stat as u32,
+                    p1_reply(
+                        p1_path_filestat_get(
+                            &mut caller,
+                            fd,
+                            flags as u32,
+                            path as u32,
+                            path_len as u32,
+                            stat as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1535,7 +1561,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_filestat_set_times",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, flags, path, path_len, atim, mtim, fstflags): (
                 i32,
                 i32,
@@ -1546,17 +1572,19 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_filestat_set_times(
-                        &mut caller,
-                        fd,
-                        flags as u32,
-                        path as u32,
-                        path_len as u32,
-                        atim as u64,
-                        mtim as u64,
-                        fstflags as u16,
+                    p1_reply(
+                        p1_path_filestat_set_times(
+                            &mut caller,
+                            fd,
+                            flags as u32,
+                            path as u32,
+                            path_len as u32,
+                            atim as u64,
+                            mtim as u64,
+                            fstflags as u16,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1565,7 +1593,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_link",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (old_fd, old_flags, old_path, old_path_len, new_fd, new_path, new_path_len): (
                 i32,
                 i32,
@@ -1576,17 +1604,19 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_link(
-                        &mut caller,
-                        old_fd,
-                        old_flags as u32,
-                        old_path as u32,
-                        old_path_len as u32,
-                        new_fd,
-                        new_path as u32,
-                        new_path_len as u32,
+                    p1_reply(
+                        p1_path_link(
+                            &mut caller,
+                            old_fd,
+                            old_flags as u32,
+                            old_path as u32,
+                            old_path_len as u32,
+                            new_fd,
+                            new_path as u32,
+                            new_path_len as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1595,7 +1625,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_readlink",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, path, path_len, buf, buf_len, bufused): (
                 i32,
                 i32,
@@ -1605,16 +1635,18 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_readlink(
-                        &mut caller,
-                        fd,
-                        path as u32,
-                        path_len as u32,
-                        buf as u32,
-                        buf_len as u32,
-                        bufused as u32,
+                    p1_reply(
+                        p1_path_readlink(
+                            &mut caller,
+                            fd,
+                            path as u32,
+                            path_len as u32,
+                            buf as u32,
+                            buf_len as u32,
+                            bufused as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1623,10 +1655,13 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_remove_directory",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, path, path_len): (i32, i32, i32)| {
                 Box::new(async move {
-                    p1_path_remove_directory(&mut caller, fd, path as u32, path_len as u32).await
+                    p1_reply(
+                        p1_path_remove_directory(&mut caller, fd, path as u32, path_len as u32)
+                            .await,
+                    )
                 })
             },
         )
@@ -1635,7 +1670,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_rename",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (old_fd, old_path, old_path_len, new_fd, new_path, new_path_len): (
                 i32,
                 i32,
@@ -1645,16 +1680,18 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_rename(
-                        &mut caller,
-                        old_fd,
-                        old_path as u32,
-                        old_path_len as u32,
-                        new_fd,
-                        new_path as u32,
-                        new_path_len as u32,
+                    p1_reply(
+                        p1_path_rename(
+                            &mut caller,
+                            old_fd,
+                            old_path as u32,
+                            old_path_len as u32,
+                            new_fd,
+                            new_path as u32,
+                            new_path_len as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1663,7 +1700,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_symlink",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (old_path, old_path_len, fd, new_path, new_path_len): (
                 i32,
                 i32,
@@ -1672,15 +1709,17 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_symlink(
-                        &mut caller,
-                        old_path as u32,
-                        old_path_len as u32,
-                        fd,
-                        new_path as u32,
-                        new_path_len as u32,
+                    p1_reply(
+                        p1_path_symlink(
+                            &mut caller,
+                            old_path as u32,
+                            old_path_len as u32,
+                            fd,
+                            new_path as u32,
+                            new_path_len as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1689,10 +1728,12 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_unlink_file",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, path, path_len): (i32, i32, i32)| {
                 Box::new(async move {
-                    p1_path_unlink_file(&mut caller, fd, path as u32, path_len as u32).await
+                    p1_reply(
+                        p1_path_unlink_file(&mut caller, fd, path as u32, path_len as u32).await,
+                    )
                 })
             },
         )
@@ -1701,17 +1742,19 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "poll_oneoff",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (subscriptions, events, nsubscriptions, nevents): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_poll_oneoff(
-                        &mut caller,
-                        subscriptions as u32,
-                        events as u32,
-                        nsubscriptions as u32,
-                        nevents as u32,
+                    p1_reply(
+                        p1_poll_oneoff(
+                            &mut caller,
+                            subscriptions as u32,
+                            events as u32,
+                            nsubscriptions as u32,
+                            nevents as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1720,7 +1763,7 @@ where
         .func_wrap(
             "wasi_snapshot_preview1",
             "proc_raise",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              signal: i32|
              -> wasmtime::Result<i32> { p1_proc_raise(&mut caller, signal as u32) },
         )
@@ -1729,11 +1772,11 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "sock_accept",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, fdflags, fd_out): (i32, i32, i32)| {
-                Box::new(
-                    async move { p1_sock_accept(&mut caller, fd, fdflags, fd_out as u32).await },
-                )
+                Box::new(async move {
+                    p1_reply(p1_sock_accept(&mut caller, fd, fdflags, fd_out as u32).await)
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -1741,7 +1784,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "sock_recv",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, ri_data, ri_data_len, ri_flags, ro_datalen, ro_flags): (
                 i32,
                 i32,
@@ -1751,16 +1794,18 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_sock_recv(
-                        &mut caller,
-                        fd,
-                        ri_data as u32,
-                        ri_data_len as u32,
-                        ri_flags as u16,
-                        ro_datalen as u32,
-                        ro_flags as u32,
+                    p1_reply(
+                        p1_sock_recv(
+                            &mut caller,
+                            fd,
+                            ri_data as u32,
+                            ri_data_len as u32,
+                            ri_flags as u16,
+                            ro_datalen as u32,
+                            ro_flags as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1769,7 +1814,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "sock_send",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, si_data, si_data_len, si_flags, so_datalen): (
                 i32,
                 i32,
@@ -1778,15 +1823,17 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_sock_send(
-                        &mut caller,
-                        fd,
-                        si_data as u32,
-                        si_data_len as u32,
-                        si_flags as u16,
-                        so_datalen as u32,
+                    p1_reply(
+                        p1_sock_send(
+                            &mut caller,
+                            fd,
+                            si_data as u32,
+                            si_data_len as u32,
+                            si_flags as u16,
+                            so_datalen as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1795,7 +1842,7 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "sock_shutdown",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, how): (i32, i32)| {
                 Box::new(async move { p1_sock_shutdown(&mut caller, fd, how as u8).await })
             },
@@ -1804,15 +1851,15 @@ where
     Ok(())
 }
 
-pub(super) fn p1_args_sizes_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_args_sizes_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     argc: u32,
     argv_buf_size: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let count = match u32::try_from(caller.data().arguments.len()) {
         Ok(count) => count,
@@ -1833,15 +1880,15 @@ where
     ))
 }
 
-pub(super) fn p1_args_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_args_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     argv: u32,
     argv_buf: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let values = caller.data().arguments.clone();
     p1_write_string_array(
@@ -1852,15 +1899,15 @@ where
     )
 }
 
-pub(super) fn p1_environ_sizes_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_environ_sizes_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     count: u32,
     size: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let env = p1_environment_strings(caller.data());
     let env_count = match u32::try_from(env.len()) {
@@ -1882,15 +1929,15 @@ where
     ))
 }
 
-pub(super) fn p1_environ_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_environ_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     environ: u32,
     environ_buf: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let env = p1_environment_strings(caller.data());
     p1_write_string_array(
@@ -1901,15 +1948,15 @@ where
     )
 }
 
-pub(super) fn p1_clock_res_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_clock_res_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     id: i32,
     resolution: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match id {
         0 | 1 => {
@@ -1922,15 +1969,15 @@ where
     }
 }
 
-pub(super) fn p1_clock_time_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_clock_time_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     id: i32,
     timestamp: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let value = match id {
         0 => caller.data().system_time_nanos(),
@@ -1943,15 +1990,15 @@ where
     p1_write_u64(caller, memory, GuestAddress::wasm32(timestamp), value)
 }
 
-pub(super) fn p1_random_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_random_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     ptr: u32,
     len: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1964,14 +2011,14 @@ where
     })
 }
 
-pub(super) fn p1_record_kernel_profile<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn p1_record_kernel_profile<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     syscall: &'static str,
     started_ticks: u64,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if store.runtime_state.profiling_enabled() {
         store.runtime_state.record_profile_stack_parts(
@@ -1983,13 +2030,13 @@ pub(super) fn p1_record_kernel_profile<CpuImpl, Net, HostFs>(
     }
 }
 
-pub(super) fn p1_kernel_profile_start<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn p1_kernel_profile_start<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
 ) -> Option<u64>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store
         .runtime_state
@@ -1997,31 +2044,31 @@ where
         .then(|| store.cpu.now().ticks())
 }
 
-pub(super) fn p1_record_optional_kernel_profile<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn p1_record_optional_kernel_profile<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     syscall: &'static str,
     started_ticks: Option<u64>,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(started_ticks) = started_ticks {
         p1_record_kernel_profile(store, syscall, started_ticks);
     }
 }
 
-pub(super) async fn p1_fd_write<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_write<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     iovs: u32,
     iovs_len: u32,
     nwritten: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started = caller.data().cpu.now().ticks();
     let result = p1_fd_write_inner(
@@ -2036,43 +2083,38 @@ where
     result
 }
 
-pub(super) async fn p1_fd_write_inner<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_write_inner<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     iovs: GuestAddress,
     iovs_len: u32,
     nwritten: GuestAddress,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let layout = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
-    let written = match p1_write_descriptor(caller, fd, memory, &layout).await {
-        Ok(written) => written,
-        Err(errno) => return errno,
-    };
-    p1_write_u32(caller, memory, nwritten, written)
+    let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
+    let written = p1_write_descriptor(caller, fd, &memory, &layout).await?;
+    memory.write_u32(nwritten, written).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_fd_read<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_read<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     iovs: u32,
     iovs_len: u32,
     nread: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started = caller.data().cpu.now().ticks();
     let result = p1_fd_read_inner(
@@ -2087,37 +2129,27 @@ where
     result
 }
 
-pub(super) async fn p1_fd_read_inner<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_read_inner<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     iovs: GuestAddress,
     iovs_len: u32,
     nread: GuestAddress,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let layout = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
+    let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
     let capacity = layout.byte_len;
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => {
-            let bytes = caller.data_mut().read_stdin(capacity).await;
-            return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
-        }
+    let bytes = match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(capacity).await,
         Some(Preview1Descriptor::PipeRead { .. }) => {
-            let bytes = match caller.data_mut().read_pipe(fd, capacity as usize).await {
-                Ok(bytes) => bytes,
-                Err(errno) => return errno,
-            };
-            return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
+            caller.data_mut().read_pipe(fd, capacity as usize).await?
         }
         Some(Preview1Descriptor::File {
             descriptor, offset, ..
@@ -2125,56 +2157,33 @@ where
             let descriptor = descriptor.clone();
             let offset = *offset;
             let namespace = p1_namespace(caller);
-            let file = match p1_grant(&descriptor) {
-                Ok(file) => file,
-                Err(errno) => return errno,
-            };
+            let file = p1_grant(&descriptor)?;
             let bytes = match wasi_fs::read(&namespace, file, offset, capacity as usize).await {
                 Ok(bytes) => bytes,
-                Err(error) => return p1_errno_from_fs(error),
+                Err(error) => return Ok(p1_errno_from_fs(error)),
             };
             p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
-            return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
+            bytes
         }
-        _ => {}
-    }
-    let bytes = match p1_read_descriptor(caller, fd, capacity).await {
-        Ok(bytes) => bytes,
-        Err(errno) => return errno,
+        _ => p1_read_descriptor(caller, fd, capacity).await?,
     };
-    let mut copied = 0usize;
-    for (ptr, len) in layout.iovs {
-        if copied >= bytes.len() {
-            break;
-        }
-        let len = (len as usize).min(bytes.len() - copied);
-        let status = p1_write_memory(
-            caller,
-            memory,
-            GuestAddress::wasm32(ptr),
-            &bytes[copied..copied + len],
-        );
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        copied += len;
-    }
-    let copied = match u32::try_from(copied) {
-        Ok(copied) => copied,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    p1_write_u32(caller, memory, nread, copied)
+    // The read above awaited, so the guest's buffers are checked again as
+    // each is written.
+    memory
+        .write_iovs_from_bytes(&layout.iovs, &bytes, nread)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn p1_fd_prestat_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_fd_prestat_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     buf: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(Preview1Descriptor::Preopen { guest_name, .. }) = caller.data().descriptors.get(fd)
     else {
@@ -2191,8 +2200,8 @@ where
     p1_write_u8(caller, memory, buf, 0).max(p1_write_u32(caller, memory, buf.offset(4), len))
 }
 
-pub(super) fn p1_fd_prestat_dir_name<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_fd_prestat_dir_name<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     path: u32,
     len: u32,
@@ -2200,7 +2209,7 @@ pub(super) fn p1_fd_prestat_dir_name<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -2225,15 +2234,15 @@ pub(super) fn p1_fdstat_bytes(filetype: u8, fdflags: u16, rights: u64) -> [u8; 2
     bytes
 }
 
-pub(super) fn p1_fd_fdstat_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_fd_fdstat_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     stat: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(descriptor) = caller.data().descriptors.get(fd) else {
         return p1::errno::BADF;
@@ -2260,15 +2269,15 @@ where
     )
 }
 
-pub(super) fn p1_fd_fdstat_set_flags<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_fd_fdstat_set_flags<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     fdflags: u16,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::File { .. } | Preview1Descriptor::NullDevice)
@@ -2285,8 +2294,8 @@ where
     }
 }
 
-pub(super) fn p1_fd_fdstat_set_rights<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_fd_fdstat_set_rights<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     rights_base: u64,
     rights_inheriting: u64,
@@ -2294,7 +2303,7 @@ pub(super) fn p1_fd_fdstat_set_rights<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let requested = rights_base | rights_inheriting;
     let Some(descriptor) = caller.data().descriptors.get(fd) else {
@@ -2316,15 +2325,15 @@ where
     }
 }
 
-pub(super) async fn p1_fd_filestat_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_filestat_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     stat: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let stat = GuestAddress::wasm32(stat);
     if matches!(
@@ -2336,25 +2345,22 @@ where
             stat,
             p1_null_device_identity(),
             p1_null_device_stat(),
-        );
+        )
+        .await;
     }
     let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
     else {
-        return p1::errno::BADF;
+        return Ok(p1::errno::BADF);
     };
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path, crate::Follow::No).await
-    {
-        Ok(stat) => stat,
-        Err(errno) => return errno,
-    };
-    p1_write_filestat(caller, stat, identity, stat_value)
+    let (identity, stat_value) = p1_stat_absolute_path(caller, &path, crate::Follow::No).await?;
+    p1_write_filestat(caller, stat, identity, stat_value).await
 }
 
 /// Resolves `path` below the directory `base` to its object identity and
 /// descriptor stat, the way `stat-at` does: `base` must be readable, which
 /// is proved before the path is resolved.
-pub(super) async fn p1_stat_below<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_stat_below<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     base: &FsDescriptor,
     path_flags: fs_types::PathFlags,
     path: &str,
@@ -2362,7 +2368,7 @@ pub(super) async fn p1_stat_below<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let base = p1_grant(base)?;
     let namespace = p1_namespace(caller);
@@ -2378,15 +2384,15 @@ where
 /// Resolves a guest-absolute path through the store's namespace to its
 /// object identity and descriptor stat, following a final symbolic link
 /// when `follow` is set.
-pub(super) async fn p1_stat_absolute_path<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_stat_absolute_path<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     path: &str,
     follow: crate::Follow<'_>,
 ) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let namespace = p1_namespace(caller);
     let metadata = wasi_fs::stat_path(&namespace, path, follow)
@@ -2400,13 +2406,13 @@ where
 
 /// The namespace the store's filesystem calls resolve through, owned so a
 /// call can await on it while the store stays borrowable.
-pub(super) fn p1_namespace<CpuImpl, Net, HostFs>(
-    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-) -> Namespace<HostFs>
+pub(super) fn p1_namespace<CpuImpl, Net, StorageImpl>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+) -> Namespace<StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     caller.data().filesystem.clone()
 }
@@ -2425,14 +2431,14 @@ pub(super) fn p1_fs_descriptor<Net: ComponentHostNetwork>(
 
 /// Moves the offset of the open file `fd` after one of its own reads or
 /// writes.
-fn p1_set_file_offset<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+fn p1_set_file_offset<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     next: u64,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
     else {
@@ -2441,15 +2447,15 @@ fn p1_set_file_offset<CpuImpl, Net, HostFs>(
     *offset = next;
 }
 
-pub(super) async fn p1_fd_filestat_set_size<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_filestat_set_size<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     size: u64,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
     else {
@@ -2467,8 +2473,8 @@ where
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_fd_filestat_set_times<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_filestat_set_times<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     atim: u64,
     mtim: u64,
@@ -2477,7 +2483,7 @@ pub(super) async fn p1_fd_filestat_set_times<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
         return p1::errno::BADF;
@@ -2496,8 +2502,8 @@ where
 /// The access time, the modification time and the current time, in
 /// nanoseconds, that `fstflags` asks `fd_filestat_set_times` and
 /// `path_filestat_set_times` to set.
-fn p1_set_times_arguments<CpuImpl, Net, HostFs>(
-    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+fn p1_set_times_arguments<CpuImpl, Net, StorageImpl>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     atim: u64,
     mtim: u64,
     fstflags: u16,
@@ -2505,7 +2511,7 @@ fn p1_set_times_arguments<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let now_nanos = caller.data().system_time_nanos();
     let access = p1_timestamp_from_fstflags(
@@ -2525,14 +2531,14 @@ where
     (access, modified, now_nanos)
 }
 
-pub(super) fn p1_fd_advise<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_fd_advise<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     caller
         .data()
@@ -2541,8 +2547,8 @@ where
         .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_fd_allocate<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_allocate<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     offset: u64,
     len: u64,
@@ -2550,7 +2556,7 @@ pub(super) async fn p1_fd_allocate<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let end = match offset.checked_add(len) {
         Some(end) => end,
@@ -2579,26 +2585,26 @@ where
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_fd_datasync<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_datasync<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     p1_fd_sync_impl(caller, fd, true).await
 }
 
-pub(super) async fn p1_fd_sync<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_sync<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     p1_fd_sync_impl(caller, fd, false).await
 }
@@ -2607,15 +2613,15 @@ where
 /// by the filesystem that serves it. Stdio, pipes and `/dev/null` have no
 /// write-back stage to flush, so success there is an accurate answer and
 /// not a silent skip.
-async fn p1_fd_sync_impl<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+async fn p1_fd_sync_impl<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     data_only: bool,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(descriptor) = caller.data().descriptors.get(fd) else {
         return p1::errno::BADF;
@@ -2629,93 +2635,80 @@ where
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_fd_pread<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_pread<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     iovs: u32,
     iovs_len: u32,
     offset: u64,
     nread: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let layout = match p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(iovs), iovs_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
+    let layout = p1_read_iovs_with_byte_len(&memory, GuestAddress::wasm32(iovs), iovs_len).await?;
     let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
     else {
-        return p1::errno::BADF;
+        return Ok(p1::errno::BADF);
     };
     let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
-    let file = match p1_grant(&descriptor) {
-        Ok(file) => file,
-        Err(errno) => return errno,
-    };
+    let file = p1_grant(&descriptor)?;
     let bytes = match wasi_fs::read(&namespace, file, offset, layout.byte_len as usize).await {
         Ok(bytes) => bytes,
-        Err(error) => return p1_errno_from_fs(error),
+        Err(error) => return Ok(p1_errno_from_fs(error)),
     };
-    p1_write_iovs_from_bytes(
-        caller,
-        memory,
-        layout.iovs,
-        &bytes,
-        GuestAddress::wasm32(nread),
-    )
+    memory
+        .write_iovs_from_bytes(&layout.iovs, &bytes, GuestAddress::wasm32(nread))
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_fd_pwrite<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_pwrite<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     iovs: u32,
     iovs_len: u32,
     offset: u64,
     nwritten: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let nwritten = GuestAddress::wasm32(nwritten);
-    let layout = match p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(iovs), iovs_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
-    let written = match p1_write_file(caller, fd, memory, &layout, Some(offset)).await {
-        Ok(written) => written,
-        Err(errno) => return errno,
-    };
-    p1_write_u32(caller, memory, nwritten, written)
+    let layout = p1_read_iovs_with_byte_len(&memory, GuestAddress::wasm32(iovs), iovs_len).await?;
+    let written = p1_write_file(caller, fd, &memory, &layout, Some(offset)).await?;
+    memory.write_u32(nwritten, written).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 /// Writes the bytes `layout` names in guest memory to the file `fd`,
-/// gathered straight into the filesystem's destination: at `at` when
+/// gathered straight into the filesystem's destination, one chunk at a
+/// time: at `at` when
 /// given (`fd_pwrite`, which leaves the offset alone), else at the
 /// descriptor's offset or, in append mode, at the end of the file, moving
 /// the offset past them.
-async fn p1_write_file<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+async fn p1_write_file<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
-    memory: Preview1Memory,
+    memory: &Preview1AsyncMemory,
     layout: &Preview1IovLayout,
     at: Option<u64>,
-) -> Result<u32, i32>
+) -> Result<u32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(Preview1Descriptor::File {
         descriptor,
@@ -2723,7 +2716,7 @@ where
         fdflags,
     }) = caller.data().descriptors.get(fd)
     else {
-        return Err(p1::errno::BADF);
+        return Err(P1Stop::Errno(p1::errno::BADF));
     };
     let position = match at {
         Some(at) => WritePosition::At(at),
@@ -2741,8 +2734,8 @@ where
             file: &file,
             now_nanos,
         };
-        p1_write_gathered(&mut gather, position, &mut file)
-            .await
+        p1_write_gathered(memory, &mut gather, position, &mut file)
+            .await?
             .map_err(p1_errno_from_fs)?
     };
     if at.is_none() {
@@ -2755,166 +2748,144 @@ where
 
 /// A resolved file as what a gathered write lands in: each chunk goes
 /// straight from guest memory into the file system's own destination.
-struct ResolvedFileChunks<'file, 'namespace, HostFs: crate::HostFileSystem> {
-    file: &'file crate::vfs::Resolved<'namespace, HostFs>,
+struct ResolvedFileChunks<'file, 'namespace, StorageImpl: crate::Storage> {
+    file: &'file crate::vfs::Resolved<'namespace, StorageImpl>,
     now_nanos: u64,
 }
 
-impl<HostFs: crate::HostFileSystem> Preview1ChunkedFile for ResolvedFileChunks<'_, '_, HostFs> {
+impl<StorageImpl: crate::Storage> Preview1ChunkedFile for ResolvedFileChunks<'_, '_, StorageImpl> {
     type Refusal = fs_types::ErrorCode;
 
     async fn land(
         &mut self,
+        memory: &Preview1AsyncMemory,
         gather: &mut Preview1Gather,
         position: WritePosition,
         len: usize,
-    ) -> Result<u64, fs_types::ErrorCode> {
-        // The regions arrive in write order and cover the chunk exactly,
-        // which is the order `gather` hands its bytes out in.
-        wasi_fs::write_resolved_with(
-            self.file,
-            position,
-            len,
-            self.now_nanos,
-            |_, destination| gather.fill(destination),
-        )
-        .await
+    ) -> Result<Result<u64, fs_types::ErrorCode>, GuestAccessError> {
+        // The chunk's pages are brought in before the write is staged, so
+        // waiting on swap holds up this write and never the file; each
+        // round checks them again in the poll that fills it.
+        gather.bring_in(memory, len).await?;
+        let write =
+            match wasi_fs::prepare_resolved_write(self.file, position, len, self.now_nanos).await {
+                Ok(write) => write,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+        let landed = gather.submit_staged(memory, write).await?;
+        Ok(landed.map_err(wasi_fs::fs_error_code).and_then(|landed| {
+            landed
+                .checked_add(len as u64)
+                .ok_or(fs_types::ErrorCode::Overflow)
+        }))
     }
 }
 
-pub(super) async fn p1_fd_readdir<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_readdir<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     buf: u32,
     buf_len: u32,
     cookie: u64,
     bufused: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let (buf, bufused) = (GuestAddress::wasm32(buf), GuestAddress::wasm32(bufused));
     let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
-        return p1::errno::BADF;
+        return Ok(p1::errno::BADF);
     };
     let namespace = p1_namespace(caller);
-    let directory = match p1_grant(&descriptor) {
-        Ok(directory) => directory,
-        Err(errno) => return errno,
-    };
+    let directory = p1_grant(&descriptor)?;
     let entries = match wasi_fs::read_directory(&namespace, directory).await {
         Ok(entries) => entries,
-        Err(error) => return p1_errno_from_fs(error),
+        Err(error) => return Ok(p1_errno_from_fs(error)),
     };
-    p1_fd_readdir_entries(caller, entries, buf, buf_len, cookie, bufused)
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let records = p1_fd_readdir_records(&entries, buf_len, cookie)?;
+    memory.write_bytes(buf, &records).await?;
+    let used = u32::try_from(records.len()).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+    memory.write_u32(bufused, used).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn p1_fd_readdir_entries<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    entries: Vec<fs_types::DirectoryEntry>,
-    buf: GuestAddress,
+/// The size of a preview1 `dirent` header.
+const P1_DIRENT_BYTES: usize = 24;
+
+/// The `dirent` records of `entries` from `cookie` on, each header followed
+/// by its name, cut off at `buf_len` bytes: what `fd_readdir` copies to the
+/// guest's buffer. A name the buffer cannot hold whole is cut, which ends
+/// the listing.
+pub(super) fn p1_fd_readdir_records(
+    entries: &[fs_types::DirectoryEntry],
     buf_len: u32,
     cookie: u64,
-    bufused: GuestAddress,
-) -> i32
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let start_index = match usize::try_from(cookie) {
-        Ok(index) => index,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    let mut used = 0usize;
+) -> Result<Vec<u8>, i32> {
+    let start_index = usize::try_from(cookie).map_err(|_| p1::errno::OVERFLOW)?;
     let capacity = buf_len as usize;
+    let mut records = Vec::new();
     for (index, entry) in entries.iter().enumerate().skip(start_index) {
-        let dirent_len = 24usize;
+        let used = records.len();
         if used >= capacity {
             break;
         }
-        let next = match u64::try_from(index + 1) {
-            Ok(next) => next,
-            Err(_) => return p1::errno::OVERFLOW,
-        };
+        let next = u64::try_from(index + 1).map_err(|_| p1::errno::OVERFLOW)?;
         let name = entry.name.as_bytes();
-        if capacity - used < dirent_len {
+        if capacity - used < P1_DIRENT_BYTES {
             break;
         }
-        let dirent_ptr = buf.offset(used as u64);
-        let status = p1_write_u64(caller, memory, dirent_ptr, next)
-            .max(p1_write_u64(caller, memory, dirent_ptr.offset(8), next))
-            .max(p1_write_u32(
-                caller,
-                memory,
-                dirent_ptr.offset(16),
-                name.len().try_into().unwrap_or(u32::MAX),
-            ))
-            .max(p1_write_u8(
-                caller,
-                memory,
-                dirent_ptr.offset(20),
-                p1_filetype_from_descriptor_type(entry.type_.clone()),
-            ));
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        used += dirent_len;
-        let remaining = capacity - used;
-        let copied = remaining.min(name.len());
-        let name_ptr = buf.offset(used as u64);
-        let status = p1_write_memory(caller, memory, name_ptr, &name[..copied]);
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        used += copied;
+        // The header is `d_next`, `d_ino`, `d_namlen` and `d_type`.
+        records.extend_from_slice(&next.to_le_bytes());
+        records.extend_from_slice(&next.to_le_bytes());
+        records.extend_from_slice(&u32::try_from(name.len()).unwrap_or(u32::MAX).to_le_bytes());
+        records.push(p1_filetype_from_descriptor_type(entry.type_.clone()));
+        // Bytes 21..24 are padding.
+        records.resize(used + P1_DIRENT_BYTES, 0);
+        let copied = (capacity - records.len()).min(name.len());
+        records.extend_from_slice(&name[..copied]);
         if copied < name.len() {
             break;
         }
     }
-    let used = match u32::try_from(used) {
-        Ok(used) => used,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    p1_write_u32(caller, memory, bufused, used)
+    Ok(records)
 }
 
-pub(super) fn p1_fd_renumber<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_fd_renumber<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     from: i32,
     to: i32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     caller.data_mut().descriptors.renumber(from, to)
 }
 
-pub(super) async fn p1_fd_seek<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_fd_seek<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     offset: i64,
     whence: u8,
     new_offset: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let (descriptor, current) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::File {
             descriptor, offset, ..
         }) => (descriptor.clone(), *offset),
-        Some(_) => return p1::errno::SPIPE,
-        None => return p1::errno::BADF,
+        Some(_) => return Ok(p1::errno::SPIPE),
+        None => return Ok(p1::errno::BADF),
     };
     let base = match whence {
         0 => 0,
@@ -2923,10 +2894,10 @@ where
             let namespace = p1_namespace(caller);
             match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
                 Ok(metadata) => metadata.size,
-                Err(error) => return p1_errno_from_fs(error),
+                Err(error) => return Ok(p1_errno_from_fs(error)),
             }
         }
-        _ => return p1::errno::INVAL,
+        _ => return Ok(p1::errno::INVAL),
     };
     let next = if offset >= 0 {
         base.checked_add(offset as u64)
@@ -2934,28 +2905,31 @@ where
         base.checked_sub(offset.unsigned_abs())
     };
     let Some(next) = next else {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     };
     let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
     else {
-        return p1::errno::BADF;
+        return Ok(p1::errno::BADF);
     };
     *offset = next;
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    p1_write_u64(caller, memory, GuestAddress::wasm32(new_offset), next)
+    memory
+        .write_u64(GuestAddress::wasm32(new_offset), next)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn p1_fd_tell<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_fd_tell<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     offset_out: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let offset = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::File { offset, .. }) => *offset,
@@ -2969,8 +2943,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn p1_path_open<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_open<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     dirflags: u32,
     path: u32,
@@ -2979,23 +2953,22 @@ pub(super) async fn p1_path_open<CpuImpl, Net, HostFs>(
     rights: u64,
     fdflags: u16,
     opened_fd: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
     let (base, path) = if caller.data().wasix_abi {
         match caller.data().resolve_wasix_path_base(fd, &path) {
             Ok(resolved) => resolved,
-            Err(errno) => return errno,
+            Err(errno) => return Ok(errno),
         }
     } else {
         let base = match caller.data().descriptors.get(fd) {
@@ -3005,15 +2978,15 @@ where
             {
                 descriptor.clone()
             }
-            Some(_) => return p1::errno::NOTDIR,
-            None => return p1::errno::BADF,
+            Some(_) => return Ok(p1::errno::NOTDIR),
+            None => return Ok(p1::errno::BADF),
         };
         (base, path)
     };
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
     if !p1_file_fdflags_supported(fdflags) {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
     let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
     if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
@@ -3021,7 +2994,7 @@ where
     }
     p1_path_open_resolved(
         caller,
-        memory,
+        &memory,
         base,
         path,
         path_flags,
@@ -3034,9 +3007,9 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn p1_path_open_resolved<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    memory: Preview1Memory,
+pub(super) async fn p1_path_open_resolved<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    memory: &Preview1AsyncMemory,
     base: FsDescriptor,
     path: String,
     path_flags: fs_types::PathFlags,
@@ -3044,11 +3017,11 @@ pub(super) async fn p1_path_open_resolved<CpuImpl, Net, HostFs>(
     descriptor_flags: fs_types::DescriptorFlags,
     fdflags: u16,
     opened_fd: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match p1_open_null_device(&base, &path, open_flags) {
         Ok(true) => {
@@ -3058,12 +3031,15 @@ where
                 .insert(Preview1Descriptor::NullDevice)
             {
                 Ok(fd) => fd,
-                Err(errno) => return errno,
+                Err(errno) => return Ok(errno),
             };
-            return p1_write_u32(caller, memory, GuestAddress::wasm32(opened_fd), fd);
+            memory
+                .write_u32(GuestAddress::wasm32(opened_fd), fd)
+                .await?;
+            return Ok(p1::errno::SUCCESS);
         }
         Ok(false) => {}
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     }
     let opened = match p1_open_descriptor_resolved(
         caller,
@@ -3076,7 +3052,7 @@ where
     .await
     {
         Ok(descriptor) => descriptor,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
     let fd = match caller
         .data_mut()
@@ -3087,9 +3063,12 @@ where
             fdflags,
         }) {
         Ok(fd) => fd,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
-    p1_write_u32(caller, memory, GuestAddress::wasm32(opened_fd), fd)
+    memory
+        .write_u32(GuestAddress::wasm32(opened_fd), fd)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) fn p1_open_null_device(
@@ -3113,8 +3092,8 @@ pub(super) fn p1_open_null_device(
     Ok(true)
 }
 
-pub(super) async fn p1_open_descriptor_resolved<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_open_descriptor_resolved<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     base: &FsDescriptor,
     path_flags: fs_types::PathFlags,
     path: &str,
@@ -3124,7 +3103,7 @@ pub(super) async fn p1_open_descriptor_resolved<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let base = p1_grant(base)?;
     let namespace = p1_namespace(caller);
@@ -3142,25 +3121,37 @@ where
     .map_err(p1_errno_from_fs)
 }
 
-pub(super) async fn p1_path_create_directory<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_create_directory<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     path: u32,
     path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    Ok(p1_path_create_directory_at(caller, fd, &path).await)
+}
+
+async fn p1_path_create_directory_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3175,30 +3166,29 @@ where
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_path_filestat_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_filestat_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     flags: u32,
     path: u32,
     path_len: u32,
     stat: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let stat = GuestAddress::wasm32(stat);
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
     let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
     if absolute == WASIX_NULL_DEVICE_PATH {
         return p1_write_filestat(
@@ -3206,22 +3196,19 @@ where
             stat,
             p1_null_device_identity(),
             p1_null_device_stat(),
-        );
+        )
+        .await;
     }
-    let (identity, stat_value) =
-        match p1_stat_below(caller, &base, p1_path_flags(flags), &path).await {
-            Ok(stat) => stat,
-            Err(errno) => return errno,
-        };
-    p1_write_filestat(caller, stat, identity, stat_value)
+    let (identity, stat_value) = p1_stat_below(caller, &base, p1_path_flags(flags), &path).await?;
+    p1_write_filestat(caller, stat, identity, stat_value).await
 }
 
 #[expect(
     clippy::too_many_arguments,
     reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration"
 )]
-pub(super) async fn p1_path_filestat_set_times<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_filestat_set_times<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     _flags: u32,
     path: u32,
@@ -3229,20 +3216,35 @@ pub(super) async fn p1_path_filestat_set_times<CpuImpl, Net, HostFs>(
     atim: u64,
     mtim: u64,
     fstflags: u16,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    Ok(p1_path_filestat_set_times_at(caller, fd, &path, atim, mtim, fstflags).await)
+}
+
+async fn p1_path_filestat_set_times_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    path: &str,
+    atim: u64,
+    mtim: u64,
+    fstflags: u16,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3261,8 +3263,8 @@ where
     clippy::too_many_arguments,
     reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration"
 )]
-pub(super) async fn p1_path_link<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_link<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     old_fd: i32,
     _old_flags: u32,
     old_path: u32,
@@ -3270,35 +3272,46 @@ pub(super) async fn p1_path_link<CpuImpl, Net, HostFs>(
     new_fd: i32,
     new_path: u32,
     new_path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let old_path = memory
+        .read_path(GuestAddress::wasm32(old_path), old_path_len)
+        .await?;
+    let new_path = memory
+        .read_path(GuestAddress::wasm32(new_path), new_path_len)
+        .await?;
+    Ok(p1_path_link_at(caller, old_fd, &old_path, new_fd, &new_path).await)
+}
+
+async fn p1_path_link_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    old_fd: i32,
+    old_path: &str,
+    new_fd: i32,
+    new_path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let old_path = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let new_path = match p1_read_path(caller, memory, GuestAddress::wasm32(new_path), new_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
     let status = caller.data().require_hardlink_authority();
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, &old_path) {
+    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, old_path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
     let (destination_base, new_path, _) =
-        match caller.data().resolve_preview1_path(new_fd, &new_path) {
+        match caller.data().resolve_preview1_path(new_fd, new_path) {
             Ok(resolved) => resolved,
             Err(errno) => return errno,
         };
@@ -3317,76 +3330,86 @@ where
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_path_readlink<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_readlink<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     path: u32,
     path_len: u32,
     buf: u32,
     buf_len: u32,
     bufused: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
     let status = caller.data().require_symlink_read_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Ok(status);
     }
     let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
     let namespace = p1_namespace(caller);
     let base = match p1_grant(&base) {
         Ok(base) => base,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
     let target = match wasi_fs::readlink_at(&namespace, base, &path).await {
         Ok(target) => target,
-        Err(error) => return p1_errno_from_fs(error),
+        Err(error) => return Ok(p1_errno_from_fs(error)),
     };
     let bytes = target.as_bytes();
     let copied = (buf_len as usize).min(bytes.len());
-    let status = p1_write_memory(caller, memory, GuestAddress::wasm32(buf), &bytes[..copied]);
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    let copied = match u32::try_from(copied) {
-        Ok(copied) => copied,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    p1_write_u32(caller, memory, GuestAddress::wasm32(bufused), copied)
+    memory
+        .write_bytes(GuestAddress::wasm32(buf), &bytes[..copied])
+        .await?;
+    let copied = u32::try_from(copied).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+    memory
+        .write_u32(GuestAddress::wasm32(bufused), copied)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_path_remove_directory<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_remove_directory<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     path: u32,
     path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    Ok(p1_path_remove_directory_at(caller, fd, &path).await)
+}
+
+async fn p1_path_remove_directory_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3400,39 +3423,50 @@ where
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_path_rename<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_rename<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     old_fd: i32,
     old_path: u32,
     old_path_len: u32,
     new_fd: i32,
     new_path: u32,
     new_path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let old_path = memory
+        .read_path(GuestAddress::wasm32(old_path), old_path_len)
+        .await?;
+    let new_path = memory
+        .read_path(GuestAddress::wasm32(new_path), new_path_len)
+        .await?;
+    Ok(p1_path_rename_at(caller, old_fd, &old_path, new_fd, &new_path).await)
+}
+
+async fn p1_path_rename_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    old_fd: i32,
+    old_path: &str,
+    new_fd: i32,
+    new_path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let old_path = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let new_path = match p1_read_path(caller, memory, GuestAddress::wasm32(new_path), new_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, &old_path) {
+    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, old_path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
     let (destination_base, new_path, _) =
-        match caller.data().resolve_preview1_path(new_fd, &new_path) {
+        match caller.data().resolve_preview1_path(new_fd, new_path) {
             Ok(resolved) => resolved,
             Err(errno) => return errno,
         };
@@ -3452,36 +3486,47 @@ where
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_path_symlink<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_symlink<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     old_path: u32,
     old_path_len: u32,
     fd: i32,
     new_path: u32,
     new_path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let target = memory
+        .read_path(GuestAddress::wasm32(old_path), old_path_len)
+        .await?;
+    let new_path = memory
+        .read_path(GuestAddress::wasm32(new_path), new_path_len)
+        .await?;
+    Ok(p1_path_symlink_at(caller, &target, fd, &new_path).await)
+}
+
+async fn p1_path_symlink_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    target: &str,
+    fd: i32,
+    new_path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let target = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let new_path = match p1_read_path(caller, memory, GuestAddress::wasm32(new_path), new_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
     let status = caller.data().require_symlink_create_authority();
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (base, new_path, _) = match caller.data().resolve_preview1_path(fd, &new_path) {
+    let (base, new_path, _) = match caller.data().resolve_preview1_path(fd, new_path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3491,30 +3536,42 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::symlink_at(&namespace, granted, &target, &new_path, now_nanos)
+    wasi_fs::symlink_at(&namespace, granted, target, &new_path, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_path_unlink_file<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_path_unlink_file<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     path: u32,
     path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    Ok(p1_path_unlink_file_at(caller, fd, &path).await)
+}
+
+async fn p1_path_unlink_file_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3573,39 +3630,37 @@ struct P1ReadyEvent {
 /// whether or not it was ready. A guest polling "socket readable, or 5s
 /// timeout" therefore always waited the whole 5 seconds, and then could not
 /// tell which of the two events had actually fired.
-pub(super) async fn p1_poll_oneoff<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_poll_oneoff<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     subscriptions: u32,
     events: u32,
     nsubscriptions: u32,
     nevents: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if nsubscriptions == 0 {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
 
     let (monotonic_now, system_now) =
         (caller.data().now_nanos(), caller.data().system_time_nanos());
     let max_subscriptions = p1_subscription_limit(caller.data().descriptors.limit);
-    let parsed = match p1_read_subscriptions(
-        memory,
+    let parsed = p1_read_subscriptions(
+        &memory,
         GuestAddress::wasm32(subscriptions),
         nsubscriptions,
         max_subscriptions,
         monotonic_now,
         system_now,
-    ) {
-        Ok(parsed) => parsed,
-        Err(errno) => return errno,
-    };
+    )
+    .await?;
 
     let ready = loop {
         // Arm every subscribed descriptor before testing any of them: a
@@ -3679,41 +3734,32 @@ where
         p1_wait_step(&timer, &mut wait, earliest).await;
     };
 
-    let events = GuestAddress::wasm32(events);
-    let mut event_count = 0u32;
-    for event in &ready {
-        let event_ptr = events.offset(u64::from(event_count) * u64::from(P1_EVENT_SIZE));
-        let status = p1_write_u64(caller, memory, event_ptr, event.userdata)
-            .max(p1_write_u16(
-                caller,
-                memory,
-                event_ptr.offset(8),
-                event.error,
-            ))
-            .max(p1_write_u8(
-                caller,
-                memory,
-                event_ptr.offset(10),
-                event.event_type,
-            ))
-            .max(p1_write_u64(
-                caller,
-                memory,
-                event_ptr.offset(16),
-                event.nbytes,
-            ))
-            .max(p1_write_u16(
-                caller,
-                memory,
-                event_ptr.offset(24),
-                event.fd_flags,
-            ));
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        event_count += 1;
-    }
-    p1_write_u32(caller, memory, GuestAddress::wasm32(nevents), event_count)
+    // The wait above awaited, so the guest's pages are checked again here,
+    // in the poll that writes the events. Each record keeps the padding
+    // between its fields as the guest had it.
+    let event_size = P1_EVENT_SIZE as usize;
+    memory
+        .write(
+            GuestAddress::wasm32(events),
+            ready.len() * event_size,
+            |records| {
+                for (event, record) in ready.iter().zip(records.chunks_exact_mut(event_size)) {
+                    record[0..8].copy_from_slice(&event.userdata.to_le_bytes());
+                    record[8..10].copy_from_slice(&event.error.to_le_bytes());
+                    record[10] = event.event_type;
+                    record[16..24].copy_from_slice(&event.nbytes.to_le_bytes());
+                    record[24..26].copy_from_slice(&event.fd_flags.to_le_bytes());
+                }
+            },
+        )
+        .await?;
+    // Every event of `ready` is reported, and `ready` is bounded by the
+    // subscriptions the guest passed, which fit a `u32`.
+    let event_count = u32::try_from(ready.len()).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+    memory
+        .write_u32(GuestAddress::wasm32(nevents), event_count)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 /// Whether a clock subscription's deadline has arrived.
@@ -3787,30 +3833,28 @@ fn p1_subscription_limit(limit: DescriptorLimit) -> usize {
 /// clock timeouts at `monotonic_now` / `system_now`. A count above
 /// `max_subscriptions` is `EINVAL`, and the array must lie inside `memory`;
 /// both are checked before anything is collected for it.
-fn p1_read_subscriptions(
-    memory: Preview1Memory,
+async fn p1_read_subscriptions(
+    memory: &Preview1AsyncMemory,
     subscriptions: GuestAddress,
     nsubscriptions: u32,
     max_subscriptions: usize,
     monotonic_now: u64,
     system_now: u64,
-) -> Result<Vec<P1Subscription>, i32> {
+) -> Result<Vec<P1Subscription>, P1Stop> {
     if nsubscriptions as usize > max_subscriptions {
-        return Err(p1::errno::INVAL);
+        return Err(P1Stop::Errno(p1::errno::INVAL));
     }
     let mut parsed = Vec::with_capacity(nsubscriptions as usize);
     for index in 0..nsubscriptions {
         let subscription_ptr =
             subscriptions.offset(u64::from(index) * u64::from(P1_SUBSCRIPTION_SIZE));
-        let userdata = u64::from_le_bytes(p1_read_array(memory, subscription_ptr)?);
-        let [event_type] = p1_read_array(memory, subscription_ptr.offset(8))?;
+        let userdata = memory.read_u64(subscription_ptr).await?;
+        let event_type = memory.read_u8(subscription_ptr.offset(8)).await?;
         parsed.push(match event_type {
             P1_EVENTTYPE_CLOCK => {
-                let clock_id =
-                    u32::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(16))?);
-                let timeout =
-                    u64::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(24))?);
-                let flags = u16::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(40))?);
+                let clock_id = memory.read_u32(subscription_ptr.offset(16)).await?;
+                let timeout = memory.read_u64(subscription_ptr.offset(24)).await?;
+                let flags = memory.read_u16(subscription_ptr.offset(40)).await?;
                 if !matches!(clock_id, 0 | 1) {
                     P1Subscription::Failed {
                         userdata,
@@ -3836,7 +3880,7 @@ fn p1_read_subscriptions(
                 }
             }
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE => {
-                let fd = i32::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(16))?);
+                let fd = memory.read_u32(subscription_ptr.offset(16)).await? as i32;
                 P1Subscription::Fd {
                     userdata,
                     event_type,
@@ -3853,14 +3897,14 @@ fn p1_read_subscriptions(
     Ok(parsed)
 }
 
-pub(super) fn p1_proc_raise<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     signal: u32,
 ) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     caller
         .data_mut()
@@ -3890,24 +3934,55 @@ pub(super) fn p1_errno_from_program_exec_error(error: &ProgramExecError) -> i32 
     }
 }
 
-pub(super) async fn p1_sock_accept<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_sock_accept<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     fdflags: i32,
     fd_out: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
+{
+    let accepted_fd = match p1_sock_accepted_fd(caller, fd, fdflags).await {
+        Ok(accepted_fd) => accepted_fd,
+        Err(errno) => return Ok(errno),
+    };
+    // The accept awaited, so the guest's page is checked again as it is
+    // written. A descriptor the guest never learned of is closed again.
+    let written = match p1_async_memory(caller) {
+        Some(memory) => memory
+            .write_u32(GuestAddress::wasm32(fd_out), accepted_fd)
+            .await
+            .map_err(P1Stop::from),
+        None => Err(P1Stop::Errno(p1::errno::FAULT)),
+    };
+    if written.is_err() {
+        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
+    }
+    written.map(|()| p1::errno::SUCCESS)
+}
+
+/// Accepts a connection on the listening socket `fd` and installs it as a
+/// descriptor, whose number it answers.
+async fn p1_sock_accepted_fd<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    fdflags: i32,
+) -> Result<u32, i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
 {
     let fdflags = match u16::try_from(fdflags) {
         Ok(fdflags) if p1_socket_fdflags_supported(fdflags) => fdflags,
-        _ => return p1::errno::INVAL,
+        _ => return Err(p1::errno::INVAL),
     };
     let status = caller.data().require_tcp_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Err(status);
     }
     let (listener, family) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
@@ -3915,25 +3990,22 @@ where
                 listener, family, ..
             },
         ))) => (listener.id(), *family),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
-            return p1::errno::INVAL;
-        }
-        Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
-        Some(_) => return p1::errno::NOTSOCK,
-        None => return p1::errno::BADF,
+        Some(Preview1Descriptor::Socket(_)) => return Err(p1::errno::INVAL),
+        Some(_) => return Err(p1::errno::NOTSOCK),
+        None => return Err(p1::errno::BADF),
     };
     let Some(service) = caller.data().runtime_state.network_service() else {
-        return p1::errno::NETDOWN;
+        return Err(p1::errno::NETDOWN);
     };
     let timeout = if p1_fdflags_nonblocking(fdflags) {
         0
     } else {
         u64::MAX
     };
-    let accepted = match service.tcp_accept(listener, timeout).await {
-        Ok(accepted) => accepted,
-        Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
-    };
+    let accepted = service
+        .tcp_accept(listener, timeout)
+        .await
+        .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
             family,
@@ -3942,34 +4014,20 @@ where
             peer_port: accepted.port,
             options: WasixSocketOptions::default(),
         }));
-    let accepted_fd = match caller
+    caller
         .data_mut()
         .descriptors
         .insert_with_fdflags(descriptor, false, fdflags)
-    {
-        Ok(fd) => fd,
-        Err(errno) => return errno,
-    };
-    let Some(memory) = p1_memory(caller) else {
-        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
-        return p1::errno::FAULT;
-    };
-    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(fd_out), accepted_fd);
-    if status != p1::errno::SUCCESS {
-        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
-        return status;
-    }
-    p1::errno::SUCCESS
 }
 
-pub(super) fn p1_connected_tcp_stream<CpuImpl, Net, HostFs>(
-    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_connected_tcp_stream<CpuImpl, Net, StorageImpl>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
 ) -> Result<Net::TcpStream, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
@@ -3981,19 +4039,19 @@ where
     }
 }
 
-pub(super) async fn p1_sock_recv<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_sock_recv<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     ri_data: u32,
     ri_data_len: u32,
     _ri_flags: u16,
     ro_datalen: u32,
     ro_flags: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started = caller
         .data()
@@ -4016,22 +4074,22 @@ where
     result
 }
 
-pub(super) async fn p1_sock_recv_inner<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_sock_recv_inner<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     ri_data: u32,
     ri_data_len: u32,
     _ri_flags: u16,
     ro_datalen: u32,
     ro_flags: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let (ri_data, ro_datalen, ro_flags) = (
         GuestAddress::wasm32(ri_data),
@@ -4039,117 +4097,119 @@ where
         GuestAddress::wasm32(ro_flags),
     );
     let iovs_started = p1_kernel_profile_start(caller.data());
-    let layout = match p1_read_iovs_with_byte_len(memory, ri_data, ri_data_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
+    let layout = p1_read_iovs_with_byte_len(&memory, ri_data, ri_data_len).await?;
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_iovs", iovs_started);
     let capacity = layout.byte_len;
-    let fdflags = match caller.data().descriptors.fdflags(fd) {
-        Ok(fdflags) => fdflags,
-        Err(errno) => return errno,
-    };
+    let fdflags = caller.data().descriptors.fdflags(fd)?;
     if matches!(
         caller.data().descriptors.get(fd),
         Some(Preview1Descriptor::Socket(
             WasixSocketDescriptor::Pair { .. }
         ))
     ) {
-        if capacity == 0 {
-            let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &[], ro_datalen);
-            if status != p1::errno::SUCCESS {
-                return status;
-            }
-            return p1_write_u16(caller, memory, ro_flags, 0);
-        }
-        if p1_fdflags_nonblocking(fdflags) {
-            let bytes = match caller
+        let bytes = if capacity == 0 {
+            Bytes::new()
+        } else if p1_fdflags_nonblocking(fdflags) {
+            match caller
                 .data_mut()
-                .try_read_socket_pair(fd, capacity as usize)
+                .try_read_socket_pair(fd, capacity as usize)?
             {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => return p1::errno::AGAIN,
-                Err(errno) => return errno,
-            };
-            let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ro_datalen);
-            if status != p1::errno::SUCCESS {
-                return status;
+                Some(bytes) => bytes,
+                None => return Ok(p1::errno::AGAIN),
             }
-            return p1_write_u16(caller, memory, ro_flags, 0);
-        }
-        let bytes = match caller
-            .data_mut()
-            .read_socket_pair(fd, capacity as usize)
-            .await
-        {
-            Ok(bytes) => bytes,
-            Err(errno) => return errno,
+        } else {
+            caller
+                .data_mut()
+                .read_socket_pair(fd, capacity as usize)
+                .await?
         };
-        let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ro_datalen);
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        return p1_write_u16(caller, memory, ro_flags, 0);
+        return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
     }
     let stream = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { stream, .. },
         ))) => stream.id(),
-        Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
-        Some(_) => return p1::errno::NOTSOCK,
-        None => return p1::errno::BADF,
+        Some(Preview1Descriptor::Socket(_)) => return Ok(p1::errno::INVAL),
+        Some(_) => return Ok(p1::errno::NOTSOCK),
+        None => return Ok(p1::errno::BADF),
     };
     let status = caller.data().require_tcp_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Ok(status);
     }
     let Some(service) = caller.data().runtime_state.network_service() else {
-        return p1::errno::NETDOWN;
+        return Ok(p1::errno::NETDOWN);
     };
     let timeout = if p1_fdflags_nonblocking(fdflags) {
         0
     } else {
         u64::MAX
     };
-    let ranges = match p1_iovs_memory_ranges(memory, &layout.iovs) {
-        Ok(ranges) => ranges,
-        Err(errno) => return errno,
-    };
-    let buffer = crate::RegisteredTcpReadBuffer::new(memory.base, &ranges);
+    // The stack copies straight out of its receive queue into the guest's
+    // buffers, on this call's own poll, each page checked present in the
+    // step that writes it.
+    let ranges = memory.iov_ranges(&layout.iovs)?;
+    let mut buffer = memory.tcp_receive_buffer(&ranges);
     let service_started = p1_kernel_profile_start(caller.data());
-    let bytes = match service.tcp_read_into(stream, buffer, timeout).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => 0,
-        Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
-    };
+    let received = p1_tcp_received(service.tcp_read_into(stream, &mut buffer, timeout).await);
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_tcp_read", service_started);
+    let received = match received? {
+        Ok(received) => received,
+        Err(error) => return Ok(p1_errno_from_tcp_error_for_fdflags(error, fdflags)),
+    };
     let write_started = p1_kernel_profile_start(caller.data());
-    let status = p1_write_u32(
-        caller,
-        memory,
-        ro_datalen,
-        u32::try_from(bytes).unwrap_or_else(|_| panic!("TCP receive byte count exceeds u32")),
-    );
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    let status = p1_write_u16(caller, memory, ro_flags, 0);
+    memory.write_u32(ro_datalen, received).await?;
+    memory.write_u16(ro_flags, 0).await?;
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_write_iovs", write_started);
-    status
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_sock_send<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+/// The byte count a read into a guest's registered buffer delivered, or
+/// the stream's error for the caller to answer with its errno; a buffer
+/// page that could not come back from swap traps the guest.
+pub(super) fn p1_tcp_received(
+    read: Result<crate::TcpReadInto, crate::TcpError>,
+) -> Result<Result<u32, crate::TcpError>, P1Stop> {
+    let received = match read {
+        Ok(crate::TcpReadInto::Data(received)) => received,
+        Ok(crate::TcpReadInto::Eof) => 0,
+        Ok(crate::TcpReadInto::PageLost(error)) => return Err(P1Stop::Trap(error)),
+        Err(error) => return Ok(Err(error)),
+    };
+    // The buffer's capacity is the iovecs' sum, which fits a `u32`.
+    Ok(Ok(u32::try_from(received).expect(
+        "a TCP read delivers no more than its buffer, whose length fits a u32",
+    )))
+}
+
+/// Hands a receive's `bytes` to the guest: scattered over its buffers, the
+/// count in `ro_datalen`, and no message flags.
+pub(super) async fn p1_write_received(
+    memory: &Preview1AsyncMemory,
+    iovs: &[(u32, u32)],
+    bytes: &[u8],
+    ro_datalen: GuestAddress,
+    ro_flags: GuestAddress,
+) -> Result<i32, P1Stop> {
+    memory
+        .write_iovs_from_bytes(iovs, bytes, ro_datalen)
+        .await?;
+    memory.write_u16(ro_flags, 0).await?;
+    Ok(p1::errno::SUCCESS)
+}
+
+pub(super) async fn p1_sock_send<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     si_data: u32,
     si_data_len: u32,
     _si_flags: u16,
     so_datalen: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started = caller
         .data()
@@ -4163,75 +4223,62 @@ where
     result
 }
 
-pub(super) async fn p1_sock_send_inner<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_sock_send_inner<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     si_data: u32,
     si_data_len: u32,
     _si_flags: u16,
     so_datalen: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let (si_data, so_datalen) = (
         GuestAddress::wasm32(si_data),
         GuestAddress::wasm32(so_datalen),
     );
-    let mut gather = match p1_read_iovs_with_byte_len(memory, si_data, si_data_len)
-        .and_then(|layout| Preview1Gather::new(memory, &layout))
-    {
-        Ok(gather) => gather,
-        Err(errno) => return errno,
-    };
+    let layout = p1_read_iovs_with_byte_len(&memory, si_data, si_data_len).await?;
+    let mut gather = Preview1Gather::new(&memory, &layout)?;
     let descriptor = caller.data().descriptors.get(fd).cloned();
     if let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) = descriptor
     {
-        let fdflags = match caller.data().descriptors.fdflags(fd) {
-            Ok(fdflags) => fdflags,
-            Err(errno) => return errno,
-        };
-        let written = match p1_send_gathered(&mut gather, |chunk| {
+        let fdflags = caller.data().descriptors.fdflags(fd)?;
+        let written = p1_send_gathered(&memory, &mut gather, |chunk| {
             p1_send_to_socketpair(&writer, chunk, fdflags)
         })
-        .await
-        {
-            Ok(written) => written,
-            Err(errno) => return errno,
-        };
-        return p1_write_u32(caller, memory, so_datalen, written);
+        .await?;
+        memory.write_u32(so_datalen, written).await?;
+        return Ok(p1::errno::SUCCESS);
     }
     let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
         stream,
         ..
     }))) = &descriptor
     else {
-        return p1_connected_tcp_stream(caller, fd)
+        return Ok(p1_connected_tcp_stream(caller, fd)
             .err()
-            .unwrap_or(p1::errno::INVAL);
+            .unwrap_or(p1::errno::INVAL));
     };
     let status = caller.data().require_tcp_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Ok(status);
     }
     let Some(service) = caller.data().runtime_state.network_service() else {
-        return p1::errno::NETDOWN;
+        return Ok(p1::errno::NETDOWN);
     };
-    let fdflags = match caller.data().descriptors.fdflags(fd) {
-        Ok(fdflags) => fdflags,
-        Err(errno) => return errno,
-    };
+    let fdflags = caller.data().descriptors.fdflags(fd)?;
     let timeout = if p1_fdflags_nonblocking(fdflags) {
         0
     } else {
         u64::MAX
     };
-    let written = match p1_send_gathered(&mut gather, |chunk| {
+    let written = p1_send_gathered(&memory, &mut gather, |chunk| {
         let (service, stream) = (&service, stream.id());
         async move {
             service
@@ -4240,23 +4287,20 @@ where
                 .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))
         }
     })
-    .await
-    {
-        Ok(written) => written,
-        Err(errno) => return errno,
-    };
-    p1_write_u32(caller, memory, so_datalen, written)
+    .await?;
+    memory.write_u32(so_datalen, written).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) async fn p1_sock_shutdown<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_sock_shutdown<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     how: u8,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if how == 0 || how & !P1_SDFLAGS_SUPPORTED != 0 {
         return p1::errno::INVAL;
@@ -4334,13 +4378,13 @@ where
     }
 }
 
-pub(super) fn p1_environment_strings<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn p1_environment_strings<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
 ) -> Vec<String>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     store
         .environment
@@ -4383,8 +4427,8 @@ pub(super) async fn p1_send_to_socketpair(
 /// a non-blocking one reports `EAGAIN` and keeps its bytes. A reader that
 /// has gone away is not an error — the bytes go nowhere, exactly like a
 /// POSIX write to a closed pipe with SIGPIPE suppressed.
-async fn p1_write_stdio<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+async fn p1_write_stdio<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     stream: crate::ComponentOutputStreamKind,
     bytes: &[u8],
     nonblocking: bool,
@@ -4392,7 +4436,7 @@ async fn p1_write_stdio<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let written = u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
     let serial = caller.data().write_serial;
@@ -4450,19 +4494,19 @@ pub(super) enum RoutedOutput {
     Child(crate::ByteWriter),
 }
 
-pub(super) async fn p1_write_descriptor<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_write_descriptor<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
-    memory: Preview1Memory,
+    memory: &Preview1AsyncMemory,
     layout: &Preview1IovLayout,
-) -> Result<u32, i32>
+) -> Result<u32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    // A file takes the guest's bytes straight into its own destination;
-    // every other sink takes them gathered, one bounded chunk at a time.
+    // Every sink takes the guest's bytes gathered, one bounded chunk at a
+    // time.
     if let Some(Preview1Descriptor::File { .. }) = caller.data().descriptors.get(fd) {
         return p1_write_file(caller, fd, memory, layout, None).await;
     }
@@ -4478,13 +4522,13 @@ where
     let mut written = 0_u32;
     // An empty write still reaches the sink once.
     loop {
-        let chunk = gather.next_chunk().unwrap_or_default();
+        let chunk = gather.next_chunk(memory).await?.unwrap_or_default();
         let taken = match p1_write_sink_chunk(caller, fd, &chunk, nonblocking).await {
             Ok(taken) => taken,
             // What an earlier chunk wrote stands; the guest meets the
             // refusal on its next call.
             Err(_) if written > 0 => break,
-            Err(errno) => return Err(errno),
+            Err(errno) => return Err(P1Stop::Errno(errno)),
         };
         // A count above `u32::MAX` cannot arise: the iovecs' sum fits it.
         written += taken;
@@ -4497,8 +4541,8 @@ where
 
 /// One chunk of a gathered write to the non-file descriptor `fd`, and how
 /// many of its bytes the sink took.
-async fn p1_write_sink_chunk<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+async fn p1_write_sink_chunk<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     bytes: &[u8],
     nonblocking: bool,
@@ -4506,7 +4550,7 @@ async fn p1_write_sink_chunk<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Stdout) => {
@@ -4563,15 +4607,15 @@ where
     }
 }
 
-pub(super) async fn p1_read_descriptor<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_read_descriptor<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     capacity: u32,
 ) -> Result<Bytes, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Stdin { .. }) => Ok(caller.data_mut().read_stdin(capacity).await),
@@ -4668,19 +4712,19 @@ pub(super) fn p1_fdflags_nonblocking(fdflags: u16) -> bool {
 /// local id is the inode. Programs that de-duplicate files by `(dev, ino)` —
 /// `cp -r`, `find`, `rsync`, tar — need both to be real and stable, so no
 /// field here may be a placeholder zero.
-pub(super) fn p1_write_filestat<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn p1_write_filestat<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     stat: GuestAddress,
     identity: crate::ObjectIdentity,
     value: fs_types::DescriptorStat,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let atim = value
         .data_access_timestamp
@@ -4709,30 +4753,28 @@ where
                 .saturating_add(u64::from(datetime.nanoseconds))
         })
         .unwrap_or(0);
-    p1_write_u64(caller, memory, stat, identity.domain().raw())
-        .max(p1_write_u64(
-            caller,
-            memory,
-            stat.offset(8),
-            identity.local(),
-        ))
-        .max(p1_write_u8(
-            caller,
-            memory,
-            stat.offset(16),
-            p1_filetype_from_descriptor_type(value.type_),
-        ))
-        .max(p1_write_u64(
-            caller,
-            memory,
-            stat.offset(24),
-            value.link_count,
-        ))
-        .max(p1_write_u64(caller, memory, stat.offset(32), value.size))
-        .max(p1_write_u64(caller, memory, stat.offset(40), atim))
-        .max(p1_write_u64(caller, memory, stat.offset(48), mtim))
-        .max(p1_write_u64(caller, memory, stat.offset(56), ctim))
+    // The `filestat` record: `dev`, `ino`, the file type (its padding is
+    // the guest's own), then `nlink`, `size` and the three times.
+    memory
+        .write(stat, P1_FILESTAT_SIZE, |record| {
+            let mut field = |offset: usize, bytes: &[u8]| {
+                record[offset..offset + bytes.len()].copy_from_slice(bytes);
+            };
+            field(0, &identity.domain().raw().to_le_bytes());
+            field(8, &identity.local().to_le_bytes());
+            field(16, &[p1_filetype_from_descriptor_type(value.type_)]);
+            field(24, &value.link_count.to_le_bytes());
+            field(32, &value.size.to_le_bytes());
+            field(40, &atim.to_le_bytes());
+            field(48, &mtim.to_le_bytes());
+            field(56, &ctim.to_le_bytes());
+        })
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
+
+/// The size of a preview1 `filestat` record.
+const P1_FILESTAT_SIZE: usize = 64;
 
 pub(super) fn p1_timestamp_from_fstflags(
     fstflags: u16,
@@ -4857,7 +4899,7 @@ mod tests {
     fn path_open_truncate_without_write_authority_leaves_the_file_untouched() {
         use futures_lite::future::block_on;
 
-        let namespace: crate::Namespace<crate::UnsupportedHostFileSystem> =
+        let namespace: crate::Namespace<crate::UnsupportedStorage> =
             crate::Namespace::new(crate::MountTable::new(
                 crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
                 1,
@@ -4918,7 +4960,7 @@ mod tests {
 
     /// A namespace with one file, `/data`, and the time it was last
     /// modified.
-    fn namespace_with_file() -> crate::Namespace<crate::UnsupportedHostFileSystem> {
+    fn namespace_with_file() -> crate::Namespace<crate::UnsupportedStorage> {
         use futures_lite::future::block_on;
 
         let namespace = crate::Namespace::new(crate::MountTable::new(
@@ -4947,7 +4989,7 @@ mod tests {
         namespace
     }
 
-    fn modified_nanos(namespace: &crate::Namespace<crate::UnsupportedHostFileSystem>) -> u64 {
+    fn modified_nanos(namespace: &crate::Namespace<crate::UnsupportedStorage>) -> u64 {
         futures_lite::future::block_on(wasi_fs::stat_path(namespace, "/data", crate::Follow::No))
             .expect("the file exists")
             .modified_nanos
@@ -5707,6 +5749,26 @@ mod tests {
         }
     }
 
+    /// The accessor over `bytes`, on a machine that cannot swap, so every
+    /// page is present. What the accessor does once pages go missing is
+    /// tested with the swap service.
+    fn async_memory_of(bytes: &[u8]) -> Preview1AsyncMemory {
+        Preview1AsyncMemory::new(memory_of(bytes))
+    }
+
+    /// [`async_memory_of`] for a test that reads back what a host call
+    /// wrote.
+    fn async_memory_over(bytes: &mut [u8]) -> Preview1AsyncMemory {
+        Preview1AsyncMemory::new(Preview1Memory {
+            base: bytes.as_mut_ptr() as usize,
+            len: bytes.len(),
+        })
+    }
+
+    fn run<F: Future>(future: F) -> F::Output {
+        futures_lite::future::block_on(future)
+    }
+
     fn iovec_table(entries: &[(u32, u32)]) -> Vec<u8> {
         entries
             .iter()
@@ -5758,26 +5820,49 @@ mod tests {
     fn poll_oneoff_refuses_a_subscription_count_beyond_its_bounds() {
         assert_eq!(p1_subscription_limit(DescriptorLimit::DEFAULT), 2049);
         let guest = vec![0_u8; 4 * P1_SUBSCRIPTION_SIZE as usize];
-        let memory = memory_of(&guest);
+        let memory = async_memory_of(&guest);
         let max = p1_subscription_limit(DescriptorLimit::new(1));
         assert_eq!(max, 3);
         for count in [u32::MAX, 4] {
             assert_eq!(
-                p1_read_subscriptions(memory, GuestAddress::wasm32(0), count, max, 0, 0).err(),
-                Some(p1::errno::INVAL),
+                run(p1_read_subscriptions(
+                    &memory,
+                    GuestAddress::wasm32(0),
+                    count,
+                    max,
+                    0,
+                    0
+                ))
+                .err(),
+                Some(P1Stop::Errno(p1::errno::INVAL)),
                 "poll_oneoff count {count} over a bound of {max}",
             );
         }
         let max = p1_subscription_limit(DescriptorLimit::new(1 << 20));
         for (ptr, count) in [(0, 5), (16, 4), (u32::MAX, 1)] {
             assert_eq!(
-                p1_read_subscriptions(memory, GuestAddress::wasm32(ptr), count, max, 0, 0).err(),
-                Some(p1::errno::FAULT),
+                run(p1_read_subscriptions(
+                    &memory,
+                    GuestAddress::wasm32(ptr),
+                    count,
+                    max,
+                    0,
+                    0
+                ))
+                .err(),
+                Some(P1Stop::Errno(p1::errno::FAULT)),
                 "poll_oneoff subscriptions at {ptr}, count {count}",
             );
         }
-        let subscriptions = p1_read_subscriptions(memory, GuestAddress::wasm32(0), 4, max, 0, 0)
-            .expect("four subscriptions fit");
+        let subscriptions = run(p1_read_subscriptions(
+            &memory,
+            GuestAddress::wasm32(0),
+            4,
+            max,
+            0,
+            0,
+        ))
+        .expect("four subscriptions fit");
         assert_eq!(subscriptions.len(), 4);
     }
 
@@ -5787,7 +5872,7 @@ mod tests {
     #[test]
     fn vectored_io_refuses_iovecs_guest_memory_cannot_hold() {
         let guest = vec![0_u8; 4096];
-        let memory = memory_of(&guest);
+        let memory = async_memory_of(&guest);
         let table_at = |table: &[u8]| {
             let mut guest = guest.clone();
             guest[..table.len()].copy_from_slice(table);
@@ -5796,31 +5881,54 @@ mod tests {
         // More iovecs than `IOV_MAX`.
         for count in [u32::MAX, P1_IOV_MAX as u32 + 1] {
             assert_eq!(
-                p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), count).err(),
-                Some(p1::errno::INVAL)
+                run(p1_read_iovs_with_byte_len(
+                    &memory,
+                    GuestAddress::wasm32(0),
+                    count
+                ))
+                .err(),
+                Some(P1Stop::Errno(p1::errno::INVAL))
             );
         }
         // The array does not fit.
         assert_eq!(
-            p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), P1_IOV_MAX as u32).err(),
-            Some(p1::errno::FAULT)
+            run(p1_read_iovs_with_byte_len(
+                &memory,
+                GuestAddress::wasm32(0),
+                P1_IOV_MAX as u32
+            ))
+            .err(),
+            Some(P1Stop::Errno(p1::errno::FAULT))
         );
         // A buffer lies outside memory.
         let table = table_at(&iovec_table(&[(0, 16), (4090, u32::MAX)]));
         assert_eq!(
-            p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2).err(),
-            Some(p1::errno::FAULT)
+            run(p1_read_iovs_with_byte_len(
+                &async_memory_of(&table),
+                GuestAddress::wasm32(0),
+                2
+            ))
+            .err(),
+            Some(P1Stop::Errno(p1::errno::FAULT))
         );
         // Overlapping buffers may add up to more than memory holds: nothing
         // is sized by the total, so that is a valid transfer.
         let table = table_at(&iovec_table(&[(0, 4096), (0, 4096)]));
-        let layout = p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2)
-            .expect("overlapping buffers are valid");
+        let layout = run(p1_read_iovs_with_byte_len(
+            &async_memory_of(&table),
+            GuestAddress::wasm32(0),
+            2,
+        ))
+        .expect("overlapping buffers are valid");
         assert_eq!(layout.byte_len, 8192);
         // Overlapping buffers that fit are a valid transfer.
         let table = table_at(&iovec_table(&[(64, 2048), (1024, 1024)]));
-        let layout = p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2)
-            .expect("buffers that fit are valid");
+        let layout = run(p1_read_iovs_with_byte_len(
+            &async_memory_of(&table),
+            GuestAddress::wasm32(0),
+            2,
+        ))
+        .expect("buffers that fit are valid");
         assert_eq!(layout.byte_len, 3072);
     }
 
@@ -5831,15 +5939,20 @@ mod tests {
     #[test]
     fn iovecs_summing_past_u32_are_refused_not_converted() {
         let table = iovec_table(&[(0, 0x8000_0000), (0, 0x8000_0000)]);
-        let memory = Preview1Memory {
+        let memory = Preview1AsyncMemory::new(Preview1Memory {
             base: table.as_ptr() as usize,
             // Linear memory of 4 GiB: each buffer is inside it, and only
             // the iovec table, which is real, is ever read.
             len: 1 << 32,
-        };
+        });
         assert_eq!(
-            p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 2).err(),
-            Some(p1::errno::INVAL)
+            run(p1_read_iovs_with_byte_len(
+                &memory,
+                GuestAddress::wasm32(0),
+                2
+            ))
+            .err(),
+            Some(P1Stop::Errno(p1::errno::INVAL))
         );
     }
 
@@ -5848,8 +5961,6 @@ mod tests {
     /// iovecs, and hands the sink every byte once.
     #[test]
     fn gathered_writes_move_in_bounded_chunks() {
-        use futures_lite::future::block_on;
-
         let guest: Vec<u8> = (0..3 * P1_IO_CHUNK_BYTES)
             .map(|index| index as u8)
             .collect();
@@ -5857,17 +5968,21 @@ mod tests {
         let table_at = guest.len() - table.len();
         let mut memory = guest.clone();
         memory[table_at..].copy_from_slice(&table);
-        let memory = memory_of(&memory);
-        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table_at as u32), 3)
-            .expect("iovecs fit");
+        let memory = async_memory_of(&memory);
+        let layout = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(table_at as u32),
+            3,
+        ))
+        .expect("iovecs fit");
         let expected: Vec<u8> = guest[..150_000]
             .iter()
             .chain(&guest[50_000..90_000])
             .copied()
             .collect();
-        let mut gather = Preview1Gather::new(memory, &layout).expect("buffers fit");
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
         let mut chunks = Vec::new();
-        let sent = block_on(p1_send_gathered(&mut gather, |chunk| {
+        let sent = run(p1_send_gathered(&memory, &mut gather, |chunk| {
             chunks.push(chunk);
             core::future::ready(Ok(()))
         }))
@@ -5883,18 +5998,21 @@ mod tests {
     /// went is the error.
     #[test]
     fn a_refusal_after_some_chunks_reports_what_went() {
-        use futures_lite::future::block_on;
-
         let guest = vec![1_u8; 3 * P1_IO_CHUNK_BYTES];
         let table = iovec_table(&[(0, (3 * P1_IO_CHUNK_BYTES) as u32)]);
         let mut memory = guest.clone();
         memory[..table.len()].copy_from_slice(&table);
-        let memory = memory_of(&memory);
-        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 1).expect("fits");
+        let memory = async_memory_of(&memory);
+        let layout = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(0),
+            1,
+        ))
+        .expect("fits");
 
         let mut calls = 0;
-        let mut gather = Preview1Gather::new(memory, &layout).expect("fits");
-        let sent = block_on(p1_send_gathered(&mut gather, |_| {
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("fits");
+        let sent = run(p1_send_gathered(&memory, &mut gather, |_| {
             calls += 1;
             core::future::ready(if calls == 1 {
                 Ok(())
@@ -5904,24 +6022,27 @@ mod tests {
         }));
         assert_eq!(sent, Ok(P1_IO_CHUNK_BYTES as u32));
 
-        let mut gather = Preview1Gather::new(memory, &layout).expect("fits");
-        let sent = block_on(p1_send_gathered(&mut gather, |_| {
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("fits");
+        let sent = run(p1_send_gathered(&memory, &mut gather, |_| {
             core::future::ready(Err(p1::errno::AGAIN))
         }));
-        assert_eq!(sent, Err(p1::errno::AGAIN));
+        assert_eq!(sent, Err(P1Stop::Errno(p1::errno::AGAIN)));
     }
 
     /// An empty transfer still reaches the sink once, as an empty write.
     #[test]
     fn an_empty_gathered_write_reaches_the_sink_once() {
-        use futures_lite::future::block_on;
-
         let guest = vec![0_u8; 64];
-        let memory = memory_of(&guest);
-        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 0).expect("empty");
-        let mut gather = Preview1Gather::new(memory, &layout).expect("empty");
+        let memory = async_memory_of(&guest);
+        let layout = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(0),
+            0,
+        ))
+        .expect("empty");
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("empty");
         let mut calls = Vec::new();
-        let sent = block_on(p1_send_gathered(&mut gather, |chunk| {
+        let sent = run(p1_send_gathered(&memory, &mut gather, |chunk| {
             calls.push(chunk.len());
             core::future::ready(Ok(()))
         }));
@@ -5934,10 +6055,50 @@ mod tests {
     fn one_iovec(len: usize) -> (Vec<u8>, Preview1IovLayout) {
         let mut guest: Vec<u8> = (0..len).map(|index| index as u8).collect();
         guest.extend(iovec_table(&[(0, len as u32)]));
-        let layout =
-            p1_read_iovs_with_byte_len(memory_of(&guest), GuestAddress::wasm32(len as u32), 1)
-                .expect("the iovec fits");
+        let layout = run(p1_read_iovs_with_byte_len(
+            &async_memory_of(&guest),
+            GuestAddress::wasm32(len as u32),
+            1,
+        ))
+        .expect("the iovec fits");
         (guest, layout)
+    }
+
+    /// A receive reaches the guest scattered over its buffers in Chinese,
+    /// Japanese and Korean alike, with the byte count and the cleared
+    /// message flags after it; a buffer outside memory is `EFAULT`.
+    #[test]
+    fn a_receive_is_scattered_over_the_guest_buffers() {
+        for text in ["你好，世界", "こんにちは世界", "안녕하세요 세계"] {
+            let mut guest = vec![0xee_u8; 256];
+            let memory = async_memory_over(&mut guest);
+            let bytes = text.as_bytes();
+            let (head, tail) = bytes.split_at(5);
+            let status = run(p1_write_received(
+                &memory,
+                &[(0, 5), (100, tail.len() as u32 + 10)],
+                bytes,
+                GuestAddress::wasm32(200),
+                GuestAddress::wasm32(204),
+            ));
+            assert_eq!(status, Ok(p1::errno::SUCCESS));
+            assert_eq!(guest[..5], *head);
+            assert_eq!(guest[100..100 + tail.len()], *tail);
+            assert_eq!(guest[200..204], (bytes.len() as u32).to_le_bytes());
+            assert_eq!(guest[204..206], [0, 0], "no message flags");
+        }
+        let mut guest = vec![0_u8; 16];
+        let memory = async_memory_over(&mut guest);
+        assert_eq!(
+            run(p1_write_received(
+                &memory,
+                &[(12, 8)],
+                b"datagram",
+                GuestAddress::wasm32(0),
+                GuestAddress::wasm32(4),
+            )),
+            Err(P1Stop::Errno(p1::errno::FAULT))
+        );
     }
 
     /// A datagram's payload is gathered whole, across its buffers and past
@@ -5949,18 +6110,32 @@ mod tests {
         let mut guest: Vec<u8> = (0..max + 1).map(|index| index as u8).collect();
         let table = guest.len() as u32;
         guest.extend(iovec_table(&[(0, 9), (9, max as u32 - 9), (max as u32, 1)]));
-        let memory = memory_of(&guest);
+        let memory = async_memory_of(&guest);
 
-        let whole = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 2)
-            .expect("the iovecs fit");
-        let mut gather = Preview1Gather::new(memory, &whole).expect("buffers fit");
-        assert_eq!(gather.datagram(max).as_deref(), Ok(&guest[..max]));
+        let whole = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(table),
+            2,
+        ))
+        .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(&memory, &whole).expect("buffers fit");
+        assert_eq!(
+            run(gather.datagram(&memory, max)),
+            Ok(guest[..max].to_vec())
+        );
         assert_eq!(gather.remaining(), 0);
 
-        let over = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 3)
-            .expect("the iovecs fit");
-        let mut gather = Preview1Gather::new(memory, &over).expect("buffers fit");
-        assert_eq!(gather.datagram(max), Err(p1::errno::MSGSIZE));
+        let over = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(table),
+            3,
+        ))
+        .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(&memory, &over).expect("buffers fit");
+        assert_eq!(
+            run(gather.datagram(&memory, max)),
+            Err(P1Stop::Errno(p1::errno::MSGSIZE))
+        );
         assert_eq!(gather.remaining(), max + 1);
     }
 
@@ -5991,16 +6166,17 @@ mod tests {
 
         async fn land(
             &mut self,
+            memory: &Preview1AsyncMemory,
             gather: &mut Preview1Gather,
             position: WritePosition,
             len: usize,
-        ) -> Result<u64, i32> {
+        ) -> Result<Result<u64, i32>, GuestAccessError> {
             if self.positions.len() == 1 {
                 self.bytes.extend_from_slice(self.other_writer);
             }
             self.positions.push(position);
             if self.accepts == 0 {
-                return Err(p1::errno::IO);
+                return Ok(Err(p1::errno::IO));
             }
             self.accepts -= 1;
             let at = match position {
@@ -6010,8 +6186,8 @@ mod tests {
             if self.bytes.len() < at + len {
                 self.bytes.resize(at + len, 0);
             }
-            gather.fill(&mut self.bytes[at..at + len]);
-            Ok((at + len) as u64)
+            gather.fill(memory, &mut self.bytes[at..at + len]).await?;
+            Ok(Ok((at + len) as u64))
         }
     }
 
@@ -6020,18 +6196,19 @@ mod tests {
     /// are still there afterwards.
     #[test]
     fn a_chunked_append_never_lands_on_another_writers_bytes() {
-        use futures_lite::future::block_on;
-
         let len = 2 * P1_IO_CHUNK_BYTES + 10;
         let (guest, layout) = one_iovec(len);
-        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+        let memory = async_memory_of(&guest);
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
         let mut file = ChunkedFile::new(b"head", usize::MAX);
         file.other_writer = b"other";
-        let landed = block_on(p1_write_gathered(
+        let landed = run(p1_write_gathered(
+            &memory,
             &mut gather,
             WritePosition::End,
             &mut file,
-        ));
+        ))
+        .expect("the guest's pages are present");
         let expected: Vec<u8> = b"head"
             .iter()
             .chain(&guest[..P1_IO_CHUNK_BYTES])
@@ -6048,17 +6225,18 @@ mod tests {
     /// it was given.
     #[test]
     fn a_chunked_positioned_write_continues_where_the_last_chunk_ended() {
-        use futures_lite::future::block_on;
-
         let len = 2 * P1_IO_CHUNK_BYTES + 10;
         let (guest, layout) = one_iovec(len);
-        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+        let memory = async_memory_of(&guest);
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
         let mut file = ChunkedFile::new(&[0xEE; 16], usize::MAX);
-        let landed = block_on(p1_write_gathered(
+        let landed = run(p1_write_gathered(
+            &memory,
             &mut gather,
             WritePosition::At(3),
             &mut file,
-        ));
+        ))
+        .expect("the guest's pages are present");
         assert_eq!(landed, Ok((3 + len as u64, len as u32)));
         assert_eq!(
             file.positions,
@@ -6077,17 +6255,18 @@ mod tests {
     /// chunk is the error, and an empty write reaches the file once.
     #[test]
     fn a_refused_file_chunk_is_a_short_write() {
-        use futures_lite::future::block_on;
-
         let (guest, layout) = one_iovec(3 * P1_IO_CHUNK_BYTES);
+        let memory = async_memory_of(&guest);
         let write = |accepts: usize| {
-            let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+            let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
             let mut file = ChunkedFile::new(b"", accepts);
-            let landed = block_on(p1_write_gathered(
+            let landed = run(p1_write_gathered(
+                &memory,
                 &mut gather,
                 WritePosition::At(0),
                 &mut file,
-            ));
+            ))
+            .expect("the guest's pages are present");
             (landed, file.positions.len())
         };
         let two = 2 * P1_IO_CHUNK_BYTES;
@@ -6095,14 +6274,80 @@ mod tests {
         assert_eq!(write(0), (Err(p1::errno::IO), 1));
 
         let (guest, layout) = one_iovec(0);
-        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("empty");
+        let memory = async_memory_of(&guest);
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("empty");
         let mut file = ChunkedFile::new(b"four", usize::MAX);
-        let landed = block_on(p1_write_gathered(
+        let landed = run(p1_write_gathered(
+            &memory,
             &mut gather,
             WritePosition::End,
             &mut file,
-        ));
+        ))
+        .expect("the guest's pages are present");
         assert_eq!(landed, Ok((4, 0)));
         assert_eq!(file.positions, [WritePosition::End]);
+    }
+
+    /// A receive whose buffers run from a present page onto one swap has
+    /// taken, over a memory with its count and flags slots on page zero.
+    fn receive_over_an_evicted_page() -> (crate::memory::GuestSwap, [(u32, u32); 2], Vec<u8>) {
+        let mut swap = crate::memory::GuestSwap::new(3);
+        swap.evict(2);
+        let iovs = [
+            ((TEST_PAGE + 100) as u32, 100),
+            ((2 * TEST_PAGE) as u32, 200),
+        ];
+        (swap, iovs, cjk_bytes(300))
+    }
+
+    /// The scatter of a receive waits for a buffer page that is out
+    /// rather than writing it, asks for it, and once it is back lands
+    /// every byte, the count and the flags.
+    #[test]
+    fn a_receive_into_an_evicted_buffer_page_lands_once_the_page_is_back() {
+        let (mut swap, iovs, payload) = receive_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(p1_write_received(
+            &memory,
+            &iovs,
+            &payload,
+            GuestAddress::wasm32(0),
+            GuestAddress::wasm32(8),
+        ));
+        assert!(poll_once(write.as_mut()).is_none(), "the scatter waits");
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+        assert!(swap.is_out(2));
+
+        swap.serve();
+        assert_eq!(poll_once(write.as_mut()), Some(Ok(p1::errno::SUCCESS)));
+        let bytes = swap.bytes();
+        assert!(bytes[TEST_PAGE + 100..TEST_PAGE + 200] == payload[..100]);
+        assert!(bytes[2 * TEST_PAGE..2 * TEST_PAGE + 200] == payload[100..]);
+        assert_eq!(bytes[0..4], 300_u32.to_le_bytes());
+        assert_eq!(bytes[8..10], [0, 0]);
+    }
+
+    /// A buffer page that cannot come back traps the guest instead of
+    /// answering it an errno.
+    #[test]
+    fn a_receive_into_a_lost_buffer_page_traps_the_guest() {
+        let (mut swap, iovs, payload) = receive_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(p1_write_received(
+            &memory,
+            &iovs,
+            &payload,
+            GuestAddress::wasm32(0),
+            GuestAddress::wasm32(8),
+        ));
+        assert!(poll_once(write.as_mut()).is_none());
+        swap.serve();
+        let stop = poll_once(write.as_mut()).expect("the scatter ends");
+        assert_eq!(
+            stop,
+            Err(P1Stop::Trap(crate::memory::SwapFaultError::Backend))
+        );
+        assert!(p1_reply(stop).is_err(), "the guest traps");
     }
 }

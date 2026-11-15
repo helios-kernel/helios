@@ -8,7 +8,8 @@ default = ["embedded-debugger"]
 embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
-acpi = { git = "https://github.com/rust-osdev/acpi", branch = "main", default-features = false, features = ["aml"] }
+acpi.workspace = true
+helios-acpi.workspace = true
 arm-gic = "0.9.1"
 # The ID, key and control registers return-address signing programs. `arm-gic`
 # pins its sysreg subcrates to exactly 0.4.0, so this stays at that version.
@@ -20,7 +21,9 @@ helios-artifact.workspace = true
 helios-hal.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
 helios-virtio.workspace = true
+helios-tpm.workspace = true
 limine = "0.6.5"
+smccc = "0.2.3"
 spin = "0.12.3"
 thiserror = { version = "2.0.20", default-features = false }
 triomphe = { version = "0.1.16", default-features = false }

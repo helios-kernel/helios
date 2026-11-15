@@ -62,22 +62,22 @@ pub(super) enum WasixExecSearchPath<'a> {
     Guest(&'a str),
 }
 
-pub(super) fn add_wasix_extended_program_imports<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_wasix_extended_program_imports<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     linker
         .func_wrap_async(
             WASIX_MODULE,
             "thread_spawn_v2",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (args, ret_tid): (i32, i32)| {
                 Box::new(async move {
-                    wasix_thread_spawn_v2(&mut caller, args as u32, ret_tid as u32).await
+                    p1_reply(wasix_thread_spawn_v2(&mut caller, args as u32, ret_tid as u32).await)
                 })
             },
         )
@@ -86,10 +86,13 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "stack_checkpoint",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (snapshot, ret_value): (i32, i32)| {
                 Box::new(async move {
-                    wasix_stack_checkpoint(&mut caller, snapshot as u32, ret_value as u32).await
+                    p1_reply(
+                        wasix_stack_checkpoint(&mut caller, snapshot as u32, ret_value as u32)
+                            .await,
+                    )
                 })
             },
         )
@@ -98,7 +101,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "stack_restore",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (snapshot, value): (i32, i64)| {
                 Box::new(async move {
                     wasix_stack_restore(&mut caller, snapshot as u32, value as u64).await
@@ -110,7 +113,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "proc_raise_interval",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              signal: i32,
              interval: i64,
              repeat: i32|
@@ -123,9 +126,11 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "proc_fork",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (_copy_memory, ret_pid): (i32, i32)| {
-                Box::new(async move { wasix_proc_fork(&mut caller, ret_pid as u32).await })
+                Box::new(
+                    async move { p1_reply(wasix_proc_fork(&mut caller, ret_pid as u32).await) },
+                )
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -133,7 +138,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "proc_exec",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (name, name_len, args, args_len): (i32, i32, i32, i32)| {
                 Box::new(async move {
                     wasix_proc_exec(
@@ -153,7 +158,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "proc_exec2",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (name, name_len, args, args_len, env, env_len): (i32, i32, i32, i32, i32, i32)| {
                 Box::new(async move {
                     wasix_proc_exec(
@@ -173,7 +178,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "proc_exec3",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (name, name_len, args, args_len, env, env_len, search_path, path, path_len): (
                 i32,
                 i32,
@@ -207,7 +212,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "proc_spawn",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (
                 name,
                 name_len,
@@ -224,23 +229,25 @@ where
                 ret_handles,
             ): WasixHostArgs13| {
                 Box::new(async move {
-                    wasix_proc_spawn(
-                        &mut caller,
-                        name as u32,
-                        name_len as u32,
-                        chroot,
-                        args as u32,
-                        args_len as u32,
-                        preopen as u32,
-                        preopen_len as u32,
-                        stdin,
-                        stdout,
-                        stderr,
-                        working_dir as u32,
-                        working_dir_len as u32,
-                        ret_handles as u32,
+                    p1_reply(
+                        wasix_proc_spawn(
+                            &mut caller,
+                            name as u32,
+                            name_len as u32,
+                            chroot,
+                            args as u32,
+                            args_len as u32,
+                            preopen as u32,
+                            preopen_len as u32,
+                            stdin,
+                            stdout,
+                            stderr,
+                            working_dir as u32,
+                            working_dir_len as u32,
+                            ret_handles as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -249,7 +256,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "proc_spawn2",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (
                 name,
                 name_len,
@@ -267,24 +274,26 @@ where
                 ret_pid,
             ): WasixHostArgs14| {
                 Box::new(async move {
-                    wasix_proc_spawn2(
-                        &mut caller,
-                        name as u32,
-                        name_len as u32,
-                        args as u32,
-                        args_len as u32,
-                        env as u32,
-                        env_len as u32,
-                        fd_ops as u32,
-                        fd_ops_len as u32,
-                        signals as u32,
-                        signals_len as u32,
-                        search_path,
-                        path as u32,
-                        path_len as u32,
-                        ret_pid as u32,
+                    p1_reply(
+                        wasix_proc_spawn2(
+                            &mut caller,
+                            name as u32,
+                            name_len as u32,
+                            args as u32,
+                            args_len as u32,
+                            env as u32,
+                            env_len as u32,
+                            fd_ops as u32,
+                            fd_ops_len as u32,
+                            signals as u32,
+                            signals_len as u32,
+                            search_path,
+                            path as u32,
+                            path_len as u32,
+                            ret_pid as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -293,10 +302,13 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "proc_join",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (pid, flags, ret_status): (i32, i32, i32)| {
                 Box::new(async move {
-                    wasix_proc_join(&mut caller, pid as u32, flags as u32, ret_status as u32).await
+                    p1_reply(
+                        wasix_proc_join(&mut caller, pid as u32, flags as u32, ret_status as u32)
+                            .await,
+                    )
                 })
             },
         )
@@ -305,8 +317,8 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "proc_snapshot",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, (): ()| {
-                Box::new(async move { wasix_proc_snapshot(&mut caller).await })
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, (): ()| {
+                Box::new(async move { p1_reply(wasix_proc_snapshot(&mut caller).await) })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -316,19 +328,19 @@ where
     Ok(())
 }
 
-pub(super) fn add_wasix_program_imports<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_wasix_program_imports<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     linker
         .func_wrap(
             WASIX_MODULE,
             "clock_time_set",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              clock_id: i32,
              timestamp: i64|
              -> i32 { wasix_clock_time_set(&mut caller, clock_id, timestamp) },
@@ -338,7 +350,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_dup",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              ret_fd: i32|
              -> i32 { wasix_fd_dup(&mut caller, fd, ret_fd as u32) },
@@ -348,7 +360,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_dup2",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              min_result_fd: i32,
              cloexec: i32,
@@ -362,7 +374,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_pipe",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              ret_fd1: i32,
              ret_fd2: i32|
              -> i32 { wasix_fd_pipe(&mut caller, ret_fd1 as u32, ret_fd2 as u32) },
@@ -372,7 +384,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "tty_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              state: i32|
              -> i32 { wasix_tty_get(&mut caller, state as u32) },
         )
@@ -381,7 +393,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "tty_set",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              state: i32|
              -> i32 { wasix_tty_set(&mut caller, state as u32) },
         )
@@ -390,7 +402,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "getcwd",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              path: i32,
              path_len: i32|
              -> i32 { wasix_getcwd(&mut caller, path as u32, path_len as u32) },
@@ -400,11 +412,11 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "chdir",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (path, path_len): (i32, i32)| {
-                Box::new(
-                    async move { wasix_chdir(&mut caller, path as u32, path_len as u32).await },
-                )
+                Box::new(async move {
+                    p1_reply(wasix_chdir(&mut caller, path as u32, path_len as u32).await)
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -412,7 +424,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_event",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              initial_value: i64,
              flags: i32,
              ret_fd: i32|
@@ -430,7 +442,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "path_open2",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (
                 fd,
                 dirflags,
@@ -444,19 +456,21 @@ where
                 opened_fd,
             ): (i32, i32, i32, i32, i32, i64, i64, i32, i32, i32)| {
                 Box::new(async move {
-                    wasix_path_open2(
-                        &mut caller,
-                        fd,
-                        dirflags as u32,
-                        path as u32,
-                        path_len as u32,
-                        oflags as u16,
-                        fs_rights_base as u64,
-                        fdflags as u16,
-                        fdflagsext as u16,
-                        opened_fd as u32,
+                    p1_reply(
+                        wasix_path_open2(
+                            &mut caller,
+                            fd,
+                            dirflags as u32,
+                            path as u32,
+                            path_len as u32,
+                            oflags as u16,
+                            fs_rights_base as u64,
+                            fdflags as u16,
+                            fdflagsext as u16,
+                            opened_fd as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -465,7 +479,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_fdflags_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              ret_flags: i32|
              -> i32 { wasix_fd_fdflags_get(&mut caller, fd, ret_flags as u32) },
@@ -475,7 +489,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_fdflags_set",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              flags: i32|
              -> i32 { wasix_fd_fdflags_set(&mut caller, fd, flags as u16) },
@@ -485,7 +499,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "callback_signal",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              callback: i32,
              callback_len: i32|
              -> wasmtime::Result<()> {
@@ -497,7 +511,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "proc_id",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              ret_pid: i32|
              -> i32 { wasix_proc_id(&mut caller, ret_pid as u32) },
         )
@@ -506,7 +520,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "proc_signal",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              pid: i32,
              signal: i32|
              -> wasmtime::Result<i32> {
@@ -518,16 +532,16 @@ where
         .func_wrap(
             WASIX_MODULE,
             "proc_signals_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, buf: i32| -> i32 {
-                wasix_proc_signals_get(&mut caller, buf as u32)
-            },
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+             buf: i32|
+             -> i32 { wasix_proc_signals_get(&mut caller, buf as u32) },
         )
         .map_err(map_program_runtime_error)?;
     linker
         .func_wrap(
             WASIX_MODULE,
             "proc_signals_sizes_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              ret_size: i32|
              -> i32 { wasix_proc_signals_sizes_get(&mut caller, ret_size as u32) },
         )
@@ -536,7 +550,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "resolve",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (host, host_len, port, addrs, naddrs, ret_naddrs): (
                 i32,
                 i32,
@@ -546,16 +560,18 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    wasix_resolve(
-                        &mut caller,
-                        host as u32,
-                        host_len as u32,
-                        port,
-                        addrs as u32,
-                        naddrs as u32,
-                        ret_naddrs as u32,
+                    p1_reply(
+                        wasix_resolve(
+                            &mut caller,
+                            host as u32,
+                            host_len as u32,
+                            port,
+                            addrs as u32,
+                            naddrs as u32,
+                            ret_naddrs as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -564,7 +580,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "proc_parent",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              pid: i32,
              ret_pid: i32|
              -> i32 { wasix_proc_parent(&mut caller, pid as u32, ret_pid as u32) },
@@ -574,7 +590,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "thread_sleep",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (duration,): (i64,)| {
                 Box::new(async move { wasix_thread_sleep(&mut caller, duration).await })
             },
@@ -584,7 +600,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "thread_id",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              ret_tid: i32|
              -> i32 { wasix_thread_id(&mut caller, ret_tid as u32) },
         )
@@ -593,7 +609,8 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "thread_join",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, (tid,): (i32,)| {
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+             (tid,): (i32,)| {
                 Box::new(async move { wasix_thread_join(&mut caller, tid as u32).await })
             },
         )
@@ -602,7 +619,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "thread_parallelism",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              ret_parallelism: i32|
              -> i32 { wasix_thread_parallelism(&mut caller, ret_parallelism as u32) },
         )
@@ -611,7 +628,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "thread_signal",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              tid: i32,
              signal: i32|
              -> wasmtime::Result<i32> { wasix_thread_signal(&mut caller, tid, signal) },
@@ -621,7 +638,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "thread_exit",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              code: i32|
              -> wasmtime::Result<()> { wasix_thread_exit(&mut caller, code as u32) },
         )
@@ -630,17 +647,19 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "futex_wait",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (futex, expected, timeout, ret_woken): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    wasix_futex_wait(
-                        &mut caller,
-                        futex as u32,
-                        expected as u32,
-                        timeout as u32,
-                        ret_woken as u32,
+                    p1_reply(
+                        wasix_futex_wait(
+                            &mut caller,
+                            futex as u32,
+                            expected as u32,
+                            timeout as u32,
+                            ret_woken as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -649,7 +668,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "futex_wake",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              futex: i32,
              ret_woken: i32|
              -> i32 { wasix_futex_wake(&mut caller, futex as u32, ret_woken as u32) },
@@ -659,7 +678,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "futex_wake_all",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              futex: i32,
              ret_woken: i32|
              -> i32 {
@@ -672,19 +691,19 @@ where
     Ok(())
 }
 
-pub(super) fn add_wasix_preview1_alias_imports<CpuImpl, Net, HostFs>(
-    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn add_wasix_preview1_alias_imports<CpuImpl, Net, StorageImpl>(
+    linker: &mut CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     linker
         .func_wrap(
             WASIX_MODULE,
             "args_sizes_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              argc: i32,
              argv_buf_size: i32|
              -> i32 {
@@ -696,7 +715,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "args_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              argv: i32,
              argv_buf: i32|
              -> i32 { p1_args_get(&mut caller, argv as u32, argv_buf as u32) },
@@ -706,7 +725,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "environ_sizes_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              count: i32,
              size: i32|
              -> i32 { p1_environ_sizes_get(&mut caller, count as u32, size as u32) },
@@ -716,7 +735,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "environ_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              environ: i32,
              environ_buf: i32|
              -> i32 { p1_environ_get(&mut caller, environ as u32, environ_buf as u32) },
@@ -726,7 +745,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "clock_time_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              id: i32,
              _precision: i64,
              timestamp: i32|
@@ -737,16 +756,16 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_close",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, fd: i32| -> i32 {
-                caller.data_mut().descriptors.close(fd)
-            },
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+             fd: i32|
+             -> i32 { caller.data_mut().descriptors.close(fd) },
         )
         .map_err(map_program_runtime_error)?;
     linker
         .func_wrap(
             WASIX_MODULE,
             "fd_fdstat_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              stat: i32|
              -> i32 { p1_fd_fdstat_get(&mut caller, fd, stat as u32) },
@@ -756,7 +775,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_fdstat_set_flags",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              fdflags: i32|
              -> i32 { p1_fd_fdstat_set_flags(&mut caller, fd, fdflags as u16) },
@@ -766,9 +785,11 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "fd_filestat_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, stat): (i32, i32)| {
-                Box::new(async move { p1_fd_filestat_get(&mut caller, fd, stat as u32).await })
+                Box::new(
+                    async move { p1_reply(p1_fd_filestat_get(&mut caller, fd, stat as u32).await) },
+                )
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -776,7 +797,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_prestat_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              buf: i32|
              -> i32 { p1_fd_prestat_get(&mut caller, fd, buf as u32) },
@@ -786,7 +807,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_prestat_dir_name",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              fd: i32,
              path: i32,
              len: i32|
@@ -799,10 +820,13 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "fd_read",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nread): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_fd_read(&mut caller, fd, iovs as u32, iovs_len as u32, nread as u32).await
+                    p1_reply(
+                        p1_fd_read(&mut caller, fd, iovs as u32, iovs_len as u32, nread as u32)
+                            .await,
+                    )
                 })
             },
         )
@@ -811,18 +835,20 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "fd_readdir",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, buf, buf_len, cookie, bufused): (i32, i32, i32, i64, i32)| {
                 Box::new(async move {
-                    p1_fd_readdir(
-                        &mut caller,
-                        fd,
-                        buf as u32,
-                        buf_len as u32,
-                        cookie as u64,
-                        bufused as u32,
+                    p1_reply(
+                        p1_fd_readdir(
+                            &mut caller,
+                            fd,
+                            buf as u32,
+                            buf_len as u32,
+                            cookie as u64,
+                            bufused as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -831,7 +857,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "fd_renumber",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              from: i32,
              to: i32|
              -> i32 { p1_fd_renumber(&mut caller, from, to) },
@@ -841,10 +867,12 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "fd_seek",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, offset, whence, new_offset): (i32, i64, i32, i32)| {
                 Box::new(async move {
-                    p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32).await
+                    p1_reply(
+                        p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32).await,
+                    )
                 })
             },
         )
@@ -853,17 +881,19 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "fd_write",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nwritten): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_fd_write(
-                        &mut caller,
-                        fd,
-                        iovs as u32,
-                        iovs_len as u32,
-                        nwritten as u32,
+                    p1_reply(
+                        p1_fd_write(
+                            &mut caller,
+                            fd,
+                            iovs as u32,
+                            iovs_len as u32,
+                            nwritten as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -872,18 +902,20 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "path_filestat_get",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, flags, path, path_len, stat): (i32, i32, i32, i32, i32)| {
                 Box::new(async move {
-                    wasix_path_filestat_get(
-                        &mut caller,
-                        fd,
-                        flags as u32,
-                        path as u32,
-                        path_len as u32,
-                        stat as u32,
+                    p1_reply(
+                        wasix_path_filestat_get(
+                            &mut caller,
+                            fd,
+                            flags as u32,
+                            path as u32,
+                            path_len as u32,
+                            stat as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -892,7 +924,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "path_open",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (
                 fd,
                 dirflags,
@@ -905,18 +937,20 @@ where
                 opened_fd,
             ): (i32, i32, i32, i32, i32, i64, i64, i32, i32)| {
                 Box::new(async move {
-                    wasix_path_open(
-                        &mut caller,
-                        fd,
-                        dirflags as u32,
-                        path as u32,
-                        path_len as u32,
-                        oflags as u16,
-                        fs_rights_base as u64,
-                        fdflags as u16,
-                        opened_fd as u32,
+                    p1_reply(
+                        wasix_path_open(
+                            &mut caller,
+                            fd,
+                            dirflags as u32,
+                            path as u32,
+                            path_len as u32,
+                            oflags as u16,
+                            fs_rights_base as u64,
+                            fdflags as u16,
+                            opened_fd as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -925,7 +959,7 @@ where
         .func_wrap_async(
             WASIX_MODULE,
             "sched_yield",
-            |_caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>, ()| {
+            |_caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
                 Box::new(async move {
                     crate::yield_now().await;
                     p1::errno::SUCCESS
@@ -937,7 +971,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "proc_exit",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              code: i32|
              -> wasmtime::Result<()> {
                 caller.data_mut().request_exit(code as u32);
@@ -949,7 +983,7 @@ where
         .func_wrap(
             WASIX_MODULE,
             "proc_exit2",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              code: i32|
              -> wasmtime::Result<()> {
                 caller.data_mut().request_exit(code as u32);
@@ -961,8 +995,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_path_open<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_path_open<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     dirflags: u32,
     path: u32,
@@ -971,27 +1005,24 @@ pub(super) async fn wasix_path_open<CpuImpl, Net, HostFs>(
     rights: u64,
     fdflags: u16,
     opened_fd: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let path = match wasix_read_exec_string(caller, memory, path, path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
+    let path = wasix_read_exec_string(&memory, path, path_len).await?;
     let (base, path) = match caller.data().resolve_wasix_path_base(fd, &path) {
         Ok(resolved) => resolved,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
     if !p1_file_fdflags_supported(fdflags) {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
     let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
     if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
@@ -999,7 +1030,7 @@ where
     }
     p1_path_open_resolved(
         caller,
-        memory,
+        &memory,
         base,
         path,
         path_flags,
@@ -1011,34 +1042,33 @@ where
     .await
 }
 
-pub(super) async fn wasix_path_filestat_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_path_filestat_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     flags: u32,
     path: u32,
     path_len: u32,
     stat: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let stat = GuestAddress::wasm32(stat);
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
     let (base, path) = match caller.data().resolve_wasix_path_base(fd, &path) {
         Ok(resolved) => resolved,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
     let absolute = match crate::resolve_child_path(&base.path, &path) {
         Ok(absolute) => absolute,
-        Err(error) => return p1_errno_from_component_path(error),
+        Err(error) => return Ok(p1_errno_from_component_path(error)),
     };
     if absolute == WASIX_NULL_DEVICE_PATH {
         return p1_write_filestat(
@@ -1046,25 +1076,26 @@ where
             stat,
             p1_null_device_identity(),
             p1_null_device_stat(),
-        );
+        )
+        .await;
     }
     let (identity, stat_value) =
         match p1_stat_below(caller, &base, p1_path_flags(flags), &path).await {
             Ok(stat) => stat,
-            Err(errno) => return errno,
+            Err(errno) => return Ok(errno),
         };
-    p1_write_filestat(caller, stat, identity, stat_value)
+    p1_write_filestat(caller, stat, identity, stat_value).await
 }
 
-pub(super) fn wasix_clock_time_set<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_clock_time_set<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     clock_id: i32,
     timestamp: i64,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if clock_id != 0 {
         return p1::errno::INVAL;
@@ -1075,15 +1106,15 @@ where
     caller.data_mut().set_system_time_nanos(timestamp)
 }
 
-pub(super) fn wasix_fd_dup<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_fd_dup<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     ret_fd: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1095,8 +1126,8 @@ where
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), duplicated)
 }
 
-pub(super) fn wasix_fd_dup2<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_fd_dup2<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     target_fd: i32,
     cloexec: bool,
@@ -1105,7 +1136,7 @@ pub(super) fn wasix_fd_dup2<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1117,15 +1148,15 @@ where
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), duplicated)
 }
 
-pub(super) fn wasix_fd_pipe<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_fd_pipe<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     ret_fd1: u32,
     ret_fd2: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1159,8 +1190,8 @@ where
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd2), write_fd)
 }
 
-pub(super) fn wasix_fd_event<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_fd_event<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     initial_value: u64,
     flags: u32,
     ret_fd: u32,
@@ -1168,7 +1199,7 @@ pub(super) fn wasix_fd_event<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if flags & !WASIX_EVENTFDFLAG_SEMAPHORE != 0 {
         return p1::errno::INVAL;
@@ -1189,14 +1220,14 @@ where
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_fd), fd)
 }
 
-pub(super) fn wasix_tty_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_tty_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     state: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let status = caller.data().require_tty_control();
     if status != p1::errno::SUCCESS {
@@ -1209,14 +1240,14 @@ where
     write_wasix_tty_state(caller, memory, GuestAddress::wasm32(state), tty)
 }
 
-pub(super) fn wasix_tty_set<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_tty_set<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     state: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let status = caller.data().require_tty_control();
     if status != p1::errno::SUCCESS {
@@ -1234,8 +1265,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_path_open2<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_path_open2<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     dirflags: u32,
     path: u32,
@@ -1245,45 +1276,42 @@ pub(super) async fn wasix_path_open2<CpuImpl, Net, HostFs>(
     fdflags: u16,
     fdflagsext: u16,
     opened_fd: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let close_on_exec = match wasix_close_on_exec_flag(fdflagsext) {
         Ok(close_on_exec) => close_on_exec,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
     let status = wasix_path_open(
         caller, fd, dirflags, path, path_len, oflags, rights, fdflags, opened_fd,
     )
-    .await;
+    .await?;
     if status != p1::errno::SUCCESS {
-        return status;
+        return Ok(status);
     }
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let opened = match p1_try_read_u32(caller, memory, GuestAddress::wasm32(opened_fd)) {
-        Ok(opened) => opened,
-        Err(_) => return p1::errno::FAULT,
-    };
-    caller
+    let opened = memory.read_u32(GuestAddress::wasm32(opened_fd)).await?;
+    Ok(caller
         .data_mut()
         .descriptors
-        .set_close_on_exec(opened as i32, close_on_exec)
+        .set_close_on_exec(opened as i32, close_on_exec))
 }
 
-pub(super) fn wasix_fd_fdflags_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_fd_fdflags_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     ret_flags: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1300,15 +1328,15 @@ where
     p1_write_u16(caller, memory, GuestAddress::wasm32(ret_flags), flags)
 }
 
-pub(super) fn wasix_fd_fdflags_set<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_fd_fdflags_set<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     flags: u16,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let close_on_exec = match wasix_close_on_exec_flag(flags) {
         Ok(close_on_exec) => close_on_exec,
@@ -1327,15 +1355,15 @@ pub(super) fn wasix_close_on_exec_flag(flags: u16) -> Result<bool, i32> {
     Ok(flags & WASIX_FDFLAGSEXT_CLOEXEC != 0)
 }
 
-pub(super) fn wasix_getcwd<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_getcwd<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     path: u32,
     path_len: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1374,35 +1402,32 @@ pub(super) fn wasix_getcwd_required_len(cwd: &str) -> Result<u32, i32> {
     u32::try_from(cwd.len()).map_err(|_| p1::errno::OVERFLOW)
 }
 
-pub(super) async fn wasix_chdir<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_chdir<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     path: u32,
     path_len: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let path = match wasix_read_exec_string(caller, memory, path, path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    caller.data_mut().chdir(&path).await
+    let path = wasix_read_exec_string(&memory, path, path_len).await?;
+    Ok(caller.data_mut().chdir(&path).await)
 }
 
-pub(super) fn wasix_callback_signal<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_callback_signal<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     callback: u32,
     callback_len: u32,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return Err(wasmtime::Error::new(ProgramExecError {
@@ -1416,14 +1441,14 @@ where
     Ok(())
 }
 
-pub(super) fn wasix_proc_id<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_proc_id<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     ret_pid: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1435,15 +1460,15 @@ where
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), pid)
 }
 
-pub(super) fn wasix_proc_parent<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_proc_parent<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     pid: u32,
     ret_pid: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1465,15 +1490,15 @@ where
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), parent)
 }
 
-pub(super) fn wasix_proc_signal<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_proc_signal<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     pid: u32,
     signal: i32,
 ) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let status = caller.data().require_signal_authority();
     if status != p1::errno::SUCCESS {
@@ -1503,14 +1528,14 @@ where
     Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn wasix_proc_signals_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_proc_signals_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     buf: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1542,14 +1567,14 @@ where
     p1::errno::SUCCESS
 }
 
-pub(super) fn wasix_proc_signals_sizes_get<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_proc_signals_sizes_get<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     ret_size: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1560,8 +1585,8 @@ where
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_size), len)
 }
 
-pub(super) fn wasix_proc_raise_interval<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_proc_raise_interval<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     signal: i32,
     interval: i64,
     repeat: i32,
@@ -1569,7 +1594,7 @@ pub(super) fn wasix_proc_raise_interval<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let status = caller.data().require_signal_authority();
     if status != p1::errno::SUCCESS {
@@ -1633,72 +1658,64 @@ where
     p1::errno::SUCCESS
 }
 
-pub(super) async fn wasix_proc_fork<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_fork<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     ret_pid: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(value) = caller.data_mut().asyncify.rewind_value.take() {
         if wasix_call_asyncify_stop_rewind(caller).await != p1::errno::SUCCESS {
-            return p1::errno::NOTSUP;
+            return Ok(p1::errno::NOTSUP);
         }
-        let Some(memory) = p1_memory(caller) else {
-            return p1::errno::FAULT;
+        let Some(memory) = p1_async_memory(caller) else {
+            return Ok(p1::errno::FAULT);
         };
         let Ok(pid) = u32::try_from(value) else {
-            return p1::errno::OVERFLOW;
+            return Ok(p1::errno::OVERFLOW);
         };
-        return p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), pid);
+        memory.write_u32(GuestAddress::wasm32(ret_pid), pid).await?;
+        return Ok(p1::errno::SUCCESS);
     }
     let status = caller.data().require_fork_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Ok(status);
     }
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     if caller.data().current_core_module.is_none() {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     }
     let Ok((stack_lower, stack_upper, stack_pointer)) = wasix_stack_bounds_from_caller(caller)
     else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
     let memory_stack_len = match usize::try_from(stack_upper - stack_pointer) {
         Ok(len) => len,
-        Err(_) => return p1::errno::OVERFLOW,
+        Err(_) => return Ok(p1::errno::OVERFLOW),
     };
-    let memory_stack = match p1_read_memory(
-        caller,
-        memory,
-        GuestAddress::wasm32(stack_pointer),
-        memory_stack_len,
-    ) {
-        Ok(stack) => stack,
-        Err(_) => return p1::errno::FAULT,
-    };
+    let memory_stack = memory
+        .read_bytes(GuestAddress::wasm32(stack_pointer), memory_stack_len)
+        .await?;
     let unwind_stack_begin = match stack_lower.checked_add(WASIX_ASYNCIFY_DATA_SIZE) {
         Some(begin) if begin <= stack_pointer => begin,
-        _ => return p1::errno::OVERFLOW,
+        _ => return Ok(p1::errno::OVERFLOW),
     };
-    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), 0);
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
+    memory.write_u32(GuestAddress::wasm32(ret_pid), 0).await?;
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    let status = p1_write_u32(caller, memory, stack_lower_address, unwind_stack_begin).max(
-        p1_write_u32(caller, memory, stack_lower_address.offset(4), stack_pointer),
-    );
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
+    memory
+        .write_u32(stack_lower_address, unwind_stack_begin)
+        .await?;
+    memory
+        .write_u32(stack_lower_address.offset(4), stack_pointer)
+        .await?;
     caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Forking {
         ret_pid,
         stack_lower,
@@ -1707,7 +1724,25 @@ where
         memory_stack,
         stack_pointer,
     };
-    wasix_call_asyncify_start_unwind(caller, stack_lower).await
+    Ok(wasix_call_asyncify_start_unwind(caller, stack_lower).await)
+}
+
+/// The program name a launch's timeline carries, decoded only while the
+/// launch target is watched. A string the guest left unreadable is
+/// recorded as empty and refused by the launch itself; a lost page traps.
+async fn wasix_launch_program_label(
+    memory: &Preview1AsyncMemory,
+    name: u32,
+    name_len: u32,
+) -> Result<String, crate::memory::SwapFaultError> {
+    if phases::gated(|| ()).is_none() {
+        return Ok(String::new());
+    }
+    match wasix_read_exec_string(memory, name, name_len).await {
+        Ok(program) => Ok(program),
+        Err(ExecReadError::Program(_)) => Ok(String::new()),
+        Err(ExecReadError::Swap(error)) => Err(error),
+    }
 }
 
 /// The launch line's terminal for an errno-shaped exit: resource
@@ -1749,8 +1784,33 @@ fn launch_exit_error_errno<CpuImpl: Cpu>(
     }
 }
 
-pub(super) async fn wasix_proc_exec<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+/// Marks `trace`'s terminal for a stop that ended a launch call: an errno
+/// as [`launch_exit_errno`] does, the loss of a guest page as a failure.
+fn launch_exit_stop<CpuImpl: Cpu>(trace: &phases::Trace<CpuImpl>, stop: P1Stop) -> P1Stop {
+    match stop {
+        P1Stop::Errno(errno) => P1Stop::Errno(launch_exit_errno(trace, errno)),
+        P1Stop::Trap(_) => {
+            trace.failed(ProgramExecErrorKind::Internal);
+            stop
+        }
+    }
+}
+
+/// [`launch_exit_error_errno`] for a launch-path error that may be the
+/// loss of a guest page, which traps the guest instead of answering an
+/// errno.
+fn launch_exit_error_stop<CpuImpl: Cpu>(
+    trace: &phases::Trace<CpuImpl>,
+    error: &wasmtime::Error,
+) -> Result<i32, P1Stop> {
+    match error.downcast_ref::<crate::memory::SwapFaultError>() {
+        Some(error) => Err(launch_exit_stop(trace, P1Stop::Trap(*error))),
+        None => Ok(launch_exit_error_errno(trace, error)),
+    }
+}
+
+pub(super) async fn wasix_proc_exec<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: u32,
     name_len: u32,
     args: u32,
@@ -1760,9 +1820,9 @@ pub(super) async fn wasix_proc_exec<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
+    let Some(memory) = p1_async_memory(caller) else {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
@@ -1771,9 +1831,9 @@ where
     // The launch call arrives before its program string can be
     // decoded, so the timeline's `program` is the decoded `name` — and
     // only a watched stream pays for reading it twice.
-    let program = phases::gated(|| wasix_read_exec_string(caller, memory, name, name_len).ok())
-        .flatten()
-        .unwrap_or_default();
+    let program = wasix_launch_program_label(&memory, name, name_len)
+        .await
+        .map_err(wasmtime::Error::new)?;
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "exec", &program);
     let exec_authority = match caller.data().require_exec_authority() {
         Ok(authority) => authority,
@@ -1786,7 +1846,7 @@ where
         }
     };
     let compile_authority = CompileAuthority::from(&exec_authority);
-    let prepared = match wasix_prepare_program(caller, memory, name, name_len).await {
+    let prepared = match wasix_prepare_program(caller, &memory, name, name_len).await {
         Ok(prepared) => prepared,
         Err(error) => {
             launch_exit_error(&trace, &error);
@@ -1800,7 +1860,7 @@ where
     wasix_exec_prepared_program(
         caller,
         &compile_authority,
-        memory,
+        &memory,
         prepared,
         args,
         args_len,
@@ -1814,10 +1874,10 @@ where
     clippy::too_many_arguments,
     reason = "the compile authority is the one argument that must be spelled out so no exec reaches the compiler without a process right"
 )]
-pub(super) async fn wasix_exec_prepared_program<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_exec_prepared_program<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     compile: &CompileAuthority,
-    memory: Preview1Memory,
+    memory: &Preview1AsyncMemory,
     prepared: WasixPreparedProgram,
     args: u32,
     args_len: u32,
@@ -1827,18 +1887,25 @@ pub(super) async fn wasix_exec_prepared_program<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut trace = phases::Trace::adopt(caller.data().cpu.clone(), timeline);
-    let argv = wasix_read_exec_string(caller, memory, args, args_len)
+    let argv = wasix_read_exec_string(memory, args, args_len)
+        .await
         .map(|value| wasix_split_lines(&value))
-        .map_err(wasmtime::Error::new)
+        .map_err(ExecReadError::into_error)
         .inspect_err(|error| launch_exit_error(&trace, error))?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
     let environment = match env {
-        Some((ptr, len)) => wasix_read_exec_string(caller, memory, ptr, len)
-            .map(|value| wasix_split_environment(&value))
-            .unwrap_or_default(),
+        Some((ptr, len)) => match wasix_read_exec_string(memory, ptr, len).await {
+            Ok(value) => wasix_split_environment(&value),
+            Err(ExecReadError::Program(_)) => Vec::new(),
+            Err(error @ ExecReadError::Swap(_)) => {
+                let error = error.into_error();
+                launch_exit_error(&trace, &error);
+                return Err(error);
+            }
+        },
         None => caller.data().environment.clone(),
     };
     // The replacement keeps this instance, so it keeps this instance's id.
@@ -1898,8 +1965,8 @@ where
     clippy::too_many_arguments,
     reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration"
 )]
-pub(super) async fn wasix_proc_exec3<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_exec3<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: u32,
     name_len: u32,
     args: u32,
@@ -1913,7 +1980,7 @@ pub(super) async fn wasix_proc_exec3<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     wasix_proc_exec_with_search(
         caller,
@@ -1931,8 +1998,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_proc_exec_with_search<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_exec_with_search<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: u32,
     name_len: u32,
     args: u32,
@@ -1945,17 +2012,17 @@ pub(super) async fn wasix_proc_exec_with_search<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
+    let Some(memory) = p1_async_memory(caller) else {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
         }));
     };
-    let program = phases::gated(|| wasix_read_exec_string(caller, memory, name, name_len).ok())
-        .flatten()
-        .unwrap_or_default();
+    let program = wasix_launch_program_label(&memory, name, name_len)
+        .await
+        .map_err(wasmtime::Error::new)?;
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "exec", &program);
     let exec_authority = match caller.data().require_exec_authority() {
         Ok(authority) => authority,
@@ -1970,7 +2037,7 @@ where
     let compile_authority = CompileAuthority::from(&exec_authority);
     let prepared = match wasix_prepare_program_with_search(
         caller,
-        memory,
+        &memory,
         name,
         name_len,
         search_path,
@@ -1991,7 +2058,7 @@ where
     wasix_exec_prepared_program(
         caller,
         &compile_authority,
-        memory,
+        &memory,
         prepared,
         args,
         args_len,
@@ -2002,8 +2069,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_proc_spawn<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_spawn<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: u32,
     name_len: u32,
     chroot: i32,
@@ -2017,11 +2084,11 @@ pub(super) async fn wasix_proc_spawn<CpuImpl, Net, HostFs>(
     working_dir: u32,
     working_dir_len: u32,
     ret_handles: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started = p1_kernel_profile_start(caller.data());
     let result = wasix_proc_spawn_inner(
@@ -2046,8 +2113,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_proc_spawn_inner<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_spawn_inner<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: u32,
     name_len: u32,
     chroot: i32,
@@ -2061,63 +2128,60 @@ pub(super) async fn wasix_proc_spawn_inner<CpuImpl, Net, HostFs>(
     working_dir: u32,
     working_dir_len: u32,
     ret_handles: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     // The boundary lands at the argv decode — before the chroot,
     // preopen and cwd work — symmetric with `proc_spawn2` and
     // `proc_exec`.
-    let argv = match wasix_read_exec_string(caller, memory, args, args_len) {
-        Ok(value) => wasix_split_lines(&value),
-        Err(_) => return p1::errno::FAULT,
-    };
+    let argv = wasix_split_lines(&wasix_read_exec_string(&memory, args, args_len).await?);
     let program = phases::gated(|| argv.first().cloned().unwrap_or_default()).unwrap_or_default();
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "spawn", &program);
     let spawn_authority = match caller.data().require_spawn_authority() {
         Ok(authority) => authority,
-        Err(status) => return launch_exit_errno(&trace, status),
+        Err(status) => return Ok(launch_exit_errno(&trace, status)),
     };
     let compile_authority = CompileAuthority::from(&spawn_authority);
     let chroot = match chroot {
         0 => false,
         1 => true,
-        _ => return launch_exit_errno(&trace, p1::errno::INVAL),
+        _ => return Ok(launch_exit_errno(&trace, p1::errno::INVAL)),
     };
     let mut authority = if preopen_len == 0 {
         if chroot {
-            return launch_exit_errno(&trace, p1::errno::INVAL);
+            return Ok(launch_exit_errno(&trace, p1::errno::INVAL));
         }
         caller.data().authority.clone()
     } else {
-        let preopen = match wasix_read_exec_string(caller, memory, preopen, preopen_len) {
+        let preopen = match wasix_read_exec_string(&memory, preopen, preopen_len).await {
             Ok(preopen) => preopen,
-            Err(_) => return launch_exit_errno(&trace, p1::errno::FAULT),
+            Err(error) => return Err(launch_exit_stop(&trace, error.into())),
         };
         match wasix_proc_spawn_preopen_authority(caller, &preopen, chroot).await {
             Ok(authority) => authority,
-            Err(errno) => return launch_exit_errno(&trace, errno),
+            Err(errno) => return Ok(launch_exit_errno(&trace, errno)),
         }
     };
     if working_dir_len != 0 {
-        let working_dir = match wasix_read_exec_string(caller, memory, working_dir, working_dir_len)
+        let working_dir = match wasix_read_exec_string(&memory, working_dir, working_dir_len).await
         {
             Ok(working_dir) => working_dir,
-            Err(_) => return launch_exit_errno(&trace, p1::errno::FAULT),
+            Err(error) => return Err(launch_exit_stop(&trace, error.into())),
         };
         if !working_dir.is_empty() && working_dir != "." {
             let cwd = match wasix_proc_spawn_resolve_child_cwd(&authority, &working_dir) {
                 Ok(cwd) => cwd,
-                Err(errno) => return launch_exit_errno(&trace, errno),
+                Err(errno) => return Ok(launch_exit_errno(&trace, errno)),
             };
             let namespace = p1_namespace(caller);
             if let Err(errno) = wasix_require_directory(&namespace, &cwd.descriptor.path).await {
-                return launch_exit_errno(&trace, errno);
+                return Ok(launch_exit_errno(&trace, errno));
             }
             let cap = match authority.derive_directory_cap(
                 &cwd.descriptor.path,
@@ -2125,14 +2189,14 @@ where
                 descriptor_flags_to_directory_authority(cwd.descriptor.flags),
             ) {
                 Ok(cap) => cap,
-                Err(_) => return launch_exit_errno(&trace, p1::errno::NOTCAPABLE),
+                Err(_) => return Ok(launch_exit_errno(&trace, p1::errno::NOTCAPABLE)),
             };
             authority.chdir(cap);
         }
     }
-    let prepared = match wasix_prepare_program(caller, memory, name, name_len).await {
+    let prepared = match wasix_prepare_program(caller, &memory, name, name_len).await {
         Ok(prepared) => prepared,
-        Err(error) => return launch_exit_error_errno(&trace, &error),
+        Err(error) => return launch_exit_error_stop(&trace, &error),
     };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
@@ -2154,18 +2218,19 @@ where
     {
         Ok(result) => result,
         // The child marked the launch's terminal on the error it returned.
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
-    wasix_write_process_handles(caller, memory, GuestAddress::wasm32(ret_handles), result)
+    wasix_write_process_handles(&memory, GuestAddress::wasm32(ret_handles), result).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 /// Refuses a path that does not name a directory.
-pub(super) async fn wasix_require_directory<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(super) async fn wasix_require_directory<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     path: &str,
 ) -> Result<(), i32>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let metadata = wasi_fs::stat_path(namespace, path, crate::Follow::No)
         .await
@@ -2176,15 +2241,15 @@ where
     Ok(())
 }
 
-pub(super) async fn wasix_proc_spawn_preopen_authority<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_spawn_preopen_authority<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     preopen: &str,
     chroot: bool,
 ) -> Result<ProcessAuthority, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let namespace = p1_namespace(caller);
     let mut authority =
@@ -2329,8 +2394,8 @@ pub(super) fn wasix_authority_resolve_absolute_guest_path(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_proc_spawn2<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_spawn2<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: u32,
     name_len: u32,
     args: u32,
@@ -2345,11 +2410,11 @@ pub(super) async fn wasix_proc_spawn2<CpuImpl, Net, HostFs>(
     path: u32,
     path_len: u32,
     ret_pid: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started = p1_kernel_profile_start(caller.data());
     let result = wasix_proc_spawn2_inner(
@@ -2375,8 +2440,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_proc_spawn2_inner<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_spawn2_inner<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: u32,
     name_len: u32,
     args: u32,
@@ -2391,37 +2456,34 @@ pub(super) async fn wasix_proc_spawn2_inner<CpuImpl, Net, HostFs>(
     path: u32,
     path_len: u32,
     ret_pid: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let argv = match wasix_read_exec_string(caller, memory, args, args_len) {
-        Ok(value) => wasix_split_lines(&value),
-        Err(_) => return p1::errno::FAULT,
-    };
+    let argv = wasix_split_lines(&wasix_read_exec_string(&memory, args, args_len).await?);
     let program = phases::gated(|| argv.first().cloned().unwrap_or_default()).unwrap_or_default();
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "spawn", &program);
     let spawn_authority = match caller.data().require_spawn_authority() {
         Ok(authority) => authority,
-        Err(status) => return launch_exit_errno(&trace, status),
+        Err(status) => return Ok(launch_exit_errno(&trace, status)),
     };
     let compile_authority = CompileAuthority::from(&spawn_authority);
     let environment = if env == 0 && env_len == 0 {
         None
     } else {
-        match wasix_read_exec_string(caller, memory, env, env_len) {
+        match wasix_read_exec_string(&memory, env, env_len).await {
             Ok(value) => Some(wasix_split_environment(&value)),
-            Err(_) => return launch_exit_errno(&trace, p1::errno::FAULT),
+            Err(error) => return Err(launch_exit_stop(&trace, error.into())),
         }
     };
     let prepared = match wasix_prepare_program_with_search(
         caller,
-        memory,
+        &memory,
         name,
         name_len,
         search_path,
@@ -2431,31 +2493,29 @@ where
     .await
     {
         Ok(prepared) => prepared,
-        Err(error) => return launch_exit_error_errno(&trace, &error),
+        Err(error) => return launch_exit_error_stop(&trace, &error),
     };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
     let snapshot = if fd_ops == 0 && fd_ops_len == 0 {
         None
     } else {
-        match wasix_spawn_descriptor_snapshot(caller, memory, fd_ops, fd_ops_len).await {
+        match wasix_spawn_descriptor_snapshot(caller, &memory, fd_ops, fd_ops_len).await {
             Ok(snapshot) => Some(snapshot),
-            Err(errno) => return launch_exit_errno(&trace, errno),
+            Err(stop) => return Err(launch_exit_stop(&trace, stop)),
         }
     };
     let (authority, descriptors) = match snapshot {
         Some(snapshot) => (Some(snapshot.authority), Some(snapshot.descriptors)),
         None => (None, None),
     };
-    let signal_dispositions = match wasix_read_signal_dispositions(
-        caller,
-        memory,
-        GuestAddress::wasm32(signals),
-        signals_len,
-    ) {
-        Ok(dispositions) => dispositions,
-        Err(errno) => return launch_exit_errno(&trace, errno),
-    };
+    let signal_dispositions =
+        match wasix_read_signal_dispositions(&memory, GuestAddress::wasm32(signals), signals_len)
+            .await
+        {
+            Ok(dispositions) => dispositions,
+            Err(stop) => return Err(launch_exit_stop(&trace, stop)),
+        };
     let result = match wasix_spawn_child(
         caller,
         &compile_authority,
@@ -2474,21 +2534,24 @@ where
     {
         Ok(result) => result,
         // The child marked the launch's terminal on the error it returned.
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
-    p1_write_u32(caller, memory, GuestAddress::wasm32(ret_pid), result.pid)
+    memory
+        .write_u32(GuestAddress::wasm32(ret_pid), result.pid)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) async fn wasix_proc_join<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_join<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     pid: u32,
     flags: u32,
     ret_status: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let started = p1_kernel_profile_start(caller.data());
     let result = wasix_proc_join_inner(caller, pid, flags, ret_status).await;
@@ -2496,70 +2559,72 @@ where
     result
 }
 
-pub(super) async fn wasix_proc_join_inner<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_proc_join_inner<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     pid: u32,
     flags: u32,
     ret_status: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let status = caller.data().require_join_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Ok(status);
     }
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     if flags & !WASIX_JOIN_FLAGS_SUPPORTED != 0 {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
     let (pid, ret_status) = (GuestAddress::wasm32(pid), GuestAddress::wasm32(ret_status));
-    let requested_pid = match wasix_read_option_pid(caller, memory, pid) {
-        Ok(pid) => pid,
-        Err(errno) => return errno,
-    };
+    let requested_pid = wasix_read_option_pid(&memory, pid).await?;
     let Some(index) = caller.data().find_child_index(requested_pid) else {
-        return wasix_write_join_nothing(caller, memory, ret_status);
+        wasix_write_join_nothing(&memory, ret_status).await?;
+        return Ok(p1::errno::SUCCESS);
     };
     if flags & WASIX_JOIN_FLAG_NON_BLOCKING != 0 {
         match caller.data_mut().poll_child_exit(index) {
             Ok(Some(code)) => {
                 let child = caller.data_mut().children.swap_remove(index);
-                wasix_write_join_exit(caller, memory, pid, ret_status, child.pid, code)
+                wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
             }
             Ok(None) => {
                 crate::yield_now().await;
-                wasix_write_join_nothing(caller, memory, ret_status)
+                wasix_write_join_nothing(&memory, ret_status).await?;
             }
-            Err(errno) => errno,
+            Err(errno) => return Ok(errno),
         }
     } else {
         let child_pid = caller.data().children[index].pid;
         match caller.data_mut().poll_child_exit(index) {
             Ok(Some(code)) => {
                 let child = caller.data_mut().children.swap_remove(index);
-                return wasix_write_join_exit(caller, memory, pid, ret_status, child.pid, code);
+                wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
+                return Ok(p1::errno::SUCCESS);
             }
             Ok(None) => {}
-            Err(errno) => return errno,
+            Err(errno) => return Ok(errno),
         }
         let Some(exit) = caller.data_mut().children[index].exit.take() else {
-            return wasix_write_join_nothing(caller, memory, ret_status);
+            wasix_write_join_nothing(&memory, ret_status).await?;
+            return Ok(p1::errno::SUCCESS);
         };
         let (code, filesystem) = wasix_child_exit_result(exit.await);
         if let Some(filesystem) = filesystem {
             caller.data_mut().filesystem.adopt_root_layer(filesystem);
         }
         let Some(index) = caller.data().find_child_index(Some(child_pid)) else {
-            return wasix_write_join_nothing(caller, memory, ret_status);
+            wasix_write_join_nothing(&memory, ret_status).await?;
+            return Ok(p1::errno::SUCCESS);
         };
         let child = caller.data_mut().children.swap_remove(index);
-        wasix_write_join_exit(caller, memory, pid, ret_status, child.pid, code)
+        wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
     }
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) fn wasix_child_exit_result(
@@ -2571,59 +2636,53 @@ pub(super) fn wasix_child_exit_result(
     }
 }
 
-pub(super) async fn wasix_proc_snapshot<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-) -> i32
+pub(super) async fn wasix_proc_snapshot<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if caller.data_mut().asyncify.process_snapshot_rewinding {
         caller.data_mut().asyncify.process_snapshot_rewinding = false;
         if wasix_call_asyncify_stop_rewind(caller).await != p1::errno::SUCCESS {
-            return p1::errno::NOTSUP;
+            return Ok(p1::errno::NOTSUP);
         }
-        return p1::errno::SUCCESS;
+        return Ok(p1::errno::SUCCESS);
     }
 
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     if caller.data().current_core_module.is_none() {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     }
     let Ok((stack_lower, stack_upper, stack_pointer)) = wasix_stack_bounds_from_caller(caller)
     else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
     let memory_stack_len = match usize::try_from(stack_upper - stack_pointer) {
         Ok(len) => len,
-        Err(_) => return p1::errno::OVERFLOW,
+        Err(_) => return Ok(p1::errno::OVERFLOW),
     };
-    let memory_stack = match p1_read_memory(
-        caller,
-        memory,
-        GuestAddress::wasm32(stack_pointer),
-        memory_stack_len,
-    ) {
-        Ok(stack) => stack,
-        Err(_) => return p1::errno::FAULT,
-    };
+    let memory_stack = memory
+        .read_bytes(GuestAddress::wasm32(stack_pointer), memory_stack_len)
+        .await?;
     let unwind_stack_begin = match stack_lower.checked_add(WASIX_ASYNCIFY_DATA_SIZE) {
         Some(begin) if begin <= stack_pointer => begin,
-        _ => return p1::errno::OVERFLOW,
+        _ => return Ok(p1::errno::OVERFLOW),
     };
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    let status = p1_write_u32(caller, memory, stack_lower_address, unwind_stack_begin).max(
-        p1_write_u32(caller, memory, stack_lower_address.offset(4), stack_pointer),
-    );
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
+    memory
+        .write_u32(stack_lower_address, unwind_stack_begin)
+        .await?;
+    memory
+        .write_u32(stack_lower_address.offset(4), stack_pointer)
+        .await?;
     caller.data_mut().asyncify.phase = WasixAsyncifyPhase::ProcessSnapshot {
         stack_lower,
         stack_upper,
@@ -2631,7 +2690,7 @@ where
         memory_stack,
         stack_pointer,
     };
-    wasix_call_asyncify_start_unwind(caller, stack_lower).await
+    Ok(wasix_call_asyncify_start_unwind(caller, stack_lower).await)
 }
 
 #[derive(Clone, Copy)]
@@ -2682,14 +2741,14 @@ impl WasixSpawnIo {
     }
 }
 
-pub(super) fn wasix_prepare_child_io<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn wasix_prepare_child_io<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     io: WasixSpawnIo,
 ) -> Result<WasixSpawnPreparedIo, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if matches!(
         (io.stdin, io.stdout, io.stderr),
@@ -2728,15 +2787,15 @@ where
     })
 }
 
-pub(super) fn wasix_prepare_child_output_route<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn wasix_prepare_child_output_route<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     mode: WasixStdioMode,
     stream: crate::ComponentOutputStreamKind,
 ) -> Result<(OutputRoute, Option<crate::ByteReader>), i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match mode {
         WasixStdioMode::Piped => {
@@ -2761,25 +2820,26 @@ impl WasixStdioMode {
     }
 }
 
-pub(super) async fn wasix_prepare_program<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    memory: Preview1Memory,
+pub(super) async fn wasix_prepare_program<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    memory: &Preview1AsyncMemory,
     name: u32,
     name_len: u32,
 ) -> wasmtime::Result<WasixPreparedProgram>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let name =
-        wasix_read_exec_string(caller, memory, name, name_len).map_err(wasmtime::Error::new)?;
+    let name = wasix_read_exec_string(memory, name, name_len)
+        .await
+        .map_err(ExecReadError::into_error)?;
     wasix_prepare_program_from_name(caller, &name).await
 }
 
-pub(super) async fn wasix_prepare_program_with_search<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    memory: Preview1Memory,
+pub(super) async fn wasix_prepare_program_with_search<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    memory: &Preview1AsyncMemory,
     name: u32,
     name_len: u32,
     search_path: i32,
@@ -2789,10 +2849,11 @@ pub(super) async fn wasix_prepare_program_with_search<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let name =
-        wasix_read_exec_string(caller, memory, name, name_len).map_err(wasmtime::Error::new)?;
+    let name = wasix_read_exec_string(memory, name, name_len)
+        .await
+        .map_err(ExecReadError::into_error)?;
     let search_path = match search_path {
         0 => false,
         1 => true,
@@ -2816,20 +2877,21 @@ where
         .await;
     }
 
-    let path =
-        wasix_read_exec_string(caller, memory, path, path_len).map_err(wasmtime::Error::new)?;
+    let path = wasix_read_exec_string(memory, path, path_len)
+        .await
+        .map_err(ExecReadError::into_error)?;
     wasix_prepare_program_from_search_paths(caller, &name, WasixExecSearchPath::Guest(&path)).await
 }
 
-pub(super) async fn wasix_prepare_program_from_search_paths<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_prepare_program_from_search_paths<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: &str,
     search_path: WasixExecSearchPath<'_>,
 ) -> wasmtime::Result<WasixPreparedProgram>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     match search_path {
         WasixExecSearchPath::Default => {
@@ -2858,15 +2920,15 @@ where
     }))
 }
 
-pub(super) async fn wasix_prepare_program_from_search_directory<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_prepare_program_from_search_directory<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: &str,
     directory: &str,
 ) -> Option<WasixPreparedProgram>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let cwd = caller
         .data()
@@ -2879,19 +2941,19 @@ where
         .ok()
 }
 
-pub(super) async fn wasix_spawn_descriptor_snapshot<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    memory: Preview1Memory,
+pub(super) async fn wasix_spawn_descriptor_snapshot<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    memory: &Preview1AsyncMemory,
     fd_ops: u32,
     fd_ops_len: u32,
-) -> Result<WasixSpawnFdSnapshot<Net>, i32>
+) -> Result<WasixSpawnFdSnapshot<Net>, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if fd_ops == 0 {
-        return Err(p1::errno::FAULT);
+        return Err(P1Stop::Errno(p1::errno::FAULT));
     }
     let mut snapshot = WasixSpawnFdSnapshot {
         descriptors: caller.data().descriptors.clone(),
@@ -2906,107 +2968,93 @@ where
     Ok(snapshot)
 }
 
-pub(super) async fn wasix_apply_spawn_fd_op<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    memory: Preview1Memory,
+pub(super) async fn wasix_apply_spawn_fd_op<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    memory: &Preview1AsyncMemory,
     snapshot: &mut WasixSpawnFdSnapshot<Net>,
     op: GuestAddress,
-) -> Result<(), i32>
+) -> Result<(), P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let field = |offset: u32| op.offset(u64::from(offset));
-    let cmd = p1_try_read_u8(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET))
-        .map_err(|_| p1::errno::FAULT)?;
-    let fd = p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_FD_OFFSET))
-        .map_err(|_| p1::errno::FAULT)?;
-    let fd = i32::try_from(fd).map_err(|_| p1::errno::OVERFLOW)?;
+    let cmd = memory
+        .read_u8(field(WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET))
+        .await?;
+    let fd = memory
+        .read_u32(field(WASIX_PROC_SPAWN_FD_OP_FD_OFFSET))
+        .await?;
+    let fd = i32::try_from(fd).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
     match cmd {
         WASIX_PROC_SPAWN_FD_OP_CLOSE => {
             let status = snapshot.descriptors.close(fd);
             if status == p1::errno::SUCCESS {
                 Ok(())
             } else {
-                Err(status)
+                Err(P1Stop::Errno(status))
             }
         }
         WASIX_PROC_SPAWN_FD_OP_DUP2 => {
+            let source_fd = memory
+                .read_u32(field(WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET))
+                .await?;
             let source_fd =
-                p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET))
-                    .map_err(|_| p1::errno::FAULT)?;
-            let source_fd = i32::try_from(source_fd).map_err(|_| p1::errno::OVERFLOW)?;
-            let fdflagsext = p1_try_read_u16(
-                caller,
-                memory,
-                field(WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET),
-            )
-            .map_err(|_| p1::errno::FAULT)?;
+                i32::try_from(source_fd).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+            let fdflagsext = memory
+                .read_u16(field(WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET))
+                .await?;
             let close_on_exec = wasix_close_on_exec_flag(fdflagsext)?;
-            snapshot
+            Ok(snapshot
                 .descriptors
                 .dup_to(source_fd, fd, close_on_exec)
-                .map(drop)
+                .map(drop)?)
         }
         WASIX_PROC_SPAWN_FD_OP_CHDIR => {
-            let path_ptr =
-                p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET))
-                    .map_err(|_| p1::errno::FAULT)?;
-            let path_len = p1_try_read_u32(
-                caller,
-                memory,
-                field(WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET),
-            )
-            .map_err(|_| p1::errno::FAULT)?;
-            let path = wasix_read_exec_string(caller, memory, path_ptr, path_len)
-                .map_err(|_| p1::errno::FAULT)?;
+            let path_ptr = memory
+                .read_u32(field(WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET))
+                .await?;
+            let path_len = memory
+                .read_u32(field(WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET))
+                .await?;
+            let path = wasix_read_exec_string(memory, path_ptr, path_len).await?;
             let namespace = p1_namespace(caller);
-            wasix_apply_spawn_chdir(&namespace, snapshot, fd, &path).await
+            Ok(wasix_apply_spawn_chdir(&namespace, snapshot, fd, &path).await?)
         }
-        WASIX_PROC_SPAWN_FD_OP_FCHDIR => wasix_apply_spawn_fchdir(snapshot, fd),
+        WASIX_PROC_SPAWN_FD_OP_FCHDIR => Ok(wasix_apply_spawn_fchdir(snapshot, fd)?),
         WASIX_PROC_SPAWN_FD_OP_OPEN => {
+            let source_fd = memory
+                .read_u32(field(WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET))
+                .await?;
             let source_fd =
-                p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET))
-                    .map_err(|_| p1::errno::FAULT)?;
-            let source_fd = i32::try_from(source_fd).map_err(|_| p1::errno::OVERFLOW)?;
-            let path_ptr =
-                p1_try_read_u32(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET))
-                    .map_err(|_| p1::errno::FAULT)?;
-            let path_len = p1_try_read_u32(
-                caller,
-                memory,
-                field(WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET),
-            )
-            .map_err(|_| p1::errno::FAULT)?;
-            let dirflags = p1_try_read_u32(
-                caller,
-                memory,
-                field(WASIX_PROC_SPAWN_FD_OP_DIRFLAGS_OFFSET),
-            )
-            .map_err(|_| p1::errno::FAULT)?;
-            let oflags =
-                p1_try_read_u16(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_OFLAGS_OFFSET))
-                    .map_err(|_| p1::errno::FAULT)?;
-            let rights = p1_try_read_u64(
-                caller,
-                memory,
-                field(WASIX_PROC_SPAWN_FD_OP_RIGHTS_BASE_OFFSET),
-            )
-            .map_err(|_| p1::errno::FAULT)?;
-            let fdflags =
-                p1_try_read_u16(caller, memory, field(WASIX_PROC_SPAWN_FD_OP_FDFLAGS_OFFSET))
-                    .map_err(|_| p1::errno::FAULT)?;
-            let fdflagsext = p1_try_read_u16(
-                caller,
-                memory,
-                field(WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET),
-            )
-            .map_err(|_| p1::errno::FAULT)?;
+                i32::try_from(source_fd).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+            let path_ptr = memory
+                .read_u32(field(WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET))
+                .await?;
+            let path_len = memory
+                .read_u32(field(WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET))
+                .await?;
+            let dirflags = memory
+                .read_u32(field(WASIX_PROC_SPAWN_FD_OP_DIRFLAGS_OFFSET))
+                .await?;
+            let oflags = memory
+                .read_u16(field(WASIX_PROC_SPAWN_FD_OP_OFLAGS_OFFSET))
+                .await?;
+            let rights = memory
+                .read_u64(field(WASIX_PROC_SPAWN_FD_OP_RIGHTS_BASE_OFFSET))
+                .await?;
+            let fdflags = memory
+                .read_u16(field(WASIX_PROC_SPAWN_FD_OP_FDFLAGS_OFFSET))
+                .await?;
+            let fdflagsext = memory
+                .read_u16(field(WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET))
+                .await?;
             let close_on_exec = wasix_close_on_exec_flag(fdflagsext)?;
-            let path = p1_read_path(caller, memory, GuestAddress::wasm32(path_ptr), path_len)
-                .map_err(|_| p1::errno::FAULT)?;
-            wasix_apply_spawn_open(
+            let path = memory
+                .read_path(GuestAddress::wasm32(path_ptr), path_len)
+                .await?;
+            Ok(wasix_apply_spawn_open(
                 caller,
                 snapshot,
                 fd,
@@ -3018,15 +3066,15 @@ where
                 fdflags,
                 close_on_exec,
             )
-            .await
+            .await?)
         }
-        _ => Err(p1::errno::INVAL),
+        _ => Err(P1Stop::Errno(p1::errno::INVAL)),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_apply_spawn_open<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_apply_spawn_open<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     snapshot: &mut WasixSpawnFdSnapshot<Net>,
     fd: i32,
     source_fd: i32,
@@ -3040,7 +3088,7 @@ pub(super) async fn wasix_apply_spawn_open<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if !p1_file_fdflags_supported(fdflags) {
         return Err(p1::errno::INVAL);
@@ -3097,15 +3145,15 @@ pub(super) fn wasix_spawn_resolve_open_base<Net: ComponentHostNetwork>(
     Ok((base, path.to_owned()))
 }
 
-pub(super) async fn wasix_apply_spawn_chdir<HostFs, Net>(
-    namespace: &Namespace<HostFs>,
+pub(super) async fn wasix_apply_spawn_chdir<StorageImpl, Net>(
+    namespace: &Namespace<StorageImpl>,
     snapshot: &mut WasixSpawnFdSnapshot<Net>,
     fd: i32,
     path: &str,
 ) -> Result<(), i32>
 where
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let cwd = wasix_spawn_resolve_cwd_target(snapshot, fd, path)?;
     wasix_require_directory(namespace, &cwd.descriptor.path).await?;
@@ -3295,41 +3343,41 @@ pub(super) fn wasix_spawn_resolve_absolute_guest_base<Net: ComponentHostNetwork>
     Ok((descriptor.clone(), suffix.to_owned()))
 }
 
-pub(super) async fn wasix_prepare_program_from_name<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_prepare_program_from_name<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: &str,
 ) -> wasmtime::Result<WasixPreparedProgram>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let guest_name = wasix_resolve_exec_guest_name(caller.data(), name)?;
     wasix_prepare_program_from_guest_name(caller, guest_name).await
 }
 
-pub(super) async fn wasix_prepare_program_from_guest_name<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_prepare_program_from_guest_name<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     guest_name: String,
 ) -> wasmtime::Result<WasixPreparedProgram>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let source_path = wasix_resolve_exec_source_path(caller.data(), &guest_name)?;
     let source = wasix_read_program_source(caller, &source_path).await?;
     Ok(WasixPreparedProgram { guest_name, source })
 }
 
-pub(super) async fn wasix_read_program_source<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_read_program_source<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     source_path: &str,
 ) -> wasmtime::Result<ProgramSource>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let namespace = p1_namespace(caller);
     read_program_source_from(&namespace, &caller.data().authority, source_path)
@@ -3344,13 +3392,13 @@ where
 /// [`ProgramExecErrorDetail::ProgramSourceNotGranted`]; once admitted, a
 /// failing read is the filesystem's own error, so a missing file is
 /// [`ProgramExecErrorKind::NotFound`] and never a refusal.
-pub(super) async fn read_program_source_from<HostFs>(
-    namespace: &Namespace<HostFs>,
+pub(super) async fn read_program_source_from<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
     authority: &ProcessAuthority,
     source_path: &str,
 ) -> Result<ProgramSource, ProgramExecError>
 where
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let floor = authority
         .program_load_floor(source_path)
@@ -3366,14 +3414,14 @@ where
         .map_err(ProgramExecError::from_source_read_error)
 }
 
-pub(super) fn wasix_resolve_exec_guest_name<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn wasix_resolve_exec_guest_name<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     name: &str,
 ) -> wasmtime::Result<String>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if name.starts_with('/') {
         return crate::resolve_absolute_path(name).map_err(|_| {
@@ -3398,14 +3446,14 @@ where
     })
 }
 
-pub(super) fn wasix_resolve_exec_source_path<CpuImpl, Net, HostFs>(
-    store: &Preview1ProgramStore<CpuImpl, Net, HostFs>,
+pub(super) fn wasix_resolve_exec_source_path<CpuImpl, Net, StorageImpl>(
+    store: &Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     guest_name: &str,
 ) -> wasmtime::Result<String>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let (path, _) = store.resolve_absolute_guest_path(guest_name).map_err(|_| {
         wasmtime::Error::new(ProgramExecError {
@@ -3442,8 +3490,8 @@ pub(super) fn wasix_search_path_candidate(
 /// `error_kind`/`errno` where the error was a `ProgramExecError`,
 /// classified `end`+`errno` otherwise — so its callers return the
 /// errno untouched rather than reclassifying from the bare `i32`.
-pub(super) async fn wasix_spawn_child<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_spawn_child<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     compile: &CompileAuthority,
     prepared: WasixPreparedProgram,
     argv: Vec<String>,
@@ -3454,7 +3502,7 @@ pub(super) async fn wasix_spawn_child<CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let WasixChildInheritance {
         environment,
@@ -3525,14 +3573,14 @@ where
     })
 }
 
-pub(super) fn wasix_insert_child_stdin<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_insert_child_stdin<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     child: &mut ChildHandle,
 ) -> Result<Option<u32>, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(writer) = child.take_stdin() else {
         return Ok(None);
@@ -3544,15 +3592,15 @@ where
         .map(Some)
 }
 
-pub(super) fn wasix_insert_child_output<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_insert_child_output<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     child: &mut ChildHandle,
     stream: crate::ComponentOutputStreamKind,
 ) -> Result<Option<u32>, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let reader = match stream {
         crate::ComponentOutputStreamKind::Stdout => child.take_stdout(),
@@ -3571,132 +3619,150 @@ where
         .map(Some)
 }
 
-pub(super) fn wasix_write_process_handles<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    memory: Preview1Memory,
+pub(super) async fn wasix_write_process_handles(
+    memory: &Preview1AsyncMemory,
     ret_handles: GuestAddress,
     result: WasixSpawnResult,
-) -> i32
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    p1_write_u32(caller, memory, ret_handles, result.pid)
-        .max(wasix_write_option_fd(
-            caller,
-            memory,
-            ret_handles.offset(u64::from(WASIX_PROCESS_HANDLES_STDIN_OFFSET)),
-            result.stdin_fd,
-        ))
-        .max(wasix_write_option_fd(
-            caller,
-            memory,
-            ret_handles.offset(u64::from(WASIX_PROCESS_HANDLES_STDOUT_OFFSET)),
-            result.stdout_fd,
-        ))
-        .max(wasix_write_option_fd(
-            caller,
-            memory,
-            ret_handles.offset(u64::from(WASIX_PROCESS_HANDLES_STDERR_OFFSET)),
-            result.stderr_fd,
-        ))
+) -> Result<(), GuestAccessError> {
+    memory.write_u32(ret_handles, result.pid).await?;
+    wasix_write_option_fd(
+        memory,
+        ret_handles.offset(u64::from(WASIX_PROCESS_HANDLES_STDIN_OFFSET)),
+        result.stdin_fd,
+    )
+    .await?;
+    wasix_write_option_fd(
+        memory,
+        ret_handles.offset(u64::from(WASIX_PROCESS_HANDLES_STDOUT_OFFSET)),
+        result.stdout_fd,
+    )
+    .await?;
+    wasix_write_option_fd(
+        memory,
+        ret_handles.offset(u64::from(WASIX_PROCESS_HANDLES_STDERR_OFFSET)),
+        result.stderr_fd,
+    )
+    .await
 }
 
-pub(super) fn wasix_write_option_fd<T>(
-    caller: &mut Caller<'_, T>,
-    memory: Preview1Memory,
+pub(super) async fn wasix_write_option_fd(
+    memory: &Preview1AsyncMemory,
     ptr: GuestAddress,
     fd: Option<u32>,
-) -> i32 {
-    let status = p1_write_u8(
-        caller,
-        memory,
-        ptr,
-        if fd.is_some() {
-            WASIX_OPTION_SOME
-        } else {
-            WASIX_OPTION_NONE
-        },
-    );
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    p1_write_u32(
-        caller,
-        memory,
-        ptr.offset(u64::from(WASIX_OPTION_UNION_U32_OFFSET)),
-        fd.unwrap_or(0),
-    )
+) -> Result<(), GuestAccessError> {
+    memory
+        .write_u8(
+            ptr,
+            if fd.is_some() {
+                WASIX_OPTION_SOME
+            } else {
+                WASIX_OPTION_NONE
+            },
+        )
+        .await?;
+    memory
+        .write_u32(
+            ptr.offset(u64::from(WASIX_OPTION_UNION_U32_OFFSET)),
+            fd.unwrap_or(0),
+        )
+        .await
 }
 
-pub(super) fn wasix_write_join_nothing<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    memory: Preview1Memory,
+pub(super) async fn wasix_write_join_nothing(
+    memory: &Preview1AsyncMemory,
     ret_status: GuestAddress,
-) -> i32
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
-    p1_write_u8(caller, memory, ret_status, WASIX_JOIN_STATUS_NOTHING).max(p1_write_u16(
-        caller,
-        memory,
-        ret_status.offset(u64::from(WASIX_JOIN_STATUS_UNION_OFFSET)),
-        0,
-    ))
+) -> Result<(), GuestAccessError> {
+    memory
+        .write_u8(ret_status, WASIX_JOIN_STATUS_NOTHING)
+        .await?;
+    memory
+        .write_u16(
+            ret_status.offset(u64::from(WASIX_JOIN_STATUS_UNION_OFFSET)),
+            0,
+        )
+        .await
 }
 
-pub(super) fn wasix_write_join_exit<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-    memory: Preview1Memory,
+pub(super) async fn wasix_write_join_exit(
+    memory: &Preview1AsyncMemory,
     pid_ptr: GuestAddress,
     ret_status: GuestAddress,
     pid: u32,
     code: u32,
-) -> i32
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
-{
+) -> Result<(), GuestAccessError> {
     let errno = u16::try_from(code).unwrap_or(u16::MAX);
-    p1_write_u8(caller, memory, pid_ptr, WASIX_OPTION_SOME)
-        .max(p1_write_u32(
-            caller,
-            memory,
+    memory.write_u8(pid_ptr, WASIX_OPTION_SOME).await?;
+    memory
+        .write_u32(
             pid_ptr.offset(u64::from(WASIX_OPTION_UNION_U32_OFFSET)),
             pid,
-        ))
-        .max(p1_write_u8(
-            caller,
-            memory,
-            ret_status,
-            WASIX_JOIN_STATUS_EXIT_NORMAL,
-        ))
-        .max(p1_write_u16(
-            caller,
-            memory,
+        )
+        .await?;
+    memory
+        .write_u8(ret_status, WASIX_JOIN_STATUS_EXIT_NORMAL)
+        .await?;
+    memory
+        .write_u16(
             ret_status.offset(u64::from(WASIX_JOIN_STATUS_UNION_OFFSET)),
             errno,
-        ))
+        )
+        .await
 }
 
-pub(super) fn wasix_read_exec_string<T>(
-    caller: &mut Caller<'_, T>,
-    memory: Preview1Memory,
+/// Why a guest string a launch call names could not be read: the guest's
+/// own mistake, which the call answers as it always has, or the loss of a
+/// guest page, which traps the guest.
+pub(super) enum ExecReadError {
+    Program(ProgramExecError),
+    Swap(crate::memory::SwapFaultError),
+}
+
+impl ExecReadError {
+    /// The error a launch call that answers with a `wasmtime::Error`
+    /// returns for this failure.
+    pub(super) fn into_error(self) -> wasmtime::Error {
+        match self {
+            Self::Program(error) => wasmtime::Error::new(error),
+            Self::Swap(error) => wasmtime::Error::new(error),
+        }
+    }
+}
+
+impl From<ExecReadError> for P1Stop {
+    fn from(error: ExecReadError) -> Self {
+        match error {
+            ExecReadError::Program(_) => Self::Errno(p1::errno::FAULT),
+            ExecReadError::Swap(error) => Self::Trap(error),
+        }
+    }
+}
+
+pub(super) async fn wasix_read_exec_string(
+    memory: &Preview1AsyncMemory,
     ptr: u32,
     len: u32,
-) -> Result<String, ProgramExecError> {
+) -> Result<String, ExecReadError> {
     if len == 0 {
         return Ok(String::new());
     }
-    p1_read_memory(caller, memory, GuestAddress::wasm32(ptr), len as usize).and_then(|mut bytes| {
-        while bytes.last().is_some_and(|byte| *byte == 0) {
-            bytes.pop();
+    let mut bytes = match memory
+        .read_bytes(GuestAddress::wasm32(ptr), len as usize)
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(GuestAccessError::OutOfBounds) => {
+            return Err(ExecReadError::Program(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
+            }));
         }
-        String::from_utf8(bytes).map_err(|_| ProgramExecError {
+        Err(GuestAccessError::Swap(error)) => return Err(ExecReadError::Swap(error)),
+    };
+    while bytes.last().is_some_and(|byte| *byte == 0) {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        ExecReadError::Program(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidPath,
             detail: ProgramExecErrorDetail::InvalidProgramPathEncoding,
         })
@@ -3734,36 +3800,29 @@ pub(super) fn wasix_nonempty_line_count(value: &str) -> usize {
     value.split('\n').filter(|entry| !entry.is_empty()).count()
 }
 
-pub(super) fn wasix_read_signal_dispositions<T>(
-    caller: &mut Caller<'_, T>,
-    memory: Preview1Memory,
+pub(super) async fn wasix_read_signal_dispositions(
+    memory: &Preview1AsyncMemory,
     ptr: GuestAddress,
     len: u32,
-) -> Result<Vec<WasixSignalDisposition>, i32> {
+) -> Result<Vec<WasixSignalDisposition>, P1Stop> {
     if len == 0 {
         if ptr == GuestAddress::wasm32(0) {
             return Ok(Vec::new());
         }
-        return Err(p1::errno::INVAL);
+        return Err(P1Stop::Errno(p1::errno::INVAL));
     }
     if ptr == GuestAddress::wasm32(0) {
-        return Err(p1::errno::FAULT);
+        return Err(P1Stop::Errno(p1::errno::FAULT));
     }
     let mut dispositions = Vec::new();
     for index in 0..len {
         let offset = ptr.offset(u64::from(index) * u64::from(WASIX_SIGNAL_DISPOSITION_SIZE));
-        let signal = p1_try_read_u8(
-            caller,
-            memory,
-            offset.offset(u64::from(WASIX_SIGNAL_DISPOSITION_SIGNAL_OFFSET)),
-        )
-        .map_err(|_| p1::errno::FAULT)?;
-        let action = p1_try_read_u8(
-            caller,
-            memory,
-            offset.offset(u64::from(WASIX_SIGNAL_DISPOSITION_ACTION_OFFSET)),
-        )
-        .map_err(|_| p1::errno::FAULT)?;
+        let signal = memory
+            .read_u8(offset.offset(u64::from(WASIX_SIGNAL_DISPOSITION_SIGNAL_OFFSET)))
+            .await?;
+        let action = memory
+            .read_u8(offset.offset(u64::from(WASIX_SIGNAL_DISPOSITION_ACTION_OFFSET)))
+            .await?;
         dispositions.push(wasix_signal_disposition_from_raw(signal, action)?);
     }
     Ok(dispositions)
@@ -3849,4 +3908,269 @@ pub(super) fn write_wasix_tty_state<T>(
             ptr.offset(21),
             state.line_feeds,
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The accessor over `bytes`, on a machine that cannot swap, so every
+    /// page is present.
+    fn memory_over(bytes: &mut [u8]) -> Preview1AsyncMemory {
+        Preview1AsyncMemory::new(Preview1Memory {
+            base: bytes.as_mut_ptr() as usize,
+            len: bytes.len(),
+        })
+    }
+
+    fn run<F: Future>(future: F) -> F::Output {
+        futures_lite::future::block_on(future)
+    }
+
+    fn read_error_stop(error: ExecReadError) -> P1Stop {
+        error.into()
+    }
+
+    /// A launch string is read in full in Chinese, Japanese and Korean,
+    /// with the NUL padding a guest's C string carries trimmed off.
+    #[test]
+    fn a_launch_string_reads_in_every_cjk_script_without_its_padding() {
+        for text in ["程序\n参数", "プログラム\n引数", "프로그램\n인수"] {
+            let mut guest = vec![0_u8; 128];
+            guest[16..16 + text.len()].copy_from_slice(text.as_bytes());
+            let padded = text.len() + 3;
+            let memory = memory_over(&mut guest);
+            let read = run(wasix_read_exec_string(&memory, 16, padded as u32));
+            assert_eq!(read.ok().as_deref(), Some(text));
+        }
+    }
+
+    /// A string outside memory or not UTF-8 is the guest's mistake, which a
+    /// launch call answers with `EFAULT`; an empty one needs no memory.
+    #[test]
+    fn a_launch_string_the_guest_cannot_supply_is_efault() {
+        let mut guest = vec![0xff_u8; 32];
+        let memory = memory_over(&mut guest);
+        for (ptr, len) in [(0, 4), (16, 64), (u32::MAX, 1)] {
+            let error = run(wasix_read_exec_string(&memory, ptr, len))
+                .expect_err("the string is not there");
+            assert_eq!(read_error_stop(error), P1Stop::Errno(p1::errno::FAULT));
+        }
+        assert_eq!(
+            run(wasix_read_exec_string(&memory, u32::MAX, 0))
+                .ok()
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    /// The process handles of a spawn land as the guest's layout has
+    /// them: the pid, then three optional descriptors at their offsets.
+    #[test]
+    fn spawned_process_handles_land_at_their_offsets() {
+        let mut guest = vec![0xee_u8; 64];
+        let memory = memory_over(&mut guest);
+        run(wasix_write_process_handles(
+            &memory,
+            GuestAddress::wasm32(8),
+            WasixSpawnResult {
+                pid: 77,
+                stdin_fd: Some(3),
+                stdout_fd: None,
+                stderr_fd: Some(5),
+            },
+        ))
+        .expect("the record fits");
+        let at = |offset: u32| 8 + offset as usize;
+        assert_eq!(
+            guest[at(0)..at(4)],
+            77_u32.to_le_bytes(),
+            "the pid opens the record"
+        );
+        let option = |offset: u32| {
+            (
+                guest[at(offset)],
+                u32::from_le_bytes(
+                    guest[at(offset + WASIX_OPTION_UNION_U32_OFFSET)
+                        ..at(offset + WASIX_OPTION_UNION_U32_OFFSET + 4)]
+                        .try_into()
+                        .expect("four bytes"),
+                ),
+            )
+        };
+        assert_eq!(option(WASIX_PROCESS_HANDLES_STDIN_OFFSET), (1, 3));
+        assert_eq!(option(WASIX_PROCESS_HANDLES_STDOUT_OFFSET), (0, 0));
+        assert_eq!(option(WASIX_PROCESS_HANDLES_STDERR_OFFSET), (1, 5));
+    }
+
+    /// A record that does not fit in memory is refused, not truncated.
+    #[test]
+    fn process_handles_past_the_end_of_memory_are_refused() {
+        let mut guest = vec![0_u8; 24];
+        let memory = memory_over(&mut guest);
+        let result = || WasixSpawnResult {
+            pid: 1,
+            stdin_fd: None,
+            stdout_fd: None,
+            stderr_fd: None,
+        };
+        assert_eq!(
+            run(wasix_write_process_handles(
+                &memory,
+                GuestAddress::wasm32(8),
+                result()
+            )),
+            Err(GuestAccessError::OutOfBounds)
+        );
+    }
+
+    /// A join that reaped a child reports it as the guest's record has
+    /// it, and one that found nothing reports so.
+    #[test]
+    fn a_join_reports_an_exit_and_the_absence_of_one() {
+        let mut guest = vec![0xee_u8; 64];
+        let memory = memory_over(&mut guest);
+        run(wasix_write_join_exit(
+            &memory,
+            GuestAddress::wasm32(0),
+            GuestAddress::wasm32(16),
+            9,
+            3,
+        ))
+        .expect("the records fit");
+        run(wasix_write_join_nothing(&memory, GuestAddress::wasm32(32))).expect("fits");
+        assert_eq!(guest[0], WASIX_OPTION_SOME);
+        assert_eq!(guest[4..8], 9_u32.to_le_bytes());
+        assert_eq!(guest[16], WASIX_JOIN_STATUS_EXIT_NORMAL);
+        assert_eq!(
+            guest[16 + WASIX_JOIN_STATUS_UNION_OFFSET as usize..][..2],
+            3_u16.to_le_bytes()
+        );
+        assert_eq!(guest[32], WASIX_JOIN_STATUS_NOTHING);
+        assert_eq!(
+            guest[32 + WASIX_JOIN_STATUS_UNION_OFFSET as usize..][..2],
+            0_u16.to_le_bytes()
+        );
+    }
+
+    /// Signal dispositions are decoded one record at a time; an unknown
+    /// signal or action is `EINVAL`, a null array with a count is
+    /// `EFAULT`, and a count with no array is `EINVAL`.
+    #[test]
+    fn signal_dispositions_decode_and_refuse_what_is_not_one() {
+        let mut guest = vec![0_u8; 32];
+        guest[8..12].copy_from_slice(&[
+            2,
+            WASIX_SIGNAL_DISPOSITION_IGNORE,
+            15,
+            WASIX_SIGNAL_DISPOSITION_DEFAULT,
+        ]);
+        let memory = memory_over(&mut guest);
+        assert_eq!(
+            run(wasix_read_signal_dispositions(
+                &memory,
+                GuestAddress::wasm32(8),
+                2
+            )),
+            Ok(vec![
+                WasixSignalDisposition {
+                    signal: 2,
+                    action: WasixSignalDispositionAction::Ignore,
+                },
+                WasixSignalDisposition {
+                    signal: 15,
+                    action: WasixSignalDispositionAction::Default,
+                },
+            ])
+        );
+        assert_eq!(
+            run(wasix_read_signal_dispositions(
+                &memory,
+                GuestAddress::wasm32(4),
+                1
+            )),
+            Err(P1Stop::Errno(p1::errno::INVAL)),
+            "signal 0 is no signal"
+        );
+        assert_eq!(
+            run(wasix_read_signal_dispositions(
+                &memory,
+                GuestAddress::wasm32(0),
+                1
+            )),
+            Err(P1Stop::Errno(p1::errno::FAULT)),
+            "a null array with a count"
+        );
+        assert_eq!(
+            run(wasix_read_signal_dispositions(
+                &memory,
+                GuestAddress::wasm32(0),
+                0
+            )),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            run(wasix_read_signal_dispositions(
+                &memory,
+                GuestAddress::wasm32(8),
+                0
+            )),
+            Err(P1Stop::Errno(p1::errno::INVAL))
+        );
+        assert_eq!(
+            run(wasix_read_signal_dispositions(
+                &memory,
+                GuestAddress::wasm32(31),
+                1
+            )),
+            Err(P1Stop::Errno(p1::errno::FAULT)),
+            "the record's action byte is past the end of memory"
+        );
+    }
+
+    /// A launch string in Chinese, Japanese and Korean that runs from a
+    /// present page onto one swap has taken.
+    fn launch_string_over_an_evicted_page() -> (crate::memory::GuestSwap, u32, String) {
+        let text = "程序\nプログラム\n프로그램".repeat(40);
+        let mut swap = crate::memory::GuestSwap::new(2);
+        let at = TEST_PAGE - text.len() / 2;
+        swap.bytes_mut()[at..at + text.len()].copy_from_slice(text.as_bytes());
+        swap.evict(1);
+        (swap, at as u32, text)
+    }
+
+    /// Reading a launch string whose tail is on a page that is out waits
+    /// for the page, asks for it, and once it is back reads the string the
+    /// guest wrote.
+    #[test]
+    fn a_launch_string_on_an_evicted_page_reads_once_the_page_is_back() {
+        let (mut swap, at, text) = launch_string_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut read = core::pin::pin!(wasix_read_exec_string(&memory, at, text.len() as u32));
+        assert!(poll_once(read.as_mut()).is_none(), "the read waits");
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+
+        swap.serve();
+        let read = poll_once(read.as_mut()).expect("the page is back");
+        assert_eq!(read.ok().as_deref(), Some(text.as_str()));
+    }
+
+    /// The string's page cannot come back, so the launch call traps the
+    /// guest rather than answering it `EFAULT`.
+    #[test]
+    fn a_launch_string_on_a_lost_page_traps_the_guest() {
+        let (mut swap, at, text) = launch_string_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut read = core::pin::pin!(wasix_read_exec_string(&memory, at, text.len() as u32));
+        assert!(poll_once(read.as_mut()).is_none());
+        swap.serve();
+        let error = poll_once(read.as_mut())
+            .expect("the read ends")
+            .expect_err("the page is gone");
+        assert_eq!(
+            read_error_stop(error),
+            P1Stop::Trap(crate::memory::SwapFaultError::Backend)
+        );
+    }
 }
