@@ -51,6 +51,7 @@ mod items;
 mod key;
 mod ondisk;
 mod source;
+mod space;
 mod superblock;
 mod tree;
 mod volume;

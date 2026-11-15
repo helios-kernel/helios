@@ -772,7 +772,7 @@ async fn read_chunk_tree<S: BlockSource>(
 }
 
 /// The newest root item of tree `tree`.
-async fn find_root<S: BlockSource>(
+pub(crate) async fn find_root<S: BlockSource>(
     volume: &Volume<S>,
     root_tree: TreeRoot,
     tree: u64,

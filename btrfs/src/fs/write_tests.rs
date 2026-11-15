@@ -33,6 +33,10 @@ impl BlockSource for Disk {
 }
 
 fn filesystem() -> Filesystem<Disk> {
+    filesystem_image().0
+}
+
+fn filesystem_image() -> (Filesystem<Disk>, File) {
     let mut file = tempfile::tempfile().unwrap();
     // ferrosys' default single-device geometry needs at least 109 MiB.
     let size = 128 << 20;
@@ -46,7 +50,8 @@ fn filesystem() -> Filesystem<Disk> {
         FormatOptions::new([0x53; 16], timestamp),
     )
     .unwrap();
-    block_on(Filesystem::mount(Disk(file))).unwrap()
+    let reference = file.try_clone().unwrap();
+    (block_on(Filesystem::mount(Disk(file))).unwrap(), reference)
 }
 
 fn root_node(fs: &Filesystem<Disk>) -> Node {
@@ -70,6 +75,10 @@ struct Allocator {
 }
 
 impl MetadataAllocator for Allocator {
+    fn cancel(&mut self, _: u64) {
+        self.remaining += 1;
+    }
+
     fn allocate(&mut self, tree: u64, _: u8, _: Key) -> Result<u64, WriteError> {
         if self.remaining == 0 {
             return Err(WriteError::NoSpace { tree });
@@ -267,4 +276,124 @@ fn splits_propagate_through_internal_nodes_and_deletion_shrinks_multiple_levels(
             .collect();
         assert_eq!(contents(&trees, root), expected);
     });
+}
+
+#[test]
+fn space_reservations_exclude_existing_extents_and_return_private_allocations() {
+    use crate::space::{Space, SpaceError};
+    use btrfs_disk::reader::{Traversal, filesystem_open, tree_walk};
+    use btrfs_disk::tree::KeyType;
+
+    block_on(async {
+        let (fs, reference) = filesystem_image();
+        let mut independent = filesystem_open(reference).unwrap();
+        let mut occupied = Vec::new();
+        tree_walk(
+            &mut independent.reader,
+            independent.tree_roots[&2].0,
+            Traversal::Dfs,
+            &mut |block| {
+                if let TreeBlock::Leaf { items, .. } = block {
+                    for item in items {
+                        let length = match item.key.key_type {
+                            KeyType::ExtentItem => item.key.offset,
+                            KeyType::MetadataItem => u64::from(independent.superblock.nodesize),
+                            _ => continue,
+                        };
+                        occupied.push(item.key.objectid..item.key.objectid + length);
+                    }
+                }
+            },
+        )
+        .unwrap();
+        let mut space = Space::load(&fs.volume, fs.root_tree).await.unwrap();
+        let original_available = space.available_metadata();
+        let size = u64::from(fs.superblock().nodesize());
+        let mut allocated = Vec::new();
+        loop {
+            match space.allocate(5, 0, Key::new(256, 1, 0)) {
+                Ok(address) => {
+                    assert!(
+                        occupied
+                            .iter()
+                            .all(|range| address + size <= range.start || range.end <= address)
+                    );
+                    assert!(
+                        fs.volume
+                            .chunks()
+                            .superblock_stripes()
+                            .iter()
+                            .all(|range| address + size <= range.start || range.end <= address)
+                    );
+                    assert!(fs.volume.chunks().map(address, size).is_ok());
+                    allocated.push(address);
+                }
+                Err(WriteError::Space(SpaceError::Exhausted { .. })) => break,
+                Err(error) => panic!("unexpected allocation failure: {error}"),
+            }
+        }
+        assert!(!allocated.is_empty());
+        let mut unique = allocated.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), allocated.len());
+        assert_eq!(space.metadata().count(), allocated.len());
+        assert!(!space.cancel_metadata(fs.default_subvolume.root.bytenr));
+        // Alternating holes exercise coalescing on both sides of each free.
+        for &address in allocated.iter().step_by(2) {
+            assert!(space.cancel_metadata(address));
+            assert!(!space.cancel_metadata(address));
+        }
+        for &address in allocated.iter().skip(1).step_by(2) {
+            assert!(space.cancel_metadata(address));
+        }
+        assert_eq!(space.available_metadata(), original_available);
+        assert_eq!(space.metadata().count(), 0);
+        let address = space.allocate(5, 0, Key::new(256, 1, 0)).unwrap();
+        assert_eq!(address, allocated[0]);
+    });
+}
+
+#[test]
+fn repeated_cow_edits_recycle_private_space_and_pin_committed_blocks() {
+    let fs = filesystem();
+    let mut space = block_on(crate::space::Space::load(&fs.volume, fs.root_tree)).unwrap();
+    let available = space.available_metadata();
+    let original = fs.default_subvolume.root;
+    let mut root = original;
+    let mut trees = Trees::new(original.generation + 1, ChecksumType::Crc32c);
+    let key = Key::new(900, 1, 0);
+    for revision in 0_u64..2048 {
+        root = block_on(trees.apply(
+            &fs.volume,
+            root,
+            key,
+            Some(&revision.to_le_bytes()),
+            &mut space,
+        ))
+        .unwrap();
+        assert_eq!(trees.blocks().count(), 1);
+        assert_eq!(space.metadata().count(), 1);
+        assert_eq!(
+            space.available_metadata(),
+            available - u64::from(fs.volume.superblock().nodesize())
+        );
+        assert_eq!(
+            trees.retired(),
+            &[(original.tree, original.bytenr, original.level)]
+        );
+        assert!(!space.cancel_metadata(original.bytenr));
+        let (address, reservation) = space.metadata().next().unwrap();
+        assert_eq!(address, root.bytenr);
+        assert_eq!(reservation.tree, root.tree);
+        assert_eq!(reservation.level, root.level);
+        let block = trees.blocks().next().unwrap().1;
+        let node = TreeBlock::parse(block);
+        let TreeBlock::Leaf { items, .. } = node else {
+            panic!("expected leaf")
+        };
+        assert_eq!(reservation.first.objectid, items[0].key.objectid);
+    }
+    assert_eq!(contents(&trees, root)[&key], 2047_u64.to_le_bytes());
+    assert_eq!(root_node(&fs).level(), original.level);
 }

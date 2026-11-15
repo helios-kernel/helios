@@ -37,7 +37,9 @@ pub(crate) const STRIPE_LEN: u64 = 64 * 1024;
 /// Object ids with a fixed meaning.
 pub(crate) mod objectid {
     pub(crate) const ROOT_TREE: u64 = 1;
+    pub(crate) const EXTENT_TREE: u64 = 2;
     pub(crate) const CHUNK_TREE: u64 = 3;
+    pub(crate) const BLOCK_GROUP_TREE: u64 = 11;
     pub(crate) const FS_TREE: u64 = 5;
     pub(crate) const ROOT_TREE_DIR: u64 = 6;
     pub(crate) const CSUM_TREE: u64 = 7;
@@ -56,6 +58,9 @@ pub(crate) mod item_type {
     pub(crate) const EXTENT_DATA: u8 = 108;
     pub(crate) const EXTENT_CSUM: u8 = 128;
     pub(crate) const ROOT_ITEM: u8 = 132;
+    pub(crate) const EXTENT_ITEM: u8 = 168;
+    pub(crate) const METADATA_ITEM: u8 = 169;
+    pub(crate) const BLOCK_GROUP_ITEM: u8 = 192;
     pub(crate) const CHUNK_ITEM: u8 = 228;
 }
 

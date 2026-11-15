@@ -20,6 +20,8 @@ pub(crate) enum WriteError {
     #[error(transparent)]
     Read(#[from] Error),
     #[error(transparent)]
+    Space(#[from] crate::space::SpaceError),
+    #[error(transparent)]
     Item(#[from] EditError),
     #[error("no metadata space remains for tree {tree}")]
     NoSpace { tree: u64 },
@@ -31,6 +33,9 @@ pub(crate) enum WriteError {
 /// cleanup all follow the same transaction lifetime, including failed edits.
 pub(crate) trait MetadataAllocator {
     fn allocate(&mut self, tree: u64, level: u8, first: Key) -> Result<u64, WriteError>;
+
+    /// Return an unpublished allocation after its overlay block is discarded.
+    fn cancel(&mut self, address: u64);
 }
 
 pub(crate) struct Trees {
@@ -62,11 +67,18 @@ impl Trees {
         Ok(Node::read(volume, address, expected).await?)
     }
 
-    fn retire(&mut self, tree: u64, address: u64, level: u8) {
-        // Even a transaction-local block has an allocation/reference record.
-        // The allocator must cancel that record rather than leak its reservation.
-        self.blocks.remove(&address);
-        self.retired.push((tree, address, level));
+    fn retire<A: MetadataAllocator>(
+        &mut self,
+        tree: u64,
+        address: u64,
+        level: u8,
+        allocator: &mut A,
+    ) {
+        if self.blocks.remove(&address).is_some() {
+            allocator.cancel(address);
+        } else {
+            self.retired.push((tree, address, level));
+        }
     }
 
     fn insert(&mut self, bytes: alloc::boxed::Box<[u8]>) {
@@ -132,7 +144,7 @@ impl Trees {
                 generation: self.generation,
             });
         }
-        self.retire(root.tree, address, 0);
+        self.retire(root.tree, address, 0, allocator);
         let mut level = 0;
         while let Some((address, node, slot)) = path.pop() {
             level = node.level;
@@ -151,7 +163,7 @@ impl Trees {
                     generation: self.generation,
                 });
             }
-            self.retire(root.tree, address, level);
+            self.retire(root.tree, address, level, allocator);
         }
         if children.is_empty() {
             let fresh = allocator.allocate(root.tree, 0, Key::new(0, 0, 0))?;
@@ -203,7 +215,7 @@ impl Trees {
                 break;
             }
             let (address, generation) = node.child(0);
-            self.retire(root.tree, child.address, level);
+            self.retire(root.tree, child.address, level, allocator);
             child = Child {
                 key: node.key(0),
                 address,
