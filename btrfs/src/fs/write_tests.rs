@@ -2161,6 +2161,17 @@ fn owned_mutations_commit_as_one_generation() {
             .create_node(name(b"source"), attributes(), when)
             .await
             .unwrap();
+        let (tx, removed) = tx
+            .create_node(name(b"temporary"), attributes(), when)
+            .await
+            .unwrap();
+        let tx = tx.unlink_name(name(b"temporary"), when).await.unwrap();
+        let (tx, replacement) = tx
+            .create_node(name(b"temporary"), attributes(), when)
+            .await
+            .unwrap();
+        assert!(replacement.inode > removed.inode);
+        let tx = tx.unlink_name(name(b"temporary"), when).await.unwrap();
         let bytes = vec![0x53; 16384];
         let (tx, count) = tx
             .write_file(source, 0, &bytes, WriteOptions::plain(when, concurrency))

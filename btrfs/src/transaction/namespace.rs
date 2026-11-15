@@ -157,21 +157,26 @@ impl<S: BlockSink> Transaction<'_, S> {
     ) -> Result<u64, WriteError> {
         validate_name(name.bytes)?;
         let tree = name.tree;
-        let root = self.roots.get(tree)?;
-        let last = self
-            .trees
-            .floor(
-                &self.volume,
-                root,
-                Key::new(objectid::LAST_FREE, u8::MAX, u64::MAX),
-            )
-            .await?;
-        let inode = last
-            .map_or(Some(objectid::FIRST_FREE), |(key, _)| {
+        let next = if let Some(last) = self.inode_high_water.get(&tree) {
+            last.checked_add(1)
+        } else {
+            let root = self.roots.get(tree)?;
+            let last = self
+                .trees
+                .floor(
+                    &self.volume,
+                    root,
+                    Key::new(objectid::LAST_FREE, u8::MAX, u64::MAX),
+                )
+                .await?;
+            last.map_or(Some(objectid::FIRST_FREE), |(key, _)| {
                 key.objectid.checked_add(1)
             })
+        };
+        let inode = next
             .filter(|number| *number <= objectid::LAST_FREE)
             .ok_or(WriteError::IdentifierExhausted { tree })?;
+        self.inode_high_water.insert(tree, inode);
         let timestamp = time(tree, inode, when)?;
         let mut raw = RawInodeItem::new_zeroed();
         raw.generation.set(self.trees.generation());

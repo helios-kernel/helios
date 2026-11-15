@@ -23,6 +23,7 @@ use crate::source::BlockSink;
 use crate::space::Space;
 use crate::tree::write::{Trees, WriteError};
 use crate::volume::Volume;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
 /// Produced only once the new roots are durable, or for an unchanged view.
@@ -32,6 +33,9 @@ pub(crate) struct Committed {
 
 pub(crate) struct Transaction<'a, S> {
     generation: Arc<Snapshot>,
+    // Inode generations distinguish reuse across commits. Within one commit,
+    // keep allocated numbers monotonic even after an inode is deleted again.
+    inode_high_water: BTreeMap<u64, u64>,
     retirements: &'a mut Retirements,
     volume: Volume<S>,
     image: CommitImage,
@@ -96,6 +100,7 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         let trees = Trees::new(generation, volume.superblock().csum_type());
         Ok(Self {
             generation: pin,
+            inode_high_water: BTreeMap::new(),
             retirements,
             volume,
             image,
