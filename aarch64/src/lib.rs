@@ -1756,6 +1756,15 @@ extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
 /// it disabled.
 const SPSR_IRQ_MASK: u64 = 1 << 7;
 
+/// CurrentEL uses the same EL bits as SPSR.M; bit zero selects the stack.
+fn current_exception_level() -> u64 {
+    let level;
+    unsafe {
+        asm!("mrs {level}, CurrentEL", level = out(reg) level, options(nomem, nostack, preserves_flags));
+    }
+    level
+}
+
 fn mask_irq() {
     unsafe {
         asm!(
