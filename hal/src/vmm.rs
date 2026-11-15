@@ -439,8 +439,10 @@ pub trait AddressSpace: Send + Sync + 'static {
     /// attributes: the leaf entries carry the region's own — a
     /// [`MemoryKind::Device`](crate::device::MemoryKind::Device) range
     /// is mapped so that accesses reach the device unmerged,
-    /// unspeculated and in program order, and a region that is not
-    /// writable is mapped read-only.
+    /// unspeculated and in program order, a
+    /// [`MemoryKind::WriteCombining`](crate::device::MemoryKind::WriteCombining)
+    /// one with the architecture's write-combining type, and a region
+    /// that is not writable is mapped read-only.
     ///
     /// A backend that cannot express device memory in its page tables
     /// reports [`AddressSpaceError::DeviceMappingUnsupported`] rather
@@ -585,7 +587,7 @@ pub trait AddressSpace: Send + Sync + 'static {
     ///    frames are unconstrained by the user-pool free list and
     ///    may not even be reachable through the HHDM the backend
     ///    expects). The required primitive is a per-platform
-    ///    `PhysFrameAllocator::allocate(count, zero_first_use=false)`
+    ///    `PhysFrameAllocator::allocate(node, count, zero_first_use=false)`
     ///    that returns a contiguous `PhysFrameRange`.
     /// 3. Copy bytes through the kernel data view of both the source
     ///    and destination frames (HHDM on x86/aarch64,

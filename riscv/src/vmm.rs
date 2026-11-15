@@ -56,7 +56,7 @@
 //! hart sets up the root table, secondary harts share it via `satp`.
 //! Every address-space mutation invalidates this hart's TLB entries
 //! and dispatches one `sbi_rt::remote_sfence_vma` range fence to every
-//! other hart, after the last page-table write and before any frame
+//! other running hart (a stopped hart flushes on restart), after the last page-table write and before any frame
 //! goes back to the user-memory pool.
 
 extern crate alloc;
@@ -81,8 +81,9 @@ use helios_kernel::runtime_memory::{
 };
 use helios_kernel::{
     FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, VaCursor,
-    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame_on,
-    deallocate_user_run_on, install_fiber_stack_hooks, ranges_outside, validate_range,
+    allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on,
+    deallocate_user_frame_on, deallocate_user_run_on, install_fiber_stack_hooks, ranges_outside,
+    user_frame_node, validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -283,9 +284,13 @@ impl RiscvUserAddressSpace {
     /// access is cacheable and reorderable is a physical memory
     /// attribute of the address, fixed by the platform, not something
     /// a leaf PTE selects. (Svpbmt adds one, and QEMU's `virt` does not
-    /// offer it.) So a register window is an ordinary valid leaf
-    /// pointing into the platform's I/O space, and the region's `kind`
-    /// changes nothing here — it is already true of the address.
+    /// offer it, so this backend negotiates no Svpbmt.) So a register
+    /// window is an ordinary valid leaf pointing into the platform's I/O
+    /// space, and the region's `kind` changes nothing here — it is
+    /// already true of the address. A write-combining region is reached
+    /// with whatever the platform's attributes of its address say, which
+    /// for a device aperture is I/O memory: stronger ordering than the
+    /// kind asks for, never weaker.
     /// Execute is never granted: a device holds no instructions the
     /// guest may run.
     fn device_pte(&self, attributes: DeviceRegionAttributes) -> u64 {
@@ -501,6 +506,18 @@ impl RiscvUserAddressSpace {
         Ok(raw.as_ptr() as usize)
     }
 
+    /// A replacement for the frame at `old_phys`, from the node that
+    /// frame is on: a relocation that moved the page to another node
+    /// would undo its placement. Not zeroed, because the caller copies
+    /// the whole page over it.
+    fn alloc_relocation_frame(&self, old_phys: usize) -> Result<usize, AddressSpaceError> {
+        let old = NonNull::new(old_phys as *mut u8)
+            .unwrap_or_else(|| panic!("RISC-V relocation source is a null frame"));
+        let raw = allocate_user_frame_uninit_on_node(user_frame_node(old))
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        Ok(raw.as_ptr() as usize)
+    }
+
     fn dealloc_user_phys(&self, phys: usize) {
         let ptr = NonNull::new(phys as *mut u8)
             .unwrap_or_else(|| panic!("RISC-V user-frame dealloc received null pointer"));
@@ -523,7 +540,7 @@ impl RiscvUserAddressSpace {
                     return Err(AddressSpaceError::NotCommitted);
                 }
             };
-            let new_phys = match self.alloc_user_frame() {
+            let new_phys = match self.alloc_relocation_frame(old_phys) {
                 Ok(phys) => phys,
                 Err(error) => {
                     for page in pages {
@@ -1183,17 +1200,7 @@ fn flush_tlb_pages(start: usize, pages: usize) {
         }
     }
     let byte_len = pages * PAGE_SIZE;
-    let ret = sbi_rt::remote_sfence_vma(
-        sbi_rt::HartMask::from_mask_base(0, usize::MAX),
-        start,
-        byte_len,
-    );
-    assert!(
-        ret.is_ok(),
-        "SBI remote_sfence_vma failed for user VA {start:#x}+{byte_len:#x}: error={} value={}",
-        ret.error,
-        ret.value
-    );
+    crate::lifecycle::remote_sfence_vma(start, byte_len);
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
