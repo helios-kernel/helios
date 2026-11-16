@@ -19,7 +19,13 @@ impl wit::GuestGpu for Gpu {
     ) -> Option<wit::GpuAdapter> {
         let instance = self
             .instance
-            .get_or_init(|| Instance::open().ok())
+            .get_or_init(|| {
+                Instance::open()
+                    .inspect_err(|error| {
+                        tracing::error!(%error, "the Vulkan instance did not open");
+                    })
+                    .ok()
+            })
             .as_ref()?;
         let mut native = wgpu_types::RequestAdapterOptions::default();
         if let Some(options) = options {

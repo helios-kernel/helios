@@ -66,10 +66,9 @@ impl Adapter {
     pub fn request(instance: &Instance, options: &RequestAdapterOptions) -> Option<Self> {
         let global = instance.global();
         let id = instance.ids.adapters.allocate();
-        if global
-            .request_adapter(options, wgpu_types::Backends::VULKAN, Some(id))
-            .is_err()
+        if let Err(error) = global.request_adapter(options, wgpu_types::Backends::VULKAN, Some(id))
         {
+            tracing::error!(%error, "no Vulkan adapter");
             instance.ids.adapters.release(id);
             return None;
         }
@@ -83,9 +82,30 @@ impl Adapter {
             consumed: Cell::new(false),
         };
         // A rejected adapter drops through its handle like any other.
-        (adapter.downlevel.is_webgpu_compliant()
-            && wgpu_types::Limits::default().check_limits(&adapter.limits))
-        .then_some(adapter)
+        let compliant = adapter.downlevel.is_webgpu_compliant();
+        if !compliant {
+            tracing::error!(
+                missing = ?(wgpu_types::DownlevelFlags::compliant() - adapter.downlevel.flags),
+                shader_model = ?adapter.downlevel.shader_model,
+                adapter = ?adapter.info.name,
+                "the adapter lacks WebGPU's downlevel capabilities",
+            );
+        }
+        let mut within = true;
+        wgpu_types::Limits::default().check_limits_with_fail_fn(
+            &adapter.limits,
+            false,
+            |name, required, allowed| {
+                within = false;
+                tracing::error!(
+                    limit = name,
+                    required,
+                    allowed,
+                    "the adapter is below WebGPU's default limits"
+                );
+            },
+        );
+        (compliant && within).then_some(adapter)
     }
 
     /// Open the device and start its timeline. This runs in the async

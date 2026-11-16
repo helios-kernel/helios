@@ -2911,6 +2911,8 @@ dependencies = [
  "helios-venus",
  "indexmap",
  "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
  "wgpu",
  "wgpu-core",
  "wgpu-hal",

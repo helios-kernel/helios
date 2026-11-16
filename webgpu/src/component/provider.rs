@@ -63,6 +63,18 @@ impl wit::Guest for Provider {
     type WgslLanguageFeatures = LanguageFeatures;
 
     fn get_gpu() -> wit::Gpu {
+        // The component's diagnostics, the Venus driver's included, go to
+        // its stderr. `get-gpu` is the entry every program calls first; a
+        // second call finds the subscriber already installed, which is
+        // what it would have installed.
+        if tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .without_time()
+            .try_init()
+            .is_err()
+        {
+            tracing::trace!("a subscriber is already installed");
+        }
         wit::Gpu::new(Gpu::default())
     }
 }

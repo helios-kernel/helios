@@ -4,8 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-component = ["dep:wgpu-core", "dep:wgpu-types", "dep:indexmap", "runtime", "helios-api/webgpu-provider"]
-runtime = ["dep:ash", "dep:async-channel", "dep:helios-api", "dep:helios-venus", "dep:thiserror", "dep:wgpu", "dep:wgpu-hal"]
+component = ["dep:wgpu-core", "dep:wgpu-types", "dep:indexmap", "dep:tracing-subscriber", "runtime", "helios-api/webgpu-provider"]
+runtime = ["dep:ash", "dep:async-channel", "dep:helios-api", "dep:helios-venus", "dep:thiserror", "dep:tracing", "dep:wgpu", "dep:wgpu-hal"]
 
 [dependencies]
 indexmap = { version = "2.14.2", default-features = false, features = ["std"], optional = true }
@@ -14,6 +14,10 @@ async-channel = { version = "2.5.0", default-features = false, features = ["std"
 helios-api = { path = "../api", default-features = false, features = ["gpu", "surface", "sync"], optional = true }
 helios-venus = { path = "../venus", default-features = false, features = ["helios", "driver"], optional = true }
 thiserror = { version = "2.0.21", default-features = false, optional = true }
+tracing = { workspace = true, optional = true }
+# The provider component's own diagnostics, and the Venus driver's, on its
+# stderr.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"], optional = true }
 wgpu = { git = "https://github.com/lexoliu/wgpu", branch = "feat/helios-wasi-vulkan", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
 wgpu-hal = { git = "https://github.com/lexoliu/wgpu", branch = "feat/helios-wasi-vulkan", default-features = false, features = ["vulkan"], optional = true }
 
