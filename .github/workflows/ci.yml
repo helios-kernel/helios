@@ -2715,7 +2715,7 @@ jobs:
             libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin \
             liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev \
             uuid-runtime xfsprogs "linux-headers-$(uname -r)" sqlite3 \
-            libgdbm-compat-dev btrfs-progs fuse3 libclang-dev
+            libgdbm-compat-dev xfslibs-dev btrfs-progs fuse3 libclang-dev
       - name: Build the FUSE adapter
         working-directory: helios
         run: cargo build --locked -p helios-btrfs --example fuse-btrfs --features test-support,write
