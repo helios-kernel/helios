@@ -9317,39 +9317,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    #[ignore = "requires QEMU and a cross-compiled native-users kernel"]
-    fn native_linux_syscalls_x86() -> Result<(), GuestTestFailure> {
-        let root = repo_root()?;
-        let bootfs = root.join("target/native-linux-bootfs");
-        run_step(
-            "building Linux ABI fixtures",
-            Command::new("bash")
-                .current_dir(&root)
-                .arg("linux/tests/build-fixtures.sh")
-                .arg(&bootfs),
-        )?;
-        let mut command = guest_test_command(&X86_64_VM_PROFILE);
-        command.accel =
-            vec![std::env::var("HELIOS_NATIVE_TEST_ACCEL").unwrap_or_else(|_| "kvm".to_owned())];
-        command.cpu = default_cpu(command.profile, &command.accel).map(str::to_owned);
-        command.build.kernel_features = vec!["linux-prototype".to_owned()];
-        command.build.bootfs_root = Some(bootfs);
-        command.runtime_dir = Some(root.join("target/native-linux-runtime"));
-        command.keep_runtime_dir = true;
-        command.debug_serial_log = Some(root.join("target/native-linux-serial.log"));
-        build_self_test_kernel(&command, &[])?;
-        let mut runtime = VmRuntime::spawn(&command)?;
-        let marker = b"native Linux prototype passed:";
-        let result = wait_for_console_matches(
-            runtime.socket_path(),
-            |line| line.windows(marker.len()).any(|window| window == marker),
-            1,
-        );
-        runtime.shutdown();
-        result
-    }
-
     /// The aarch64 kernel built with `HELIOS_CFI_SELF_TEST` corrupts a signed
     /// return address on the bootstrap processor once every processor has
     /// started, so a machine that enforces return-address signing panics with

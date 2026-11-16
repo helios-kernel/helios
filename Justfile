@@ -236,7 +236,7 @@ clippy-target target package:
     cargo clippy ${build_std} \
         -p "{{ package }}" --target "{{ target }}" -- -D warnings
     if [[ "{{ package }}" == helios-x86 ]]; then
-        cargo clippy -p helios --features linux-prototype --target "{{ target }}" -- -D warnings
+        cargo clippy -p helios --features linux --target "{{ target }}" -- -D warnings
     fi
 
 # Build the instrumented kernel image of docs/pgo.md for `arch` (aarch64,
