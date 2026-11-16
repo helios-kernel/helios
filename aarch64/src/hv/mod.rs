@@ -306,7 +306,8 @@ impl Vcpu {
         let saved_mdcr = read!(mdcr_el2);
         write!(vtcr_el2, self.space.lease.hardware.vtcr);
         write!(vttbr_el2, self.space.tables.vttbr() as u64);
-        tables::flush();
+        // VMIDs retain translations across switches. Table mutations and
+        // final VMID release complete their own broadcast invalidation.
         write!(cntvoff_el2, 0u64);
         // E2H shifts EL1 physical-counter/timer access enables to bits 10/11.
         write!(cnthctl_el2, 3u64 << 10);
@@ -352,7 +353,6 @@ impl Vcpu {
         host_debug.restore();
         write!(cnthp_ctl_el2, 0u64);
         self.vgic.detach();
-        tables::flush();
         write!(vttbr_el2, saved_vttbr);
         write!(vtcr_el2, saved_vtcr);
         write!(cntvoff_el2, saved_offset);
