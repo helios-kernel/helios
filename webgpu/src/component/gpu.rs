@@ -1,15 +1,15 @@
+use core::cell::OnceCell;
+
 use super::{adapter::Adapter, backend::Runtime, convert::Convert, value::LanguageFeatures, wit};
 
+/// The `gpu` entry point.
+///
+/// `get-gpu` is a synchronous export, and opening the Vulkan instance
+/// waits on the host's GPU device, which a synchronous task may not do, so
+/// the instance opens on the first `request-adapter`, an async export.
+#[derive(Default)]
 pub struct Gpu {
-    pub runtime: Result<Runtime, wgpu_hal::InstanceError>,
-}
-
-impl Default for Gpu {
-    fn default() -> Self {
-        Self {
-            runtime: Runtime::open(),
-        }
-    }
+    runtime: OnceCell<Result<Runtime, wgpu_hal::InstanceError>>,
 }
 
 impl wit::GuestGpu for Gpu {
@@ -17,7 +17,7 @@ impl wit::GuestGpu for Gpu {
         &self,
         options: Option<wit::GpuRequestAdapterOptions>,
     ) -> Option<wit::GpuAdapter> {
-        let runtime = self.runtime.as_ref().ok()?;
+        let runtime = self.runtime.get_or_init(Runtime::open).as_ref().ok()?;
         let mut native = wgpu_types::RequestAdapterOptions::default();
         if let Some(options) = options {
             // WebGPU permits core-defaulting adapters for compatibility requests
