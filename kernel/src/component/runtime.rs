@@ -62,15 +62,24 @@ pub const MAX_CORE_INSTANCES_PER_COMPONENT: u32 = 8;
 /// so it is deliberately tight.
 pub const MAX_MEMORIES_PER_COMPONENT: u32 = 2;
 
-/// The most tables one component may hold.
+/// The tables the pool sets aside for each of [`MAX_CONCURRENT_INSTANCES`].
 ///
-/// Measured at exactly two for every component this tree builds: the
-/// main module's function table and the shim's. There is no headroom
+/// Measured at exactly two for every single component this tree builds:
+/// the main module's function table and the shim's. There is no headroom
 /// here on purpose — the table pool is the one pool the runtime commits
 /// up front rather than reserving, so this number is paid in user pages
 /// per live slot whether or not any component uses it. See
 /// [`MAX_POOLED_USER_MEMORY`].
-pub const MAX_TABLES_PER_COMPONENT: u32 = 2;
+pub const TABLES_PER_INSTANCE: u32 = 2;
+
+/// The most tables one component may hold.
+///
+/// A component the build composed from others holds the sum of theirs: a
+/// program with the WebGPU provider plugged in carries its own two and
+/// the provider's two. The pool is sized by [`TABLES_PER_INSTANCE`], not
+/// by this, so a composed program draws more of the shared pool rather
+/// than growing what every slot commits.
+pub const MAX_TABLES_PER_COMPONENT: u32 = 4;
 
 /// The virtual address space the kernel will let the runtime's instance
 /// pools reserve.
