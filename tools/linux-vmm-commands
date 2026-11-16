@@ -9,5 +9,6 @@ if test -e /sys/devices/system/cpu/cpu1/online; then
 fi
 printf 'helios-virtio-block\n' | dd of=/dev/vda bs=512 conv=sync
 sync
-test "$(dd if=/dev/vda bs=512 count=1 2>/dev/null | head -c 18)" = helios-virtio-block && printf '\nHELIOS_BLOCK_OK\n'
+IFS= read -r written < /dev/vda
+test "$written" = helios-virtio-block && printf '\nHELIOS_BLOCK_OK\n'
 poweroff -f

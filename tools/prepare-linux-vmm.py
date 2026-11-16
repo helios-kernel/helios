@@ -57,7 +57,10 @@ def main():
     # Alpine's network installer without changing its real BusyBox or modules.
     init = Path(__file__).with_name("linux-vmm-init").read_bytes()
     original = gzip.decompress((args.output / "initramfs-alpine.gz").read_bytes())
-    overlay = cpio_entry("init", init, 0o100755) + cpio_entry("TRAILER!!!", b"", 0)
+    rules = Path(__file__).with_name("linux-vmm-mdev.conf").read_bytes()
+    overlay = (cpio_entry("init", init, 0o100755)
+               + cpio_entry("etc/mdev.conf", rules, 0o100644)
+               + cpio_entry("TRAILER!!!", b"", 0))
     with (args.output / "initramfs.gz").open("wb") as target:
         with gzip.GzipFile(fileobj=target, mode="wb", mtime=0) as compressed:
             compressed.write(original)

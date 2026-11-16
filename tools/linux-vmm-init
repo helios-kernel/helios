@@ -4,8 +4,17 @@ set -eu
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
+# mdev binds its event socket and scans before daemonizing. Keep the FIFO
+# open at both ends so an add event can arrive before the reader starts.
+mkdir -p /run
+mkfifo /run/console-ready
+exec 3<>/run/console-ready
+mdev -d
 modprobe virtio_mmio
 modprobe virtio_blk
+timeout 30 sh -c 'read -r ready <&3'
+exec 3>&-
+rm /run/console-ready
 hostname helios-vm
 exec </dev/hvc0 >/dev/hvc0 2>&1
 printf '\nHELIOS_LINUX_READY\n'
