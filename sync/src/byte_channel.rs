@@ -190,6 +190,22 @@ impl ByteQueue {
         (chunks.pop(), was_full)
     }
 
+    fn pop_limit(&self, limit: usize) -> (Option<Bytes>, bool) {
+        let mut chunks = self.chunks.lock();
+        let was_full = chunks.is_full();
+        let front = if !chunks.inline.is_empty() {
+            chunks.inline.front_mut()
+        } else {
+            chunks.overflow.as_mut().and_then(VecDeque::front_mut)
+        };
+        if let Some(front) = front
+            && front.len() > limit
+        {
+            return (Some(front.split_to(limit)), false);
+        }
+        (chunks.pop(), was_full)
+    }
+
     fn is_empty(&self) -> bool {
         self.chunks.lock().is_empty()
     }
@@ -763,6 +779,16 @@ impl ByteReader {
         }
     }
 
+    /// True while the shared stream still contains unread bytes.
+    pub fn has_buffered_data(&self) -> bool {
+        !self.channel.queue.is_empty()
+    }
+
+    /// True after the final writer closes, including while buffered data remains.
+    pub fn is_writer_closed(&self) -> bool {
+        self.channel.writer_closed.load(Ordering::Acquire)
+    }
+
     pub fn is_readable(&self) -> bool {
         !self.channel.queue.is_empty()
             || self.channel.writer_closed.load(Ordering::Acquire)
@@ -808,6 +834,41 @@ impl ByteReader {
                 }
             }
         }
+    }
+
+    /// Reads at most `limit` bytes while keeping the unconsumed tail in the
+    /// shared queue. Duplicated read handles observe one byte stream.
+    pub fn try_read_limit(&self, limit: usize) -> TryRead {
+        if limit == 0 {
+            return TryRead::Ready(Bytes::new());
+        }
+        let (bytes, freed_full_slot) = self.channel.queue.pop_limit(limit);
+        if freed_full_slot && bytes.is_some() {
+            self.channel.writable.notify_all();
+        }
+        match bytes {
+            Some(bytes) => TryRead::Ready(bytes),
+            None if self.channel.is_closed() => TryRead::Eof,
+            None => TryRead::Pending,
+        }
+    }
+    pub async fn read_limit(&self, limit: usize) -> Option<Bytes> {
+        let mut wait = self.wait_state();
+        core::future::poll_fn(|cx| {
+            loop {
+                match self.try_read_limit(limit) {
+                    TryRead::Ready(bytes) => return Poll::Ready(Some(bytes)),
+                    TryRead::Eof => return Poll::Ready(None),
+                    TryRead::Pending => {
+                        match self.channel.readable.poll_notified(cx, &mut wait.wait) {
+                            Poll::Ready(()) => continue,
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                }
+            }
+        })
+        .await
     }
 
     /// Non-blocking peek: returns an immediately available chunk or
@@ -904,6 +965,26 @@ mod tests {
                 "chunk {index} should fit below capacity"
             );
         }
+    }
+
+    #[test]
+    fn partial_reads_leave_one_tail_for_all_read_handles() {
+        let (writer, reader) = byte_channel();
+        let duplicate = reader.clone();
+        assert_eq!(
+            writer.try_write(Bytes::from_static(b"abcdef")),
+            TryWrite::Written
+        );
+        assert!(
+            matches!(reader.try_read_limit(2), super::TryRead::Ready(bytes) if bytes == b"ab"[..])
+        );
+        drop(writer);
+        assert!(duplicate.is_writer_closed());
+        assert!(duplicate.has_buffered_data());
+        assert!(
+            matches!(duplicate.try_read_limit(8), super::TryRead::Ready(bytes) if bytes == b"cdef"[..])
+        );
+        assert!(matches!(reader.try_read_limit(1), super::TryRead::Eof));
     }
 
     #[test]

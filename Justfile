@@ -70,6 +70,8 @@ clippy-host:
     # `helios-venus` generates its protocol module from the pinned
     # venus-protocol inputs when it builds.
     cargo run -p helios-cli --quiet -- venus-protocol-fetch
+    cargo clippy -p helios-sync --all-targets --features runtime -- -D warnings
+    cargo clippy -p helios-unix --all-targets --features runtime -- -D warnings
     cargo clippy -p helios-linux --all-targets --features runtime -- -D warnings
     cargo clippy \
         --workspace --all-targets \
@@ -124,6 +126,8 @@ test-kernel run_ignored="default":
 test-libraries:
     #!/usr/bin/env bash
     set -euo pipefail
+    cargo nextest run -p helios-sync --features runtime
+    cargo nextest run -p helios-unix --features runtime
     cargo nextest run -p helios-linux --features runtime
     cargo nextest run -p helios-firmware
     cargo nextest run -p helios-workspace-root --lib

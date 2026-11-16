@@ -2055,6 +2055,7 @@ name = "helios"
 version = "0.1.0"
 dependencies = [
  "helios-aarch64",
+ "helios-hal",
  "helios-hosted",
  "helios-inspector-protocol",
  "helios-kernel",
@@ -2493,7 +2494,6 @@ dependencies = [
  "arc-swap",
  "arrayvec",
  "askama",
- "async-lock",
  "async-task",
  "atomic-waker",
  "bitflags 2.13.1",
@@ -2505,7 +2505,6 @@ dependencies = [
  "divan",
  "ed25519-dalek",
  "erofs-rs",
- "event-listener",
  "ferrosys",
  "frame-alloc",
  "futures",
@@ -2517,6 +2516,8 @@ dependencies = [
  "helios-compiler-abi",
  "helios-hal",
  "helios-netstack",
+ "helios-sync",
+ "helios-unix",
  "hkdf",
  "hmac",
  "lru 0.16.4",
@@ -2548,6 +2549,10 @@ dependencies = [
 name = "helios-linux"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "critical-section",
+ "helios-sync",
+ "helios-unix",
  "object",
  "thiserror 2.0.21",
 ]
@@ -2654,6 +2659,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-sync"
+version = "0.1.0"
+dependencies = [
+ "async-lock",
+ "bytes",
+ "critical-section",
+ "event-listener",
+ "futures",
+ "futures-lite",
+ "heapless",
+ "spin 0.9.9",
+ "triomphe",
+]
+
+[[package]]
 name = "helios-tpm"
 version = "0.1.0"
 dependencies = [
@@ -2665,6 +2685,23 @@ dependencies = [
  "thiserror 2.0.21",
  "tpm2-protocol",
  "zeroize",
+]
+
+[[package]]
+name = "helios-unix"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "critical-section",
+ "futures",
+ "futures-lite",
+ "hashbrown 0.16.1",
+ "heapless",
+ "helios-hal",
+ "helios-sync",
+ "spin 0.9.9",
+ "thiserror 2.0.21",
+ "triomphe",
 ]
 
 [[package]]

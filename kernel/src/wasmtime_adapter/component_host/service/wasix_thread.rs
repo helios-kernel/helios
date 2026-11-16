@@ -1,275 +1,5 @@
 use super::*;
 
-/// The threads of one WASIX process: its main thread's mailbox, every
-/// thread any store of the process spawned and nobody has joined, the
-/// next thread id, and the end a spawned thread chose for the whole
-/// process.
-///
-/// The process owns its threads, not the store that spawned each one,
-/// so any thread joins or signals any other and the process's end
-/// ([`Self::end`]) reaches all of them, those whose spawner has itself
-/// returned included. A spawned thread that exits, execs, takes a
-/// fatal signal or fails (a trap, an out-of-memory kill) ends the
-/// process the same way main does ([`Self::end_from_thread`]): `Image`
-/// is what an exec hands the process's main thread to run next.
-///
-/// # Concurrency
-///
-/// Every store of the process, each driven on whichever processor runs
-/// it, admits, joins, signals and ends the process through one table.
-/// Each of those takes the spin lock for one lookup, push, removal or
-/// record and releases it before anything is awaited or raised; no
-/// interrupt handler touches the table. A thread's end is published
-/// lock-free through its own [`WasixThreadExit`], which the joiner and
-/// the process's end wait on outside the lock.
-pub(super) struct WasixProcessThreads<Image> {
-    table: Arc<Mutex<WasixThreadTable<Image>>>,
-    /// The main thread's own mailbox, through which a spawned thread
-    /// that ends the process ends main's image.
-    main: WasixSignalState,
-}
-
-impl<Image> Clone for WasixProcessThreads<Image> {
-    fn clone(&self) -> Self {
-        Self {
-            table: self.table.clone(),
-            main: self.main.clone(),
-        }
-    }
-}
-
-struct WasixThreadTable<Image> {
-    next_tid: u32,
-    threads: Vec<WasixThread>,
-    /// Set by [`WasixProcessThreads::end`] and by
-    /// [`WasixProcessThreads::end_from_thread`]; no thread is admitted
-    /// after, and no second end is recorded.
-    ended: bool,
-    /// The end a spawned thread chose for the process, recorded before
-    /// main's image is ended and taken by main once its call has
-    /// stopped.
-    process_end: Option<WasixProcessEnd<Image>>,
-}
-
-/// How a spawned thread ended its whole process: each is the end the
-/// same call would have given main's image (`run_core_module_image`).
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum WasixProcessEnd<Image> {
-    /// `proc_exit` or a fatal signal's default action, with the
-    /// process's exit status.
-    Exit(u32),
-    /// `proc_exec*`: the image the process runs next, in place of the
-    /// one every thread of it was running.
-    Exec(Image),
-    /// A trap or any other failure, with the failure main reports for
-    /// it, as the default action of `SIGSEGV` and `SIGILL` ends the
-    /// process.
-    Fail(ProgramExecError),
-}
-
-struct WasixThread {
-    tid: u32,
-    /// The thread's own mailbox: `thread_signal` raises on it and the
-    /// process's end ends the thread through it.
-    mailbox: WasixSignalState,
-    exit: Arc<WasixThreadExit>,
-}
-
-impl<Image> WasixProcessThreads<Image> {
-    /// The table of a new process, whose main thread is thread 0.
-    pub(super) fn new() -> Self {
-        Self {
-            table: Arc::new(Mutex::new(WasixThreadTable {
-                next_tid: 1,
-                threads: Vec::new(),
-                ended: false,
-                process_end: None,
-            })),
-            main: WasixSignalState::new(),
-        }
-    }
-
-    /// The main thread's own mailbox, for its store to read.
-    pub(super) fn main_mailbox(&self) -> WasixSignalState {
-        self.main.clone()
-    }
-
-    /// Ends the whole process from spawned thread `tid`, whose own call
-    /// has ended with `end`, as POSIX `exit`, `execve`, a fatal signal
-    /// and a fault's default action do from any thread.
-    ///
-    /// The end is recorded first, then main's image is ended through
-    /// its mailbox, which stops main's call and makes main's completion
-    /// take the end ([`Self::take_process_end`]): the exit status or the
-    /// failure it reports, or the image it runs next once every thread
-    /// has ended; every other thread is
-    /// ended in the same pass, so none runs on after the process's end
-    /// and they stop concurrently. Main's completion path then waits for
-    /// all of them through [`Self::end`], as for any other end of the
-    /// image.
-    ///
-    /// The first end wins. One that comes after the process has already
-    /// ended, by main's own end or another thread's, is dropped: the
-    /// thread raising it is being ended with the rest.
-    pub(super) fn end_from_thread(&self, tid: u32, end: WasixProcessEnd<Image>) {
-        let others: Vec<WasixSignalState> = {
-            let mut table = self.table.lock();
-            if table.ended {
-                return;
-            }
-            table.ended = true;
-            table.process_end = Some(end);
-            table
-                .threads
-                .iter()
-                .filter(|thread| thread.tid != tid)
-                .map(|thread| thread.mailbox.clone())
-                .collect()
-        };
-        // Recorded under the lock before main is stopped, so main finds
-        // the end once its call meets the stop.
-        self.main.end_thread();
-        for mailbox in &others {
-            mailbox.end_thread();
-        }
-    }
-
-    /// The end a spawned thread recorded for the process, taken by main
-    /// once its call has stopped on its mailbox's end.
-    pub(super) fn take_process_end(&self) -> Option<WasixProcessEnd<Image>> {
-        self.table.lock().process_end.take()
-    }
-
-    /// Admits a thread whose mailbox is `mailbox` and whose end `exit`
-    /// will publish, and returns its id, which fits the `i32` that
-    /// `wasi_thread_start` takes. A process that has ended admits
-    /// nothing: the caller is one of its threads, ended already, and it
-    /// gets `AGAIN`, `pthread_create`'s answer for a thread it cannot
-    /// have.
-    pub(super) fn admit(
-        &self,
-        mailbox: WasixSignalState,
-        exit: Arc<WasixThreadExit>,
-    ) -> Result<u32, i32> {
-        let mut table = self.table.lock();
-        if table.ended {
-            return Err(p1::errno::AGAIN);
-        }
-        let tid = table.next_tid;
-        i32::try_from(tid).map_err(|_| p1::errno::OVERFLOW)?;
-        table.next_tid = tid + 1;
-        table.threads.push(WasixThread { tid, mailbox, exit });
-        Ok(tid)
-    }
-
-    /// Removes thread `tid` from the table, if it is still there.
-    pub(super) fn withdraw(&self, tid: u32) {
-        let mut table = self.table.lock();
-        if let Some(index) = table.threads.iter().position(|thread| thread.tid == tid) {
-            table.threads.swap_remove(index);
-        }
-    }
-
-    /// The end of thread `tid`, for a join to wait on.
-    pub(super) fn exit_of(&self, tid: u32) -> Option<Arc<WasixThreadExit>> {
-        self.table
-            .lock()
-            .threads
-            .iter()
-            .find(|thread| thread.tid == tid)
-            .map(|thread| thread.exit.clone())
-    }
-
-    /// The mailbox of thread `tid`, while it is still running.
-    pub(super) fn live_mailbox(&self, tid: u32) -> Option<WasixSignalState> {
-        self.table
-            .lock()
-            .threads
-            .iter()
-            .find(|thread| thread.tid == tid && thread.exit.code().is_none())
-            .map(|thread| thread.mailbox.clone())
-    }
-
-    /// Ends every thread the process still has and returns once each one
-    /// has ended, its store, fiber stack and registry handle dropped.
-    ///
-    /// Called once, by the process's main thread after its own call has
-    /// ended and before the process's completion is reported, whether
-    /// main ended on its own or a spawned thread ended it
-    /// ([`Self::end_from_thread`]). The table is closed and emptied
-    /// under the lock, so a thread admitted later cannot exist; then
-    /// every thread is ended (again, harmlessly, for those a spawned
-    /// thread's end already reached), and only then is any
-    /// awaited, so the threads stop concurrently and the wait is the
-    /// slowest one's. A parked thread is reached through the wake its
-    /// turn is armed on, which drops the call it is parked in, and a
-    /// running one through its interrupt check (see
-    /// [`WasixSignalState::end_thread`]).
-    pub(super) async fn end(&self) {
-        let threads = {
-            let mut table = self.table.lock();
-            table.ended = true;
-            core::mem::take(&mut table.threads)
-        };
-        for thread in &threads {
-            thread.mailbox.end_thread();
-        }
-        futures::future::join_all(threads.iter().map(|thread| thread.exit.wait())).await;
-    }
-}
-
-/// The end of one WASIX thread: its exit status, published once, after
-/// the thread's store is gone.
-///
-/// # Concurrency
-///
-/// The thread's task publishes from whichever processor ran it; any
-/// number of waiters (a joiner, the process's end) wait on any other.
-/// The status is one atomic and the broadcast stores nothing, so a
-/// waiter arms its wait before it reads the status.
-pub(super) struct WasixThreadExit {
-    status: AtomicU64,
-    ended: crate::Notify,
-}
-
-impl WasixThreadExit {
-    const RUNNING: u64 = u64::MAX;
-
-    pub(super) fn new() -> Self {
-        Self {
-            status: AtomicU64::new(Self::RUNNING),
-            ended: crate::Notify::new(),
-        }
-    }
-
-    /// Publishes the thread's exit status and wakes every waiter.
-    pub(super) fn publish(&self, code: u32) {
-        self.status.store(u64::from(code), AtomicOrdering::Release);
-        self.ended.notify_all();
-    }
-
-    /// The thread's exit status, once it has ended.
-    pub(super) fn code(&self) -> Option<u32> {
-        match self.status.load(AtomicOrdering::Acquire) {
-            Self::RUNNING => None,
-            code => Some(code as u32),
-        }
-    }
-
-    /// Waits for the thread's end and returns its exit status.
-    pub(super) async fn wait(&self) -> u32 {
-        loop {
-            // Armed before the status is read, so a publish between the
-            // read and the park still completes the wait.
-            let ended = self.ended.notified();
-            if let Some(code) = self.code() {
-                return code;
-            }
-            ended.await;
-        }
-    }
-}
-
 pub(super) async fn wasix_thread_sleep<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     duration: i64,
@@ -392,7 +122,10 @@ where
             // refuses it here, and one that comes later finds it in the
             // table and ends it, whether or not its task has started.
             let exit = Arc::new(WasixThreadExit::new());
-            let tid = match threads.admit(store_data.thread_signals.clone(), exit.clone()) {
+            let tid = match threads
+                .admit(store_data.thread_signals.clone(), exit.clone())
+                .map_err(thread_admission_errno)
+            {
                 Ok(tid) => tid,
                 Err(errno) => return errno,
             };
@@ -948,7 +681,7 @@ where
     let key = caller.data().futex_key(futex);
     let ((registration, mut wake), current) =
         wasix_futex_armed_word(&memory, GuestAddress::wasm32(futex), || {
-            let registration = caller.data().runtime_state.prepare_futex_wait(key);
+            let registration = caller.data().threads.futex().prepare_wait(key);
             let wake = registration.notify().waiter();
             (registration, wake)
         })
@@ -1025,7 +758,7 @@ where
         return p1::errno::FAULT;
     }
     let key = caller.data().futex_key(futex);
-    let woken = caller.data().runtime_state.wake_futex(key, 1) != 0;
+    let woken = caller.data().threads.futex().wake(key, 1) != 0;
     p1_write_wasix_bool(caller, memory, GuestAddress::wasm32(ret_woken), woken)
 }
 
@@ -1046,8 +779,15 @@ where
         return p1::errno::FAULT;
     }
     let key = caller.data().futex_key(futex);
-    let woken = caller.data().runtime_state.wake_all_futex(key) != 0;
+    let woken = caller.data().threads.futex().wake_all(key) != 0;
     p1_write_wasix_bool(caller, memory, GuestAddress::wasm32(ret_woken), woken)
+}
+
+fn thread_admission_errno(error: helios_unix::ThreadAdmissionError) -> i32 {
+    match error {
+        helios_unix::ThreadAdmissionError::Ended => p1::errno::AGAIN,
+        helios_unix::ThreadAdmissionError::IdOverflow => p1::errno::OVERFLOW,
+    }
 }
 
 #[cfg(test)]
@@ -1197,7 +937,7 @@ mod tests {
         let stray_exit = Arc::new(WasixThreadExit::new());
         assert_eq!(
             threads.admit(WasixSignalState::new(), stray_exit).err(),
-            Some(p1::errno::AGAIN),
+            Some(helios_unix::ThreadAdmissionError::Ended),
             "an ended process admits no thread"
         );
 
@@ -1353,7 +1093,7 @@ mod tests {
             threads
                 .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
                 .err(),
-            Some(p1::errno::AGAIN),
+            Some(helios_unix::ThreadAdmissionError::Ended),
             "an exiting process admits no thread"
         );
         threads.end_from_thread(other_tid, WasixProcessEnd::Exit(3));
@@ -1593,8 +1333,9 @@ mod tests {
     /// refuses the id past `i32::MAX` rather than hand it out.
     #[test]
     fn the_thread_table_hands_out_only_ids_an_i32_holds() {
-        let threads = WasixProcessThreads::<()>::new();
-        threads.table.lock().next_tid = i32::MAX as u32;
+        let threads = WasixProcessThreads::<()>::starting_at(
+            core::num::NonZeroU32::new(i32::MAX as u32).unwrap(),
+        );
         let last = threads
             .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
             .expect("i32::MAX is a thread id");
@@ -1603,7 +1344,7 @@ mod tests {
             threads
                 .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
                 .err(),
-            Some(p1::errno::OVERFLOW)
+            Some(helios_unix::ThreadAdmissionError::IdOverflow)
         );
     }
 

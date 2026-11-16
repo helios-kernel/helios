@@ -55,7 +55,6 @@ use wasix_epoll::*;
 
 use super::*;
 use crate::isa::GuestIsa;
-use crate::process::{DescriptorLimit, FreeDescriptorSlots};
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::code_map::{CodeMap, CodeRegistration};
 use crate::wasmtime_adapter::config::AotCompileHint;
@@ -70,8 +69,7 @@ use crate::wasmtime_adapter::{
     },
 };
 use crate::{
-    BootfsBytes, ComponentStdioRefusal, GuestAddress, ProgramExecErrorDetail, RuntimeMessage,
-    UnbindableStdio,
+    BootfsBytes, ComponentStdioRefusal, ProgramExecErrorDetail, RuntimeMessage, UnbindableStdio,
 };
 use crate::{FileContents, MemoryFs, Namespace};
 use alloc::borrow::ToOwned;
@@ -81,7 +79,7 @@ use alloc::vec;
 use bytes::Bytes;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use hashbrown::HashMap;
@@ -94,6 +92,7 @@ use helios_compiler_abi::{
 use helios_hal::fs::WritePosition;
 use helios_hal::measured_boot::{MeasuredBoot, Sha256Digest};
 use helios_hal::watchdog::Watchdog;
+use helios_unix::{DescriptorLimit, GuestAddress};
 use smallvec::SmallVec;
 use thiserror::Error;
 use wasmtime::component::{Component, InstancePre as ComponentInstancePre};
@@ -109,7 +108,6 @@ const SHARED_MEMORY_POOL_FRACTION: usize = 16;
 const WASIX_ASYNCIFY_DATA_SIZE: u32 = 8;
 const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
 const WASIX_THREAD_START_SIZE: usize = 64;
-const WASIX_NO_PENDING_SIGNAL: u32 = u32::MAX;
 const WASIX_MODULE: &str = "wasix_32v1";
 const WASIX_NULL_DEVICE_PATH: &str = "/dev/null";
 const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
@@ -4166,7 +4164,6 @@ mod tests {
         let (pipe_writer, pipe_reader) = crate::byte_channel();
         let pipe = Preview1Descriptor::PipeRead {
             reader: pipe_reader,
-            carry: Bytes::new(),
         };
         assert_eq!(local_epoll_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         assert_eq!(

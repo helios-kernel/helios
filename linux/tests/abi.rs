@@ -12,6 +12,11 @@ use helios_linux::syscall::{
 #[derive(Clone)]
 struct Memory(Vec<u8>);
 impl UserMemory for Memory {
+    fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+        let start = usize::try_from(address).map_err(|_| MemoryFault)?;
+        let end = start.checked_add(length).ok_or(MemoryFault)?;
+        self.0.get(start..end).map(|_| ()).ok_or(MemoryFault)
+    }
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
         let start = usize::try_from(address).map_err(|_| MemoryFault)?;
         let end = start.checked_add(bytes.len()).ok_or(MemoryFault)?;
@@ -53,6 +58,7 @@ async fn dispatch(call: Call, memory: &Memory, sink: &mut Sink) -> ControlFlow<u
 }
 #[derive(Default)]
 struct Sink {
+    time: core::sync::atomic::AtomicU64,
     bytes: Vec<u8>,
     short: Option<usize>,
     error: Option<WriteError>,
@@ -455,4 +461,385 @@ fn anonymous_mmap_allocates_zeroed_memory_and_rejects_invalid_requests() {
             ControlFlow::Continue(error.wrapping_neg())
         );
     }
+}
+
+impl helios_linux::syscall::Clock for Sink {
+    fn now_nanos(&self) -> u64 {
+        self.time.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    async fn sleep_until(&self, deadline: u64) {
+        self.time
+            .store(deadline, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn unix_call(
+    process: &mut Process,
+    number: u64,
+    arguments: [u64; 6],
+    memory: &mut Memory,
+    sink: &mut Sink,
+) -> u64 {
+    match ready(process_dispatch(
+        process,
+        Call { number, arguments },
+        memory,
+        sink,
+    )) {
+        ControlFlow::Continue(result) => result,
+        ControlFlow::Break(_) => panic!("I/O syscall terminated the process"),
+    }
+}
+
+#[test]
+fn eventfd_epoll_uses_linux_layout_and_a_shared_counter_after_dup() {
+    let mut process = Process::new(core::num::NonZeroU32::new(1).unwrap());
+    let mut memory = Memory(vec![0; 256]);
+    let mut sink = Sink::default();
+    let event = unix_call(
+        &mut process,
+        290,
+        [0, 0x800, 0, 0, 0, 0],
+        &mut memory,
+        &mut sink,
+    );
+    let epoll = unix_call(
+        &mut process,
+        291,
+        [0, 0, 0, 0, 0, 0],
+        &mut memory,
+        &mut sink,
+    );
+    memory.0[16..20].copy_from_slice(&1u32.to_le_bytes());
+    memory.0[20..28].copy_from_slice(&0x1122334455667788u64.to_le_bytes());
+    assert_eq!(
+        unix_call(
+            &mut process,
+            233,
+            [epoll, 1, event, 16, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            232,
+            [epoll, 64, 4, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+    let dup = unix_call(
+        &mut process,
+        32,
+        [event, 0, 0, 0, 0, 0],
+        &mut memory,
+        &mut sink,
+    );
+    memory.0[0..8].copy_from_slice(&7u64.to_le_bytes());
+    assert_eq!(
+        unix_call(
+            &mut process,
+            1,
+            [dup, 0, 8, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        8
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            232,
+            [epoll, 64, 4, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        1
+    );
+    assert_eq!(&memory.0[64..76], &memory.0[16..28]);
+    assert_eq!(
+        unix_call(
+            &mut process,
+            0,
+            [event, 32, 8, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        8
+    );
+    assert_eq!(u64::from_le_bytes(memory.0[32..40].try_into().unwrap()), 7);
+    assert_eq!(
+        unix_call(
+            &mut process,
+            0,
+            [dup, 32, 8, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        (-11i64) as u64
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            233,
+            [epoll, 2, event, u64::MAX, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+}
+
+#[test]
+fn epoll_errors_timeout_and_pipe_readiness_are_real() {
+    let mut process = Process::new(core::num::NonZeroU32::new(1).unwrap());
+    let mut memory = Memory(vec![0; 256]);
+    let mut sink = Sink::default();
+    assert_eq!(
+        unix_call(
+            &mut process,
+            293,
+            [0, 0x800, 0, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+    let reader = u32::from_le_bytes(memory.0[..4].try_into().unwrap()) as u64;
+    let writer = u32::from_le_bytes(memory.0[4..8].try_into().unwrap()) as u64;
+    let epoll = unix_call(
+        &mut process,
+        291,
+        [0, 0, 0, 0, 0, 0],
+        &mut memory,
+        &mut sink,
+    );
+    memory.0[16..20].copy_from_slice(&1u32.to_le_bytes());
+    memory.0[20..28].copy_from_slice(&99u64.to_le_bytes());
+    assert_eq!(
+        unix_call(
+            &mut process,
+            233,
+            [epoll, 1, reader, 16, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            233,
+            [epoll, 1, reader, 16, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        (-17i64) as u64
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            232,
+            [epoll, 64, 4, 7, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+    assert_eq!(helios_linux::syscall::Clock::now_nanos(&sink), 7_000_000);
+    memory.0[32..38].copy_from_slice(b"abcdef");
+    assert_eq!(
+        unix_call(
+            &mut process,
+            1,
+            [writer, 32, 6, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        6
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            232,
+            [epoll, 64, 4, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        1
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            0,
+            [reader, 40, 3, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        3
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            0,
+            [reader, 43, 3, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        3
+    );
+    assert_eq!(&memory.0[40..46], b"abcdef");
+    assert_eq!(
+        unix_call(
+            &mut process,
+            0,
+            [reader, 40, 3, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        (-11i64) as u64
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            3,
+            [writer, 0, 0, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            0,
+            [reader, 40, 3, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+}
+
+#[test]
+fn epoll_rejects_cycles_including_disabled_one_shot_registrations() {
+    let mut process = Process::new(core::num::NonZeroU32::new(1).unwrap());
+    let mut memory = Memory(vec![0; 64]);
+    let mut sink = Sink::default();
+    let first = unix_call(&mut process, 291, [0; 6], &mut memory, &mut sink);
+    let second = unix_call(&mut process, 291, [0; 6], &mut memory, &mut sink);
+    memory.0[..4].copy_from_slice(&(1u32 | (1 << 30)).to_le_bytes());
+    assert_eq!(
+        unix_call(
+            &mut process,
+            233,
+            [first, 1, second, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            233,
+            [second, 1, first, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        (-40i64) as u64
+    );
+    let duplicate = unix_call(
+        &mut process,
+        32,
+        [first, 0, 0, 0, 0, 0],
+        &mut memory,
+        &mut sink,
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            233,
+            [first, 1, duplicate, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        (-22i64) as u64
+    );
+}
+
+#[test]
+fn invalid_pipe_destination_does_not_consume_data_and_dup_shares_nonblocking() {
+    let mut process = Process::new(core::num::NonZeroU32::new(1).unwrap());
+    let mut memory = Memory(vec![0; 64]);
+    let mut sink = Sink::default();
+    assert_eq!(
+        unix_call(&mut process, 293, [0; 6], &mut memory, &mut sink),
+        0
+    );
+    let reader = u32::from_le_bytes(memory.0[..4].try_into().unwrap()) as u64;
+    let writer = u32::from_le_bytes(memory.0[4..8].try_into().unwrap()) as u64;
+    let duplicate = unix_call(
+        &mut process,
+        32,
+        [reader, 0, 0, 0, 0, 0],
+        &mut memory,
+        &mut sink,
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            72,
+            [duplicate, 4, 0x800, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        0
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            72,
+            [reader, 3, 0, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ) & 0x800,
+        0x800
+    );
+    memory.0[16..19].copy_from_slice(b"abc");
+    assert_eq!(
+        unix_call(
+            &mut process,
+            1,
+            [writer, 16, 3, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        3
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            0,
+            [reader, u64::MAX, 3, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        (-14i64) as u64
+    );
+    assert_eq!(
+        unix_call(
+            &mut process,
+            0,
+            [duplicate, 32, 3, 0, 0, 0],
+            &mut memory,
+            &mut sink
+        ),
+        3
+    );
+    assert_eq!(&memory.0[32..35], b"abc");
 }

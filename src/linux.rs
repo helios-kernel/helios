@@ -12,8 +12,9 @@ use helios_x86::{BootHook, X86Cpu};
 pub struct Prototype;
 impl BootHook for Prototype {
     fn start(
-        _: X86Cpu,
+        cpu: X86Cpu,
         spawner: Spawner<X86Cpu>,
+        timer: helios_kernel::Timer<X86Cpu>,
         payload: BootPayload,
         entropy: helios_kernel::RootEntropyHandle,
     ) {
@@ -24,10 +25,10 @@ impl BootHook for Prototype {
                 ("linux-prototype/fault", Expected::Fault),
                 ("linux-prototype/spin", Expected::Preempt),
             ].into_iter().enumerate() {
-                run(payload, path, expected, NonZeroU32::new(index as u32 + 1).unwrap(), &entropy).await;
+                run(cpu.clone(), timer.clone(), payload, path, expected, NonZeroU32::new(index as u32 + 1).unwrap(), &entropy).await;
             }
             tracing::info!(
-                "native Linux prototype passed: write exit ENOSYS EBADF EFAULT isolation preemption libc TLS writev"
+                "native Linux prototype passed: write exit ENOSYS EBADF EFAULT isolation preemption libc TLS writev eventfd pipe dup epoll"
             );
         });
     }
@@ -41,6 +42,11 @@ enum Expected {
 }
 struct Memory(AddressSpace);
 impl UserMemory for Memory {
+    fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+        self.0
+            .check_writable(address, length)
+            .map_err(|_| MemoryFault)
+    }
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
         self.0.write(address, bytes).map_err(|_| MemoryFault)
     }
@@ -68,6 +74,8 @@ impl syscall::VirtualMemory for Memory {
     }
 }
 struct Console {
+    cpu: X86Cpu,
+    timer: helios_kernel::Timer<X86Cpu>,
     writer: DebugSerialWriter,
     written: usize,
     expected: &'static [u8],
@@ -92,6 +100,8 @@ impl Output for Console {
 }
 
 async fn run(
+    cpu: X86Cpu,
+    timer: helios_kernel::Timer<X86Cpu>,
     payload: BootPayload,
     path: &str,
     expected: Expected,
@@ -141,6 +151,8 @@ async fn run(
         .expect("map user stack");
     let mut context = Context::new(image.entry(), stack_pointer).expect("native context");
     let mut console = Console {
+        cpu,
+        timer,
         writer: helios_x86::debug_serial_writer(),
         written: 0,
         expected: match expected {
@@ -207,5 +219,19 @@ async fn run(
             }
         }
         yield_now().await;
+    }
+}
+
+impl syscall::Clock for Console {
+    fn now_nanos(&self) -> u64 {
+        use helios_hal::cpu::Cpu;
+        self.cpu.timebase().ticks_to_nanos(self.cpu.now().ticks())
+    }
+    async fn sleep_until(&self, deadline: u64) {
+        self.timer
+            .sleep_for(core::time::Duration::from_nanos(
+                deadline.saturating_sub(self.now_nanos()),
+            ))
+            .await;
     }
 }

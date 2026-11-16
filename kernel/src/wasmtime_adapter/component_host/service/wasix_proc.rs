@@ -1182,10 +1182,8 @@ where
     let read_fd = match caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::PipeRead {
-            reader,
-            carry: Bytes::new(),
-        }) {
+        .insert(Preview1Descriptor::PipeRead { reader })
+    {
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
@@ -1470,7 +1468,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let pid = match u32::try_from(caller.data().instance().id().raw()) {
+    let pid = match u32::try_from(caller.data().identity.id().get()) {
         Ok(pid) => pid,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -1490,7 +1488,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let current = match u32::try_from(caller.data().instance().id().raw()) {
+    let current = match u32::try_from(caller.data().identity.id().get()) {
         Ok(pid) => pid,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -1521,7 +1519,7 @@ where
     if status != p1::errno::SUCCESS {
         return Ok(status);
     }
-    let current = match u32::try_from(caller.data().instance().id().raw()) {
+    let current = match u32::try_from(caller.data().identity.id().get()) {
         Ok(pid) => pid,
         Err(_) => return Ok(p1::errno::OVERFLOW),
     };
@@ -3632,10 +3630,7 @@ where
     caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::PipeRead {
-            reader,
-            carry: Bytes::new(),
-        })
+        .insert(Preview1Descriptor::PipeRead { reader })
         .map(Some)
 }
 

@@ -169,6 +169,7 @@ pub trait BootHook {
     fn start(
         cpu: X86Cpu,
         spawner: helios_kernel::Spawner<X86Cpu>,
+        timer: helios_kernel::Timer<X86Cpu>,
         payload: helios_kernel::BootPayload,
         entropy: helios_kernel::RootEntropyHandle,
     );
@@ -181,6 +182,7 @@ impl BootHook for NoBootHook {
     fn start(
         _: X86Cpu,
         _: helios_kernel::Spawner<X86Cpu>,
+        _: helios_kernel::Timer<X86Cpu>,
         _: helios_kernel::BootPayload,
         _: helios_kernel::RootEntropyHandle,
     ) {
@@ -533,7 +535,13 @@ fn x86_kernel_main<Hook: BootHook>() -> ! {
             }
         }
     }
-    Hook::start(cpu.clone(), kernel.spawner(), payload, root_entropy);
+    Hook::start(
+        cpu.clone(),
+        kernel.spawner(),
+        kernel.timer(),
+        payload,
+        root_entropy,
+    );
     run_current_processor(cpu, kernel, debug_state)
 }
 
