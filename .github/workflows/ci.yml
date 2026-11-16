@@ -238,18 +238,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev cmake ninja-build
+      # Each program's wasm, kept with the files its build read (#1022): a
+      # program none of whose inputs changed is taken from the cache
+      # instead of built. The key carries the run id so that each
+      # default-branch run saves its own cache, and the prefix restores the
+      # newest earlier one. A hit and a store both set an entry's
+      # modification time, so pruning what is older than the job's start,
+      # last of all, leaves the cache holding exactly what this run used.
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the guest wasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ github.workspace }}/wasm-cache
+          key: helios-wasm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-${{ github.run_id }}
+          restore-keys: helios-wasm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-
       - name: Build the guest wasm
         working-directory: helios
         run: >-
           cargo run -p helios-cli --
           wasm-build --out-dir target/wasm-programs
           --profile ${{ matrix.profile }} --cargo cargo
+          --cache-dir ${{ github.workspace }}/wasm-cache
       - uses: actions/upload-artifact@v4
         with:
           name: helios-wasm-${{ matrix.profile }}
           path: helios/target/wasm-programs/${{ matrix.profile }}
           if-no-files-found: error
           retention-days: 1
+      - name: Prune the guest wasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ github.workspace }}/wasm-cache
+          since: ${{ env.HELIOS_CACHE_START }}
 
   wasm-release:
     name: wasm-programs (${{ matrix.profile }})
@@ -385,11 +407,31 @@ jobs:
       actions: read
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # Where every `helios-cli kernel-prebuild` of this job, however the
+      # inspector starts it, finds and keeps the `cwasm` it precompiles
+      # (#1022). It is set for the job because no prebuild is named here.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
     steps:
       - uses: actions/checkout@v4
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # An entry is addressed by its input, the `helios-cli` that compiled
+      # it, the target level and the hint, so a restored cache can only
+      # answer a precompile it is exact for. The key carries the run id so
+      # that each default-branch run saves its own cache, and the prefix
+      # restores the newest earlier one. The job's prebuilds each use a
+      # subset of the entries and each hit or store sets an entry's
+      # modification time, so the last step prunes what is older than the
+      # job's start: the saved cache holds what the whole job used.
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
         run: |
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
@@ -680,6 +722,12 @@ jobs:
             helios/target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs
           if-no-files-found: error
           retention-days: 90
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
 
   # A native Arm Linux runner under multi-threaded TCG. This lane is a
   # functional check, not a performance surface: `ubuntu-24.04-arm`
@@ -710,6 +758,8 @@ jobs:
       actions: read
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
       QEMU_VERSION: "11.1.1"
       # download.qemu.org publishes a detached signature but no checksum
       # file; this is the digest of the tarball that signature covers.
@@ -720,6 +770,14 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
         run: |
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
@@ -1151,6 +1209,13 @@ jobs:
             helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
+
   # A kernel built with HELIOS_CFI_SELF_TEST corrupts a signed return
   # address once every processor has started, and the guest has to panic
   # with a control-flow violation. The test builds a debug `helios-cli`,
@@ -1257,6 +1322,8 @@ jobs:
     timeout-minutes: 40
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       # Every boot below names `--accel kvm`. The inspector no longer
@@ -1269,6 +1336,14 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
         run: |
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
@@ -2311,6 +2386,12 @@ jobs:
             helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
 
   # The processor lifecycle end to end (#498): `cpu` takes the guest's
   # highest processor offline and back eight times while the in-kernel
@@ -2330,6 +2411,8 @@ jobs:
     timeout-minutes: 40
     env:
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
@@ -2338,6 +2421,14 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
         run: |
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
@@ -2435,6 +2526,12 @@ jobs:
           path: smoke-runtime/cpu-hotplug
           if-no-files-found: ignore
           retention-days: 14
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
 
   # The 3D path against a real renderer: `gpu-test` opens a virgl
   # context, retires a fence on it, maps a host blob and a guest blob,
@@ -2459,6 +2556,8 @@ jobs:
     env:
       # The debug guest programs the lane's debug inspector prebuilds from.
       HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
@@ -2476,6 +2575,14 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
         run: |
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
@@ -2643,6 +2750,12 @@ jobs:
             helios/venus-smoke.out
           if-no-files-found: warn
           retention-days: 7
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
 
   test-btrfs-upstream:
     name: test-btrfs-upstream (${{ matrix.suite }})
