@@ -10,13 +10,13 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use arm_gic::IntId;
 use helios_artifact::{ProbeAnswers, cwasm_target_isa_levels};
+use helios_firmware::ProcessorIdentities;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, BootReservedRanges, FirmwareKind,
-    usable_region_segments,
+    usable_node_regions,
 };
 use helios_hal::cpu::{
     ControlFlowIntegrity, Cpu, GUEST_STACK_LIMIT_OFFSET, HardwarePerfCounters, Instant,
@@ -24,14 +24,14 @@ use helios_hal::cpu::{
 };
 use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
-use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::NumaTopology;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{
     DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology, align_up,
 };
 use helios_kernel::{
-    DebugSerialAccess, DebugSerialInterrupt, KernelException, KernelExceptionCause, Timer,
-    WasmtimeTlsSlots,
+    DebugSerialAccess, DebugSerialInterrupt, KernelException, KernelExceptionCause, PerProcessor,
+    Timer, UserMemoryPool, WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -41,10 +41,11 @@ use limine::firmware::{
 use limine::memmap::{Entry, MEMMAP_USABLE};
 use limine::mp::MpInfo;
 use limine::request::{
-    DtbRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest,
-    FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
-    StackSizeRequest,
+    DtbRequest, EfiRequest, ExecutableAddressRequest, ExecutableCmdlineRequest,
+    ExecutableFileRequest, FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest,
+    MpRequest, RsdpRequest, StackSizeRequest,
 };
+use r_efi::efi::SystemTable;
 use spin::Once;
 
 const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
@@ -185,6 +186,8 @@ mod gic;
 mod gpu;
 mod hand_over;
 mod host_fs;
+#[cfg(feature = "hv")]
+pub mod hv;
 mod input;
 mod lifecycle;
 mod net;
@@ -253,6 +256,10 @@ static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
 static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 #[used]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+/// The UEFI system table, whose configuration table names the firmware's
+/// own device tree (`platform::efi`).
+#[used]
+static EFI_SYSTEM_TABLE_REQUEST: EfiRequest = EfiRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
 /// The firmware's TPM event log, which the measured-boot discovery reads
@@ -338,6 +345,8 @@ struct ProcessorRuntime {
     device_interrupts: Once<DeviceInterruptRoutes>,
     /// The record of this processor's trap hand-over self-check.
     hand_over_probe: hand_over::HandOverProbe,
+    /// Selected at bring-up, so IRQ dispatch does not probe the exception level.
+    timer_interrupt: IntId,
 }
 
 impl ProcessorRuntime {
@@ -356,6 +365,7 @@ impl ProcessorRuntime {
             program_service: Once::new(),
             device_interrupts: Once::new(),
             hand_over_probe: hand_over::HandOverProbe::new(),
+            timer_interrupt: gic::host_timer_interrupt(),
         }
     }
 }
@@ -388,7 +398,7 @@ struct Aarch64ProcessorSlot {
 }
 
 struct Aarch64PlatformState {
-    processors: Box<[Aarch64ProcessorSlot]>,
+    processors: PerProcessor<Aarch64ProcessorSlot>,
     /// The PSCI service that stops and restarts processors, when the
     /// platform describes one.
     psci: Option<lifecycle::Psci>,
@@ -402,6 +412,10 @@ struct Aarch64PlatformState {
     instruction_key: cfi::SharedInstructionKey,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
+    #[cfg(feature = "hv")]
+    hypervisor: Once<hv::Hypervisor>,
+    #[cfg(helios_hv_self_test)]
+    hv_test: hv::self_test::Remote,
     /// The bootstrap processor's answer to every ISA level feature. Written
     /// once before any secondary starts; each secondary compares its own.
     isa_answers: ProbeAnswers,
@@ -416,44 +430,31 @@ fn probe_isa_answers() -> ProbeAnswers {
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(timebase: Timebase, psci: Option<platform::PsciConduit>) -> &'static Self {
-        let response = MP_REQUEST
-            .response()
-            .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
-        let cpus = response.cpus();
-        assert!(
-            !cpus.is_empty(),
-            "Limine AArch64 MP response did not describe any CPU"
+    /// Every processor's slot, each in memory of its processor's node.
+    ///
+    /// A slot outlives every stop and restart of its processor: its node
+    /// is the one the NUMA description gave it, and its power state and
+    /// resume context are found again when it comes back.
+    fn from_limine_mp(
+        timebase: Timebase,
+        pool: &UserMemoryPool,
+        psci: Option<platform::PsciConduit>,
+    ) -> &'static Self {
+        assert_eq!(
+            pool.locality().processor_count(),
+            limine_processors().count(),
+            "the NUMA locality and Limine's MP response disagree on the processor count"
         );
-        let bootstrap_mpidr = response.bsp_mpidr;
-        let bootstrap = cpus
-            .iter()
-            .copied()
-            .find(|cpu| cpu.mpidr == bootstrap_mpidr)
-            .unwrap_or_else(|| {
-                panic!("Limine AArch64 MP response omitted bootstrap MPIDR {bootstrap_mpidr:#x}")
-            });
-        let mut ordered = Vec::with_capacity(cpus.len());
-        ordered.push(bootstrap);
-        for &cpu in cpus {
-            if cpu.mpidr != bootstrap_mpidr {
-                ordered.push(cpu);
+        let processors = PerProcessor::new(pool, |processor, _| {
+            let index = usize::from(processor.id());
+            Aarch64ProcessorSlot {
+                mp_info: limine_processors()
+                    .nth(index)
+                    .unwrap_or_else(|| panic!("Limine's MP response has no processor {index}")),
+                runtime: ProcessorRuntime::new(processor.id()),
+                power: lifecycle::ProcessorPower::new(),
             }
-        }
-        let processors = ordered
-            .into_iter()
-            .enumerate()
-            .map(|(index, mp_info)| {
-                let logical_id = u16::try_from(index)
-                    .unwrap_or_else(|_| panic!("AArch64 processor index {index} exceeds u16"));
-                Aarch64ProcessorSlot {
-                    mp_info,
-                    runtime: ProcessorRuntime::new(logical_id),
-                    power: lifecycle::ProcessorPower::new(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        });
         Box::leak(Box::new(Self {
             processors,
             psci: psci.map(lifecycle::Psci::new),
@@ -462,6 +463,10 @@ impl Aarch64PlatformState {
             instruction_key: cfi::SharedInstructionKey::new(),
             debug_state: Once::new(),
             gic: Once::new(),
+            #[cfg(feature = "hv")]
+            hypervisor: Once::new(),
+            #[cfg(helios_hv_self_test)]
+            hv_test: hv::self_test::Remote::new(),
             isa_answers: probe_isa_answers(),
         }))
     }
@@ -506,16 +511,16 @@ impl Aarch64PlatformState {
     }
 
     fn bootstrap_mpidr(&self) -> u64 {
-        self.processors[0].mp_info.mpidr
+        self.processors.get(ProcessorId::new(0)).mp_info.mpidr
     }
 
     /// The MPIDR of every processor Limine started, bootstrap first.
     fn processor_mpidrs(&self) -> impl Iterator<Item = u64> + Clone + '_ {
-        self.processors.iter().map(|slot| slot.mp_info.mpidr)
+        self.processors.iter().map(|(_, slot)| slot.mp_info.mpidr)
     }
 
     fn bootstrap_runtime(&'static self) -> &'static ProcessorRuntime {
-        &self.processors[0].runtime
+        &self.processors.get(ProcessorId::new(0)).runtime
     }
 
     fn processor_count(&self) -> usize {
@@ -524,13 +529,14 @@ impl Aarch64PlatformState {
 
     fn processor_slot(&self, processor: ProcessorId) -> &Aarch64ProcessorSlot {
         self.processors
-            .get(processor.id() as usize)
+            .try_get(processor)
             .unwrap_or_else(|| panic!("AArch64 processor {} is out of range", processor.id()))
     }
 
     fn processor_slot_by_mpidr(&self, mpidr: u64) -> &Aarch64ProcessorSlot {
         self.processors
             .iter()
+            .map(|(_, slot)| slot)
             .find(|slot| slot.mp_info.mpidr == mpidr)
             .unwrap_or_else(|| panic!("AArch64 processor MPIDR {mpidr:#x} is unknown"))
     }
@@ -573,6 +579,82 @@ fn aarch64_processor_count() -> usize {
         "Limine AArch64 MP response did not describe any CPU"
     );
     processor_count
+}
+
+/// The processors Limine started, in [`ProcessorId`] order: the bootstrap
+/// processor first, then the rest in the order Limine lists them. Read
+/// straight from the MP response, so it answers before the heap exists.
+fn limine_processors() -> impl Iterator<Item = &'static MpInfo> {
+    let response = MP_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
+    let cpus = response.cpus();
+    assert!(
+        !cpus.is_empty(),
+        "Limine AArch64 MP response did not describe any CPU"
+    );
+    let bootstrap_mpidr = response.bsp_mpidr;
+    let bootstrap = cpus
+        .iter()
+        .copied()
+        .find(|cpu| cpu.mpidr == bootstrap_mpidr)
+        .unwrap_or_else(|| {
+            panic!("Limine AArch64 MP response omitted bootstrap MPIDR {bootstrap_mpidr:#x}")
+        });
+    core::iter::once(bootstrap).chain(
+        cpus.iter()
+            .copied()
+            .filter(move |cpu| cpu.mpidr != bootstrap_mpidr),
+    )
+}
+
+/// Each processor's firmware identity: the affinity bits of its
+/// `MPIDR_EL1`, which is what a device tree cpu node's `reg` holds
+/// (`Documentation/devicetree/bindings/arm/cpus.yaml`). Answered from the
+/// MP response in [`limine_processors`] order, the order the processor
+/// table is later built in, because the description is read before the
+/// heap the table lives in exists.
+struct LimineProcessorIdentities;
+
+impl ProcessorIdentities for LimineProcessorIdentities {
+    fn processor_count(&self) -> usize {
+        aarch64_processor_count()
+    }
+
+    fn hardware_id(&self, processor: ProcessorId) -> u64 {
+        let index = usize::from(processor.id());
+        let entry = limine_processors().nth(index).unwrap_or_else(|| {
+            panic!("AArch64 processor {index} is beyond the Limine MP response")
+        });
+        entry.mpidr & platform::MPIDR_AFFINITY_MASK
+    }
+}
+
+/// Seeds the kernel's bootstrap allocator with Limine's usable memory,
+/// each region on the node the firmware's NUMA description places it.
+struct PrimeBootstrapAllocator<'h> {
+    handoff: &'h LimineBootHandoff,
+    physical_memory_offset: usize,
+}
+
+impl platform::NumaConsumer for PrimeBootstrapAllocator<'_> {
+    type Output = &'static UserMemoryPool;
+
+    fn consume<Numa: NumaTopology>(self, numa: &Numa) -> &'static UserMemoryPool {
+        let reserved_ranges = boot_reserved_ranges(self.handoff);
+        let memory_regions = self.handoff.memory_map.regions().flat_map(|region| {
+            // SAFETY: Limine's usable entries are RAM nothing else owns,
+            // mapped in the higher-half direct map at
+            // `physical_memory_offset`, and the kernel image is reserved
+            // out.
+            unsafe {
+                usable_node_regions(region, &reserved_ranges, self.physical_memory_offset, numa)
+            }
+        });
+        // Limine hands control to the bootstrap processor, which the
+        // processor table lists first.
+        helios_kernel::prime_bootstrap_allocator(memory_regions, numa, ProcessorId::new(0))
+    }
 }
 
 struct Aarch64InterruptOps;
@@ -641,7 +723,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     // the console is part of it and a panic from here on should reach a
     // serial port. Reading the console out of it allocates nothing, in
     // either description.
-    let tables = platform::PlatformTables::discover(&handoff)
+    let tables = platform::PlatformTables::discover(&handoff, efi_system_table())
         .unwrap_or_else(|error| panic!("AArch64 platform discovery failed: {error}"));
     let console = tables
         .console()
@@ -649,10 +731,15 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let debug_serial = DebugSerial::map(console, physical_memory_offset, &handoff);
     debug_serial.init();
     DEBUG_SERIAL_BASE.store(debug_serial.base, Ordering::Release);
-    let processor_count = aarch64_processor_count();
-    let reserved_ranges = boot_reserved_ranges(&handoff);
-    let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
-    helios_kernel::prime_bootstrap_allocator(memory_regions, processor_count);
+    let pool = tables
+        .with_numa(
+            LimineProcessorIdentities,
+            PrimeBootstrapAllocator {
+                handoff: &handoff,
+                physical_memory_offset,
+            },
+        )
+        .unwrap_or_else(|error| panic!("AArch64 NUMA discovery failed: {error}"));
     let payload = helios_kernel::BootPayload::from_boot_modules(&handoff.modules);
     // The rest of the description needs the heap: the ACPI path has to
     // interpret AML to reach a device's `_CRS`.
@@ -660,7 +747,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         .describe(console)
         .unwrap_or_else(|error| panic!("AArch64 platform description failed: {error}"));
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timebase(), platform.psci);
+    let platform_state = Aarch64PlatformState::from_limine_mp(timebase(), pool, platform.psci);
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
@@ -716,7 +803,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let (measured_boot, measured_boot_discovery) =
         tpm::discover(&platform, physical_memory_offset, &handoff, cpu);
     let kernel = helios_kernel::init(
-        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
+        Platform::new(console, cpu)
             .with_topology(
                 ProcessorTopology::start_all_secondaries(
                     cpu.bootstrap_processor(),
@@ -801,6 +888,10 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
     ));
     gic.attach_current_processor(platform_state.bootstrap_mpidr());
+    #[cfg(feature = "hv")]
+    if let Some(hypervisor) = hv::Hypervisor::discover(platform_state) {
+        platform_state.hypervisor.call_once(|| hypervisor);
+    }
     // The device path's platform surface comes up with the controller
     // and before any grant is published, which the registry enforces.
     device::install_hooks(gic);
@@ -992,6 +1083,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
         cfi::self_test()
     };
 
+    #[cfg(helios_hv_self_test)]
+    kernel.spawn_local_detached(hv::self_test::run(cpu, kernel.processor_control()));
+
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
@@ -1033,6 +1127,14 @@ impl Drop for Aarch64WakeOnlyMask {
 }
 
 impl Cpu for Aarch64Cpu {
+    #[cfg(feature = "hv")]
+    type Hypervisor = hv::Hypervisor;
+    #[cfg(not(feature = "hv"))]
+    type Hypervisor = core::convert::Infallible;
+    #[cfg(feature = "hv")]
+    fn hv(&self) -> Option<&Self::Hypervisor> {
+        self.state.hypervisor.get()
+    }
     // `CNTV_CVAL_EL0` is this processor's one-shot comparator.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
@@ -1410,7 +1512,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
         Some(DEBUG_SERIAL_WRITER),
     );
     let kernel = helios_kernel::init(
-        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
+        Platform::new(console, cpu)
             .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),
@@ -1429,6 +1531,10 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     // bootstrap processor, so only private interrupts arrive here.
     unsafe { unmask_irq() };
     hand_over::verify_trap_hand_over(mp_info.mpidr);
+    #[cfg(helios_hv_self_test)]
+    if helios_hal::cpu::current_processor() == ProcessorId::new(1) {
+        kernel.spawn_local_detached(state.hv_test.serve());
+    }
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
@@ -1649,7 +1755,7 @@ extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
         if intid == gic::WAKE_SGI {
             // The wake carries no payload: returning from `wfi` is the
             // whole message, and `park_current` owns the flag.
-        } else if intid == gic::VIRTUAL_TIMER_PPI {
+        } else if intid == runtime.timer_interrupt {
             // Every processor's timer interrupt ends the slice of every
             // guest on the machine that has run one.
             if let Some(program_service) = runtime.program_service.get() {
@@ -1680,6 +1786,15 @@ extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
 /// critical section that unmasked them on exit would enable more than
 /// it disabled.
 const SPSR_IRQ_MASK: u64 = 1 << 7;
+
+/// CurrentEL uses the same EL bits as SPSR.M; bit zero selects the stack.
+fn current_exception_level() -> u64 {
+    let level;
+    unsafe {
+        asm!("mrs {level}, CurrentEL", level = out(reg) level, options(nomem, nostack, preserves_flags));
+    }
+    level
+}
 
 fn mask_irq() {
     unsafe {
@@ -2326,6 +2441,16 @@ fn physical_memory_offset() -> usize {
         .offset as usize
 }
 
+/// The firmware's UEFI system table, at the direct-map address Limine
+/// returns for it from base revision 5 on, or `None` when Limine gave no
+/// response.
+fn efi_system_table() -> Option<NonNull<SystemTable>> {
+    EFI_SYSTEM_TABLE_REQUEST.response().map(|response| {
+        NonNull::new(response.address.cast::<SystemTable>().cast_mut())
+            .unwrap_or_else(|| panic!("Limine's EFI system table response holds a null address"))
+    })
+}
+
 #[derive(Clone, Copy)]
 struct LimineMemoryMap {
     entries: &'static [&'static Entry],
@@ -2482,26 +2607,6 @@ fn boot_reserved_ranges(handoff: &LimineBootHandoff) -> BootReservedRanges {
     reserved.reserve(loaded_executable_start..loaded_executable_end);
     reserved.reserve(file_start..file_end);
     reserved
-}
-
-fn boot_memory_regions(
-    handoff: &LimineBootHandoff,
-    physical_memory_offset: usize,
-    reserved_ranges: &BootReservedRanges,
-) -> impl IntoIterator<Item = MemoryRegion> {
-    handoff.memory_map.regions().flat_map(move |region| {
-        usable_region_segments(region, reserved_ranges)
-            .into_iter()
-            .flatten()
-            .map(move |segment| {
-                let start = segment.start + physical_memory_offset;
-                let len = segment.end - segment.start;
-                let slice = core::ptr::slice_from_raw_parts_mut(start as *mut u8, len);
-                core::ptr::NonNull::new(slice).unwrap_or_else(|| {
-                    panic!("usable memory segment had a null start: {segment:?}")
-                })
-            })
-    })
 }
 
 #[cfg(target_os = "none")]

@@ -3,9 +3,19 @@
 version = 4
 
 [[package]]
+name = "aarch64-paging"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33031af061bdc70425bc55be120e6ac1801d5613aeb84906a282febadf72176e"
+dependencies = [
+ "bitflags 2.13.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "acpi"
 version = "7.0.0-pre1"
-source = "git+https://github.com/lexoliu/acpi?branch=aml-notify-handler#a85ab3c933741d69a6a4241184b16e845740fdd2"
+source = "git+https://github.com/lexoliu/acpi?branch=helios#a4207d9f8f7feccdc409232762953674a75f523d"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
@@ -448,6 +458,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags 2.13.1",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease 0.2.37",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 1.3.0",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "binrw"
 version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -516,6 +546,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "blake2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b5d4d889834ee8ecfc0f8426ad30faf7cdcb10f741a8e6d7224d95325479f6f"
+dependencies = [
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -548,12 +596,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "buddy_system_allocator"
-version = "0.12.0"
+name = "btrfs-disk"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672b945a3e4f4f40bfd4cd5ee07df9e796a42254ce7cd6d2599ad969244c44a"
+checksum = "b7d5b5cdf551a5695223f94a7c4ccd6af5420cdfb44b29fec241915b2708d7c9"
 dependencies = [
- "spin 0.10.1",
+ "bindgen",
+ "bitflags 2.13.1",
+ "blake2 0.10.6",
+ "bytes",
+ "crc32c",
+ "sha2 0.10.9",
+ "uuid",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "btrfs-transaction"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10c852b90ae6ece2695b8dc8e212db9d8bf9503ba822a508f4bf5fb86afabc2d"
+dependencies = [
+ "btrfs-disk",
+ "bytes",
+ "crc32c",
+ "flate2",
+ "lzokay",
+ "tempfile",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -634,7 +705,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ff2a8126fff0f8c839080d619675a585e61720bb12d2baceae45769fd66f155"
 dependencies = [
  "find-msvc-tools",
- "shlex",
+ "jobserver",
+ "libc",
+ "shlex 2.0.1",
+]
+
+[[package]]
+name = "cexpr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
+dependencies = [
+ "nom",
 ]
 
 [[package]]
@@ -677,6 +759,17 @@ dependencies = [
  "num-traits",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "clang-sys"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
+dependencies = [
+ "glob",
+ "libc",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -777,7 +870,7 @@ dependencies = [
 [[package]]
 name = "compio-buf"
 version = "0.8.3"
-source = "git+https://github.com/lexoliu/compio?branch=skyzen#e61491c7da76dd4ca71765e8cf2e5b1fa2ff6b6d"
+source = "git+https://github.com/lexoliu/compio?branch=skyzen#23ce721e472045310d6bf09894836698d8914ae9"
 dependencies = [
  "bytes",
  "libc",
@@ -1318,6 +1411,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
+ "subtle",
 ]
 
 [[package]]
@@ -1639,6 +1733,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "784a4df722dc6267a04af36895398f59d21d07dce47232adf31ec0ff2fa45e67"
 
 [[package]]
+name = "ferrosys"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a32728fc8cbfb02bdcff89ffe64a37bf4d0fb85540e1f5f47529ab397e3a1d7"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1954,8 +2057,11 @@ dependencies = [
  "helios-aarch64",
  "helios-hosted",
  "helios-inspector-protocol",
+ "helios-kernel",
+ "helios-linux",
  "helios-riscv",
  "helios-x86",
+ "tracing",
  "wasmtime",
 ]
 
@@ -1963,19 +2069,23 @@ dependencies = [
 name = "helios-aarch64"
 version = "0.1.0"
 dependencies = [
+ "aarch64-paging",
  "acpi",
  "arm-gic",
  "arm-sysregs",
  "bytes",
  "critical-section",
+ "crossbeam-utils",
  "fdt",
  "helios-acpi",
  "helios-artifact",
+ "helios-firmware",
  "helios-hal",
  "helios-kernel",
  "helios-tpm",
  "helios-virtio",
  "limine 0.6.5",
+ "r-efi 7.1.0",
  "smccc",
  "spin 0.12.3",
  "thiserror 2.0.21",
@@ -2059,6 +2169,31 @@ dependencies = [
  "wasmparser 0.245.1",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "helios-btrfs"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "blake2 0.11.0",
+ "btrfs-disk",
+ "btrfs-transaction",
+ "chrono",
+ "crc",
+ "ferrosys",
+ "futures-lite",
+ "helios-hal",
+ "libfuzzer-sys",
+ "lzokay",
+ "miniz_oxide 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "zerocopy",
+ "zrip-core",
+ "zrip-decode",
 ]
 
 [[package]]
@@ -2161,6 +2296,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-cpu"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "helios-date"
 version = "0.1.0"
 dependencies = [
@@ -2193,6 +2336,17 @@ name = "helios-display-test"
 version = "0.1.0"
 dependencies = [
  "helios-api",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "helios-firmware"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "arrayvec",
+ "fdt",
+ "helios-hal",
  "thiserror 2.0.21",
 ]
 
@@ -2300,6 +2454,7 @@ dependencies = [
  "object",
  "ratatui",
  "rustc-demangle",
+ "rustix",
  "rustyline",
  "serde",
  "serde_json",
@@ -2342,7 +2497,6 @@ dependencies = [
  "async-task",
  "atomic-waker",
  "bitflags 2.13.1",
- "buddy_system_allocator",
  "bytes",
  "concurrent-queue",
  "crc",
@@ -2352,12 +2506,14 @@ dependencies = [
  "ed25519-dalek",
  "erofs-rs",
  "event-listener",
+ "ferrosys",
  "frame-alloc",
  "futures",
  "futures-lite",
  "hashbrown 0.16.1",
  "heapless",
  "helios-artifact",
+ "helios-btrfs",
  "helios-compiler-abi",
  "helios-hal",
  "helios-netstack",
@@ -2370,6 +2526,7 @@ dependencies = [
  "rand_chacha",
  "rand_core 0.6.4",
  "sha2 0.11.0",
+ "siphasher",
  "slab",
  "smallvec",
  "spin 0.9.9",
@@ -2388,6 +2545,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-linux"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "helios-netstack"
 version = "0.1.0"
 dependencies = [
@@ -2396,6 +2561,7 @@ dependencies = [
  "divan",
  "heapless",
  "helios-hal",
+ "num-integer",
  "siphasher",
  "thiserror 2.0.21",
  "tracing",
@@ -2454,6 +2620,7 @@ dependencies = [
  "bytes",
  "critical-section",
  "fdt",
+ "helios-firmware",
  "helios-hal",
  "helios-kernel",
  "helios-virtio",
@@ -2572,6 +2739,7 @@ dependencies = [
  "critical-section",
  "helios-acpi",
  "helios-artifact",
+ "helios-firmware",
  "helios-hal",
  "helios-kernel",
  "helios-tpm",
@@ -2581,6 +2749,7 @@ dependencies = [
  "limine 0.5.0",
  "pci_types",
  "spin 0.9.9",
+ "thiserror 2.0.21",
  "tracing",
  "x86",
  "x86_64",
@@ -2732,7 +2901,7 @@ dependencies = [
 [[package]]
 name = "http-kit"
 version = "0.8.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "bytes",
  "bytestr",
@@ -2753,7 +2922,7 @@ dependencies = [
 [[package]]
 name = "http-kit-h1"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "async-channel",
  "bytes",
@@ -2770,7 +2939,7 @@ dependencies = [
 [[package]]
 name = "http-kit-io"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "bytes",
  "compio-buf",
@@ -2783,7 +2952,7 @@ dependencies = [
 [[package]]
 name = "http-kit-tls"
 version = "0.4.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "futures-lite",
  "http-kit-io",
@@ -3104,6 +3273,15 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -3193,6 +3371,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3237,6 +3425,16 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libfuzzer-sys"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
+dependencies = [
+ "arbitrary",
+ "cc",
+]
 
 [[package]]
 name = "libloading"
@@ -3381,6 +3579,15 @@ dependencies = [
 name = "lz4_flex"
 version = "0.14.0"
 source = "git+https://github.com/Dreamacro/lz4_flex?branch=feat%2Fblock-compress-prefix#46f45f2b6e15b9fd0fa3b8614891fb8228fe6e40"
+
+[[package]]
+name = "lzokay"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "953d350dc065718bb00b61ea2118274ffe2fdf6488f32f720422bcd1c9d6025f"
+dependencies = [
+ "zerocopy",
+]
 
 [[package]]
 name = "mac_address"
@@ -3674,6 +3881,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "num-integer"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
@@ -4157,6 +4373,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "r-efi"
+version = "7.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0ff379dd174eec5b2cab797063a2e7592dfcf0bf0323a50eeee724ee3537f13"
+
+[[package]]
 name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4240,7 +4462,7 @@ dependencies = [
  "compact_str",
  "critical-section",
  "hashbrown 0.17.1",
- "itertools",
+ "itertools 0.14.0",
  "kasuari",
  "lru 0.18.4",
  "palette",
@@ -4305,7 +4527,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "indoc",
  "instability",
- "itertools",
+ "itertools 0.14.0",
  "line-clipping",
  "ratatui-core",
  "serde",
@@ -4855,6 +5077,12 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+
+[[package]]
+name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
@@ -4969,12 +5197,6 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
-
-[[package]]
-name = "spin"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spin"
@@ -5560,7 +5782,7 @@ version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16b380a1238663e5f8a691f9039c73e1cdae598a30e9855f541d29b08b53e9a5"
 dependencies = [
- "itertools",
+ "itertools 0.14.0",
  "unicode-segmentation",
  "unicode-width 0.2.2",
 ]
@@ -6017,7 +6239,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-native",
  "gimli",
- "itertools",
+ "itertools 0.14.0",
  "log",
  "object",
  "pulley-interpreter",
@@ -6693,6 +6915,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
 name = "yoke"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6918,4 +7146,32 @@ version = "0.9.4"
 source = "git+https://github.com/lexoliu/zrip?branch=compress-context-alloc#d83abccf8e6ed53b77c4965886033c194806c678"
 dependencies = [
  "zrip-core",
+]
+
+[[package]]
+name = "zstd"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50adf04cf3ec914b0b9905c9dde90c80fe74bfd701e331fc80a39c512c525278"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498d94ad68720c89b4fbe41b9090850651e68cb2dd9210ce7ffbff3a94653819"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.3+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
+dependencies = [
+ "cc",
+ "pkg-config",
 ]

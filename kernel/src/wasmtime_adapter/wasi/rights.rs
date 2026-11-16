@@ -239,3 +239,80 @@ impl FsDescriptor {
         Ok(Granted::new(self))
     }
 }
+
+/// The rights checked for one open operation, held with its descriptor snapshot.
+/// The owner is either the caller's borrow or an owned snapshot crossing an await.
+/// No other task can narrow this snapshot after the proof is constructed.
+pub(crate) struct OpenGrant<D> {
+    descriptor: D,
+    create: Option<CreatePermission>,
+    truncate: Option<TruncatePermission>,
+}
+
+struct CreatePermission;
+struct TruncatePermission;
+
+impl<D: core::borrow::Borrow<FsDescriptor>> OpenGrant<D> {
+    // Callers in this module have already proved Directory + Read.
+    fn new(descriptor: D, flags: fs_types::OpenFlags) -> FsOpResult<Self> {
+        let base = descriptor.borrow();
+        let truncate = if flags.contains(fs_types::OpenFlags::TRUNCATE) {
+            base.grant::<Directory, Mutate>()?;
+            base.grant::<Directory, Write>()?;
+            Some(TruncatePermission)
+        } else {
+            None
+        };
+        let create = if flags.contains(fs_types::OpenFlags::CREATE) {
+            base.grant::<Directory, Mutate>()?;
+            Some(CreatePermission)
+        } else {
+            None
+        };
+        Ok(Self {
+            descriptor,
+            create,
+            truncate,
+        })
+    }
+
+    pub(crate) fn base(&self) -> Granted<'_, Directory, Read> {
+        Granted::new(self.descriptor.borrow())
+    }
+
+    pub(crate) fn create(&self) -> Option<Granted<'_, Directory, Mutate>> {
+        self.create
+            .as_ref()
+            .map(|_| Granted::new(self.descriptor.borrow()))
+    }
+
+    pub(crate) fn truncate(
+        &self,
+    ) -> Option<(
+        Granted<'_, Directory, Mutate>,
+        Granted<'_, Directory, Write>,
+    )> {
+        self.truncate.as_ref().map(|_| {
+            (
+                Granted::new(self.descriptor.borrow()),
+                Granted::new(self.descriptor.borrow()),
+            )
+        })
+    }
+}
+
+impl<'d> Granted<'d, Directory, Read> {
+    pub(crate) fn prepare_open(
+        self,
+        flags: fs_types::OpenFlags,
+    ) -> FsOpResult<OpenGrant<&'d FsDescriptor>> {
+        OpenGrant::new(self.descriptor, flags)
+    }
+}
+
+impl FsDescriptor {
+    pub(crate) fn prepare_open(self, flags: fs_types::OpenFlags) -> FsOpResult<OpenGrant<Self>> {
+        self.grant::<Directory, Read>()?;
+        OpenGrant::new(self, flags)
+    }
+}

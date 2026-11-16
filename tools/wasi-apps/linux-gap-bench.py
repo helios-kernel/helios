@@ -20,6 +20,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 import linux_workload_runner as runner
 from owned_tcp_server import OwnedTCPServer
@@ -220,6 +221,7 @@ def run_isolated(
     timeout_seconds: int = DEFAULT_HELIOS_TIMEOUT_SECONDS,
     cwd: Path | None = None,
     stderr_lines: list[str] | None = None,
+    stdout: TextIO | None = None,
 ) -> None:
     """Runs `command` in a process group of its own, torn down on return.
 
@@ -232,6 +234,7 @@ def run_isolated(
         cwd=cwd or repo_root(),
         env=env,
         start_new_session=True,
+        stdout=stdout,
         stderr=subprocess.PIPE if stderr_lines is not None else None,
         text=stderr_lines is not None,
         errors="replace" if stderr_lines is not None else None,

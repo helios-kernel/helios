@@ -11,6 +11,8 @@
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod bindings;
+#[cfg(feature = "hv")]
+pub use bindings::helios::hv::virtualization as hv;
 #[cfg(feature = "channel")]
 pub mod channel;
 #[cfg(feature = "compositor")]
@@ -40,6 +42,8 @@ pub mod mounts;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod prelude;
+#[cfg(feature = "processors")]
+pub mod processors;
 #[cfg(feature = "profiling")]
 pub mod profiling;
 #[cfg(feature = "programs")]

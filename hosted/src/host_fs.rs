@@ -78,7 +78,7 @@ where
 }
 
 impl HostFileSystem for HostedFileSystem {
-    type Write<'a> = HostedWrite;
+    type Write = HostedWrite;
 
     /// The hosted backend calls the host OS directly, which does its own
     /// caching; there is no 9p session in front of it to cache for.

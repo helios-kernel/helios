@@ -34,6 +34,7 @@
 
 use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 use alloc::boxed::Box;
+use arm_sysregs::el1::accessors::{read_apiakeyhi_el1, read_apiakeylo_el1};
 use core::arch::{asm, global_asm, naked_asm};
 use core::cell::UnsafeCell;
 use core::mem::{offset_of, size_of};
@@ -120,6 +121,11 @@ pub(crate) struct ResumeContext {
     continuation: u64,
     /// Physical address of the entry code, `CPU_ON`'s entry point.
     entry_physical: u64,
+    /// The host may run at EL1 or EL2; PSCI resumes at the highest level.
+    exception_level: u64,
+    hcr: u64,
+    apia_lo: u64,
+    apia_hi: u64,
     idmap: [Table; 3],
 }
 
@@ -141,6 +147,10 @@ const _: () = {
     assert!(offset_of!(ResumeContext, idmap_ttbr0) == 272);
     assert!(offset_of!(ResumeContext, self_virtual) == 280);
     assert!(offset_of!(ResumeContext, continuation) == 288);
+    assert!(offset_of!(ResumeContext, exception_level) == 304);
+    assert!(offset_of!(ResumeContext, hcr) == 312);
+    assert!(offset_of!(ResumeContext, apia_lo) == 320);
+    assert!(offset_of!(ResumeContext, apia_hi) == 328);
 };
 
 impl ResumeContext {
@@ -418,6 +428,14 @@ unsafe fn prepare_context(context: *mut ResumeContext, psci: Psci) {
     context.sp_el0 = read_system_register!("sp_el0");
     context.fpcr = read_system_register!("fpcr");
     context.conduit = psci.conduit as u64;
+    context.apia_lo = read_apiakeylo_el1().bits();
+    context.apia_hi = read_apiakeyhi_el1().bits();
+    context.exception_level = crate::current_exception_level();
+    context.hcr = if context.exception_level == 2 << 2 {
+        read_system_register!("hcr_el2")
+    } else {
+        0
+    };
 
     // The identity map needs a Normal write-back attribute and the one
     // that is there is whichever index the live MAIR gives it.

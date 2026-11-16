@@ -20,6 +20,7 @@ pub(crate) mod fiber_stack;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
 pub mod parking;
 pub(crate) mod preemption;
+pub(crate) mod residency;
 pub mod store;
 pub mod swap_fault;
 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
@@ -262,7 +263,7 @@ where
                 wasmtime::component::ResourceTable::new(),
                 context.cpu,
                 context.timer,
-                context.spawner.instance_spawner(funding),
+                context.spawner.instance_spawner(funding, &context.instance),
                 context.runtime_state,
                 context.instance_registry,
                 context.instance,
