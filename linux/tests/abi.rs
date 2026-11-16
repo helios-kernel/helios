@@ -4,16 +4,52 @@ use core::future::Future;
 use core::ops::ControlFlow;
 use core::task::{Context, Poll, Waker};
 use helios_linux::elf::{Error, Image};
-use helios_linux::syscall::{Call, MemoryFault, Output, Stream, UserMemory, WriteError, dispatch};
+use helios_linux::syscall::{
+    Call, MemoryFault, Output, Process, Stream, UserMemory, WriteError,
+    dispatch as process_dispatch,
+};
 
+#[derive(Clone)]
 struct Memory(Vec<u8>);
 impl UserMemory for Memory {
+    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+        let start = usize::try_from(address).map_err(|_| MemoryFault)?;
+        let end = start.checked_add(bytes.len()).ok_or(MemoryFault)?;
+        self.0
+            .get_mut(start..end)
+            .ok_or(MemoryFault)?
+            .copy_from_slice(bytes);
+        Ok(())
+    }
     fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
         let start = usize::try_from(address).map_err(|_| MemoryFault)?;
         let end = start.checked_add(output.len()).ok_or(MemoryFault)?;
         output.copy_from_slice(self.0.get(start..end).ok_or(MemoryFault)?);
         Ok(())
     }
+}
+impl helios_linux::syscall::VirtualMemory for Memory {
+    fn map_anonymous(
+        &mut self,
+        hint: u64,
+        length: u64,
+        _: bool,
+        _: bool,
+        _: bool,
+    ) -> Result<u64, helios_linux::syscall::MapError> {
+        let base = hint.max((self.0.len() as u64 + 4095) & !4095).max(4096);
+        self.0.resize((base + length) as usize, 0);
+        Ok(base)
+    }
+}
+async fn dispatch(call: Call, memory: &Memory, sink: &mut Sink) -> ControlFlow<u8, u64> {
+    process_dispatch(
+        &mut Process::new(core::num::NonZeroU32::new(1).unwrap()),
+        call,
+        &mut memory.clone(),
+        sink,
+    )
+    .await
 }
 #[derive(Default)]
 struct Sink {
@@ -197,19 +233,226 @@ fn refuses_truncated_dynamic_writable_code_and_kernel_addresses() {
 fn initial_stack_is_aligned_and_contains_linux_arguments() {
     let mut bytes = [0xff; 256];
     let base = 0x10003;
-    let rsp = helios_linux::stack::initialize(&mut bytes, base, b"hello", 0x401000, 4096).unwrap();
+    let startup = helios_linux::stack::Startup {
+        entry: 0x401000,
+        page_size: 4096,
+        headers: helios_linux::elf::ProgramHeaders {
+            address: 0x400040,
+            count: 3,
+        },
+        random: [7; 16],
+    };
+    let rsp = helios_linux::stack::initialize(&mut bytes, base, b"hello", &startup).unwrap();
     assert_eq!(rsp % 16, 0);
     let offset = (rsp - base) as usize;
-    let words: Vec<u64> = bytes[offset..offset + 80]
+    let words: Vec<u64> = bytes[offset..offset + 160]
         .as_chunks::<8>()
         .0
         .iter()
         .map(|word| u64::from_le_bytes(*word))
         .collect();
     assert_eq!(words[0], 1);
-    assert_eq!(&words[2..], &[0, 0, 6, 4096, 9, 0x401000, 0, 0]);
+    assert_eq!(
+        &words[2..14],
+        &[0, 0, 3, 0x400040, 4, 56, 5, 3, 6, 4096, 9, 0x401000]
+    );
+    assert_eq!(words[14], 25);
+    let random_offset = (words[15] - base) as usize;
+    assert_eq!(&bytes[random_offset..random_offset + 16], &[7; 16]);
+    assert_eq!(&words[16..], &[31, words[1], 0, 0]);
     let argument = (words[1] - base) as usize;
     assert_eq!(&bytes[argument..argument + 6], b"hello\0");
-    assert!(helios_linux::stack::initialize(&mut [0; 8], base, b"hello", 0, 4096).is_err());
-    assert!(helios_linux::stack::initialize(&mut bytes, base, b"bad\0arg", 0, 4096).is_err());
+    assert!(helios_linux::stack::initialize(&mut [0; 8], base, b"hello", &startup).is_err());
+    assert!(helios_linux::stack::initialize(&mut bytes, base, b"bad\0arg", &startup).is_err());
+}
+
+fn call(number: u64, arguments: [u64; 6]) -> Call {
+    Call { number, arguments }
+}
+
+#[test]
+fn thread_state_round_trips_and_exit_clears_registered_tid() {
+    let mut process = Process::new(core::num::NonZeroU32::new(73).unwrap());
+    let mut memory = Memory(vec![0xff; 64]);
+    let mut sink = Sink::default();
+    for number in [39, 186] {
+        assert_eq!(
+            ready(process_dispatch(
+                &mut process,
+                call(number, [0; 6]),
+                &mut memory,
+                &mut sink
+            )),
+            ControlFlow::Continue(73)
+        );
+    }
+    assert_eq!(
+        ready(process_dispatch(
+            &mut process,
+            call(158, [0x1002, 0x12345000, 0, 0, 0, 0]),
+            &mut memory,
+            &mut sink
+        )),
+        ControlFlow::Continue(0)
+    );
+    assert_eq!(process.fs_base(), 0x12345000);
+    assert_eq!(
+        ready(process_dispatch(
+            &mut process,
+            call(158, [0x1003, 8, 0, 0, 0, 0]),
+            &mut memory,
+            &mut sink
+        )),
+        ControlFlow::Continue(0)
+    );
+    assert_eq!(&memory.0[8..16], &0x12345000u64.to_le_bytes());
+    assert_eq!(
+        ready(process_dispatch(
+            &mut process,
+            call(158, [0x1002, 1 << 47, 0, 0, 0, 0]),
+            &mut memory,
+            &mut sink
+        )),
+        ControlFlow::Continue(1u64.wrapping_neg())
+    );
+    assert_eq!(process.fs_base(), 0x12345000);
+    assert_eq!(
+        ready(process_dispatch(
+            &mut process,
+            call(158, [0x1003, 60, 0, 0, 0, 0]),
+            &mut memory,
+            &mut sink
+        )),
+        ControlFlow::Continue(14u64.wrapping_neg())
+    );
+    assert_eq!(
+        ready(process_dispatch(
+            &mut process,
+            call(218, [4, 0, 0, 0, 0, 0]),
+            &mut memory,
+            &mut sink
+        )),
+        ControlFlow::Continue(73)
+    );
+    assert_eq!(
+        ready(process_dispatch(
+            &mut process,
+            call(60, [0; 6]),
+            &mut memory,
+            &mut sink
+        )),
+        ControlFlow::Break(0)
+    );
+    assert_eq!(&memory.0[4..8], &[0; 4]);
+}
+
+#[test]
+fn vectored_output_validates_descriptors_and_preserves_partial_writes() {
+    let mut memory = Memory(vec![0; 4096]);
+    memory.0[0..8].copy_from_slice(&128u64.to_le_bytes());
+    memory.0[8..16].copy_from_slice(&3u64.to_le_bytes());
+    memory.0[16..24].copy_from_slice(&4094u64.to_le_bytes());
+    memory.0[24..32].copy_from_slice(&8u64.to_le_bytes());
+    memory.0[128..131].copy_from_slice(b"abc");
+    memory.0[4094..].copy_from_slice(b"de");
+    let mut sink = Sink::default();
+    assert_eq!(
+        ready(dispatch(call(20, [1, 0, 2, 0, 0, 0]), &memory, &mut sink)),
+        ControlFlow::Continue(5)
+    );
+    assert_eq!(&sink.bytes, b"abcde");
+    memory.0[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+    sink.bytes.clear();
+    assert_eq!(
+        ready(dispatch(call(20, [1, 0, 2, 0, 0, 0]), &memory, &mut sink)),
+        ControlFlow::Continue(22u64.wrapping_neg())
+    );
+    assert!(sink.bytes.is_empty());
+    assert_eq!(
+        ready(dispatch(
+            call(20, [1, 4090, 1, 0, 0, 0]),
+            &memory,
+            &mut sink
+        )),
+        ControlFlow::Continue(14u64.wrapping_neg())
+    );
+    assert_eq!(
+        ready(dispatch(
+            call(20, [1, 0, 1025, 0, 0, 0]),
+            &memory,
+            &mut sink
+        )),
+        ControlFlow::Continue(22u64.wrapping_neg())
+    );
+    assert_eq!(
+        ready(dispatch(
+            call(16, [1, 0x5413, 0, 0, 0, 0]),
+            &memory,
+            &mut sink
+        )),
+        ControlFlow::Continue(25u64.wrapping_neg())
+    );
+    assert_eq!(
+        ready(dispatch(
+            call(16, [9, 0x5413, 0, 0, 0, 0]),
+            &memory,
+            &mut sink
+        )),
+        ControlFlow::Continue(9u64.wrapping_neg())
+    );
+}
+
+#[test]
+fn elf_exposes_mapped_headers_and_validates_tls_initialization_bytes() {
+    let mut bytes = image();
+    bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+    // Second ELF64 program header describes a four-byte template plus TLS BSS.
+    bytes[120..124].copy_from_slice(&7u32.to_le_bytes());
+    bytes[124..128].copy_from_slice(&4u32.to_le_bytes());
+    bytes[128..136].copy_from_slice(&512u64.to_le_bytes());
+    bytes[136..144].copy_from_slice(&0x400200u64.to_le_bytes());
+    bytes[152..160].copy_from_slice(&4u64.to_le_bytes());
+    bytes[160..168].copy_from_slice(&8u64.to_le_bytes());
+    bytes[168..176].copy_from_slice(&4u64.to_le_bytes());
+    let parsed = Image::parse(&bytes).unwrap();
+    let headers = parsed.program_headers().unwrap();
+    assert_eq!(headers.address, 0x400040);
+    assert_eq!(headers.count, 2);
+    bytes[160..168].copy_from_slice(&2u64.to_le_bytes());
+    assert!(matches!(Image::parse(&bytes), Err(Error::InvalidSegment)));
+    bytes[160..168].copy_from_slice(&8u64.to_le_bytes());
+    bytes[136..144].copy_from_slice(&0x900200u64.to_le_bytes());
+    assert!(matches!(Image::parse(&bytes), Err(Error::InvalidSegment)));
+}
+
+#[test]
+fn anonymous_mmap_allocates_zeroed_memory_and_rejects_invalid_requests() {
+    let mut process = Process::new(core::num::NonZeroU32::new(1).unwrap());
+    let mut memory = Memory(vec![1; 4096]);
+    let mut sink = Sink::default();
+    let result = ready(process_dispatch(
+        &mut process,
+        call(9, [0, 17, 3, 0x22, u64::MAX, 0]),
+        &mut memory,
+        &mut sink,
+    ));
+    assert_eq!(result, ControlFlow::Continue(4096));
+    assert_eq!(&memory.0[4096..], &[0; 4096]);
+    for (arguments, error) in [
+        ([0, 0, 3, 0x22, u64::MAX, 0], 22u64),
+        ([0, 4096, 7, 0x22, u64::MAX, 0], 1),
+        ([0, 4096, 3, 0x32, u64::MAX, 0], 95),
+        ([0, 4096, 3, 0x22, u64::MAX, 1], 22),
+        ([0, u64::MAX, 3, 0x22, u64::MAX, 0], 12),
+    ] {
+        assert_eq!(
+            ready(process_dispatch(
+                &mut process,
+                call(9, arguments),
+                &mut memory,
+                &mut sink
+            )),
+            ControlFlow::Continue(error.wrapping_neg())
+        );
+    }
 }

@@ -16,10 +16,11 @@ helios_x86_native_enter:
     xrstor64 [rsi]
     mov rax, [rdi + {user_cr3}]
     mov cr3, rax
-    // Native userspace starts without TLS. Kernel FS is restored on every exit.
+    // User TLS is separate from the kernel's per-processor FS anchor.
     mov ecx, 0xc0000100
-    xor eax, eax
-    xor edx, edx
+    mov rax, [rdi + {user_fs}]
+    mov rdx, rax
+    shr rdx, 32
     wrmsr
     mov rsp, rdi
     pop r15

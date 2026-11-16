@@ -50,6 +50,8 @@ pub enum Error {
 struct UserPage {
     address: u64,
     frame: NonNull<u8>,
+    writable: bool,
+    readable: bool,
 }
 
 struct Tables {
@@ -108,6 +110,7 @@ impl AddressSpace {
         address: u64,
         size: u64,
         data: &[u8],
+        readable: bool,
         writable: bool,
         executable: bool,
     ) -> Result<(), Error> {
@@ -129,7 +132,10 @@ impl AddressSpace {
         {
             return Err(Error::Address);
         }
-        let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        let mut flags = PageTableFlags::PRESENT;
+        if readable {
+            flags |= PageTableFlags::USER_ACCESSIBLE;
+        }
         if writable {
             flags |= PageTableFlags::WRITABLE;
         }
@@ -142,6 +148,8 @@ impl AddressSpace {
             self.pages.push(UserPage {
                 address: base,
                 frame: raw,
+                writable,
+                readable,
             });
             let physical = raw.as_ptr() as usize - self.tables.offset;
             let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(physical as u64))
@@ -175,6 +183,60 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Finds a free user range and installs an anonymous mapping atomically.
+    /// This space is inactive for the whole allocation and any rollback.
+    pub fn map_anonymous(
+        &mut self,
+        hint: u64,
+        length: u64,
+        readable: bool,
+        writable: bool,
+        executable: bool,
+    ) -> Result<u64, Error> {
+        let candidate = self
+            .free_range(hint, length)
+            .or_else(|| self.free_range(PAGE_BYTES as u64, length))
+            .ok_or(Error::OutOfMemory)?;
+        let previous = self.pages.len();
+        if let Err(error) = self.map(candidate, length, &[], readable, writable, executable) {
+            while self.pages.len() > previous {
+                let page = self.pages.pop().expect("newly allocated page");
+                // SAFETY: the inactive root and all lower tables are exclusively
+                // owned. No CPU can retain translations from this attempted map.
+                let mut mapper = unsafe {
+                    OffsetPageTable::new(&mut self.root, VirtAddr::new(self.tables.offset as u64))
+                };
+                match mapper.unmap(
+                    Page::<Size4KiB>::from_start_address(VirtAddr::new(page.address)).unwrap(),
+                ) {
+                    Ok((_, flush)) => flush.ignore(),
+                    Err(x86_64::structures::paging::mapper::UnmapError::PageNotMapped) => {}
+                    Err(error) => panic!("native mapping rollback: {error:?}"),
+                }
+                deallocate_user_frame_on(smp::current_processor(), page.frame);
+            }
+            return Err(error);
+        }
+        Ok(candidate)
+    }
+
+    fn free_range(&self, start: u64, length: u64) -> Option<u64> {
+        let mut candidate = (start & !(PAGE_BYTES as u64 - 1)).max(PAGE_BYTES as u64);
+        loop {
+            let end = candidate
+                .checked_add(length)
+                .filter(|end| *end <= USER_END)?;
+            match self
+                .pages
+                .iter()
+                .find(|page| (candidate..end).contains(&page.address))
+            {
+                Some(page) => candidate = page.address + PAGE_BYTES as u64,
+                None => return Some(candidate),
+            }
+        }
+    }
+
     /// Copies through owned frame aliases, never through unchecked user pointers.
     pub fn read(&self, address: u64, output: &mut [u8]) -> Result<(), Error> {
         let end = address
@@ -190,7 +252,7 @@ impl AddressSpace {
             let page = self
                 .pages
                 .iter()
-                .find(|page| page.address == base)
+                .find(|page| page.address == base && page.readable)
                 .ok_or(Error::Address)?;
             let offset = (cursor - base) as usize;
             let length = (PAGE_BYTES - offset).min(output.len() - done);
@@ -200,6 +262,51 @@ impl AddressSpace {
                 core::ptr::copy_nonoverlapping(
                     page.frame.as_ptr().add(offset),
                     output[done..].as_mut_ptr(),
+                    length,
+                );
+            }
+            done += length;
+        }
+        Ok(())
+    }
+
+    /// Copies into owned writable pages while this space is inactive.
+    pub fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
+        let end = address
+            .checked_add(bytes.len() as u64)
+            .ok_or(Error::Address)?;
+        if end > USER_END {
+            return Err(Error::Address);
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        for cursor in (address & !(PAGE_BYTES as u64 - 1)..end).step_by(PAGE_BYTES) {
+            if !self
+                .pages
+                .iter()
+                .any(|page| page.address == cursor && page.writable)
+            {
+                return Err(Error::Address);
+            }
+        }
+        let mut done = 0;
+        while done < bytes.len() {
+            let cursor = address + done as u64;
+            let base = cursor & !(PAGE_BYTES as u64 - 1);
+            let page = self
+                .pages
+                .iter()
+                .find(|page| page.address == base)
+                .expect("validated writable page");
+            let offset = (cursor - base) as usize;
+            let length = (PAGE_BYTES - offset).min(bytes.len() - done);
+            // SAFETY: exclusive inactive ownership and all writable pages were
+            // validated above; the copy stays inside this page's allocation.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes[done..].as_ptr(),
+                    page.frame.as_ptr().add(offset),
                     length,
                 );
             }
@@ -287,6 +394,7 @@ struct Switch {
     kernel_rsp: u64,
     kernel_cr3: u64,
     kernel_fs: u64,
+    user_fs: u64,
     kernel_gs: u64,
     entry_stack: u64,
     scratch_rsp: u64,
@@ -340,6 +448,7 @@ impl Context {
                 kernel_rsp: 0,
                 kernel_cr3: 0,
                 kernel_fs: 0,
+                user_fs: 0,
                 kernel_gs: 0,
                 entry_stack: entry_stack.pointer.as_ptr() as u64 + entry_stack.layout.size() as u64,
                 scratch_rsp: 0,
@@ -354,6 +463,15 @@ impl Context {
 
     pub fn registers(&self) -> &Registers {
         &self.switch.registers
+    }
+
+    /// Selects a canonical userspace TLS base for the next execution slice.
+    pub fn set_thread_pointer(&mut self, address: u64) -> Result<(), Error> {
+        if address >= USER_END {
+            return Err(Error::Address);
+        }
+        self.switch.user_fs = address;
+        Ok(())
     }
 
     pub fn return_value(&mut self, value: u64) {
@@ -429,6 +547,7 @@ global_asm!(include_str!("native.S"),
     kernel_rsp = const core::mem::offset_of!(Switch, kernel_rsp),
     kernel_cr3 = const core::mem::offset_of!(Switch, kernel_cr3),
     kernel_fs = const core::mem::offset_of!(Switch, kernel_fs),
+    user_fs = const core::mem::offset_of!(Switch, user_fs),
     entry_stack = const core::mem::offset_of!(Switch, entry_stack),
     scratch_rsp = const core::mem::offset_of!(Switch, scratch_rsp),
     user_cr3 = const core::mem::offset_of!(Switch, user_cr3),
