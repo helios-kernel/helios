@@ -114,6 +114,9 @@ impl Vgic {
             self.asserted[word] &= !bit;
             if let Some(index) = existing {
                 self.lrs[index] &= !PENDING;
+                if self.lrs[index] & ACTIVE == 0 {
+                    self.lrs[index] = 0;
+                }
             }
             return Ok(true);
         }
