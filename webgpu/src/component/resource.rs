@@ -80,6 +80,7 @@ impl wit::GuestGpuQuerySet for QuerySet {
     }
 }
 
+#[derive(Clone)]
 pub struct Texture {
     pub object: Object<backend::Texture>,
     pub descriptor: wit::GpuTextureDescriptor,

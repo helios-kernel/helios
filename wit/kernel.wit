@@ -216,4 +216,5 @@ world webgpu-provider {
   import helios:system/sync@0.1.0;
   import helios:system/tracing@0.1.0;
   export wasi:webgpu/webgpu@0.3.0-rc.2;
+  export helios:webgpu/canvas@0.1.0;
 }

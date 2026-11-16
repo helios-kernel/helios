@@ -8,10 +8,11 @@ use super::wit;
 use crate::runtime::{DeviceLost, GpuError, GpuErrorKind};
 
 /// Resource labels are component state; Vulkan objects keep their creation label.
+#[derive(Clone)]
 pub struct Object<T> {
     pub raw: Option<T>,
     pub owner: Rc<DeviceState>,
-    label: RefCell<String>,
+    label: Rc<RefCell<String>>,
 }
 
 impl<T> Object<T> {
@@ -19,7 +20,7 @@ impl<T> Object<T> {
         Self {
             raw: Some(raw),
             owner,
-            label: RefCell::new(label.unwrap_or_default()),
+            label: Rc::new(RefCell::new(label.unwrap_or_default())),
         }
     }
 
@@ -27,7 +28,7 @@ impl<T> Object<T> {
         Self {
             raw: None,
             owner,
-            label: RefCell::new(label.unwrap_or_default()),
+            label: Rc::new(RefCell::new(label.unwrap_or_default())),
         }
     }
 

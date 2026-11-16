@@ -33,3 +33,7 @@ pub mod adapter;
 pub mod gpu;
 
 pub mod presentation;
+
+pub mod canvas;
+
+pub mod provider;

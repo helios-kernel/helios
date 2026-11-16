@@ -18,6 +18,7 @@ use super::{
     wit,
 };
 
+#[derive(Clone)]
 pub struct Device {
     pub object: Object<()>,
     pub queue: Queue,

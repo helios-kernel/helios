@@ -2,6 +2,7 @@
 // W3C Community Contributor License Agreement:
 // https://www.w3.org/community/about/agreements/cla/
 // WebAssembly/wasi-webgpu v0.3.0-rc.2, commit 6a776bada0b66d3dbf9da304a49ff2947ce4e1f8.
+// Helios adds recoverable canvas configuration and invalid-state errors.
 package wasi:webgpu@0.3.0-rc.2;
 
 interface webgpu {
@@ -197,11 +198,21 @@ interface webgpu {
     tone-mapping: option<gpu-canvas-tone-mapping>,
     alpha-mode: option<gpu-canvas-alpha-mode>,
   }
+  enum configure-canvas-error-kind {
+    type-error,
+  }
+  record configure-canvas-error {
+    kind: configure-canvas-error-kind,
+    message: string,
+  }
+  enum get-current-texture-error {
+    invalid-state,
+  }
   resource gpu-canvas-context {
-    configure: func(configuration: gpu-canvas-configuration);
+    configure: func(configuration: gpu-canvas-configuration) -> result<_, configure-canvas-error>;
     unconfigure: func();
     get-configuration: func() -> option<gpu-canvas-configuration-owned>;
-    get-current-texture: func() -> gpu-texture;
+    get-current-texture: func() -> result<gpu-texture, get-current-texture-error>;
   }
   record gpu-canvas-tone-mapping {
     mode: option<gpu-canvas-tone-mapping-mode>,
