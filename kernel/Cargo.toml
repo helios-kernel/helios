@@ -6,6 +6,10 @@ build = "build.rs"
 
 [features]
 unix = ["dep:helios-unix", "helios-unix/runtime"]
+# The Linux process host: a program service launch of a static Linux ELF
+# runs it natively through `Cpu::native`. Off by default; a build without it
+# compiles none of `helios-linux`.
+linux = ["wasmtime-runtime", "dep:helios-linux", "helios-linux/runtime"]
 default = ["wasmtime-host", "embedded-debugger"]
 # Autostart of the embedded debugger system component. Production kernels
 # can drop it; the prebuild bootfs contents are controlled separately by
@@ -36,6 +40,7 @@ wasmtime-bare-metal = [
 [dependencies]
 helios-sync = { workspace = true, features = ["runtime"] }
 helios-unix = { workspace = true, optional = true }
+helios-linux = { path = "../linux", default-features = false, optional = true }
 helios-btrfs = { path = "../btrfs", default-features = false, features = ["write"] }
 async-task = { version = "4.7.1", default-features = false }
 atomic-waker = "1.1.2"

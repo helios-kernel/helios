@@ -52,6 +52,10 @@ mod wasix_net;
 use wasix_net::*;
 mod wasix_epoll;
 use wasix_epoll::*;
+#[cfg(feature = "linux")]
+mod linux;
+#[cfg(feature = "linux")]
+use linux::*;
 
 use super::*;
 use crate::isa::GuestIsa;
@@ -399,17 +403,26 @@ pub(crate) enum ProgramSource {
     RawWasm(Bytes),
     SignedArtifact(Bytes),
     BootfsArtifact(BootfsBytes),
+    /// A Linux executable. It runs natively in an address space of its
+    /// own, so no provenance is asked of its bytes.
+    #[cfg(feature = "linux")]
+    LinuxElf(Bytes),
 }
 
 impl ProgramSource {
     /// Classifies a program file by the provenance the filesystem layer
     /// that produced its bytes gave them.
     pub(crate) fn from_file(contents: FileContents) -> Self {
+        // A Wasmtime artifact is an ELF file too, so it is recognised first.
         match contents {
             FileContents::Boot(bytes)
                 if WasmtimePrecompiledKind::detect(bytes.as_slice()).is_some() =>
             {
                 Self::BootfsArtifact(bytes)
+            }
+            #[cfg(feature = "linux")]
+            FileContents::Boot(bytes) if is_linux_elf(bytes.as_slice()) => {
+                Self::LinuxElf(bytes.to_bytes())
             }
             FileContents::Boot(bytes) => Self::RawWasm(bytes.to_bytes()),
             FileContents::Written(bytes) => Self::from_untrusted(bytes),
@@ -419,11 +432,15 @@ impl ProgramSource {
     /// Classifies bytes no boot payload vouches for: a file a guest
     /// wrote, on whichever mount, or one a host shared.
     fn from_untrusted(bytes: Bytes) -> Self {
+        // A Wasmtime artifact is an ELF file too, so it is recognised first.
         if cwasm::is_cwasm(&bytes) {
-            Self::SignedArtifact(bytes)
-        } else {
-            Self::RawWasm(bytes)
+            return Self::SignedArtifact(bytes);
         }
+        #[cfg(feature = "linux")]
+        if is_linux_elf(&bytes) {
+            return Self::LinuxElf(bytes);
+        }
+        Self::RawWasm(bytes)
     }
 
     /// Byte length of the payload the source carries, whichever
@@ -431,6 +448,8 @@ impl ProgramSource {
     pub(crate) fn payload_len(&self) -> usize {
         match self {
             Self::RawWasm(bytes) | Self::SignedArtifact(bytes) => bytes.len(),
+            #[cfg(feature = "linux")]
+            Self::LinuxElf(bytes) => bytes.len(),
             Self::BootfsArtifact(bytes) => bytes.as_slice().len(),
         }
     }
@@ -1616,6 +1635,19 @@ where
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadBegin);
         let payload = match source {
+            #[cfg(feature = "linux")]
+            ProgramSource::LinuxElf(image) => {
+                if hint.is_some() {
+                    return Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidHint,
+                        detail: ProgramExecErrorDetail::HintNotAllowedForPrecompiledArtifact,
+                    });
+                }
+                let loaded = LinuxExecutable::load(&exec_context.cpu, image.clone())
+                    .map(ProgramExecutable::Linux);
+                timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadComplete);
+                return loaded;
+            }
             ProgramSource::SignedArtifact(bytes) => {
                 if hint.is_some() {
                     return Err(ProgramExecError {

@@ -10,6 +10,8 @@
 extern crate alloc;
 
 #[cfg(feature = "runtime")]
+pub mod abi;
+#[cfg(feature = "runtime")]
 pub mod elf;
 #[cfg(feature = "runtime")]
 pub mod syscall;

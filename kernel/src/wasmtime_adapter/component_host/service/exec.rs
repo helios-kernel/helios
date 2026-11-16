@@ -20,6 +20,9 @@ where
         /// executable itself is moved through every launch path.
         restore: Box<CoreModuleRestore<Net>>,
     },
+    /// A static Linux executable the native host runs.
+    #[cfg(feature = "linux")]
+    Linux(LinuxExecutable),
 }
 
 pub(super) struct CoreModuleRestore<Net: ComponentHostNetwork> {
@@ -287,6 +290,24 @@ where
                 core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
+                &timeline,
+            )
+            .await
+        }
+        // A Linux process holds the descriptor table it is handed as its
+        // own, and its standard streams lead where the launch routes them.
+        #[cfg(feature = "linux")]
+        ProgramExecutable::Linux(executable) => {
+            run_linux_process(
+                exec_context,
+                argv,
+                env,
+                authority,
+                descriptors,
+                signal_state,
+                launched_instance,
+                output_mode,
+                executable,
                 &timeline,
             )
             .await

@@ -2084,14 +2084,11 @@ name = "helios"
 version = "0.1.0"
 dependencies = [
  "helios-aarch64",
- "helios-hal",
  "helios-hosted",
  "helios-inspector-protocol",
  "helios-kernel",
- "helios-linux",
  "helios-riscv",
  "helios-x86",
- "tracing",
  "wasmtime",
 ]
 
@@ -2552,6 +2549,7 @@ dependencies = [
  "helios-btrfs",
  "helios-compiler-abi",
  "helios-hal",
+ "helios-linux",
  "helios-netstack",
  "helios-sync",
  "helios-unix",
@@ -2588,6 +2586,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "critical-section",
+ "helios-hal",
  "helios-sync",
  "helios-unix",
  "object",
@@ -2835,7 +2834,6 @@ dependencies = [
  "limine 0.5.0",
  "pci_types",
  "spin 0.9.9",
- "thiserror 2.0.21",
  "tracing",
  "x86",
  "x86_64",

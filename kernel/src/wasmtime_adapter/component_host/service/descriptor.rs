@@ -1160,6 +1160,13 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         }
     }
 
+    /// The descriptor slots themselves, for a process of another ABI that
+    /// takes this table over whole.
+    #[cfg(feature = "linux")]
+    pub(super) fn into_slots(self) -> helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>> {
+        self.slots
+    }
+
     pub(super) fn clone_for_exec(&self) -> Self {
         let mut table = Self::from_entries(
             self.slots

@@ -184,8 +184,14 @@ pub trait VcpuKick: Send + Sync + 'static {
     fn kick(&self);
 }
 
-/// Architectural names used by VMM boot loaders and exit emulation. The
-/// backend's snapshot keeps its native layout; names never encode pointers.
+/// Architectural register names, shared by every contract that exposes a
+/// detached register snapshot: VMM boot loaders and exit emulation here, and
+/// native user contexts ([`crate::native::UserContext`]). The backend's
+/// snapshot keeps its native layout; names never encode pointers.
+///
+/// `X86Gpr(n)` numbers the sixteen 64-bit general registers by their
+/// instruction encoding (Intel SDM vol. 2, table 2-2 with REX.B): RAX 0,
+/// RCX 1, RDX 2, RBX 3, RSP 4, RBP 5, RSI 6, RDI 7, R8 to R15 8 to 15.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegisterId {
     Aarch64X(u8),

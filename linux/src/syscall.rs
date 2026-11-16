@@ -1,16 +1,67 @@
+use bytes::Bytes;
 use core::convert::Infallible;
 use core::future::Future;
 use core::num::NonZeroU32;
+use core::ops::ControlFlow;
 use helios_unix::{DescriptorSlots, FileDescriptor, FileDescriptorEntry, ProcessIdentity};
 mod io;
+pub use crate::abi::{Abi, Operation};
 pub use io::Clock;
-/// A descriptor whose file slot holds the platform's filesystem node through
-/// the shared [`helios_unix::OpenFile`], the same open file description WASIX
-/// descriptors hold.
-type Descriptor<File> = FileDescriptor<File, Infallible, u64>;
-type Entry<File> = FileDescriptorEntry<File, Infallible, u64>;
-type Descriptors<File> = DescriptorSlots<Entry<File>>;
-use core::ops::ControlFlow;
+
+/// The platform objects a process's descriptors can hold besides the UNIX
+/// objects `helios-unix` owns (pipes, eventfds, epoll sets): the host's
+/// files and sockets, and the user data its epoll interests carry. A
+/// process shares descriptors with programs of another ABI by naming the
+/// same resource set they use.
+pub trait Resources: 'static {
+    type File: Clone;
+    type Socket: Clone;
+    type Data: EpollData;
+}
+
+/// User data an epoll interest carries, as Linux's 64-bit `epoll_data`.
+pub trait EpollData: Clone {
+    fn from_linux(data: u64) -> Self;
+    fn to_linux(&self) -> u64;
+}
+
+impl EpollData for u64 {
+    fn from_linux(data: u64) -> Self {
+        data
+    }
+    fn to_linux(&self) -> u64 {
+        *self
+    }
+}
+
+/// A resource set with no files and no sockets.
+pub struct NoBacking;
+impl Resources for NoBacking {
+    type File = Infallible;
+    type Socket = Infallible;
+    type Data = u64;
+}
+
+pub type Descriptor<R> =
+    FileDescriptor<<R as Resources>::File, <R as Resources>::Socket, <R as Resources>::Data>;
+pub type Entry<R> =
+    FileDescriptorEntry<<R as Resources>::File, <R as Resources>::Socket, <R as Resources>::Data>;
+pub type Descriptors<R> = DescriptorSlots<Entry<R>>;
+
+/// The descriptor table a process started by no other process holds:
+/// standard input, output and error at 0, 1 and 2.
+pub fn standard_streams<R: Resources>() -> Descriptors<R> {
+    DescriptorSlots::from_entries(alloc::vec![
+        Some(Entry::<R>::new(
+            Descriptor::<R>::Stdin {
+                carry: Bytes::new()
+            },
+            false
+        )),
+        Some(Entry::<R>::new(Descriptor::<R>::Stdout, false)),
+        Some(Entry::<R>::new(Descriptor::<R>::Stderr, false)),
+    ])
+}
 
 /// A fault reported by the address-space owner, before any bytes are exposed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -24,7 +75,7 @@ pub trait UserMemory {
     /// Validates a writable range without modifying it. The exclusive memory
     /// borrow keeps its mappings stable until the syscall completes.
     fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault>;
-    /// Copies bytes only into writable user mappings while execution is stopped.
+    /// Copies bytes only into writable user mappings.
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault>;
 }
 
@@ -39,8 +90,8 @@ pub enum MapError {
 }
 
 pub trait VirtualMemory: UserMemory {
-    /// Installs zero-filled private pages in an inactive address space. `hint`
-    /// is advisory. Failure leaves the address space's mappings unchanged.
+    /// Installs zero-filled private pages. `hint` is advisory. Failure
+    /// leaves the address space's mappings unchanged.
     fn map_anonymous(
         &mut self,
         hint: u64,
@@ -49,6 +100,14 @@ pub trait VirtualMemory: UserMemory {
         writable: bool,
         executable: bool,
     ) -> Result<u64, MapError>;
+}
+
+/// The calling thread's thread pointer, which x86-64's `arch_prctl` sets
+/// and reads. aarch64 user code writes `TPIDR_EL0` itself.
+pub trait Thread {
+    fn thread_pointer(&self) -> u64;
+    /// Refused for an address outside the user range.
+    fn set_thread_pointer(&mut self, address: u64) -> Result<(), Denied>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,9 +122,19 @@ pub enum WriteError {
     Interrupted,
     #[error("output failed")]
     Io,
+    #[error("the process's authority does not reach this output")]
+    Denied,
 }
 
-pub trait Output {
+/// A refusal by the process's authority, or of an address it may not use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("refused")]
+pub struct Denied;
+
+/// Where the standard-stream descriptors lead: the terminal, a parent's
+/// channel, or a log, as the process's host routes them. The host refuses
+/// a stream its process's authority does not reach.
+pub trait Stdio {
     /// Writes up to the supplied length, including short writes. The buffer
     /// belongs to the caller and remains stable across suspension.
     fn write(
@@ -73,68 +142,60 @@ pub trait Output {
         stream: Stream,
         bytes: &[u8],
     ) -> impl Future<Output = Result<usize, WriteError>> + Send;
+
+    /// Waits for standard input and returns what arrived, at most `limit`
+    /// bytes; empty at the end of input.
+    fn read_input(&mut self, limit: usize) -> impl Future<Output = Result<Bytes, Denied>> + Send;
 }
 
-/// The x86-64 Linux syscall register ABI: RAX and RDI, RSI, RDX, R10, R8, R9.
+/// A system call as its ABI's registers carry it.
 #[derive(Debug, Clone, Copy)]
 pub struct Call {
     pub number: u64,
     pub arguments: [u64; 6],
 }
 
-// Linux UAPI arch/x86/entry/syscalls/syscall_64.tbl and asm-generic/errno-base.h.
-const SYS_WRITE: u64 = 1;
-const SYS_MMAP: u64 = 9;
-const SYS_IOCTL: u64 = 16;
-const SYS_WRITEV: u64 = 20;
-const SYS_GETPID: u64 = 39;
-const SYS_ARCH_PRCTL: u64 = 158;
-const SYS_GETTID: u64 = 186;
-const SYS_SET_TID_ADDRESS: u64 = 218;
+// Linux uapi/asm-generic/errno-base.h and errno.h.
+const EPERM: u64 = 1;
+const EINTR: u64 = 4;
+const EIO: u64 = 5;
+const EBADF: u64 = 9;
 const ENOMEM: u64 = 12;
+const EACCES: u64 = 13;
+const EFAULT: u64 = 14;
 const ENODEV: u64 = 19;
-const EOPNOTSUPP: u64 = 95;
 const EINVAL: u64 = 22;
 const ENOTTY: u64 = 25;
-const EPERM: u64 = 1;
+const ENOSYS: u64 = 38;
+const EOPNOTSUPP: u64 = 95;
 const MAX_RW_COUNT: u64 = 0x7fff_f000; // Linux INT_MAX rounded down to a page.
+// x86-64 TASK_SIZE_MAX with four-level paging: the end of the user half.
+const X86_64_USER_END: u64 = 1 << 47;
 
 /// State of a single-threaded Linux process, exclusively owned by its task.
 /// No syscall or user-memory mutation runs concurrently with guest execution.
 /// The execution owner supplies a unique nonzero ID for each live process.
-/// `File` is the platform's filesystem node handle; a descriptor that names a
-/// file holds it through the open file description every duplicate shares.
-pub struct Process<File: Clone> {
+pub struct Process<R: Resources> {
+    abi: Abi,
     identity: ProcessIdentity,
-    descriptors: Descriptors<File>,
-    fs_base: u64,
+    descriptors: Descriptors<R>,
     clear_child_tid: u64,
 }
-impl<File: Clone> Process<File> {
-    pub fn new(id: NonZeroU32) -> Self {
+impl<R: Resources> Process<R> {
+    /// A process holding the standard streams only.
+    pub fn new(abi: Abi, id: NonZeroU32) -> Self {
+        Self::with_descriptors(abi, id, standard_streams::<R>())
+    }
+    /// A process holding the descriptors its parent handed it.
+    pub fn with_descriptors(abi: Abi, id: NonZeroU32, descriptors: Descriptors<R>) -> Self {
         Self {
+            abi,
             identity: ProcessIdentity::new(id.into()),
-            descriptors: DescriptorSlots::from_entries(alloc::vec![
-                None,
-                Some(Entry::new(Descriptor::Stdout, false)),
-                Some(Entry::new(Descriptor::Stderr, false))
-            ]),
-            fs_base: 0,
+            descriptors,
             clear_child_tid: 0,
         }
     }
-    pub fn fs_base(&self) -> u64 {
-        self.fs_base
-    }
 }
-
-const SYS_EXIT: u64 = 60;
-const SYS_EXIT_GROUP: u64 = 231;
-const EINTR: u64 = 4;
-const EIO: u64 = 5;
-const EBADF: u64 = 9;
-const EFAULT: u64 = 14;
-const ENOSYS: u64 = 38;
 
 fn errno(value: u64) -> u64 {
     value.wrapping_neg()
@@ -142,90 +203,85 @@ fn errno(value: u64) -> u64 {
 
 /// A single-threaded process's initial ABI surface. Exit consumes the execution
 /// loop through `Break`; it is never returned to the guest as a syscall result.
-pub async fn dispatch<File: Clone, M: VirtualMemory, O: Output + Clock>(
-    process: &mut Process<File>,
+pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread, O: Stdio + Clock>(
+    process: &mut Process<R>,
     call: Call,
     memory: &mut M,
+    thread: &mut T,
     output: &mut O,
 ) -> ControlFlow<u8, u64> {
-    match call.number {
-        SYS_EXIT | SYS_EXIT_GROUP => {
+    let arguments = call.arguments;
+    let result = match process.abi.operation(call.number) {
+        Operation::Exit | Operation::ExitGroup => {
             // Linux ignores a fault clearing this address. There are no sibling
             // threads/futex waiters in this single-threaded process model.
             if process.clear_child_tid != 0 {
                 let _ = memory.write(process.clear_child_tid, &0u32.to_le_bytes());
             }
-            ControlFlow::Break(call.arguments[0] as u8)
+            return ControlFlow::Break(arguments[0] as u8);
         }
-        0 => {
-            ControlFlow::Continue(io::read(&mut process.descriptors, call.arguments, memory).await)
+        Operation::Read => {
+            io::read::<R, _, _>(&mut process.descriptors, arguments, memory, output).await
         }
-        3 => ControlFlow::Continue(
-            process
-                .descriptors
-                .close(call.arguments[0] as u32 as i32)
-                .map_or_else(io::descriptor_errno, |_| 0),
+        Operation::Close => process
+            .descriptors
+            .close(arguments[0] as u32 as i32)
+            .map_or_else(io::descriptor_errno, |_| 0),
+        operation @ (Operation::Pipe | Operation::Pipe2) => io::pipe::<R, _>(
+            &mut process.descriptors,
+            arguments,
+            memory,
+            operation == Operation::Pipe2,
         ),
-        22 | 293 => ControlFlow::Continue(io::pipe(
+        operation @ (Operation::Dup | Operation::Dup2 | Operation::Dup3 | Operation::Fcntl) => {
+            io::duplicate::<R>(&mut process.descriptors, operation, arguments)
+        }
+        operation @ (Operation::Eventfd | Operation::Eventfd2) => io::event::<R>(
             &mut process.descriptors,
-            call.arguments,
-            memory,
-            call.number == 293,
-        )),
-        32 | 33 | 292 | 72 => ControlFlow::Continue(io::duplicate(&mut process.descriptors, call)),
-        284 | 290 => ControlFlow::Continue(io::event(
+            arguments,
+            operation == Operation::Eventfd2,
+        ),
+        operation @ (Operation::EpollCreate | Operation::EpollCreate1) => io::epoll_create::<R>(
             &mut process.descriptors,
-            call.arguments,
-            call.number == 290,
-        )),
-        213 | 291 => ControlFlow::Continue(io::epoll_create(
-            &mut process.descriptors,
-            call.arguments,
-            call.number == 291,
-        )),
-        233 => ControlFlow::Continue(io::epoll_ctl(
-            &mut process.descriptors,
-            call.arguments,
-            memory,
-        )),
-        232 | 281 => ControlFlow::Continue(
-            io::epoll_wait(
+            arguments,
+            operation == Operation::EpollCreate1,
+        ),
+        Operation::EpollCtl => {
+            io::epoll_ctl::<R, _>(process.abi, &mut process.descriptors, arguments, memory)
+        }
+        operation @ (Operation::EpollWait | Operation::EpollPwait) => {
+            io::epoll_wait::<R, _, _>(
+                process.abi,
                 &process.descriptors,
-                call.arguments,
+                arguments,
                 memory,
                 output,
-                call.number == 281,
+                operation == Operation::EpollPwait,
             )
-            .await,
-        ),
-        SYS_MMAP => ControlFlow::Continue(mmap(call.arguments, memory)),
-        SYS_GETPID | SYS_GETTID => ControlFlow::Continue(process.identity.id().get()),
-        SYS_SET_TID_ADDRESS => {
-            process.clear_child_tid = call.arguments[0];
-            ControlFlow::Continue(process.identity.id().get())
+            .await
         }
-        SYS_ARCH_PRCTL => ControlFlow::Continue(arch_prctl(process, call.arguments, memory)),
-        SYS_WRITEV => ControlFlow::Continue(
-            writev(&process.descriptors, call.arguments, memory, output).await,
-        ),
-        SYS_IOCTL => ControlFlow::Continue(
-            match process
-                .descriptors
-                .get_entry(call.arguments[0] as u32 as i32)
-            {
-                Some(_) => errno(ENOTTY),
-                None => errno(EBADF),
-            },
-        ),
-        SYS_WRITE => {
-            ControlFlow::Continue(write(&process.descriptors, call.arguments, memory, output).await)
+        Operation::Mmap => mmap(arguments, memory),
+        Operation::Getpid | Operation::Gettid => process.identity.id().get(),
+        Operation::SetTidAddress => {
+            process.clear_child_tid = arguments[0];
+            process.identity.id().get()
         }
-        _ => ControlFlow::Continue(errno(ENOSYS)),
-    }
+        Operation::ArchPrctl => arch_prctl(arguments, memory, thread),
+        Operation::Writev => {
+            writev::<R, _, _>(&process.descriptors, arguments, memory, output).await
+        }
+        Operation::Ioctl => match process.descriptors.get_entry(arguments[0] as u32 as i32) {
+            Some(_) => errno(ENOTTY),
+            None => errno(EBADF),
+        },
+        Operation::Write => write::<R, _, _>(&process.descriptors, arguments, memory, output).await,
+        Operation::Unknown => errno(ENOSYS),
+    };
+    ControlFlow::Continue(result)
 }
 
-async fn write<File: Clone, M: UserMemory, O: Output>(
-    descriptors: &Descriptors<File>,
+async fn write<R: Resources, M: UserMemory, O: Stdio>(
+    descriptors: &Descriptors<R>,
     args: [u64; 6],
     memory: &M,
     output: &mut O,
@@ -235,17 +291,13 @@ async fn write<File: Clone, M: UserMemory, O: Output>(
         return errno(EBADF);
     };
     let stream = match &entry.descriptor {
-        Descriptor::Stdout => Stream::Stdout,
-        Descriptor::Stderr => Stream::Stderr,
-        _ => return io::write_resource(entry, args, memory).await,
+        Descriptor::<R>::Stdout => Stream::Stdout,
+        Descriptor::<R>::Stderr => Stream::Stderr,
+        _ => return io::write_resource::<R, M>(entry, args, memory).await,
     };
     // Linux MAX_RW_COUNT is INT_MAX rounded down to PAGE_SIZE (x86-64: 4096).
     let count = args[2].min(MAX_RW_COUNT);
-    let Some(end) = args[1].checked_add(count) else {
-        return errno(EFAULT);
-    };
-    // Four-level x86-64 userspace ends at the canonical lower-half boundary.
-    if args[1] >= 1 << 47 || end > 1 << 47 {
+    if args[1].checked_add(count).is_none() {
         return errno(EFAULT);
     }
     // One page bounds kernel stack use independently of the guest's count.
@@ -275,6 +327,7 @@ async fn write<File: Clone, M: UserMemory, O: Output>(
                     errno(match error {
                         WriteError::Interrupted => EINTR,
                         WriteError::Io => EIO,
+                        WriteError::Denied => EACCES,
                     })
                 };
             }
@@ -283,21 +336,16 @@ async fn write<File: Clone, M: UserMemory, O: Output>(
     written
 }
 
-fn arch_prctl<File: Clone, M: UserMemory>(
-    process: &mut Process<File>,
-    args: [u64; 6],
-    memory: &mut M,
-) -> u64 {
+fn arch_prctl<M: UserMemory, T: Thread>(args: [u64; 6], memory: &mut M, thread: &mut T) -> u64 {
     // Linux UAPI asm/prctl.h: ARCH_SET_FS and ARCH_GET_FS.
     match args[0] as u32 {
         0x1002 => {
-            if args[1] >= 1 << 47 {
+            if args[1] >= X86_64_USER_END || thread.set_thread_pointer(args[1]).is_err() {
                 return errno(EPERM);
             }
-            process.fs_base = args[1];
             0
         }
-        0x1003 => match memory.write(args[1], &process.fs_base.to_le_bytes()) {
+        0x1003 => match memory.write(args[1], &thread.thread_pointer().to_le_bytes()) {
             Ok(()) => 0,
             Err(_) => errno(EFAULT),
         },
@@ -305,8 +353,8 @@ fn arch_prctl<File: Clone, M: UserMemory>(
     }
 }
 
-async fn writev<File: Clone, M: UserMemory, O: Output>(
-    descriptors: &Descriptors<File>,
+async fn writev<R: Resources, M: UserMemory, O: Stdio>(
+    descriptors: &Descriptors<R>,
     args: [u64; 6],
     memory: &M,
     output: &mut O,
@@ -322,10 +370,7 @@ async fn writev<File: Clone, M: UserMemory, O: Output>(
     if count == 0 {
         return 0;
     }
-    let Some(end) = args[1].checked_add(u64::from(count) * 16) else {
-        return errno(EFAULT);
-    };
-    if end > 1 << 47 {
+    if args[1].checked_add(u64::from(count) * 16).is_none() {
         return errno(EFAULT);
     }
     let mut vector = [0; 16];
@@ -356,7 +401,7 @@ async fn writev<File: Clone, M: UserMemory, O: Output>(
         if length == 0 {
             continue;
         }
-        let result = write(
+        let result = write::<R, _, _>(
             descriptors,
             [args[0], base, length, 0, 0, 0],
             memory,
@@ -375,7 +420,8 @@ async fn writev<File: Clone, M: UserMemory, O: Output>(
 }
 
 fn mmap<M: VirtualMemory>(args: [u64; 6], memory: &mut M) -> u64 {
-    // Linux x86-64 mmap: MAP_PRIVATE | MAP_ANONYMOUS, PROT_{READ,WRITE,EXEC}.
+    // Linux mmap: MAP_PRIVATE | MAP_ANONYMOUS, PROT_{READ,WRITE,EXEC}, whose
+    // values asm-generic/mman-common.h gives both ABIs.
     if args[1] == 0 || args[2] & !7 != 0 || args[3] & 3 != 2 || args[5] & 4095 != 0 {
         return errno(EINVAL);
     }
@@ -393,14 +439,10 @@ fn mmap<M: VirtualMemory>(args: [u64; 6], memory: &mut M) -> u64 {
     if args[2] & 6 == 6 {
         return errno(EPERM);
     } // Enforce the native W^X policy.
-    let Some(length) = args[1]
-        .checked_add(4095)
-        .map(|n| n & !4095)
-        .filter(|n| *n < 1 << 47)
-    else {
+    let Some(length) = args[1].checked_add(4095).map(|n| n & !4095) else {
         return errno(ENOMEM);
     };
-    // x86 permits reads from writable or executable mappings as well.
+    // Both ISAs permit reads from writable or executable mappings as well.
     match memory.map_anonymous(
         args[0] & !4095,
         length,
@@ -420,9 +462,7 @@ mod tests {
     use super::*;
     use helios_unix::OpenFile;
 
-    // Linux UAPI syscall_64.tbl: dup and dup3; fcntl.h: O_CLOEXEC.
-    const SYS_DUP: u64 = 32;
-    const SYS_DUP3: u64 = 292;
+    // fcntl.h: O_CLOEXEC.
     const O_CLOEXEC: u64 = 0x80000;
 
     /// A node handle as the platform would supply one; only its identity
@@ -430,33 +470,39 @@ mod tests {
     #[derive(Clone)]
     struct Node;
 
-    fn open_file(descriptors: &Descriptors<Node>, fd: i32) -> &OpenFile<Node> {
+    struct Files;
+    impl Resources for Files {
+        type File = Node;
+        type Socket = Infallible;
+        type Data = u64;
+    }
+
+    fn open_file(descriptors: &Descriptors<Files>, fd: i32) -> &OpenFile<Node> {
         match descriptors.get_entry(fd).map(|entry| &entry.descriptor) {
-            Some(Descriptor::File(file)) => file,
+            Some(Descriptor::<Files>::File(file)) => file,
             _ => panic!("descriptor {fd} must name the file"),
         }
     }
 
     #[test]
     fn duplicated_file_descriptors_share_one_open_file_description() {
-        let mut process = Process::<Node>::new(NonZeroU32::new(1).unwrap());
+        let mut process = Process::<Files>::new(Abi::X86_64, NonZeroU32::new(1).unwrap());
         let fd = process
             .descriptors
-            .insert_entry(Entry::new(Descriptor::File(OpenFile::new(Node)), false))
+            .insert_entry(Entry::<Files>::new(
+                Descriptor::<Files>::File(OpenFile::new(Node)),
+                false,
+            ))
             .expect("the table has room");
-        let duplicate = io::duplicate(
+        let duplicate = io::duplicate::<Files>(
             &mut process.descriptors,
-            Call {
-                number: SYS_DUP,
-                arguments: [u64::from(fd), 0, 0, 0, 0, 0],
-            },
+            Operation::Dup,
+            [u64::from(fd), 0, 0, 0, 0, 0],
         );
-        let target = io::duplicate(
+        let target = io::duplicate::<Files>(
             &mut process.descriptors,
-            Call {
-                number: SYS_DUP3,
-                arguments: [u64::from(fd), 9, O_CLOEXEC, 0, 0, 0],
-            },
+            Operation::Dup3,
+            [u64::from(fd), 9, O_CLOEXEC, 0, 0, 0],
         );
         assert_eq!(target, 9);
 

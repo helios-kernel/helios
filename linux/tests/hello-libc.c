@@ -47,12 +47,18 @@ int main(int argc, char **argv) {
     if (argc != 1 || !argv[0] || value++ != 41 || zero++ != 0) return 1;
     errno = 0;
     if (getpid() <= 0 || syscall(SYS_gettid) != getpid()) return 2;
+#ifdef __x86_64__
     unsigned long fs_base = 0;
     /* Linux x86-64 ARCH_GET_FS; compare the syscall result to the real TLS register. */
     if (syscall(SYS_arch_prctl, 0x1003, &fs_base) != 0 ||
         fs_base != (unsigned long)__builtin_thread_pointer()) return 3;
     /* A user output pointer must not let the syscall overwrite executable text. */
     if (syscall(SYS_arch_prctl, 0x1003, (void *)main) != -1 || errno != EFAULT) return 5;
+#else
+    /* aarch64 user code owns TPIDR_EL0; the thread-local values above
+     * already proved the kernel kept it across every call. */
+    if (!__builtin_thread_pointer()) return 3;
+#endif
     int io_result = unix_io();
     if (io_result) return io_result;
     errno = 0;
