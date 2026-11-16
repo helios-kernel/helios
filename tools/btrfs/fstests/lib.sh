@@ -8,9 +8,10 @@ die() {
 
 # Waits, with a deadline, for the fuse-btrfs daemon that served $1 to exit.
 # `mount.fuse.helios-btrfs` records its pid under HELIOS_FUSE_BTRFS_RUN_DIR.
-# The mount is `fuseblk`, so umount already waited for the daemon's answer to
-# the kernel's destroy request; this waits for the process to finish exiting
-# and let go of the device.
+# The mount is plain `fuse`, so umount returns without waiting for the daemon;
+# the device is already consistent (each reply followed its commit), and this
+# waits for the process to exit and let go of the device before the caller
+# checks or tears it down.
 wait_daemon_exit() {
     local device=$1 pidfile pid deadline=$((SECONDS + 30))
     pidfile="$HELIOS_FUSE_BTRFS_RUN_DIR/$(basename "$device").pid"

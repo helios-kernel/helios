@@ -19,9 +19,6 @@ use device::Device;
 use filesystem::Daemon;
 use state::State;
 
-/// The filesystem type `mount -t fuse.helios-btrfs` names.
-const SUBTYPE: &str = "helios-btrfs";
-
 #[derive(Debug, Error)]
 pub enum OpenError {
     #[error(transparent)]
@@ -67,17 +64,14 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Arguments, Err
         mountpoint: mountpoint.into(),
         read_only: false,
         // The kernel checks permissions from the modes the filesystem
-        // reports, and any user may reach the mount. `blkdev` makes the mount
-        // `fuseblk`: unmounting waits for the daemon to answer the kernel's
-        // destroy request, so the device may be mounted again right after.
-        // fuser mounts a `fuseblk` filesystem only through `fusermount3`,
-        // which it uses when asked to unmount automatically.
+        // reports, and any user may reach the mount. The mount's type stays
+        // plain `fuse`, with no subtype and no `blkdev`: fstests' init_rc
+        // refuses a TEST_DEV whose `df -T` type is not exactly $FSTYP. Every
+        // reply follows its commit, so the device is consistent the moment
+        // the kernel unmounts it, whether or not this process has exited.
         mount_options: vec![
             MountOption::FSName(device.to_string_lossy().into_owned()),
-            MountOption::Subtype(SUBTYPE.to_owned()),
-            MountOption::CUSTOM("blkdev".to_owned()),
             MountOption::DefaultPermissions,
-            MountOption::AutoUnmount,
         ],
     };
     let options = options.map(|options| options.to_string_lossy().into_owned());
