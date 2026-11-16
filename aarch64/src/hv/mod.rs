@@ -321,7 +321,7 @@ impl Vcpu {
         // directed to guest EL1 (TDE=0), where its own debugger handles them.
         write!(mdcr_el2, (1u64 << 6) | (1 << 9) | (1 << 10));
         self.vgic.install();
-        let ticks = self
+        self.context.slice_ticks = self
             .space
             .lease
             .hardware
@@ -329,19 +329,16 @@ impl Vcpu {
             .duration_to_ticks(slice)
             .max(1);
         let now = read!(cntpct_el0);
-        let slice_deadline = now.saturating_add(ticks);
-        // A single host-owned timer bounds execution and observes the next
-        // guest timer deadline. Guest timer PPIs are masked in the GIC so
-        // an expired level cannot repeatedly exit before the guest handles
-        // its virtual interrupt.
-        let deadline = self
+        // The switch arms the host timer after context restoration, so host
+        // setup cannot consume the guest's execution slice. It also observes
+        // the next guest deadline; guest timer PPIs stay masked in the GIC.
+        self.context.timer_deadline = self
             .timer_state()
             .into_iter()
             .filter(|(control, deadline, _)| control & 3 == 1 && *deadline > now)
             .map(|(_, deadline, _)| deadline)
-            .fold(slice_deadline, u64::min);
-        write!(cnthp_cval_el2, deadline);
-        write!(cnthp_ctl_el2, 1u64);
+            .min()
+            .unwrap_or(0);
         unsafe {
             asm!("isb", options(nostack, preserves_flags));
         }

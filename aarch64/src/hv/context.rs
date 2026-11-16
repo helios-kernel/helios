@@ -98,6 +98,8 @@ macro_rules! system_registers {
             hpfar = const offset_of!(Context, hpfar),
             exit_kind = const offset_of!(Context, exit_kind),
             host_vbar = const offset_of!(Context, host_vbar),
+            slice_ticks = const offset_of!(Context, slice_ticks),
+            timer_deadline = const offset_of!(Context, timer_deadline),
         );
     };
 }
@@ -135,6 +137,10 @@ pub(super) struct Context {
     pub(super) hpfar: u64,
     pub(super) exit_kind: u64,
     host_vbar: u64,
+    // Armed by the switch assembly after restoring the guest state.
+    pub(super) slice_ticks: u64,
+    // Zero means no future guest timer deadline; expired timers are injected.
+    pub(super) timer_deadline: u64,
 }
 
 impl Context {
@@ -157,12 +163,15 @@ impl Context {
             hpfar: 0,
             exit_kind: 0,
             host_vbar: 0,
+            slice_ticks: 0,
+            timer_deadline: 0,
         }
     }
 }
 
 unsafe extern "C" {
-    /// Caller has masked host IRQs, installed Stage-2 and a bounded timer,
-    /// and validated the return mode. Restores host state before returning.
+    /// Caller has masked host IRQs, installed Stage-2, supplied timer bounds,
+    /// and validated the return mode. Arms the timer immediately before entry
+    /// and restores host state before returning.
     pub(super) fn helios_aarch64_enter_guest(context: *mut Context);
 }
