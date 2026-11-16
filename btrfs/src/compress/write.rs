@@ -59,8 +59,14 @@ pub struct Zlib {
 
 impl Zlib {
     pub fn new(level: CompressionLevel) -> Self {
+        Self::at_level(level as u8)
+    }
+
+    /// A zlib encoder at deflate level `level`, 0 to 10, as Linux's
+    /// `compress=zlib:<level>` selects.
+    pub fn at_level(level: u8) -> Self {
         let mut state = Box::<CompressorOxide>::default();
-        state.set_format_and_level(DataFormat::Zlib, level as u8);
+        state.set_format_and_level(DataFormat::Zlib, level);
         Self {
             state,
             output: Vec::new(),

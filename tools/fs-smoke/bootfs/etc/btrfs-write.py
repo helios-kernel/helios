@@ -6,6 +6,8 @@ import sys
 
 
 PAYLOAD = bytes(range(256)) * 257
+# Several 128 KiB extents of text that zstd shrinks by far more than a sector.
+COMPRESSIBLE = ("compressible line of text, 中文 日本語 한국어\n" * 8000).encode("utf-8")
 LABELS = {
     "中文.txt": "你好，世界\n",
     "日本語.txt": "こんにちは世界\n",
@@ -40,6 +42,9 @@ def write(root):
     os.symlink("renamed", directory / "symlink")
     for name, content in LABELS.items():
         synced_file(directory / name, content.encode("utf-8"))
+    # The mount is `compress=zstd:3`, so these extents are stored compressed;
+    # run.sh finds them in the image with `btrfs inspect-internal dump-tree`.
+    synced_file(directory / "compressible", COMPRESSIBLE)
     synced_file(directory / "deleted", b"must disappear")
     (directory / "deleted").unlink()
     (directory / "empty").mkdir()
@@ -70,6 +75,7 @@ def verify(root):
     assert (directory / "renamed").stat().st_nlink == 2
     assert os.readlink(directory / "symlink") == "renamed"
     assert (directory / "truncated").read_bytes() == PAYLOAD[:17]
+    assert (directory / "compressible").read_bytes() == COMPRESSIBLE
     assert not (directory / "original").exists()
     assert not (directory / "deleted").exists()
     assert not (directory / "empty").exists()

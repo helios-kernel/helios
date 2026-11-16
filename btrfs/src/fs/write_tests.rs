@@ -1931,6 +1931,173 @@ fn reader_accepts_compat_ro_features_that_the_writer_refuses() {
     });
 }
 
+/// Whether any extent of inode `number` in the committed `fs` is compressed
+/// with `algorithm`, and whether any is compressed with another or stored plain.
+#[cfg(feature = "write")]
+async fn extent_compressions<S: BlockSource>(
+    fs: &Filesystem<S>,
+    tree: u64,
+    number: u64,
+) -> Vec<Option<crate::Compression>> {
+    use crate::items::{ExtentData, FileExtent};
+    use crate::ondisk::item_type;
+    let root = crate::fs::find_root(&fs.volume, fs.snapshot.root_tree, tree)
+        .await
+        .unwrap()
+        .root;
+    let mut cursor = crate::tree::Cursor::ceiling(
+        &fs.volume,
+        root,
+        Key::new(number, item_type::EXTENT_DATA, 0),
+    )
+    .await
+    .unwrap();
+    let mut found = Vec::new();
+    while let Some(key) = cursor.key() {
+        if !key.is(number, item_type::EXTENT_DATA) {
+            break;
+        }
+        let extent =
+            FileExtent::parse(key, cursor.item().unwrap(), fs.superblock().sectorsize()).unwrap();
+        if let ExtentData::Regular { compression, .. } = extent.data {
+            found.push(compression);
+        }
+        cursor.advance(&fs.volume).await.unwrap();
+    }
+    found
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn a_policy_compresses_only_inodes_that_linux_would_compress() {
+    use super::writer::{Attributes, Name, Writer};
+    use crate::Compression;
+    use crate::compress::policy::{CompressionPolicy, Compressor};
+    use crate::items::{INODE_NOCOMPRESS, INODE_NODATACOW, INODE_NODATASUM};
+    use crate::ondisk::{RawInodeItem, item_type, view};
+    use zerocopy::IntoBytes;
+
+    block_on(async {
+        let concurrency = std::thread::available_parallelism().unwrap();
+        let when = crate::Timestamp {
+            seconds: 1_700_000_100,
+            nanoseconds: 0,
+        };
+        let data: Vec<u8> = b"compressible line of text\n"
+            .iter()
+            .copied()
+            .cycle()
+            .take(96 * 1024)
+            .collect();
+        for (policy, expected) in [
+            (None, None),
+            (
+                Some(CompressionPolicy::new(Compression::Zlib, 0)),
+                Some(Compression::Zlib),
+            ),
+            (
+                Some(CompressionPolicy::new(Compression::Zlib, 9)),
+                Some(Compression::Zlib),
+            ),
+            (
+                Some(CompressionPolicy::new(Compression::Lzo, 0)),
+                Some(Compression::Lzo),
+            ),
+            (
+                Some(CompressionPolicy::new(Compression::Zstd, 0)),
+                Some(Compression::Zstd),
+            ),
+            (
+                Some(CompressionPolicy::new(Compression::Zstd, -3)),
+                Some(Compression::Zstd),
+            ),
+        ] {
+            let (_, image) = filesystem_image();
+            let mut writer = Writer::mount(Disk(image)).await.unwrap();
+            let mut compressor = Compressor::new(policy).unwrap();
+            let base = writer.snapshot().unwrap();
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let mut files = Vec::new();
+            for (name, flags) in [
+                (&b"plain"[..], 0),
+                (b"nocompress", INODE_NOCOMPRESS),
+                (b"nodatasum", INODE_NODATASUM),
+                (b"nodatacow", INODE_NODATACOW | INODE_NODATASUM),
+            ] {
+                let file = tx
+                    .create_file(
+                        Name {
+                            parent: &root,
+                            bytes: name,
+                        },
+                        Attributes {
+                            permissions: 0o644,
+                            uid: 0,
+                            gid: 0,
+                        },
+                        when,
+                    )
+                    .await
+                    .unwrap();
+                let edits = tx.edits();
+                let tree = edits.roots.get(file.tree()).unwrap();
+                let key = Key::new(file.number(), item_type::INODE_ITEM, 0);
+                let bytes = edits
+                    .trees
+                    .get(&base.volume, tree, key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut raw = *view::<RawInodeItem>(&bytes).unwrap();
+                raw.flags.set(flags);
+                let tree = edits
+                    .trees
+                    .apply(
+                        &base.volume,
+                        tree,
+                        key,
+                        Some(raw.as_bytes()),
+                        &mut edits.space,
+                    )
+                    .await
+                    .unwrap();
+                edits.roots.set(tree).unwrap();
+                files.push((name, file));
+            }
+            for (_, file) in &files {
+                assert_eq!(
+                    tx.write_file_with_policy(file, 0, &data, when, concurrency, &mut compressor)
+                        .await
+                        .unwrap(),
+                    data.len()
+                );
+            }
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+            let current = writer.snapshot().unwrap();
+            for (name, handle) in &files {
+                let inode = current.resolve(&[b"/", *name].concat()).await.unwrap();
+                let mut output = vec![0; data.len()];
+                assert_eq!(
+                    current.read(&inode, 0, &mut output).await.unwrap(),
+                    data.len()
+                );
+                assert_eq!(output, data);
+                let extents = extent_compressions(&current, handle.tree(), handle.number()).await;
+                assert!(!extents.is_empty());
+                let want = if name == b"plain" { expected } else { None };
+                assert!(
+                    extents.iter().all(|found| *found == want),
+                    "{policy:?} {}: {extents:?}",
+                    String::from_utf8_lossy(name)
+                );
+            }
+        }
+    });
+}
+
 #[cfg(feature = "write")]
 #[test]
 fn writer_refuses_a_filesystem_with_a_quota_tree_and_the_reader_keeps_working() {

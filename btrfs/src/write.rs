@@ -27,6 +27,7 @@
 
 pub use crate::allocation::AllocationDefect;
 pub use crate::allocation::data::DataDefect;
+pub use crate::compress::policy::{CompressionOptionError, CompressionPolicy, Compressor};
 pub use crate::compress::write::{EncodeError, Encoded, Encoder, Lzo, Plain, Zlib, Zstd};
 pub use crate::free_space::FreeSpaceDefect;
 pub use crate::fs::writer::{Attributes, CloneRange, InodeHandle, Name, WriteTransaction, Writer};

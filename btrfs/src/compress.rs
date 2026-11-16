@@ -8,6 +8,8 @@
 //! file's last compressed extent.
 
 #[cfg(feature = "write")]
+pub(crate) mod policy;
+#[cfg(feature = "write")]
 pub(crate) mod write;
 
 use alloc::boxed::Box;

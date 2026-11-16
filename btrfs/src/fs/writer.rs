@@ -9,7 +9,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{Filesystem, find_root};
 use crate::accounting::Allocation;
-use crate::compress::write::Encoder;
+use crate::compress::policy::{Compressor, inode_compresses};
+use crate::compress::write::{Encoder, Plain};
 use crate::ondisk::objectid;
 use crate::retirement::Retirements;
 use crate::source::BlockSink;
@@ -310,6 +311,42 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
             .await?;
         operation.accept();
         Ok(written)
+    }
+
+    /// [`Self::write_file`] with the mount's compression policy. An inode that
+    /// Linux does not compress (`NODATASUM`, `NODATACOW` or `NOCOMPRESS`) is
+    /// written uncompressed, where `write_file` with an encoder refuses it.
+    pub async fn write_file_with_policy(
+        &mut self,
+        file: &InodeHandle,
+        offset: u64,
+        data: &[u8],
+        when: Timestamp,
+        concurrency: NonZeroUsize,
+        compressor: &mut Compressor,
+    ) -> Result<usize, WriteError> {
+        let compresses = inode_compresses(self.metadata(file).await?.flags);
+        macro_rules! write {
+            ($encoder:expr) => {
+                self.write_file(
+                    file,
+                    offset,
+                    data,
+                    WriteOptions {
+                        when,
+                        concurrency,
+                        encoder: $encoder,
+                    },
+                )
+                .await
+            };
+        }
+        match compressor {
+            Compressor::Zlib(encoder) if compresses => write!(encoder),
+            Compressor::Lzo(encoder) if compresses => write!(encoder),
+            Compressor::Zstd(encoder) if compresses => write!(&mut **encoder),
+            _ => write!(Plain),
+        }
     }
 
     pub async fn truncate_file(

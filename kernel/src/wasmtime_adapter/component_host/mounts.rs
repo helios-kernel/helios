@@ -15,6 +15,7 @@
 use alloc::format;
 use alloc::string::String;
 
+use helios_btrfs::write::CompressionPolicy;
 use helios_hal::cpu::Cpu;
 use helios_hal::fs::BlockSerial;
 use wasmtime::component::{Accessor, HasSelf, Linker};
@@ -47,6 +48,12 @@ fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
             error: crate::vfs::BtrfsMountError::Busy,
             ..
         } => RefusalKind::Busy,
+        MountRequestError::Btrfs {
+            error: crate::vfs::BtrfsMountError::Compression(_),
+            ..
+        }
+        | MountRequestError::CompressionOption(_)
+        | MountRequestError::CompressionUnsupported => RefusalKind::InvalidOption,
         MountRequestError::Btrfs { .. } => RefusalKind::InvalidFilesystem,
         MountRequestError::Mount(MountError::InvalidPoint(_) | MountError::RootKind) => {
             RefusalKind::InvalidPoint
@@ -71,6 +78,7 @@ enum RefusalKind {
     InvalidPath,
     InvalidFilesystem,
     Io,
+    InvalidOption,
 }
 
 /// The source a request names, or the refusal of a disk serial no disk
@@ -101,6 +109,7 @@ macro_rules! impl_mount_bindings {
                         RefusalKind::InvalidPath => wit::MountErrorKind::InvalidPath,
                         RefusalKind::InvalidFilesystem => wit::MountErrorKind::InvalidFilesystem,
                         RefusalKind::Io => wit::MountErrorKind::Io,
+                        RefusalKind::InvalidOption => wit::MountErrorKind::InvalidOption,
                     },
                     detail,
                 }
@@ -139,6 +148,15 @@ macro_rules! impl_mount_bindings {
                     accessor: &Accessor<U, Self>,
                     request: wit::MountRequest,
                 ) -> wasmtime::Result<Result<(), wit::MountError>> {
+                    let compress = match request.compress.as_deref().map(CompressionPolicy::parse) {
+                        None => None,
+                        Some(Ok(policy)) => policy,
+                        Some(Err(error)) => {
+                            let error = MountRequestError::from(error);
+                            tracing::debug!(%error, path = %request.path, "mount refused");
+                            return Ok(Err(mount_error(&error)));
+                        }
+                    };
                     let (authority, namespace, attached, write, spawner) = accessor.with(|mut access| {
                         let store = access.get();
                         (
@@ -149,6 +167,7 @@ macro_rules! impl_mount_bindings {
                                 entropy: store.runtime_state.root_entropy_handle().clone(),
                                 concurrency: core::num::NonZeroUsize::new(store.cpu.processor_count())
                                     .expect("a machine has at least one processor"),
+                                compress,
                             },
                             store.spawner().launch_spawner().clone(),
                         )

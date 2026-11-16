@@ -23,7 +23,7 @@ use helios_hal::io::{IoError, IoResult};
 use triomphe::Arc;
 
 use crate::{BlockCacheError, BlockPages, CACHE_BLOCK_BYTES, CachedDisk, RootEntropyHandle};
-use helios_btrfs::write::{WriteError, Writer};
+use helios_btrfs::write::{CompressionPolicy, Compressor, EncodeError, WriteError, Writer};
 
 mod prepared;
 mod writer;
@@ -36,6 +36,10 @@ use writer::{Operation, Response};
 pub struct BtrfsWriteOptions {
     pub entropy: RootEntropyHandle,
     pub concurrency: NonZeroUsize,
+    /// Linux's `compress=<algorithm>[:<level>]` mount option: the algorithm
+    /// every compressible inode's new data is written with. `None` writes
+    /// every extent uncompressed.
+    pub compress: Option<CompressionPolicy>,
 }
 type Snapshot<Device> = Filesystem<SourceArc<Image<Device>>>;
 
@@ -47,6 +51,8 @@ pub enum BtrfsMountError {
     Read(#[from] Error),
     #[error(transparent)]
     Write(#[from] WriteError),
+    #[error("the mount's compression policy cannot be encoded: {0}")]
+    Compression(#[from] EncodeError),
 }
 
 // A writable mount excludes independent read snapshots: those snapshots have
@@ -175,9 +181,14 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
     pub async fn mount_writable(
         disk: CachedDisk<Device>,
         mut allocate_device: impl FnMut() -> DeviceId + Send,
-        entropy: RootEntropyHandle,
-        concurrency: NonZeroUsize,
+        options: BtrfsWriteOptions,
     ) -> Result<(Self, BtrfsService<Device>), BtrfsMountError> {
+        let BtrfsWriteOptions {
+            entropy,
+            concurrency,
+            compress,
+        } = options;
+        let compressor = Compressor::new(compress)?;
         let serial = disk.serial();
         let lease = disk.write_mount().ok_or(BtrfsMountError::Busy)?;
         let writer = Writer::mount(Image {
@@ -200,6 +211,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             published: reader.clone(),
             entropy,
             concurrency,
+            compressor,
         };
         Ok((
             Self {

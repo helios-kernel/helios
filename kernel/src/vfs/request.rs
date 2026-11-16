@@ -60,6 +60,10 @@ pub enum MountRequestError {
         serial: BlockSerial,
         error: ErofsError,
     },
+    #[error("invalid compression option: {0}")]
+    CompressionOption(#[from] helios_btrfs::write::CompressionOptionError),
+    #[error("a compression policy applies only to a btrfs mount")]
+    CompressionUnsupported,
     #[error("the btrfs image on disk {serial:?} cannot be mounted: {error}")]
     Btrfs {
         serial: BlockSerial,
@@ -82,6 +86,9 @@ pub async fn request_mount<S: Storage>(
     write: BtrfsWriteOptions,
 ) -> Result<Option<BtrfsService<S::Disk>>, MountRequestError> {
     let cap = authority.derive_mount_cap(point)?;
+    if write.compress.is_some() && !matches!(source, MountSource::Btrfs { .. }) {
+        return Err(MountRequestError::CompressionUnsupported);
+    }
     let mut service = None;
     let fs = match source {
         MountSource::Memory => {
@@ -116,14 +123,10 @@ pub async fn request_mount<S: Storage>(
                     .await
                     .map_err(|error| MountRequestError::Btrfs { serial, error })?
             } else {
-                let (fs, task) = BtrfsFs::mount_writable(
-                    disk,
-                    || namespace.table().allocate_device(),
-                    write.entropy,
-                    write.concurrency,
-                )
-                .await
-                .map_err(|error| MountRequestError::Btrfs { serial, error })?;
+                let (fs, task) =
+                    BtrfsFs::mount_writable(disk, || namespace.table().allocate_device(), write)
+                        .await
+                        .map_err(|error| MountRequestError::Btrfs { serial, error })?;
                 service = Some(task);
                 fs
             };

@@ -72,6 +72,147 @@ fn path(value: &str) -> FsPath<'_> {
     FsPath::new(value).expect("normalized path")
 }
 
+fn write_options(
+    concurrency: usize,
+    compress: Option<helios_btrfs::write::CompressionPolicy>,
+) -> crate::vfs::BtrfsWriteOptions {
+    crate::vfs::BtrfsWriteOptions {
+        entropy: crate::test_support::test_root_entropy(),
+        concurrency: core::num::NonZeroUsize::new(concurrency).unwrap(),
+        compress,
+    }
+}
+
+/// The device blocks that contain `needle`, skipping the blocks never written.
+async fn blocks_holding(cache: &crate::BlockCache<MemoryDisk>, needle: &[u8]) -> usize {
+    let disk = cache.disk(0);
+    let mut block = alloc::vec![0; crate::CACHE_BLOCK_BYTES];
+    let mut found = 0;
+    for index in 0..disk.capacity_blocks() {
+        disk.read_at(index * crate::CACHE_BLOCK_BYTES as u64, &mut block)
+            .await
+            .expect("reads the block");
+        if block.iter().any(|byte| *byte != 0)
+            && block.windows(needle.len()).any(|window| window == needle)
+        {
+            found += 1;
+        }
+    }
+    found
+}
+
+/// A writable mount with a compression policy stores compressible data in
+/// compressed extents: the reader returns the same bytes, the device holds
+/// the text in far fewer blocks than a plain write does, and the superblock
+/// records the algorithm's incompat bit.
+#[test]
+fn a_compressing_mount_writes_extents_the_reader_reads_back() {
+    use helios_btrfs::Compression;
+    use helios_btrfs::write::CompressionPolicy;
+
+    // Text with CJK, repeated past one 128 KiB extent so several extents form.
+    let payload: Vec<u8> = "压缩 圧縮 압축 compressible line\n"
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(300_000)
+        .collect();
+    // The incompat bits of btrfs_tree.h: COMPRESS_LZO and COMPRESS_ZSTD.
+    for (policy, bit, compressed) in [
+        (None, 0, false),
+        (Some(CompressionPolicy::new(Compression::Zlib, 0)), 0, true),
+        (Some(CompressionPolicy::new(Compression::Zlib, 9)), 0, true),
+        (
+            Some(CompressionPolicy::new(Compression::Lzo, 0)),
+            1 << 3,
+            true,
+        ),
+        (
+            Some(CompressionPolicy::new(Compression::Zstd, 0)),
+            1 << 4,
+            true,
+        ),
+        (
+            Some(CompressionPolicy::new(Compression::Zstd, -5)),
+            1 << 4,
+            true,
+        ),
+    ] {
+        let time = Timestamp::from_secs(1_700_000_000);
+        let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+        let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
+        block_on(async {
+            let (fs, service) = BtrfsFs::mount_writable(
+                cache.disk(0),
+                || DeviceId::new(100),
+                write_options(2, policy),
+            )
+            .await
+            .expect("writable mount");
+            let payload = &payload;
+            let client = async move {
+                fs.open(
+                    path("text"),
+                    OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                    1_000_000_000,
+                )
+                .await
+                .expect("create");
+                write_with(
+                    &fs,
+                    path("text"),
+                    WritePosition::At(0),
+                    payload.len(),
+                    1_000_000_001,
+                    |offset, bytes| bytes.copy_from_slice(&payload[offset..offset + bytes.len()]),
+                )
+                .await
+                .expect("write");
+                fs.sync(path("text")).await.expect("sync");
+                assert_eq!(
+                    fs.read_at(path("text"), 0, payload.len()).await.unwrap(),
+                    payload.as_slice()
+                );
+                drop(fs);
+            };
+            futures::future::join(client, service.run()).await;
+            let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
+                .await
+                .expect("reopen");
+            assert_eq!(
+                reopened
+                    .read_at(path("text"), 0, payload.len())
+                    .await
+                    .unwrap(),
+                payload.as_slice(),
+                "{policy:?}"
+            );
+            let snapshot = reopened.inner.reader.lock().clone();
+            let inode = snapshot.resolve(b"/text").await.unwrap();
+            assert_eq!(inode.metadata().size, payload.len() as u64);
+            // The inode's nbytes counts logical bytes for compressed extents,
+            // as Linux's does, so the stored form is read off the device: the
+            // payload's plaintext spans about 73 blocks when written plain,
+            // and under half of that when compressed (LZO compresses this
+            // text least, to about a third).
+            let plaintext = blocks_holding(&cache, b"compressible line").await;
+            if compressed {
+                assert!(
+                    plaintext < 36,
+                    "{policy:?} left {plaintext} plaintext blocks"
+                );
+            } else {
+                assert!(plaintext >= 70, "{plaintext} plaintext blocks");
+            }
+            assert_eq!(
+                snapshot.superblock().incompat_flags() & (1 << 3 | 1 << 4),
+                bit
+            );
+        });
+    }
+}
+
 #[test]
 fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
     let time = Timestamp::from_secs(1_700_000_000);
@@ -168,6 +309,7 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
         crate::vfs::BtrfsWriteOptions {
             entropy: crate::test_support::test_root_entropy(),
             concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+            compress: None,
         },
     ))
     .expect("mount request");
@@ -212,6 +354,7 @@ fn a_writable_mount_links_a_file_created_through_the_namespace() {
         crate::vfs::BtrfsWriteOptions {
             entropy: crate::test_support::test_root_entropy(),
             concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+            compress: None,
         },
     ))
     .expect("mount request")
@@ -278,26 +421,17 @@ fn writable_service_publishes_namespace_and_survives_remount() {
     );
     let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
     block_on(async {
-        let (fs, service) = BtrfsFs::mount_writable(
-            cache.disk(0),
-            || DeviceId::new(100),
-            crate::test_support::test_root_entropy(),
-            core::num::NonZeroUsize::new(2).unwrap(),
-        )
-        .await
-        .expect("writable mount");
+        let (fs, service) =
+            BtrfsFs::mount_writable(cache.disk(0), || DeviceId::new(100), write_options(2, None))
+                .await
+                .expect("writable mount");
         assert!(matches!(
             BtrfsFs::mount(cache.disk(0), || DeviceId::new(102)).await,
             Err(super::BtrfsMountError::Busy)
         ));
         assert!(matches!(
-            BtrfsFs::mount_writable(
-                cache.disk(0),
-                || DeviceId::new(103),
-                crate::test_support::test_root_entropy(),
-                core::num::NonZeroUsize::new(1).unwrap()
-            )
-            .await,
+            BtrfsFs::mount_writable(cache.disk(0), || DeviceId::new(103), write_options(1, None))
+                .await,
             Err(super::BtrfsMountError::Busy)
         ));
         let client = async move {
@@ -477,8 +611,7 @@ fn a_full_device_stores_a_prefix_then_refuses_with_no_space() {
         let (fs, service) = BtrfsFs::mount_writable(
             cache.disk(0),
             || DeviceId::new(100),
-            crate::test_support::test_root_entropy(),
-            core::num::NonZeroUsize::new(64).unwrap(),
+            write_options(64, None),
         )
         .await
         .expect("writable mount");

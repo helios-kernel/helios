@@ -8,7 +8,8 @@ use core::num::NonZeroUsize;
 
 use futures::channel::oneshot;
 use helios_btrfs::write::{
-    Attributes, ChunkError, InodeHandle, Name, SpaceError, WriteError, WriteTransaction, Writer,
+    Attributes, ChunkError, Compressor, InodeHandle, Name, SpaceError, WriteError,
+    WriteTransaction, Writer,
 };
 use helios_btrfs::{BlockSink, Error, FileKind, Timestamp};
 use helios_hal::fs::{BlockDevice, FsError, FsResult, Landed, OpenFlags, WritePosition};
@@ -110,6 +111,7 @@ pub struct BtrfsService<Device: BlockDevice<Buffer = BlockPages>> {
     pub(super) published: Arc<spin::Mutex<Snapshot<Device>>>,
     pub(super) entropy: RootEntropyHandle,
     pub(super) concurrency: NonZeroUsize,
+    pub(super) compressor: Compressor,
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
@@ -120,6 +122,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
             self.published,
             self.entropy,
             self.concurrency,
+            self.compressor,
         )
         .await;
     }
@@ -131,6 +134,7 @@ pub(super) async fn serve<Device: BlockDevice<Buffer = BlockPages>>(
     published: Arc<spin::Mutex<Snapshot<Device>>>,
     entropy: RootEntropyHandle,
     concurrency: NonZeroUsize,
+    mut compressor: Compressor,
 ) {
     while let Some(first) = receiver.recv().await {
         let mut requests = Vec::with_capacity(concurrency.get());
@@ -171,6 +175,7 @@ pub(super) async fn serve<Device: BlockDevice<Buffer = BlockPages>>(
                 request.when,
                 request.operation,
                 concurrency,
+                &mut compressor,
             )
             .await;
             dirty |= mutates && result.is_ok();
@@ -259,6 +264,7 @@ async fn apply<S: BlockSink>(
     now: u64,
     operation: Operation,
     concurrency: NonZeroUsize,
+    compressor: &mut Compressor,
 ) -> FsResult<Response> {
     let when = timestamp(now);
     match operation {
@@ -276,12 +282,7 @@ async fn apply<S: BlockSink>(
                 .checked_add(bytes.len() as u64)
                 .ok_or(FsError::Overflow)?;
             let written = transaction
-                .write_file(
-                    &inode,
-                    offset,
-                    &bytes,
-                    helios_btrfs::write::WriteOptions::plain(when, concurrency),
-                )
+                .write_file_with_policy(&inode, offset, &bytes, when, concurrency, compressor)
                 .await
                 .map_err(fs_error)?;
             // A device with no more free sectors stores a prefix, which the

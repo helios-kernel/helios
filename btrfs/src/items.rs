@@ -36,6 +36,11 @@ impl Timestamp {
 
 /// The inode flag marking a file whose data carries no checksums.
 pub(crate) const INODE_NODATASUM: u64 = 1 << 0;
+/// BTRFS_INODE_NODATACOW and BTRFS_INODE_NOCOMPRESS in btrfs_tree.h.
+#[cfg(feature = "write")]
+pub(crate) const INODE_NODATACOW: u64 = 1 << 1;
+#[cfg(feature = "write")]
+pub(crate) const INODE_NOCOMPRESS: u64 = 1 << 3;
 /// BTRFS_INODE_IMMUTABLE and BTRFS_INODE_APPEND in btrfs_tree.h.
 #[cfg(feature = "write")]
 pub(crate) const INODE_IMMUTABLE: u64 = 1 << 6;

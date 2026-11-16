@@ -40,6 +40,12 @@ done
 
 grep -Fqx 'btrfs:guest-write-synced' "$runtime/guest.out"
 btrfs check --readonly "$runtime/image.btrfs" 2>&1 | tee "$runtime/btrfs-check.log"
+# The guest mounted with compress=zstd:3, so the file it wrote must be stored
+# in zstd extents (`extent compression 3 (zstd)` in btrfs-progs' tree dump),
+# not merely read back correctly.
+btrfs inspect-internal dump-tree -t 5 "$runtime/image.btrfs" > "$runtime/fs-tree.log"
+grep -Eq 'extent compression 3 \(zstd\)' "$runtime/fs-tree.log"
+echo 'btrfs:zstd-extents-present'
 mkdir -p "$runtime/linux-mount"
 sudo mount -t btrfs -o loop,ro "$runtime/image.btrfs" "$runtime/linux-mount"
 trap 'sudo umount "$runtime/linux-mount"' EXIT

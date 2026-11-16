@@ -428,6 +428,7 @@ fn request(
         crate::vfs::BtrfsWriteOptions {
             entropy: crate::test_support::test_root_entropy(),
             concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+            compress: None,
         },
     ))
     .map(drop)
