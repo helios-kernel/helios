@@ -10,15 +10,19 @@ pub use crate::bindings::helios::system::mounts::{
 };
 
 /// Attaches `source` at `path`, a directory path in the caller's authority.
+/// `compress` is the value of Linux's `compress=` option for a writable btrfs
+/// mount, such as `zstd:3`.
 pub async fn mount(
     source: MountSource,
     path: impl Into<String>,
     read_only: bool,
+    compress: Option<String>,
 ) -> Result<(), MountError> {
     raw::mount(MountRequest {
         source,
         path: path.into(),
         read_only,
+        compress,
     })
     .await
 }

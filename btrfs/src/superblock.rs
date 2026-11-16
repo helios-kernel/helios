@@ -11,6 +11,8 @@ use crate::ondisk::{
     SYS_CHUNK_ARRAY_BYTES, view,
 };
 use crate::source::BlockSource;
+#[cfg(feature = "write")]
+use crate::tree::write::WriteError;
 
 /// Device offsets of the superblock copies: the primary, then the backups
 /// at 64 MiB and 256 GiB where the device is long enough to hold them.
@@ -67,6 +69,7 @@ pub struct Superblock {
     chunk_root: RootPointer,
     log_root: u64,
     total_bytes: u64,
+    bytes_used: u64,
     num_devices: u64,
     sectorsize: u32,
     nodesize: u32,
@@ -168,6 +171,7 @@ impl Superblock {
             },
             log_root: raw.log_root.get(),
             total_bytes: raw.total_bytes.get(),
+            bytes_used: raw.bytes_used.get(),
             num_devices: raw.num_devices.get(),
             sectorsize,
             nodesize,
@@ -212,6 +216,21 @@ impl Superblock {
         Ok(())
     }
 
+    /// COMPAT_RO explicitly permits readers that do not implement a feature,
+    /// but a writer must understand every set bit before changing the image.
+    #[cfg(feature = "write")]
+    pub(crate) fn check_writable(&self) -> Result<(), WriteError> {
+        // FREE_SPACE_TREE, FREE_SPACE_TREE_VALID and BLOCK_GROUP_TREE are
+        // maintained by the transaction's accounting and root catalogue.
+        let unsupported = self.compat_ro_flags & !((1 << 0) | (1 << 1) | (1 << 3));
+        if unsupported != 0 {
+            let bit = 1_u64 << unsupported.trailing_zeros();
+            let name = if bit == 1 << 2 { "verity" } else { "undefined" };
+            return Err(WriteError::UnsupportedCompatRo { name, bit });
+        }
+        Ok(())
+    }
+
     /// The filesystem's UUID, the one `blkid` reports.
     pub fn fsid(&self) -> [u8; 16] {
         self.fsid
@@ -238,6 +257,12 @@ impl Superblock {
 
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+
+    /// Bytes of the device's block groups in use, as the superblock records
+    /// them at its commit.
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used
     }
 
     pub fn sectorsize(&self) -> u32 {

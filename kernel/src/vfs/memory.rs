@@ -30,7 +30,7 @@ use core::ops::Bound;
 use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
+    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeId,
     NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, WritePosition, WriteProgress,
 };
 use spin::Mutex;
@@ -182,7 +182,13 @@ impl MemoryFs {
     /// so the layer below stays hidden. With `whiteout`, a path the tree
     /// has no object at is the layer below's alone, and only the whiteout
     /// is recorded.
-    pub(super) fn remove(&self, path: FsPath<'_>, directory: bool, whiteout: bool) -> FsResult<()> {
+    pub(super) fn remove(
+        &self,
+        path: FsPath<'_>,
+        directory: bool,
+        whiteout: bool,
+        now: u64,
+    ) -> FsResult<()> {
         if path.is_root() {
             return Err(if directory {
                 FsError::NotPermitted
@@ -201,6 +207,17 @@ impl MemoryFs {
                     }
                     _ => {}
                 }
+                let number = state.inode_of(path).expect("removed name exists");
+                let (parent, _) = path.split_last().expect("root removal was rejected");
+                let parent = state.inode_of(parent).expect("removed name has a parent");
+                state
+                    .inodes
+                    .get_mut(&number)
+                    .expect("removed inode exists")
+                    .status_nanos = now;
+                let parent = state.inodes.get_mut(&parent).expect("parent inode exists");
+                parent.modified_nanos = now;
+                parent.status_nanos = now;
                 state.remove_name(path);
             }
             Err(FsError::NoEntry) if whiteout && state.beneath(path) => {}
@@ -507,7 +524,7 @@ impl MemoryWrite {
     /// Lands the write and resolves with the offset it began at. The
     /// checks of [`Self::prepare`] are made again under the lock, since
     /// the file may have changed in between.
-    pub(super) fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<u64> {
+    pub(super) fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
         self.fs.write_now(
             self.path.as_path(),
             self.position,
@@ -544,7 +561,7 @@ impl MemoryFs {
         len: usize,
         now: u64,
         fill: impl FnOnce(&mut [u8]),
-    ) -> FsResult<u64> {
+    ) -> FsResult<Landed> {
         let mut landed = 0;
         self.state.lock().edit_contents(path, now, |contents| {
             let at = match position {
@@ -561,7 +578,10 @@ impl MemoryFs {
             landed = at as u64;
             Ok(())
         })?;
-        Ok(landed)
+        Ok(Landed {
+            offset: landed,
+            len,
+        })
     }
 }
 
@@ -684,12 +704,12 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.remove(path, true, false)
+    async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.remove(path, true, false, now)
     }
 
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.remove(path, false, false)
+    async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.remove(path, false, false, now)
     }
 
     async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -755,7 +775,7 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, NodeKind, OpenFlags,
+        DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind, OpenFlags,
         PreparedWrite, WritePosition, WriteProgress,
     };
 
@@ -893,7 +913,7 @@ mod tests {
                     })
                     .submit()
             ),
-            Ok(WriteProgress::Done(4))
+            Ok(WriteProgress::Done(Landed { offset: 4, len: 2 }))
         ));
         let read = block_on(fs.read_at(path("f"), 0, 64)).expect("reads");
         assert_eq!(read.as_ref(), b"\0\0cdef");
@@ -922,10 +942,11 @@ mod tests {
         let filled = staged.fill(|at, destination| {
             destination.copy_from_slice(&source[at..at + destination.len()]);
         });
+        let len = source.len();
         drop(source);
         assert!(matches!(
             block_on(filled.submit()),
-            Ok(WriteProgress::Done(0))
+            Ok(WriteProgress::Done(Landed { offset: 0, len: landed })) if landed == len
         ));
         let bytes = block_on(fs.read_at(path("f"), 0, 128)).expect("reads");
         assert_eq!(bytes.as_ref(), "文件・ファイル・파일".as_bytes());
@@ -955,7 +976,7 @@ mod tests {
             (a.link_count, a.id),
             (2, block_on(fs.stat(path("b"))).expect("stats").id)
         );
-        block_on(fs.unlink(path("a"))).expect("unlinks");
+        block_on(fs.unlink(path("a"), 7_000_000_000)).expect("unlinks");
         assert_eq!(block_on(fs.stat(path("b"))).expect("stats").link_count, 1);
     }
 
@@ -975,7 +996,7 @@ mod tests {
         assert_eq!(names(&fs, ""), ["d.x", "dx", "e"]);
         assert_eq!(names(&fs, "e"), ["f"]);
         assert_eq!(
-            block_on(fs.remove_directory(path("e"))),
+            block_on(fs.remove_directory(path("e"), 7_000_000_000)),
             Err(FsError::NotEmpty)
         );
     }

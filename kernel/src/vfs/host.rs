@@ -66,6 +66,7 @@ pub(crate) fn fs_error_from_host(error: HostFsError) -> FsError {
         HostFsErrorKind::ReadOnly => FsError::ReadOnly,
         HostFsErrorKind::Unsupported => FsError::Unsupported,
         HostFsErrorKind::NameTooLong => FsError::NameTooLong,
+        HostFsErrorKind::NoSpace => FsError::NoSpace,
         HostFsErrorKind::Io => FsError::Io,
         HostFsErrorKind::Refused(refusal) => refusal,
     }
@@ -277,14 +278,14 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, path: FsPath<'_>, _now: u64) -> FsResult<()> {
         self.client
             .remove(host_path(path), true)
             .await
             .map_err(fs_error_from_host)
     }
 
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, path: FsPath<'_>, _now: u64) -> FsResult<()> {
         self.client
             .remove(host_path(path), false)
             .await

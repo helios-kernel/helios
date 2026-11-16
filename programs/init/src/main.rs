@@ -8,14 +8,15 @@
 //! `/etc/fstab` holds one mount per line, `#` starting a comment:
 //!
 //! ```text
-//! <source> <mount point> [ro|rw]
+//! <source> <mount point> [<option>[,<option>]...]
 //! ```
 //!
 //! Sources are `memory`, `boot-image`, `host-share`, `disk:<serial>`
 //! for EROFS, and `btrfs:<serial>` for btrfs. Disk sources use the serial
-//! the device reported. The mode defaults to `rw`; the boot image and disks are
-//! read-only whatever it says. A line init cannot parse, or a mount the
-//! kernel refuses, fails init.
+//! the device reported. The options are `ro` or `rw` (default `rw`; the
+//! boot image and EROFS disks remain read-only) and, for btrfs, Linux's
+//! `compress` (zlib) or `compress=<algorithm>[:<level>]`. A line init cannot
+//! parse, or a mount the kernel refuses, fails init.
 
 use std::fs;
 use std::io::{self, ErrorKind, Write};
@@ -34,6 +35,8 @@ struct Mount {
     label: String,
     point: String,
     read_only: bool,
+    /// The value of the `compress=` option, when the line carries one.
+    compress: Option<String>,
 }
 
 fn invalid(line: usize, detail: impl std::fmt::Display) -> io::Error {
@@ -49,10 +52,15 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let (label, point, mode) = match fields.as_slice() {
+        let (label, point, options) = match fields.as_slice() {
             [label, point] => (*label, *point, "rw"),
-            [label, point, mode] => (*label, *point, *mode),
-            _ => return Err(invalid(number, "expected `<source> <mount point> [ro|rw]`")),
+            [label, point, options] => (*label, *point, *options),
+            _ => {
+                return Err(invalid(
+                    number,
+                    "expected `<source> <mount point> [<option>[,<option>]...]`",
+                ));
+            }
         };
         let source = match label {
             "memory" => MountSource::Memory,
@@ -70,16 +78,26 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
                 _ => return Err(invalid(number, format!("unknown source `{label}`"))),
             },
         };
-        let read_only = match mode {
-            "ro" => true,
-            "rw" => false,
-            _ => return Err(invalid(number, format!("unknown mode `{mode}`"))),
-        };
+        let mut read_only = false;
+        let mut compress = None;
+        for option in options.split(',') {
+            match option {
+                "ro" => read_only = true,
+                "rw" => read_only = false,
+                // Linux's bare `compress` selects zlib at its default level.
+                "compress" => compress = Some("zlib".to_owned()),
+                _ => match option.strip_prefix("compress=") {
+                    Some(value) => compress = Some(value.to_owned()),
+                    None => return Err(invalid(number, format!("unknown option `{option}`"))),
+                },
+            }
+        }
         mounts.push(Mount {
             source,
             label: label.to_owned(),
             point: point.to_owned(),
             read_only,
+            compress,
         });
     }
     Ok(mounts)
@@ -123,6 +141,7 @@ async fn run_rc() -> io::Result<()> {
         hint: None,
         capability_grants: vec![
             programs::root_directory_grant(),
+            programs::root_link_grant(),
             programs::root_process_grant(),
         ],
     })
@@ -151,14 +170,19 @@ async fn main() -> io::Result<()> {
 
     let mounts = fstab()?;
     for mount in &mounts {
-        mounts::mount(mount.source.clone(), mount.point.as_str(), mount.read_only)
-            .await
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "mounting {} at {}: {:?}: {}",
-                    mount.label, mount.point, error.kind, error.detail
-                ))
-            })?;
+        mounts::mount(
+            mount.source.clone(),
+            mount.point.as_str(),
+            mount.read_only,
+            mount.compress.clone(),
+        )
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "mounting {} at {}: {:?}: {}",
+                mount.label, mount.point, error.kind, error.detail
+            ))
+        })?;
         println!("helios init: mounted {} at {}", mount.label, mount.point);
     }
 

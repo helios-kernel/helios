@@ -9,7 +9,7 @@
 //! them and only translate types.
 
 use helios_hal::fs::{
-    FileSystem, FilledWrite, FsError as VfsError, FsResult, Metadata, NodeKind, OpenFlags,
+    FileSystem, FilledWrite, FsError as VfsError, FsResult, Landed, Metadata, NodeKind, OpenFlags,
     PreparedWrite, WritePosition, WriteProgress,
 };
 use pin_project_lite::pin_project;
@@ -136,6 +136,7 @@ pub(crate) fn fs_error_code(error: VfsError) -> fs_types::ErrorCode {
         VfsError::IllegalByteSequence => fs_types::ErrorCode::IllegalByteSequence,
         VfsError::NameTooLong => fs_types::ErrorCode::NameTooLong,
         VfsError::Unsupported => fs_types::ErrorCode::Unsupported,
+        VfsError::NoSpace => fs_types::ErrorCode::InsufficientSpace,
         VfsError::Io => fs_types::ErrorCode::Io,
     }
 }
@@ -593,15 +594,16 @@ where
     read_resolved(&held.resolved(), offset, max_bytes).await
 }
 
-/// Writes `bytes` to the file `descriptor` names, and resolves with the
-/// offset just past them: where a sequential writer continues.
+/// Writes `bytes` to the file `descriptor` names, and resolves with where
+/// they landed and how many did: fewer than `bytes` only when the
+/// filesystem ran out of space after storing a prefix.
 pub(crate) async fn write<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     file: Granted<'_, RegularFile, Write>,
     position: WritePosition,
     bytes: &[u8],
     now: u64,
-) -> FsOpResult<u64>
+) -> FsOpResult<Landed>
 where
     StorageImpl: crate::Storage,
 {
@@ -619,14 +621,14 @@ where
     resolve(namespace, &file.descriptor().path)
 }
 
-/// Writes `bytes` through `resolved`, and resolves with the offset just
-/// past them.
+/// Writes `bytes` through `resolved`, and resolves with where they landed
+/// and how many did ([`Landed`]).
 pub(crate) async fn write_resolved<StorageImpl>(
     resolved: &Resolved<'_, StorageImpl>,
     position: WritePosition,
     bytes: &[u8],
     now: u64,
-) -> FsOpResult<u64>
+) -> FsOpResult<Landed>
 where
     StorageImpl: crate::Storage,
 {
@@ -661,7 +663,8 @@ where
 
 /// Writes `len` bytes that `source` copies straight into the
 /// filesystem's destination ([`helios_hal::fs::write_with`]), and
-/// resolves with the offset just past them. An append lands at the end of
+/// resolves with where they landed and how many did ([`Landed::end`] is
+/// where a sequential writer continues). An append lands at the end of
 /// the file as the filesystem sees it when the write arrives, so its end
 /// is the filesystem's answer, never the caller's idea of where the file
 /// ended.
@@ -676,18 +679,15 @@ pub(crate) async fn write_resolved_with<StorageImpl, S>(
     len: usize,
     now: u64,
     source: S,
-) -> FsOpResult<u64>
+) -> FsOpResult<Landed>
 where
     StorageImpl: crate::Storage,
     S: FnMut(usize, &mut [u8]),
 {
     let fs = resolved.writable().map_err(fs_error_code)?;
-    let landed = helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source)
+    helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source)
         .await
-        .map_err(fs_error_code)?;
-    landed
-        .checked_add(len as u64)
-        .ok_or(fs_types::ErrorCode::Overflow)
+        .map_err(fs_error_code)
 }
 
 pub(crate) async fn set_size<StorageImpl>(
@@ -885,6 +885,7 @@ pub(crate) async fn create_directory_at<StorageImpl: crate::Storage>(
 pub struct PreparedRemoveDirectoryAt<StorageImpl: crate::Storage> {
     namespace: Namespace<StorageImpl>,
     absolute: String,
+    now: u64,
 }
 
 impl<StorageImpl: crate::Storage> PreparedRemoveDirectoryAt<StorageImpl> {
@@ -892,17 +893,19 @@ impl<StorageImpl: crate::Storage> PreparedRemoveDirectoryAt<StorageImpl> {
         namespace: Namespace<StorageImpl>,
         base: Granted<'_, Directory, Mutate>,
         path: &str,
+        now: u64,
     ) -> FsOpResult<Self> {
         let absolute = child_below(base.descriptor(), path)?;
         Ok(Self {
             namespace,
             absolute,
+            now,
         })
     }
 
     pub(crate) async fn execute(self) -> FsOpResult<()> {
         self.namespace
-            .remove_directory(&self.absolute)
+            .remove_directory(&self.absolute, self.now)
             .await
             .map_err(fs_error_code)
     }
@@ -912,8 +915,9 @@ pub(crate) async fn remove_directory_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
+    now: u64,
 ) -> FsOpResult<()> {
-    PreparedRemoveDirectoryAt::new(namespace.clone(), base, path)?
+    PreparedRemoveDirectoryAt::new(namespace.clone(), base, path, now)?
         .execute()
         .await
 }
@@ -921,6 +925,7 @@ pub(crate) async fn remove_directory_at<StorageImpl: crate::Storage>(
 pub struct PreparedUnlinkFileAt<StorageImpl: crate::Storage> {
     namespace: Namespace<StorageImpl>,
     absolute: String,
+    now: u64,
 }
 
 impl<StorageImpl: crate::Storage> PreparedUnlinkFileAt<StorageImpl> {
@@ -928,11 +933,13 @@ impl<StorageImpl: crate::Storage> PreparedUnlinkFileAt<StorageImpl> {
         namespace: Namespace<StorageImpl>,
         base: Granted<'_, Directory, Mutate>,
         path: &str,
+        now: u64,
     ) -> FsOpResult<Self> {
         let absolute = child_below(base.descriptor(), path)?;
         Ok(Self {
             namespace,
             absolute,
+            now,
         })
     }
 
@@ -944,7 +951,7 @@ impl<StorageImpl: crate::Storage> PreparedUnlinkFileAt<StorageImpl> {
         resolved
             .writable()
             .map_err(fs_error_code)?
-            .unlink(resolved.path())
+            .unlink(resolved.path(), self.now)
             .await
             .map_err(fs_error_code)
     }
@@ -954,8 +961,9 @@ pub(crate) async fn unlink_file_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
+    now: u64,
 ) -> FsOpResult<()> {
-    PreparedUnlinkFileAt::new(namespace.clone(), base, path)?
+    PreparedUnlinkFileAt::new(namespace.clone(), base, path, now)?
         .execute()
         .await
 }
@@ -1212,9 +1220,12 @@ where
     )
     .await
     .map_err(fs_error_code)?;
-    write_resolved(&resolved, WritePosition::At(0), bytes, now)
-        .await
-        .map(drop)
+    let landed = write_resolved(&resolved, WritePosition::At(0), bytes, now).await?;
+    // A file replaced in part is not the file the caller asked for.
+    if landed.len != bytes.len() {
+        return Err(fs_types::ErrorCode::InsufficientSpace);
+    }
+    Ok(())
 }
 
 /// What one bounded read resolves with.
@@ -1362,7 +1373,9 @@ pin_project! {
     enum FileWriteState<Prepare, Submit> {
         Idle,
         Preparing { #[pin] future: Prepare },
-        Submitting { #[pin] future: Submit, len: usize },
+        /// `len` is the round being submitted, `taken` the bytes of the whole
+        /// write the stream has handed over so far, this round's included.
+        Submitting { #[pin] future: Submit, len: usize, taken: usize },
     }
 }
 
@@ -1448,6 +1461,8 @@ where
         let mut this = self.project();
         let now = (*this.getter)(store.data_mut()).now_nanos();
         let mut source = source.as_direct(store);
+        // The bytes of the write in flight the earlier rounds took.
+        let mut taken = 0;
         loop {
             let staged = match this.state.as_mut().project() {
                 FileWriteStateProjection::Idle => {
@@ -1474,12 +1489,17 @@ where
                     this.state.set(FileWriteState::Idle);
                     result
                 }
-                FileWriteStateProjection::Submitting { future, len } => {
+                FileWriteStateProjection::Submitting {
+                    future,
+                    len,
+                    taken: submitted,
+                } => {
                     let result = match future.poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(result) => result,
                     };
                     let len = *len;
+                    taken = *submitted;
                     this.state.set(FileWriteState::Idle);
                     match result {
                         Ok(progress) => {
@@ -1490,6 +1510,12 @@ where
                             }
                             match progress {
                                 WriteProgress::More(next) if !finish => Ok(next),
+                                // A write that ran out of space stored a prefix of
+                                // bytes the stream already took, so the stream can
+                                // only end with the out-of-space error.
+                                WriteProgress::Done(landed) if landed.len != taken => {
+                                    Err(fs_types::ErrorCode::InsufficientSpace)
+                                }
                                 // Cancellation completes the consumed round and drops any
                                 // unfilled next round without taking more guest bytes.
                                 _ => return Poll::Ready(Ok(StreamResult::Completed)),
@@ -1519,7 +1545,11 @@ where
                 filled
             };
             let future = (*this.submit)(filled);
-            this.state.set(FileWriteState::Submitting { future, len });
+            this.state.set(FileWriteState::Submitting {
+                future,
+                len,
+                taken: taken + len,
+            });
         }
     }
 }
@@ -2107,7 +2137,7 @@ where
     ) -> Result<Self::RemoveDirectoryAtPrepared> {
         Ok((|| -> FsOpResult<_> {
             let (base, namespace) = descriptor_in(store, &descriptor)?;
-            PreparedRemoveDirectoryAt::new(namespace, base.grant()?, path)
+            PreparedRemoveDirectoryAt::new(namespace, base.grant()?, path, store.now_nanos())
         })())
     }
     async fn remove_directory_at(
@@ -2187,7 +2217,7 @@ where
     ) -> Result<Self::UnlinkFileAtPrepared> {
         Ok((|| -> FsOpResult<_> {
             let (base, namespace) = descriptor_in(store, &descriptor)?;
-            PreparedUnlinkFileAt::new(namespace, base.grant()?, path)
+            PreparedUnlinkFileAt::new(namespace, base.grant()?, path, store.now_nanos())
         })())
     }
     async fn unlink_file_at(
@@ -2382,7 +2412,10 @@ mod direct_write_tests {
         async fn submit(self) -> FsResult<WriteProgress<Self::Next>> {
             yield_now().await;
             Ok(if self.0.offset == self.0.len {
-                WriteProgress::Done(0)
+                WriteProgress::Done(Landed {
+                    offset: 0,
+                    len: self.0.len,
+                })
             } else {
                 WriteProgress::More(self.0)
             })
@@ -2410,6 +2443,18 @@ mod direct_write_tests {
 
     async fn submit(filled: FilledRound) -> FsOpResult<WriteProgress<RoundWrite>> {
         filled.submit().await.map_err(fs_error_code)
+    }
+
+    /// A filesystem that stores one byte less than the write staged, as a
+    /// device that ran out of space part way does.
+    async fn submit_short(filled: FilledRound) -> FsOpResult<WriteProgress<RoundWrite>> {
+        match filled.submit().await.map_err(fs_error_code)? {
+            WriteProgress::Done(landed) => Ok(WriteProgress::Done(Landed {
+                offset: landed.offset,
+                len: landed.len - 1,
+            })),
+            more => Ok(more),
+        }
     }
 
     pin_project! {
@@ -2459,6 +2504,22 @@ mod direct_write_tests {
     ) where
         P: core::future::Future<Output = FsOpResult<RoundWrite>> + Send + 'static,
     {
+        let (outcome, skipped) = run(prepare, submit, cancel);
+        outcome.expect("write completed");
+        assert_eq!(skipped, consumed);
+    }
+
+    /// Pipes `abcdef` into a file write consumer, and returns how the
+    /// stream ended and how many source bytes it took.
+    fn run<P, S>(
+        prepare: fn(TestHeld, WritePosition, usize, u64) -> P,
+        submit: fn(FilledRound) -> S,
+        cancel: bool,
+    ) -> (FsOpResult<()>, usize)
+    where
+        P: core::future::Future<Output = FsOpResult<RoundWrite>> + Send + 'static,
+        S: core::future::Future<Output = FsOpResult<WriteProgress<RoundWrite>>> + Send + 'static,
+    {
         let mut config = wasmtime::Config::new();
         config
             .wasm_component_model(true)
@@ -2492,15 +2553,25 @@ mod direct_write_tests {
             bytes: b"abcdef",
             reads: reads.clone(),
         };
-        block_on(store.run_concurrent(async |accessor| {
+        let outcome = block_on(store.run_concurrent(async |accessor| {
             accessor
                 .with(|mut store| StreamReader::new(&mut store, source)?.pipe(store, consumer))
                 .expect("connect stream");
-            rx.await.expect("completion sent").expect("write completed");
+            rx.await.expect("completion sent")
         }))
         .expect("stream event loop");
-        assert_eq!(reads.skipped.load(Ordering::Relaxed), consumed);
         assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
+        (outcome, reads.skipped.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn a_short_write_ends_the_stream_with_insufficient_space() {
+        let (outcome, skipped) = run(prepare_ready, submit_short, false);
+        assert!(matches!(
+            outcome,
+            Err(fs_types::ErrorCode::InsufficientSpace)
+        ));
+        assert_eq!(skipped, 6);
     }
 
     #[test]
@@ -2622,7 +2693,7 @@ mod borrowed_request_tests {
             "中文-日本語-한국어/symbolic",
         ] {
             block_on(
-                PreparedUnlinkFileAt::new(namespace.clone(), root.grant().unwrap(), path)
+                PreparedUnlinkFileAt::new(namespace.clone(), root.grant().unwrap(), path, 7)
                     .unwrap()
                     .execute(),
             )
@@ -2633,6 +2704,7 @@ mod borrowed_request_tests {
                 namespace.clone(),
                 root.grant().unwrap(),
                 "中文-日本語-한국어",
+                7,
             )
             .unwrap()
             .execute(),

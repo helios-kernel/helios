@@ -7,10 +7,13 @@ edition.workspace = true
 cargo-fuzz = true
 
 [features]
+write = ["dep:rpds", "dep:futures", "dep:zrip-encode", "lzokay/compress", "lzokay/alloc"]
 test-support = []
 fuzzing = ["test-support", "dep:libfuzzer-sys"]
 
 [dependencies]
+rpds = { version = "1.2.1", default-features = false, optional = true }
+futures = { version = "0.3.34", default-features = false, features = ["alloc"], optional = true }
 libfuzzer-sys = { version = "0.4.13", default-features = false, features = ["link_libfuzzer"], optional = true }
 arrayvec = { version = "0.7.6", default-features = false }
 blake2 = { version = "0.11.0", default-features = false }
@@ -27,6 +30,8 @@ zerocopy = { version = "0.8.57", default-features = false, features = ["derive"]
 zrip-core = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
 zrip-decode = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
 
+zrip-encode = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"], optional = true }
+
 [dev-dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 btrfs-disk = { version = "0.13.0", default-features = false }
@@ -35,6 +40,15 @@ ferrosys = { version = "0.8.0", default-features = false, features = ["btrfs"] }
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 lzokay = { version = "2.0.1", default-features = false, features = ["compress", "alloc"] }
 tempfile.workspace = true
+
+# Only the FUSE adapter example needs these, and only on Linux: fuser mounts
+# through `fusermount3` with no libfuse.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+fuser = { version = "0.18.0", default-features = false }
+getrandom = { version = "0.4.3", default-features = false }
+libc = { version = "0.2.191", default-features = false }
+tracing-log = { version = "0.2.0", default-features = false, features = ["log-tracer", "std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [lints]
 workspace = true
@@ -56,3 +70,7 @@ bench = false
 [[example]]
 name = "btrfs-corpus"
 required-features = ["test-support"]
+
+[[example]]
+name = "fuse-btrfs"
+required-features = ["test-support", "write"]
