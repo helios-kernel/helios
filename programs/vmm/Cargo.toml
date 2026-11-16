@@ -1,0 +1,21 @@
+[package]
+name = "helios-vmm"
+version = "0.1.0"
+edition.workspace = true
+autobins = false
+
+[dependencies]
+helios-api = { path = "../../api", default-features = false, features = ["hv", "io", "task"] }
+thiserror = { version = "2.0.21", default-features = false }
+clap = { version = "4.6.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+async-channel = { version = "2.5.0", default-features = false }
+futures-lite = { version = "2.6.1", default-features = false }
+vm-fdt = { version = "0.3.0", default-features = false, features = ["std"] }
+
+[lib]
+name = "helios_vmm"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

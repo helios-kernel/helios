@@ -186,6 +186,8 @@ mod gic;
 mod gpu;
 mod hand_over;
 mod host_fs;
+#[cfg(feature = "hv")]
+pub mod hv;
 mod input;
 mod lifecycle;
 mod net;
@@ -343,6 +345,8 @@ struct ProcessorRuntime {
     device_interrupts: Once<DeviceInterruptRoutes>,
     /// The record of this processor's trap hand-over self-check.
     hand_over_probe: hand_over::HandOverProbe,
+    /// Selected at bring-up, so IRQ dispatch does not probe the exception level.
+    timer_interrupt: IntId,
 }
 
 impl ProcessorRuntime {
@@ -361,6 +365,7 @@ impl ProcessorRuntime {
             program_service: Once::new(),
             device_interrupts: Once::new(),
             hand_over_probe: hand_over::HandOverProbe::new(),
+            timer_interrupt: gic::host_timer_interrupt(),
         }
     }
 }
@@ -407,6 +412,10 @@ struct Aarch64PlatformState {
     instruction_key: cfi::SharedInstructionKey,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
+    #[cfg(feature = "hv")]
+    hypervisor: Once<hv::Hypervisor>,
+    #[cfg(helios_hv_self_test)]
+    hv_test: hv::self_test::Remote,
     /// The bootstrap processor's answer to every ISA level feature. Written
     /// once before any secondary starts; each secondary compares its own.
     isa_answers: ProbeAnswers,
@@ -454,6 +463,10 @@ impl Aarch64PlatformState {
             instruction_key: cfi::SharedInstructionKey::new(),
             debug_state: Once::new(),
             gic: Once::new(),
+            #[cfg(feature = "hv")]
+            hypervisor: Once::new(),
+            #[cfg(helios_hv_self_test)]
+            hv_test: hv::self_test::Remote::new(),
             isa_answers: probe_isa_answers(),
         }))
     }
@@ -875,6 +888,10 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
     ));
     gic.attach_current_processor(platform_state.bootstrap_mpidr());
+    #[cfg(feature = "hv")]
+    if let Some(hypervisor) = hv::Hypervisor::discover(platform_state) {
+        platform_state.hypervisor.call_once(|| hypervisor);
+    }
     // The device path's platform surface comes up with the controller
     // and before any grant is published, which the registry enforces.
     device::install_hooks(gic);
@@ -1066,6 +1083,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
         cfi::self_test()
     };
 
+    #[cfg(helios_hv_self_test)]
+    kernel.spawn_local_detached(hv::self_test::run(cpu, kernel.processor_control()));
+
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
@@ -1107,6 +1127,14 @@ impl Drop for Aarch64WakeOnlyMask {
 }
 
 impl Cpu for Aarch64Cpu {
+    #[cfg(feature = "hv")]
+    type Hypervisor = hv::Hypervisor;
+    #[cfg(not(feature = "hv"))]
+    type Hypervisor = core::convert::Infallible;
+    #[cfg(feature = "hv")]
+    fn hv(&self) -> Option<&Self::Hypervisor> {
+        self.state.hypervisor.get()
+    }
     // `CNTV_CVAL_EL0` is this processor's one-shot comparator.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
@@ -1503,6 +1531,10 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     // bootstrap processor, so only private interrupts arrive here.
     unsafe { unmask_irq() };
     hand_over::verify_trap_hand_over(mp_info.mpidr);
+    #[cfg(helios_hv_self_test)]
+    if helios_hal::cpu::current_processor() == ProcessorId::new(1) {
+        kernel.spawn_local_detached(state.hv_test.serve());
+    }
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
@@ -1723,7 +1755,7 @@ extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
         if intid == gic::WAKE_SGI {
             // The wake carries no payload: returning from `wfi` is the
             // whole message, and `park_current` owns the flag.
-        } else if intid == gic::VIRTUAL_TIMER_PPI {
+        } else if intid == runtime.timer_interrupt {
             // Every processor's timer interrupt ends the slice of every
             // guest on the machine that has run one.
             if let Some(program_service) = runtime.program_service.get() {
@@ -1754,6 +1786,15 @@ extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
 /// critical section that unmasked them on exit would enable more than
 /// it disabled.
 const SPSR_IRQ_MASK: u64 = 1 << 7;
+
+/// CurrentEL uses the same EL bits as SPSR.M; bit zero selects the stack.
+fn current_exception_level() -> u64 {
+    let level;
+    unsafe {
+        asm!("mrs {level}, CurrentEL", level = out(reg) level, options(nomem, nostack, preserves_flags));
+    }
+    level
+}
 
 fn mask_irq() {
     unsafe {

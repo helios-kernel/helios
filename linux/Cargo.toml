@@ -1,0 +1,22 @@
+[package]
+name = "helios-linux"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[features]
+default = []
+runtime = ["dep:helios-sync", "helios-sync/runtime", "dep:bytes", "dep:helios-unix", "helios-unix/runtime", "dep:object", "dep:thiserror"]
+
+[dependencies]
+helios-sync = { workspace = true, optional = true }
+bytes = { version = "1.12.1", default-features = false, optional = true }
+helios-unix = { workspace = true, optional = true }
+object = { version = "0.39.1", default-features = false, features = ["read_core", "elf"], optional = true }
+thiserror = { version = "2.0.21", default-features = false, optional = true }
+
+[dev-dependencies]
+critical-section = { version = "1.2.0", features = ["std"] }
+
+[lints]
+workspace = true

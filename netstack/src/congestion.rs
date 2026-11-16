@@ -1440,7 +1440,12 @@ impl BbrV3 {
         let tx_in_flight = lost.sent.tx_in_flight;
         let lost_since_send = lost.lost - lost.sent.lost;
         if self.is_inflight_too_high(lost_since_send, tx_in_flight, lost.has_selective_acks) {
-            let at_loss = Self::inflight_at_loss(lost.bytes, tx_in_flight, lost_since_send);
+            let at_loss = Self::inflight_at_loss(
+                lost.bytes,
+                tx_in_flight,
+                lost_since_send,
+                lost.has_selective_acks,
+            );
             self.handle_inflight_too_high(
                 at_loss,
                 lost.sent.is_app_limited,
@@ -1451,13 +1456,21 @@ impl BbrV3 {
     }
 
     /// `InflightAtLoss`: where in this segment the loss rate crossed
-    /// `BBR.LossThresh`. A negative prefix (the threshold was crossed
+    /// the threshold used by `IsInflightTooHigh` (zero without SACK).
+    /// A negative prefix (the threshold was crossed
     /// before this segment) is kept, as the draft's arithmetic keeps it;
     /// the result floors at zero.
-    fn inflight_at_loss(size: u32, tx_in_flight: u32, lost: u64) -> u64 {
+    fn inflight_at_loss(size: u32, tx_in_flight: u32, lost: u64, has_selective_acks: bool) -> u64 {
         let inflight_prev = i128::from(tx_in_flight) - i128::from(size);
         let lost_prev = i128::from(lost) - i128::from(size);
-        let thresh = i128::from(Self::LOSS_THRESH_PER_MILLE);
+        // Without SACK, IsInflightTooHigh reacts to the first loss.
+        // Use that same zero-loss threshold here: extrapolating to 2%
+        // can place the safe bound beyond the packet already lost.
+        let thresh = if has_selective_acks {
+            i128::from(Self::LOSS_THRESH_PER_MILLE)
+        } else {
+            0
+        };
         let lost_prefix = (thresh * inflight_prev - 1000 * lost_prev) / (1000 - thresh);
         u64::try_from((inflight_prev + lost_prefix).max(0)).unwrap_or(u64::MAX)
     }
@@ -1843,9 +1856,19 @@ mod tests {
         // inflight that makes one segment 2% of it, less the prefix.
         let mss = 1460;
         let before = 100 * mss;
-        let at_loss = BbrV3::inflight_at_loss(mss, before + mss, u64::from(mss));
+        let at_loss = BbrV3::inflight_at_loss(mss, before + mss, u64::from(mss), true);
         // lost_prefix = (0.02 * 146000 - 0) / 0.98 = 2979.59..., floored.
         assert_eq!(at_loss, u64::from(before) + 2979);
+    }
+
+    #[test]
+    fn without_sack_the_safe_bound_precedes_the_first_lost_packet() {
+        let mss = 1460;
+        let before = 100 * mss;
+        assert_eq!(
+            BbrV3::inflight_at_loss(mss, before + mss, u64::from(mss), false),
+            u64::from(before)
+        );
     }
 
     #[test]

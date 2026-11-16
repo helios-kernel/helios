@@ -1,6 +1,19 @@
 use crate::wit_bindgen;
 
 #[cfg(all(
+    feature = "hv",
+    any(
+        feature = "http-handler",
+        feature = "compositor",
+        feature = "webgpu",
+        feature = "webgpu-provider"
+    )
+))]
+compile_error!(
+    "`hv` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
+);
+
+#[cfg(all(
     feature = "mounts",
     any(
         feature = "http-handler",

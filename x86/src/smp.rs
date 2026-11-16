@@ -193,7 +193,7 @@ const _: () = assert!(
 #[repr(C)]
 pub(crate) struct ProcessorRuntime {
     anchor: ProcessorAnchor,
-    physical_memory_offset: usize,
+    pub(crate) physical_memory_offset: usize,
     tsc_hz: u64,
     apic_mode: LocalApicMode,
     pub(crate) wasmtime_tls: WasmtimeTlsSlots,

@@ -14,6 +14,7 @@ where
     /// threads' stores register with too.
     pub(super) interrupts: Arc<GuestInterrupts>,
     activity: crate::InstanceActivity,
+    pub(super) identity: helios_unix::ProcessIdentity,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
     pub(super) filesystem: Namespace<StorageImpl>,
     pub(super) clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>,
@@ -88,6 +89,9 @@ where
         threads: WasixImageThreads<CpuImpl, Net, StorageImpl>,
     ) -> Self {
         let filesystem = filesystem.unwrap_or_else(|| runtime_state.root_namespace().descend());
+        let identity = helios_unix::ProcessIdentity::new(
+            core::num::NonZeroU64::new(instance.id().raw()).expect("live instance ID is nonzero"),
+        );
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
         let descriptors =
             descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
@@ -105,6 +109,7 @@ where
                 instance,
                 crate::store_kernel_heap_bytes(size_of::<Self>()),
             ),
+            identity,
             parent_instance_id,
             filesystem,
             clock,
@@ -153,9 +158,9 @@ where
         self.timer.sleep_for(duration)
     }
 
-    pub(super) fn futex_key(&self, address: u32) -> crate::FutexKey {
-        crate::FutexKey::new(
-            crate::ProcessMemoryIdentity::new(self.instance().id().raw()),
+    pub(super) fn futex_key(&self, address: u32) -> helios_unix::FutexKey {
+        helios_unix::FutexKey::new(
+            helios_unix::ProcessMemoryIdentity::new(self.instance().id().raw()),
             GuestAddress::wasm32(address),
         )
     }
@@ -525,23 +530,10 @@ where
     }
 
     pub(super) async fn read_pipe(&mut self, fd: i32, max_bytes: usize) -> Result<Bytes, i32> {
-        let reader = match self.descriptors.get_mut(fd) {
-            Some(Preview1Descriptor::PipeRead { reader, carry }) => {
-                if !carry.is_empty() {
-                    return Ok(take_preview1_carry(carry, max_bytes));
-                }
-                reader.clone()
-            }
-            Some(_) => return Err(p1::errno::BADF),
-            None => return Err(p1::errno::BADF),
-        };
-
-        let bytes = reader.read().await.unwrap_or_default();
-        let Some(Preview1Descriptor::PipeRead { carry, .. }) = self.descriptors.get_mut(fd) else {
+        let Some(Preview1Descriptor::PipeRead { reader }) = self.descriptors.get(fd) else {
             return Err(p1::errno::BADF);
         };
-        *carry = bytes;
-        Ok(take_preview1_carry(carry, max_bytes))
+        Ok(reader.read_limit(max_bytes).await.unwrap_or_default())
     }
 
     pub(super) async fn read_socket_pair(
@@ -1037,11 +1029,14 @@ where
     let registration = interrupts.register(instance, store, store.data().cpu.clone());
     // The thread's mailbox needs a target as well, so a running thread
     // meets a signal raised on it at its next interrupt check.
-    store
-        .data()
-        .signal_state
-        .attach(interrupts.clone(), instance);
-    store.data().thread_signals.attach(interrupts, instance);
+    store.data().signal_state.attach(SignalTarget {
+        interrupts: interrupts.clone(),
+        instance,
+    });
+    store.data().thread_signals.attach(SignalTarget {
+        interrupts,
+        instance,
+    });
     registration
 }
 
@@ -2696,16 +2691,16 @@ where
     StorageImpl: crate::Storage,
 {
     let Some(Preview1Descriptor::File {
-        descriptor,
-        offset,
-        fdflags,
+        descriptor, offset, ..
     }) = caller.data().descriptors.get(fd)
     else {
         return Err(P1Stop::Errno(p1::errno::BADF));
     };
     let position = match at {
         Some(at) => WritePosition::At(at),
-        None if fdflags & P1_FDFLAG_APPEND != 0 => WritePosition::End,
+        None if caller.data().descriptors.fdflags(fd)? & P1_FDFLAG_APPEND != 0 => {
+            WritePosition::End
+        }
         None => WritePosition::At(*offset),
     };
     let descriptor = descriptor.clone();
@@ -4581,7 +4576,10 @@ where
                     .try_into()
                     .unwrap_or_else(|_| panic!("eventfd write length was checked")),
             );
-            event.write(increment)?;
+            event.write(increment).map_err(|error| match error {
+                helios_unix::EventError::InvalidIncrement => p1::errno::INVAL,
+                helios_unix::EventError::WouldBlock => p1::errno::AGAIN,
+            })?;
             Ok(8)
         }
         Some(Preview1Descriptor::NullDevice) => {
@@ -5059,39 +5057,33 @@ mod tests {
         service: Net,
         stream: Net::TcpStream,
     ) -> Preview1DescriptorEntry<Net> {
-        Preview1DescriptorEntry {
-            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Connected {
-                    family: WasixSocketFamily::Ipv4,
-                    stream: WasixOwnedTcpStream::new(service, stream),
-                    peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
-                        127, 0, 0, 1,
-                    ])),
-                    peer_port: 80,
-                    options: WasixSocketOptions::default(),
-                },
-            )),
-            close_on_exec: false,
-            fdflags: 0,
-        }
+        Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+                family: WasixSocketFamily::Ipv4,
+                stream: WasixOwnedTcpStream::new(service, stream),
+                peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                    127, 0, 0, 1,
+                ])),
+                peer_port: 80,
+                options: WasixSocketOptions::default(),
+            })),
+            false,
+        )
     }
 
     fn listening_socket_entry<Net: ComponentHostNetwork>(
         service: Net,
         listener: Net::TcpListener,
     ) -> Preview1DescriptorEntry<Net> {
-        Preview1DescriptorEntry {
-            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Listening {
-                    family: WasixSocketFamily::Ipv4,
-                    listener: WasixOwnedTcpListener::new(service, listener),
-                    local_port: 8080,
-                    options: WasixSocketOptions::default(),
-                },
-            )),
-            close_on_exec: false,
-            fdflags: 0,
-        }
+        Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Listening {
+                family: WasixSocketFamily::Ipv4,
+                listener: WasixOwnedTcpListener::new(service, listener),
+                local_port: 8080,
+                options: WasixSocketOptions::default(),
+            })),
+            false,
+        )
     }
 
     /// A program that exits with a listener open retires it.
@@ -5280,18 +5272,15 @@ mod tests {
         service: Net,
         socket: Net::UdpSocket,
     ) -> Preview1DescriptorEntry<Net> {
-        Preview1DescriptorEntry {
-            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(
-                WasixUdpSocket::Bound {
-                    family: WasixSocketFamily::Ipv4,
-                    socket: WasixOwnedUdpSocket::new(service, socket),
-                    local_port: 5353,
-                    options: WasixSocketOptions::default(),
-                },
-            )),
-            close_on_exec: false,
-            fdflags: 0,
-        }
+        Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+                family: WasixSocketFamily::Ipv4,
+                socket: WasixOwnedUdpSocket::new(service, socket),
+                local_port: 5353,
+                options: WasixSocketOptions::default(),
+            })),
+            false,
+        )
     }
 
     /// A program that exits with a datagram socket open retires it.
@@ -5587,7 +5576,12 @@ mod tests {
         assert!(driven.as_mut().poll(&mut cx).is_pending());
         signal_state.raise(9);
         assert_eq!(
-            registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+            registry.request_kill(
+                instance.id(),
+                crate::KillReason::Operator,
+                0,
+                &crate::UserResidency::default()
+            ),
             crate::KillOutcome::Requested
         );
         assert!(
@@ -5715,7 +5709,12 @@ mod tests {
         let call = core::future::poll_fn(move |_| {
             sender.raise(2);
             assert_eq!(
-                registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+                registry.request_kill(
+                    instance.id(),
+                    crate::KillReason::Operator,
+                    0,
+                    &crate::UserResidency::default()
+                ),
                 crate::KillOutcome::Requested
             );
             core::task::Poll::Ready(Ok(()))

@@ -19,6 +19,7 @@ mod embedded;
 mod exec;
 mod gpu;
 mod host_fs;
+pub mod hv;
 mod input;
 mod instance;
 mod io;
@@ -187,21 +188,22 @@ pub use memory::{
     KERNEL_HEAP_RESERVE_FRACTION, LocalMemory, LocalSlice, Locality, MemoryNodeStats, MemoryOwner,
     NoCryptographicEntropy, NoEntropyDevice, NodeLocalArena, NodeMemory, NodeRun, PerProcessor,
     ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
-    ReservationTracker, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault,
-    SwapDisabled, SwapEntry, SwapFaultError, SwapFaultIn, SwapHandle, SwapLeafFormat, SwapSpace,
-    SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES,
-    UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, VaCursor,
-    allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed,
-    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, claim_fiber_stack,
-    configure_user_memory_owner_processors, current_user_memory_owner, deallocate_user_frame,
-    deallocate_user_frame_on, deallocate_user_run_on, disable_swap, enter_user_memory_owner,
-    fiber_stack_arena_stats, fiber_stack_demand_commits_on, install_entropy_device,
-    install_fiber_stack_arena, install_fiber_stack_hooks, install_memory_balloon, install_swap,
+    ReservationTracker, ResidencyVmHooks, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
+    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapFaultIn, SwapHandle,
+    SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
+    USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
+    UserMemoryPool, UserResidency, VaCursor, allocate_user_frame_uninit_on,
+    allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
+    allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
+    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
+    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
+    fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
+    install_fiber_stack_hooks, install_memory_balloon, install_residency_hooks, install_swap,
     install_swap_hooks, install_user_memory_pool, installed_swap_handle, installed_swap_hooks,
     kernel_reserve_for, largest_servable_user_bytes, page_fault_frame_reserve_bytes,
-    ranges_outside, resolve_stack_fault, seed_root_entropy, swap_vm_hooks, swapped_token,
-    task_arena_bytes_for, user_frame_node, user_heap_stats, user_mapping_kernel_heap_bytes,
-    user_node_stats, validate_range,
+    ranges_outside, residency_vm_hooks, resolve_stack_fault, seed_root_entropy, swap_vm_hooks,
+    swapped_token, task_arena_bytes_for, user_frame_node, user_heap_stats,
+    user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -216,20 +218,16 @@ pub use network::{
 };
 pub use process::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, ComponentStdioRefusal,
-    ControlProcessorsCap, DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable,
-    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
+    ControlProcessorsCap, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap,
-    GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
-    LinkTargetDirectoryCap, MachineAuthorityRights, MountAuthorityRights, MountCap, MulticastCap,
-    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap,
-    ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
-    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
+    ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap, JoinAuthority, LinkAuthorityRights,
+    LinkSourceCap, LinkTargetDirectoryCap, MachineAuthorityRights, MountAuthorityRights, MountCap,
+    MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap,
+    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
     ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
     RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
-    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
-    UnbindableStdio, UnmountCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap,
+    TtyControlCap, UdpCap, UnbindableStdio, UnmountCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -2036,3 +2034,6 @@ mod tests {
         assert_eq!(stats.requested_live_bytes, 0);
     }
 }
+
+#[cfg(feature = "unix")]
+mod unix;

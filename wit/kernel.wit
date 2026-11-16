@@ -2,6 +2,7 @@ package helios:kernel@0.1.0;
 
 world init {
   include wasi:cli/command@0.3.0;
+  import helios:hv/virtualization@0.1.0;
   import helios:system/programs@0.1.0;
   import helios:system/mounts@0.1.0;
   import helios:system/net@0.1.0;
@@ -23,6 +24,7 @@ world init {
 
 world debugger{
   include wasi:cli/command@0.3.0;
+  import helios:hv/virtualization@0.1.0;
   import helios:system/programs@0.1.0;
   import helios:system/mounts@0.1.0;
   import helios:system/net@0.1.0;
@@ -226,4 +228,18 @@ world webgpu-provider {
   import helios:system/tracing@0.1.0;
   export wasi:webgpu/webgpu@0.3.0-rc.2;
   export helios:webgpu/canvas@0.1.0;
+}
+
+world hv-host {
+  import helios:hv/virtualization@0.1.0;
+}
+
+/// Interfaces whose values cross the inspector's serialized RPC transport.
+world inspector-system {
+  import helios:system/programs@0.1.0;
+  import helios:system/stats@0.1.0;
+  import helios:system/tracing@0.1.0;
+  import helios:system/profiling@0.1.0;
+  import helios:system/instances@0.1.0;
+  import helios:system/processors@0.1.0;
 }

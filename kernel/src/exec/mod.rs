@@ -21,7 +21,7 @@ mod observer;
 pub(crate) mod phases;
 mod ready;
 mod sequence;
-mod sync;
+use helios_sync as sync;
 mod task;
 mod time;
 mod timeline;
