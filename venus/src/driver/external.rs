@@ -16,13 +16,18 @@
 //! offers (`vn_sanitize_image_format_properties`,
 //! `vn_GetPhysicalDeviceExternalBufferProperties`).
 //!
-//! The renderer's handle type is chosen differently from Mesa's: Mesa takes
-//! DMA_BUF whenever the renderer's driver advertises
+//! The renderer's handle type is DMA_BUF or nothing, as in Mesa: a blob the
+//! guest exports may be scanned out, and the host's display imports a
+//! scanout blob as a dma-buf (QEMU's `virgl_cmd_set_scanout_blob` hands the
+//! blob's fd to an `EGL_LINUX_DMA_BUF_EXT` import), so an allocation exported
+//! through any other handle type would reach scanout and never be shown.
+//! Mesa takes DMA_BUF whenever the renderer's driver advertises
 //! `VK_EXT_external_memory_dma_buf`, which a driver also advertises when it
-//! can only import dma-bufs (lavapipe without `/dev/udmabuf`). The guest asks
-//! instead whether the renderer can export each handle type, the test
-//! virglrenderer itself applies before it exports a blob
-//! (`vkr_physical_device_init_memory_properties`), preferring DMA_BUF.
+//! can only import dma-bufs (lavapipe without `/dev/udmabuf`); the guest asks
+//! instead whether the renderer can export one, the test virglrenderer itself
+//! applies before it exports a blob
+//! (`vkr_physical_device_init_memory_properties`), so such a renderer offers
+//! no external memory and a program that needs it is refused up front.
 
 use core::ffi::{CStr, c_char};
 use core::ptr::{null, null_mut};
@@ -73,30 +78,25 @@ impl ExternalMemory {
         renderer: HandleTypes::empty(),
     };
 
-    /// The renderer's handle type, from its answers for an exportable
-    /// transfer buffer of each handle type its driver has an extension for.
-    pub(super) fn choose(
-        dma_buf: Option<vk::ExternalMemoryProperties>,
-        opaque_fd: Option<vk::ExternalMemoryProperties>,
-    ) -> Self {
-        let exports = |properties: Option<vk::ExternalMemoryProperties>, handle: HandleTypes| {
-            properties.is_some_and(|properties| {
-                properties
-                    .external_memory_features
-                    .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
-                    && properties
-                        .export_from_imported_handle_types
-                        .contains(handle)
-            })
-        };
-        let renderer = if exports(dma_buf, HandleTypes::DMA_BUF_EXT) {
-            HandleTypes::DMA_BUF_EXT
-        } else if exports(opaque_fd, HandleTypes::OPAQUE_FD) {
-            HandleTypes::OPAQUE_FD
+    /// The renderer's handle type, from its answer for an exportable
+    /// dma-buf transfer buffer, `None` when its driver has no dma-buf
+    /// extension.
+    pub(super) fn choose(dma_buf: Option<vk::ExternalMemoryProperties>) -> Self {
+        let exports = dma_buf.is_some_and(|properties| {
+            properties
+                .external_memory_features
+                .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+                && properties
+                    .export_from_imported_handle_types
+                    .contains(HandleTypes::DMA_BUF_EXT)
+        });
+        if exports {
+            Self {
+                renderer: HandleTypes::DMA_BUF_EXT,
+            }
         } else {
-            HandleTypes::empty()
-        };
-        Self { renderer }
+            Self::NONE
+        }
     }
 
     /// The handle types the guest offers the application.
@@ -142,16 +142,14 @@ impl ExternalMemory {
 
     /// The renderer device extensions its handle type needs.
     fn renderer_extensions(self) -> &'static [&'static CStr] {
-        if self.renderer == HandleTypes::DMA_BUF_EXT {
+        if self.renderer.is_empty() {
+            &[]
+        } else {
             // VK_EXT_external_memory_dma_buf requires VK_KHR_external_memory_fd.
             &[
                 ash::ext::external_memory_dma_buf::NAME,
                 ash::khr::external_memory_fd::NAME,
             ]
-        } else if self.renderer == HandleTypes::OPAQUE_FD {
-            &[ash::khr::external_memory_fd::NAME]
-        } else {
-            &[]
         }
     }
 }
@@ -290,12 +288,7 @@ fn probe<T: Transport>(
     } else {
         None
     };
-    let opaque_fd = if has(ash::khr::external_memory_fd::NAME) {
-        Some(buffer_export(connection, physical, HandleTypes::OPAQUE_FD)?)
-    } else {
-        None
-    };
-    let memory = ExternalMemory::choose(dma_buf, opaque_fd);
+    let memory = ExternalMemory::choose(dma_buf);
     Ok(Ok(PhysicalExternal {
         extensions: advertised_extensions(&renderer, memory),
         memory,
@@ -649,64 +642,53 @@ mod tests {
             | vk::ExternalMemoryFeatureFlags::IMPORTABLE.as_raw(),
     );
 
+    const DMA_BUF: ExternalMemory = ExternalMemory {
+        renderer: HandleTypes::DMA_BUF_EXT,
+    };
+
     #[test]
-    fn an_exporting_dma_buf_renderer_keeps_dma_buf() {
-        let memory = ExternalMemory::choose(
-            Some(properties(BOTH, HandleTypes::DMA_BUF_EXT)),
-            Some(properties(BOTH, HandleTypes::OPAQUE_FD)),
-        );
-        assert_eq!(memory.renderer, HandleTypes::DMA_BUF_EXT);
+    fn an_exporting_dma_buf_renderer_takes_every_offered_handle_type() {
+        let memory = ExternalMemory::choose(Some(properties(BOTH, HandleTypes::DMA_BUF_EXT)));
+        assert_eq!(memory, DMA_BUF);
+        assert_eq!(memory.offered(), OFFERED);
         assert_eq!(memory.rewrite(HandleTypes::DMA_BUF_EXT), None);
         assert_eq!(
             memory.rewrite(HandleTypes::OPAQUE_FD),
             Some(HandleTypes::DMA_BUF_EXT)
         );
-    }
-
-    #[test]
-    fn an_import_only_dma_buf_renderer_exports_opaque_fds() {
-        // lavapipe without /dev/udmabuf: dma-bufs import only, memfds export.
-        let memory = ExternalMemory::choose(
-            Some(properties(
-                vk::ExternalMemoryFeatureFlags::IMPORTABLE,
-                HandleTypes::DMA_BUF_EXT,
-            )),
-            Some(properties(BOTH, HandleTypes::OPAQUE_FD)),
-        );
-        assert_eq!(memory.renderer, HandleTypes::OPAQUE_FD);
-        assert_eq!(memory.offered(), OFFERED);
-        assert_eq!(
-            memory.rewrite(HandleTypes::DMA_BUF_EXT),
-            Some(HandleTypes::OPAQUE_FD)
-        );
-        assert_eq!(memory.rewrite(HandleTypes::OPAQUE_FD), None);
         assert_eq!(memory.rewrite(HandleTypes::empty()), None);
     }
 
     #[test]
-    fn exportability_needs_the_handle_type_among_the_exportable_ones() {
-        let memory = ExternalMemory::choose(
-            Some(properties(
-                vk::ExternalMemoryFeatureFlags::EXPORTABLE,
-                HandleTypes::empty(),
-            )),
-            None,
-        );
+    fn an_import_only_dma_buf_renderer_exports_nothing() {
+        // lavapipe without /dev/udmabuf: dma-bufs import only. Its memfds
+        // export, but the host's display cannot scan one out.
+        let memory = ExternalMemory::choose(Some(properties(
+            vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+            HandleTypes::DMA_BUF_EXT,
+        )));
         assert_eq!(memory, ExternalMemory::NONE);
         assert_eq!(memory.offered(), HandleTypes::empty());
     }
 
     #[test]
-    fn a_renderer_without_external_memory_extensions_exports_nothing() {
-        assert_eq!(ExternalMemory::choose(None, None), ExternalMemory::NONE);
+    fn exportability_needs_the_handle_type_among_the_exportable_ones() {
+        let memory = ExternalMemory::choose(Some(properties(
+            vk::ExternalMemoryFeatureFlags::EXPORTABLE,
+            HandleTypes::empty(),
+        )));
+        assert_eq!(memory, ExternalMemory::NONE);
+    }
+
+    #[test]
+    fn a_renderer_without_the_dma_buf_extension_exports_nothing() {
+        assert_eq!(ExternalMemory::choose(None), ExternalMemory::NONE);
     }
 
     #[test]
     fn answers_name_the_offered_handle_types_and_never_import() {
-        let memory = ExternalMemory {
-            renderer: HandleTypes::OPAQUE_FD,
-        };
-        let mut answer = properties(BOTH, HandleTypes::OPAQUE_FD);
+        let memory = DMA_BUF;
+        let mut answer = properties(BOTH, HandleTypes::DMA_BUF_EXT);
         memory.answer(&mut answer);
         assert_eq!(
             answer.external_memory_features,
@@ -761,9 +743,7 @@ mod tests {
             extension(ash::ext::external_memory_dma_buf::NAME, 1),
             extension(ash::khr::external_memory_fd::NAME, 1),
         ];
-        let exporting = ExternalMemory {
-            renderer: HandleTypes::OPAQUE_FD,
-        };
+        let exporting = DMA_BUF;
         assert_eq!(
             names(&advertised_extensions(&renderer, exporting)),
             [
@@ -776,16 +756,6 @@ mod tests {
             names(&advertised_extensions(&renderer, ExternalMemory::NONE)),
             [ash::ext::queue_family_foreign::NAME]
         );
-        // An exporting renderer without the dma-buf extension still gets it
-        // from the guest.
-        let opaque_only = [extension(ash::khr::external_memory_fd::NAME, 1)];
-        assert_eq!(
-            names(&advertised_extensions(&opaque_only, exporting)),
-            [
-                ash::khr::external_memory_fd::NAME,
-                ash::ext::external_memory_dma_buf::NAME,
-            ]
-        );
     }
 
     #[test]
@@ -793,16 +763,11 @@ mod tests {
         let foreign = ash::ext::queue_family_foreign::NAME;
         let dma_buf = ash::ext::external_memory_dma_buf::NAME;
         let fd = ash::khr::external_memory_fd::NAME;
-        let opaque = ExternalMemory {
-            renderer: HandleTypes::OPAQUE_FD,
-        };
-        let native = ExternalMemory {
-            renderer: HandleTypes::DMA_BUF_EXT,
-        };
-        assert_eq!(renderer_device_extensions(&[foreign], opaque), Ok(None));
+        let native = DMA_BUF;
+        assert_eq!(renderer_device_extensions(&[foreign], native), Ok(None));
         assert_eq!(
-            renderer_device_extensions(&[foreign, dma_buf], opaque),
-            Ok(Some(vec![foreign, fd]))
+            renderer_device_extensions(&[foreign, dma_buf], native),
+            Ok(Some(vec![foreign, dma_buf, fd]))
         );
         assert_eq!(
             renderer_device_extensions(&[dma_buf, fd], native),
@@ -820,21 +785,20 @@ mod tests {
 
     #[test]
     fn create_infos_carry_the_renderer_handle_type() {
-        let memory = ExternalMemory {
-            renderer: HandleTypes::OPAQUE_FD,
-        };
+        let memory = DMA_BUF;
         let external =
-            vk::ExternalMemoryImageCreateInfo::default().handle_types(HandleTypes::DMA_BUF_EXT);
+            vk::ExternalMemoryImageCreateInfo::default().handle_types(HandleTypes::OPAQUE_FD);
         let mut image = vk::ImageCreateInfo::default().tiling(vk::ImageTiling::LINEAR);
         image.p_next = (&raw const external).cast();
         let external_buffer =
-            vk::ExternalMemoryBufferCreateInfo::default().handle_types(HandleTypes::DMA_BUF_EXT);
+            vk::ExternalMemoryBufferCreateInfo::default().handle_types(HandleTypes::OPAQUE_FD);
         let mut buffer = vk::BufferCreateInfo::default().size(64);
         buffer.p_next = (&raw const external_buffer).cast();
-        // The allocation the WebGPU provider makes: export, then dedicated.
+        // An export, then a dedicated allocation, as the WebGPU provider
+        // allocates, naming the handle type the renderer does not export.
         let dedicated = vk::MemoryDedicatedAllocateInfo::default();
         let mut export =
-            vk::ExportMemoryAllocateInfo::default().handle_types(HandleTypes::DMA_BUF_EXT);
+            vk::ExportMemoryAllocateInfo::default().handle_types(HandleTypes::OPAQUE_FD);
         export.p_next = (&raw const dedicated).cast();
         let allocation = vk::MemoryAllocateInfo {
             p_next: (&raw const export).cast(),
@@ -846,27 +810,27 @@ mod tests {
             let image = &*image.head();
             assert_eq!(image.tiling, vk::ImageTiling::LINEAR);
             let external = chain::next::<vk::ExternalMemoryImageCreateInfo<'_>>(image.p_next);
-            assert_eq!(external.unwrap().handle_types, HandleTypes::OPAQUE_FD);
+            assert_eq!(external.unwrap().handle_types, HandleTypes::DMA_BUF_EXT);
 
             let buffer = buffer_info(memory, &buffer).unwrap();
             let buffer = &*buffer.head();
             assert_eq!(buffer.size, 64);
             let external = chain::next::<vk::ExternalMemoryBufferCreateInfo<'_>>(buffer.p_next);
-            assert_eq!(external.unwrap().handle_types, HandleTypes::OPAQUE_FD);
+            assert_eq!(external.unwrap().handle_types, HandleTypes::DMA_BUF_EXT);
 
             let rewritten = allocate_info(memory, &allocation).unwrap();
             let allocation = &*rewritten.head();
             let export = chain::next::<vk::ExportMemoryAllocateInfo<'_>>(allocation.p_next);
-            assert_eq!(export.unwrap().handle_types, HandleTypes::OPAQUE_FD);
+            assert_eq!(export.unwrap().handle_types, HandleTypes::DMA_BUF_EXT);
             assert!(
                 chain::next::<vk::MemoryDedicatedAllocateInfo<'_>>(allocation.p_next).is_some()
             );
         }
-        assert_eq!(external.handle_types, HandleTypes::DMA_BUF_EXT);
-        assert_eq!(export.handle_types, HandleTypes::DMA_BUF_EXT);
+        assert_eq!(external.handle_types, HandleTypes::OPAQUE_FD);
+        assert_eq!(export.handle_types, HandleTypes::OPAQUE_FD);
 
         // The renderer's own handle type reaches it unchanged.
-        let own = vk::ExportMemoryAllocateInfo::default().handle_types(HandleTypes::OPAQUE_FD);
+        let own = vk::ExportMemoryAllocateInfo::default().handle_types(HandleTypes::DMA_BUF_EXT);
         let allocation = vk::MemoryAllocateInfo {
             p_next: (&raw const own).cast(),
             ..Default::default()
