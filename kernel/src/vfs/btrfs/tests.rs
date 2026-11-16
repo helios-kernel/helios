@@ -83,32 +83,14 @@ fn write_options(
     }
 }
 
-/// The device blocks that contain `needle`, skipping the blocks never written.
-async fn blocks_holding(cache: &crate::BlockCache<MemoryDisk>, needle: &[u8]) -> usize {
-    let disk = cache.disk(0);
-    let mut block = alloc::vec![0; crate::CACHE_BLOCK_BYTES];
-    let mut found = 0;
-    for index in 0..disk.capacity_blocks() {
-        disk.read_at(index * crate::CACHE_BLOCK_BYTES as u64, &mut block)
-            .await
-            .expect("reads the block");
-        if block.iter().any(|byte| *byte != 0)
-            && block.windows(needle.len()).any(|window| window == needle)
-        {
-            found += 1;
-        }
-    }
-    found
-}
-
 /// A writable mount with a compression policy stores compressible data in
-/// compressed extents: the reader returns the same bytes, the device holds
-/// the text in far fewer blocks than a plain write does, and the superblock
+/// compressed extents: the reader returns the same bytes, every regular
+/// extent item names the policy's algorithm (a plain mount's name none), and the superblock
 /// records the algorithm's incompat bit.
 #[test]
 fn a_compressing_mount_writes_extents_the_reader_reads_back() {
-    use helios_btrfs::Compression;
     use helios_btrfs::write::CompressionPolicy;
+    use helios_btrfs::{Compression, ExtentKind};
 
     // Text with CJK, repeated past one 128 KiB extent so several extents form.
     let payload: Vec<u8> = "压缩 圧縮 압축 compressible line\n"
@@ -119,26 +101,15 @@ fn a_compressing_mount_writes_extents_the_reader_reads_back() {
         .take(300_000)
         .collect();
     // The incompat bits of btrfs_tree.h: COMPRESS_LZO and COMPRESS_ZSTD.
-    for (policy, bit, compressed) in [
-        (None, 0, false),
-        (Some(CompressionPolicy::new(Compression::Zlib, 0)), 0, true),
-        (Some(CompressionPolicy::new(Compression::Zlib, 9)), 0, true),
-        (
-            Some(CompressionPolicy::new(Compression::Lzo, 0)),
-            1 << 3,
-            true,
-        ),
-        (
-            Some(CompressionPolicy::new(Compression::Zstd, 0)),
-            1 << 4,
-            true,
-        ),
-        (
-            Some(CompressionPolicy::new(Compression::Zstd, -5)),
-            1 << 4,
-            true,
-        ),
+    for (algorithm, level, bit) in [
+        (None, 0, 0),
+        (Some(Compression::Zlib), 0, 0),
+        (Some(Compression::Zlib), 9, 0),
+        (Some(Compression::Lzo), 0, 1 << 3),
+        (Some(Compression::Zstd), 0, 1 << 4),
+        (Some(Compression::Zstd), -5, 1 << 4),
     ] {
+        let policy = algorithm.map(|algorithm| CompressionPolicy::new(algorithm, level));
         let time = Timestamp::from_secs(1_700_000_000);
         let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
         let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
@@ -191,19 +162,20 @@ fn a_compressing_mount_writes_extents_the_reader_reads_back() {
             let snapshot = reopened.inner.reader.lock().clone();
             let inode = snapshot.resolve(b"/text").await.unwrap();
             assert_eq!(inode.metadata().size, payload.len() as u64);
-            // The inode's nbytes counts logical bytes for compressed extents,
-            // as Linux's does, so the stored form is read off the device: the
-            // payload's plaintext spans about 73 blocks when written plain,
-            // and under half of that when compressed (LZO compresses this
-            // text least, to about a third).
-            let plaintext = blocks_holding(&cache, b"compressible line").await;
-            if compressed {
-                assert!(
-                    plaintext < 36,
-                    "{policy:?} left {plaintext} plaintext blocks"
-                );
-            } else {
-                assert!(plaintext >= 70, "{plaintext} plaintext blocks");
+            // Read the stored form off the extent items: this payload
+            // shrinks in every extent under every algorithm, so each regular
+            // extent carries the policy's algorithm and a plain mount's
+            // carry none.
+            let extents = snapshot.file_extents(&inode).await.unwrap();
+            assert!(!extents.is_empty(), "{policy:?} wrote no extents");
+            assert_eq!(
+                extents.iter().map(|extent| extent.len).sum::<u64>(),
+                payload.len().next_multiple_of(4096) as u64,
+                "{policy:?} extents cover the file"
+            );
+            for extent in &extents {
+                assert_eq!(extent.kind, ExtentKind::Regular, "{policy:?} {extent:?}");
+                assert_eq!(extent.compression, algorithm, "{policy:?} {extent:?}");
             }
             assert_eq!(
                 snapshot.superblock().incompat_flags() & (1 << 3 | 1 << 4),

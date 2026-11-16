@@ -77,6 +77,32 @@ impl Snapshot {
     }
 }
 
+/// How a file extent item stores its range.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentKind {
+    /// The bytes are in the item itself.
+    Inline,
+    /// The bytes are in a data extent (a `disk_bytenr` of zero is a hole).
+    Regular,
+    /// Preallocated, never written.
+    Prealloc,
+}
+
+/// One file extent item, as returned by [`Filesystem::file_extents`]: a test
+/// inspection API.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtentInfo {
+    /// File offset of the range the item covers.
+    pub offset: u64,
+    /// Length of that range in bytes.
+    pub len: u64,
+    pub kind: ExtentKind,
+    /// The item's compression type; `None` for stored plain.
+    pub compression: Option<crate::Compression>,
+}
+
 /// An inode, as of the commit it was read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inode {
@@ -381,6 +407,23 @@ impl<S: BlockSource> Filesystem<S> {
     pub async fn read(&self, file: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         file.expect_kind(FileKind::Regular)?;
         self.read_range(file, offset, buf).await
+    }
+
+    /// The file extents of `file`, in file-offset order, as stored.
+    ///
+    /// A test inspection API: it exposes the on-disk layout (extent kind and
+    /// compression) that reads deliberately hide.
+    #[cfg(feature = "test-support")]
+    pub async fn file_extents(&self, file: &Inode) -> Result<Vec<ExtentInfo>, Error> {
+        file.expect_kind(FileKind::Regular)?;
+        let volume = self.volume.view(&file.snapshot.mapping);
+        crate::data::Reader::new(&volume, &volume, file.snapshot.csum_tree)
+            .extents(crate::data::File {
+                root: file.root,
+                number: file.number,
+                metadata: &file.metadata,
+            })
+            .await
     }
 
     /// Reads the target of symlink `link` into `buf`. Returns the target's

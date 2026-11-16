@@ -83,6 +83,8 @@ pub use error::{
     SuperblockDefect,
 };
 pub use fs::{DirEntry, DirPosition, Filesystem, Inode, MAX_SYMLINK_FOLLOWS};
+#[cfg(feature = "test-support")]
+pub use fs::{ExtentInfo, ExtentKind};
 pub use items::{EntryTarget, Metadata, Timestamp};
 pub use key::Key;
 pub use source::{BlockSink, BlockSource, READ_ALIGNMENT};

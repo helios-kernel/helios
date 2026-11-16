@@ -3,7 +3,7 @@
 
 use crate::compress::decompress;
 use crate::items::{ExtentData, FileExtent, INODE_NODATASUM, Metadata};
-use crate::ondisk::{MAX_COMPRESSED_EXTENT, item_type, objectid};
+use crate::ondisk::{MAX_COMPRESSED_EXTENT, RawFileExtentHead, item_type, objectid, view};
 use crate::source::BlockSource;
 use crate::tree::{Cursor, NodeSource, TreeRoot};
 use crate::volume::Volume;
@@ -40,6 +40,58 @@ impl<'a, S: BlockSource, N: NodeSource> Reader<'a, S, N> {
             checksums,
         }
     }
+    /// Every EXTENT_DATA item of the file, in file-offset order.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn extents(
+        &self,
+        file: File<'_>,
+    ) -> Result<Vec<crate::fs::ExtentInfo>, Error> {
+        use crate::fs::{ExtentInfo, ExtentKind};
+        let mut cursor = Cursor::floor(
+            self.nodes,
+            file.root,
+            Key::new(file.number, item_type::EXTENT_DATA, 0),
+        )
+        .await?;
+        let mut found = Vec::new();
+        while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
+            if key < Key::new(file.number, item_type::EXTENT_DATA, 0) {
+                cursor.advance(self.nodes).await?;
+                continue;
+            }
+            if !key.is(file.number, item_type::EXTENT_DATA) {
+                break;
+            }
+            let extent = FileExtent::parse(key, item, self.volume.superblock().sectorsize())
+                .map_err(|defect| Error::Item {
+                    tree: file.root.tree,
+                    key,
+                    defect,
+                })?;
+            // `parse` validated the head, so the view and the codes are valid.
+            let head: &RawFileExtentHead = view(item).expect("validated file extent head");
+            let kind = match head.extent_type {
+                0 => ExtentKind::Inline,
+                1 => ExtentKind::Regular,
+                _ => ExtentKind::Prealloc,
+            };
+            let compression = match head.compression {
+                0 => None,
+                1 => Some(crate::Compression::Zlib),
+                2 => Some(crate::Compression::Lzo),
+                _ => Some(crate::Compression::Zstd),
+            };
+            found.push(ExtentInfo {
+                offset: extent.start,
+                len: extent.end - extent.start,
+                kind,
+                compression,
+            });
+            cursor.advance(self.nodes).await?;
+        }
+        Ok(found)
+    }
+
     /// The file bytes at `offset`, through the inode's extents.
     pub(crate) async fn read(
         &self,
