@@ -4,10 +4,14 @@
 use alloc::sync::Arc;
 use zerocopy::{FromZeros, IntoBytes};
 
-use crate::ondisk::{RawRootBackup, RawSuperblock, SUPERBLOCK_BYTES, objectid, view};
+use crate::ondisk::{
+    RawKey, RawRootBackup, RawSuperblock, SUPERBLOCK_BYTES, SYS_CHUNK_ARRAY_BYTES, objectid, view,
+};
 use crate::roots::Roots;
+use crate::transaction::chunks::ChunkError;
+use crate::tree::TreeRoot;
 use crate::tree::write::WriteError;
-use crate::{ChecksumType, Compression};
+use crate::{ChecksumType, Compression, Key};
 
 #[derive(Clone)]
 pub(crate) struct CommitImage {
@@ -38,8 +42,52 @@ impl CommitImage {
             .copy_from_slice(raw.as_bytes());
     }
 
-    pub(crate) fn prepare(&mut self, roots: &Roots, used: u64) -> Result<(), WriteError> {
+    /// Records `bytes` more allocated on the device in the superblock's
+    /// embedded device item, which the chunk tree's device item mirrors.
+    pub(crate) fn add_device_used(&mut self, bytes: u64) {
         let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
+        raw.dev_item
+            .bytes_used
+            .set(raw.dev_item.bytes_used.get() + bytes);
+        Arc::make_mut(&mut self.bytes)[..size_of::<RawSuperblock>()]
+            .copy_from_slice(raw.as_bytes());
+    }
+
+    /// Appends a SYSTEM chunk to the bootstrap array the superblock carries,
+    /// as Linux's `btrfs_add_system_chunk`: the key, then the chunk item.
+    pub(crate) fn append_system_chunk(&mut self, key: Key, chunk: &[u8]) -> Result<(), ChunkError> {
+        let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
+        let used = raw.sys_chunk_array_size.get() as usize;
+        let needed = size_of::<RawKey>() + chunk.len();
+        if used + needed > SYS_CHUNK_ARRAY_BYTES {
+            return Err(ChunkError::SystemArrayFull {
+                used,
+                needed,
+                capacity: SYS_CHUNK_ARRAY_BYTES,
+            });
+        }
+        let mut raw_key = RawKey::new_zeroed();
+        raw_key.objectid.set(key.objectid);
+        raw_key.item_type = key.item_type;
+        raw_key.offset.set(key.offset);
+        raw.sys_chunk_array[used..used + size_of::<RawKey>()].copy_from_slice(raw_key.as_bytes());
+        raw.sys_chunk_array[used + size_of::<RawKey>()..used + needed].copy_from_slice(chunk);
+        raw.sys_chunk_array_size.set((used + needed) as u32);
+        Arc::make_mut(&mut self.bytes)[..size_of::<RawSuperblock>()]
+            .copy_from_slice(raw.as_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn prepare(
+        &mut self,
+        roots: &Roots,
+        chunk_root: TreeRoot,
+        used: u64,
+    ) -> Result<(), WriteError> {
+        let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
+        raw.chunk_root.set(chunk_root.bytenr);
+        raw.chunk_root_level = chunk_root.level;
+        raw.chunk_root_generation.set(chunk_root.generation);
         let extent = roots.get(objectid::EXTENT_TREE)?;
         let fs = roots.get(objectid::FS_TREE)?;
         let device = roots.get(objectid::DEV_TREE)?;

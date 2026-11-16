@@ -62,10 +62,11 @@ impl Snapshot {
     pub(crate) fn advance(
         &self,
         superblock: Superblock,
+        chunks: Arc<ChunkMap>,
         roots: &crate::roots::Roots,
     ) -> Result<Arc<Self>, crate::tree::write::WriteError> {
         Ok(Arc::new(Self {
-            mapping: self.mapping.advance(superblock),
+            mapping: Mapping::advance(superblock, chunks),
             root_tree: roots.root,
             csum_tree: roots.get(objectid::CSUM_TREE)?,
             default_subvolume: RootRecord {

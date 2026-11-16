@@ -133,6 +133,8 @@ pub enum WriteError {
     MissingExtent { address: u64, level: u8 },
     #[error("no metadata space remains for tree {tree}")]
     NoSpace { tree: u64 },
+    #[error(transparent)]
+    Chunk(#[from] crate::transaction::chunks::ChunkError),
     #[error("tree {tree} cannot grow beyond {MAX_LEVEL} levels")]
     Height { tree: u64 },
 }

@@ -54,6 +54,9 @@ pub(crate) mod objectid {
     pub(crate) const FIRST_FREE: u64 = 256;
     pub(crate) const LAST_FREE: u64 = -256_i64 as u64;
     pub(crate) const FIRST_CHUNK_TREE: u64 = 256;
+    /// `BTRFS_DEV_ITEMS_OBJECTID`: the chunk tree's device items.
+    #[cfg(feature = "write")]
+    pub(crate) const DEV_ITEMS: u64 = 1;
     pub(crate) const EXTENT_CSUM: u64 = -10_i64 as u64;
 }
 
@@ -90,6 +93,10 @@ pub(crate) mod item_type {
     pub(crate) const FREE_SPACE_EXTENT: u8 = 199;
     #[cfg(feature = "write")]
     pub(crate) const FREE_SPACE_BITMAP: u8 = 200;
+    #[cfg(feature = "write")]
+    pub(crate) const DEV_EXTENT: u8 = 204;
+    #[cfg(feature = "write")]
+    pub(crate) const DEV_ITEM: u8 = 216;
     pub(crate) const CHUNK_ITEM: u8 = 228;
     #[cfg(feature = "write")]
     pub(crate) const UUID_SUBVOL: u8 = 251;
@@ -230,7 +237,7 @@ pub(crate) struct RawKeyPtr {
 }
 
 /// `btrfs_chunk`, without its trailing stripes.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawChunk {
     pub(crate) length: U64,
@@ -245,7 +252,7 @@ pub(crate) struct RawChunk {
 }
 
 /// `btrfs_stripe`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawStripe {
     pub(crate) devid: U64,

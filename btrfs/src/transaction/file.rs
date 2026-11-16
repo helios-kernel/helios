@@ -16,6 +16,7 @@ use crate::ondisk::{
     RawTimespec, item_type, view,
 };
 use crate::source::BlockSink;
+use crate::space::{DATA, SpaceError};
 use crate::tree::write::WriteError;
 use crate::{Compression, Error, FileKind, Key, Timestamp};
 
@@ -106,10 +107,10 @@ impl<S: BlockSink> Transaction<'_, S> {
         if data.is_empty() {
             return Ok(0);
         }
-        let end = offset
+        let mut end = offset
             .checked_add(data.len() as u64)
             .ok_or(WriteError::FileOverflow)?;
-        let size = metadata.size.max(end);
+        let mut size = metadata.size.max(end);
         let sector = u64::from(self.volume.superblock().sectorsize());
         let rounded_end = aligned_end(end, sector)?;
         let first_key = Key::new(inode, item_type::EXTENT_DATA, 0);
@@ -190,7 +191,25 @@ impl<S: BlockSink> Transaction<'_, S> {
             }
             let mut position = start;
             while position < rounded_end {
-                let length = (rounded_end - position).min(MAX_COMPRESSED_EXTENT);
+                // A window the free ranges cannot hold shrinks to the largest
+                // range there is; each pass writes at least one sector.
+                let length = match self
+                    .fit_data_window((rounded_end - position).min(MAX_COMPRESSED_EXTENT))
+                    .await
+                {
+                    Ok(length) => length,
+                    // Out of space after the first window: a short write, as
+                    // write(2) reports it. Only a write that stores nothing
+                    // fails.
+                    Err(WriteError::Space(SpaceError::Exhausted { flags: DATA, .. }))
+                        if position > offset =>
+                    {
+                        end = position;
+                        size = metadata.size.max(end);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let mut window = vec![0; length as usize];
                 self.read_file(tree, inode, position, &mut window).await?;
                 let from = offset.max(position);
@@ -210,7 +229,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         }
         raw.size.set(size);
         self.store_file_inode(tree, inode, raw, when).await?;
-        Ok(data.len())
+        Ok((end - offset) as usize)
     }
 
     pub(crate) async fn truncate_file(
@@ -475,6 +494,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         let removed = self
             .remove_regular_range(tree, inode, offset..offset + length)
             .await?;
+        self.ensure_data(stored.len() as u64).await?;
         let allocation = self
             .accounting
             .stage_data(

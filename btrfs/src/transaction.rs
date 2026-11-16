@@ -1,6 +1,7 @@
 //! A single-owner transaction. Its owner serializes writers and retains the
 //! mounted generation's reader pins; this module never reuses retired extents.
 
+pub(crate) mod chunks;
 mod extents;
 pub(crate) mod file;
 pub(crate) mod namespace;
@@ -20,8 +21,9 @@ use crate::retirement::Retirements;
 use crate::roots::Roots;
 use crate::source::{BlockSink, PendingWrites, READ_ALIGNMENT};
 use crate::space::Space;
+use crate::tree::TreeRoot;
 use crate::tree::write::{Trees, WriteError};
-use crate::volume::Volume;
+use crate::volume::{Mapping, Volume};
 use crate::{EntryTarget, Metadata};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -43,6 +45,8 @@ pub(crate) struct Transaction<'a, S> {
     volume: Volume<S>,
     image: CommitImage,
     pub(crate) roots: Roots,
+    /// The chunk tree's root. The superblock, not the root tree, records it.
+    chunk_root: TreeRoot,
     pub(crate) trees: Trees,
     pub(crate) space: Space,
     pub(crate) accounting: Accounting,
@@ -54,6 +58,8 @@ pub(crate) struct Transaction<'a, S> {
 pub(crate) struct Checkpoint {
     image: CommitImage,
     roots: Roots,
+    chunk_root: TreeRoot,
+    mapping: Arc<Mapping>,
     trees: Trees,
     space: Space,
     accounting: Accounting,
@@ -64,6 +70,8 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         let saved = Checkpoint {
             image: self.image.clone(),
             roots: self.roots.clone(),
+            chunk_root: self.chunk_root,
+            mapping: self.volume.mapping(),
             trees: self.trees.clone(),
             space: self.space.clone(),
             accounting: self.accounting.clone(),
@@ -75,6 +83,8 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
     pub(crate) fn restore(&mut self, saved: Checkpoint) {
         self.image = saved.image;
         self.roots = saved.roots;
+        self.chunk_root = saved.chunk_root;
+        self.volume.install(saved.mapping);
         self.trees = saved.trees;
         self.space = saved.space;
         self.accounting = saved.accounting;
@@ -164,6 +174,7 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
             free,
         );
         let trees = Trees::new(generation, volume.superblock().csum_type());
+        let chunk = volume.superblock().chunk_tree();
         Ok(Self {
             generation: pin,
             inode_high_water: BTreeMap::new(),
@@ -171,6 +182,12 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
             volume,
             image,
             roots,
+            chunk_root: TreeRoot {
+                tree: objectid::CHUNK_TREE,
+                bytenr: chunk.bytenr,
+                level: chunk.level,
+                generation: chunk.generation,
+            },
             space,
             accounting,
             trees,
@@ -185,6 +202,10 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         concurrency: NonZeroUsize,
         publishing: impl FnOnce(),
     ) -> Result<Committed, WriteError> {
+        // A metadata chunk the commit may need exists before it starts.
+        if self.trees.blocks().next().is_some() {
+            self.grow_metadata().await?;
+        }
         loop {
             self.accounting
                 .sync_allocations(&self.volume, &mut self.trees, &mut self.space)
@@ -210,12 +231,17 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
             });
         }
         let allocation = self.accounting.committed(&self.space)?;
-        self.image
-            .prepare(&self.roots, self.accounting.bytes_used(&self.space)?)?;
+        self.image.prepare(
+            &self.roots,
+            self.chunk_root,
+            self.accounting.bytes_used(&self.space)?,
+        )?;
         let superblock = self
             .image
             .superblock(self.volume.superblock().csum_type())?;
-        let snapshot = self.generation.advance(superblock, &self.roots)?;
+        let snapshot =
+            self.generation
+                .advance(superblock, self.volume.shared_chunks(), &self.roots)?;
         // Register before the first await that can publish the new generation.
         // Cancellation or a failed mirror write must not lose these pins.
         self.retirements

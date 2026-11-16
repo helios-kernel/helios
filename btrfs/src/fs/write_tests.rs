@@ -5,6 +5,8 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(feature = "write")]
+use core::num::NonZeroUsize;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
@@ -3370,6 +3372,615 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
     }
 }
 
+/// What a device layout looks like on disk, read back through a fresh mount.
+#[cfg(feature = "write")]
+struct Layout {
+    /// Each chunk's logical start, length and type, from the chunk tree.
+    chunks: Vec<(u64, u64, u64)>,
+    /// Each chunk's physical copies.
+    copies: BTreeMap<u64, Vec<u64>>,
+    /// Bytes in the bootstrap chunk array.
+    sys_chunk_array: usize,
+    /// Logical starts of the chunks the bootstrap array carries.
+    bootstrap: Vec<u64>,
+}
+
+/// Asserts that the chunk tree, the dev tree, both device items, the
+/// bootstrap chunk array and the block-group items describe one consistent
+/// device, as a fresh mount reads them, and returns what they describe.
+#[cfg(feature = "write")]
+async fn assert_device_layout(image: &File) -> Layout {
+    use crate::ondisk::{
+        RawChunk, RawDevItem, RawKey, RawStripe, RawSuperblock, SYS_CHUNK_ARRAY_OFFSET, item_type,
+        objectid, view,
+    };
+    use crate::tree::Cursor;
+
+    let fs = Filesystem::mount(Disk(image.try_clone().unwrap()))
+        .await
+        .unwrap();
+    let device_bytes = fs.superblock().device_bytes();
+    let devid = fs.superblock().devid();
+    let selected = crate::superblock::select(&Disk(image.try_clone().unwrap()))
+        .await
+        .unwrap();
+    let raw: RawSuperblock = *view(&selected.bytes[..]).unwrap();
+
+    let chunk_pointer = fs.superblock().chunk_tree();
+    let chunk_root = TreeRoot {
+        tree: objectid::CHUNK_TREE,
+        bytenr: chunk_pointer.bytenr,
+        level: chunk_pointer.level,
+        generation: chunk_pointer.generation,
+    };
+    let dev_key = Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, devid);
+    let cursor = Cursor::ceiling(&fs.volume, chunk_root, dev_key)
+        .await
+        .unwrap();
+    assert_eq!(cursor.key(), Some(dev_key));
+    let dev: RawDevItem = *view(cursor.item().unwrap()).unwrap();
+
+    let mut chunks = vec![];
+    let mut copies = BTreeMap::new();
+    let mut stripes = vec![];
+    let mut cursor = Cursor::ceiling(
+        &fs.volume,
+        chunk_root,
+        Key::new(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM, 0),
+    )
+    .await
+    .unwrap();
+    while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
+        if !key.is(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM) {
+            break;
+        }
+        let chunk: &RawChunk = view(item).unwrap();
+        chunks.push((key.offset, chunk.length.get(), chunk.chunk_type.get()));
+        let mut physical = vec![];
+        for stripe in item[size_of::<RawChunk>()..].chunks(size_of::<RawStripe>()) {
+            let stripe: &RawStripe = view(stripe).unwrap();
+            assert_eq!(stripe.devid.get(), devid);
+            assert_eq!(stripe.dev_uuid, dev.uuid, "stripe names the device's UUID");
+            physical.push(stripe.offset.get());
+            stripes.push((stripe.offset.get(), chunk.length.get(), key.offset));
+        }
+        assert_eq!(usize::from(chunk.num_stripes.get()), physical.len());
+        copies.insert(key.offset, physical);
+        cursor.advance(&fs.volume).await.unwrap();
+    }
+
+    let dev_root = super::find_root(&fs.volume, fs.snapshot.root_tree, objectid::DEV_TREE)
+        .await
+        .unwrap()
+        .root;
+    let mut extents = vec![];
+    let mut cursor = Cursor::ceiling(
+        &fs.volume,
+        dev_root,
+        Key::new(devid, item_type::DEV_EXTENT, 0),
+    )
+    .await
+    .unwrap();
+    while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
+        if !key.is(devid, item_type::DEV_EXTENT) {
+            break;
+        }
+        let word = |at: usize| u64::from_le_bytes(item[at..at + 8].try_into().unwrap());
+        assert_eq!(word(0), objectid::CHUNK_TREE);
+        assert_eq!(word(8), objectid::FIRST_CHUNK_TREE);
+        extents.push((key.offset, word(24), word(16)));
+        cursor.advance(&fs.volume).await.unwrap();
+    }
+    // Every copy of every chunk has its device extent, and nothing else does.
+    stripes.sort_unstable();
+    assert_eq!(extents, stripes);
+    let mut end = 1 << 20;
+    for &(start, length, _) in &extents {
+        assert!(
+            start >= end,
+            "device extents overlap or sit in the first MiB"
+        );
+        end = start + length;
+    }
+    assert!(end <= device_bytes);
+    let allocated: u64 = extents.iter().map(|&(_, length, _)| length).sum();
+    assert_eq!(dev.bytes_used.get(), allocated, "chunk-tree device item");
+    assert_eq!(
+        raw.dev_item.bytes_used.get(),
+        allocated,
+        "superblock device item"
+    );
+
+    let array_length = raw.sys_chunk_array_size.get() as usize;
+    let array = &selected.bytes[SYS_CHUNK_ARRAY_OFFSET..][..array_length];
+    let mut bootstrap = vec![];
+    let mut at = 0;
+    while at < array.len() {
+        let key: &RawKey = view(&array[at..]).unwrap();
+        assert_eq!(key.objectid.get(), objectid::FIRST_CHUNK_TREE);
+        assert_eq!(key.item_type, item_type::CHUNK_ITEM);
+        let chunk: &RawChunk = view(&array[at + size_of::<RawKey>()..]).unwrap();
+        bootstrap.push(key.offset.get());
+        at += size_of::<RawKey>()
+            + size_of::<RawChunk>()
+            + usize::from(chunk.num_stripes.get()) * size_of::<RawStripe>();
+    }
+    assert_eq!(at, array.len());
+    let system: Vec<u64> = chunks
+        .iter()
+        .filter(|&&(_, _, flags)| flags & 2 != 0)
+        .map(|&(logical, ..)| logical)
+        .collect();
+    assert_eq!(
+        bootstrap, system,
+        "bootstrap array carries every SYSTEM chunk"
+    );
+
+    assert_eq!(
+        allocation_of(&fs).await.space.group_summary(),
+        chunks,
+        "block-group items match the chunk tree"
+    );
+    Layout {
+        chunks,
+        copies,
+        sys_chunk_array: array_length,
+        bootstrap,
+    }
+}
+
+#[cfg(feature = "write")]
+fn count_kind(layout: &Layout, kind: u64) -> usize {
+    layout
+        .chunks
+        .iter()
+        .filter(|&&(_, _, flags)| flags & kind != 0)
+        .count()
+}
+
+#[cfg(feature = "write")]
+fn profile_image(
+    metadata: ferrosys::btrfs::Profile,
+    data: ferrosys::btrfs::Profile,
+) -> (Filesystem<Disk>, File) {
+    let timestamp = Timestamp::from_secs(1_700_000_000);
+    let mut options = FormatOptions::new([0x53; 16], timestamp);
+    options.chunk_tree_uuid = [0x71; 16];
+    options.device_uuid = [0x29; 16];
+    options.plan.metadata_profile = metadata;
+    options.plan.data_profile = data;
+    filesystem_image_options(
+        TreeBuilder::new().root(Metadata::new(0o755, timestamp)),
+        tempfile::tempfile().unwrap(),
+        options,
+    )
+}
+
+#[cfg(feature = "write")]
+const DIRECTORY: &str = "大容量-大容量-대용량";
+
+#[cfg(feature = "write")]
+#[test]
+fn data_chunks_are_allocated_after_the_mkfs_group_fills() {
+    use super::writer::{Attributes, Name, Writer};
+    use ferrosys::btrfs::Profile;
+
+    // Single data, and DUP data, whose chunks keep two identical copies.
+    for data in [Profile::Single, Profile::Dup] {
+        block_on(async {
+            let (_, image) = profile_image(Profile::Dup, data);
+            let before = assert_device_layout(&image).await;
+            let mut writer = Writer::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            let concurrency = NonZeroUsize::MIN;
+            let when = crate::Timestamp {
+                seconds: 1_700_000_100,
+                nanoseconds: 0,
+            };
+            let attributes = Attributes {
+                permissions: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            // Several times the one data group a fresh image has.
+            const MIB: usize = 1 << 20;
+            let data_bytes: u64 = before
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.2 & 1 != 0)
+                .map(|chunk| chunk.1)
+                .sum();
+            let pieces = (data_bytes as usize / MIB) + 8;
+            let content: Vec<u8> = (0..pieces)
+                .flat_map(|seed| noise(MIB, seed as u8))
+                .collect();
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let file = tx
+                .create_file(
+                    Name {
+                        parent: &root,
+                        bytes: DIRECTORY.as_bytes(),
+                    },
+                    attributes,
+                    when,
+                )
+                .await
+                .unwrap();
+            for (index, piece) in content.chunks(MIB).enumerate() {
+                let written = tx
+                    .write_file(
+                        &file,
+                        (index * MIB) as u64,
+                        piece,
+                        WriteOptions::plain(when, concurrency),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(written, MIB);
+            }
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+
+            let after = assert_device_layout(&image).await;
+            assert!(
+                count_kind(&after, 1) > count_kind(&before, 1),
+                "a data chunk was allocated"
+            );
+            assert_eq!(count_kind(&after, 4), count_kind(&before, 4));
+            // The carried state still equals a reload.
+            let fresh = Filesystem::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            assert!(*writer.committed_allocation() == allocation_of(&fresh).await);
+
+            // The data reads back through the committed view and a fresh mount.
+            let committed = writer.snapshot().unwrap();
+            let inode = committed
+                .resolve(alloc::format!("/{DIRECTORY}").as_bytes())
+                .await
+                .unwrap();
+            let mut output = vec![0; content.len()];
+            assert_eq!(
+                committed.read(&inode, 0, &mut output).await.unwrap(),
+                content.len()
+            );
+            assert!(
+                output == content,
+                "committed view survives chunk allocation"
+            );
+            let inode = fresh
+                .resolve(alloc::format!("/{DIRECTORY}").as_bytes())
+                .await
+                .unwrap();
+            let mut output = vec![0; content.len()];
+            assert_eq!(
+                fresh.read(&inode, 0, &mut output).await.unwrap(),
+                content.len()
+            );
+            assert!(output == content, "fresh mount survives chunk allocation");
+
+            // DUP chunks hold two identical copies of every byte.
+            let fs = Filesystem::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            for (&logical, physical) in &after.copies {
+                let &(_, length, flags) = after
+                    .chunks
+                    .iter()
+                    .find(|&&(start, ..)| start == logical)
+                    .unwrap();
+                assert_eq!(physical.len(), if flags & (1 << 5) != 0 { 2 } else { 1 });
+                assert_eq!(
+                    fs.volume.chunks().map(logical, length).unwrap().as_slice(),
+                    physical
+                );
+                if let [first, second] = physical[..] {
+                    let (mut a, mut b) = (vec![0; length as usize], vec![0; length as usize]);
+                    image.read_exact_at(&mut a, first).unwrap();
+                    image.read_exact_at(&mut b, second).unwrap();
+                    // The superblock mirror at 64 MiB is each device's own
+                    // block, never a chunk copy, wherever a chunk spans it.
+                    let mirror = 64_u64 << 20;
+                    let at = a.iter().zip(&b).enumerate().position(|(index, (x, y))| {
+                        let spans = |start: u64| {
+                            (mirror..mirror + (64 << 10)).contains(&(start + index as u64))
+                        };
+                        x != y && !spans(first) && !spans(second)
+                    });
+                    assert!(
+                        at.is_none(),
+                        "chunk {logical:#x} (flags {flags:#x}, length {length:#x}, copies {first:#x} {second:#x}) differs at {at:?}"
+                    );
+                }
+            }
+        });
+    }
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn a_system_chunk_lands_in_the_bootstrap_array_and_survives_remount() {
+    use super::writer::{Attributes, Name, Writer};
+    use crate::space::SYSTEM;
+    use ferrosys::btrfs::Profile;
+
+    for metadata in [Profile::Dup, Profile::Single] {
+        block_on(async {
+            let (_, image) = profile_image(metadata, Profile::Single);
+            let before = assert_device_layout(&image).await;
+            let mut writer = Writer::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            let concurrency = NonZeroUsize::MIN;
+            let mut tx = writer.begin().await.unwrap();
+            tx.edits().allocate_chunk(SYSTEM).await.unwrap();
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+
+            let after = assert_device_layout(&image).await;
+            assert_eq!(count_kind(&after, 2), count_kind(&before, 2) + 1);
+            assert_eq!(after.bootstrap.len(), before.bootstrap.len() + 1);
+            let &(logical, _, flags) = after.chunks.last().unwrap();
+            // A key, a chunk item and one stripe per copy.
+            let copies = if flags & (1 << 5) != 0 { 2 } else { 1 };
+            assert_eq!(copies, after.copies[&logical].len());
+            assert_eq!(
+                after.sys_chunk_array,
+                before.sys_chunk_array + 17 + 48 + 32 * copies
+            );
+            assert_eq!(flags & 7, SYSTEM);
+            // The new chunk keeps the profile the system group already had.
+            let &(_, _, old) = before
+                .chunks
+                .iter()
+                .rfind(|chunk| chunk.2 & 2 != 0)
+                .unwrap();
+            assert_eq!(flags, old);
+
+            // A fresh mount reads the grown array, and the new chunk takes
+            // chunk-tree blocks and carries on writing.
+            let mut writer = Writer::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            let when = crate::Timestamp {
+                seconds: 1_700_000_200,
+                nanoseconds: 0,
+            };
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            tx.create_file(
+                Name {
+                    parent: &root,
+                    bytes: "書き込み-写入-쓰기".as_bytes(),
+                },
+                Attributes {
+                    permissions: 0o600,
+                    uid: 0,
+                    gid: 0,
+                },
+                when,
+            )
+            .await
+            .unwrap();
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+            assert_device_layout(&image).await;
+        });
+    }
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn metadata_chunks_keep_their_profile_and_arrive_before_the_group_runs_short() {
+    use super::writer::Writer;
+    use crate::space::METADATA;
+    use ferrosys::btrfs::Profile;
+
+    for profile in [Profile::Dup, Profile::Single] {
+        block_on(async {
+            let (_, image) = profile_image(profile, Profile::Single);
+            let before = assert_device_layout(&image).await;
+            let mut writer = Writer::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            let mut tx = writer.begin().await.unwrap();
+            let transaction = tx.edits();
+            transaction.prepare_mutation().await.unwrap();
+            assert_eq!(
+                transaction.space.group_summary().len(),
+                before.chunks.len(),
+                "a nearly empty metadata group needs no new chunk"
+            );
+            // Reserve tree blocks until the 80% rule asks for another chunk.
+            let (total, _) = transaction.space.totals(METADATA);
+            let mut key = 0;
+            while {
+                let (total, free) = transaction.space.totals(METADATA);
+                (total - free) + (2 << 20) < total / 100 * 80
+            } {
+                key += 1;
+                transaction
+                    .space
+                    .allocate(crate::ondisk::objectid::FS_TREE, 0, Key::new(key, 1, 0))
+                    .unwrap();
+            }
+            transaction.prepare_mutation().await.unwrap();
+            let groups = transaction.space.group_summary();
+            assert_eq!(groups.len(), before.chunks.len() + 1);
+            let &(_, length, flags) = groups.last().unwrap();
+            assert_eq!(flags & 7, METADATA);
+            assert_eq!(flags & (1 << 5) != 0, profile == Profile::Dup);
+            assert!(length <= total.max(256 << 20));
+            // The grown group serves the next reservations.
+            assert!(transaction.space.totals(METADATA).1 > 2 << 20);
+        });
+    }
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sector() {
+    use super::writer::{Attributes, Name, Writer};
+    use crate::space::{DATA, SpaceError};
+    use ferrosys::btrfs::Profile;
+
+    block_on(async {
+        let (_, image) = profile_image(Profile::Dup, Profile::Single);
+        let mut writer = Writer::mount(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        let concurrency = NonZeroUsize::MIN;
+        let when = crate::Timestamp {
+            seconds: 1_700_000_100,
+            nanoseconds: 0,
+        };
+        let attributes = Attributes {
+            permissions: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        const PIECE: usize = 64 << 10;
+        let mut tx = writer.begin().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let kept = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "保存-保存-보존".as_bytes(),
+                },
+                attributes,
+                when,
+            )
+            .await
+            .unwrap();
+        let freed = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "解放-解放-해제".as_bytes(),
+                },
+                attributes,
+                when,
+            )
+            .await
+            .unwrap();
+        // Alternate 64 KiB pieces of two files until the device has nothing
+        // left for either: the data groups fill, chunks follow, and the last
+        // chunk shrinks to the hole that is left.
+        let mut offset = 0;
+        let mut kept_content = vec![];
+        'fill: for index in 0_u32.. {
+            for file in [&kept, &freed] {
+                let piece = noise(PIECE, index as u8);
+                match tx
+                    .write_file(file, offset, &piece, WriteOptions::plain(when, concurrency))
+                    .await
+                {
+                    Ok(PIECE) => {
+                        if std::ptr::eq(file, &kept) {
+                            kept_content.extend_from_slice(&piece);
+                        }
+                    }
+                    Ok(_) | Err(WriteError::Space(SpaceError::Exhausted { .. })) => break 'fill,
+                    Err(error) => panic!("unexpected write failure: {error}"),
+                }
+            }
+            offset += PIECE as u64;
+        }
+        assert!(tx.edits().space.largest_free(DATA) < PIECE as u64);
+        // Free every second piece: the free ranges are now 64 KiB holes and
+        // the device has no room for another chunk.
+        tx.truncate_file(&freed, 0, when, concurrency)
+            .await
+            .unwrap();
+        assert_eq!(tx.edits().space.largest_free(DATA), PIECE as u64);
+        let holes = tx.edits().space.totals(DATA).1 / PIECE as u64;
+        assert!(holes > 100, "the test needs many holes, has {holes}");
+
+        // A 128 KiB write exceeds every range, so each window shrinks to one
+        // hole and the write still succeeds.
+        let large = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "断片-断片-단편".as_bytes(),
+                },
+                attributes,
+                when,
+            )
+            .await
+            .unwrap();
+        let mut large_content = vec![];
+        let mut stored = 0;
+        let remainder = loop {
+            let piece = noise(2 * PIECE, (large_content.len() / PIECE / 2) as u8);
+            let written = tx
+                .write_file(
+                    &large,
+                    stored,
+                    &piece,
+                    WriteOptions::plain(when, concurrency),
+                )
+                .await
+                .unwrap_or(0);
+            large_content.extend_from_slice(&piece[..written]);
+            stored += written as u64;
+            if written < piece.len() {
+                break written;
+            }
+        };
+        // The device ended it with a short write, a prefix of a piece, or with
+        // none left; both leave no free sector to report.
+        assert!(remainder < 2 * PIECE);
+        assert!(large_content.len() >= 2 * PIECE * 10);
+        assert!(tx.edits().space.largest_free(DATA) < 4096);
+        let refused = tx
+            .write_file(
+                &large,
+                stored,
+                &[0x5a; 4096],
+                WriteOptions::plain(when, concurrency),
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(WriteError::Space(SpaceError::Exhausted { flags: DATA, .. }))
+            ),
+            "{refused:?}"
+        );
+        tx.commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+
+        assert_device_layout(&image).await;
+        let fresh = Filesystem::mount(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        assert!(*writer.committed_allocation() == allocation_of(&fresh).await);
+        for (name, expected) in [
+            ("保存-保存-보존", &kept_content),
+            ("断片-断片-단편", &large_content),
+        ] {
+            let inode = fresh
+                .resolve(alloc::format!("/{name}").as_bytes())
+                .await
+                .unwrap();
+            let mut output = vec![0; expected.len()];
+            assert_eq!(
+                fresh.read(&inode, 0, &mut output).await.unwrap(),
+                expected.len()
+            );
+            assert!(&output == expected, "{name}");
+        }
+    });
+}
+
 #[cfg(feature = "write")]
 #[test]
 fn empty_transaction_does_not_publish() {
@@ -3480,7 +4091,12 @@ fn filesystem_image_options(
     options: FormatOptions,
 ) -> (Filesystem<Disk>, File) {
     // ferrosys' default single-device geometry needs at least 109 MiB.
-    let size = 128 << 20;
+    // DUP data, which mkfs lays out twice, needs 240123904 bytes.
+    let size = if options.plan.data_profile == ferrosys::btrfs::Profile::Dup {
+        512 << 20
+    } else {
+        128 << 20
+    };
     file.set_len(size).unwrap();
     format_to(&mut file, tree, size, options).unwrap();
     let reference = file.try_clone().unwrap();

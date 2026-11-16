@@ -434,17 +434,34 @@ impl Accounting {
             }
             if u64::from_le_bytes(bytes[..8].try_into().unwrap()) != used {
                 bytes[..8].copy_from_slice(&used.to_le_bytes());
-                let root = trees.apply(volume, root, key, Some(&bytes), space).await?;
-                if root.tree == objectid::EXTENT_TREE {
-                    self.root = root;
-                } else {
-                    self.groups = root;
-                }
+                self.set_group_item(volume, trees, space, key, Some(&bytes))
+                    .await?;
                 changed = true;
             }
             self.group_used.insert_mut(key, used);
         }
         Ok(changed)
+    }
+
+    /// Insert, replace or delete a block-group item in whichever tree holds
+    /// them, the extent tree or the block-group tree.
+    pub(crate) async fn set_group_item<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        key: Key,
+        value: Option<&[u8]>,
+    ) -> Result<(), WriteError> {
+        let root = trees
+            .apply(volume, self.group_root(), key, value, space)
+            .await?;
+        if root.tree == objectid::EXTENT_TREE {
+            self.root = root;
+        } else {
+            self.groups = root;
+        }
+        Ok(())
     }
 
     /// Read the current extent record, including earlier reference edits.

@@ -21,9 +21,9 @@ use crate::volume::Volume;
 use crate::{Error, Key};
 
 // BTRFS_BLOCK_GROUP_{DATA,SYSTEM,METADATA}, from btrfs_tree.h.
-const DATA: u64 = 1;
-const SYSTEM: u64 = 2;
-const METADATA: u64 = 4;
+pub(crate) const DATA: u64 = 1;
+pub(crate) const SYSTEM: u64 = 2;
+pub(crate) const METADATA: u64 = 4;
 // BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE, from btrfs.h.
 const BLOCK_GROUP_TREE: u64 = 1 << 3;
 
@@ -398,6 +398,80 @@ impl Space {
         })
     }
 
+    /// Whether some block group with a `kind` bit has a free range of `length`.
+    pub(crate) fn can_reserve(&self, length: u64, kind: u64) -> bool {
+        self.largest_free(kind) >= length
+    }
+
+    /// The largest free range in any block group with a `kind` bit.
+    pub(crate) fn largest_free(&self, kind: u64) -> u64 {
+        self.groups
+            .iter()
+            .filter(|group| group.flags & kind != 0)
+            .flat_map(|group| group.free.iter())
+            .map(|range| range.end - range.start)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Total and allocatable bytes of the block groups with a `kind` bit. What
+    /// is not allocatable is used, reserved, pinned for a reader or a
+    /// superblock mirror stripe; Linux's `btrfs_space_info_used` counts all of
+    /// those as used.
+    pub(crate) fn totals(&self, kind: u64) -> (u64, u64) {
+        self.groups
+            .iter()
+            .filter(|group| group.flags & kind != 0)
+            .fold((0, 0), |(total, free), group| {
+                let available: u64 = group.free.iter().map(|range| range.end - range.start).sum();
+                (total + group.length, free + available)
+            })
+    }
+
+    /// The flags of the last block group with a `kind` bit: the profile a new
+    /// chunk of that kind takes, as Linux derives it from the profiles the
+    /// filesystem already has.
+    pub(crate) fn latest_flags(&self, kind: u64) -> Option<u64> {
+        self.groups
+            .iter()
+            .rev()
+            .find(|group| group.flags & kind != 0)
+            .map(|group| group.flags)
+    }
+
+    /// Adds the block group of a chunk this transaction allocated. Its logical
+    /// range is above every existing group, so order is preserved.
+    pub(crate) fn push_group(
+        &mut self,
+        start: u64,
+        length: u64,
+        flags: u64,
+        chunks: &crate::chunk::ChunkMap,
+    ) {
+        let end = start + length;
+        assert!(
+            self.groups
+                .last()
+                .is_none_or(|last| last.start + last.length <= start),
+            "a new block group starts above every existing one"
+        );
+        let mut group = Group {
+            start,
+            length,
+            flags,
+            declared_used: 0,
+            found_used: 0,
+            free: Intervals::whole(start..end),
+            excluded_free: Intervals::default(),
+        };
+        for range in chunks.superblock_stripes() {
+            if range.start < end && start < range.end {
+                group.exclude(&range);
+            }
+        }
+        self.groups.push_back_mut(group);
+    }
+
     pub(crate) fn reserve_data(&mut self, length: u64) -> Result<u64, SpaceError> {
         if length == 0 || !length.is_multiple_of(self.sector) {
             return Err(SpaceError::DataLength {
@@ -521,6 +595,15 @@ impl Space {
         }
         self.release_private(address..address + self.nodesize);
         true
+    }
+
+    /// Every group's start, length and flags, in address order.
+    #[cfg(test)]
+    pub(crate) fn group_summary(&self) -> Vec<(u64, u64, u64)> {
+        self.groups
+            .iter()
+            .map(|group| (group.start, group.length, group.flags))
+            .collect()
     }
 
     #[cfg(test)]

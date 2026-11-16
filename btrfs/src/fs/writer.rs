@@ -275,6 +275,9 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
             .await
     }
 
+    /// Writes `data` at `offset` and returns the bytes stored, as `write(2)`:
+    /// fewer than `data.len()` only when the device ran out of free sectors
+    /// partway, never zero for a nonempty write, which fails instead.
     pub async fn write_file<E: Encoder>(
         &mut self,
         file: &InodeHandle,
@@ -282,7 +285,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         data: &[u8],
         options: WriteOptions<E>,
     ) -> Result<usize, WriteError> {
-        let mut operation = Mutation::new(self);
+        let mut operation = Mutation::new(self).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner.roots.check_writable(file.tree)?;
@@ -301,7 +304,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         when: Timestamp,
         concurrency: NonZeroUsize,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self);
+        let mut operation = Mutation::new(self).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner.roots.check_writable(file.tree)?;
@@ -319,7 +322,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         when: Timestamp,
         concurrency: NonZeroUsize,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self);
+        let mut operation = Mutation::new(self).await?;
         operation.checked(range.source).await?;
         operation.checked(range.destination).await?;
         let range = RawCloneRange {
@@ -348,7 +351,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         modified: Option<Timestamp>,
         changed: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self);
+        let mut operation = Mutation::new(self).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner.roots.check_writable(file.tree)?;
@@ -384,7 +387,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         attributes: RawAttributes,
         when: Timestamp,
     ) -> Result<InodeHandle, WriteError> {
-        let mut operation = Mutation::new(self);
+        let mut operation = Mutation::new(self).await?;
         let name = operation.entry_name(name).await?;
         operation.inner.roots.check_writable(name.tree)?;
         let inode = operation.inner.create_node(name, attributes, when).await?;
@@ -404,7 +407,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         file: &InodeHandle,
         when: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self);
+        let mut operation = Mutation::new(self).await?;
         operation.checked(file).await?;
         let name = operation.entry_name(name).await?;
         if file.tree() != name.tree {
@@ -424,7 +427,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         attributes: Attributes,
         when: Timestamp,
     ) -> Result<InodeHandle, WriteError> {
-        let mut operation = Mutation::new(self);
+        let mut operation = Mutation::new(self).await?;
         let name = operation.entry_name(name).await?;
         operation.inner.roots.check_writable(name.tree)?;
         let inode = operation
@@ -447,7 +450,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         destination: Name<'_>,
         when: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self);
+        let mut operation = Mutation::new(self).await?;
         let source = operation.entry_name(source).await?;
         let destination = operation.entry_name(destination).await?;
         operation.inner.roots.check_writable(source.tree)?;
@@ -458,7 +461,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
     }
 
     pub async fn unlink_name(&mut self, name: Name<'_>, when: Timestamp) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self);
+        let mut operation = Mutation::new(self).await?;
         let name = operation.entry_name(name).await?;
         operation.inner.roots.check_writable(name.tree)?;
         operation.inner.unlink_name(name, when).await?;
@@ -502,9 +505,13 @@ struct Mutation<'op, 'tx, S: BlockSink> {
 }
 
 impl<'op, 'tx, S: BlockSink> Mutation<'op, 'tx, S> {
-    fn new(transaction: &'op mut WriteTransaction<'tx, S>) -> Self {
+    /// Checkpoints the transaction, then makes the space the operation may
+    /// need: a failure here restores the checkpoint like any other.
+    async fn new(transaction: &'op mut WriteTransaction<'tx, S>) -> Result<Self, WriteError> {
         let saved = Some(transaction.inner.checkpoint());
-        Self { transaction, saved }
+        let operation = Self { transaction, saved };
+        operation.transaction.inner.prepare_mutation().await?;
+        Ok(operation)
     }
     fn accept(mut self) {
         self.transaction.inner.space.accept_operation();

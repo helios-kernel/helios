@@ -14,12 +14,12 @@ pub(crate) struct Mapping {
 }
 
 impl Mapping {
+    /// The mapping of the generation a transaction publishes: its superblock
+    /// and the chunks the transaction's own volume holds, including any it
+    /// allocated.
     #[cfg(feature = "write")]
-    pub(crate) fn advance(&self, superblock: Superblock) -> Arc<Self> {
-        Arc::new(Self {
-            superblock,
-            chunks: self.chunks.clone(),
-        })
+    pub(crate) fn advance(superblock: Superblock, chunks: Arc<ChunkMap>) -> Arc<Self> {
+        Arc::new(Self { superblock, chunks })
     }
 }
 
@@ -62,6 +62,27 @@ impl<S: BlockSource> Volume<S> {
     #[cfg(feature = "write")]
     pub(crate) fn install(&mut self, mapping: Arc<Mapping>) {
         self.mapping = mapping;
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn shared_chunks(&self) -> Arc<ChunkMap> {
+        self.mapping.chunks.clone()
+    }
+
+    /// Learn a chunk the transaction allocated. Readers of older generations
+    /// keep the mapping they opened; only this volume sees the new chunk.
+    #[cfg(feature = "write")]
+    pub(crate) fn add_chunk(
+        &mut self,
+        chunk: crate::chunk::Chunk,
+    ) -> Result<(), crate::error::ChunkDefect> {
+        let mut chunks = (*self.mapping.chunks).clone();
+        chunks.insert(chunk)?;
+        self.mapping = Arc::new(Mapping {
+            superblock: self.mapping.superblock.clone(),
+            chunks: Arc::new(chunks),
+        });
+        Ok(())
     }
 
     pub(crate) fn mapping(&self) -> Arc<Mapping> {

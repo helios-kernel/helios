@@ -7,7 +7,7 @@
 use std::fmt::Display;
 
 use fuser::Errno;
-use helios_btrfs::write::{SpaceError, WriteError};
+use helios_btrfs::write::{ChunkError, SpaceError, WriteError};
 use helios_btrfs::{Error, FileKind};
 use tracing::error;
 
@@ -78,6 +78,16 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::DirectoryLink => Errno::EPERM,
         WriteError::FileOverflow => Errno::EFBIG,
         WriteError::NoSpace { .. } => Errno::ENOSPC,
+        WriteError::Chunk(ChunkError::NoDeviceSpace { .. }) => Errno::ENOSPC,
+        WriteError::Chunk(ChunkError::SystemArrayFull { .. }) => Errno::ENOSPC,
+        WriteError::Chunk(ChunkError::UnsupportedProfile { .. }) => {
+            defect("Chunk::UnsupportedProfile", error)
+        }
+        WriteError::Chunk(ChunkError::MissingDevice { .. }) => {
+            defect("Chunk::MissingDevice", error)
+        }
+        WriteError::Chunk(ChunkError::Truncated { .. }) => defect("Chunk::Truncated", error),
+        WriteError::Chunk(ChunkError::Map { .. }) => defect("Chunk::Map", error),
         WriteError::Read(error) => read_errno(error),
         WriteError::Space(SpaceError::Read(error)) => read_errno(error),
         WriteError::Space(SpaceError::Exhausted { .. }) => Errno::ENOSPC,

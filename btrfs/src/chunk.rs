@@ -149,6 +149,23 @@ impl Chunk {
         // `parse` refused a range that overflows.
         self.logical + self.length
     }
+
+    /// A chunk the writer allocated. The caller has placed every copy inside
+    /// the device and chosen a length the sector size divides.
+    #[cfg(feature = "write")]
+    pub(crate) fn allocated(
+        logical: u64,
+        length: u64,
+        flags: u64,
+        copies: ArrayVec<u64, MAX_COPIES>,
+    ) -> Self {
+        Self {
+            logical,
+            length,
+            flags,
+            copies,
+        }
+    }
 }
 
 /// The whole logical-to-physical map of a single-device filesystem.
@@ -207,7 +224,14 @@ impl ChunkMap {
         self.insert(chunk).map_err(|defect| refused(defect.into()))
     }
 
-    fn insert(&mut self, chunk: Chunk) -> Result<(), ChunkDefect> {
+    /// Where the next chunk starts: the end of the last one, as
+    /// `find_next_chunk` in Linux's volumes.c.
+    #[cfg(feature = "write")]
+    pub(crate) fn next_logical(&self) -> u64 {
+        self.chunks.last().map_or(0, Chunk::end)
+    }
+
+    pub(crate) fn insert(&mut self, chunk: Chunk) -> Result<(), ChunkDefect> {
         if let Some(last) = self.chunks.last()
             && chunk.logical < last.end()
         {

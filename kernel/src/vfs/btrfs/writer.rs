@@ -273,7 +273,7 @@ async fn apply<S: BlockSink>(
             offset
                 .checked_add(bytes.len() as u64)
                 .ok_or(FsError::Overflow)?;
-            transaction
+            let written = transaction
                 .write_file(
                     &inode,
                     offset,
@@ -282,6 +282,17 @@ async fn apply<S: BlockSink>(
                 )
                 .await
                 .map_err(fs_error)?;
+            // A device with no more free sectors stores a prefix. This round
+            // has no way to report one, so the whole write fails as it did
+            // before short writes existed, and its transaction is dropped.
+            if written != bytes.len() {
+                tracing::warn!(
+                    written,
+                    requested = bytes.len(),
+                    "btrfs write ran out of space"
+                );
+                return Err(FsError::Io);
+            }
             return Ok(Response::Written(offset));
         }
         Operation::Open { flags } => {
