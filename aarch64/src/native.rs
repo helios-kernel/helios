@@ -38,9 +38,14 @@ const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 const ADDRESS: u64 = 0x0000_ffff_ffff_f000;
 
-// SPSR_EL1: the NZCV flags user code keeps; M = 0 is EL0t with every
-// exception unmasked.
+// SPSR_EL1: the NZCV flags user code keeps; M = 0 is EL0t (AArch64, so
+// M[4] = 0 and no AArch32 state is ever entered).
 const SPSR_NZCV: u64 = 0xf << 28;
+// SPSR_EL1.F: FIQs stay masked in user mode as in the kernel, which takes
+// none (`entry.S` clears only PSTATE.I); a FIQ unmasked at EL0 would end
+// every slice with nothing to acknowledge it. IRQ, SError and debug
+// exceptions stay unmasked.
+const SPSR_FIQ_MASKED: u64 = 1 << 6;
 
 // `ESR_EL1.EC` classes taken from EL0 (Arm ARM D19.2 "ESR_EL1").
 const EC_SVC64: u64 = 0x15;
@@ -55,15 +60,21 @@ const EC_WATCHPOINT_LOWER: u64 = 0x34;
 const EC_BRK64: u64 = 0x3c;
 const EC_ILLEGAL_STATE: u64 = 0x0e;
 // Data/instruction fault status codes, bits [5:2]: translation, access
-// flag, permission; 0b100001 is an alignment fault.
+// flag, permission, and a synchronous external abort on a table walk at
+// levels 0 to 3. Whole codes: 0b100001 is an alignment fault, 0b010000 a
+// synchronous external abort on the access itself.
 const FSC_TRANSLATION: u64 = 0b0001;
 const FSC_ACCESS_FLAG: u64 = 0b0010;
 const FSC_PERMISSION: u64 = 0b0011;
+const FSC_EXTERNAL_WALK: u64 = 0b0101;
 const FSC_ALIGNMENT: u64 = 0b10_0001;
+const FSC_EXTERNAL: u64 = 0b01_0000;
 const ISS_WNR: u64 = 1 << 6;
 
 const EXIT_SYNC: u64 = 1;
 const EXIT_IRQ: u64 = 2;
+const EXIT_FIQ: u64 = 3;
+const EXIT_SERROR: u64 = 4;
 
 /// The AArch64 native execution capability.
 pub struct Aarch64Native;
@@ -273,6 +284,9 @@ impl Aarch64Context {
         let status = esr & 0x3f;
         let page = |access| match status >> 2 {
             _ if status == FSC_ALIGNMENT => FaultKind::Alignment,
+            // Synchronous external aborts: Linux's `do_sea` class.
+            _ if status == FSC_EXTERNAL => FaultKind::Bus,
+            FSC_EXTERNAL_WALK => FaultKind::Bus,
             FSC_TRANSLATION => FaultKind::Page {
                 address: VirtAddr::new(self.switch.far as usize),
                 access,
@@ -283,8 +297,8 @@ impl Aarch64Context {
                 access,
                 present: true,
             },
-            // Address-size and external aborts at EL0 address nothing a
-            // mapping could provide.
+            // Address-size aborts and the rest address nothing a mapping
+            // could provide.
             _ => FaultKind::Protection,
         };
         let kind = match class {
@@ -313,8 +327,8 @@ impl Aarch64Context {
 
 // SAFETY: `resume` enters EL0t with the space's TTBR0 and restores the
 // kernel's TTBR0, TCR, SP_EL0, TPIDR_EL0, FPCR and callee-saved registers
-// before it returns; SPSR is rebuilt from NZCV alone, so user code never
-// leaves EL0 or masks an exception.
+// before it returns; SPSR is rebuilt from NZCV and the kernel's FIQ mask
+// alone, so user code never leaves AArch64 EL0 or masks an IRQ or SError.
 unsafe impl UserContext for Aarch64Context {
     type Space = NativeSpace<Aarch64Tables>;
 
@@ -346,7 +360,7 @@ unsafe impl UserContext for Aarch64Context {
     }
 
     fn resume(&mut self, space: &NativeSpace<Aarch64Tables>) -> Stop {
-        self.switch.pstate &= SPSR_NZCV;
+        self.switch.pstate = (self.switch.pstate & SPSR_NZCV) | SPSR_FIQ_MASKED;
         // ASID 0 in TTBR0[63:48]; every user page is non-global under it.
         self.switch.user_ttbr0 = space.with_tables(|tables| tables.root_physical());
         let tcr: u64;
@@ -371,6 +385,11 @@ unsafe impl UserContext for Aarch64Context {
             }
             EXIT_SYNC if self.switch.esr >> 26 == EC_SVC64 => Stop::SystemCall,
             EXIT_SYNC => Stop::Fault(self.fault()),
+            EXIT_FIQ => Stop::Interrupted,
+            EXIT_SERROR => Stop::Fault(UserFault {
+                kind: FaultKind::Bus,
+                instruction: VirtAddr::new(self.switch.pc as usize),
+            }),
             exit => panic!("native slice ended with unknown exit {exit}"),
         };
         // SAFETY: restores the mask read above.
@@ -398,6 +417,8 @@ global_asm!(include_str!("native.S"),
     q = const offset_of!(Switch, q),
     exit_sync = const EXIT_SYNC,
     exit_irq = const EXIT_IRQ,
+    exit_fiq = const EXIT_FIQ,
+    exit_serror = const EXIT_SERROR,
 );
 
 // The paired loads and stores of `native.S` reach these with a signed

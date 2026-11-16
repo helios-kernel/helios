@@ -45,7 +45,12 @@
 //!   when its timer interrupts every processor at a bounded period whatever
 //!   user code does. A program that never traps therefore cannot hold a
 //!   processor, and the context's owner observes every pending event within
-//!   one timer period.
+//!   one timer period. An interrupt class the kernel itself keeps masked
+//!   stays masked in user mode, so a slice never ends on an interrupt no
+//!   handler will take.
+//! - An asynchronous error the processor reports while user code runs (an
+//!   AArch64 SError) ends the slice as a [`FaultKind::Bus`] fault of the
+//!   program: the slice it interrupted is the one it is attributed to.
 //! - `resume` is called from task context with interrupts enabled. It
 //!   occupies its processor for at most one slice and does not suspend.
 //! - Every register a slice can change, general, flags, vector and every
@@ -101,7 +106,8 @@ pub enum Stop {
     Fault(UserFault),
 }
 
-/// A synchronous exception user code raised.
+/// An exception user code raised: synchronous, or the asynchronous error
+/// of [`FaultKind::Bus`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserFault {
     pub kind: FaultKind,
@@ -132,6 +138,11 @@ pub enum FaultKind {
     Protection,
     /// A misaligned access the processor refused.
     Alignment,
+    /// An external abort: the memory system reported an error for an access
+    /// of the program, synchronously or as an asynchronous error taken while
+    /// it ran. `instruction` is where the program resumes, not necessarily
+    /// the access that caused the error.
+    Bus,
 }
 
 /// The platform's native execution capability. [`crate::cpu::Cpu::native`]

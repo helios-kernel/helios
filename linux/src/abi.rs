@@ -190,7 +190,8 @@ pub fn fault_signal(kind: FaultKind) -> u8 {
         FaultKind::InvalidInstruction => SIGILL,
         FaultKind::Arithmetic => SIGFPE,
         FaultKind::Breakpoint => SIGTRAP,
-        FaultKind::Alignment => SIGBUS,
+        // arch/arm64/kernel/traps.c and arch/arm64/mm/fault.c (`do_sea`).
+        FaultKind::Alignment | FaultKind::Bus => SIGBUS,
     }
 }
 

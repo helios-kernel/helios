@@ -113,6 +113,30 @@ helios_aarch64_native_lower_irq:
     b helios_aarch64_native_exit
 .size helios_aarch64_native_lower_irq, . - helios_aarch64_native_lower_irq
 
+// Lower-EL AArch64 FIQ: the kernel takes no FIQ and a slice runs with
+// PSTATE.F set as the kernel does (`SPSR_FIQ_MASKED`), so a FIQ reaches
+// this vector only if that mask is ever lifted. It then ends the slice and
+// stays pending, as an IRQ does.
+.global helios_aarch64_native_lower_fiq
+.type helios_aarch64_native_lower_fiq, %function
+helios_aarch64_native_lower_fiq:
+    stp x0, x1, [sp, #0x00]
+    mov x0, #{exit_fiq}
+    b helios_aarch64_native_exit
+.size helios_aarch64_native_lower_fiq, . - helios_aarch64_native_lower_fiq
+
+// Lower-EL AArch64 SError: an asynchronous error taken while the slice ran,
+// recorded with its syndrome for the program's fault.
+.global helios_aarch64_native_lower_serror
+.type helios_aarch64_native_lower_serror, %function
+helios_aarch64_native_lower_serror:
+    stp x0, x1, [sp, #0x00]
+    mrs x0, esr_el1
+    stp x0, xzr, [sp, #{esr}]
+    mov x0, #{exit_serror}
+    b helios_aarch64_native_exit
+.size helios_aarch64_native_lower_serror, . - helios_aarch64_native_lower_serror
+
 helios_aarch64_native_exit:
     str x0, [sp, #{exit}]
     stp x2, x3, [sp, #0x10]
