@@ -4,7 +4,14 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, UNIX_EPOCH};
 
+use artifact_cache::{
+    ArtifactCache, CacheError, EntryKind, KeyBuilder, PrecompileCache, PrecompileError,
+    package_directories, precompile, prune, workspace_inputs,
+};
 use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
@@ -13,7 +20,7 @@ use helios_artifact::bootfs::{self, WriteEntry};
 use helios_artifact::{
     CwasmTarget, IsaLevelError, cwasm_target_isa_levels, cwasm_target_supports_wasm_simd,
 };
-use helios_compiler_support::{AotCompileHint, CompileError, precompile_artifact};
+use helios_compiler_support::AotCompileHint;
 use helios_profdata::{
     FetchedProfile, KERNEL_PROFILE_ARTIFACT, KERNEL_PROFILE_ASSET, KERNEL_PROFILE_WORKFLOW,
     KernelProfileStore, KernelProfileStoreError, ProfileUseError, RELEASE_REPOSITORY,
@@ -30,6 +37,7 @@ use walkdir::WalkDir;
 use wasmparser::Parser as WasmParser;
 use wit_component::ComponentEncoder;
 
+mod artifact_cache;
 mod boot_kernel;
 mod venus_fetch;
 
@@ -40,6 +48,8 @@ mod venus_fetch;
 /// names the step.
 #[derive(Debug, thiserror::Error)]
 enum CliError {
+    #[error("{0}")]
+    ArtifactCachePrune(#[from] CacheError),
     #[error("{0}")]
     KernelPrebuild(#[from] PrebuildError),
     #[error("{0}")]
@@ -63,6 +73,13 @@ enum WasmProgramsError {
     BootPrograms(#[from] BootProgramError),
     #[error("{0}")]
     WasmBuild(#[from] WasmBuildError),
+    #[error("{0}")]
+    Cache(#[from] CacheError),
+    #[error("the host does not report its available parallelism: {source}")]
+    Parallelism {
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to create {path}: {source}")]
     CreateDir {
         path: String,
@@ -127,7 +144,9 @@ enum PrebuildError {
     #[error("{0}")]
     IsaLevel(#[from] IsaLevelError),
     #[error("{0}")]
-    Compile(#[from] CompileError),
+    Precompile(#[from] PrecompileError),
+    #[error("{0}")]
+    Cache(#[from] CacheError),
     #[error("failed to create {path}: {source}")]
     CreateOutDir {
         path: String,
@@ -243,6 +262,16 @@ enum WasmBuildError {
          writes the directory --prebuilt-wasm names"
     )]
     PrebuiltMissing { path: String, profile: String },
+    #[error("{0}")]
+    Cache(#[from] CacheError),
+    #[error("crate manifest {manifest} is outside the workspace {root}, so no cache key names it")]
+    ManifestOutsideWorkspace { manifest: String, root: String },
+    #[error("failed to write the cached artifact {path}: {source}")]
+    WriteCached {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Why the set of boot programs could not be resolved from the
@@ -349,7 +378,7 @@ enum BootfsError {
     #[error("{0}")]
     WasmBuild(#[from] WasmBuildError),
     #[error("{0}")]
-    Compile(#[from] CompileError),
+    Precompile(#[from] PrecompileError),
     #[error("{0}")]
     BootArtifacts(#[from] BootArtifactsError),
     #[error("{0}")]
@@ -683,6 +712,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    ArtifactCachePrune(ArtifactCachePruneCommand),
     /// Prepare the root keypair that compile and lint checks read,
     /// without building a boot payload.
     KernelKeys {
@@ -762,6 +792,8 @@ struct KernelPrebuildCommand {
     /// installed.
     #[arg(long, value_name = "PATH")]
     root_secret_key: Option<PathBuf>,
+    #[command(flatten)]
+    cache: CacheArgs,
 }
 
 #[derive(Parser)]
@@ -773,6 +805,56 @@ struct WasmBuildCommand {
     profile: String,
     #[arg(long)]
     cargo: PathBuf,
+    #[command(flatten)]
+    cache: CacheArgs,
+}
+
+/// The artifact cache a build reads and fills (#1022).
+#[derive(Parser)]
+struct CacheArgs {
+    /// Take the wasm and the precompiled `cwasm` this directory holds
+    /// instead of building them, and store what is built there.
+    ///
+    /// Without it nothing is read or kept between runs. A wasm entry is a
+    /// hit only while every source file cargo listed for it is unchanged;
+    /// a `cwasm` entry is addressed by its input, this executable, the
+    /// target level and the compile hint. A relative path is relative to
+    /// the current directory. `artifact-cache-prune` empties what a job
+    /// did not use.
+    #[arg(long, value_name = "DIR", env = "HELIOS_ARTIFACT_CACHE")]
+    cache_dir: Option<PathBuf>,
+}
+
+impl CacheArgs {
+    fn open(&self) -> Result<Option<ArtifactCache>, CacheError> {
+        self.cache_dir
+            .as_deref()
+            .map(ArtifactCache::open)
+            .transpose()
+    }
+
+    /// Reports what the run took from the cache.
+    fn report(cache: Option<&ArtifactCache>) {
+        if let Some(cache) = cache {
+            eprintln!("helios-cli: artifact cache: {}", cache.stats());
+        }
+    }
+}
+
+/// Delete the entries of an artifact cache that nothing has used since a
+/// point in time (#1022).
+///
+/// A hit and a store both set an entry's modification time to now, so a job
+/// that notes when it started and runs this last leaves a cache holding
+/// what the job used, whichever processes of it used it.
+#[derive(Parser)]
+struct ArtifactCachePruneCommand {
+    #[arg(long, value_name = "DIR", env = "HELIOS_ARTIFACT_CACHE")]
+    cache_dir: PathBuf,
+    /// Delete the entries last used before this many whole seconds since
+    /// the unix epoch: what `date +%s` printed when the job started.
+    #[arg(long, value_name = "UNIX_SECONDS")]
+    older_than: u64,
 }
 
 #[derive(Parser)]
@@ -890,18 +972,16 @@ struct BootBuild<'a> {
     /// The level every boot artifact is compiled for: the target's floor.
     target: &'a CwasmTarget<'a>,
     workspace_root: &'a WorkspaceRoot,
+    /// Where a precompiled artifact is taken from and kept, when a cache
+    /// directory was named.
+    precompile: Option<&'a PrecompileCache<'a>>,
 }
 
 /// Where the architecture-independent guest wasm of a boot payload comes
 /// from: compiled by this run, or read from the directory `wasm-build`
 /// wrote. Only the precompile to a target is the payload's own work.
 enum WasmSource<'a> {
-    Build {
-        cargo: &'a Path,
-        profile: &'a str,
-        /// Where cargo's target directories go.
-        out_dir: &'a Path,
-    },
+    Build(WasmBuilder<'a>),
     Prebuilt {
         /// The profile's own directory of the prebuilt tree.
         dir: PathBuf,
@@ -909,23 +989,23 @@ enum WasmSource<'a> {
     },
 }
 
+/// What one `cargo build` of a guest program needs besides the program.
+struct WasmBuilder<'a> {
+    cargo: &'a Path,
+    profile: &'a str,
+    /// Where cargo's target directories go.
+    out_dir: &'a Path,
+    workspace_root: &'a WorkspaceRoot,
+    /// Where a built wasm is taken from and kept, when a cache directory
+    /// was named.
+    cache: Option<&'a ArtifactCache>,
+}
+
 impl<'a> WasmSource<'a> {
-    fn new(
-        cargo: &'a Path,
-        profile: &'a str,
-        out_dir: &'a Path,
-        prebuilt: Option<PathBuf>,
-    ) -> Self {
-        match prebuilt {
-            Some(root) => Self::Prebuilt {
-                dir: root.join(profile_dir_name(profile)),
-                profile,
-            },
-            None => Self::Build {
-                cargo,
-                profile,
-                out_dir,
-            },
+    fn prebuilt(root: PathBuf, profile: &'a str) -> Self {
+        Self::Prebuilt {
+            dir: root.join(profile_dir_name(profile)),
+            profile,
         }
     }
 
@@ -937,31 +1017,15 @@ impl<'a> WasmSource<'a> {
         artifact_name: &str,
     ) -> Result<PathBuf, WasmBuildError> {
         match self {
-            Self::Build {
-                cargo,
-                profile,
-                out_dir,
-            } => build_component_program(cargo, profile, out_dir, manifest_path, artifact_name),
+            Self::Build(builder) => builder.component(manifest_path, artifact_name),
             Self::Prebuilt { dir, profile } => prebuilt_wasm(dir, profile, artifact_name),
         }
     }
 
     /// The in-kernel compiler's `wasm32-wasip1-threads` module.
-    fn compiler_plugin(&self, workspace_root: &WorkspaceRoot) -> Result<PathBuf, WasmBuildError> {
+    fn compiler_plugin(&self) -> Result<PathBuf, WasmBuildError> {
         match self {
-            Self::Build {
-                cargo,
-                profile,
-                out_dir,
-            } => build_wasm_program(
-                cargo,
-                profile,
-                out_dir,
-                &workspace_root.join(Path::new(COMPILER_PLUGIN_MANIFEST)),
-                COMPILER_PLUGIN_TARGET_DIR,
-                COMPILER_PLUGIN_TRIPLE,
-                COMPILER_PLUGIN_WASM,
-            ),
+            Self::Build(builder) => builder.compiler_plugin(),
             Self::Prebuilt { dir, profile } => prebuilt_wasm(dir, profile, COMPILER_PLUGIN_WASM),
         }
     }
@@ -1030,6 +1094,17 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
+        Commands::ArtifactCachePrune(command) => {
+            let removed = prune(
+                &command.cache_dir,
+                UNIX_EPOCH + Duration::from_secs(command.older_than),
+            )?;
+            eprintln!(
+                "helios-cli: artifact cache: pruned {removed} entries from {}",
+                command.cache_dir.display()
+            );
+            Ok(())
+        }
         Commands::KernelKeys { out_dir } => {
             prepare_root_key(&out_dir, None)?;
             Ok(())
@@ -1075,15 +1150,18 @@ fn run_kernel_prebuild(
         &workspace_root,
     )?;
 
-    let wasm = WasmSource::new(
-        &command.cargo,
-        &command.profile,
-        &command.out_dir,
-        command
-            .prebuilt_wasm
-            .as_deref()
-            .map(|dir| workspace_root.join(dir)),
-    );
+    let cache = command.cache.open()?;
+    let wasm = match command.prebuilt_wasm.as_deref() {
+        Some(dir) => WasmSource::prebuilt(workspace_root.join(dir), &command.profile),
+        None => WasmSource::Build(WasmBuilder {
+            cargo: &command.cargo,
+            profile: &command.profile,
+            out_dir: &command.out_dir,
+            workspace_root: &workspace_root,
+            cache: cache.as_ref(),
+        }),
+    };
+    let precompile_cache = cache.as_ref().map(PrecompileCache::new).transpose()?;
     let init_component = wasm.component(&init_manifest, INIT_WASM)?;
     let init_cwasm = command.out_dir.join("init_component.cwasm");
     let init_component_bytes = encode_component(&init_component)?;
@@ -1092,8 +1170,12 @@ fn run_kernel_prebuild(
     // processor's own level.
     let floor = cwasm_target_isa_levels(&command.target).floor();
     let target = CwasmTarget::new(&command.target, floor.name())?;
-    let init_payload =
-        precompile_artifact(&init_component_bytes, &target, Hint::Performance.into())?.bytes;
+    let init_payload = precompile(
+        precompile_cache.as_ref(),
+        &init_component_bytes,
+        &target,
+        Hint::Performance.into(),
+    )?;
     fs::write(&init_cwasm, init_payload).map_err(|source| PrebuildError::Write {
         path: init_cwasm.display().to_string(),
         source,
@@ -1104,6 +1186,7 @@ fn run_kernel_prebuild(
         out_dir: &command.out_dir,
         target: &target,
         workspace_root: &workspace_root,
+        precompile: precompile_cache.as_ref(),
     };
     let mut bootfs_assets = Vec::new();
     if !command.no_compiler_plugin {
@@ -1158,6 +1241,7 @@ fn run_kernel_prebuild(
         path: manifest_path.display().to_string(),
         source,
     })?;
+    CacheArgs::report(cache.as_ref());
     Ok(())
 }
 
@@ -1293,11 +1377,12 @@ fn file_modified_nanos(path: &Path) -> Result<u64, BootfsError> {
             path: path.display().to_string(),
             source,
         })?;
-    let duration = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| BootfsError::ModifiedBeforeEpoch {
-            path: path.display().to_string(),
-        })?;
+    let duration =
+        modified
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| BootfsError::ModifiedBeforeEpoch {
+                path: path.display().to_string(),
+            })?;
     duration
         .as_secs()
         .checked_mul(1_000_000_000)
@@ -1668,12 +1753,17 @@ impl Seek for FileSlice<'_> {
 }
 
 fn build_compiler_plugin_asset(build: &BootBuild<'_>) -> Result<BootAsset, BootfsError> {
-    let wasm_path = build.wasm.compiler_plugin(build.workspace_root)?;
+    let wasm_path = build.wasm.compiler_plugin()?;
     let wasm = fs::read(&wasm_path).map_err(|source| BootfsError::Read {
         path: wasm_path.display().to_string(),
         source,
     })?;
-    let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
+    let payload = precompile(
+        build.precompile,
+        &wasm,
+        build.target,
+        Hint::Performance.into(),
+    )?;
     // The exact module this run precompiled into the bootfs, at a path that
     // does not depend on cargo's target-directory layout: the bench's Linux
     // + Wasmtime column runs this file under `helios-compiler-host`, so both
@@ -1857,23 +1947,45 @@ fn run_wasm_build(
     let scratch = command
         .out_dir
         .join(format!("{}-target", profile_dir_name(&command.profile)));
-    let wasm = WasmSource::Build {
+    let cache = command.cache.open()?;
+    let builder = WasmBuilder {
         cargo: &command.cargo,
         profile: &command.profile,
         out_dir: &scratch,
+        workspace_root,
+        cache: cache.as_ref(),
     };
 
-    let mut built = vec![(
-        COMPILER_PLUGIN_MANIFEST.to_owned(),
-        wasm.compiler_plugin(workspace_root)?,
-    )];
+    // The compiler plugin builds first and longest, so it takes the first
+    // worker; every target directory's programs follow.
     let mut programs = program_dirs(&workspace_root.join(Path::new("programs")))?;
     programs.sort();
-    for (command_name, path) in programs {
+    let mut groups = BTreeMap::<String, Vec<(usize, ProgramManifest)>>::new();
+    let mut venus_protocol = false;
+    for (index, (command_name, path)) in programs.into_iter().enumerate() {
         let manifest = read_program_manifest(&command_name, &path.join("Cargo.toml"))?;
-        let artifact = wasm.component(&manifest.manifest_path, &manifest.artifact_name)?;
-        built.push((manifest.manifest_path.display().to_string(), artifact));
+        let requirements = read_wasm_requirements(&manifest.manifest_path)?;
+        venus_protocol |= requirements.venus_protocol;
+        groups
+            .entry(component_target_dir(&requirements))
+            .or_default()
+            .push((index + 1, manifest));
     }
+    // Fetched once before the groups start, so that groups building at the
+    // same time only ever find the pinned files in place and never write
+    // the cache directory together.
+    if venus_protocol {
+        venus_fetch::run(workspace_root.path()).map_err(WasmBuildError::from)?;
+    }
+    let jobs = std::iter::once(WasmJob::CompilerPlugin)
+        .chain(groups.into_values().map(WasmJob::Programs))
+        .collect::<Vec<_>>();
+    let mut built = run_wasm_jobs(&builder, &jobs)?;
+    built.sort_by_key(|built| built.order);
+    let built = built
+        .into_iter()
+        .map(|built| (built.manifest, built.artifact))
+        .collect::<Vec<_>>();
 
     let mut names = BTreeSet::new();
     for (source_manifest, artifact) in &built {
@@ -1898,7 +2010,91 @@ fn run_wasm_build(
             source,
         })?;
     }
+    CacheArgs::report(cache.as_ref());
     Ok(())
+}
+
+/// One unit of work `wasm-build` runs beside the others.
+enum WasmJob {
+    CompilerPlugin,
+    /// The programs that build into one target directory, each with its
+    /// place in the output order. Cargo locks a target directory, so they
+    /// build one after another.
+    Programs(Vec<(usize, ProgramManifest)>),
+}
+
+/// A wasm one job built.
+struct BuiltWasm {
+    order: usize,
+    /// The manifest it came from.
+    manifest: String,
+    artifact: PathBuf,
+}
+
+impl WasmJob {
+    fn run(&self, builder: &WasmBuilder<'_>) -> Result<Vec<BuiltWasm>, WasmBuildError> {
+        match self {
+            Self::CompilerPlugin => Ok(vec![BuiltWasm {
+                order: 0,
+                manifest: COMPILER_PLUGIN_MANIFEST.to_owned(),
+                artifact: builder.compiler_plugin()?,
+            }]),
+            Self::Programs(programs) => programs
+                .iter()
+                .map(|(order, manifest)| {
+                    Ok(BuiltWasm {
+                        order: *order,
+                        manifest: manifest.manifest_path.display().to_string(),
+                        artifact: builder
+                            .component(&manifest.manifest_path, &manifest.artifact_name)?,
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Runs `jobs`, as many at once as the host has parallelism for.
+///
+/// Workers take jobs in order until none is left or one has failed. The
+/// first failure to arrive is the one returned, after the builds already
+/// running have finished.
+fn run_wasm_jobs(
+    builder: &WasmBuilder<'_>,
+    jobs: &[WasmJob],
+) -> Result<Vec<BuiltWasm>, WasmProgramsError> {
+    let workers = std::thread::available_parallelism()
+        .map_err(|source| WasmProgramsError::Parallelism { source })?
+        .get()
+        .min(jobs.len());
+    let next = &AtomicUsize::new(0);
+    let failed = &AtomicBool::new(false);
+    let (results, outcomes) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let results = results.clone();
+            scope.spawn(move || {
+                while !failed.load(Ordering::Relaxed) {
+                    let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    let outcome = job.run(builder);
+                    if outcome.is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                    results
+                        .send(outcome)
+                        .expect("the receiver outlives the scope that sends to it");
+                }
+            });
+        }
+    });
+    drop(results);
+    let mut built = Vec::new();
+    for outcome in outcomes {
+        built.extend(outcome?);
+    }
+    Ok(built)
 }
 
 fn read_external_boot_artifacts(
@@ -2078,8 +2274,12 @@ fn build_boot_program_asset(
             .collect::<Result<Vec<_>, BootfsError>>()?;
         component_bytes = compose(&manifest.command, component_bytes, plugs)?;
     }
-    let payload =
-        precompile_artifact(&component_bytes, build.target, Hint::Performance.into())?.bytes;
+    let payload = precompile(
+        build.precompile,
+        &component_bytes,
+        build.target,
+        Hint::Performance.into(),
+    )?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", manifest.command));
@@ -2101,7 +2301,12 @@ fn build_external_boot_artifact_assets(
         path: source.display().to_string(),
         source: error,
     })?;
-    let payload = precompile_artifact(&wasm, build.target, Hint::Performance.into())?.bytes;
+    let payload = precompile(
+        build.precompile,
+        &wasm,
+        build.target,
+        Hint::Performance.into(),
+    )?;
     let output_path = build
         .out_dir
         .join(format!("{}_bootfs_component.cwasm", artifact.command));
@@ -2312,22 +2517,47 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 /// resolution and its `.wasm` are what a private directory would produce.
 const COMPONENT_PROGRAMS_TARGET_DIR: &str = "component-programs-target";
 
-fn build_component_program(
-    cargo: &Path,
-    profile: &str,
-    out_dir: &Path,
-    manifest_path: &Path,
-    artifact_name: &str,
-) -> Result<PathBuf, WasmBuildError> {
-    build_wasm_program(
-        cargo,
-        profile,
-        out_dir,
-        manifest_path,
-        COMPONENT_PROGRAMS_TARGET_DIR,
-        "wasm32-wasip2",
-        artifact_name,
-    )
+/// The target the component programs build for.
+const COMPONENT_TRIPLE: &str = "wasm32-wasip2";
+
+/// The target directory, by name, a component program with these
+/// requirements builds into.
+///
+/// Programs that name the same directory build one after another, because
+/// cargo locks a target directory; programs that name different ones build
+/// at the same time. Programs with extra target features compile every
+/// crate, std included, with other flags, so they get a directory of their
+/// own rather than invalidating the shared one on every switch.
+fn component_target_dir(requirements: &WasmRequirements) -> String {
+    if requirements.target_features.is_empty() {
+        COMPONENT_PROGRAMS_TARGET_DIR.to_owned()
+    } else {
+        format!(
+            "{COMPONENT_PROGRAMS_TARGET_DIR}-{}",
+            requirements.target_features.join("-")
+        )
+    }
+}
+
+/// What `package.metadata.helios` asks of the wasm build of the crate at
+/// `manifest_path`.
+fn read_wasm_requirements(manifest_path: &Path) -> Result<WasmRequirements, WasmBuildError> {
+    if !manifest_path.is_file() {
+        return Err(WasmBuildError::ManifestMissing {
+            path: manifest_path.display().to_string(),
+        });
+    }
+    let manifest_text =
+        fs::read_to_string(manifest_path).map_err(|source| WasmBuildError::Read {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    let settings: WasmBuildSettings =
+        toml::from_str(&manifest_text).map_err(|source| WasmBuildError::ManifestSettings {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    Ok(settings.package.metadata.helios)
 }
 
 #[derive(Default, Deserialize)]
@@ -2348,7 +2578,7 @@ struct WasmMetadata {
     helios: WasmRequirements,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct WasmRequirements {
     #[serde(default)]
@@ -2357,103 +2587,231 @@ struct WasmRequirements {
     target_features: Vec<String>,
 }
 
-fn build_wasm_program(
-    cargo: &Path,
+/// The environment variables a guest build sets, in a fixed order.
+///
+/// They decide what the build produces, so they are also part of its
+/// cache key. The target features are among them, in the rustflags, and
+/// they alone decide whether std is rebuilt with them, so the key covers
+/// that too.
+fn build_environment(
     profile: &str,
-    out_dir: &Path,
-    manifest_path: &Path,
-    target_dir_name: &str,
     target_triple: &str,
-    artifact_name: &str,
-) -> Result<PathBuf, WasmBuildError> {
-    if !manifest_path.is_file() {
-        return Err(WasmBuildError::ManifestMissing {
-            path: manifest_path.display().to_string(),
-        });
-    }
-    let manifest_text =
-        fs::read_to_string(manifest_path).map_err(|source| WasmBuildError::Read {
-            path: manifest_path.display().to_string(),
-            source,
-        })?;
-    let settings: WasmBuildSettings =
-        toml::from_str(&manifest_text).map_err(|source| WasmBuildError::ManifestSettings {
-            path: manifest_path.display().to_string(),
-            source,
-        })?;
-    let requirements = settings.package.metadata.helios;
-    if requirements.venus_protocol {
-        let root = WorkspaceRoot::discover_from(
-            manifest_path
-                .parent()
-                .expect("a manifest has a containing directory"),
-        )?;
-        venus_fetch::run(root.path())?;
-    }
-    let target_dir = out_dir.join(target_dir_name);
-    let mut command = Command::new(cargo);
-    if !requirements.target_features.is_empty() {
-        // Wasm atomics change TLS relocations. Every Rust object,
-        // including std, must use the same target features.
-        command.arg("-Zbuild-std=std,panic_abort");
-    }
-    command
-        .arg("build")
-        .arg("--manifest-path")
-        .arg(manifest_path)
-        .arg("--target")
-        .arg(target_triple)
-        .arg("--target-dir")
-        .arg(&target_dir);
+    requirements: &WasmRequirements,
+) -> Vec<(&'static str, String)> {
+    let mut environment = Vec::new();
     if profile == "release" {
-        command.arg("--release");
-        if target_triple == "wasm32-wasip1-threads" {
-            command.env("CARGO_PROFILE_RELEASE_LTO", "fat");
-            command.env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+        if target_triple == COMPILER_PLUGIN_TRIPLE {
+            environment.push(("CARGO_PROFILE_RELEASE_LTO", "fat".to_owned()));
+            environment.push(("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1".to_owned()));
         }
     } else {
-        command.env("CARGO_PROFILE_DEV_OPT_LEVEL", "z");
-        command.env("CARGO_PROFILE_DEV_DEBUG", "0");
-        command.env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1");
-        command.env("CARGO_PROFILE_DEV_PANIC", "abort");
+        environment.push(("CARGO_PROFILE_DEV_OPT_LEVEL", "z".to_owned()));
+        environment.push(("CARGO_PROFILE_DEV_DEBUG", "0".to_owned()));
+        environment.push(("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1".to_owned()));
+        environment.push(("CARGO_PROFILE_DEV_PANIC", "abort".to_owned()));
     }
-    command.env_remove("RUSTFLAGS");
-    command.env(
+    // The flags carry link arguments with spaces in them, so they go as
+    // the separator-joined list cargo reads verbatim.
+    environment.push((
         "CARGO_ENCODED_RUSTFLAGS",
         wasm_rustflags(target_triple, &requirements.target_features).join("\x1f"),
-    );
-    // C code a program links (ring's, for one) is archived by `cc`, which
-    // falls back to the host's `ar` for a wasm target; that archive carries
-    // no symbol index wasm-ld can read, and the link then misses every C
-    // symbol. The toolchain's own llvm-ar writes one.
-    command.env(
-        format!("AR_{}", target_triple.replace('-', "_")),
-        toolchain_llvm_ar()?,
-    );
-    let status = command
-        .status()
-        .map_err(|source| WasmBuildError::SpawnCargo {
-            path: manifest_path.display().to_string(),
-            source,
-        })?;
-    if !status.success() {
-        return Err(WasmBuildError::BuildFailed {
-            path: manifest_path.display().to_string(),
-            target: target_triple.to_owned(),
-            status,
-        });
+    ));
+    environment
+}
+
+impl WasmBuilder<'_> {
+    /// The `wasm32-wasip2` core module or component `manifest_path`
+    /// builds, whose file is named `artifact_name`.
+    fn component(
+        &self,
+        manifest_path: &Path,
+        artifact_name: &str,
+    ) -> Result<PathBuf, WasmBuildError> {
+        let requirements = read_wasm_requirements(manifest_path)?;
+        self.build(
+            manifest_path,
+            &component_target_dir(&requirements),
+            COMPONENT_TRIPLE,
+            artifact_name,
+            &requirements,
+        )
     }
 
-    fs::canonicalize(
-        target_dir
+    /// The in-kernel compiler's `wasm32-wasip1-threads` module.
+    fn compiler_plugin(&self) -> Result<PathBuf, WasmBuildError> {
+        let manifest_path = self
+            .workspace_root
+            .join(Path::new(COMPILER_PLUGIN_MANIFEST));
+        let requirements = read_wasm_requirements(&manifest_path)?;
+        self.build(
+            &manifest_path,
+            COMPILER_PLUGIN_TARGET_DIR,
+            COMPILER_PLUGIN_TRIPLE,
+            COMPILER_PLUGIN_WASM,
+            &requirements,
+        )
+    }
+
+    /// Builds `manifest_path` for `target_triple` into the target
+    /// directory `target_dir_name`, or takes the wasm from the cache when
+    /// every input of an earlier build is unchanged. Either way the wasm
+    /// is at the path cargo would have left it.
+    fn build(
+        &self,
+        manifest_path: &Path,
+        target_dir_name: &str,
+        target_triple: &str,
+        artifact_name: &str,
+        requirements: &WasmRequirements,
+    ) -> Result<PathBuf, WasmBuildError> {
+        let target_dir = self.out_dir.join(target_dir_name);
+        let artifact = target_dir
             .join(target_triple)
-            .join(profile_dir_name(profile))
-            .join(artifact_name),
-    )
-    .map_err(|source| WasmBuildError::ResolveArtifact {
-        artifact: artifact_name.to_owned(),
-        source,
-    })
+            .join(profile_dir_name(self.profile))
+            .join(artifact_name);
+        let environment = build_environment(self.profile, target_triple, requirements);
+        let cache = match self.cache {
+            Some(cache) => Some((
+                cache,
+                self.cache_key(manifest_path, target_triple, &environment)?,
+            )),
+            None => None,
+        };
+        let resolve = || {
+            fs::canonicalize(&artifact).map_err(|source| WasmBuildError::ResolveArtifact {
+                artifact: artifact_name.to_owned(),
+                source,
+            })
+        };
+        if let Some((cache, key)) = &cache
+            && let Some(wasm) = cache.lookup_wasm(key, self.workspace_root.path())?
+        {
+            let write_cached = |source| WasmBuildError::WriteCached {
+                path: artifact.display().to_string(),
+                source,
+            };
+            if let Some(parent) = artifact.parent() {
+                fs::create_dir_all(parent).map_err(write_cached)?;
+            }
+            fs::write(&artifact, wasm).map_err(write_cached)?;
+            return resolve();
+        }
+
+        // The protocol inputs are pinned by a file in `venus/`, which the
+        // cache key's package closure covers; they are fetched only for a
+        // build that will read them.
+        if requirements.venus_protocol {
+            venus_fetch::run(self.workspace_root.path())?;
+        }
+        let mut command = Command::new(self.cargo);
+        if !requirements.target_features.is_empty() {
+            // Wasm atomics change TLS relocations. Every Rust object,
+            // including std, must use the same target features.
+            command.arg("-Zbuild-std=std,panic_abort");
+        }
+        command
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(manifest_path)
+            .arg("--target")
+            .arg(target_triple)
+            .arg("--target-dir")
+            .arg(&target_dir);
+        if self.profile == "release" {
+            command.arg("--release");
+        }
+        command.envs(environment);
+        command.env_remove("RUSTFLAGS");
+        // C code a program links (ring's, for one) is archived by `cc`, which
+        // falls back to the host's `ar` for a wasm target; that archive carries
+        // no symbol index wasm-ld can read, and the link then misses every C
+        // symbol. The toolchain's own llvm-ar writes one. Its path follows the
+        // toolchain, which `rustc -vV` in the cache key already names.
+        command.env(
+            format!("AR_{}", target_triple.replace('-', "_")),
+            toolchain_llvm_ar()?,
+        );
+        let status = command
+            .status()
+            .map_err(|source| WasmBuildError::SpawnCargo {
+                path: manifest_path.display().to_string(),
+                source,
+            })?;
+        if !status.success() {
+            return Err(WasmBuildError::BuildFailed {
+                path: manifest_path.display().to_string(),
+                target: target_triple.to_owned(),
+                status,
+            });
+        }
+        let resolved = resolve()?;
+
+        if let Some((cache, key)) = &cache {
+            let wasm = fs::read(&resolved).map_err(|source| WasmBuildError::Read {
+                path: resolved.display().to_string(),
+                source,
+            })?;
+            // Cargo leaves the dep-info of the artifact beside it.
+            let excluded = fs::canonicalize(&target_dir).map_err(|source| {
+                WasmBuildError::ResolveArtifact {
+                    artifact: target_dir.display().to_string(),
+                    source,
+                }
+            })?;
+            let inputs = workspace_inputs(
+                &artifact.with_extension("d"),
+                self.workspace_root.path(),
+                &excluded,
+                &package_directories(self.cargo, manifest_path, target_triple)?,
+            )?;
+            cache.store_wasm(key, self.workspace_root.path(), &inputs, &wasm)?;
+        }
+        Ok(resolved)
+    }
+
+    /// The key an earlier build of the same program is found by: what
+    /// the build is, not what its sources hold, which the entry's own file
+    /// list checks.
+    fn cache_key(
+        &self,
+        manifest_path: &Path,
+        target_triple: &str,
+        environment: &[(&'static str, String)],
+    ) -> Result<artifact_cache::Key, WasmBuildError> {
+        let root = self.workspace_root.path();
+        let relative = manifest_path.strip_prefix(root).map_err(|_| {
+            WasmBuildError::ManifestOutsideWorkspace {
+                manifest: manifest_path.display().to_string(),
+                root: root.display().to_string(),
+            }
+        })?;
+        let read = |path: PathBuf| {
+            fs::read(&path).map_err(|source| WasmBuildError::Read {
+                path: path.display().to_string(),
+                source,
+            })
+        };
+        // Cargo reads this file for every build in the workspace, and an
+        // absent one is an empty one.
+        let config_path = root.join(".cargo/config.toml");
+        let config = if config_path.is_file() {
+            read(config_path)?
+        } else {
+            Vec::new()
+        };
+        let mut key = KeyBuilder::new(EntryKind::Wasm)
+            .field(relative.as_os_str().as_encoded_bytes())
+            .field(self.profile)
+            .field(target_triple);
+        for (name, value) in environment {
+            key = key.field(name).field(value);
+        }
+        Ok(key
+            .field(rustc_print("-vV")?)
+            .field(config)
+            .field(read(root.join("Cargo.lock"))?)
+            .finish())
+    }
 }
 
 /// The llvm-ar the toolchain's llvm-tools component installs beside
@@ -3112,12 +3470,7 @@ mod tests {
         let release = root.path().join("release");
         fs::create_dir(&release).expect("a profile directory");
         fs::write(release.join(INIT_WASM), b"\0asm").expect("a wasm file");
-        let source = WasmSource::new(
-            Path::new("cargo"),
-            "release",
-            Path::new("unused"),
-            Some(root.path().to_path_buf()),
-        );
+        let source = WasmSource::prebuilt(root.path().to_path_buf(), "release");
         let found = source
             .component(Path::new("unused/Cargo.toml"), INIT_WASM)
             .expect("the prebuilt file is found");
@@ -3129,12 +3482,7 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary directory");
         // Only the release tree exists, so a debug prebuild finds nothing.
         fs::create_dir(root.path().join("release")).expect("a profile directory");
-        let source = WasmSource::new(
-            Path::new("cargo"),
-            "debug",
-            Path::new("unused"),
-            Some(root.path().to_path_buf()),
-        );
+        let source = WasmSource::prebuilt(root.path().to_path_buf(), "debug");
         let Err(error) = source.component(Path::new("unused/Cargo.toml"), INIT_WASM) else {
             panic!("a file that is not there is refused");
         };

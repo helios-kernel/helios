@@ -20,6 +20,8 @@ rand = "0.10.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
+# Writes a cache entry beside its final name before renaming it into place.
+tempfile.workspace = true
 thiserror = "2.0.20"
 toml = "0.8.23"
 # Plugs library components (the WebGPU provider) into the programs that
@@ -29,9 +31,6 @@ walkdir = "2.5.0"
 wasmparser = "0.245.0"
 wit-component = "0.245.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true
