@@ -13,13 +13,11 @@ use helios_hal::fs::{
 
 use super::BtrfsFs;
 use crate::io::{MemoryDisk, cache_over};
+use crate::test_support::UnsupportedHostFileSystem;
 use crate::vfs::{
     AttachedStorage, BOOT_DEVICE, Follow, MountSource, MountTable, Namespace, Storage,
 };
-use crate::{
-    BootFs, EmbeddedBootDirectory, EmbeddedBootFs, ProcessAuthority, UnsupportedHostFileSystem,
-    request_mount,
-};
+use crate::{BootFs, EmbeddedBootDirectory, EmbeddedBootFs, ProcessAuthority, request_mount};
 
 #[derive(Clone, Copy)]
 struct MemoryStorage;

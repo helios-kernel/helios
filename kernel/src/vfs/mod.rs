@@ -54,7 +54,7 @@ pub use request::{
     AttachedStorage, MountRequestError, MountSource, request_mount, request_unmount,
 };
 pub use root::{RootFs, RootWrite};
-pub use storage::{NoDisks, Storage, UnsupportedStorage};
+pub use storage::{NoDisks, Storage};
 
 use alloc::borrow::{Cow, ToOwned};
 use alloc::boxed::Box;

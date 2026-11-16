@@ -1337,7 +1337,7 @@ mod tests {
 
     #[test]
     fn a_reseed_moves_the_wall_clock_to_the_new_reading() {
-        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
@@ -1351,7 +1351,7 @@ mod tests {
 
         // The machine was stopped and the calendar moved a day.
         rtc.0.set(1_000 + 86_400);
-        let wall = RuntimeState::<(), (), crate::UnsupportedStorage>::read_rtc(&rtc);
+        let wall = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::read_rtc(&rtc);
         state.reseed_wall_clock(6_000_000_000, wall);
         assert_eq!(state.wall_clock_nanos(6_000_000_000), 87_400_000_000_000);
     }
@@ -1359,7 +1359,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "seeded more than once")]
     fn seeding_the_wall_clock_twice_is_a_bring_up_fault() {
-        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
@@ -1373,7 +1373,7 @@ mod tests {
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {
-        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,

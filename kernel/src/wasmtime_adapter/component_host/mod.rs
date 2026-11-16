@@ -1869,7 +1869,6 @@ where
     let wasi_imports =
         crate::wasmtime_adapter::wasi::WasiImportSet::from_component(engine, component);
     linker.allow_shadowing(true);
-    wasmtime_wasi_io::add_to_linker_async(&mut linker)?;
     crate::wasmtime_adapter::wasi::preview2::add_to_linker(&mut linker, &wasi_imports)?;
     crate::wasmtime_adapter::wasi::preview3::add_to_linker(&mut linker, &wasi_imports)?;
     crate::wasmtime_adapter::wasi::http::add_to_linker(&mut linker, &wasi_imports)?;

@@ -538,39 +538,18 @@ mod tests {
         }
     }
 
+    /// The linker serves every interface Wasmtime's preview2 WIT declares
+    /// except `wasi:cli/run`, which a component exports and the kernel calls.
     #[test]
-    fn preview2_linked_interfaces_cover_required_subsystems() {
+    fn preview2_linked_interfaces_cover_the_wasmtime_wit() {
+        let served =
+            wit_interface_names(crate::wasmtime_adapter::wasi::preview2::PREVIEW2_WIT_PACKAGES)
+                .into_iter()
+                .filter(|interface| *interface != "wasi:cli/run")
+                .collect::<alloc::vec::Vec<_>>();
         assert_interface_set_eq(
             crate::wasmtime_adapter::wasi::preview2::PREVIEW2_LINKED_INTERFACES,
-            &[
-                "wasi:cli/environment",
-                "wasi:cli/exit",
-                "wasi:cli/stdin",
-                "wasi:cli/stdout",
-                "wasi:cli/stderr",
-                "wasi:cli/terminal-input",
-                "wasi:cli/terminal-output",
-                "wasi:cli/terminal-stdin",
-                "wasi:cli/terminal-stdout",
-                "wasi:cli/terminal-stderr",
-                "wasi:clocks/monotonic-clock",
-                "wasi:clocks/system-clock",
-                "wasi:filesystem/preopens",
-                "wasi:filesystem/types",
-                "wasi:random/random",
-                "wasi:random/insecure",
-                "wasi:random/insecure-seed",
-                "wasi:io/error",
-                "wasi:io/poll",
-                "wasi:io/streams",
-                "wasi:sockets/network",
-                "wasi:sockets/instance-network",
-                "wasi:sockets/udp",
-                "wasi:sockets/udp-create-socket",
-                "wasi:sockets/tcp",
-                "wasi:sockets/tcp-create-socket",
-                "wasi:sockets/ip-name-lookup",
-            ],
+            &served,
             "Preview2",
         );
     }
@@ -598,8 +577,10 @@ mod tests {
                 "wasi:clocks/monotonic-clock.resolution",
                 "wasi:clocks/monotonic-clock.subscribe-duration",
                 "wasi:clocks/monotonic-clock.subscribe-instant",
-                "wasi:clocks/system-clock.now",
-                "wasi:clocks/system-clock.resolution",
+                "wasi:clocks/timezone.display",
+                "wasi:clocks/timezone.utc-offset",
+                "wasi:clocks/wall-clock.now",
+                "wasi:clocks/wall-clock.resolution",
                 "wasi:filesystem/preopens.get-directories",
                 "wasi:filesystem/types.descriptor.advise",
                 "wasi:filesystem/types.descriptor.append-via-stream",
@@ -883,7 +864,8 @@ mod tests {
             "wasi:clocks" => match name {
                 "types" => "wasi:clocks/types",
                 "monotonic-clock" => "wasi:clocks/monotonic-clock",
-                "system-clock" | "wall-clock" => "wasi:clocks/system-clock",
+                "system-clock" => "wasi:clocks/system-clock",
+                "wall-clock" => "wasi:clocks/wall-clock",
                 "timezone" => "wasi:clocks/timezone",
                 _ => return None,
             },
@@ -1105,13 +1087,13 @@ mod tests {
 
     #[test]
     fn p2_resolve_stream_yields_both_address_families_in_resolver_order() {
-        let mut stream = P2ResolveAddressStream::pending();
+        let (mut stream, completion) = P2ResolveAddressStream::pending();
         let v4 = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([93, 184, 215, 14]));
         let v6 = crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
             0x26, 0x06, 0x28, 0x00, 0x02, 0x1f, 0xcb, 0x07, 0x68, 0x20, 0x80, 0xda, 0x00, 0xaf,
             0x6b, 0x08,
         ]));
-        stream.complete(Ok(vec![v4, v6]));
+        completion.complete(Ok(vec![v4, v6]));
 
         assert_eq!(stream.next_address().unwrap(), Some(v4));
         assert_eq!(stream.next_address().unwrap(), Some(v6));
@@ -1141,7 +1123,7 @@ mod tests {
 
     #[test]
     fn p2_resolve_stream_yields_addresses_after_background_completion() {
-        let mut stream = P2ResolveAddressStream::pending();
+        let (mut stream, completion) = P2ResolveAddressStream::pending();
         assert!(!stream.is_ready());
         assert!(matches!(
             stream
@@ -1154,10 +1136,31 @@ mod tests {
         ));
 
         let address = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 1]));
-        stream.complete(Ok(vec![address]));
+        completion.complete(Ok(vec![address]));
         assert!(stream.is_ready());
         assert_eq!(stream.next_address().unwrap(), Some(address));
         assert_eq!(stream.next_address().unwrap(), None);
+    }
+
+    /// The pollable a guest parks on resolves once the lookup task answers,
+    /// and a lookup that already answered resolves it at once.
+    #[test]
+    fn p2_resolve_stream_wakes_a_waiter_when_the_lookup_answers() {
+        let (mut stream, completion) = P2ResolveAddressStream::pending();
+        let address = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 7]));
+
+        {
+            let mut waiting = core::pin::pin!(stream.wait_ready());
+            let waker = futures::task::noop_waker();
+            let mut context = core::task::Context::from_waker(&waker);
+            assert!(waiting.as_mut().poll(&mut context).is_pending());
+
+            completion.complete(Ok(vec![address]));
+            assert!(waiting.as_mut().poll(&mut context).is_ready());
+        }
+        assert_eq!(stream.next_address().unwrap(), Some(address));
+
+        block_on(stream.wait_ready());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use helios_hal::fs::{
     BlockRange, BlockSerial, IoResult,
 };
 
-use crate::{BlockPages, HostFileSystem, UnsupportedHostFileSystem};
+use crate::{BlockPages, HostFileSystem};
 
 /// The storage drivers of one machine.
 ///
@@ -78,14 +78,4 @@ impl BlockDevice for NoDisks {
     fn is_read_only(&self) -> bool {
         match *self {}
     }
-}
-
-/// The storage of a machine with neither a host share nor a disk: the
-/// kernel's own tests, and a backend that brings up neither.
-#[derive(Clone, Copy, Debug)]
-pub struct UnsupportedStorage;
-
-impl Storage for UnsupportedStorage {
-    type HostShare = UnsupportedHostFileSystem;
-    type Disk = NoDisks;
 }

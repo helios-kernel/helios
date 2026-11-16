@@ -2518,6 +2518,7 @@ dependencies = [
  "helios-netstack",
  "helios-sync",
  "helios-unix",
+ "helios-virtio",
  "hkdf",
  "hmac",
  "lru 0.16.4",

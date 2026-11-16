@@ -38,18 +38,40 @@ pub struct TcpSocket {
     pub(super) ready: Arc<crate::Notify>,
 }
 
-#[derive(Clone)]
+/// Every address a lookup resolved, in both families, or why it failed.
+///
+/// `wasi:sockets` `resolve-address-stream` promises no ordering, so the
+/// resolver's own answer order is preserved.
+type P2Resolution = core::result::Result<Vec<crate::NetworkIpAddress>, crate::DnsError>;
+
+/// The `wasi:sockets` `resolve-address-stream` of one lookup.
+///
+/// The stream owns its state outright, in the resource table. The task
+/// that runs the lookup holds the other end of a oneshot
+/// ([`P2ResolveCompletion`]) and hands the answer back through it; the
+/// stream takes the answer the first time it is asked for it.
 pub struct P2ResolveAddressStream {
-    pub(super) inner: Arc<Mutex<P2ResolveAddressStreamState>>,
-    pub(super) ready: Arc<crate::Notify>,
+    state: P2ResolveState,
 }
 
-pub(super) struct P2ResolveAddressStreamState {
-    /// Every resolved address, in both families. `wasi:sockets`
-    /// `resolve-address-stream` promises no ordering, so the resolver's
-    /// own answer order is preserved.
-    pub(super) result: Option<core::result::Result<Vec<crate::NetworkIpAddress>, crate::DnsError>>,
-    pub(super) cursor: usize,
+enum P2ResolveState {
+    /// The lookup task has not answered yet.
+    Pending(oneshot::Receiver<P2Resolution>),
+    Resolved {
+        resolution: P2Resolution,
+        cursor: usize,
+    },
+}
+
+/// The lookup task's end of a [`P2ResolveAddressStream`].
+pub(crate) struct P2ResolveCompletion(oneshot::Sender<P2Resolution>);
+
+impl P2ResolveCompletion {
+    /// Hands the lookup's answer to the stream. A stream the guest
+    /// already dropped has no one to read it.
+    pub(crate) fn complete(self, resolution: P2Resolution) {
+        let _ = self.0.send(resolution);
+    }
 }
 
 pub(super) struct TcpSocketState {
@@ -441,56 +463,78 @@ impl WasiTcpIpAddress {
 }
 
 impl P2ResolveAddressStream {
-    pub(crate) fn pending() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(P2ResolveAddressStreamState {
-                result: None,
-                cursor: 0,
-            })),
-            ready: Arc::new(crate::Notify::new()),
-        }
+    /// A stream whose lookup has not answered yet, and the end the
+    /// lookup task answers through.
+    pub(crate) fn pending() -> (Self, P2ResolveCompletion) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                state: P2ResolveState::Pending(receiver),
+            },
+            P2ResolveCompletion(sender),
+        )
     }
 
-    pub(crate) fn complete(
-        &self,
-        result: core::result::Result<Vec<crate::NetworkIpAddress>, crate::DnsError>,
-    ) {
-        self.inner.lock().result = Some(result);
-        self.ready.notify_all();
-    }
-
-    pub(crate) fn is_ready(&self) -> bool {
-        self.inner.lock().result.is_some()
-    }
-
-    pub(crate) async fn wait_ready(&self) {
-        loop {
-            // Armed before the result is read: completion broadcasts to
-            // every waiter and banks nothing, so a wait created after
-            // the resolver finished would park for a second completion
-            // that never comes.
-            let completed = self.ready.notified();
-            if self.is_ready() {
-                return;
+    /// Takes the lookup's answer in, if it has arrived, and says whether
+    /// the stream holds one.
+    pub(crate) fn is_ready(&mut self) -> bool {
+        if let P2ResolveState::Pending(receiver) = &mut self.state {
+            match receiver.try_recv() {
+                Ok(Some(resolution)) => self.settle(Ok(resolution)),
+                Ok(None) => return false,
+                Err(canceled) => self.settle(Err(canceled)),
             }
-            completed.await;
         }
+        true
+    }
+
+    /// Resolves once the lookup has answered.
+    ///
+    /// Cancel-safe: the answer stays in the oneshot until it is taken.
+    pub(crate) async fn wait_ready(&mut self) {
+        if let P2ResolveState::Pending(receiver) = &mut self.state {
+            let answer = receiver.await;
+            self.settle(answer);
+        }
+    }
+
+    fn settle(&mut self, answer: core::result::Result<P2Resolution, oneshot::Canceled>) {
+        let resolution = answer.unwrap_or_else(|oneshot::Canceled| {
+            // The lookup task owns the only sender and answers before it
+            // ends; a task that was dropped unanswered means the instance
+            // is being torn down around this stream.
+            debug_assert!(false, "a dns lookup task ended without answering");
+            tracing::error!(
+                target: "helios_kernel::program",
+                "a dns lookup task ended without answering its resolve stream"
+            );
+            Err(crate::DnsError {
+                kind: crate::DnsErrorKind::Unavailable,
+                detail: crate::NetworkErrorDetail::DnsLookupFailed,
+            })
+        });
+        self.state = P2ResolveState::Resolved {
+            resolution,
+            cursor: 0,
+        };
     }
 
     pub(crate) fn next_address(
         &mut self,
     ) -> core::result::Result<Option<crate::NetworkIpAddress>, crate::DnsError> {
-        let mut state = self.inner.lock();
-        let Some(result) = state.result.as_ref() else {
+        if !self.is_ready() {
             return Err(crate::DnsError {
                 kind: crate::DnsErrorKind::Unavailable,
                 detail: crate::NetworkErrorDetail::DnsResultNotReady,
             });
+        }
+        let P2ResolveState::Resolved { resolution, cursor } = &mut self.state else {
+            unreachable!("is_ready settled the stream");
         };
-        let addresses = result.as_ref().map_err(Clone::clone)?;
-        let address = addresses.get(state.cursor).copied();
+        let addresses = resolution.as_ref().map_err(Clone::clone)?;
+        let address = addresses.get(*cursor).copied();
         if address.is_some() {
-            state.cursor += 1;
+            *cursor += 1;
         }
         Ok(address)
     }

@@ -13,12 +13,13 @@ use super::{
     set_times_at, stat_at, stat_path, symlink_at, unlink_file_at, write_program_file,
     write_stream_target,
 };
+use crate::test_support::{UnsupportedHostFileSystem, UnsupportedStorage};
 use crate::wasmtime_adapter::component_host::ProgramSource;
 use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
 use crate::{
     AuthorityDomain, BOOT_DEVICE, BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
     FileContents, Follow, FsDescriptorFlags, HostShare, MemoryFs, MountTable, MountedFs, Namespace,
-    UnsupportedHostFileSystem, UnsupportedStorage, object_identity,
+    object_identity,
 };
 
 type TestNamespace = Namespace<UnsupportedStorage>;
