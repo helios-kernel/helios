@@ -66,7 +66,8 @@ impl Features {
         let op2 = encoding & 7;
         Some(match (crm, op2) {
             (4, 0) => self.pfr0,
-            (5, 0) => 0, // Debug, PMU and trace are absent.
+            // Debug is supplied by the separately banked debug capability.
+            // PMU and trace are absent.
             (6, 0) => self.isar0,
             (6, 1) => self.isar1,
             (7, 0) => self.mmfr0,

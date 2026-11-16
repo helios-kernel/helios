@@ -127,6 +127,24 @@ pub(crate) async fn run(cpu: crate::Aarch64Cpu, control: ProcessorControl<crate:
             .unwrap();
     }
     let mut vcpu = Space::create_vcpu(&space, 0).unwrap();
+    for level in [IrqLevel::Assert, IrqLevel::Deassert] {
+        assert!(vcpu.inject_irq(VirtualIrq { number: 32, level }).unwrap());
+    }
+    helios_hal::critical_section::with_local_interrupts_masked(|| {
+        vcpu.vgic.install();
+        let maintenance: u64;
+        unsafe {
+            asm!("mrs {maintenance}, ich_misr_el2", maintenance = out(reg) maintenance,
+                options(nomem, nostack));
+        }
+        vcpu.vgic.detach();
+        assert_eq!(
+            maintenance & 1,
+            0,
+            "deasserted IRQ retained EOI maintenance"
+        );
+    });
+    tracing::info!("HV self-test: deasserted IRQ retired without maintenance");
     let mut registers = Registers {
         pc: range.start().0,
         ..Registers::default()
