@@ -726,7 +726,7 @@ fn epoll_errors_timeout_and_pipe_readiness_are_real() {
 }
 
 #[test]
-fn epoll_rejects_cycles_including_disabled_one_shot_registrations() {
+fn epoll_rejects_cycles_and_duplicate_self_registration() {
     let mut process = Process::new(core::num::NonZeroU32::new(1).unwrap());
     let mut memory = Memory(vec![0; 64]);
     let mut sink = Sink::default();

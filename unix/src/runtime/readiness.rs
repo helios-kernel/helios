@@ -140,6 +140,7 @@ mod tests {
         epoll.add(interest).unwrap();
         duplicate.delivered(7);
         assert!(epoll.interests().is_empty());
+        assert_eq!(epoll.registrations(), alloc::vec![interest]);
         assert_eq!(epoll.add(interest), Err(InterestError::Exists));
         duplicate
             .modify(Interest {

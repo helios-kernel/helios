@@ -842,13 +842,16 @@ impl ByteReader {
         if limit == 0 {
             return TryRead::Ready(Bytes::new());
         }
+        // Observe closure before taking the queue lock: a final write that
+        // precedes closure must be visible to this pop before it can report EOF.
+        let closed = self.channel.is_closed();
         let (bytes, freed_full_slot) = self.channel.queue.pop_limit(limit);
         if freed_full_slot && bytes.is_some() {
             self.channel.writable.notify_all();
         }
         match bytes {
             Some(bytes) => TryRead::Ready(bytes),
-            None if self.channel.is_closed() => TryRead::Eof,
+            None if closed => TryRead::Eof,
             None => TryRead::Pending,
         }
     }
@@ -964,6 +967,26 @@ mod tests {
                 TryWrite::Written,
                 "chunk {index} should fit below capacity"
             );
+        }
+    }
+
+    #[test]
+    fn a_partial_reader_drains_a_concurrent_final_write_before_eof() {
+        for _ in 0..100 {
+            let (writer, reader) = byte_channel();
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    assert_eq!(
+                        writer.try_write(Bytes::from_static(b"tail")),
+                        TryWrite::Written
+                    );
+                });
+                let first = futures_lite::future::block_on(reader.read_limit(2));
+                let second = futures_lite::future::block_on(reader.read_limit(2));
+                assert_eq!(first.as_deref(), Some(&b"ta"[..]));
+                assert_eq!(second.as_deref(), Some(&b"il"[..]));
+                assert!(futures_lite::future::block_on(reader.read_limit(2)).is_none());
+            });
         }
     }
 
