@@ -186,6 +186,7 @@ jobs:
             | map(select(.value.command and (.key as $name | $lanes | index($name))))
             | map({name: .key, command: .value.command,
                    "rust-cache": (.value["rust-cache"] // false),
+                   "helios-cli": (.value["helios-cli"] // ""),
                    "guest-wasm": (.value["guest-wasm"] // "")})' .github/ci-lanes.json)"
           # Every consumer declares the profile its prebuild reads.
           wasm_profiles="$(jq -c --argjson lanes "${lanes}" '
@@ -238,10 +239,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev cmake ninja-build
+      # The guest programs build in the profile the matrix names; the tool
+      # that drives them is the debug one every check lane runs.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: debug
       - name: Build the guest wasm
         working-directory: helios
         run: >-
-          cargo run -p helios-cli --
+          "$HELIOS_CLI_BIN"
           wasm-build --out-dir target/wasm-programs
           --profile ${{ matrix.profile }} --cargo cargo
       - uses: actions/upload-artifact@v4
@@ -339,6 +345,12 @@ jobs:
           key: ${{ matrix.name }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       - uses: astral-sh/setup-uv@v6
+      # After the Rust cache, so a lane whose cache holds the binary
+      # builds it from there when no other job has uploaded it yet.
+      - uses: ./helios/.github/actions/helios-cli
+        if: matrix.helios-cli != ''
+        with:
+          profile: ${{ matrix.helios-cli }}
       - uses: ./helios/.github/actions/prebuilt-wasm
         if: matrix.guest-wasm != ''
         with:
@@ -417,6 +429,11 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # The inspector's `vm` and the profile fetch run this one rather
+      # than building their own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: release
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
@@ -796,6 +813,11 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # The inspector's `vm` and the profile fetch run this one rather
+      # than building their own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: release
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
@@ -1316,6 +1338,11 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # The inspector's `vm` and the profile fetch run this one rather
+      # than building their own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: release
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector -p helios-desktop-text-check
@@ -1330,7 +1357,8 @@ jobs:
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo run --release -p helios-cli -- profile-fetch
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch
       # A change to what fixes the profile's format or to the compiler
       # that reads it leaves the default branch's profile unreadable to
       # this tree, and nothing on that branch can replace it before the
@@ -1341,7 +1369,8 @@ jobs:
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo run --release -p helios-cli -- profile-fetch --run "${{ github.run_id }}"
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch --run "${{ github.run_id }}"
       # The first step that prebuilds: `vm` builds the guest image. The
       # steps before it only fetch the profile, which builds no guest.
       - uses: ./helios/.github/actions/prebuilt-wasm
@@ -2381,6 +2410,11 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # The inspector's `vm` and the profile fetch run this one rather
+      # than building their own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: release
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
@@ -2391,13 +2425,15 @@ jobs:
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo run --release -p helios-cli -- profile-fetch
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch
       - name: Fetch this run's kernel profile
         if: needs.changes.outputs.profile_format == 'true'
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo run --release -p helios-cli -- profile-fetch --run "${{ github.run_id }}"
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch --run "${{ github.run_id }}"
       - uses: ./helios/.github/actions/prebuilt-wasm
         with:
           profile: release
@@ -2590,6 +2626,10 @@ jobs:
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # The inspector's `vm` runs this one rather than building its own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: debug
       - name: Build inspector
         working-directory: helios
         run: cargo build -p helios-inspector
