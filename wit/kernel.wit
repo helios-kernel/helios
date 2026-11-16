@@ -208,6 +208,15 @@ world processors-host {
   import helios:system/processors@0.1.0;
 }
 
+/// A program that draws through `wasi:webgpu` on a platform canvas: the
+/// build plugs `webgpu-provider` into its two WebGPU imports.
+world webgpu {
+  include wasi:cli/command@0.3.0;
+  import wasi:webgpu/webgpu@0.3.0-rc.2;
+  import helios:webgpu/canvas@0.1.0;
+  import helios:system/tracing@0.1.0;
+}
+
 /// A per-program WebGPU library, composed into its consumer's store.
 world webgpu-provider {
   include wasi:cli/imports@0.3.0;

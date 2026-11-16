@@ -65,6 +65,8 @@ pub mod task;
 pub mod tracing;
 #[cfg(feature = "vsock")]
 pub mod vsock;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
 
 #[cfg(any(feature = "fs", feature = "io"))]
 pub use error::Result;

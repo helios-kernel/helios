@@ -5,11 +5,12 @@ use crate::wit_bindgen;
     any(
         feature = "http-handler",
         feature = "compositor",
+        feature = "webgpu",
         feature = "webgpu-provider"
     )
 ))]
 compile_error!(
-    "`mounts` is part of the `init` and `debugger` worlds; `http-handler`, `compositor` and `webgpu-provider` do not import it"
+    "`mounts` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
 #[cfg(all(
@@ -17,16 +18,26 @@ compile_error!(
     any(
         feature = "http-handler",
         feature = "compositor",
+        feature = "webgpu",
         feature = "webgpu-provider"
     )
 ))]
 compile_error!(
-    "`processors` is part of the `init` and `debugger` worlds; `http-handler`, `compositor` and `webgpu-provider` do not import it"
+    "`processors` is part of the `init` and `debugger` worlds; `http-handler`, `compositor`, `webgpu` and `webgpu-provider` do not import it"
 );
 
 #[cfg(any(
     all(
         feature = "webgpu-provider",
+        any(
+            feature = "instances",
+            feature = "http-handler",
+            feature = "compositor",
+            feature = "webgpu"
+        )
+    ),
+    all(
+        feature = "webgpu",
         any(
             feature = "instances",
             feature = "http-handler",
@@ -38,7 +49,7 @@ compile_error!(
     all(feature = "http-handler", feature = "compositor"),
 ))]
 compile_error!(
-    "a component implements exactly one world: `instances` selects `debugger`, `http-handler` selects `http-handler` `compositor` selects `compositor` and `webgpu-provider` selects `webgpu-provider`, so enable at most one"
+    "a component implements exactly one world: `instances` selects `debugger`, `http-handler` selects `http-handler`, `compositor` selects `compositor`, `webgpu` selects `webgpu` and `webgpu-provider` selects `webgpu-provider`, so enable at most one"
 );
 
 #[cfg(feature = "compositor")]
@@ -63,6 +74,7 @@ crate::wit_bindgen::generate!({
     feature = "instances",
     not(feature = "http-handler"),
     not(feature = "compositor"),
+    not(feature = "webgpu"),
     not(feature = "webgpu-provider")
 ))]
 crate::wit_bindgen::generate!({
@@ -77,6 +89,7 @@ crate::wit_bindgen::generate!({
     not(feature = "instances"),
     not(feature = "http-handler"),
     not(feature = "compositor"),
+    not(feature = "webgpu"),
     not(feature = "webgpu-provider")
 ))]
 crate::wit_bindgen::generate!({
@@ -87,15 +100,19 @@ crate::wit_bindgen::generate!({
     pub_export_macro: true,
 });
 
+#[cfg(feature = "webgpu")]
+crate::wit_bindgen::generate!({
+    path: "../wit",
+    world: "webgpu",
+    generate_all,
+    default_bindings_module: "bindings",
+    pub_export_macro: true,
+});
+
 #[cfg(feature = "webgpu-provider")]
 crate::wit_bindgen::generate!({
     path: "../wit",
     world: "webgpu-provider",
-    async: [
-        "export:wasi:webgpu/webgpu@0.3.0-rc.2#[method]gpu-device.lost",
-        "export:wasi:webgpu/webgpu@0.3.0-rc.2#[method]gpu-device.on-uncaptured-error",
-        "export:wasi:webgpu/webgpu@0.3.0-rc.2#[method]gpu-device.destroy",
-    ],
     generate_all,
     default_bindings_module: "bindings",
     pub_export_macro: true,

@@ -81,9 +81,10 @@ impl State {
     fn expire(&mut self) -> Option<Drawing> {
         let drawing = self.drawing.take();
         if let Some(Texture { object, .. }) = drawing.as_ref().and_then(|d| d.current.as_ref())
-            && let Some(child) = &object.raw {
-                child.destroy();
-            }
+            && let Some(child) = &object.raw
+        {
+            child.destroy();
+        }
         drawing
     }
 }

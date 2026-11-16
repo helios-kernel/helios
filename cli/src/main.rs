@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -199,6 +199,29 @@ enum WasmBuildError {
     LoadCoreModule { path: String, report: String },
     #[error("failed to encode component {path}: {report}")]
     EncodeComponent { path: String, report: String },
+    /// wac-types reports through `anyhow`; its chain travels as text.
+    #[error("failed to load {name} into the composition graph: {report}")]
+    LoadComposed { name: String, report: String },
+    #[error("failed to register {name} in the composition graph: {source}")]
+    RegisterComposed {
+        name: String,
+        #[source]
+        source: wac_graph::RegisterPackageError,
+    },
+    /// `PlugError` carries an `anyhow` source, so the rendered chain is
+    /// kept beside the variant.
+    #[error("failed to plug {plugs} into {command}: {report}")]
+    Plug {
+        command: String,
+        plugs: String,
+        report: String,
+    },
+    #[error("failed to encode the composition of {command}: {source}")]
+    EncodeComposition {
+        command: String,
+        #[source]
+        source: wac_graph::EncodeError,
+    },
     #[error("failed to run `rustc {query}`: {source}")]
     SpawnRustc {
         query: &'static str,
@@ -232,6 +255,13 @@ enum BootProgramError {
     EmptyEnvSelection,
     #[error("HELIOS_BOOT_PROGRAMS referenced unknown program(s): {missing}")]
     UnknownPrograms { missing: String },
+    #[error(
+        "program {command} plugs {plug}, which is no library component under programs/ \
+         (package.metadata.helios.library)"
+    )]
+    UnknownPlug { command: String, plug: String },
+    #[error("a library component cannot plug others: {command} names {plugs}")]
+    LibraryPlugs { command: String, plugs: String },
     #[error("failed to read {path}: {source}")]
     ReadProgramsRoot {
         path: String,
@@ -968,6 +998,21 @@ struct ProgramManifest {
     command: String,
     manifest_path: PathBuf,
     artifact_name: String,
+    role: ProgramRole,
+}
+
+/// What `package.metadata.helios` says a directory under `programs/` is.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ProgramRole {
+    /// A library component: it is plugged into the programs that import
+    /// what it exports and is never installed as a command.
+    #[serde(default)]
+    library: bool,
+    /// The library components, by directory name, whose exports satisfy
+    /// this program's imports.
+    #[serde(default)]
+    plugs: Vec<String>,
 }
 
 /// Every command's failure is a typed error whose message names what was
@@ -1700,22 +1745,29 @@ fn build_boot_program_assets(
     let programs_root = build.workspace_root.join(Path::new("programs"));
     let mut available_programs = BTreeSet::new();
     let mut manifests = Vec::new();
+    let mut libraries = BTreeMap::new();
     let mut external_artifacts = read_external_boot_artifacts(boot_artifacts_manifest)?;
 
     for (command, path) in program_dirs(&programs_root)? {
-        available_programs.insert(command.clone());
         // Init is built once, as the payload's init component; the
         // prebuild publishes that same artifact at `bin/init`.
         if command == INIT_COMMAND {
+            available_programs.insert(command);
             continue;
         }
+        let manifest = read_program_manifest(&command, &path.join("Cargo.toml"))?;
+        if manifest.role.library {
+            libraries.insert(command, manifest);
+            continue;
+        }
+        available_programs.insert(command.clone());
         if selected_programs
             .as_ref()
             .is_some_and(|selected| !selected.contains(&command))
         {
             continue;
         }
-        manifests.push(read_program_manifest(&command, &path.join("Cargo.toml"))?);
+        manifests.push(manifest);
     }
     for artifact in &external_artifacts {
         if !available_programs.insert(artifact.command.clone()) {
@@ -1755,7 +1807,7 @@ fn build_boot_program_assets(
     external_artifacts.sort_by(|left, right| left.command.cmp(&right.command));
     let mut assets = manifests
         .into_iter()
-        .map(|manifest| build_boot_program_asset(build, manifest))
+        .map(|manifest| build_boot_program_asset(build, manifest, &libraries))
         .collect::<Result<Vec<_>, BootfsError>>()?;
     for artifact in external_artifacts {
         assets.extend(build_external_boot_artifact_assets(build, artifact)?);
@@ -2000,11 +2052,32 @@ impl ExternalBootArtifact {
 fn build_boot_program_asset(
     build: &BootBuild<'_>,
     manifest: ProgramManifest,
+    libraries: &BTreeMap<String, ProgramManifest>,
 ) -> Result<BootAsset, BootfsError> {
     let wasm_path = build
         .wasm
         .component(&manifest.manifest_path, &manifest.artifact_name)?;
-    let component_bytes = encode_component(&wasm_path)?;
+    let mut component_bytes = encode_component(&wasm_path)?;
+    if !manifest.role.plugs.is_empty() {
+        let plugs = manifest
+            .role
+            .plugs
+            .iter()
+            .map(|plug| {
+                let library = libraries
+                    .get(plug)
+                    .ok_or_else(|| BootProgramError::UnknownPlug {
+                        command: manifest.command.clone(),
+                        plug: plug.clone(),
+                    })?;
+                let path = build
+                    .wasm
+                    .component(&library.manifest_path, &library.artifact_name)?;
+                Ok((plug.clone(), encode_component(&path)?))
+            })
+            .collect::<Result<Vec<_>, BootfsError>>()?;
+        component_bytes = compose(&manifest.command, component_bytes, plugs)?;
+    }
     let payload =
         precompile_artifact(&component_bytes, build.target, Hint::Performance.into())?.bytes;
     let output_path = build
@@ -2146,11 +2219,90 @@ fn read_program_manifest(
         .ok_or_else(|| BootProgramError::ManifestHasNoName {
             path: manifest_path.display().to_string(),
         })?;
+    let role = manifest
+        .get("package")
+        .and_then(|package| package.get("metadata"))
+        .and_then(|metadata| metadata.get("helios"))
+        .cloned()
+        .map(Value::try_into::<ProgramRole>)
+        .transpose()
+        .map_err(|source| BootProgramError::ParseManifest {
+            path: manifest_path.display().to_string(),
+            source,
+        })?
+        .unwrap_or_default();
+    if role.library && !role.plugs.is_empty() {
+        return Err(BootProgramError::LibraryPlugs {
+            command: command.to_owned(),
+            plugs: role.plugs.join(", "),
+        });
+    }
     Ok(ProgramManifest {
         command: command.to_owned(),
         manifest_path: manifest_path.to_path_buf(),
         artifact_name: format!("{artifact_stem}.wasm"),
+        role,
     })
+}
+
+/// Plugs each library's exports into the imports of `command`'s component
+/// that they satisfy; what the libraries import stays imported by the
+/// result, beside the program's own imports.
+fn compose(
+    command: &str,
+    socket: Vec<u8>,
+    plugs: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<u8>, WasmBuildError> {
+    let mut graph = wac_graph::CompositionGraph::new();
+    let mut register = |name: &str, bytes: Vec<u8>| {
+        // A package name in the graph is a `namespace:name` pair.
+        let package_name = format!("helios:{name}");
+        let package =
+            wac_graph::types::Package::from_bytes(&package_name, None, bytes, graph.types_mut())
+                .map_err(|error| WasmBuildError::LoadComposed {
+                    name: name.to_owned(),
+                    report: format!("{error:#}"),
+                })?;
+        graph
+            .register_package(package)
+            .map_err(|source| WasmBuildError::RegisterComposed {
+                name: name.to_owned(),
+                source,
+            })
+    };
+    let socket = register(command, socket)?;
+    let plug_names = plugs
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plugs = plugs
+        .into_iter()
+        .map(|(name, bytes)| register(&name, bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    wac_graph::plug(&mut graph, plugs, socket).map_err(|error| WasmBuildError::Plug {
+        command: command.to_owned(),
+        plugs: plug_names,
+        report: error_chain(&error),
+    })?;
+    graph
+        .encode(wac_graph::EncodeOptions::default())
+        .map_err(|source| WasmBuildError::EncodeComposition {
+            command: command.to_owned(),
+            source,
+        })
+}
+
+/// An error and every source under it, outermost first.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut report = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        report.push_str(": ");
+        report.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    report
 }
 
 /// The target directory every `wasm32-wasip2` component program builds

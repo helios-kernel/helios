@@ -5,6 +5,7 @@ edition.workspace = true
 autobins = false
 
 [package.metadata.helios]
+library = true
 venus-protocol = true
 target-features = ["atomics"]
 

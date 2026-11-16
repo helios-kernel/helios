@@ -2,7 +2,10 @@
 // W3C Community Contributor License Agreement:
 // https://www.w3.org/community/about/agreements/cla/
 // WebAssembly/wasi-webgpu v0.3.0-rc.2, commit 6a776bada0b66d3dbf9da304a49ff2947ce4e1f8.
-// Helios adds recoverable canvas configuration and invalid-state errors.
+// Helios adds recoverable canvas configuration and invalid-state errors,
+// and declares gpu-device's destroy, lost and on-uncaptured-error async:
+// a guest implementation writes their future and stream from a task, which
+// only an async export has.
 package wasi:webgpu@0.3.0-rc.2;
 
 interface webgpu {
@@ -346,7 +349,7 @@ interface webgpu {
     limits: func() -> gpu-supported-limits;
     adapter-info: func() -> gpu-adapter-info;
     queue: func() -> gpu-queue;
-    destroy: func();
+    destroy: async func();
     create-buffer: func(descriptor: gpu-buffer-descriptor) -> gpu-buffer;
     create-texture: func(descriptor: gpu-texture-descriptor) -> gpu-texture;
     create-sampler: func(descriptor: option<gpu-sampler-descriptor>) -> gpu-sampler;
@@ -363,10 +366,10 @@ interface webgpu {
     create-query-set: func(descriptor: gpu-query-set-descriptor) -> result<gpu-query-set, create-query-set-error>;
     label: func() -> string;
     set-label: func(label: string);
-    lost: func() -> future<gpu-device-lost-info>;
+    lost: async func() -> future<gpu-device-lost-info>;
     push-error-scope: func(filter: gpu-error-filter);
     pop-error-scope: async func() -> result<option<gpu-error>, pop-error-scope-error>;
-    on-uncaptured-error: func() -> stream<gpu-error>;
+    on-uncaptured-error: async func() -> stream<gpu-error>;
   }
   record gpu-device-descriptor {
     required-features: option<list<gpu-feature-name>>,
