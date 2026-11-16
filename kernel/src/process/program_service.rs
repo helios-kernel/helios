@@ -421,7 +421,7 @@ impl ProgramExecError {
                 };
             }
             FsError::NoEntry => ProgramExecErrorKind::NotFound,
-            FsError::Io => ProgramExecErrorKind::Io,
+            FsError::Io | FsError::NoSpace => ProgramExecErrorKind::Io,
             FsError::NotDirectory
             | FsError::IsDirectory
             | FsError::ReadOnly

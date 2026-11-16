@@ -41,7 +41,7 @@ wasmtime-bare-metal = [
 helios-sync = { workspace = true, features = ["runtime"] }
 helios-unix = { workspace = true, optional = true }
 helios-linux = { path = "../linux", default-features = false, optional = true }
-helios-btrfs = { path = "../btrfs", default-features = false }
+helios-btrfs = { path = "../btrfs", default-features = false, features = ["write"] }
 async-task = { version = "4.7.1", default-features = false }
 atomic-waker = "1.1.2"
 arrayvec = { version = "0.7.6", default-features = false }
@@ -91,6 +91,8 @@ frame-alloc = { version = "=0.1.0", default-features = false, features = ["stats
 zrip = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+# The compression test reads each extent's stored kind and algorithm.
+helios-btrfs = { path = "../btrfs", default-features = false, features = ["write", "test-support"] }
 ferrosys = { version = "0.8.0", default-features = false, features = ["btrfs"] }
 critical-section = { version = "1.2.0", features = ["std"] }
 # The image builder writes the EROFS fixtures that run on every host;

@@ -45,7 +45,7 @@ mod request;
 mod root;
 mod storage;
 
-pub use btrfs::BtrfsFs;
+pub use btrfs::{BtrfsFs, BtrfsMountError, BtrfsService, BtrfsWriteOptions};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
 pub use memory::{MemoryFs, MemoryWrite};
@@ -183,12 +183,12 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.create_directory(path, now).await,)+ }
             }
 
-            async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.remove_directory(path).await,)+ }
+            async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.remove_directory(path, now).await,)+ }
             }
 
-            async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.unlink(path).await,)+ }
+            async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.unlink(path, now).await,)+ }
             }
 
             async fn rename(
@@ -304,7 +304,7 @@ macro_rules! mount_kinds {
 
 /// Writes `data` at `position` through [`helios_hal::fs::write_with`],
 /// and resolves with the offset it landed at: the filesystem tests'
-/// write.
+/// write. It asserts that every byte landed.
 #[cfg(test)]
 pub(crate) async fn write_bytes<F: FileSystem>(
     fs: &F,
@@ -313,10 +313,13 @@ pub(crate) async fn write_bytes<F: FileSystem>(
     data: &[u8],
     now: u64,
 ) -> FsResult<u64> {
-    helios_hal::fs::write_with(fs, path, position, data.len(), now, |at, destination| {
-        destination.copy_from_slice(&data[at..at + destination.len()]);
-    })
-    .await
+    let landed =
+        helios_hal::fs::write_with(fs, path, position, data.len(), now, |at, destination| {
+            destination.copy_from_slice(&data[at..at + destination.len()]);
+        })
+        .await?;
+    assert_eq!(landed.len, data.len(), "the write landed in full");
+    Ok(landed.offset)
 }
 
 mount_kinds! {
@@ -1296,12 +1299,15 @@ impl<S: Storage> Namespace<S> {
     /// Removes the empty directory `absolute`. A mount point, or a
     /// directory with a mount point below it, is in use:
     /// [`FsError::Busy`].
-    pub async fn remove_directory(&self, absolute: &str) -> FsResult<()> {
+    pub async fn remove_directory(&self, absolute: &str, now: u64) -> FsResult<()> {
         let resolved = self.resolve(absolute)?;
         if resolved.is_mount_root() || self.holds_mounts(absolute) {
             return Err(FsError::Busy);
         }
-        resolved.writable()?.remove_directory(resolved.path()).await
+        resolved
+            .writable()?
+            .remove_directory(resolved.path(), now)
+            .await
     }
 
     /// Renames within one mount; across two, [`FsError::CrossDevice`]. A

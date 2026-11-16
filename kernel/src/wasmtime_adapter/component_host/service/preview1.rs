@@ -2745,7 +2745,7 @@ impl<StorageImpl: crate::Storage> Preview1ChunkedFile for ResolvedFileChunks<'_,
         gather: &mut Preview1Gather,
         position: WritePosition,
         len: usize,
-    ) -> Result<Result<u64, fs_types::ErrorCode>, GuestAccessError> {
+    ) -> Result<Result<ChunkLanded, fs_types::ErrorCode>, GuestAccessError> {
         // The chunk's pages are brought in before the write is staged, so
         // waiting on swap holds up this write and never the file; each
         // round checks them again in the poll that fills it.
@@ -2757,9 +2757,10 @@ impl<StorageImpl: crate::Storage> Preview1ChunkedFile for ResolvedFileChunks<'_,
             };
         let landed = gather.submit_staged(memory, write).await?;
         Ok(landed.map_err(wasi_fs::fs_error_code).and_then(|landed| {
-            landed
-                .checked_add(len as u64)
-                .ok_or(fs_types::ErrorCode::Overflow)
+            Ok(ChunkLanded {
+                end: landed.end().ok_or(fs_types::ErrorCode::Overflow)?,
+                len: landed.len,
+            })
         }))
     }
 }
@@ -3389,7 +3390,7 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::remove_directory_at(&namespace, granted, &path)
+    wasi_fs::remove_directory_at(&namespace, granted, &path, caller.data().now_nanos())
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3551,7 +3552,7 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::unlink_file_at(&namespace, granted, &path)
+    wasi_fs::unlink_file_at(&namespace, granted, &path, caller.data().now_nanos())
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -4794,6 +4795,7 @@ pub(super) fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
         fs_types::ErrorCode::Unsupported => p1::errno::NOTSUP,
         fs_types::ErrorCode::Overflow => p1::errno::OVERFLOW,
         fs_types::ErrorCode::NotPermitted => p1::errno::PERM,
+        fs_types::ErrorCode::InsufficientSpace => p1::errno::NOSPC,
         fs_types::ErrorCode::ReadOnly => p1::errno::ROFS,
         fs_types::ErrorCode::CrossDevice => p1::errno::XDEV,
         _ => p1::errno::IO,
@@ -6209,6 +6211,9 @@ mod tests {
         accepts: usize,
         /// What another writer appends after the first chunk landed.
         other_writer: &'static [u8],
+        /// How many bytes the file can still store: a chunk past it is
+        /// stored in part, as a filesystem that runs out of space does.
+        room: usize,
     }
 
     impl ChunkedFile {
@@ -6218,6 +6223,7 @@ mod tests {
                 positions: Vec::new(),
                 accepts,
                 other_writer: b"",
+                room: usize::MAX,
             }
         }
     }
@@ -6231,7 +6237,7 @@ mod tests {
             gather: &mut Preview1Gather,
             position: WritePosition,
             len: usize,
-        ) -> Result<Result<u64, i32>, GuestAccessError> {
+        ) -> Result<Result<ChunkLanded, i32>, GuestAccessError> {
             if self.positions.len() == 1 {
                 self.bytes.extend_from_slice(self.other_writer);
             }
@@ -6244,11 +6250,18 @@ mod tests {
                 WritePosition::End => self.bytes.len(),
                 WritePosition::At(at) => at as usize,
             };
-            if self.bytes.len() < at + len {
-                self.bytes.resize(at + len, 0);
+            let stored = len.min(self.room);
+            self.room -= stored;
+            if self.bytes.len() < at + stored {
+                self.bytes.resize(at + stored, 0);
             }
-            gather.fill(memory, &mut self.bytes[at..at + len]).await?;
-            Ok(Ok((at + len) as u64))
+            gather
+                .fill(memory, &mut self.bytes[at..at + stored])
+                .await?;
+            Ok(Ok(ChunkLanded {
+                end: (at + stored) as u64,
+                len: stored,
+            }))
         }
     }
 
@@ -6347,6 +6360,32 @@ mod tests {
         .expect("the guest's pages are present");
         assert_eq!(landed, Ok((4, 0)));
         assert_eq!(file.positions, [WritePosition::End]);
+    }
+
+    /// A chunk the file stores only a prefix of ends the write there: the
+    /// guest is told how many bytes landed, and no later chunk is tried.
+    #[test]
+    fn a_chunk_stored_in_part_ends_the_write_after_the_prefix() {
+        let (guest, layout) = one_iovec(3 * P1_IO_CHUNK_BYTES);
+        let memory = async_memory_of(&guest);
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
+        let mut file = ChunkedFile::new(b"", usize::MAX);
+        let prefix = P1_IO_CHUNK_BYTES + 5;
+        file.room = prefix;
+        let landed = run(p1_write_gathered(
+            &memory,
+            &mut gather,
+            WritePosition::At(0),
+            &mut file,
+        ))
+        .expect("the guest's pages are present");
+        assert_eq!(landed, Ok((prefix as u64, prefix as u32)));
+        assert_eq!(
+            file.positions.len(),
+            2,
+            "no chunk is tried after the short one"
+        );
+        assert!(file.bytes == guest[..prefix]);
     }
 
     /// A receive whose buffers run from a present page onto one swap has

@@ -8,7 +8,8 @@ use ferrosys::btrfs::{FormatOptions, SubvolumeRequest, format_to};
 use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
-    BlockSerial, DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags,
+    BlockSerial, DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind,
+    OpenFlags, PreparedWrite, WritePosition, WriteProgress, write_with,
 };
 
 use super::BtrfsFs;
@@ -29,8 +30,159 @@ impl Storage for MemoryStorage {
     type Disk = MemoryDisk;
 }
 
+fn options(time: Timestamp) -> FormatOptions {
+    FormatOptions::new([0x51; 16], time)
+        .subvolume(SubvolumeRequest::new(b"/@home".to_vec(), [0x52; 16]))
+}
+
+fn formatted_image(tree: TreeBuilder, options: FormatOptions) -> crate::BlockCache<MemoryDisk> {
+    formatted_cache(tree, options, true)
+}
+
+fn formatted_writable_image(
+    tree: TreeBuilder,
+    options: FormatOptions,
+) -> crate::BlockCache<MemoryDisk> {
+    formatted_cache(tree, options, false)
+}
+
+fn formatted_cache(
+    tree: TreeBuilder,
+    options: FormatOptions,
+    read_only: bool,
+) -> crate::BlockCache<MemoryDisk> {
+    // ferrosys' default geometry requires a volume above 109 MiB.
+    let size = 128 << 20;
+    let mut image = tempfile::tempfile().expect("image file");
+    image.set_len(size).expect("image length");
+    format_to(&mut image, tree, size, options).expect("formats btrfs");
+    image.seek(SeekFrom::Start(0)).expect("rewinds");
+    let mut bytes = Vec::new();
+    image.read_to_end(&mut bytes).expect("reads image");
+    let disk = if read_only {
+        MemoryDisk::holding("btrfs-test", &bytes, false)
+    } else {
+        MemoryDisk::holding_writable("btrfs-test", &bytes)
+    };
+    drop(bytes);
+    cache_over(&disk, 256, 1)
+}
+
 fn path(value: &str) -> FsPath<'_> {
     FsPath::new(value).expect("normalized path")
+}
+
+fn write_options(
+    concurrency: usize,
+    compress: Option<helios_btrfs::write::CompressionPolicy>,
+) -> crate::vfs::BtrfsWriteOptions {
+    crate::vfs::BtrfsWriteOptions {
+        entropy: crate::test_support::test_root_entropy(),
+        concurrency: core::num::NonZeroUsize::new(concurrency).unwrap(),
+        compress,
+    }
+}
+
+/// A writable mount with a compression policy stores compressible data in
+/// compressed extents: the reader returns the same bytes, every regular
+/// extent item names the policy's algorithm (a plain mount's name none), and the superblock
+/// records the algorithm's incompat bit.
+#[test]
+fn a_compressing_mount_writes_extents_the_reader_reads_back() {
+    use helios_btrfs::write::CompressionPolicy;
+    use helios_btrfs::{Compression, ExtentKind};
+
+    // Text with CJK, repeated past one 128 KiB extent so several extents form.
+    let payload: Vec<u8> = "压缩 圧縮 압축 compressible line\n"
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(300_000)
+        .collect();
+    // The incompat bits of btrfs_tree.h: COMPRESS_LZO and COMPRESS_ZSTD.
+    for (algorithm, level, bit) in [
+        (None, 0, 0),
+        (Some(Compression::Zlib), 0, 0),
+        (Some(Compression::Zlib), 9, 0),
+        (Some(Compression::Lzo), 0, 1 << 3),
+        (Some(Compression::Zstd), 0, 1 << 4),
+        (Some(Compression::Zstd), -5, 1 << 4),
+    ] {
+        let policy = algorithm.map(|algorithm| CompressionPolicy::new(algorithm, level));
+        let time = Timestamp::from_secs(1_700_000_000);
+        let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+        let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
+        block_on(async {
+            let (fs, service) = BtrfsFs::mount_writable(
+                cache.disk(0),
+                || DeviceId::new(100),
+                write_options(2, policy),
+            )
+            .await
+            .expect("writable mount");
+            let payload = &payload;
+            let client = async move {
+                fs.open(
+                    path("text"),
+                    OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                    1_000_000_000,
+                )
+                .await
+                .expect("create");
+                write_with(
+                    &fs,
+                    path("text"),
+                    WritePosition::At(0),
+                    payload.len(),
+                    1_000_000_001,
+                    |offset, bytes| bytes.copy_from_slice(&payload[offset..offset + bytes.len()]),
+                )
+                .await
+                .expect("write");
+                fs.sync(path("text")).await.expect("sync");
+                assert_eq!(
+                    fs.read_at(path("text"), 0, payload.len()).await.unwrap(),
+                    payload.as_slice()
+                );
+                drop(fs);
+            };
+            futures::future::join(client, service.run()).await;
+            let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
+                .await
+                .expect("reopen");
+            assert_eq!(
+                reopened
+                    .read_at(path("text"), 0, payload.len())
+                    .await
+                    .unwrap(),
+                payload.as_slice(),
+                "{policy:?}"
+            );
+            let snapshot = reopened.inner.reader.lock().clone();
+            let inode = snapshot.resolve(b"/text").await.unwrap();
+            assert_eq!(inode.metadata().size, payload.len() as u64);
+            // Read the stored form off the extent items: this payload
+            // shrinks in every extent under every algorithm, so each regular
+            // extent carries the policy's algorithm and a plain mount's
+            // carry none.
+            let extents = snapshot.file_extents(&inode).await.unwrap();
+            assert!(!extents.is_empty(), "{policy:?} wrote no extents");
+            assert_eq!(
+                extents.iter().map(|extent| extent.len).sum::<u64>(),
+                payload.len().next_multiple_of(4096) as u64,
+                "{policy:?} extents cover the file"
+            );
+            for extent in &extents {
+                assert_eq!(extent.kind, ExtentKind::Regular, "{policy:?} {extent:?}");
+                assert_eq!(extent.compression, algorithm, "{policy:?} {extent:?}");
+            }
+            assert_eq!(
+                snapshot.superblock().incompat_flags() & (1 << 3 | 1 << 4),
+                bit
+            );
+        });
+    }
 }
 
 /// The bytes of a btrfs volume holding `tree`.
@@ -146,10 +298,7 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
         .symlink("/link", "hello", Metadata::new(0o777, time))
         .directory("/@home", dir)
         .file("/@home/notes", b"subvolume\n", file);
-    let options = FormatOptions::new([0x51; 16], time)
-        .subvolume(SubvolumeRequest::new(b"/@home".to_vec(), [0x52; 16]));
-    let disk = MemoryDisk::holding("btrfs-test", &format_image(tree, options), false);
-    let cache = cache_over(&disk, 256, 1);
+    let cache = formatted_image(tree, options(time));
     let fs = mount(&cache);
 
     let root = block_on(fs.stat(path(""))).expect("root");
@@ -224,7 +373,12 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
             serial: BlockSerial::new(b"btrfs-test").unwrap(),
         },
         "/mnt",
-        false,
+        true,
+        crate::vfs::BtrfsWriteOptions {
+            entropy: crate::test_support::test_root_entropy(),
+            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+            compress: None,
+        },
     ))
     .expect("mount request");
     let resolved = namespace.resolve("/mnt/hello").expect("mounted file");
@@ -241,4 +395,364 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
         block_on(followed.fs().read_at(followed.path(), 0, 99)).expect("read through symlink"),
         &b"hello btrfs\n"[..]
     );
+}
+
+/// The guest smoke's sequence through a writable namespace mount, ending in
+/// the namespace link every guest ABI's link call reaches.
+#[test]
+fn a_writable_mount_links_a_file_created_through_the_namespace() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+    let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
+    const BOOT: EmbeddedBootFs = EmbeddedBootFs::new(&[EmbeddedBootDirectory::new("mnt", 0)], &[]);
+    let namespace =
+        Namespace::<MemoryStorage>::new(MountTable::new(BootFs::new(BOOT, BOOT_DEVICE), 1));
+    let service = block_on(request_mount(
+        &ProcessAuthority::root(),
+        &namespace,
+        AttachedStorage {
+            host_share: None,
+            disks: Some(cache),
+        },
+        MountSource::Btrfs {
+            serial: BlockSerial::new(b"btrfs-test").unwrap(),
+        },
+        "/mnt",
+        false,
+        crate::vfs::BtrfsWriteOptions {
+            entropy: crate::test_support::test_root_entropy(),
+            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+            compress: None,
+        },
+    ))
+    .expect("mount request")
+    .expect("a writable btrfs mount returns its service");
+    let client = async {
+        let resolved = namespace.resolve("/mnt/written").unwrap();
+        resolved
+            .writable()
+            .unwrap()
+            .create_directory(resolved.path(), 1_000_000_000)
+            .await
+            .expect("mkdir");
+        let resolved = namespace.resolve("/mnt/written/original").unwrap();
+        let fs = resolved.writable().unwrap();
+        fs.open(
+            resolved.path(),
+            OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            1_000_000_001,
+        )
+        .await
+        .expect("create");
+        write_with(
+            fs,
+            resolved.path(),
+            WritePosition::At(0),
+            4096,
+            1_000_000_002,
+            |_, bytes| bytes.fill(0x50),
+        )
+        .await
+        .expect("write");
+        fs.sync(resolved.path()).await.expect("fsync");
+        namespace
+            .link("/mnt/written/original", "/mnt/written/hard", 1_000_000_003)
+            .await
+            .expect("link through the namespace");
+        assert_eq!(
+            namespace
+                .resolve("/mnt/written/hard")
+                .unwrap()
+                .fs()
+                .stat(path("written/hard"))
+                .await
+                .unwrap()
+                .link_count,
+            2
+        );
+    };
+    let service = service.run();
+    futures::pin_mut!(client, service);
+    match block_on(futures::future::select(client, service)) {
+        futures::future::Either::Left(((), _)) => {}
+        futures::future::Either::Right(_) => panic!("the write service stopped first"),
+    }
+}
+
+#[test]
+fn writable_service_publishes_namespace_and_survives_remount() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, time)).file(
+        "/file",
+        b"durable contents",
+        Metadata::new(0o644, time),
+    );
+    let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
+    block_on(async {
+        let (fs, service) =
+            BtrfsFs::mount_writable(cache.disk(0), || DeviceId::new(100), write_options(2, None))
+                .await
+                .expect("writable mount");
+        assert!(matches!(
+            BtrfsFs::mount(cache.disk(0), || DeviceId::new(102)).await,
+            Err(super::BtrfsMountError::Busy)
+        ));
+        assert!(matches!(
+            BtrfsFs::mount_writable(cache.disk(0), || DeviceId::new(103), write_options(1, None))
+                .await,
+            Err(super::BtrfsMountError::Busy)
+        ));
+        let client = async move {
+            fs.open(
+                path("created"),
+                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                1_000_000_000,
+            )
+            .await
+            .expect("create file");
+            assert_eq!(
+                fs.open(
+                    path("created"),
+                    OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                    1_000_000_000
+                )
+                .await,
+                Err(FsError::Exists)
+            );
+            let payload = alloc::vec![0x53; 19_000];
+            let start = write_with(
+                &fs,
+                path("created"),
+                WritePosition::At(0),
+                payload.len(),
+                1_000_000_001,
+                |offset, bytes| bytes.copy_from_slice(&payload[offset..offset + bytes.len()]),
+            )
+            .await
+            .expect("multiple rounds");
+            assert_eq!(
+                start,
+                Landed {
+                    offset: 0,
+                    len: payload.len()
+                }
+            );
+            assert_eq!(
+                fs.read_at(path("created"), 0, payload.len()).await.unwrap(),
+                payload.as_slice()
+            );
+            let staged = fs
+                .prepare_write(path("created"), WritePosition::End, 5, 1_000_000_002)
+                .await
+                .expect("stage without mutation");
+            drop(staged);
+            assert_eq!(
+                fs.stat(path("created")).await.unwrap().size,
+                payload.len() as u64
+            );
+            let first = fs
+                .prepare_write(path("created"), WritePosition::End, 3, 1_000_000_003)
+                .await
+                .unwrap();
+            let second = fs
+                .prepare_write(path("created"), WritePosition::End, 2, 1_000_000_004)
+                .await
+                .unwrap();
+            fs.rename(path("created"), path("renamed"), 1_000_000_005)
+                .await
+                .expect("rename prepared inode");
+            let (first, second) = futures::future::join(
+                first.fill(|_, bytes| bytes.fill(0x41)).submit(),
+                second.fill(|_, bytes| bytes.fill(0x42)).submit(),
+            )
+            .await;
+            assert!(matches!(
+                first,
+                Ok(WriteProgress::Done(Landed {
+                    offset: 19_000,
+                    len: 3
+                }))
+            ));
+            assert!(matches!(
+                second,
+                Ok(WriteProgress::Done(Landed {
+                    offset: 19_003,
+                    len: 2
+                }))
+            ));
+            assert_eq!(
+                fs.read_at(path("renamed"), 19_000, 5).await.unwrap(),
+                &b"AAABB"[..]
+            );
+            fs.create_directory(path("dir"), 2_000_000_000)
+                .await
+                .expect("mkdir");
+            fs.link(path("file"), path("dir/link"), 3_000_000_000)
+                .await
+                .expect("link");
+            fs.rename(path("dir/link"), path("dir/moved"), 4_000_000_000)
+                .await
+                .expect("rename");
+            fs.set_size(path("dir/moved"), 7, 5_000_000_000)
+                .await
+                .expect("truncate");
+            fs.symlink("moved", path("dir/symlink"), 6_000_000_000)
+                .await
+                .expect("symlink");
+            assert_eq!(
+                fs.remove_directory(path("dir"), 7_000_000_000).await,
+                Err(FsError::NotEmpty)
+            );
+            assert_eq!(
+                fs.unlink(path("dir"), 7_000_000_000).await,
+                Err(FsError::IsDirectory)
+            );
+            fs.open(path("dir/deleted"), OpenFlags::CREATE, 7_000_000_000)
+                .await
+                .unwrap();
+            fs.unlink(path("dir/deleted"), 8_000_000_000).await.unwrap();
+            let parent = fs.stat(path("dir")).await.unwrap();
+            assert_eq!(parent.modified_nanos, 8_000_000_000);
+            assert_eq!(parent.status_nanos, 8_000_000_000);
+            fs.open(
+                path("dir/fresh"),
+                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                9_000_000_000,
+            )
+            .await
+            .expect("create in a created directory");
+            write_with(
+                &fs,
+                path("dir/fresh"),
+                WritePosition::At(0),
+                4096,
+                9_000_000_001,
+                |_, bytes| bytes.fill(0x46),
+            )
+            .await
+            .expect("write the fresh file");
+            fs.sync(path("dir/fresh")).await.expect("fsync");
+            fs.link(path("dir/fresh"), path("dir/fresh-link"), 9_000_000_002)
+                .await
+                .expect("link a file created and synced in this mount");
+            fs.sync(path("file")).await.expect("sync commit");
+            assert_eq!(
+                fs.read_at(path("file"), 0, 99).await.unwrap(),
+                &b"durable"[..]
+            );
+            drop(fs);
+        };
+        futures::future::join(client, service.run()).await;
+        let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened.read_at(path("dir/moved"), 0, 99).await.unwrap(),
+            &b"durable"[..]
+        );
+        assert_eq!(
+            reopened.read_at(path("renamed"), 19_000, 5).await.unwrap(),
+            &b"AAABB"[..]
+        );
+        assert_eq!(
+            reopened.read_link(path("dir/symlink")).await.unwrap(),
+            "moved"
+        );
+    });
+}
+
+/// The byte every sector of the full-device test's file holds at `offset`:
+/// one value per 4 KiB sector, so a shifted or repeated sector reads wrong.
+fn sector_pattern(offset: usize) -> u8 {
+    ((offset / 4096) % 251) as u8 + 1
+}
+
+#[test]
+fn a_full_device_stores_a_prefix_then_refuses_with_no_space() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+    let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
+    // Far more than the 128 MiB image can hold.
+    const REQUESTED: usize = 160 << 20;
+    const NAME: &str = "容量-容量-용량";
+    let stored = block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache.disk(0),
+            || DeviceId::new(100),
+            write_options(64, None),
+        )
+        .await
+        .expect("writable mount");
+        let client = async move {
+            fs.open(
+                path(NAME),
+                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                1_000_000_000,
+            )
+            .await
+            .expect("create file");
+            let landed = write_with(
+                &fs,
+                path(NAME),
+                WritePosition::At(0),
+                REQUESTED,
+                1_000_000_001,
+                |offset, bytes| {
+                    // Rounds and sectors both start on sector boundaries.
+                    for (index, sector) in bytes.chunks_mut(4096).enumerate() {
+                        sector.fill(sector_pattern(offset + index * 4096));
+                    }
+                },
+            )
+            .await
+            .expect("a prefix of the write lands");
+            assert_eq!(landed.offset, 0);
+            assert!(landed.len > 0, "something landed");
+            assert!(landed.len < REQUESTED, "the device ran out of space");
+            assert_eq!(
+                fs.stat(path(NAME)).await.unwrap().size,
+                landed.len as u64,
+                "the file holds exactly the prefix"
+            );
+            // No sector is left, so the next write stores nothing.
+            let refused = write_with(
+                &fs,
+                path(NAME),
+                WritePosition::End,
+                4096,
+                1_000_000_002,
+                |_, bytes| bytes.fill(0x5a),
+            )
+            .await;
+            assert_eq!(refused, Err(FsError::NoSpace));
+            fs.sync(path(NAME)).await.expect("the prefix commits");
+            drop(fs);
+            landed.len
+        };
+        futures::future::join(client, service.run()).await.0
+    });
+    block_on(async {
+        let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
+            .await
+            .expect("remount");
+        assert_eq!(reopened.stat(path(NAME)).await.unwrap().size, stored as u64);
+        const READ: usize = 1 << 20;
+        let mut offset = 0;
+        while offset < stored {
+            let chunk = reopened
+                .read_at(path(NAME), offset as u64, READ)
+                .await
+                .expect("reads the prefix");
+            assert!(!chunk.is_empty(), "the file is shorter than its size");
+            for (index, sector) in chunk.chunks(4096).enumerate() {
+                let at = offset + index * 4096;
+                assert!(
+                    sector.iter().all(|byte| *byte == sector_pattern(at)),
+                    "sector at {at}"
+                );
+            }
+            offset += chunk.len();
+        }
+        assert_eq!(offset, stored);
+    });
 }

@@ -1,4 +1,4 @@
-use helios_hal::fs::{FilledWrite, FsResult, PreparedWrite, WriteProgress};
+use helios_hal::fs::{FilledWrite, FsResult, Landed, PreparedWrite, WriteProgress};
 use helios_hal::vmm::{VirtAddr, VirtRange};
 use thiserror::Error;
 
@@ -832,7 +832,7 @@ impl Preview1Gather {
 
     /// Lands everything `write` staged straight from the guest's buffers
     /// into the filesystem's own destinations, so each byte is copied
-    /// once, and answers the offset the write began at.
+    /// once, and answers where the write began and how many bytes landed.
     ///
     /// Before each round is submitted, every page its bytes come from is
     /// brought in, and the final check that finds them all present runs
@@ -842,7 +842,7 @@ impl Preview1Gather {
         &mut self,
         memory: &Preview1AsyncMemory,
         mut write: Write,
-    ) -> Result<FsResult<u64>, GuestAccessError> {
+    ) -> Result<FsResult<Landed>, GuestAccessError> {
         loop {
             self.bring_in(memory, write.staged_len()).await?;
             let submitted = write.fill(|_, destination| self.fill_present(memory, destination));
@@ -982,15 +982,26 @@ pub(super) trait Preview1ChunkedFile {
     type Refusal;
 
     /// Takes the next `len` bytes out of `gather`, lands them at
-    /// `position`, and answers the end of the file they reached. A page of
-    /// the guest's buffers that cannot come back from swap ends the write.
+    /// `position`, and answers the end of the file they reached and how
+    /// many of them landed: fewer than `len` when the file ran out of
+    /// space after storing a prefix. A page of the guest's buffers that
+    /// cannot come back from swap ends the write.
     fn land(
         &mut self,
         memory: &Preview1AsyncMemory,
         gather: &mut Preview1Gather,
         position: WritePosition,
         len: usize,
-    ) -> impl Future<Output = Result<Result<u64, Self::Refusal>, GuestAccessError>> + Send;
+    ) -> impl Future<Output = Result<Result<ChunkLanded, Self::Refusal>, GuestAccessError>> + Send;
+}
+
+/// What one chunk of a gathered write left in the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ChunkLanded {
+    /// The end of the file the stored bytes reached.
+    pub(super) end: u64,
+    /// The bytes stored, at most the chunk's length.
+    pub(super) len: usize,
 }
 
 /// What a gathered write to a file came to: the end of the file its last
@@ -1007,7 +1018,7 @@ pub(super) type Preview1Landed<Refusal> = Result<(u64, u32), Refusal>;
 /// so it never lands on what another writer appended in between; a
 /// positioned write continues where its last chunk ended. A refusal after
 /// some chunks landed is a short write: the guest meets the refusal on its
-/// next call.
+/// next call. A chunk the file stored only a prefix of ends the write there.
 pub(super) async fn p1_write_gathered<File: Preview1ChunkedFile + Send>(
     memory: &Preview1AsyncMemory,
     gather: &mut Preview1Gather,
@@ -1015,23 +1026,26 @@ pub(super) async fn p1_write_gathered<File: Preview1ChunkedFile + Send>(
     file: &mut File,
 ) -> Result<Preview1Landed<File::Refusal>, GuestAccessError> {
     let len = gather.next_len();
-    let mut end = match file.land(memory, gather, position, len).await? {
-        Ok(end) => end,
+    let first = match file.land(memory, gather, position, len).await? {
+        Ok(landed) => landed,
         Err(refusal) => return Ok(Err(refusal)),
     };
+    let mut end = first.end;
     // The iovecs' sum fits a `u32`, so no count of it overflows.
-    let mut written = len as u32;
-    while gather.remaining() > 0 {
+    let mut written = first.len as u32;
+    let mut short = first.len < len;
+    while gather.remaining() > 0 && !short {
         let next = match position {
             WritePosition::End => WritePosition::End,
             WritePosition::At(_) => WritePosition::At(end),
         };
         let len = gather.next_len();
-        let Ok(chunk_end) = file.land(memory, gather, next, len).await? else {
+        let Ok(chunk) = file.land(memory, gather, next, len).await? else {
             break;
         };
-        end = chunk_end;
-        written += len as u32;
+        end = chunk.end;
+        written += chunk.len as u32;
+        short = chunk.len < len;
     }
     Ok(Ok((end, written)))
 }
@@ -1337,7 +1351,10 @@ mod tests {
             let mut destination = vec![0_u8; self.len];
             fill(0, &mut destination);
             *self.landed.lock().expect("the record is not poisoned") = Some(destination);
-            Ok(WriteProgress::Done(0))
+            Ok(WriteProgress::Done(Landed {
+                offset: 0,
+                len: self.len,
+            }))
         }
     }
 
@@ -1413,7 +1430,13 @@ mod tests {
         assert_eq!(swap.queued_faults(), 1, "the page was asked for");
 
         swap.serve();
-        assert!(matches!(poll_once(submit.as_mut()), Some(Ok(Ok(0)))));
+        assert!(matches!(
+            poll_once(submit.as_mut()),
+            Some(Ok(Ok(Landed {
+                offset: 0,
+                len: 600
+            })))
+        ));
         assert!(
             landed.lock().expect("unpoisoned").as_deref() == Some(&source[..]),
             "the bytes landed as the guest wrote them"

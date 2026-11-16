@@ -1287,6 +1287,7 @@ pub enum HostFsErrorKind {
     ReadOnly,
     Unsupported,
     NameTooLong,
+    NoSpace,
     Io,
     /// A kind the kernel never opens, with the error that refuses it.
     Refused(FsError),
@@ -1318,6 +1319,8 @@ impl HostFsError {
                 20 => HostFsErrorKind::NotDirectory,
                 21 => HostFsErrorKind::IsDirectory,
                 39 => HostFsErrorKind::NotEmpty,
+                // `ENOSPC`; a 9p2000.L `Rlerror` carries the host's Linux errno.
+                28 => HostFsErrorKind::NoSpace,
                 _ => HostFsErrorKind::Io,
             },
         }
