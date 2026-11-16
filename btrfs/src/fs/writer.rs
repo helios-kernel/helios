@@ -8,6 +8,7 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::Filesystem;
+use crate::accounting::Allocation;
 use crate::compress::write::Encoder;
 use crate::retirement::Retirements;
 use crate::source::BlockSink;
@@ -81,6 +82,9 @@ pub struct CloneRange<'a> {
 
 pub struct Writer<S> {
     current: Option<Filesystem<Arc<S>>>,
+    /// Allocation state of `current`'s generation, loaded and validated once
+    /// at mount and replaced only by a commit that published.
+    allocation: Allocation,
     retirements: Retirements,
     mount: Arc<MountIdentity>,
 }
@@ -89,11 +93,18 @@ impl<S: BlockSink> Writer<S> {
     pub async fn mount(source: S) -> Result<Self, WriteError> {
         let current = Filesystem::mount(Arc::new(source)).await?;
         current.superblock().check_writable()?;
+        let allocation = Allocation::load(&current.volume, current.snapshot.root_tree).await?;
         Ok(Self {
             current: Some(current),
+            allocation,
             retirements: Retirements::default(),
             mount: Arc::new(MountIdentity),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn committed_allocation(&self) -> &Allocation {
+        &self.allocation
     }
 
     pub fn snapshot(&self) -> Result<Filesystem<Arc<S>>, WriteError> {
@@ -104,6 +115,7 @@ impl<S: BlockSink> Writer<S> {
         let base = self.current.take().ok_or(WriteError::WriterPoisoned)?;
         let publication = Publication {
             current: &mut self.current,
+            allocation: &mut self.allocation,
             base: Some(base),
             publishing: false,
         };
@@ -115,6 +127,7 @@ impl<S: BlockSink> Writer<S> {
             base.volume.clone(),
             base.snapshot.clone(),
             &mut self.retirements,
+            publication.allocation,
         )
         .await?;
         Ok(WriteTransaction {
@@ -128,6 +141,7 @@ impl<S: BlockSink> Writer<S> {
 
 struct Publication<'a, S> {
     current: &'a mut Option<Filesystem<Arc<S>>>,
+    allocation: &'a mut Allocation,
     base: Option<Filesystem<Arc<S>>>,
     publishing: bool,
 }
@@ -463,11 +477,14 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
             creation,
             mount: _,
         } = self;
-        let committed = inner
+        let mut committed = inner
             .commit(uuid, concurrency, || {
                 publication.publishing = true;
             })
             .await?;
+        if let Some(allocation) = committed.allocation.take() {
+            *publication.allocation = allocation;
+        }
         let mut current = publication.base.take().expect("publication owns its base");
         current.publish(committed);
         *publication.current = Some(current);

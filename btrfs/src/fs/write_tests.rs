@@ -74,6 +74,14 @@ impl crate::source::BlockSink for FaultDisk {
     }
 }
 
+/// The committed allocation state of `fs`'s generation, loaded from disk.
+#[cfg(feature = "write")]
+async fn allocation_of<S: BlockSource>(fs: &Filesystem<S>) -> crate::accounting::Allocation {
+    crate::accounting::Allocation::load(&fs.volume, fs.snapshot.root_tree)
+        .await
+        .unwrap()
+}
+
 #[cfg(feature = "write")]
 async fn change_root_mode<S: crate::source::BlockSink>(
     fs: &Filesystem<S>,
@@ -92,6 +100,7 @@ async fn change_root_mode_with_retirements<S: crate::source::BlockSink>(
         fs.volume.view(&fs.snapshot.mapping),
         fs.snapshot.clone(),
         retirements,
+        &allocation_of(fs).await,
     )
     .await?;
     let root = edit_root_mode(fs, &mut transaction).await?;
@@ -2890,6 +2899,7 @@ fn old_inodes_read_their_own_extent_and_checksum_generation() {
             fs.volume.view(&fs.snapshot.mapping),
             fs.snapshot.clone(),
             &mut retirements,
+            &allocation_of(&fs).await,
         )
         .await
         .unwrap();
@@ -3060,6 +3070,7 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
                 current.volume.view(&current.snapshot.mapping),
                 current.snapshot.clone(),
                 &mut retirements,
+                &allocation_of(&current).await,
             )
             .await
             .unwrap();
@@ -3084,6 +3095,7 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
             current.volume.view(&current.snapshot.mapping),
             current.snapshot.clone(),
             &mut retirements,
+            &allocation_of(&current).await,
         )
         .await
         .unwrap();
@@ -3093,6 +3105,269 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
             u64::from(current.superblock().nodesize())
         ));
     });
+}
+
+/// Deterministic, incompressible file content.
+#[cfg(feature = "write")]
+fn noise(length: usize, seed: u8) -> Vec<u8> {
+    let mut state = u32::from(seed) + 1;
+    (0..length)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn carried_allocation_state_equals_a_reload_after_every_commit() {
+    use super::writer::{Attributes, CloneRange, Name, Writer};
+    use crate::compress::write::{Plain, Zstd};
+    use core::num::NonZeroUsize;
+
+    // Extent-tree groups and a separate block-group tree, with and without
+    // the free-space tree.
+    for (separate, free_tree) in [(true, true), (false, true), (false, false)] {
+        block_on(async {
+            let (_, image) = filesystem_image_with_features(separate, free_tree);
+            let mut writer = Writer::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            let concurrency = NonZeroUsize::MIN;
+            let when = crate::Timestamp {
+                seconds: 1_700_000_100,
+                nanoseconds: 0,
+            };
+            let attributes = Attributes {
+                permissions: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            let check = |writer: &Writer<Disk>, step: &'static str| {
+                let image = image.try_clone().unwrap();
+                let carried = writer.committed_allocation().clone();
+                async move {
+                    let fresh = Filesystem::mount(Disk(image)).await.unwrap();
+                    assert!(
+                        carried == allocation_of(&fresh).await,
+                        "carried allocation state diverged from the disk image after {step} \
+                         (separate block-group tree {separate}, free-space tree {free_tree})"
+                    );
+                }
+            };
+            check(&writer, "mount").await;
+
+            // Directory names cover Chinese, Japanese and Korean.
+            let directory = "目录-ディレクトリ-디렉터리".as_bytes();
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let directory = tx
+                .create_directory(
+                    Name {
+                        parent: &root,
+                        bytes: directory,
+                    },
+                    attributes,
+                    when,
+                )
+                .await
+                .unwrap();
+            let name = |bytes| Name {
+                parent: &directory,
+                bytes,
+            };
+            let first = tx
+                .create_file(name(b"a.bin"), attributes, when)
+                .await
+                .unwrap();
+            tx.write_file(
+                &first,
+                0,
+                &noise(300_000, 1),
+                WriteOptions::plain(when, concurrency),
+            )
+            .await
+            .unwrap();
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+            check(&writer, "create").await;
+
+            // A reader of this generation keeps the next commit's retired
+            // blocks pinned; the committed form must not depend on that.
+            let reader = writer.snapshot().unwrap();
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let directory = tx
+                .lookup(&root, "目录-ディレクトリ-디렉터리".as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+            let first = tx.lookup(&directory, b"a.bin").await.unwrap().unwrap();
+            tx.write_file(
+                &first,
+                100_000,
+                &noise(80_000, 2),
+                WriteOptions::plain(when, concurrency),
+            )
+            .await
+            .unwrap();
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+            check(&writer, "overwrite").await;
+
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let directory = tx
+                .lookup(&root, "目录-ディレクトリ-디렉터리".as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+            let compressed = tx
+                .create_file(
+                    Name {
+                        parent: &directory,
+                        bytes: "圧縮-压缩-압축".as_bytes(),
+                    },
+                    attributes,
+                    when,
+                )
+                .await
+                .unwrap();
+            let text = "btrfs 写入 書き込み 쓰기 ".repeat(10_000).into_bytes();
+            tx.write_file(
+                &compressed,
+                0,
+                &text,
+                WriteOptions {
+                    when,
+                    concurrency,
+                    encoder: Zstd::new(3).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+            check(&writer, "compressed write").await;
+
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let directory = tx
+                .lookup(&root, "目录-ディレクトリ-디렉터리".as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+            let first = tx.lookup(&directory, b"a.bin").await.unwrap().unwrap();
+            let clone = tx
+                .create_file(
+                    Name {
+                        parent: &directory,
+                        bytes: b"clone.bin",
+                    },
+                    attributes,
+                    when,
+                )
+                .await
+                .unwrap();
+            tx.clone_range(
+                CloneRange {
+                    source: &first,
+                    destination: &clone,
+                    source_offset: 0,
+                    destination_offset: 0,
+                    length: 131_072,
+                },
+                when,
+                concurrency,
+            )
+            .await
+            .unwrap();
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+            check(&writer, "reflink").await;
+
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let directory = tx
+                .lookup(&root, "目录-ディレクトリ-디렉터리".as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+            tx.unlink_name(
+                Name {
+                    parent: &directory,
+                    bytes: b"a.bin",
+                },
+                when,
+            )
+            .await
+            .unwrap();
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+            check(&writer, "unlink of a cloned file").await;
+
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let directory = tx
+                .lookup(&root, "目录-ディレクトリ-디렉터리".as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+            let clone = tx.lookup(&directory, b"clone.bin").await.unwrap().unwrap();
+            tx.truncate_file(&clone, 4096, when, concurrency)
+                .await
+                .unwrap();
+            tx.unlink_name(
+                Name {
+                    parent: &directory,
+                    bytes: "圧縮-压缩-압축".as_bytes(),
+                },
+                when,
+            )
+            .await
+            .unwrap();
+            tx.commit(|| panic!("valid fixture UUID"), concurrency)
+                .await
+                .unwrap();
+            check(&writer, "truncate and unlink").await;
+
+            // An aborted transaction leaves the carried form in place.
+            let mut tx = writer.begin().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let doomed = tx
+                .create_file(
+                    Name {
+                        parent: &root,
+                        bytes: b"doomed",
+                    },
+                    attributes,
+                    when,
+                )
+                .await
+                .unwrap();
+            tx.write_file(
+                &doomed,
+                0,
+                &noise(50_000, 3),
+                WriteOptions {
+                    when,
+                    concurrency,
+                    encoder: Plain,
+                },
+            )
+            .await
+            .unwrap();
+            drop(tx);
+            check(&writer, "abort").await;
+            drop(reader);
+        });
+    }
 }
 
 #[cfg(feature = "write")]
@@ -3113,6 +3388,7 @@ fn empty_transaction_does_not_publish() {
             fs.volume.view(&fs.snapshot.mapping),
             fs.snapshot.clone(),
             &mut crate::retirement::Retirements::default(),
+            &allocation_of(&fs).await,
         )
         .await
         .unwrap()
@@ -3241,7 +3517,8 @@ fn transaction_publishes_roots_and_preserves_previous_generation() {
                 Transaction::new(
                     fs.volume.view(&fs.snapshot.mapping),
                     fs.snapshot.clone(),
-                    &mut crate::retirement::Retirements::default()
+                    &mut crate::retirement::Retirements::default(),
+                    &allocation_of(&fs).await,
                 )
                 .await,
                 Err(WriteError::StaleSnapshot)

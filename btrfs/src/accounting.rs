@@ -5,7 +5,6 @@
 mod cow;
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rpds::RedBlackTreeMapSync;
 
@@ -40,12 +39,50 @@ pub(crate) struct DataWrite<'a> {
     pub(crate) checksummed: bool,
 }
 
+/// Allocation state of one committed generation, kept by the writer across
+/// transactions so that a transaction never rebuilds it from disk: the
+/// per-group free ranges and the free-space tree's records. Every collection
+/// is persistent, so a transaction starts from an O(1) clone and the writer
+/// replaces its copy only when a commit has published.
+///
+/// The tree roots held inside are stale by one generation; a transaction
+/// rebinds them to the roots it starts from. Mount loads and validates this
+/// once, from the allocation trees.
+#[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub(crate) struct Allocation {
+    pub(crate) space: Space,
+    pub(crate) free: Option<FreeTree>,
+}
+
+impl Allocation {
+    pub(crate) async fn load<S: BlockSource>(
+        volume: &Volume<S>,
+        root: TreeRoot,
+    ) -> Result<Self, WriteError> {
+        let space = Space::load_committed(volume, root).await?;
+        let free = Self::load_free(volume, &space).await?;
+        Ok(Self { space, free })
+    }
+
+    async fn load_free<S: BlockSource>(
+        volume: &Volume<S>,
+        space: &Space,
+    ) -> Result<Option<FreeTree>, WriteError> {
+        let Some(root) = space.free_root() else {
+            return Ok(None);
+        };
+        let expected = space.committed_free(&RedBlackTreeMapSync::new_sync())?;
+        Ok(Some(FreeTree::load(volume, root, &expected).await?))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Accounting {
     pub(crate) root: TreeRoot,
     nodesize: u64,
     groups: TreeRoot,
-    free_space: Option<Arc<FreeTree>>,
+    free_space: Option<FreeTree>,
     checksums: Checksums,
     group_used: RedBlackTreeMapSync<Key, u64>,
     retired_extents: RedBlackTreeMapSync<u64, u64>,
@@ -219,25 +256,32 @@ impl Accounting {
         Ok(refs == 0)
     }
 
+    #[cfg(test)]
     pub(crate) async fn new<S: BlockSource>(
         volume: &Volume<S>,
         root: TreeRoot,
         space: &Space,
         checksum_root: TreeRoot,
     ) -> Result<Self, WriteError> {
-        let free_space = if let Some(root) = space.free_root() {
-            Some(Arc::new(
-                FreeTree::load(
-                    volume,
-                    root,
-                    &space.committed_free(&RedBlackTreeMapSync::new_sync())?,
-                )
-                .await?,
-            ))
-        } else {
-            None
-        };
-        Ok(Self {
+        let free_space = Allocation::load_free(volume, space).await?;
+        Ok(Self::with_free(
+            volume,
+            root,
+            space,
+            checksum_root,
+            free_space,
+        ))
+    }
+
+    /// Start from a committed free-space tree instead of walking the disk.
+    pub(crate) fn with_free<S: BlockSource>(
+        volume: &Volume<S>,
+        root: TreeRoot,
+        space: &Space,
+        checksum_root: TreeRoot,
+        free_space: Option<FreeTree>,
+    ) -> Self {
+        Self {
             root,
             nodesize: u64::from(volume.superblock().nodesize()),
             groups: space.group_root(),
@@ -249,7 +293,7 @@ impl Accounting {
             retired_extents: RedBlackTreeMapSync::new_sync(),
             registered: RedBlackTreeMapSync::new_sync(),
             processed_retired: 0,
-        })
+        }
     }
 
     /// Reconcile transaction-owned allocations, including blocks allocated by
@@ -267,8 +311,7 @@ impl Accounting {
         loop {
             self.sync_references(volume, trees, space).await?;
             let free_changed = if let Some(free) = &mut self.free_space {
-                Arc::make_mut(free)
-                    .sync(volume, trees, space, &self.retired_extents)
+                free.sync(volume, trees, space, &self.retired_extents)
                     .await?
             } else {
                 false
@@ -325,6 +368,15 @@ impl Accounting {
 
     pub(crate) fn free_root(&self) -> Option<TreeRoot> {
         self.free_space.as_ref().map(|free| free.root)
+    }
+
+    /// The allocation state the committed generation will have, valid once the
+    /// accounting loop has converged. Call before `take_retired`.
+    pub(crate) fn committed(&self, space: &Space) -> Result<Allocation, WriteError> {
+        Ok(Allocation {
+            space: space.committed(&self.retired_extents)?,
+            free: self.free_space.clone(),
+        })
     }
 
     pub(crate) fn checksum_root(&self) -> TreeRoot {

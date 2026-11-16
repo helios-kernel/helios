@@ -6,7 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use rpds::RedBlackTreeMapSync;
+use rpds::{RedBlackTreeMapSync, VectorSync};
 use thiserror::Error;
 use zerocopy::little_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -344,17 +344,45 @@ fn validate_range(
     Ok(())
 }
 
-/// The transaction's free-space tree and its last encoded record set. Tree edits
-/// can allocate more metadata, so the enclosing accounting loop calls `sync`
-/// until allocation, usage, and free-space records all stop changing.
+/// What the free-space tree last held for one block group: the free ranges the
+/// records encode and whether they are bitmaps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Encoded {
+    free: Intervals,
+    bitmaps: bool,
+}
+
+/// A free-space tree and its last encoded record set. Tree edits can allocate
+/// more metadata, so the enclosing accounting loop calls `sync` until
+/// allocation, usage, and free-space records all stop changing.
+///
+/// Every collection is persistent, so a clone is O(1): the writer keeps the
+/// committed state across transactions and each transaction starts from a
+/// clone. `sync` re-encodes only the groups whose free ranges changed.
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug))]
 pub(crate) struct FreeTree {
     pub(crate) root: TreeRoot,
-    records: BTreeMap<Key, Vec<u8>>,
-    bitmap_modes: BTreeMap<u64, bool>,
+    records: RedBlackTreeMapSync<Key, Vec<u8>>,
+    groups: RedBlackTreeMapSync<u64, Encoded>,
+    /// Records outside every block group, left by btrfs-progs' removal of a
+    /// block group's free space; the first `sync` deletes them.
+    strays: VectorSync<Key>,
+}
+
+/// The state a free-space tree represents, independent of where its root is.
+#[cfg(test)]
+impl PartialEq for FreeTree {
+    fn eq(&self, other: &Self) -> bool {
+        self.records == other.records && self.groups == other.groups && self.strays == other.strays
+    }
 }
 
 impl FreeTree {
+    pub(crate) fn rebind(&mut self, root: TreeRoot) {
+        self.root = root;
+    }
+
     pub(crate) async fn load<S: BlockSource>(
         volume: &Volume<S>,
         root: TreeRoot,
@@ -366,7 +394,7 @@ impl FreeTree {
             records.insert(key, cursor.item().expect("cursor key has an item").to_vec());
             cursor.advance(volume).await?;
         }
-        let mut bitmap_modes = BTreeMap::new();
+        let mut groups = RedBlackTreeMapSync::new_sync();
         // FREE_SPACE_TREE_VALID: a cleared bit asks the writer to rebuild from
         // allocation metadata. Stale free-space payloads must not guide reuse.
         if volume.superblock().compat_ro_flags() & (1 << 1) != 0 {
@@ -390,7 +418,13 @@ impl FreeTree {
                 if decoded.free != group.free {
                     return Err(defect(FreeSpaceDefect::AllocationMismatch));
                 }
-                bitmap_modes.insert(group.range.start, decoded.bitmaps);
+                groups.insert_mut(
+                    group.range.start,
+                    Encoded {
+                        free: decoded.free,
+                        bitmaps: decoded.bitmaps,
+                    },
+                );
             }
             // A record inside a group was validated by that group's decode. One
             // wholly outside every group is the residue of a removed block group:
@@ -420,10 +454,20 @@ impl FreeTree {
                 }
             }
         }
+        let mut strays = VectorSync::new_sync();
+        for &key in records.keys() {
+            if !expected
+                .iter()
+                .any(|group| group.range.contains(&key.objectid))
+            {
+                strays.push_back_mut(key);
+            }
+        }
         Ok(Self {
             root,
-            records,
-            bitmap_modes,
+            records: records.into_iter().collect(),
+            groups,
+            strays,
         })
     }
 
@@ -434,40 +478,51 @@ impl FreeTree {
         space: &mut Space,
         retired: &RedBlackTreeMapSync<u64, u64>,
     ) -> Result<bool, WriteError> {
-        let mut desired = BTreeMap::new();
-        for mut group in space.committed_free(retired)? {
-            group.bitmaps = self
-                .bitmap_modes
-                .get(&group.range.start)
-                .copied()
-                .unwrap_or(false);
-            let key = Key::new(
-                group.range.start,
-                item_type::FREE_SPACE_INFO,
-                group.range.end - group.range.start,
-            );
-            desired.extend(
-                group
-                    .encode(u64::from(volume.superblock().sectorsize()))
-                    .map_err(|defect| WriteError::FreeSpace { key, defect })?,
-            );
-            self.bitmap_modes.insert(group.range.start, group.bitmaps);
-        }
-        if desired == self.records {
-            return Ok(false);
-        }
-        for &key in self.records.keys().filter(|key| !desired.contains_key(key)) {
+        let mut changed = false;
+        for key in core::mem::take(&mut self.strays).iter().copied() {
             self.root = trees.apply(volume, self.root, key, None, space).await?;
+            self.records.remove_mut(&key);
+            changed = true;
         }
-        for (&key, bytes) in &desired {
-            if self.records.get(&key) != Some(bytes) {
-                self.root = trees
-                    .apply(volume, self.root, key, Some(bytes), space)
-                    .await?;
+        for mut group in space.committed_free(retired)? {
+            let start = group.range.start;
+            let previous = self.groups.get(&start);
+            if previous.is_some_and(|previous| previous.free == group.free) {
+                continue;
             }
+            group.bitmaps = previous.is_some_and(|previous| previous.bitmaps);
+            let key = Key::new(start, item_type::FREE_SPACE_INFO, group.range.end - start);
+            let desired = group
+                .encode(u64::from(volume.superblock().sectorsize()))
+                .map_err(|defect| WriteError::FreeSpace { key, defect })?;
+            let stale: Vec<Key> = self
+                .records
+                .range(Key::new(start, 0, 0)..Key::new(group.range.end, 0, 0))
+                .map(|(&key, _)| key)
+                .filter(|key| !desired.contains_key(key))
+                .collect();
+            for key in stale {
+                self.root = trees.apply(volume, self.root, key, None, space).await?;
+                self.records.remove_mut(&key);
+            }
+            for (key, bytes) in desired {
+                if self.records.get(&key) != Some(&bytes) {
+                    self.root = trees
+                        .apply(volume, self.root, key, Some(&bytes), space)
+                        .await?;
+                    self.records.insert_mut(key, bytes);
+                }
+            }
+            self.groups.insert_mut(
+                start,
+                Encoded {
+                    free: group.free,
+                    bitmaps: group.bitmaps,
+                },
+            );
+            changed = true;
         }
-        self.records = desired;
-        Ok(true)
+        Ok(changed)
     }
 }
 

@@ -11,7 +11,7 @@ use futures::future;
 
 use self::namespace::Name;
 use self::reflink::FileId;
-use crate::accounting::Accounting;
+use crate::accounting::{Accounting, Allocation};
 use crate::commit::CommitImage;
 use crate::data::{File, Reader};
 use crate::fs::Snapshot;
@@ -29,6 +29,9 @@ use alloc::sync::Arc;
 /// Produced only once the new roots are durable, or for an unchanged view.
 pub(crate) struct Committed {
     pub(crate) snapshot: Arc<Snapshot>,
+    /// The allocation state of `snapshot`'s generation; `None` for an unchanged
+    /// view, whose state is the one the transaction started from.
+    pub(crate) allocation: Option<Allocation>,
 }
 
 pub(crate) struct Transaction<'a, S> {
@@ -128,30 +131,38 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         )
     }
 
+    /// Starts from the writer's committed allocation state for `pin`'s
+    /// generation. Only the roots are read from disk; the per-transaction
+    /// exclusions (mirror stripes, reader pins) are applied to a clone.
     pub(crate) async fn new(
         volume: Volume<S>,
         pin: Arc<Snapshot>,
         retirements: &'a mut Retirements,
+        committed: &Allocation,
     ) -> Result<Self, WriteError> {
         let root = pin.root_tree;
-        let image = volume.commit_image().await?;
+        let (image, roots) =
+            future::try_join(volume.commit_image(), Roots::load(&volume, root)).await?;
         let generation = volume
             .superblock()
             .generation()
             .checked_add(1)
             .ok_or(WriteError::GenerationOverflow)?;
-        let (roots, mut space) = future::try_join(Roots::load(&volume, root), async {
-            Space::load(&volume, root).await.map_err(WriteError::from)
-        })
-        .await?;
+        let mut space = committed.space.clone();
+        space.rebind(&roots)?;
+        space.exclude_superblock_stripes(volume.chunks());
         retirements.protect(&pin, &mut space);
-        let accounting = Accounting::new(
+        let mut free = committed.free.clone();
+        if let Some(free) = &mut free {
+            free.rebind(roots.get(objectid::FREE_SPACE_TREE)?);
+        }
+        let accounting = Accounting::with_free(
             &volume,
             roots.get(objectid::EXTENT_TREE)?,
             &space,
             roots.get(objectid::CSUM_TREE)?,
-        )
-        .await?;
+            free,
+        );
         let trees = Trees::new(generation, volume.superblock().csum_type());
         Ok(Self {
             generation: pin,
@@ -195,8 +206,10 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         if self.trees.blocks().next().is_none() {
             return Ok(Committed {
                 snapshot: self.generation.clone(),
+                allocation: None,
             });
         }
+        let allocation = self.accounting.committed(&self.space)?;
         self.image
             .prepare(&self.roots, self.accounting.bytes_used(&self.space)?)?;
         let superblock = self
@@ -224,6 +237,9 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         writes.finish().await?;
         publishing();
         self.volume.publish(self.image).await?;
-        Ok(Committed { snapshot })
+        Ok(Committed {
+            snapshot,
+            allocation: Some(allocation),
+        })
     }
 }

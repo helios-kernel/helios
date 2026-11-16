@@ -70,6 +70,7 @@ pub enum SpaceDefect {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct Group {
     start: u64,
     length: u64,
@@ -113,6 +114,7 @@ pub(crate) struct MetadataReservation {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug))]
 pub(crate) struct Space {
     groups: VectorSync<Group>,
     group_root: TreeRoot,
@@ -123,6 +125,21 @@ pub(crate) struct Space {
     data: RedBlackTreeMapSync<u64, u64>,
     protected_data: RedBlackTreeMapSync<u64, u64>,
     deferred_data: RedBlackTreeMapSync<u64, u64>,
+}
+
+/// The allocation state a tree-root-independent comparison sees: what a
+/// committed generation's disk image decodes to.
+#[cfg(test)]
+impl PartialEq for Space {
+    fn eq(&self, other: &Self) -> bool {
+        self.groups == other.groups
+            && self.nodesize == other.nodesize
+            && self.sector == other.sector
+            && self.metadata == other.metadata
+            && self.data == other.data
+            && self.protected_data == other.protected_data
+            && self.deferred_data == other.deferred_data
+    }
 }
 
 impl Space {
@@ -149,7 +166,9 @@ impl Space {
         }
     }
 
-    pub(crate) async fn load<S: BlockSource>(
+    /// Walks the allocation trees once and validates them: used-byte
+    /// accounting, extent overlap, chunk agreement.
+    pub(crate) async fn load_committed<S: BlockSource>(
         volume: &Volume<S>,
         roots: TreeRoot,
     ) -> Result<Self, SpaceError> {
@@ -272,9 +291,7 @@ impl Space {
             }
             cursor.advance(volume).await?;
         }
-        let excluded = volume.chunks().superblock_stripes();
-        for index in 0..space.groups.len() {
-            let group = &mut space.groups[index];
+        for group in &space.groups {
             if group.declared_used != group.found_used {
                 return Err(SpaceError::Corrupt {
                     tree: group_root.tree,
@@ -285,11 +302,78 @@ impl Space {
                     },
                 });
             }
-            for range in &excluded {
-                group.exclude(range);
-            }
         }
         Ok(space)
+    }
+
+    /// The committed state with this transaction's exclusions applied:
+    /// superblock mirror stripes are never allocated.
+    #[cfg(test)]
+    pub(crate) async fn load<S: BlockSource>(
+        volume: &Volume<S>,
+        roots: TreeRoot,
+    ) -> Result<Self, SpaceError> {
+        let mut space = Self::load_committed(volume, roots).await?;
+        space.exclude_superblock_stripes(volume.chunks());
+        Ok(space)
+    }
+
+    pub(crate) fn exclude_superblock_stripes(&mut self, chunks: &crate::chunk::ChunkMap) {
+        let excluded = chunks.superblock_stripes();
+        for index in 0..self.groups.len() {
+            for range in &excluded {
+                self.groups[index].exclude(range);
+            }
+        }
+    }
+
+    /// Point the carried state at the roots of the generation a transaction
+    /// starts from. The allocation tree roots move with every commit.
+    pub(crate) fn rebind(&mut self, roots: &crate::roots::Roots) -> Result<(), WriteError> {
+        self.group_root = roots.get(self.group_root.tree)?;
+        if let Some(free) = &mut self.free_root {
+            *free = roots.get(free.tree)?;
+        }
+        Ok(())
+    }
+
+    /// The state the next generation's disk image will decode to: each group's
+    /// free ranges with this transaction's reservations occupied and its
+    /// retired extents released, its usage as declared by the block-group
+    /// items, and no private reservations. Mirror stripes and reader pins are
+    /// not applied; the next transaction applies them again.
+    pub(crate) fn committed(
+        &self,
+        retired: &RedBlackTreeMapSync<u64, u64>,
+    ) -> Result<Self, SpaceError> {
+        let free = self.committed_free(retired)?;
+        let usage = self.group_usage(retired)?;
+        let groups = self
+            .groups
+            .iter()
+            .zip(free)
+            .zip(usage)
+            .map(|((group, free), (_, used))| Group {
+                start: group.start,
+                length: group.length,
+                flags: group.flags,
+                declared_used: used,
+                found_used: used,
+                free: free.free,
+                excluded_free: Intervals::default(),
+            })
+            .collect();
+        Ok(Self {
+            groups,
+            group_root: self.group_root,
+            free_root: self.free_root,
+            nodesize: self.nodesize,
+            sector: self.sector,
+            metadata: RedBlackTreeMapSync::new_sync(),
+            data: RedBlackTreeMapSync::new_sync(),
+            protected_data: RedBlackTreeMapSync::new_sync(),
+            deferred_data: RedBlackTreeMapSync::new_sync(),
+        })
     }
 
     fn reserve(&mut self, length: u64, flags: u64) -> Result<u64, SpaceError> {
