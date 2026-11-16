@@ -34,6 +34,12 @@ pub enum WriteError {
     InodeFlags { tree: u64, inode: u64, flags: u64 },
     #[error("read-write mount does not support compat-ro feature {name} ({bit:#x})")]
     UnsupportedCompatRo { name: &'static str, bit: u64 },
+    /// Quota groups are not maintained by the writer (lexoliu/helios#1043);
+    /// writing would leave Linux's qgroup counts stale.
+    #[error(
+        "read-write mount does not maintain quota groups, and the root tree holds a quota tree"
+    )]
+    QuotaTreePresent,
     #[error("subvolume {tree} is read-only")]
     ReadOnlySubvolume { tree: u64 },
     #[error("clone offsets must be sector aligned and any partial sector must end both files")]

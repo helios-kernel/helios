@@ -308,3 +308,25 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
         assert_eq!(&output[7..], &data[7..]);
     });
 }
+
+/// `mkfs.btrfs -O quota` (and `-O squota`) create the quota tree. A writable
+/// mount refuses it, since the writer keeps no qgroup counts, and a read-only
+/// mount still opens the image.
+#[test]
+#[ignore = "needs mkfs.btrfs from btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn writer_refuses_mkfs_images_with_quotas_and_the_reader_mounts_them() {
+    use helios_btrfs::write::WriteError;
+
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("hello.txt"), b"hello btrfs\n").unwrap();
+    for feature in ["quota", "squota"] {
+        let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &["-O", feature]);
+        super::fixture::mount(image.clone()).expect("a read-only mount ignores quotas");
+        let refused = block_on(Writer::mount(WritableImage(Mutex::new(image))));
+        assert!(
+            matches!(refused, Err(WriteError::QuotaTreePresent)),
+            "-O {feature}: refused with {:?}",
+            refused.err()
+        );
+    }
+}

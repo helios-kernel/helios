@@ -56,6 +56,7 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::StaleHandle { .. } => Errno::ESTALE,
         WriteError::InodeFlags { .. } => Errno::EPERM,
         WriteError::UnsupportedCompatRo { .. } => Errno::EROFS,
+        WriteError::QuotaTreePresent => Errno::EROFS,
         WriteError::ReadOnlySubvolume { .. } => Errno::EROFS,
         WriteError::CloneAlignment
         | WriteError::CloneSourceRange

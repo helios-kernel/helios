@@ -51,6 +51,9 @@ pub(crate) mod objectid {
     pub(crate) const FS_TREE: u64 = 5;
     pub(crate) const ROOT_TREE_DIR: u64 = 6;
     pub(crate) const CSUM_TREE: u64 = 7;
+    /// `BTRFS_QUOTA_TREE_OBJECTID`: present once quotas are enabled.
+    #[cfg(feature = "write")]
+    pub(crate) const QUOTA_TREE: u64 = 8;
     pub(crate) const FIRST_FREE: u64 = 256;
     pub(crate) const LAST_FREE: u64 = -256_i64 as u64;
     pub(crate) const FIRST_CHUNK_TREE: u64 = 256;

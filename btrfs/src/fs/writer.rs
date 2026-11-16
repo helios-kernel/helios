@@ -7,9 +7,10 @@ use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::Filesystem;
+use super::{Filesystem, find_root};
 use crate::accounting::Allocation;
 use crate::compress::write::Encoder;
+use crate::ondisk::objectid;
 use crate::retirement::Retirements;
 use crate::source::BlockSink;
 use crate::transaction::file::WriteOptions;
@@ -93,6 +94,20 @@ impl<S: BlockSink> Writer<S> {
     pub async fn mount(source: S) -> Result<Self, WriteError> {
         let current = Filesystem::mount(Arc::new(source)).await?;
         current.superblock().check_writable()?;
+        // Linux enables quotas by creating the quota tree. Its qgroup counts
+        // go stale under any write this writer makes, so refuse until the
+        // writer maintains them (lexoliu/helios#1043).
+        match find_root(
+            &current.volume,
+            current.snapshot.root_tree,
+            objectid::QUOTA_TREE,
+        )
+        .await
+        {
+            Ok(_) => return Err(WriteError::QuotaTreePresent),
+            Err(Error::MissingRoot { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
         let allocation = Allocation::load(&current.volume, current.snapshot.root_tree).await?;
         Ok(Self {
             current: Some(current),

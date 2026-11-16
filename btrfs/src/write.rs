@@ -12,8 +12,9 @@
 //! survives its transaction only after that transaction successfully commits.
 //! Directory lookup sees staged namespace changes, including subvolume entries.
 //!
-//! Writable support is single-device and excludes pending log replay, verity
-//! and unknown compat-ro features. Space comes from the block groups, and the
+//! Writable support is single-device and excludes pending log replay, verity,
+//! unknown compat-ro features and filesystems with quotas enabled (the writer
+//! maintains no quota-group accounting). Space comes from the block groups, and the
 //! writer allocates a chunk on the device when a type runs short, following
 //! Linux's regular policy and its single and DUP profiles (see
 //! [`ChunkError`] for what is refused): a data chunk when no free range

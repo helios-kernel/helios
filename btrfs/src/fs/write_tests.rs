@@ -1933,6 +1933,64 @@ fn reader_accepts_compat_ro_features_that_the_writer_refuses() {
 
 #[cfg(feature = "write")]
 #[test]
+fn writer_refuses_a_filesystem_with_a_quota_tree_and_the_reader_keeps_working() {
+    use super::writer::Writer;
+    use crate::ondisk::{item_type, objectid};
+    block_on(async {
+        let (_, image) = filesystem_image();
+        let mut writer = Writer::mount(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        let old = writer.snapshot().unwrap();
+        let mut tx = writer.begin().await.unwrap();
+        let edits = tx.edits();
+        // Linux enables quotas by adding a root item for tree 8; the item's
+        // content does not matter to the refusal, so borrow the checksum
+        // tree's.
+        let (_, item) = edits
+            .trees
+            .floor(
+                &old.volume,
+                edits.roots.root,
+                Key::new(objectid::CSUM_TREE, item_type::ROOT_ITEM, u64::MAX),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        edits.roots.root = edits
+            .trees
+            .apply(
+                &old.volume,
+                edits.roots.root,
+                Key::new(objectid::QUOTA_TREE, item_type::ROOT_ITEM, 0),
+                Some(&item),
+                &mut edits.space,
+            )
+            .await
+            .unwrap();
+        tx.commit(
+            || panic!("valid fixture UUID"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let reader = Filesystem::mount(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.root().await.unwrap().kind(),
+            crate::FileKind::Directory
+        );
+        assert!(matches!(
+            Writer::mount(Disk(image)).await,
+            Err(WriteError::QuotaTreePresent)
+        ));
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
 fn reflink_from_readonly_subvolume_preserves_source() {
     use super::writer::{CloneRange, Writer};
 
