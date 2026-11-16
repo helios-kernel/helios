@@ -195,7 +195,7 @@ impl Device {
 
 /// Closure of the notification channel broadcasts loss to every waiter.
 #[derive(Clone)]
-pub(crate) struct DeviceLoss {
+pub struct DeviceLoss {
     value: Arc<OnceLock<DeviceLost>>,
     wake: Receiver<()>,
 }

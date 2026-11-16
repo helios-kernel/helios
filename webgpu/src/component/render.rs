@@ -1,26 +1,37 @@
-use super::{backend, buffer::Buffer, convert::Convert, recording::Recorder, value::Object, wit};
 use core::cell::Cell;
 
+use wgpu_core::id::markers;
+
+use super::{
+    buffer::Buffer,
+    command::{BundleCommand, Command, DrawCommand, RenderCommand},
+    content::Handle,
+    convert::Convert,
+    ids::Kind,
+    recording::Recorder,
+    wit,
+};
+
 pub struct RenderBundle {
-    pub object: Object<backend::RenderBundle>,
+    pub handle: Handle<markers::RenderBundle>,
     pub draws: u64,
 }
 impl wit::GuestGpuRenderBundle for RenderBundle {
     fn label(&self) -> String {
-        self.object.label()
+        self.handle.label()
     }
     fn set_label(&self, label: String) {
-        self.object.set_label(label);
+        self.handle.set_label(label);
     }
 }
 
-pub struct RenderRecorder<T> {
-    pub recorder: Recorder<T>,
+pub struct RenderRecorder<K: Kind> {
+    pub recorder: Recorder<K>,
     pub draws: Cell<u64>,
     pub limit: u64,
 }
 
-impl<T> RenderRecorder<T> {
+impl<K: Kind> RenderRecorder<K> {
     fn count(&self, count: u64) -> bool {
         match self.draws.get().checked_add(count) {
             Some(total) if total <= self.limit => {
@@ -35,38 +46,56 @@ impl<T> RenderRecorder<T> {
     }
 }
 
-pub struct RenderPass(pub RenderRecorder<wgpu_core::command::RenderPass>);
-pub struct BundleEncoder(pub RenderRecorder<wgpu_core::command::RenderBundleEncoder>);
+pub struct RenderPass(pub RenderRecorder<markers::RenderPassEncoder>);
+pub struct BundleEncoder(pub RenderRecorder<markers::RenderBundleEncoder>);
+
+impl RenderPass {
+    fn record(&self, command: RenderCommand) {
+        let recorder = &self.0.recorder;
+        recorder
+            .device()
+            .enqueue(Command::RenderPass(recorder.handle.id, command));
+    }
+    fn record_draw(&self, command: DrawCommand) {
+        self.record(RenderCommand::Draw(command));
+    }
+}
+
+impl BundleEncoder {
+    fn record(&self, command: BundleCommand) {
+        let recorder = &self.0.recorder;
+        recorder
+            .device()
+            .enqueue(Command::Bundle(recorder.handle.id, command));
+    }
+    fn record_draw(&self, command: DrawCommand) {
+        self.record(BundleCommand::Draw(command));
+    }
+}
 
 macro_rules! render_commands {
-    ($($color:expr)?) => {
+    () => {
         fn label(&self) -> String {
-            self.0.recorder.object.label()
+            self.0.recorder.handle.label()
         }
         fn set_label(&self, label: String) {
-            self.0.recorder.object.set_label(label);
+            self.0.recorder.handle.set_label(label);
         }
         fn push_debug_group(&self, label: String) {
-            self.0.recorder.with(|raw| raw.push_debug_group(&label $(, $color)?));
+            self.record_draw(DrawCommand::PushDebugGroup(label));
         }
         fn pop_debug_group(&self) {
-            self.0.recorder.with(|raw| raw.pop_debug_group());
+            self.record_draw(DrawCommand::PopDebugGroup);
         }
         fn insert_debug_marker(&self, label: String) {
-            self.0
-                .recorder
-                .with(|raw| raw.insert_debug_marker(&label $(, $color)?));
+            self.record_draw(DrawCommand::InsertDebugMarker(label));
         }
         fn set_pipeline(&self, pipeline: wit::GpuRenderPipelineBorrow<'_>) {
-            if let Some(pipeline) = self
-                .0
-                .recorder
-                .resource(pipeline.get::<Object<backend::RenderPipeline>>())
-            {
+            self.record_draw(DrawCommand::SetPipeline(
                 self.0
                     .recorder
-                    .with(|raw| raw.set_pipeline(pipeline.clone()));
-            }
+                    .resolve(pipeline.get::<Handle<markers::RenderPipeline>>()),
+            ));
         }
         fn set_bind_group(
             &self,
@@ -77,20 +106,11 @@ macro_rules! render_commands {
             count: Option<u32>,
         ) -> Result<(), wit::SetBindGroupError> {
             let offsets = self.0.recorder.offsets(offsets, start, count)?;
-            let group = match group.as_ref() {
-                Some(group) => match self
-                    .0
-                    .recorder
-                    .resource(group.get::<Object<backend::BindGroup>>())
-                {
-                    Some(group) => Some(group.clone()),
-                    None => return Ok(()),
-                },
-                None => None,
-            };
-            self.0
-                .recorder
-                .with(|raw| raw.set_bind_group(index, group, &offsets));
+            self.record_draw(DrawCommand::SetBindGroup {
+                index,
+                group: self.0.recorder.group(group),
+                offsets,
+            });
             Ok(())
         }
         fn set_immediates(
@@ -100,8 +120,8 @@ macro_rules! render_commands {
             data_offset: Option<u64>,
             data_size: Option<u64>,
         ) {
-            if let Some(data) = self.0.recorder.data(&data, data_offset, data_size) {
-                self.0.recorder.with(|raw| raw.set_immediates(offset, data));
+            if let Some(data) = self.0.recorder.data(data, data_offset, data_size) {
+                self.record_draw(DrawCommand::SetImmediates { offset, data });
             }
         }
         fn set_index_buffer(
@@ -111,16 +131,12 @@ macro_rules! render_commands {
             offset: Option<u64>,
             size: Option<u64>,
         ) {
-            if let Some(buffer) = self.0.recorder.resource(&buffer.get::<Buffer>().object) {
-                self.0.recorder.with(|raw| {
-                    raw.set_index_buffer(
-                        buffer.clone(),
-                        format.convert(),
-                        offset.unwrap_or(0),
-                        size,
-                    )
-                });
-            }
+            self.record_draw(DrawCommand::SetIndexBuffer {
+                buffer: self.0.recorder.resolve(&buffer.get::<Buffer>().handle),
+                format: format.convert(),
+                offset: offset.unwrap_or(0),
+                size,
+            });
         }
         fn set_vertex_buffer(
             &self,
@@ -129,16 +145,13 @@ macro_rules! render_commands {
             offset: Option<u64>,
             size: Option<u64>,
         ) {
-            let buffer = match buffer.as_ref() {
-                Some(buffer) => match self.0.recorder.resource(&buffer.get::<Buffer>().object) {
-                    Some(buffer) => Some(buffer.clone()),
-                    None => return,
-                },
-                None => None,
-            };
-            self.0
-                .recorder
-                .with(|raw| raw.set_vertex_buffer(slot, buffer, offset.unwrap_or(0), size));
+            self.record_draw(DrawCommand::SetVertexBuffer {
+                slot,
+                buffer: buffer
+                    .map(|buffer| self.0.recorder.resolve(&buffer.get::<Buffer>().handle)),
+                offset: offset.unwrap_or(0),
+                size,
+            });
         }
         fn draw(
             &self,
@@ -148,13 +161,11 @@ macro_rules! render_commands {
             first_instance: Option<u32>,
         ) {
             if self.0.count(1) {
-                self.0.recorder.with(|raw| {
-                    raw.draw(
-                        vertices,
-                        instances.unwrap_or(1),
-                        first_vertex.unwrap_or(0),
-                        first_instance.unwrap_or(0),
-                    )
+                self.record_draw(DrawCommand::Draw {
+                    vertices,
+                    instances: instances.unwrap_or(1),
+                    first_vertex: first_vertex.unwrap_or(0),
+                    first_instance: first_instance.unwrap_or(0),
                 });
             }
         }
@@ -167,43 +178,38 @@ macro_rules! render_commands {
             first_instance: Option<u32>,
         ) {
             if self.0.count(1) {
-                self.0.recorder.with(|raw| {
-                    raw.draw_indexed(
-                        indices,
-                        instances.unwrap_or(1),
-                        first_index.unwrap_or(0),
-                        base_vertex.unwrap_or(0),
-                        first_instance.unwrap_or(0),
-                    )
+                self.record_draw(DrawCommand::DrawIndexed {
+                    indices,
+                    instances: instances.unwrap_or(1),
+                    first_index: first_index.unwrap_or(0),
+                    base_vertex: base_vertex.unwrap_or(0),
+                    first_instance: first_instance.unwrap_or(0),
                 });
             }
         }
         fn draw_indirect(&self, buffer: wit::GpuBufferBorrow<'_>, offset: u64) {
             if self.0.count(1) {
-                if let Some(buffer) = self.0.recorder.resource(&buffer.get::<Buffer>().object) {
-                    self.0
-                        .recorder
-                        .with(|raw| raw.draw_indirect(buffer.clone(), offset));
-                }
+                self.record_draw(DrawCommand::DrawIndirect {
+                    buffer: self.0.recorder.resolve(&buffer.get::<Buffer>().handle),
+                    offset,
+                });
             }
         }
         fn draw_indexed_indirect(&self, buffer: wit::GpuBufferBorrow<'_>, offset: u64) {
             if self.0.count(1) {
-                if let Some(buffer) = self.0.recorder.resource(&buffer.get::<Buffer>().object) {
-                    self.0
-                        .recorder
-                        .with(|raw| raw.draw_indexed_indirect(buffer.clone(), offset));
-                }
+                self.record_draw(DrawCommand::DrawIndexedIndirect {
+                    buffer: self.0.recorder.resolve(&buffer.get::<Buffer>().handle),
+                    offset,
+                });
             }
         }
     };
 }
 
 impl wit::GuestGpuRenderPassEncoder for RenderPass {
-    render_commands!(0);
+    render_commands!();
     fn end(&self) {
-        self.0.recorder.with(|raw| raw.end());
-        self.0.recorder.take();
+        self.record(RenderCommand::End);
     }
     fn set_viewport(
         &self,
@@ -214,44 +220,45 @@ impl wit::GuestGpuRenderPassEncoder for RenderPass {
         min_depth: f32,
         max_depth: f32,
     ) {
-        self.0
-            .recorder
-            .with(|raw| raw.set_viewport(x, y, width, height, min_depth, max_depth));
+        self.record(RenderCommand::SetViewport {
+            x,
+            y,
+            width,
+            height,
+            min_depth,
+            max_depth,
+        });
     }
     fn set_scissor_rect(&self, x: u32, y: u32, width: u32, height: u32) {
-        self.0
-            .recorder
-            .with(|raw| raw.set_scissor_rect(x, y, width, height));
+        self.record(RenderCommand::SetScissorRect {
+            x,
+            y,
+            width,
+            height,
+        });
     }
     fn set_blend_constant(&self, color: wit::GpuColor) {
-        self.0
-            .recorder
-            .with(|raw| raw.set_blend_constant(color.convert()));
+        self.record(RenderCommand::SetBlendConstant(color.convert()));
     }
     fn set_stencil_reference(&self, reference: u32) {
-        self.0
-            .recorder
-            .with(|raw| raw.set_stencil_reference(reference));
+        self.record(RenderCommand::SetStencilReference(reference));
     }
     fn begin_occlusion_query(&self, index: u32) {
-        self.0.recorder.with(|raw| raw.begin_occlusion_query(index));
+        self.record(RenderCommand::BeginOcclusionQuery(index));
     }
     fn end_occlusion_query(&self) {
-        self.0.recorder.with(|raw| raw.end_occlusion_query());
+        self.record(RenderCommand::EndOcclusionQuery);
     }
     fn execute_bundles(&self, bundles: Vec<wit::GpuRenderBundleBorrow<'_>>) {
-        let mut native = Vec::with_capacity(bundles.len());
+        let mut ids = Vec::with_capacity(bundles.len());
         for bundle in &bundles {
             let bundle = bundle.get::<RenderBundle>();
-            let Some(raw) = self.0.recorder.resource(&bundle.object) else {
-                return;
-            };
             if !self.0.count(bundle.draws) {
                 return;
             }
-            native.push(raw.clone());
+            ids.push(self.0.recorder.resolve(&bundle.handle));
         }
-        self.0.recorder.with(|raw| raw.execute_bundles(&native));
+        self.record(RenderCommand::ExecuteBundles(ids));
     }
 }
 
@@ -259,24 +266,49 @@ impl wit::GuestGpuRenderBundleEncoder for BundleEncoder {
     render_commands!();
     fn finish(&self, descriptor: Option<wit::GpuRenderBundleDescriptor>) -> wit::GpuRenderBundle {
         let label = descriptor.and_then(|d| d.label);
-        let raw = self.0.recorder.take().and_then(|mut raw| {
-            if self.0.recorder.invalid.get() {
-                return None;
-            }
-            Some(self.0.recorder.object.owner.created(raw.finish(
-                &wgpu_types::RenderBundleDescriptor {
-                    label: label.as_deref().map(Into::into),
-                },
-            )))
+        let recorder = &self.0.recorder;
+        let handle = Handle::new(recorder.device(), label.clone());
+        self.record(BundleCommand::Finish {
+            id: handle.id,
+            label,
+            invalid: recorder.invalid.get(),
         });
-        let owner = self.0.recorder.object.owner.clone();
-        let object = match raw {
-            Some(raw) => Object::new(owner, raw, label),
-            None => Object::invalid(owner, label),
-        };
         wit::GpuRenderBundle::new(RenderBundle {
-            object,
+            handle,
             draws: self.0.draws.get(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::content::tests::new_device;
+    use std::rc::Rc;
+    use wit::GuestGpuRenderPassEncoder;
+
+    #[test]
+    fn exceeding_max_draw_count_rejects_the_encoder_and_records_nothing() {
+        let (device, commands) = new_device();
+        let invalid = Rc::new(Cell::new(false));
+        let pass = RenderPass(RenderRecorder {
+            recorder: Recorder::new(Handle::new(&device, None), invalid.clone()),
+            draws: Cell::new(0),
+            limit: 1,
+        });
+        pass.draw(3, None, None, None);
+        assert!(!invalid.get());
+        pass.draw(3, None, None, None);
+        assert!(invalid.get());
+        let recorded: Vec<_> = core::iter::from_fn(|| commands.try_recv().ok())
+            .map(|queued| queued.command)
+            .collect();
+        assert!(matches!(
+            &recorded[..],
+            [
+                Command::RenderPass(_, RenderCommand::Draw(DrawCommand::Draw { vertices: 3, .. })),
+                Command::Error(error),
+            ] if error.message == "render pass exceeds max-draw-count"
+        ));
     }
 }

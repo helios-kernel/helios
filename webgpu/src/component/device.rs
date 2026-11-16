@@ -1,235 +1,189 @@
-//! Device-owned creation preserves core validation and invalid resource objects.
+//! The device on the content timeline: every creation allocates an id,
+//! queues the creation and returns. Core validates on the device timeline
+//! and registers an invalid object under the id when validation fails.
 
-use core::cell::Cell;
-use std::rc::Rc;
-use wgpu_core::{binding_model, command, pipeline, resource};
+use core::cell::{Cell, OnceCell, RefCell};
+use std::{borrow::Cow, rc::Rc};
+
+use wgpu_core::{
+    binding_model, command as core_command, device::global::BindingResource, id::markers, resource,
+};
 
 use super::{
-    backend,
     buffer::Buffer,
+    command::{Binding, Command, Create},
+    content::{DeviceShared, Handle},
     convert::Convert,
     encoder::Encoder,
     queue::Queue,
     recording::Recorder,
     render::{BundleEncoder, RenderRecorder},
-    resource::{QuerySet, Texture},
-    state::DeviceState,
-    value::{CompilationMessage, Features, Limits, Object, Shader},
+    resource::{AdapterInfo, QuerySet, Texture},
+    value::{Features, Limits, Shader},
     wit,
 };
+use crate::runtime::{DeviceLost, GpuErrorKind};
 
 #[derive(Clone)]
 pub struct Device {
-    pub object: Object<()>,
+    pub shared: Rc<DeviceShared>,
+    label: Rc<RefCell<String>>,
     pub queue: Queue,
-    pub info: wgpu_types::AdapterInfo,
 }
 
 impl Device {
+    pub fn new(
+        shared: Rc<DeviceShared>,
+        label: Option<String>,
+        queue_label: Option<String>,
+    ) -> Self {
+        Self {
+            queue: Queue::new(shared.clone(), queue_label),
+            shared,
+            label: Rc::new(RefCell::new(label.unwrap_or_default())),
+        }
+    }
+
+    pub fn create(&self, create: Create) {
+        self.shared.enqueue(Command::Create(create));
+    }
+
     pub fn create_texture(&self, mut descriptor: wit::GpuTextureDescriptor) -> wit::GpuTexture {
-        let owner = &self.object.owner;
-        let native = resource::TextureDescriptor {
-            label: descriptor.label.as_deref().map(Into::into),
-            size: descriptor.size.convert(),
-            mip_level_count: descriptor.mip_level_count.unwrap_or(1),
-            sample_count: descriptor.sample_count.unwrap_or(1),
-            dimension: descriptor
-                .dimension
-                .unwrap_or(wit::GpuTextureDimension::D2)
-                .convert(),
-            format: descriptor.format.convert(),
-            usage: descriptor.usage.convert(),
-            view_formats: descriptor
-                .view_formats
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .copied()
-                .map(Convert::convert)
-                .collect(),
-        };
-        let raw = owner.created(owner.device.raw.create_texture(&native));
+        let handle = Handle::new(&self.shared, descriptor.label.clone());
+        self.create(Create::Texture {
+            id: handle.id,
+            descriptor: Texture::native(&descriptor),
+        });
         // Core devices leave this compatibility-only texture property undefined.
         descriptor.texture_binding_view_dimension = None;
-        wit::GpuTexture::new(Texture {
-            object: Object::new(owner.clone(), raw, descriptor.label.clone()),
-            descriptor,
-        })
+        wit::GpuTexture::new(Texture::new(handle, descriptor))
     }
+
     pub fn create_bind_group_layout(
         &self,
         descriptor: wit::GpuBindGroupLayoutDescriptor,
     ) -> wit::GpuBindGroupLayout {
-        let owner = &self.object.owner;
+        let handle =
+            Handle::<markers::BindGroupLayout>::new(&self.shared, descriptor.label.clone());
         let entries = descriptor
             .entries
             .into_iter()
             .map(binding_layout)
             .collect::<Result<Vec<_>, _>>();
-        let object = match entries {
-            Ok(entries) => {
-                let raw = owner.created(owner.device.raw.create_bind_group_layout(
-                    &binding_model::BindGroupLayoutDescriptor {
-                        label: descriptor.label.as_deref().map(Into::into),
-                        entries: entries.into(),
-                    },
-                ));
-                Object::new(owner.clone(), raw, descriptor.label)
-            }
+        match entries {
+            Ok(entries) => self.create(Create::BindGroupLayout {
+                id: handle.id,
+                descriptor: binding_model::BindGroupLayoutDescriptor {
+                    label: descriptor.label.map(Cow::Owned),
+                    entries: Cow::Owned(entries),
+                },
+            }),
             Err(error) => {
-                owner.invalid(error.to_string());
-                Object::invalid(owner.clone(), descriptor.label)
+                self.shared.invalid(error.to_string());
+                self.create(Create::InvalidBindGroupLayout {
+                    id: handle.id,
+                    label: descriptor.label,
+                });
             }
-        };
-        wit::GpuBindGroupLayout::new(object)
+        }
+        wit::GpuBindGroupLayout::new(handle)
     }
 
     pub fn create_pipeline_layout(
         &self,
         descriptor: wit::GpuPipelineLayoutDescriptor<'_>,
     ) -> wit::GpuPipelineLayout {
-        let owner = &self.object.owner;
-        let layouts = descriptor
+        let handle = Handle::<markers::PipelineLayout>::new(&self.shared, descriptor.label.clone());
+        let bind_group_layouts = descriptor
             .bind_group_layouts
             .iter()
-            .map(|layout| match layout {
-                Some(layout) => layout
-                    .get::<Object<backend::BindGroupLayout>>()
-                    .get()
-                    .map(|raw| Some(raw.clone())),
-                None => Some(None),
+            .map(|layout| {
+                layout.as_ref().map(|layout| {
+                    self.shared
+                        .resolve(layout.get::<Handle<markers::BindGroupLayout>>())
+                })
             })
-            .collect::<Option<Vec<_>>>();
-        let object = match layouts {
-            Some(layouts) => {
-                let raw = owner.created(owner.device.raw.create_pipeline_layout(
-                    &binding_model::PipelineLayoutDescriptor {
-                        label: descriptor.label.as_deref().map(Into::into),
-                        bind_group_layouts: layouts.into(),
-                        immediate_size: descriptor.immediate_size.unwrap_or(0),
-                    },
-                ));
-                Object::new(owner.clone(), raw, descriptor.label)
-            }
-            None => {
-                owner.invalid("pipeline layout uses an invalid bind group layout");
-                Object::invalid(owner.clone(), descriptor.label)
-            }
-        };
-        wit::GpuPipelineLayout::new(object)
+            .collect();
+        self.create(Create::PipelineLayout {
+            id: handle.id,
+            descriptor: binding_model::PipelineLayoutDescriptor {
+                label: descriptor.label.map(Cow::Owned),
+                bind_group_layouts: Cow::Owned(bind_group_layouts),
+                immediate_size: descriptor.immediate_size.unwrap_or(0),
+            },
+        });
+        wit::GpuPipelineLayout::new(handle)
     }
 
-    fn binding(
-        &self,
-        binding: &wit::GpuBindingResource<'_>,
-    ) -> Option<binding_model::BindingResource<'static>> {
-        use binding_model::{BindingResource as B, BufferBinding};
+    fn binding(&self, binding: &wit::GpuBindingResource<'_>) -> Binding {
+        use binding_model::BufferBinding;
         use wit::GpuBindingResource as W;
-        Some(match binding {
-            W::GpuBuffer(buffer) => B::Buffer(BufferBinding {
-                buffer: buffer.get::<Buffer>().object.get()?.clone(),
+        let resource = match binding {
+            W::GpuBuffer(buffer) => BindingResource::Buffer(BufferBinding {
+                buffer: self.shared.resolve(&buffer.get::<Buffer>().handle),
                 offset: 0,
                 size: None,
             }),
-            W::GpuBufferBinding(binding) => B::Buffer(BufferBinding {
-                buffer: binding.buffer.get::<Buffer>().object.get()?.clone(),
+            W::GpuBufferBinding(binding) => BindingResource::Buffer(BufferBinding {
+                buffer: self.shared.resolve(&binding.buffer.get::<Buffer>().handle),
                 offset: binding.offset.unwrap_or(0),
                 size: binding.size,
             }),
-            W::GpuSampler(sampler) => {
-                B::Sampler(sampler.get::<Object<backend::Sampler>>().get()?.clone())
-            }
-            W::GpuTextureView(view) => {
-                B::TextureView(view.get::<Object<backend::TextureView>>().get()?.clone())
-            }
+            W::GpuSampler(sampler) => BindingResource::Sampler(
+                self.shared
+                    .resolve(sampler.get::<Handle<markers::Sampler>>()),
+            ),
+            W::GpuTextureView(view) => BindingResource::TextureView(
+                self.shared
+                    .resolve(view.get::<Handle<markers::TextureView>>()),
+            ),
             W::GpuTexture(texture) => {
-                let texture = texture.get::<Texture>().object.get()?;
-                B::TextureView(
-                    self.object
-                        .owner
-                        .created(texture.create_view(&resource::TextureViewDescriptor::default())),
-                )
+                return Binding::DefaultView(self.shared.resolve(&texture.get::<Texture>().handle));
             }
-        })
+        };
+        Binding::Resource(resource)
     }
 
     pub fn create_bind_group(
         &self,
         descriptor: wit::GpuBindGroupDescriptor<'_>,
     ) -> wit::GpuBindGroup {
-        let owner = &self.object.owner;
-        let layout = descriptor
-            .layout
-            .get::<Object<backend::BindGroupLayout>>()
-            .get();
+        let handle = Handle::<markers::BindGroup>::new(&self.shared, descriptor.label.clone());
         let entries = descriptor
             .entries
             .iter()
-            .map(|entry| {
-                Some(binding_model::BindGroupEntry {
-                    binding: entry.binding,
-                    resource: self.binding(&entry.resource)?,
-                })
-            })
-            .collect::<Option<Vec<_>>>();
-        let object = match (layout, entries) {
-            (Some(layout), Some(entries)) => {
-                let raw = owner.created(owner.device.raw.create_bind_group(
-                    &binding_model::BindGroupDescriptor {
-                        label: descriptor.label.as_deref().map(Into::into),
-                        layout: layout.clone(),
-                        entries: entries.into(),
-                    },
-                ));
-                Object::new(owner.clone(), raw, descriptor.label)
-            }
-            _ => {
-                owner.invalid("bind group uses an invalid resource");
-                Object::invalid(owner.clone(), descriptor.label)
-            }
-        };
-        wit::GpuBindGroup::new(object)
-    }
-    pub fn new(
-        device: backend::Device,
-        info: wgpu_types::AdapterInfo,
-        label: Option<String>,
-        queue_label: Option<String>,
-    ) -> Self {
-        let owner = Rc::new(DeviceState::new(device));
-        Self {
-            object: Object::new(owner.clone(), (), label),
-            queue: Queue::new(owner, queue_label),
-            info,
-        }
+            .map(|entry| (entry.binding, self.binding(&entry.resource)))
+            .collect();
+        self.create(Create::BindGroup {
+            id: handle.id,
+            label: descriptor.label,
+            layout: self
+                .shared
+                .resolve(descriptor.layout.get::<Handle<markers::BindGroupLayout>>()),
+            entries,
+        });
+        wit::GpuBindGroup::new(handle)
     }
 
     pub fn create_buffer(&self, descriptor: wit::GpuBufferDescriptor) -> wit::GpuBuffer {
-        let owner = &self.object.owner;
-        let (raw, error) = owner
-            .device
-            .raw
-            .create_buffer(&wgpu_types::BufferDescriptor {
-                label: descriptor.label.as_deref().map(Into::into),
+        let handle = Handle::new(&self.shared, descriptor.label.clone());
+        self.create(Create::Buffer {
+            id: handle.id,
+            descriptor: wgpu_types::BufferDescriptor {
+                label: descriptor.label.clone().map(Cow::Owned),
                 size: descriptor.size,
                 usage: descriptor.usage.convert(),
                 mapped_at_creation: descriptor.mapped_at_creation.unwrap_or(false),
-            });
-        let object = match error {
-            Some(error) => {
-                owner.report(&error);
-                Object::invalid(owner.clone(), descriptor.label.clone())
-            }
-            None => Object::new(owner.clone(), raw, descriptor.label.clone()),
-        };
-        wit::GpuBuffer::new(Buffer::new(object, &descriptor))
+            },
+        });
+        wit::GpuBuffer::new(Buffer::new(handle, &descriptor))
     }
 
     pub fn create_sampler(&self, descriptor: Option<wit::GpuSamplerDescriptor>) -> wit::GpuSampler {
         let label = descriptor.as_ref().and_then(|d| d.label.clone());
         let defaults = wgpu_types::SamplerDescriptor::<Option<&str>>::default();
         let mut native = resource::SamplerDescriptor {
-            label: label.as_deref().map(Into::into),
+            label: label.clone().map(Cow::Owned),
             address_modes: [
                 defaults.address_mode_u,
                 defaults.address_mode_v,
@@ -271,38 +225,30 @@ impl Device {
             native.compare = d.compare.map(Convert::convert);
             native.anisotropy_clamp = d.max_anisotropy.unwrap_or(native.anisotropy_clamp);
         }
-        let owner = &self.object.owner;
-        let raw = owner.created(owner.device.raw.create_sampler(&native));
-        wit::GpuSampler::new(Object::new(owner.clone(), raw, label))
+        let handle = Handle::<markers::Sampler>::new(&self.shared, label);
+        self.create(Create::Sampler {
+            id: handle.id,
+            descriptor: native,
+        });
+        wit::GpuSampler::new(handle)
     }
 
     pub fn create_shader_module(
         &self,
         descriptor: wit::GpuShaderModuleDescriptor<'_>,
     ) -> wit::GpuShaderModule {
-        let owner = &self.object.owner;
         // Compilation hints are optional optimization hints in WebGPU. Core
         // compiles each entry point when its pipeline is created.
-        let (raw, error) = owner.device.raw.create_shader_module(
-            &pipeline::ShaderModuleDescriptor {
-                label: descriptor.label.as_deref().map(Into::into),
-                runtime_checks: wgpu_types::ShaderRuntimeChecks::default(),
-            },
-            pipeline::ShaderModuleSource::Wgsl(descriptor.code.as_str().into()),
-        );
-        let diagnostics = match error {
-            Some(error) => {
-                owner.report(&error);
-                wgpu::CompilationInfo::from(error)
-                    .messages
-                    .into_iter()
-                    .map(|message| CompilationMessage::from_wgpu(message, &descriptor.code))
-                    .collect()
-            }
-            None => Vec::new(),
-        };
+        let handle = Handle::new(&self.shared, descriptor.label.clone());
+        let diagnostics = Rc::new(OnceCell::new());
+        self.create(Create::ShaderModule {
+            id: handle.id,
+            label: descriptor.label,
+            code: descriptor.code,
+            diagnostics: diagnostics.clone(),
+        });
         wit::GpuShaderModule::new(Shader {
-            object: Object::new(owner.clone(), raw, descriptor.label),
+            handle,
             diagnostics,
         })
     }
@@ -312,54 +258,41 @@ impl Device {
         descriptor: Option<wit::GpuCommandEncoderDescriptor>,
     ) -> wit::GpuCommandEncoder {
         let label = descriptor.and_then(|d| d.label);
-        let owner = &self.object.owner;
-        let raw = owner.created(owner.device.raw.create_command_encoder(
-            &wgpu_types::CommandEncoderDescriptor {
-                label: label.as_deref().map(Into::into),
-            },
-        ));
-        wit::GpuCommandEncoder::new(Encoder(Recorder::new(
-            owner.clone(),
-            Some(raw),
+        let handle = Handle::new(&self.shared, label.clone());
+        self.create(Create::CommandEncoder {
+            id: handle.id,
             label,
-            Rc::new(Cell::new(false)),
-        )))
+        });
+        wit::GpuCommandEncoder::new(Encoder(Recorder::new(handle, Rc::new(Cell::new(false)))))
     }
 
     pub fn create_render_bundle_encoder(
         &self,
         descriptor: wit::GpuRenderBundleEncoderDescriptor,
     ) -> wit::GpuRenderBundleEncoder {
-        let native = command::RenderBundleEncoderDescriptor {
-            label: descriptor.label.as_deref().map(Into::into),
-            color_formats: descriptor
-                .color_formats
-                .into_iter()
-                .map(|f| f.map(Convert::convert))
-                .collect(),
-            depth_stencil: descriptor.depth_stencil_format.map(|format| {
-                wgpu_types::RenderBundleDepthStencil {
-                    format: format.convert(),
-                    depth_read_only: descriptor.depth_read_only.unwrap_or(false),
-                    stencil_read_only: descriptor.stencil_read_only.unwrap_or(false),
-                }
-            }),
-            sample_count: descriptor.sample_count.unwrap_or(1),
-            multiview: None,
-        };
-        let owner = &self.object.owner;
-        let (raw, error) = owner.device.raw.create_render_bundle_encoder(&native);
-        let invalid = error.is_some();
-        if let Some(error) = error {
-            owner.report(&error);
-        }
+        let handle = Handle::new(&self.shared, descriptor.label.clone());
+        self.create(Create::RenderBundleEncoder {
+            id: handle.id,
+            descriptor: core_command::RenderBundleEncoderDescriptor {
+                label: descriptor.label.map(Cow::Owned),
+                color_formats: descriptor
+                    .color_formats
+                    .into_iter()
+                    .map(|f| f.map(Convert::convert))
+                    .collect(),
+                depth_stencil: descriptor.depth_stencil_format.map(|format| {
+                    wgpu_types::RenderBundleDepthStencil {
+                        format: format.convert(),
+                        depth_read_only: descriptor.depth_read_only.unwrap_or(false),
+                        stencil_read_only: descriptor.stencil_read_only.unwrap_or(false),
+                    }
+                }),
+                sample_count: descriptor.sample_count.unwrap_or(1),
+                multiview: None,
+            },
+        });
         wit::GpuRenderBundleEncoder::new(BundleEncoder(RenderRecorder {
-            recorder: Recorder::new(
-                owner.clone(),
-                Some(*raw),
-                descriptor.label,
-                Rc::new(Cell::new(invalid)),
-            ),
+            recorder: Recorder::new(handle, Rc::new(Cell::new(false))),
             draws: Cell::new(0),
             // The enclosing render pass enforces its maxDrawCount, including
             // every execution of this bundle.
@@ -371,14 +304,13 @@ impl Device {
         &self,
         descriptor: wit::GpuQuerySetDescriptor,
     ) -> Result<wit::GpuQuerySet, wit::CreateQuerySetError> {
-        let owner = &self.object.owner;
         // WebGPU createQuerySet throws TypeError before device validation when
         // timestamp-query was not enabled.
         if matches!(descriptor.type_, wit::GpuQueryType::Timestamp)
-            && !owner
-                .device
-                .raw
-                .features()
+            && !self
+                .shared
+                .capabilities
+                .features
                 .contains(wgpu_types::Features::TIMESTAMP_QUERY)
         {
             return Err(wit::CreateQuerySetError {
@@ -386,15 +318,17 @@ impl Device {
                 message: "timestamp-query was not enabled on this device".into(),
             });
         }
-        let raw = owner.created(owner.device.raw.create_query_set(
-            &wgpu_types::QuerySetDescriptor {
-                label: descriptor.label.as_deref().map(Into::into),
+        let handle = Handle::new(&self.shared, descriptor.label.clone());
+        self.create(Create::QuerySet {
+            id: handle.id,
+            descriptor: wgpu_types::QuerySetDescriptor {
+                label: descriptor.label.map(Cow::Owned),
                 ty: descriptor.type_.convert(),
                 count: descriptor.count,
             },
-        ));
+        });
         Ok(wit::GpuQuerySet::new(QuerySet {
-            object: Object::new(owner.clone(), raw, descriptor.label),
+            handle,
             kind: descriptor.type_,
             count: descriptor.count,
         }))
@@ -411,39 +345,37 @@ macro_rules! create_resource {
 
 impl wit::GuestGpuDevice for Device {
     fn label(&self) -> String {
-        self.object.label()
+        self.label.borrow().clone()
     }
     fn set_label(&self, label: String) {
-        self.object.set_label(label);
+        *self.label.borrow_mut() = label;
     }
     fn features(&self) -> wit::GpuSupportedFeatures {
         wit::GpuSupportedFeatures::new(Features {
-            raw: *self.object.owner.device.raw.features(),
+            raw: self.shared.capabilities.features,
             core: true,
         })
     }
     fn limits(&self) -> wit::GpuSupportedLimits {
-        let raw = &self.object.owner.device.raw;
+        let capabilities = &self.shared.capabilities;
         wit::GpuSupportedLimits::new(Limits {
-            raw: raw.limits().clone(),
-            stages: raw.downlevel().flags,
+            raw: capabilities.limits.clone(),
+            stages: capabilities.downlevel.flags,
         })
     }
     fn adapter_info(&self) -> wit::GpuAdapterInfo {
-        wit::GpuAdapterInfo::new(super::resource::AdapterInfo(self.info.clone()))
+        wit::GpuAdapterInfo::new(AdapterInfo(self.shared.capabilities.info.clone()))
     }
     fn queue(&self) -> wit::GpuQueue {
         wit::GpuQueue::new(self.queue.clone())
     }
 
     async fn destroy(&self) {
-        if let Err(error) = self.object.owner.device.destroy().await {
-            self.object.owner.errors.report(crate::runtime::GpuError {
-                kind: crate::runtime::GpuErrorKind::Internal,
-                message: error.to_string(),
-                causes: Vec::new(),
-            });
-        }
+        let (reply, answer) = async_channel::bounded(1);
+        self.shared.enqueue(Command::Destroy(reply));
+        // A closed reply means the device timeline answered nothing because
+        // the device was already gone; destruction holds either way.
+        let _ = answer.recv().await;
     }
 
     create_resource!(create_buffer, wit::GpuBufferDescriptor, wit::GpuBuffer);
@@ -509,27 +441,31 @@ impl wit::GuestGpuDevice for Device {
     }
 
     fn push_error_scope(&self, filter: wit::GpuErrorFilter) {
-        use crate::runtime::GpuErrorKind;
-        self.object.owner.errors.push(match filter {
+        self.shared.scopes.push(match filter {
             wit::GpuErrorFilter::Validation => GpuErrorKind::Validation,
             wit::GpuErrorFilter::OutOfMemory => GpuErrorKind::OutOfMemory,
             wit::GpuErrorFilter::Internal => GpuErrorKind::Internal,
         });
     }
+
     async fn pop_error_scope(&self) -> Result<Option<wit::GpuError>, wit::PopErrorScopeError> {
-        self.object
-            .owner
-            .errors
+        let scope = self
+            .shared
+            .scopes
             .pop()
-            .map(|error| error.map(wit::GpuError::new))
             .map_err(|error| wit::PopErrorScopeError {
                 kind: wit::PopErrorScopeErrorKind::OperationError,
                 message: error.to_string(),
-            })
+            })?;
+        // Commands queued while the scope was open report into it; once the
+        // device timeline has passed them all, its first error is final.
+        let (reply, answer) = async_channel::bounded(1);
+        self.shared.enqueue(Command::Fence(reply));
+        let _ = answer.recv().await;
+        Ok(scope.take().map(wit::GpuError::new))
     }
 
     async fn lost(&self) -> helios_api::wit_bindgen::FutureReader<wit::GpuDeviceLostInfo> {
-        use crate::runtime::DeviceLost;
         // A cancelled producer must complete its canonical future. Cancellation
         // ends this observer, so it reports an unknown reason rather than
         // fabricating a successful device-destruction notification.
@@ -539,11 +475,18 @@ impl wit::GuestGpuDevice for Device {
                 message: "device loss observation was cancelled".into(),
             })
         });
-        let loss = self.object.owner.device.loss();
+        // wgpu-core runs the loss callback on the device timeline, which
+        // answers with the notification it fills. The observer holds that
+        // notification and no part of the device.
+        let (reply, answer) = async_channel::bounded(1);
+        self.shared.enqueue(Command::Lost(reply));
+        let loss = answer
+            .recv()
+            .await
+            .unwrap_or_else(|_| unreachable!("the device task answers while a handle lives"));
         helios_api::task::spawn(async move {
-            // This task owns only the notification channel, not the device.
-            // The component never replaces the callback: closure without a
-            // notification means that the native device has been released.
+            // Closure without a notification means the device timeline has
+            // released the native device.
             let lost = loss.wait().await.unwrap_or_else(|error| DeviceLost {
                 reason: wgpu_types::DeviceLostReason::Destroyed,
                 message: error.to_string(),
@@ -554,7 +497,13 @@ impl wit::GuestGpuDevice for Device {
     }
 
     async fn on_uncaptured_error(&self) -> helios_api::wit_bindgen::StreamReader<wit::GpuError> {
-        let events = self.object.owner.errors.events();
+        let (subscriber, events) = async_channel::unbounded();
+        let (done, subscribed) = async_channel::bounded(1);
+        self.shared.enqueue(Command::Subscribe {
+            events: subscriber,
+            done,
+        });
+        let _ = subscribed.recv().await;
         let (mut writer, reader) = helios_api::bindings::wit_stream::new();
         helios_api::task::spawn(async move {
             while let Ok(error) = events.recv().await {

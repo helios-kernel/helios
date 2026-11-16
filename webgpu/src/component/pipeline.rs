@@ -1,97 +1,88 @@
 //! Owned descriptors keep synchronous and asynchronous pipeline validation equal.
 
-use wgpu_core::pipeline;
+use std::borrow::Cow;
+
+use wgpu_core::{
+    device::global::{ComputePipelineDescriptor, RenderPipelineDescriptor},
+    id::{self, markers},
+    pipeline,
+};
 use wgpu_types::error::{ErrorType, WebGpuError};
 
 use super::{
-    backend,
+    command::Create,
+    content::{DeviceShared, Handle},
     convert::Convert,
     device::Device,
-    value::{Dictionary, Object, Shader},
+    value::{Dictionary, Shader},
     wit,
 };
 
-#[derive(Debug, thiserror::Error)]
-#[error("pipeline uses an invalid {0}")]
-struct InvalidResource(&'static str);
-
-impl WebGpuError for InvalidResource {
-    fn webgpu_error_type(&self) -> ErrorType {
-        ErrorType::Validation
-    }
-}
-
-fn layout(
-    mode: wit::GpuLayoutMode<'_>,
-) -> Result<Option<backend::PipelineLayout>, InvalidResource> {
+fn layout(device: &DeviceShared, mode: wit::GpuLayoutMode<'_>) -> Option<id::PipelineLayoutId> {
     match mode {
-        wit::GpuLayoutMode::Auto => Ok(None),
-        wit::GpuLayoutMode::Specific(layout) => layout
-            .get::<Object<backend::PipelineLayout>>()
-            .raw
-            .clone()
-            .map(Some)
-            .ok_or(InvalidResource("pipeline layout")),
+        wit::GpuLayoutMode::Auto => None,
+        wit::GpuLayoutMode::Specific(layout) => {
+            Some(device.resolve(layout.get::<Handle<markers::PipelineLayout>>()))
+        }
     }
 }
 
 fn stage(
+    device: &DeviceShared,
     module: wit::GpuShaderModuleBorrow<'_>,
     entry_point: Option<String>,
     constants: Option<wit::RecordGpuPipelineConstantValue>,
-) -> Result<pipeline::ProgrammableStageDescriptor<'static>, InvalidResource> {
-    Ok(pipeline::ProgrammableStageDescriptor {
-        module: module
-            .get::<Shader>()
-            .object
-            .raw
-            .clone()
-            .ok_or(InvalidResource("shader module"))?,
-        entry_point: entry_point.map(Into::into),
+) -> pipeline::ProgrammableStageDescriptor<'static, id::ShaderModuleId> {
+    pipeline::ProgrammableStageDescriptor {
+        module: device.resolve(&module.get::<Shader>().handle),
+        entry_point: entry_point.map(Cow::Owned),
         constants: constants
             .map(|c| c.get::<Dictionary<f64>>().entries().into_iter().collect())
             .unwrap_or_default(),
         zero_initialize_workgroup_memory: true,
-    })
+    }
 }
 
 fn compute(
+    device: &DeviceShared,
     descriptor: wit::GpuComputePipelineDescriptor<'_>,
-) -> Result<pipeline::ComputePipelineDescriptor<'static>, InvalidResource> {
-    Ok(pipeline::ComputePipelineDescriptor {
-        label: descriptor.label.map(Into::into),
-        layout: layout(descriptor.layout)?,
+) -> ComputePipelineDescriptor<'static> {
+    pipeline::ComputePipelineDescriptor {
+        label: descriptor.label.map(Cow::Owned),
+        layout: layout(device, descriptor.layout),
         stage: stage(
+            device,
             descriptor.compute.module,
             descriptor.compute.entry_point,
             descriptor.compute.constants,
-        )?,
+        ),
         cache: None,
-    })
+    }
 }
 
 fn render(
+    device: &DeviceShared,
     descriptor: wit::GpuRenderPipelineDescriptor<'_>,
-) -> Result<pipeline::ResolvedGeneralRenderPipelineDescriptor<'static>, InvalidResource> {
+) -> Box<RenderPipelineDescriptor<'static>> {
     let vertex = descriptor.vertex;
-    let fragment = descriptor
-        .fragment
-        .map(|fragment| {
-            Ok(pipeline::FragmentState {
-                stage: stage(fragment.module, fragment.entry_point, fragment.constants)?,
-                targets: fragment
-                    .targets
-                    .into_iter()
-                    .map(|t| t.map(Convert::convert))
-                    .collect(),
-            })
-        })
-        .transpose()?;
-    Ok(pipeline::RenderPipelineDescriptor {
-        label: descriptor.label.map(Into::into),
-        layout: layout(descriptor.layout)?,
+    let fragment = descriptor.fragment.map(|fragment| pipeline::FragmentState {
+        stage: stage(
+            device,
+            fragment.module,
+            fragment.entry_point,
+            fragment.constants,
+        ),
+        targets: fragment
+            .targets
+            .into_iter()
+            .map(|t| t.map(Convert::convert))
+            .collect(),
+    });
+    Box::new(pipeline::RenderPipelineDescriptor {
+        label: descriptor.label.map(Cow::Owned),
+        layout: layout(device, descriptor.layout),
         vertex: pipeline::VertexState {
-            stage: stage(vertex.module, vertex.entry_point, vertex.constants)?,
+            stage: stage(device, vertex.module, vertex.entry_point, vertex.constants),
             buffers: vertex
                 .buffers
                 .unwrap_or_default()
@@ -124,11 +115,11 @@ fn render(
         fragment,
         multiview_mask: None,
         cache: None,
-    }
-    .into())
+    })
 }
 
-fn pipeline_error(error: impl WebGpuError) -> wit::CreatePipelineError {
+/// The rejection an async pipeline creation answers with.
+pub fn pipeline_error(error: impl WebGpuError) -> wit::CreatePipelineError {
     let reason = match error.webgpu_error_type() {
         ErrorType::Validation => wit::GpuPipelineErrorReason::Validation,
         ErrorType::Internal | ErrorType::OutOfMemory | ErrorType::DeviceLost => {
@@ -147,82 +138,72 @@ fn pipeline_error(error: impl WebGpuError) -> wit::CreatePipelineError {
     }
 }
 
+/// Await the device timeline's verdict. The caller holds the device, so its
+/// task is alive and answers every creation.
+async fn verdict(
+    answer: async_channel::Receiver<Result<(), wit::CreatePipelineError>>,
+) -> Result<(), wit::CreatePipelineError> {
+    answer
+        .recv()
+        .await
+        .unwrap_or_else(|_| unreachable!("the device task answers every pipeline creation"))
+}
+
 impl Device {
     pub fn create_compute_pipeline(
         &self,
         descriptor: wit::GpuComputePipelineDescriptor<'_>,
     ) -> wit::GpuComputePipeline {
-        let label = descriptor.label.clone();
-        let owner = &self.object.owner;
-        let object = match compute(descriptor) {
-            Ok(descriptor) => Object::new(
-                owner.clone(),
-                owner.created(owner.device.raw.create_compute_pipeline(descriptor)),
-                label,
-            ),
-            Err(error) => {
-                owner.report(&error);
-                Object::invalid(owner.clone(), label)
-            }
-        };
-        wit::GpuComputePipeline::new(object)
+        let handle = Handle::new(&self.shared, descriptor.label.clone());
+        self.create(Create::ComputePipeline {
+            id: handle.id,
+            descriptor: compute(&self.shared, descriptor),
+            reply: None,
+        });
+        wit::GpuComputePipeline::new(handle)
     }
 
     pub async fn create_compute_pipeline_async(
         &self,
         descriptor: wit::GpuComputePipelineDescriptor<'_>,
     ) -> Result<wit::GpuComputePipeline, wit::CreatePipelineError> {
-        let label = descriptor.label.clone();
-        let descriptor = compute(descriptor).map_err(pipeline_error)?;
-        let owner = &self.object.owner;
-        let raw = owner
-            .device
-            .raw
-            .create_compute_pipeline_inner(descriptor)
-            .map_err(pipeline_error)?;
-        Ok(wit::GpuComputePipeline::new(Object::new(
-            owner.clone(),
-            raw,
-            label,
-        )))
+        // A rejected pipeline's handle drops here, releasing its invalid object.
+        let handle = Handle::new(&self.shared, descriptor.label.clone());
+        let (reply, answer) = async_channel::bounded(1);
+        self.create(Create::ComputePipeline {
+            id: handle.id,
+            descriptor: compute(&self.shared, descriptor),
+            reply: Some(reply),
+        });
+        verdict(answer).await?;
+        Ok(wit::GpuComputePipeline::new(handle))
     }
 
     pub fn create_render_pipeline(
         &self,
         descriptor: wit::GpuRenderPipelineDescriptor<'_>,
     ) -> wit::GpuRenderPipeline {
-        let label = descriptor.label.clone();
-        let owner = &self.object.owner;
-        let object = match render(descriptor) {
-            Ok(descriptor) => Object::new(
-                owner.clone(),
-                owner.created(owner.device.raw.create_render_pipeline(descriptor)),
-                label,
-            ),
-            Err(error) => {
-                owner.report(&error);
-                Object::invalid(owner.clone(), label)
-            }
-        };
-        wit::GpuRenderPipeline::new(object)
+        let handle = Handle::new(&self.shared, descriptor.label.clone());
+        self.create(Create::RenderPipeline {
+            id: handle.id,
+            descriptor: render(&self.shared, descriptor),
+            reply: None,
+        });
+        wit::GpuRenderPipeline::new(handle)
     }
 
     pub async fn create_render_pipeline_async(
         &self,
         descriptor: wit::GpuRenderPipelineDescriptor<'_>,
     ) -> Result<wit::GpuRenderPipeline, wit::CreatePipelineError> {
-        let label = descriptor.label.clone();
-        let descriptor = render(descriptor).map_err(pipeline_error)?;
-        let owner = &self.object.owner;
-        let raw = owner
-            .device
-            .raw
-            .create_render_pipeline_inner(descriptor)
-            .map_err(pipeline_error)?;
-        Ok(wit::GpuRenderPipeline::new(Object::new(
-            owner.clone(),
-            raw,
-            label,
-        )))
+        let handle = Handle::new(&self.shared, descriptor.label.clone());
+        let (reply, answer) = async_channel::bounded(1);
+        self.create(Create::RenderPipeline {
+            id: handle.id,
+            descriptor: render(&self.shared, descriptor),
+            reply: Some(reply),
+        });
+        verdict(answer).await?;
+        Ok(wit::GpuRenderPipeline::new(handle))
     }
 }

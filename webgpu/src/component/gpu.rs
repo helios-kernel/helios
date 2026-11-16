@@ -1,15 +1,15 @@
 use core::cell::OnceCell;
 
-use super::{adapter::Adapter, backend::Runtime, convert::Convert, value::LanguageFeatures, wit};
+use super::{adapter::Adapter, convert::Convert, instance::Instance, value::LanguageFeatures, wit};
 
 /// The `gpu` entry point.
 ///
-/// `get-gpu` is a synchronous export, and opening the Vulkan instance
-/// waits on the host's GPU device, which a synchronous task may not do, so
-/// the instance opens on the first `request-adapter`, an async export.
+/// `get-gpu` is a synchronous export and opening the Vulkan instance waits
+/// on the host, so the instance opens on the first `request-adapter`, an
+/// async export, which also enumerates the adapters.
 #[derive(Default)]
 pub struct Gpu {
-    runtime: OnceCell<Result<Runtime, wgpu_hal::InstanceError>>,
+    instance: OnceCell<Option<Instance>>,
 }
 
 impl wit::GuestGpu for Gpu {
@@ -17,7 +17,10 @@ impl wit::GuestGpu for Gpu {
         &self,
         options: Option<wit::GpuRequestAdapterOptions>,
     ) -> Option<wit::GpuAdapter> {
-        let runtime = self.runtime.get_or_init(Runtime::open).as_ref().ok()?;
+        let instance = self
+            .instance
+            .get_or_init(|| Instance::open().ok())
+            .as_ref()?;
         let mut native = wgpu_types::RequestAdapterOptions::default();
         if let Some(options) = options {
             // WebGPU permits core-defaulting adapters for compatibility requests
@@ -37,11 +40,7 @@ impl wit::GuestGpu for Gpu {
             // No WebXR session is exposed by this platform; xr-compatible is a
             // hint that WebGPU permits such implementations to ignore.
         }
-        let raw = runtime
-            .0
-            .request_adapter(&native, wgpu_types::Backends::VULKAN)
-            .ok()?;
-        Adapter::core(raw).map(wit::GpuAdapter::new)
+        Adapter::request(instance, &native).map(wit::GpuAdapter::new)
     }
     fn get_preferred_canvas_format(&self) -> wit::GpuTextureFormat {
         wit::GpuTextureFormat::Bgra8unorm

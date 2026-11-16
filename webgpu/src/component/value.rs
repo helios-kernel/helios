@@ -1,69 +1,10 @@
-use super::backend;
-use super::state::DeviceState;
-use core::cell::RefCell;
+use core::cell::{OnceCell, RefCell};
 use indexmap::IndexMap;
 use std::rc::Rc;
+use wgpu_core::id::markers;
 
-use super::wit;
+use super::{command::Command, content::Handle, wit};
 use crate::runtime::{DeviceLost, GpuError, GpuErrorKind};
-
-/// Resource labels are component state; Vulkan objects keep their creation label.
-#[derive(Clone)]
-pub struct Object<T> {
-    pub raw: Option<T>,
-    pub owner: Rc<DeviceState>,
-    label: Rc<RefCell<String>>,
-}
-
-impl<T> Object<T> {
-    pub fn new(owner: Rc<DeviceState>, raw: T, label: Option<String>) -> Self {
-        Self {
-            raw: Some(raw),
-            owner,
-            label: Rc::new(RefCell::new(label.unwrap_or_default())),
-        }
-    }
-
-    pub fn invalid(owner: Rc<DeviceState>, label: Option<String>) -> Self {
-        Self {
-            raw: None,
-            owner,
-            label: Rc::new(RefCell::new(label.unwrap_or_default())),
-        }
-    }
-
-    pub fn get(&self) -> Option<&T> {
-        if self.raw.is_none() {
-            self.owner
-                .invalid("operation uses an invalid WebGPU resource");
-        }
-        self.raw.as_ref()
-    }
-
-    pub fn label(&self) -> String {
-        self.label.borrow().clone()
-    }
-    pub fn set_label(&self, label: String) {
-        *self.label.borrow_mut() = label;
-    }
-}
-
-macro_rules! labeled {
-    ($($guest:ident => $raw:ty),* $(,)?) => {$ (
-        impl wit::$guest for Object<$raw> {
-            fn label(&self) -> String { self.label() }
-            fn set_label(&self, label: String) { self.set_label(label); }
-        }
-    )*};
-}
-
-labeled! {
-    GuestGpuBindGroup => backend::BindGroup,
-    GuestGpuBindGroupLayout => backend::BindGroupLayout,
-    GuestGpuPipelineLayout => backend::PipelineLayout,
-    GuestGpuSampler => backend::Sampler,
-    GuestGpuTextureView => backend::TextureView,
-}
 
 pub struct Dictionary<T>(RefCell<IndexMap<String, T>>);
 
@@ -242,9 +183,11 @@ impl wit::GuestGpuSupportedLimits for Limits {
     }
 }
 
+/// A shader module. The device timeline fills its diagnostics when it
+/// compiles the module.
 pub struct Shader {
-    pub object: Object<backend::ShaderModule>,
-    pub diagnostics: Vec<CompilationMessage>,
+    pub handle: Handle<markers::ShaderModule>,
+    pub diagnostics: Rc<OnceCell<Vec<CompilationMessage>>>,
 }
 
 pub struct CompilationInfo(pub Vec<CompilationMessage>);
@@ -293,14 +236,22 @@ impl CompilationMessage {
 
 impl wit::GuestGpuShaderModule for Shader {
     async fn get_compilation_info(&self) -> wit::GpuCompilationInfo {
-        wit::GpuCompilationInfo::new(CompilationInfo(self.diagnostics.clone()))
+        // The module's creation precedes this fence on its device timeline.
+        let (reply, answer) = async_channel::bounded(1);
+        self.handle.device.enqueue(Command::Fence(reply));
+        let _ = answer.recv().await;
+        let messages = self
+            .diagnostics
+            .get()
+            .unwrap_or_else(|| unreachable!("the device timeline compiled the module"));
+        wit::GpuCompilationInfo::new(CompilationInfo(messages.clone()))
     }
 
     fn label(&self) -> String {
-        self.object.label()
+        self.handle.label()
     }
     fn set_label(&self, label: String) {
-        self.object.set_label(label);
+        self.handle.set_label(label);
     }
 }
 impl wit::GuestGpuCompilationInfo for CompilationInfo {

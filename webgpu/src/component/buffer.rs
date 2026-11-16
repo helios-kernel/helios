@@ -1,6 +1,11 @@
-//! Mapped views are copied at the component boundary and never survive a call.
-
-use super::backend;
+//! Buffers and their mappings on the content timeline.
+//!
+//! A mapped range lives in content-side memory, the way a browser's content
+//! process holds its shared copy: `mapped-at-creation` starts from zeroed
+//! memory, and a settled `map-async` from the bytes the device timeline
+//! read. The mapped-range calls copy in and out of that memory without
+//! reaching the device, and `unmap` queues the write-back of a writable
+//! mapping before the device timeline unmaps.
 
 use core::cell::{Cell, RefCell};
 use core::future::{Future, poll_fn};
@@ -9,7 +14,9 @@ use core::pin::pin;
 use core::task::Poll;
 use std::rc::Rc;
 
-use super::{value::Object, wit};
+use wgpu_core::id::markers;
+
+use super::{command::Command, content::Handle, convert::Convert, wit};
 
 #[derive(Debug, thiserror::Error)]
 #[error("buffer range is outside the allocation or overflows its address space")]
@@ -35,7 +42,28 @@ struct Mapping {
     range: Range<u64>,
     writable: bool,
     pending: Cell<bool>,
+    /// The mapped bytes, `range.start` at index zero.
+    data: RefCell<Vec<u8>>,
     cancel: async_channel::Sender<()>,
+}
+
+impl Mapping {
+    fn new(range: Range<u64>, writable: bool, pending: bool, data: Vec<u8>) -> Rc<Self> {
+        let (cancel, _) = async_channel::bounded(1);
+        Rc::new(Self {
+            range,
+            writable,
+            pending: Cell::new(pending),
+            data: RefCell::new(data),
+            cancel,
+        })
+    }
+
+    /// Indices into `data` for `requested`, which lies within `range`.
+    fn local(&self, requested: &Range<u64>) -> Range<usize> {
+        let start = (requested.start - self.range.start) as usize;
+        start..start + (requested.end - requested.start) as usize
+    }
 }
 
 #[derive(Default)]
@@ -49,18 +77,15 @@ impl MappingSlot {
             .is_some_and(|current| Rc::ptr_eq(current, mapping))
     }
 
-    fn remove(&self) -> bool {
-        if let Some(mapping) = self.0.borrow_mut().take() {
-            mapping.cancel.close();
-            true
-        } else {
-            false
-        }
+    fn take(&self) -> Option<Rc<Mapping>> {
+        let mapping = self.0.borrow_mut().take()?;
+        mapping.cancel.close();
+        Some(mapping)
     }
 }
 
 pub struct Buffer {
-    pub object: Object<backend::Buffer>,
+    pub handle: Handle<markers::Buffer>,
     pub size: u64,
     pub usage: wit::GpuBufferUsage,
     mapping: MappingSlot,
@@ -68,19 +93,25 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn new(object: Object<backend::Buffer>, descriptor: &wit::GpuBufferDescriptor) -> Self {
+    pub fn new(handle: Handle<markers::Buffer>, descriptor: &wit::GpuBufferDescriptor) -> Self {
         let mapping = MappingSlot::default();
-        if descriptor.mapped_at_creation.unwrap_or(false) && object.raw.is_some() {
-            let (cancel, _) = async_channel::bounded(1);
-            *mapping.0.borrow_mut() = Some(Rc::new(Mapping {
-                range: 0..descriptor.size,
-                writable: true,
-                pending: Cell::new(false),
-                cancel,
-            }));
+        if descriptor.mapped_at_creation.unwrap_or(false) {
+            // WebGPU maps the whole buffer at creation even when the device
+            // timeline rejects the buffer, so the memory is the content
+            // timeline's own.
+            match zeroed(descriptor.size) {
+                Some(data) => {
+                    *mapping.0.borrow_mut() =
+                        Some(Mapping::new(0..descriptor.size, true, false, data));
+                }
+                None => handle.device.invalid(format!(
+                    "a mapped-at-creation range of {} bytes cannot be allocated",
+                    descriptor.size
+                )),
+            }
         }
         Self {
-            object,
+            handle,
             size: descriptor.size,
             usage: descriptor.usage,
             mapping,
@@ -89,41 +120,57 @@ impl Buffer {
     }
 
     fn unmap(&self) {
-        if self.mapping.remove()
-            && let Some(raw) = &self.object.raw
-        {
-            self.object.owner.native(|| raw.unmap());
-        }
+        let Some(mapping) = self.mapping.take() else {
+            return;
+        };
+        let write_back = (mapping.writable && !mapping.pending.get())
+            .then(|| (mapping.range.start, mapping.data.take()));
+        self.handle.device.enqueue(Command::Unmap {
+            buffer: self.handle.id,
+            write_back,
+        });
     }
 
+    /// The mapping and the indices of `requested` within its memory.
     fn mapped_range(
         &self,
         offset: Option<u64>,
         size: Option<u64>,
         write: bool,
-    ) -> Result<Range<u64>, wit::GetMappedRangeError> {
+    ) -> Result<(Rc<Mapping>, Range<usize>), wit::GetMappedRangeError> {
         let error = |message: String| wit::GetMappedRangeError {
             kind: wit::GetMappedRangeErrorKind::OperationError,
             message,
         };
         let requested = range(self.size, offset, size).map_err(|e| error(e.to_string()))?;
-        let mapping = self.mapping.0.borrow();
-        let mapping = mapping
-            .as_ref()
+        let mapping = self
+            .mapping
+            .0
+            .borrow()
+            .clone()
             .ok_or_else(|| error("buffer is not mapped".into()))?;
         if mapping.pending.get()
             || (write && !mapping.writable)
             || requested.start < mapping.range.start
             || requested.end > mapping.range.end
-            || !requested.start.is_multiple_of(wgpu::MAP_ALIGNMENT)
-            || !(requested.end - requested.start).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+            || !requested.start.is_multiple_of(wgpu_types::MAP_ALIGNMENT)
+            || !(requested.end - requested.start).is_multiple_of(wgpu_types::COPY_BUFFER_ALIGNMENT)
         {
             return Err(error(
                 "requested range is not accessible in the current mapping".into(),
             ));
         }
-        Ok(requested)
+        let local = mapping.local(&requested);
+        Ok((mapping, local))
     }
+}
+
+fn zeroed(size: u64) -> Option<Vec<u8>> {
+    let size = usize::try_from(size).ok()?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(size).ok()?;
+    data.resize(size, 0);
+    Some(data)
 }
 
 /// Dropping an async invocation cancels only the mapping it started.
@@ -148,10 +195,10 @@ impl wit::GuestGpuBuffer for Buffer {
         self.usage
     }
     fn label(&self) -> String {
-        self.object.label()
+        self.handle.label()
     }
     fn set_label(&self, label: String) {
-        self.object.set_label(label);
+        self.handle.set_label(label);
     }
     fn map_state(&self) -> wit::GpuBufferMapState {
         match self.mapping.0.borrow().as_ref() {
@@ -168,7 +215,7 @@ impl wit::GuestGpuBuffer for Buffer {
         size: Option<u64>,
     ) -> Result<(), wit::MapAsyncError> {
         let invalid = |message: String| {
-            self.object.owner.invalid(message.clone());
+            self.handle.device.invalid(message.clone());
             wit::MapAsyncError {
                 kind: wit::MapAsyncErrorKind::OperationError,
                 message,
@@ -179,28 +226,26 @@ impl wit::GuestGpuBuffer for Buffer {
                 "buffer is already mapped, pending, or destroyed".into(),
             ));
         }
-        let mode = match mode.bits() {
-            bits if bits == wit::GpuMapMode::READ.bits() => wgpu::MapMode::Read,
-            bits if bits == wit::GpuMapMode::WRITE.bits() => wgpu::MapMode::Write,
+        let (host, required) = match mode.bits() {
+            bits if bits == wit::GpuMapMode::READ.bits() => (
+                wgpu_core::device::HostMap::Read,
+                wgpu_types::BufferUsages::MAP_READ,
+            ),
+            bits if bits == wit::GpuMapMode::WRITE.bits() => (
+                wgpu_core::device::HostMap::Write,
+                wgpu_types::BufferUsages::MAP_WRITE,
+            ),
             _ => return Err(invalid("map mode must be exactly read or write".into())),
         };
         let requested = range(self.size, offset, size).map_err(|e| invalid(e.to_string()))?;
-        if !requested.start.is_multiple_of(wgpu::MAP_ALIGNMENT)
-            || !(requested.end - requested.start).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+        if !requested.start.is_multiple_of(wgpu_types::MAP_ALIGNMENT)
+            || !(requested.end - requested.start).is_multiple_of(wgpu_types::COPY_BUFFER_ALIGNMENT)
         {
             return Err(invalid(
                 "map offset must be aligned to 8 bytes and size to 4 bytes".into(),
             ));
         }
-        let raw = self
-            .object
-            .get()
-            .ok_or_else(|| invalid("buffer is invalid".into()))?;
-        let required = match mode {
-            wgpu::MapMode::Read => wgpu::BufferUsages::MAP_READ,
-            wgpu::MapMode::Write => wgpu::BufferUsages::MAP_WRITE,
-        };
-        if !super::convert::Convert::convert(self.usage).contains(required) {
+        if !self.usage.convert().contains(required) {
             return Err(invalid(
                 "buffer usage does not permit the requested map mode".into(),
             ));
@@ -208,8 +253,9 @@ impl wit::GuestGpuBuffer for Buffer {
         let (cancel, cancelled) = async_channel::bounded(1);
         let mapping = Rc::new(Mapping {
             range: requested.clone(),
-            writable: mode == wgpu::MapMode::Write,
+            writable: matches!(host, wgpu_core::device::HostMap::Write),
             pending: Cell::new(true),
+            data: RefCell::new(Vec::new()),
             cancel,
         });
         *self.mapping.0.borrow_mut() = Some(mapping.clone());
@@ -217,57 +263,35 @@ impl wit::GuestGpuBuffer for Buffer {
             buffer: self,
             mapping,
         };
-        let (answer, receive) = async_channel::bounded(1);
-        let host = match mode {
-            wgpu::MapMode::Read => wgpu_core::device::HostMap::Read,
-            wgpu::MapMode::Write => wgpu_core::device::HostMap::Write,
-        };
-        if let Err(error) = raw.map_async(
-            requested.start,
-            Some(requested.end - requested.start),
-            wgpu_core::resource::BufferMapOperation {
-                host,
-                callback: Some(Box::new(move |result| {
-                    let _ = answer.try_send(result);
-                })),
-            },
-        ) {
-            self.object.owner.report(&error);
-            return Err(wit::MapAsyncError {
-                kind: wit::MapAsyncErrorKind::OperationError,
-                message: error.to_string(),
-            });
-        }
-        let mut operation = pin!(async {
-            self.object
-                .owner
-                .device
-                .submitted_work_done()
-                .await
-                .map_err(|e| e.to_string())?;
-            let result = receive.recv().await.map_err(|e| e.to_string())?;
-            result.map_err(|e| e.to_string())
+        let (reply, answer) = async_channel::bounded(1);
+        self.handle.device.enqueue(Command::Map {
+            buffer: self.handle.id,
+            host,
+            range: requested,
+            reply,
         });
+        let mut answer = pin!(answer.recv());
         let mut cancelled = pin!(cancelled.recv());
         let result = poll_fn(|cx| {
+            // An unmap or destroy on the content timeline settles the
+            // mapping before the device timeline answers.
             if cancelled.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(Err(wit::MapAsyncError {
                     kind: wit::MapAsyncErrorKind::AbortError,
                     message: "buffer mapping was cancelled".into(),
                 }));
             }
-            operation.as_mut().poll(cx).map(|result| {
-                result.map_err(|e| wit::MapAsyncError {
-                    kind: wit::MapAsyncErrorKind::OperationError,
-                    message: e.to_string(),
-                })
+            answer.as_mut().poll(cx).map(|answer| {
+                // The caller holds the buffer and so its device, whose task
+                // answers every mapping.
+                answer.unwrap_or_else(|_| unreachable!("the device task answers every mapping"))
             })
         })
         .await;
-        if result.is_ok() {
-            pending.mapping.pending.set(false);
-        }
-        result
+        let data = result?;
+        *pending.mapping.data.borrow_mut() = data;
+        pending.mapping.pending.set(false);
+        Ok(())
     }
 
     fn get_mapped_range_get_with_copy(
@@ -275,33 +299,16 @@ impl wit::GuestGpuBuffer for Buffer {
         offset: Option<u64>,
         size: Option<u64>,
     ) -> Result<Vec<u8>, wit::GetMappedRangeError> {
-        let requested = self.mapped_range(offset, size, false)?;
-        let raw = self
-            .object
-            .raw
-            .as_ref()
-            .expect("mapped buffers own a native resource");
-        let (pointer, length) = raw
-            .get_mapped_range(requested.start, Some(requested.end - requested.start))
-            .map_err(|e| wit::GetMappedRangeError {
-                kind: wit::GetMappedRangeErrorKind::OperationError,
-                message: e.to_string(),
-            })?;
-        let length = usize::try_from(length).map_err(|e| wit::GetMappedRangeError {
-            kind: wit::GetMappedRangeErrorKind::RangeError,
-            message: e.to_string(),
-        })?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(length)
+        let (mapping, local) = self.mapped_range(offset, size, false)?;
+        let data = mapping.data.borrow();
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(local.len())
             .map_err(|e| wit::GetMappedRangeError {
                 kind: wit::GetMappedRangeErrorKind::RangeError,
                 message: e.to_string(),
             })?;
-        // SAFETY: core validates the mapped range; this single-owner resource
-        // cannot be unmapped during this synchronous call. Reservation also
-        // establishes the slice length is within Rust's addressable range.
-        data.extend_from_slice(unsafe { core::slice::from_raw_parts(pointer.as_ptr(), length) });
-        Ok(data)
+        copy.extend_from_slice(&data[local]);
+        Ok(copy)
     }
 
     fn get_mapped_range_set_with_copy(
@@ -310,29 +317,14 @@ impl wit::GuestGpuBuffer for Buffer {
         offset: Option<u64>,
         size: Option<u64>,
     ) -> Result<(), wit::GetMappedRangeError> {
-        let requested = self.mapped_range(offset, size, true)?;
-        if requested.end - requested.start != data.len() as u64 {
+        let (mapping, local) = self.mapped_range(offset, size, true)?;
+        if local.len() != data.len() {
             return Err(wit::GetMappedRangeError {
                 kind: wit::GetMappedRangeErrorKind::RangeError,
                 message: "copy length does not match the mapped range".into(),
             });
         }
-        let raw = self
-            .object
-            .raw
-            .as_ref()
-            .expect("mapped buffers own a native resource");
-        let (pointer, _) = raw
-            .get_mapped_range(requested.start, Some(requested.end - requested.start))
-            .map_err(|e| wit::GetMappedRangeError {
-                kind: wit::GetMappedRangeErrorKind::OperationError,
-                message: e.to_string(),
-            })?;
-        // SAFETY: the component owns both allocations; their lengths match,
-        // they do not overlap, and no await can release the mapped buffer.
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), pointer.as_ptr(), data.len());
-        }
+        mapping.data.borrow_mut()[local].copy_from_slice(&data);
         Ok(())
     }
 
@@ -343,14 +335,15 @@ impl wit::GuestGpuBuffer for Buffer {
     fn destroy(&self) {
         self.unmap();
         self.destroyed.set(true);
-        if let Some(raw) = &self.object.raw {
-            raw.destroy();
-        }
+        self.handle
+            .device
+            .enqueue(Command::DestroyBuffer(self.handle.id));
     }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        // The write-back precedes the drop the handle queues after this.
         self.unmap();
     }
 }
@@ -358,6 +351,17 @@ impl Drop for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::{command::Queued, content::tests::new_device};
+    use wit::GuestGpuBuffer;
+
+    fn descriptor(size: u64, mapped: bool) -> wit::GpuBufferDescriptor {
+        wit::GpuBufferDescriptor {
+            size,
+            usage: wit::GpuBufferUsage::MAP_WRITE | wit::GpuBufferUsage::COPY_SRC,
+            mapped_at_creation: Some(mapped),
+            label: None,
+        }
+    }
 
     #[test]
     fn ranges_allow_empty_and_reject_overflow() {
@@ -372,26 +376,106 @@ mod tests {
     #[test]
     fn stale_mapping_does_not_own_a_replacement() {
         let slot = MappingSlot::default();
-        let (cancel, cancelled) = async_channel::bounded(1);
-        let old = Rc::new(Mapping {
-            range: 0..8,
-            writable: true,
-            pending: Cell::new(true),
-            cancel,
-        });
+        let old = Mapping::new(0..8, true, true, Vec::new());
         *slot.0.borrow_mut() = Some(old.clone());
         assert!(slot.owns(&old));
-        assert!(slot.remove());
-        assert!(cancelled.is_closed());
-        let (cancel, _) = async_channel::bounded(1);
-        let new = Rc::new(Mapping {
-            range: 0..8,
-            writable: true,
-            pending: Cell::new(true),
-            cancel,
-        });
+        assert!(slot.take().is_some());
+        assert!(old.cancel.is_closed());
+        let new = Mapping::new(0..8, true, true, Vec::new());
         *slot.0.borrow_mut() = Some(new.clone());
         assert!(!slot.owns(&old));
         assert!(slot.owns(&new));
+    }
+
+    #[test]
+    fn mapped_at_creation_writes_reach_the_device_only_through_unmap() {
+        let (device, queue) = new_device();
+        let buffer = Buffer::new(Handle::new(&device, None), &descriptor(16, true));
+        assert!(matches!(buffer.map_state(), wit::GpuBufferMapState::Mapped));
+        buffer
+            .get_mapped_range_set_with_copy(vec![1, 2, 3, 4, 5, 6, 7, 8], Some(8), None)
+            .unwrap();
+        assert_eq!(
+            buffer
+                .get_mapped_range_get_with_copy(Some(8), Some(8))
+                .unwrap(),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        // Mapped-range calls never queue a command.
+        assert!(queue.try_recv().is_err());
+        GuestGpuBuffer::unmap(&buffer).unwrap();
+        let Queued {
+            command:
+                Command::Unmap {
+                    buffer: id,
+                    write_back: Some((0, data)),
+                },
+            ..
+        } = queue.try_recv().unwrap()
+        else {
+            panic!("unmap did not queue the write-back");
+        };
+        assert_eq!(id, buffer.handle.id);
+        assert_eq!(data, [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(matches!(
+            buffer.map_state(),
+            wit::GpuBufferMapState::Unmapped
+        ));
+        assert!(buffer.get_mapped_range_get_with_copy(None, None).is_err());
+        GuestGpuBuffer::unmap(&buffer).unwrap();
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[test]
+    fn dropping_a_mapped_buffer_writes_back_before_its_release() {
+        let (device, queue) = new_device();
+        drop(Buffer::new(
+            Handle::new(&device, None),
+            &descriptor(4, true),
+        ));
+        assert!(matches!(
+            queue.try_recv().unwrap().command,
+            Command::Unmap {
+                write_back: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            queue.try_recv().unwrap().command,
+            Command::Release(super::super::ids::Release::Buffer(_))
+        ));
+    }
+
+    #[test]
+    fn mapped_ranges_respect_alignment_and_bounds() {
+        let (device, _queue) = new_device();
+        let buffer = Buffer::new(Handle::new(&device, None), &descriptor(32, true));
+        assert!(
+            buffer
+                .get_mapped_range_get_with_copy(Some(4), Some(4))
+                .is_err()
+        );
+        assert!(
+            buffer
+                .get_mapped_range_get_with_copy(Some(8), Some(6))
+                .is_err()
+        );
+        assert!(
+            buffer
+                .get_mapped_range_get_with_copy(Some(24), Some(16))
+                .is_err()
+        );
+        assert!(
+            buffer
+                .get_mapped_range_set_with_copy(vec![0; 4], Some(8), Some(8))
+                .is_err()
+        );
+        assert_eq!(
+            buffer
+                .get_mapped_range_get_with_copy(Some(24), None)
+                .unwrap()
+                .len(),
+            8
+        );
     }
 }

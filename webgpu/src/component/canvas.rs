@@ -5,6 +5,10 @@
 //! only the usages it configured, so destroying that texture expires the
 //! handle while the pixels stay available to present, and `present` hands the
 //! parent to the compositor path and starts a fresh, cleared drawing buffer.
+//!
+//! Both textures are created on the configured device's timeline: the
+//! context allocates their ids and queues the creations, and `present`
+//! queues the copy into an exported image and awaits only that frame.
 
 use core::cell::RefCell;
 use std::rc::Rc;
@@ -13,10 +17,15 @@ use helios_api::bindings::exports::helios::webgpu::canvas as platform;
 use helios_api::bindings::helios::system::surface as surface_wit;
 use helios_api::surface::{ImageSurface, SurfaceError};
 use helios_api::wit_bindgen::StreamReader;
-use wgpu_core::resource;
+use wgpu_core::id::markers;
 
 use super::{
-    backend, convert::Convert, device::Device, presentation::LinearImage, resource::Texture, wit,
+    command::{Command, Create, Present},
+    content::Handle,
+    convert::Convert,
+    device::Device,
+    resource::Texture,
+    wit,
 };
 
 /// The configuration `configure` stored, owned so it outlives the call.
@@ -57,13 +66,27 @@ impl Configuration {
             label: None,
         }
     }
+
+    /// Queue a fresh drawing buffer on the configured device.
+    fn parent(&self, size: surface_wit::Size) -> Handle<markers::Texture> {
+        let descriptor = self.descriptor(
+            size,
+            self.usage() | wit::GpuTextureUsage::COPY_SRC | wit::GpuTextureUsage::RENDER_ATTACHMENT,
+        );
+        let parent = Handle::new(&self.device.shared, None);
+        self.device.create(Create::Texture {
+            id: parent.id,
+            descriptor: Texture::native(&descriptor),
+        });
+        parent
+    }
 }
 
 /// The drawing buffer of the current frame.
 struct Drawing {
     /// Owns the pixels, with `COPY_SRC | RENDER_ATTACHMENT` beside the
     /// configured usage.
-    parent: backend::Texture,
+    parent: Handle<markers::Texture>,
     /// The texture handed out for this frame, shared by every call to
     /// `get-current-texture` until the frame is presented.
     current: Option<Texture>,
@@ -80,10 +103,8 @@ impl State {
     /// pixels are released with the parent.
     fn expire(&mut self) -> Option<Drawing> {
         let drawing = self.drawing.take();
-        if let Some(Texture { object, .. }) = drawing.as_ref().and_then(|d| d.current.as_ref())
-            && let Some(child) = &object.raw
-        {
-            child.destroy();
+        if let Some(Texture { handle, .. }) = drawing.as_ref().and_then(|d| d.current.as_ref()) {
+            handle.device.enqueue(Command::DestroyTexture(handle.id));
         }
         drawing
     }
@@ -169,60 +190,23 @@ impl wit::GuestGpuCanvasContext for CanvasContext {
         let configuration = configuration
             .as_ref()
             .ok_or(wit::GetCurrentTextureError::InvalidState)?;
-        let owner = &configuration.device.object.owner;
-        let drawing = drawing.get_or_insert_with(|| {
-            let descriptor = configuration.descriptor(
-                self.0.size,
-                configuration.usage()
-                    | wit::GpuTextureUsage::COPY_SRC
-                    | wit::GpuTextureUsage::RENDER_ATTACHMENT,
-            );
-            let native = native_descriptor(&descriptor);
-            Drawing {
-                parent: owner.created(owner.device.raw.create_texture(&native)),
-                current: None,
-            }
+        let drawing = drawing.get_or_insert_with(|| Drawing {
+            parent: configuration.parent(self.0.size),
+            current: None,
         });
         if let Some(current) = &drawing.current {
             return Ok(wit::GpuTexture::new(current.clone()));
         }
         let descriptor = configuration.descriptor(self.0.size, configuration.usage());
-        let native = native_descriptor(&descriptor);
-        let child = match drawing.parent.create_child_texture(&native) {
-            Ok(child) => super::value::Object::new(owner.clone(), child, None),
-            Err(error) => {
-                owner.invalid(error.to_string());
-                super::value::Object::invalid(owner.clone(), None)
-            }
-        };
-        let texture = Texture {
-            object: child,
-            descriptor,
-        };
+        let child = Handle::new(&configuration.device.shared, None);
+        configuration.device.create(Create::ChildTexture {
+            parent: drawing.parent.id,
+            id: child.id,
+            descriptor: Texture::native(&descriptor),
+        });
+        let texture = Texture::new(child, descriptor);
         drawing.current = Some(texture.clone());
         Ok(wit::GpuTexture::new(texture))
-    }
-}
-
-fn native_descriptor(
-    descriptor: &wit::GpuTextureDescriptor,
-) -> resource::TextureDescriptor<'static> {
-    resource::TextureDescriptor {
-        label: None,
-        size: descriptor.size.convert(),
-        mip_level_count: descriptor.mip_level_count.unwrap_or(1),
-        sample_count: descriptor.sample_count.unwrap_or(1),
-        dimension: wgpu_types::TextureDimension::D2,
-        format: descriptor.format.convert(),
-        usage: descriptor.usage.convert(),
-        view_formats: descriptor
-            .view_formats
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .copied()
-            .map(Convert::convert)
-            .collect(),
     }
 }
 
@@ -273,54 +257,45 @@ impl platform::GuestCanvas for Canvas {
     }
 
     async fn present(&self) -> Result<(), platform::Error> {
-        let (device, parent, format) = {
+        let size = self.shared.size;
+        let (device, answer) = {
             let mut state = self.shared.state.borrow_mut();
-            if state.configuration.is_none() {
-                return Err(platform::Error::Unconfigured);
-            }
             let drawing = state.expire();
             let configuration = state
                 .configuration
                 .as_ref()
                 .ok_or(platform::Error::Unconfigured)?;
-            let device = configuration.device.clone();
-            let format = configuration.format;
+            // Nothing was drawn: present a fresh, cleared drawing buffer.
             let parent = match drawing {
                 Some(drawing) => drawing.parent,
-                // Nothing was drawn: present the cleared drawing buffer.
-                None => {
-                    let descriptor = configuration.descriptor(
-                        self.shared.size,
-                        configuration.usage()
-                            | wit::GpuTextureUsage::COPY_SRC
-                            | wit::GpuTextureUsage::RENDER_ATTACHMENT,
-                    );
-                    let owner = &device.object.owner;
-                    owner.created(
-                        owner
-                            .device
-                            .raw
-                            .create_texture(&native_descriptor(&descriptor)),
-                    )
-                }
+                None => configuration.parent(size),
             };
-            (device, parent, format)
+            let (reply, answer) = async_channel::bounded(1);
+            configuration
+                .device
+                .shared
+                .enqueue(Command::Present(Present {
+                    parent: parent.id,
+                    width: size.width,
+                    height: size.height,
+                    format: native_format(configuration.format),
+                    reply,
+                }));
+            // The parent's release queues behind the copy that reads it.
+            drop(parent);
+            (configuration.device.clone(), answer)
         };
-        let backend = &device.object.owner.device;
-        let image = LinearImage::allocate(
-            backend.raw.clone(),
-            self.shared.size.width,
-            self.shared.size.height,
-            native_format(format),
-        )
-        .map_err(|error| platform::Error::Presentation(error.to_string()))?;
-        // SAFETY: the parent was created on this device with COPY_SRC and
-        // RENDER_ATTACHMENT at the canvas extent and the configured format, one
-        // mip, layer and sample; the component is single-threaded and the image
-        // was just allocated on this device.
-        let frame = unsafe { image.submit(backend, parent) }
+        let frame = answer
+            .recv()
+            .await
+            // `device` keeps the device task alive until it answers.
+            .unwrap_or_else(|_| unreachable!("the device task answers every presentation"))
             .map_err(|error| platform::Error::Presentation(error.to_string()))?;
-        frame.present(&self.surface).await.map_err(surface_error)?;
+        drop(device);
+        self.surface
+            .present(&frame.image, frame.ready.point(1))
+            .await
+            .map_err(surface_error)?;
         Ok(())
     }
 

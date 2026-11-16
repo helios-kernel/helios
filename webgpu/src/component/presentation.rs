@@ -1,14 +1,17 @@
 //! Dedicated linear images exported to the compositor, separate from render targets.
+//!
+//! Everything here runs on the device timeline: allocating the image,
+//! recording the copy and submitting it all reach the host.
 
-use super::backend;
+use std::borrow::Cow;
+
 use ash::{Device as VulkanDevice, vk};
 use helios_api::image::{Image, ImageLayout, PixelFormat};
-use helios_api::{
-    surface::{ImageSurface, PresentedFrame, SurfaceError},
-    sync::Timeline,
-};
-use std::sync::Arc;
-use wgpu_core::{command, device};
+use wgpu_core::{command, device, global::Global, id};
+
+use super::ids::{IdSpace, Release};
+
+type Vulkan = wgpu_hal::api::Vulkan;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -22,8 +25,8 @@ pub enum Error {
     Encoder(command::CommandEncoderError),
     #[error(transparent)]
     Submit(#[from] device::queue::QueueSubmitError),
-    #[error(transparent)]
-    Completion(#[from] backend::CompletionError),
+    #[error("presentation completion marker failed: {0}")]
+    Completion(vk::Result),
     #[error("Vulkan presentation failed: {0}")]
     Vulkan(#[from] vk::Result),
     #[error("presentation requires {0}")]
@@ -36,46 +39,68 @@ pub enum Error {
     Extent { width: u32, height: u32 },
 }
 
-/// Owns an image and its dedicated memory. The core device outlives both.
-/// Only unsubmitted images may be dropped directly; submitted images must be
-/// retained by their frame until GPU completion. The exported SDK image owns
-/// the renderer storage independently through scanout retirement.
+/// Owns an image and its dedicated memory on the device that allocated it.
+/// The device timeline retires a submitted image only after the queue has
+/// finished with it, and tears the device down only after every image has
+/// retired. The exported SDK image owns the renderer storage independently
+/// through scanout retirement.
 pub struct LinearImage {
-    device: Arc<wgpu_core::device::Device>,
     raw_device: VulkanDevice,
     image: vk::Image,
     memory: vk::DeviceMemory,
-    exported: Image,
     extent: vk::Extent3D,
     queue_family: u32,
 }
 
-/// An immutable frame ready for compositor handoff. The queue independently
-/// retains its allocation until completion, including when this value is dropped.
-pub struct Frame {
-    image: Arc<LinearImage>,
-    ready: Timeline,
+/// Temporary objects of one submission, released once it has been queued:
+/// core keeps what the submission uses alive until the queue finishes.
+struct Scratch<'a> {
+    global: &'a Global,
+    ids: &'a IdSpace,
+    releases: Vec<Release>,
 }
 
-impl Frame {
-    pub async fn present(&self, surface: &ImageSurface) -> Result<PresentedFrame, SurfaceError> {
-        surface
-            .present(self.image.exported(), self.ready.point(1))
-            .await
+impl Drop for Scratch<'_> {
+    fn drop(&mut self) {
+        for release in self.releases.drain(..) {
+            release.execute(self.global, self.ids);
+        }
+    }
+}
+
+impl Scratch<'_> {
+    fn encoder(&mut self, device: id::DeviceId) -> Result<id::CommandEncoderId, Error> {
+        let id = self.ids.command_encoders.allocate();
+        let (_, error) =
+            self.global
+                .device_create_command_encoder(device, &Default::default(), Some(id));
+        self.releases.push(Release::CommandEncoder(id));
+        error.map_or(Ok(id), |error| Err(error.into()))
+    }
+
+    fn finish(&mut self, encoder: id::CommandEncoderId) -> Result<id::CommandBufferId, Error> {
+        let id = self.ids.command_buffers.allocate();
+        let (_, error) = self
+            .global
+            .command_encoder_finish(encoder, &Default::default(), Some(id));
+        self.releases.push(Release::CommandBuffer(id));
+        error.map_or(Ok(id), |(_, error)| Err(Error::Encoder(error)))
     }
 }
 
 impl LinearImage {
+    /// Allocate an exportable image, and the SDK image the compositor reads.
     pub fn allocate(
-        device: Arc<wgpu_core::device::Device>,
+        global: &Global,
+        device: id::DeviceId,
         width: u32,
         height: u32,
         format: wgpu_types::TextureFormat,
-    ) -> Result<Self, Error> {
+    ) -> Result<(Self, Image), Error> {
         let (format, pixel_format) = format_pair(format)?;
         // SAFETY: the component creates only Vulkan devices; the guard remains
         // within this synchronous allocation and is dropped before return.
-        let hal = unsafe { device.clone().as_hal::<wgpu_hal::api::Vulkan>() }
+        let hal = unsafe { global.device_as_hal::<Vulkan>(device) }
             .expect("Helios WebGPU devices use Vulkan");
         for (extension, name) in [
             (
@@ -194,15 +219,16 @@ impl LinearImage {
         // Move ownership out of the rollback guard only after export succeeds.
         allocation.image = vk::Image::null();
         allocation.memory = None;
-        Ok(Self {
-            device,
-            raw_device,
-            image,
-            memory,
+        Ok((
+            Self {
+                raw_device,
+                image,
+                memory,
+                extent,
+                queue_family,
+            },
             exported,
-            extent,
-            queue_family,
-        })
+        ))
     }
 
     /// Submit a copy from a canvas texture and release it to display.
@@ -210,68 +236,71 @@ impl LinearImage {
     /// # Safety
     /// `source` belongs to `device`, has this image's format and extent, one
     /// mip, layer and sample, and COPY_SRC | RENDER_ATTACHMENT usage.
-    /// No other thread may submit or destroy the source during this call.
-    /// This image belongs to `device` and has never been submitted.
+    /// Nothing else may submit on `queue` or destroy the source during this
+    /// call. This image belongs to `device` and has never been submitted.
     pub unsafe fn submit(
-        self,
-        device: &backend::Device,
-        source: backend::Texture,
-    ) -> Result<Frame, Error> {
-        let (transition, error) = device.raw.create_command_encoder(&Default::default());
-        if let Some(error) = error {
-            return Err(error.into());
-        }
+        &self,
+        global: &Global,
+        ids: &IdSpace,
+        device: id::DeviceId,
+        queue: id::QueueId,
+        source: id::TextureId,
+    ) -> Result<(), Error> {
+        let mut scratch = Scratch {
+            global,
+            ids,
+            releases: Vec::new(),
+        };
+        let transition = scratch.encoder(device)?;
         // A load/store pass preserves rendered contents and lets core initialize
         // untouched canvas storage before native copy commands can expose it.
-        let (view, error) = source.create_view(&Default::default());
+        let view = ids.texture_views.allocate();
+        let (_, error) = global.texture_create_view(source, &Default::default(), Some(view));
+        scratch.releases.push(Release::TextureView(view));
         if let Some(error) = error {
             return Err(error.into());
         }
-        let (mut initialize, error) =
-            transition.begin_render_pass(command::ResolvedRenderPassDescriptor {
+        let (mut initialize, error) = global.command_encoder_begin_render_pass(
+            transition,
+            &command::RenderPassDescriptor {
                 label: None,
-                color_attachments: vec![Some(command::RenderPassColorAttachment {
+                color_attachments: Cow::Owned(vec![Some(command::RenderPassColorAttachment {
                     view,
                     depth_slice: None,
                     resolve_target: None,
                     load_op: wgpu_types::LoadOp::Load,
                     store_op: wgpu_types::StoreOp::Store,
-                })]
-                .into(),
+                })]),
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
-            });
+            },
+        );
         if let Some(error) = error {
             return Err(Error::Encoder(error));
         }
-        initialize.end()?;
-        transition.transition_resources(
+        global.render_pass_end(&mut initialize)?;
+        global.command_encoder_transition_resources(
+            transition,
             std::iter::empty(),
             std::iter::once(wgpu_types::TextureTransition {
-                texture: source.clone(),
+                texture: source,
                 selector: None,
                 state: wgpu_types::TextureUses::COPY_SRC,
             }),
         )?;
-        let (transition, error) = transition.finish(&Default::default());
-        if let Some((_, error)) = error {
-            return Err(Error::Encoder(error));
-        }
-        let (copy, error) = device.raw.create_command_encoder(&Default::default());
-        if let Some(error) = error {
-            return Err(error.into());
-        }
+        let transition = scratch.finish(transition)?;
+        let copy = scratch.encoder(device)?;
         // SAFETY: the caller guarantees a live Vulkan texture on this device.
         // Hold the snatch guard while recording its native image handle.
         let source_hal =
-            unsafe { source.as_hal::<wgpu_hal::api::Vulkan>() }.ok_or(device::DeviceError::Lost)?;
+            unsafe { global.texture_as_hal::<Vulkan>(source) }.ok_or(device::DeviceError::Lost)?;
         // SAFETY: the first command buffer establishes COPY_SRC; both buffers
         // execute in one submission. Core tracks the source in that submission,
-        // and the completion closure below retains the destination allocation.
+        // and the device timeline retains the destination until it completes.
         let recorded = unsafe {
-            copy.as_hal_mut::<wgpu_hal::api::Vulkan, _, _>(|encoder| {
+            global.command_encoder_as_hal_mut::<Vulkan, _, _>(copy, |encoder| {
                 let encoder = encoder.ok_or(device::DeviceError::Lost)?;
                 self.record_copy_and_release(encoder.raw_handle(), source_hal.raw_handle());
                 Ok::<(), device::DeviceError>(())
@@ -279,27 +308,13 @@ impl LinearImage {
         };
         drop(source_hal);
         recorded?;
-        let (copy, error) = copy.finish(&Default::default());
-        if let Some((_, error)) = error {
-            return Err(Error::Encoder(error));
-        }
-        let image = Arc::new(self);
-        let result = device.queue.submit(&[transition, copy]);
-        // A submit error may be reported by maintenance after native submission.
-        // Always transfer a reference to the queue before propagating the result.
-        // Device stores a weak queue reference, so this creates no ownership cycle.
-        let retained = image.clone();
-        device
-            .queue
-            .on_submitted_work_done(Box::new(move || drop(retained)));
-        result.map_err(|(_, error)| error)?;
-        let ready = device.completion()?;
-        Ok(Frame { image, ready })
+        let copy = scratch.finish(copy)?;
+        global
+            .queue_submit(queue, &[transition, copy])
+            .map_err(|(_, error)| error)?;
+        Ok(())
     }
 
-    pub fn exported(&self) -> &Image {
-        &self.exported
-    }
     pub fn raw(&self) -> vk::Image {
         self.image
     }
@@ -308,9 +323,6 @@ impl LinearImage {
     }
     pub fn queue_family(&self) -> u32 {
         self.queue_family
-    }
-    pub fn device(&self) -> &Arc<wgpu_core::device::Device> {
-        &self.device
     }
 
     /// Record the first and only write to this presentation image.
@@ -395,8 +407,9 @@ fn release_barrier(image: vk::Image, queue_family: u32) -> vk::ImageMemoryBarrie
 
 impl Drop for LinearImage {
     fn drop(&mut self) {
-        // SAFETY: the frame owner retains submitted images until GPU completion;
-        // the SDK export retains storage for any later compositor access.
+        // SAFETY: the device timeline drops an image only once the queue no
+        // longer uses it, and before the device; the SDK export retains
+        // storage for any later compositor access.
         unsafe {
             self.raw_device.destroy_image(self.image, None);
             self.raw_device.free_memory(self.memory, None);
