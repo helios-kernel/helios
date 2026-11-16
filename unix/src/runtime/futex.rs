@@ -5,7 +5,7 @@ use hashbrown::hash_map::Entry;
 use spin::Mutex;
 use triomphe::Arc;
 
-use crate::Notify;
+use helios_sync::Notify;
 
 const FUTEX_TABLE_INITIAL_CAPACITY: usize = 64;
 
@@ -124,7 +124,6 @@ struct FutexEntry {
 /// Cloning yields another handle to the same table. Concurrency contract:
 /// every operation takes the table's spin lock for a bounded, non-awaiting
 /// critical section; nothing blocks while holding it.
-#[derive(Clone)]
 pub struct FutexTable {
     entries: Arc<Mutex<HashMap<FutexKey, FutexEntry>>>,
 }
@@ -200,9 +199,22 @@ impl FutexTable {
     }
 
     /// The number of keys with at least one live wait.
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn capacity(&self) -> usize {
+        self.entries.lock().capacity()
+    }
+    pub fn len(&self) -> usize {
         self.entries.lock().len()
+    }
+}
+
+impl Clone for FutexTable {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+        }
     }
 }
 
@@ -212,9 +224,7 @@ mod tests {
 
     use futures_lite::future::{block_on, poll_once};
 
-    use super::{
-        FUTEX_TABLE_INITIAL_CAPACITY, FutexKey, FutexTable, GuestAddress, ProcessMemoryIdentity,
-    };
+    use super::*;
 
     fn key(memory: u64, address: u64) -> FutexKey {
         FutexKey::new(
@@ -235,7 +245,7 @@ mod tests {
     fn futex_table_preallocates_expected_wait_keys() {
         let table = FutexTable::new();
 
-        assert!(table.entries.lock().capacity() >= FUTEX_TABLE_INITIAL_CAPACITY);
+        assert!(table.capacity() >= 64);
     }
 
     #[test]

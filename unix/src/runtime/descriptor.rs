@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use alloc::collections::BinaryHeap;
-use alloc::vec::Vec;
 use core::cmp::Reverse;
 
 use heapless::binary_heap::{BinaryHeap as InlineBinaryHeap, Min};
@@ -112,9 +111,7 @@ pub struct DescriptorTable<T, Rights>
 where
     Rights: ResourceRights,
 {
-    entries: Vec<Option<DescriptorEntry<T, Rights>>>,
-    free: FreeDescriptorSlots,
-    limit: DescriptorLimit,
+    slots: crate::DescriptorSlots<DescriptorEntry<T, Rights>>,
 }
 
 impl<T, Rights> Default for DescriptorTable<T, Rights>
@@ -132,28 +129,24 @@ where
 {
     pub const fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            free: FreeDescriptorSlots::new(),
-            limit: DescriptorLimit::DEFAULT,
+            slots: crate::DescriptorSlots::new(),
         }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            entries: Vec::with_capacity(capacity),
-            free: FreeDescriptorSlots::with_capacity(capacity),
-            limit: DescriptorLimit::DEFAULT,
+            slots: crate::DescriptorSlots::with_capacity(capacity),
         }
     }
 
     pub const fn limit(&self) -> DescriptorLimit {
-        self.limit
+        self.slots.limit
     }
 
     /// Sets the descriptor limit. Descriptors already open at or past a
     /// lowered limit stay open; no new number at or past it is handed out.
     pub fn set_limit(&mut self, limit: DescriptorLimit) {
-        self.limit = limit;
+        self.slots.limit = limit;
     }
 
     pub fn insert(
@@ -163,7 +156,7 @@ where
     ) -> Result<DescriptorId, DescriptorTableError> {
         let index = self.allocate_slot_index()?;
         let id = u32::try_from(index).map_err(|_| DescriptorTableError::IndexOverflow)?;
-        self.entries[index] = Some(DescriptorEntry::new(resource, close_on_exec));
+        self.slots.entries[index] = Some(DescriptorEntry::new(resource, close_on_exec));
         Ok(DescriptorId::new(id))
     }
 
@@ -171,7 +164,8 @@ where
         &self,
         descriptor: DescriptorId,
     ) -> Result<&DescriptorEntry<T, Rights>, DescriptorTableError> {
-        self.entries
+        self.slots
+            .entries
             .get(descriptor_index(descriptor)?)
             .and_then(Option::as_ref)
             .ok_or(DescriptorTableError::BadDescriptor(descriptor.raw()))
@@ -181,7 +175,8 @@ where
         &mut self,
         descriptor: DescriptorId,
     ) -> Result<&mut DescriptorEntry<T, Rights>, DescriptorTableError> {
-        self.entries
+        self.slots
+            .entries
             .get_mut(descriptor_index(descriptor)?)
             .and_then(Option::as_mut)
             .ok_or(DescriptorTableError::BadDescriptor(descriptor.raw()))
@@ -192,12 +187,13 @@ where
         descriptor: DescriptorId,
     ) -> Result<KernelResource<T, Rights>, DescriptorTableError> {
         let resource = self
+            .slots
             .entries
             .get_mut(descriptor_index(descriptor)?)
             .and_then(Option::take)
             .map(DescriptorEntry::into_resource)
             .ok_or(DescriptorTableError::BadDescriptor(descriptor.raw()))?;
-        self.free.release(descriptor_index(descriptor)?);
+        self.slots.free.release(descriptor_index(descriptor)?);
         Ok(resource)
     }
 
@@ -227,30 +223,31 @@ where
 
         let source_index = descriptor_index(source)?;
         let target_index = descriptor_index(target)?;
-        if !self.limit.admits(target_index) {
+        if !self.slots.limit.admits(target_index) {
             return Err(DescriptorTableError::BadDescriptor(target.raw()));
         }
         let entry = self
+            .slots
             .entries
             .get_mut(source_index)
             .and_then(Option::take)
             .ok_or(DescriptorTableError::BadDescriptor(source.raw()))?;
 
-        if self.entries.len() <= target_index {
-            let old_len = self.entries.len();
-            self.entries.resize_with(target_index + 1, || None);
-            self.free.release_range(old_len..target_index);
+        if self.slots.entries.len() <= target_index {
+            let old_len = self.slots.entries.len();
+            self.slots.entries.resize_with(target_index + 1, || None);
+            self.slots.free.release_range(old_len..target_index);
         }
-        self.entries[target_index] = Some(entry);
-        self.free.release(source_index);
+        self.slots.entries[target_index] = Some(entry);
+        self.slots.free.release(source_index);
         Ok(())
     }
 
     pub fn close_on_exec(&mut self) {
-        for (index, slot) in self.entries.iter_mut().enumerate() {
+        for (index, slot) in self.slots.entries.iter_mut().enumerate() {
             if slot.as_ref().is_some_and(DescriptorEntry::close_on_exec) {
                 *slot = None;
-                self.free.release(index);
+                self.slots.free.release(index);
             }
         }
     }
@@ -258,44 +255,25 @@ where
     /// The lowest free descriptor number below the limit, or
     /// `TooManyDescriptors`; nothing is allocated on failure.
     fn allocate_slot_index(&mut self) -> Result<usize, DescriptorTableError> {
-        while let Some(index) = self.free.allocate() {
-            if !self.limit.admits(index) {
-                // The heap pops the lowest number, so every other free
-                // number is at or past the limit too. Keep this one free
-                // for when the limit is raised.
-                self.free.release(index);
-                break;
-            }
-            if self.entries.get(index).is_some_and(Option::is_none) {
-                return Ok(index);
-            }
-        }
-        let index = self.entries.len();
-        if !self.limit.admits(index) {
-            return Err(DescriptorTableError::TooManyDescriptors {
-                limit: self.limit.get(),
-            });
-        }
-        self.entries.push(None);
-        Ok(index)
+        self.slots.allocate_slot_index()
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct FreeDescriptorSlots {
+pub struct FreeDescriptorSlots {
     inline: InlineBinaryHeap<usize, Min, INLINE_FREE_DESCRIPTOR_SLOTS>,
     overflow: BinaryHeap<Reverse<usize>>,
 }
 
 impl FreeDescriptorSlots {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             inline: InlineBinaryHeap::new(),
             overflow: BinaryHeap::new(),
         }
     }
 
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         let mut slots = Self::new();
         if capacity > INLINE_FREE_DESCRIPTOR_SLOTS {
             slots
@@ -305,13 +283,13 @@ impl FreeDescriptorSlots {
         slots
     }
 
-    pub(crate) fn release(&mut self, index: usize) {
+    pub fn release(&mut self, index: usize) {
         if let Err(index) = self.inline.push(index) {
             self.overflow.push(Reverse(index));
         }
     }
 
-    pub(crate) fn release_range(&mut self, range: core::ops::Range<usize>) {
+    pub fn release_range(&mut self, range: core::ops::Range<usize>) {
         if range.len() > INLINE_FREE_DESCRIPTOR_SLOTS {
             self.overflow.reserve_exact(range.len());
             self.overflow.extend(range.map(Reverse));
@@ -322,7 +300,7 @@ impl FreeDescriptorSlots {
         }
     }
 
-    pub(crate) fn allocate(&mut self) -> Option<usize> {
+    pub fn allocate(&mut self) -> Option<usize> {
         match (
             self.inline.peek().copied(),
             self.overflow.peek().map(|Reverse(index)| *index),
@@ -332,6 +310,12 @@ impl FreeDescriptorSlots {
             (_, Some(_)) => self.overflow.pop().map(|Reverse(index)| index),
             (None, None) => None,
         }
+    }
+}
+
+impl Default for FreeDescriptorSlots {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -480,7 +464,7 @@ mod tests {
             Err(DescriptorTableError::BadDescriptor(target.raw()))
         );
         assert!(table.get(source).is_ok());
-        assert_eq!(table.entries.len(), 1);
+        assert_eq!(table.slots.entries.len(), 1);
     }
 
     #[test]
@@ -517,7 +501,7 @@ mod tests {
             full.clone()
         );
         assert_eq!(table.dup(first, FileRights::READ, false).unwrap_err(), full);
-        assert_eq!(table.entries.len(), 2);
+        assert_eq!(table.slots.entries.len(), 2);
 
         table.close(first).expect("close must succeed");
         let reused = table
