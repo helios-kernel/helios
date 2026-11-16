@@ -17,9 +17,12 @@ use std::time::Duration;
 
 use futures_lite::future;
 use helios_hal::cpu::{Cpu, ProcessorId, current_processor};
-use helios_hal::memory::MemoryRegion;
+use helios_hal::numa::SingleNode;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
-use helios_kernel::{Notify, OfflineError, OfflineRefusal, PinnedTasks, Sleep, Timer};
+use helios_kernel::{
+    Notify, OfflineError, OfflineRefusal, OnlineError, PinnedTasks, ProcessorLifecycle, Sleep,
+    Timer,
+};
 
 use crate::config::DEFAULT_HEAP_BYTES;
 use crate::console::HostedConsole;
@@ -32,23 +35,30 @@ const SECONDARY: ProcessorId = ProcessorId::new(1);
 /// How long any one step of the test may take before it is a hang.
 const STEP_DEADLINE: Duration = Duration::from_secs(10);
 
+/// `processor`'s platform on a machine of `processors`. On the bootstrap
+/// processor it first primes the allocator, as every backend does before
+/// `init`: the host machine reports no NUMA description, so one node holds
+/// every processor and all of the reserved heap.
 fn platform(
     machine: &Arc<HostedMachine>,
     processor: ProcessorId,
     processors: usize,
-) -> Platform<HostedConsole, HostedCpu, core::iter::Once<MemoryRegion>> {
+) -> Platform<HostedConsole, HostedCpu> {
     let cpu = HostedCpu::new(processor, machine.clone());
-    Platform::new(
-        HostedConsole::new(),
-        machine.bootstrap_memory_regions(processor),
-        cpu,
-    )
-    .with_topology(
-        ProcessorTopology::start_all_secondaries(BOOTSTRAP, processors)
-            .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
-    )
-    .with_dma_model(DmaModel::Translated)
-    .with_devices(DeviceInventory::new())
+    if processor == BOOTSTRAP {
+        helios_kernel::prime_bootstrap_allocator(
+            machine.bootstrap_memory_regions(),
+            &SingleNode::new(processors),
+            processor,
+        );
+    }
+    Platform::new(HostedConsole::new(), cpu)
+        .with_topology(
+            ProcessorTopology::start_all_secondaries(BOOTSTRAP, processors)
+                .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+        )
+        .with_dma_model(DmaModel::Translated)
+        .with_devices(DeviceInventory::new())
 }
 
 /// Waits, a millisecond at a time, until `condition` holds; panics
@@ -171,6 +181,20 @@ fn a_secondary_goes_offline_hands_its_timers_and_work_over_and_comes_back() {
         assert!(!control.online_set().contains(SECONDARY));
         assert_eq!(control.online_set().count(), 1);
         assert_eq!(helios_kernel::online_processor_count(), 1);
+        // The sets as `helios:system/processors` reads them: the
+        // possible set is unchanged, and only the secondary left.
+        assert_eq!(control.possible_processors(), 2);
+        assert_eq!(control.bootstrap_processor(), BOOTSTRAP);
+        assert!(control.is_online(BOOTSTRAP));
+        assert!(!control.is_online(SECONDARY));
+        // A second offline of a processor already offline is the
+        // lifecycle's typed answer, not a hang or a panic.
+        assert_eq!(
+            control.offline(SECONDARY).await,
+            Err(OfflineError::NotOnline {
+                processor: SECONDARY
+            })
+        );
 
         // Global work spawned while it is away runs on the processor
         // that is left.
@@ -203,6 +227,13 @@ fn a_secondary_goes_offline_hands_its_timers_and_work_over_and_comes_back() {
             .expect("the secondary comes back");
         assert!(control.online_set().contains(SECONDARY));
         assert_eq!(control.online_set().count(), 2);
+        assert!(control.is_online(SECONDARY));
+        assert_eq!(
+            control.online(SECONDARY).await,
+            Err(OnlineError::NotOffline {
+                processor: SECONDARY
+            })
+        );
         let mut ran_on_secondary = false;
         for _ in 0..10_000 {
             let ran_on = spawner

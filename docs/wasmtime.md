@@ -5,13 +5,64 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/next-solver-bindgen`):
+The local checkout must be at (branch `helios/register-component-hosts`):
 
 ```text
-18b428e6becfb6138b877a3fe70afb08bf5724ba
+e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e
 ```
 
-That revision is `helios/stack-limit-percpu` at
+This revision combines the register trampoline implementation with
+`helios/borrowed-sync-wit-inputs` at `6e4440eff80a35670c7622d4be28d422ab624461`.
+Typed synchronous scalar and resource-handle imports select precompiled native
+register trampolines; other imports retain the array ABI. Canonical validation,
+resource scopes, call hooks and traps remain in the existing runtime helpers.
+
+Borrowed-input preparation extends to synchronous WIT functions
+implemented by asynchronous Rust hosts. `func_wrap_async_prepare` and bindgen's
+`borrowed | async` option complete input validation and request construction
+before the host future starts, retaining only the owned request across suspension.
+
+`helios/borrowed-host-inputs` at
+`578de3c7598ded3a324f08cab7fb2d64e7e9401b` adds scoped guest-memory borrowing to
+`helios/data-host-task-fast-path` at
+`685697120ea7dcf237fb5b7ef6b08fc4456c6fab`. `func_wrap_data_memory` separates
+mutable host data from a read-only memory view that cannot reenter guest code.
+The `borrowed` bindgen import option uses validated cursors for string and
+byte-list inputs, including aggregates. Async WIT imports prepare an owned
+request synchronously before starting their host future; guest references cannot
+cross that boundary. UTF-16 decoding, resource scopes, traps and owned results
+retain their canonical ABI behavior.
+
+`helios/data-host-task-fast-path` adds data-only synchronous host registration to
+`helios/immediate-wit-imports` at
+`dd02866a754619ca217201a91a32d2a1f0bdb08b`. `func_wrap_data` exposes only
+store data to the callback, preventing same-store guest reentry. Synchronous
+lowering skips the HostTask lifecycle when parameter and result types do not
+access resource/task state and the result does not require guest realloc.
+Generated synchronous imports without Store access use this registration;
+resource-bearing, reallocating, Store-taking and async calls retain their
+existing lifecycle.
+
+`helios/immediate-wit-imports` adds immediate host implementations of async WIT imports to
+`helios/guest-memory-residency` at
+`d10291f68ec29a00ec0261fb72d42069be198770`. The
+`func_wrap_concurrent_immediate` registration and bindgen's `immediate` import
+flag retain async WIT typing and canonical lowering while returning directly,
+without a host future allocation. Resource scopes and reentry checks use the
+existing completed-result path.
+
+`helios/guest-memory-residency` is `helios/next-solver-bindgen` at
+`18b428e6becfb6138b877a3fe70afb08bf5724ba` plus one additive commit (#537):
+a store may register a `GuestMemoryResidency`
+(`Store::set_guest_memory_residency`), which the component event loop asks,
+in the poll that copies, whether the guest bytes a `stream` or `future`
+transfer is about to touch are present; an absent page makes the copy wait
+for the embedder's fault-in and check again. A host consumer whose payload
+holds strings or lists is polled on a worker fiber when a hook is
+registered, because the bytes its lift follows cannot be named in advance.
+A store with no hook pays one branch per copy.
+
+`helios/next-solver-bindgen` is `helios/stack-limit-percpu` at
 `1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` plus upstream
 bytecodealliance/wasmtime#14193 (30dddb655), which spells out the type
 arguments of `with_getter` and `Access::new` in the code `bindgen!`

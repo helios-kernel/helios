@@ -11,7 +11,9 @@ use alloc::string::String;
 use helios_hal::fs::{BlockSerial, FileSystemRights};
 use thiserror::Error;
 
-use super::{ErofsError, ErofsFs, HostShare, MemoryFs, MountError, MountedFs, Namespace, Storage};
+use super::{
+    BtrfsFs, ErofsError, ErofsFs, HostShare, MemoryFs, MountError, MountedFs, Namespace, Storage,
+};
 use crate::{BlockCache, ProcessAuthority, ProcessAuthorityError};
 
 /// A filesystem user space can ask the kernel to attach.
@@ -26,6 +28,8 @@ pub enum MountSource {
     /// The EROFS image on the mount-source disk that reported `serial`,
     /// read-only whatever the request says.
     Disk { serial: BlockSerial },
+    /// A read-only btrfs image on the disk with this serial.
+    Btrfs { serial: BlockSerial },
 }
 
 /// The storage a machine attached, which a request's source is built
@@ -52,6 +56,11 @@ pub enum MountRequestError {
     Erofs {
         serial: BlockSerial,
         error: ErofsError,
+    },
+    #[error("the btrfs image on disk {serial:?} cannot be mounted: {error}")]
+    Btrfs {
+        serial: BlockSerial,
+        error: helios_btrfs::Error,
     },
     #[error(transparent)]
     Mount(#[from] MountError),
@@ -88,9 +97,21 @@ pub async fn request_mount<S: Storage>(
                 .map_err(|error| MountRequestError::Erofs { serial, error })?;
             MountedFs::Erofs(fs)
         }
+        MountSource::Btrfs { serial } => {
+            let disk = attached
+                .disks
+                .and_then(|disks| disks.disk_by_serial(serial.as_bytes()))
+                .ok_or(MountRequestError::DiskUnavailable { serial })?;
+            let fs = BtrfsFs::mount(disk, || namespace.table().allocate_device())
+                .await
+                .map_err(|error| MountRequestError::Btrfs { serial, error })?;
+            MountedFs::Btrfs(fs)
+        }
     };
     let rights = match source {
-        MountSource::BootImage | MountSource::Disk { .. } => FileSystemRights::READ,
+        MountSource::BootImage | MountSource::Disk { .. } | MountSource::Btrfs { .. } => {
+            FileSystemRights::READ
+        }
         MountSource::Memory | MountSource::HostShare if read_only => FileSystemRights::READ,
         MountSource::Memory | MountSource::HostShare => {
             FileSystemRights::READ | FileSystemRights::WRITE

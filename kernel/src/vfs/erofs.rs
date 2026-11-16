@@ -340,7 +340,7 @@ where
         Ok(buffer.freeze())
     }
 
-    type Write<'a> = Infallible;
+    type Write = Infallible;
 
     async fn prepare_write(
         &self,

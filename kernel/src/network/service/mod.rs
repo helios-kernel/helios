@@ -53,8 +53,8 @@ use crate::{
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
     PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
     RegisteredTcpReadBuffer, RootEntropyHandle, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
-    TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
-    UptimeClock,
+    TcpReadInto, TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind, UptimeClock,
 };
 use triomphe::Arc;
 
@@ -669,8 +669,12 @@ where
     CpuImpl: Cpu + Clone,
     DeviceImpl: NetworkDevice,
 {
+    /// A service with one shard per processor, each carved from the
+    /// memory of its processor's node out of `pool`. `cpu` and `pool`
+    /// describe the same machine.
     pub fn new(
         cpu: CpuImpl,
+        pool: &crate::memory::UserMemoryPool,
         profiles: ProfileSink,
         clock: UptimeClock,
         timer: Timer<CpuImpl>,
@@ -700,7 +704,13 @@ where
         // are a follow-up. The `transaction_id` is staggered per
         // shard so DHCP DISCOVER messages from different shards do
         // not race over the same XID.
-        let shard_count = cpu.processor_count().max(1);
+        let shard_count = pool.locality().processor_count();
+        assert_eq!(
+            shard_count,
+            cpu.processor_count(),
+            "the platform reports {} processors and the NUMA description {shard_count}",
+            cpu.processor_count()
+        );
         // We probe the configured rx_budget once via a throwaway
         // Stack — every shard's Stack uses the same StackConfig so
         // the value is identical across shards.
@@ -725,7 +735,7 @@ where
             .with_direct_tx_dma(capabilities.direct_tx_dma)
             .with_segmentation_offload(segmentation);
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
-        let state = NetworkShardSet::new(shard_count, |index| {
+        let state = NetworkShardSet::new(pool, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
             NetworkShard::new(
                 stack_config,
@@ -1627,11 +1637,15 @@ pub(crate) mod fixture {
         pub(crate) payload_len: usize,
     }
 
+    /// A connection whose clock the test moves: time passes only when
+    /// the test says it does, so a paced sender, a retransmission timer
+    /// and a round trip all run on the time the test states.
     pub(crate) struct EstablishedTcpFixture {
         service: NetworkService<
-            crate::test_support::TestCpu,
+            crate::test_support::ManualClockCpu,
             crate::test_support::RecordingNetworkInterface,
         >,
+        clock: crate::test_support::ManualClockCpu,
         stream: TcpStreamId,
     }
 
@@ -1647,6 +1661,11 @@ pub(crate) mod fixture {
         pub(crate) const LOCAL_SEQUENCE: u32 = 7;
         /// The peer's, for the acknowledgement they carry back.
         pub(crate) const PEER_SEQUENCE: u32 = 100;
+        /// The round trip the handshake measures: the SYN-ACK arrives
+        /// this long after the SYN left. One millisecond is the order of
+        /// a guest's path to its host, and any non-zero value gives the
+        /// connection a real first sample rather than a zero one.
+        pub(crate) const ROUND_TRIP_NANOS: u64 = 1_000_000;
 
         /// A connection in `ESTABLISHED`, with the handshake's own
         /// frames already drained so the next segment on the wire is
@@ -1661,17 +1680,19 @@ pub(crate) mod fixture {
         pub(crate) fn with_interface(
             device: crate::test_support::RecordingNetworkInterface,
         ) -> Self {
-            let cpu = crate::test_support::TestCpu::without_entropy();
+            let clock = crate::test_support::ManualClockCpu::new();
             let service = NetworkService::new(
-                cpu,
+                clock.clone(),
+                crate::test_support::single_node_pool(1),
                 crate::test_support::test_profile_sink(),
                 crate::test_support::test_uptime_clock(),
-                crate::test_support::test_timer(cpu),
+                crate::test_support::test_timer(clock.clone()),
                 device,
                 crate::test_support::test_root_entropy(),
             );
             let fixture = Self {
                 service,
+                clock,
                 stream: {
                     // Placeholder: replaced below once the shard has
                     // the socket. `TcpStreamId` is non-zero, so the
@@ -1714,6 +1735,10 @@ pub(crate) mod fixture {
                 shard.insert_tcp_stream(socket)
             };
             let fixture = Self { stream, ..fixture };
+            // The SYN leaves, and its answer comes back a round trip
+            // later.
+            let _ = fixture.drive();
+            fixture.advance(Self::ROUND_TRIP_NANOS);
             fixture.deliver(
                 TcpHeader {
                     source_port: Self::PEER_PORT,
@@ -1733,10 +1758,15 @@ pub(crate) mod fixture {
         pub(crate) fn service(
             &self,
         ) -> NetworkService<
-            crate::test_support::TestCpu,
+            crate::test_support::ManualClockCpu,
             crate::test_support::RecordingNetworkInterface,
         > {
             self.service.clone()
+        }
+
+        /// Moves the connection's clock forward by `nanos`.
+        pub(crate) fn advance(&self, nanos: u64) {
+            self.clock.advance(nanos);
         }
 
         /// The stream handle a component-host owner holds.
@@ -2648,6 +2678,7 @@ mod tests {
         let cpu = ManualClockCpu::new();
         let service = super::NetworkService::new(
             cpu.clone(),
+            crate::test_support::single_node_pool(1),
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu.clone()),
@@ -3460,15 +3491,16 @@ mod tests {
         // cross-processor.
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                2,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    2,
+                    test_root_entropy(),
+                )
+            });
         // A bound datagram socket is replicated: the same slot on every
         // shard, with the receive path deciding which replica gets a
         // given datagram.
@@ -3581,15 +3613,16 @@ mod tests {
         let owner = 1;
         let cpu = RecordingSmpCpu::new(0, 2);
         let control = super::NetworkControlPlane::new();
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                2,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    2,
+                    test_root_entropy(),
+                )
+            });
         // The port the connection is opened on is the one whose replies
         // hash back to the owning shard, exactly as
         // `open_ephemeral_tcp_connect` picks it.
@@ -3933,15 +3966,16 @@ mod tests {
         // pump depends on rather than a local one.
         let owner = 1;
         let cpu = RecordingSmpCpu::new(0, 2);
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                2,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    2,
+                    test_root_entropy(),
+                )
+            });
 
         let stream = {
             let mut shard = state.shard_at(owner).lock();
@@ -4095,6 +4129,7 @@ mod tests {
         let cpu = TestCpu::without_entropy();
         super::NetworkService::new(
             cpu,
+            crate::test_support::single_node_pool(1),
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
@@ -4740,6 +4775,7 @@ mod tests {
         let cpu = RecordingSmpCpu::new(0, processors);
         super::NetworkService::new(
             cpu.clone(),
+            crate::test_support::single_node_pool(processors),
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu),
@@ -5511,26 +5547,29 @@ mod tests {
     /// reachable neighbour, so a connect opened on any of them emits
     /// its SYN.
     fn connect_shard_set(shard_count: usize) -> super::NetworkShardSet {
-        super::NetworkShardSet::new(shard_count, |index| {
-            let mut shard = NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                shard_count,
-                test_root_entropy(),
-            );
-            shard
-                .stack
-                .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64))
-                .expect("test address should be accepted");
-            shard.stack.learn_neighbor(NeighborEntry {
-                ip: IpAddress::Ipv6(connect_remote()),
-                mac: [0x02, 0, 0, 0, 0, 2],
-                state: NeighborState::Reachable,
-                updated_at: StackInstant::from_nanos(0),
-            });
-            shard
-        })
+        super::NetworkShardSet::new(
+            crate::test_support::single_node_pool(shard_count),
+            |index| {
+                let mut shard = NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    shard_count,
+                    test_root_entropy(),
+                );
+                shard
+                    .stack
+                    .add_ipv6_address(Ipv6Cidr::new(connect_local(), 64))
+                    .expect("test address should be accepted");
+                shard.stack.learn_neighbor(NeighborEntry {
+                    ip: IpAddress::Ipv6(connect_remote()),
+                    mac: [0x02, 0, 0, 0, 0, 2],
+                    state: NeighborState::Reachable,
+                    updated_at: StackInstant::from_nanos(0),
+                });
+                shard
+            },
+        )
     }
 
     fn connect_request() -> super::TcpConnectRequest {
@@ -5631,6 +5670,137 @@ mod tests {
         );
     }
 
+    /// Connects to one remote, each closed before the next (so the
+    /// four-tuple is free again, as it is for a guest that closed second
+    /// or whose peer holds no state), never take a local port twice
+    /// while the accepting shard's own-flow candidates of the window are
+    /// not exhausted. The design's bound: a connect takes the first
+    /// own-flow candidate at or after its start and the next start is the
+    /// port after it, so the taken ports ascend through the window's own
+    /// flow candidates and the first repeat is the connect after the last
+    /// of them. This is the issue #881 reuse, which the previous uniformly
+    /// random start made likely within a few connects.
+    #[test]
+    fn closed_connects_to_one_remote_walk_the_window_before_reusing_a_port() {
+        const CONNECTS: usize = 600;
+        let state = connect_shard_set(2);
+        let (first, last) = state.shard_at(0).lock().ephemeral_window();
+        let own_candidates = (first..=last)
+            .filter(|port| connect_request().owner_of(*port, 2) == 0)
+            .count();
+        assert!(
+            own_candidates > CONNECTS,
+            "the bound must not bite inside the test"
+        );
+        let mut ports = Vec::new();
+        for _ in 0..CONNECTS {
+            let stream = state
+                .open_ephemeral_tcp_connect(0, connect_request())
+                .expect("every connect finds a port");
+            let owner = state.shard_idx_for_handle(stream);
+            assert_eq!(owner, 0, "an own-flow candidate is free, so it is taken");
+            let syn = queued_syn_source_ports(&mut state.shard_at(owner).lock());
+            assert_eq!(syn.len(), 1);
+            ports.push(syn[0]);
+            state.with_handle(stream, |shard| {
+                shard.remove_tcp_stream(stream, StackInstant::from_nanos(1));
+            });
+        }
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            CONNECTS,
+            "a local port was reused: {ports:?}"
+        );
+    }
+
+    /// Two destinations that differ in address or in port start at
+    /// unrelated offsets of the window.
+    #[test]
+    fn different_remotes_start_at_unrelated_offsets() {
+        let state = connect_shard_set(1);
+        let shard = state.shard_at(0).lock();
+        let start = |request: &super::TcpConnectRequest| {
+            shard
+                .connect_walk(request)
+                .0
+                .next()
+                .expect("a walk has a first candidate")
+        };
+        let base = connect_request();
+        let mut starts = Vec::new();
+        for step in 0..8_u8 {
+            let mut octets = connect_remote().octets();
+            octets[15] = step;
+            starts.push(start(&super::TcpConnectRequest {
+                destination: IpAddress::Ipv6(Ipv6Address::new(octets)),
+                ..base
+            }));
+            starts.push(start(&super::TcpConnectRequest {
+                port: CONNECT_REMOTE_PORT + 1 + u16::from(step),
+                ..base
+            }));
+        }
+        let mut distinct = starts.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            starts.len(),
+            "sixteen destinations of a 16384 port window started alike: {starts:?}"
+        );
+        let sequential = starts
+            .windows(2)
+            .all(|pair| pair[1] == pair[0].wrapping_add(1));
+        assert!(
+            !sequential,
+            "starts follow the destination in order: {starts:?}"
+        );
+    }
+
+    /// The first port of a destination depends on the shard's secret:
+    /// another shard of the same service and another service's shard
+    /// start the same destination at different offsets, so a sender that
+    /// cannot read the key cannot name the port.
+    #[test]
+    fn the_first_port_of_a_destination_depends_on_the_shards_secret() {
+        let offsets = |shard_idx: usize, fill: u8| -> Vec<u16> {
+            let entropy = crate::RootEntropyHandle::new(
+                crate::RootEntropy::from_platform(
+                    &crate::test_support::TestCpu::with_entropy(fill),
+                    None,
+                    None,
+                    crate::MachineGeneration::new(None),
+                )
+                .expect("the test CPU has an entropy source"),
+            );
+            let shard = NetworkShard::new(test_stack_config(), 1, shard_idx, 2, entropy);
+            let (first, _) = shard.ephemeral_window();
+            (0..16_u16)
+                .map(|port| {
+                    let request = super::TcpConnectRequest {
+                        port: CONNECT_REMOTE_PORT + port,
+                        ..connect_request()
+                    };
+                    shard.connect_walk(&request).0.next().expect("a first port") - first
+                })
+                .collect()
+        };
+        let own = offsets(0, 0x5a);
+        assert_eq!(own, offsets(0, 0x5a), "the same secret is deterministic");
+        let agreeing = |other: Vec<u16>| own.iter().zip(&other).filter(|(a, b)| a == b).count();
+        assert!(
+            agreeing(offsets(1, 0x5a)) <= 1,
+            "another shard of the service starts destinations alike"
+        );
+        assert!(
+            agreeing(offsets(0, 0x5b)) <= 1,
+            "another secret starts destinations alike"
+        );
+    }
+
     /// The ports of `first..=first + 63` that hash to the accepting
     /// shard 0 and to the other shard of a two-shard set.
     fn split_by_owner(first: u16) -> (Vec<u16>, Vec<u16>) {
@@ -5667,7 +5837,8 @@ mod tests {
         assert!(own_flow.is_none(), "every own-shard candidate is held");
         let stream = state
             .open_tcp_connect_along_foreign_flows(walk, 0, connect_request())
-            .expect("the second foreign candidate opens");
+            .expect("the second foreign candidate opens")
+            .stream;
 
         assert_eq!(state.shard_idx_for_handle(stream), 1);
         let mut ports = queued_syn_source_ports(&mut state.shard_at(1).lock());
@@ -5882,15 +6053,16 @@ mod tests {
     fn accept_starts_at_the_callers_shard_and_visits_the_rest() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([198, 51, 100, 20]);
-        let state = super::NetworkShardSet::new(3, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                3,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(3), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    3,
+                    test_root_entropy(),
+                )
+            });
         let listener = TcpListenerId(ReplicaHandle::new(FIRST_TEST_LISTENER_SLOT).get());
         state
             .install_replica(
@@ -6035,15 +6207,16 @@ mod tests {
     #[test]
     fn shard_arrivals_deduplicate_within_one_receive_batch() {
         let cpu = RecordingSmpCpu::new(0, 4);
-        let state = super::NetworkShardSet::new(4, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                4,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(4), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    4,
+                    test_root_entropy(),
+                )
+            });
         let mut arrivals = super::ShardArrivals::new();
         arrivals.record(2);
         arrivals.record(2);
@@ -6077,15 +6250,16 @@ mod tests {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
-        let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(
-                test_stack_config(),
-                1 + index as u32,
-                index,
-                2,
-                test_root_entropy(),
-            )
-        });
+        let state =
+            super::NetworkShardSet::new(crate::test_support::single_node_pool(2), |index| {
+                NetworkShard::new(
+                    test_stack_config(),
+                    1 + index as u32,
+                    index,
+                    2,
+                    test_root_entropy(),
+                )
+            });
         let socket = UdpSocketId(ReplicaHandle::new(FIRST_TEST_UDP_SLOT).get());
         state
             .install_replica(

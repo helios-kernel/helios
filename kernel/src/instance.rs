@@ -3,18 +3,24 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::hint::spin_loop;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 
 use crossbeam_utils::CachePadded;
-use helios_hal::cpu::current_processor;
+use helios_hal::cpu::{ProcessorId, current_processor};
+use helios_hal::numa::NodeId;
 use slab::Slab;
 use spin::Mutex;
+use thiserror::Error;
 use triomphe::Arc;
 
-use crate::memory::{MemoryOwner, UserMemoryOwnerScope, enter_user_memory_owner};
+use crate::exec::TaskHome;
+use crate::memory::{
+    Locality, MemoryOwner, UserMemoryOwnerScope, UserResidency, enter_user_memory_owner,
+};
 use crate::user_mapping_kernel_heap_bytes;
 use crate::{Notify, NotifyWaiter};
 
@@ -185,7 +191,11 @@ pub const OOM_RECLAIM_GRACE: Duration = Duration::from_millis(500);
 /// instances rather than kept as a counter that could drift away from
 /// them. A condemnation records what the victim held in *both* pools,
 /// so a shortfall on either one is answered against the bytes that
-/// shortfall is actually waiting for.
+/// shortfall is actually waiting for. In the user pool that is what the
+/// victim held there ([`UserResidency`]), not its linear-memory size: a
+/// mostly swapped-out instance gives back only its resident pages, and
+/// counting the rest would report a shortfall covered that its death
+/// leaves open.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CondemnedMemory {
     /// Condemned within [`OOM_RECLAIM_GRACE`]: memory the killer still
@@ -244,8 +254,13 @@ pub struct OomVictim {
     pub name: String,
     /// The pool that ran out, and therefore the one `score` ranks.
     pub pool: MemoryPool,
-    /// User-pool bytes: the instance's wasm linear memory.
+    /// The instance's wasm linear-memory size: what it grew to, not
+    /// what it holds. Reported beside `user_bytes` so a log line shows
+    /// how much of the memory was out of the pool.
     pub memory_bytes: u64,
+    /// User-pool bytes the instance holds, and so what killing it gives
+    /// back to the pool: see [`UserResidency`].
+    pub user_bytes: u64,
     /// Kernel-heap bytes attributed to the instance.
     pub kernel_bytes: u64,
     pub policy: OomPolicy,
@@ -314,7 +329,8 @@ struct InstanceEntry {
     /// which for a parked or idle guest may be never.
     condemned: Notify,
     /// Monotonic nanoseconds at which the kill flag was set, and what
-    /// the instance held in each pool at that moment. Together they are
+    /// the instance held in each pool at that moment, the user pool as
+    /// the condemning caller's [`UserResidency`] saw it. Together they are
     /// this instance's entry in the condemned-memory ledger: what the
     /// killer expects back, and when it started expecting it. Both
     /// pools are recorded because either one can be the pool a later
@@ -327,6 +343,94 @@ struct InstanceEntry {
     condemned_user_bytes: AtomicU64,
     condemned_kernel_bytes: AtomicU64,
     handle_count: AtomicUsize,
+    /// How many [`InstanceRegistry::while_off_processor`] holds are in
+    /// force on this instance. While it is non-zero no store of the
+    /// instance gets past [`StoreTurns::begin`]. The holders write it and
+    /// every turn begin of every store reads it, so it has a line of its
+    /// own: the other words of the entry are written by grows, store
+    /// creation and the OOM killer, and none of that should cost a turn
+    /// begin a miss.
+    off_processor_holds: CachePadded<AtomicUsize>,
+    /// Where the instance's global tasks are queued. Shared with every
+    /// [`crate::InstanceSpawner`] of the instance, whose tasks may
+    /// outlive this entry.
+    home: Arc<InstanceHome>,
+}
+
+/// The home of an instance: the node its global tasks are queued on,
+/// named by the processor whose node it is.
+///
+/// #516 defines the home as the node the instance's memory was committed
+/// on. Wasmtime commits an instance's linear memory during instantiation,
+/// on the processor running the instance's first turn, under the owner
+/// scope [`StoreTurns::begin`] opens, so that first turn fixes the home.
+/// Until then the home is provisional: the processor that registered
+/// the instance, which is where the launch path runs.
+///
+/// The home does not move afterwards. A stolen turn runs on the thief
+/// and commits from the thief's node, but the next wake still queues the
+/// task at home: placement follows where the memory is, not where load
+/// last spiked.
+///
+/// The word holds the processor rather than its node because the
+/// processor is what the executing hardware answers, and its node is
+/// read through the machine's immutable [`Locality`] by the scheduler
+/// that queues the task.
+///
+/// # Concurrency contract
+///
+/// One lock-free word, not cache-padded: it is written at most twice in
+/// the instance's life. Registration writes the provisional value; the
+/// first [`StoreTurns::begin`] of any of the instance's stores, on any
+/// processor, settles it with one CAS that only a provisional value
+/// passes, so the first turn wins and every later one only loads.
+/// Every scheduler of the instance's tasks reads it on every schedule,
+/// from any processor. `Relaxed` throughout: the word publishes no other
+/// memory, and a scheduler that reads the provisional value just after
+/// it settled queues that one task where it would have gone a moment
+/// earlier.
+pub(crate) struct InstanceHome {
+    word: AtomicU32,
+}
+
+/// The bit of [`InstanceHome::word`] that says the home is provisional.
+/// The processor occupies the low 16 bits ([`ProcessorId`] is a `u16`).
+const HOME_PROVISIONAL: u32 = 1 << 31;
+
+impl InstanceHome {
+    fn provisional(processor: ProcessorId) -> Self {
+        Self {
+            word: AtomicU32::new(HOME_PROVISIONAL | u32::from(processor.id())),
+        }
+    }
+
+    /// Fixes the home at `processor` unless a turn already has.
+    fn settle(&self, processor: ProcessorId) {
+        let word = self.word.load(Ordering::Relaxed);
+        if word & HOME_PROVISIONAL == 0 {
+            return;
+        }
+        // A failed exchange means another store's first turn settled it
+        // first, and that turn's processor is the home.
+        let _ = self.word.compare_exchange(
+            word,
+            u32::from(processor.id()),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The processor whose node is the home.
+    pub(crate) fn processor(&self) -> ProcessorId {
+        // The low 16 bits are a processor id by construction.
+        ProcessorId::new(self.word.load(Ordering::Relaxed) as u16)
+    }
+}
+
+impl TaskHome for Arc<InstanceHome> {
+    fn node(&self, locality: &Locality) -> NodeId {
+        locality.node_of(self.processor())
+    }
 }
 
 #[derive(Default)]
@@ -378,6 +482,8 @@ impl InstanceRegistry {
             condemned_user_bytes: AtomicU64::new(0),
             condemned_kernel_bytes: AtomicU64::new(0),
             handle_count: AtomicUsize::new(1),
+            off_processor_holds: CachePadded::new(AtomicUsize::new(0)),
+            home: Arc::new(InstanceHome::provisional(current_processor())),
         });
         let entry_ptr = NonNull::from(entry.as_ref());
         let entry_slot = self.inner.entries.lock().insert(entry);
@@ -405,11 +511,25 @@ impl InstanceRegistry {
     /// memory is on the condemned ledger ([`Self::condemned_memory`])
     /// rather than available to condemn again.
     ///
+    /// A user-pool candidate is ranked by what it holds in the pool,
+    /// read from `residency`: what killing it gives back. Its
+    /// linear-memory size would rank an instance the swap policy has
+    /// mostly written out as if killing it freed all of it.
+    ///
+    /// The residency is taken by the caller before this call, and the
+    /// registry never reaches the address space itself: its `entries`
+    /// lock and the address space's reservation lock are never held
+    /// together (see [`UserResidency`]'s concurrency contract).
+    ///
     /// This is victim selection on its own. The OOM killer's entry point
     /// is [`Self::condemn_for_oom`], which weighs the ledger against the
     /// request before it selects anything.
-    pub fn pick_oom_victim(&self, pool: MemoryPool) -> Option<OomVictim> {
-        best_victim(&self.inner.entries.lock(), pool)
+    pub fn pick_oom_victim(
+        &self,
+        pool: MemoryPool,
+        residency: &UserResidency,
+    ) -> Option<OomVictim> {
+        best_victim(&self.inner.entries.lock(), pool, residency)
     }
 
     /// Memory condemned out of `pool` and not yet reclaimed, as of
@@ -450,13 +570,17 @@ impl InstanceRegistry {
     ///
     /// Selection and condemnation happen under one lock, so two
     /// processors refusing a grow at the same moment cannot both
-    /// condemn against the same empty ledger.
+    /// condemn against the same empty ledger. `residency` is what ranks
+    /// a user-pool candidate and what its condemnation puts on the
+    /// user-pool ledger, whichever pool ran out; see
+    /// [`Self::pick_oom_victim`] for why it is taken before the lock.
     pub fn condemn_for_oom(
         &self,
         requester: InstanceId,
         pool: MemoryPool,
         requested_bytes: u64,
         now_nanos: u64,
+        residency: &UserResidency,
     ) -> OomKillDecision {
         let entries = self.inner.entries.lock();
         let mut condemned = condemned_ledger(&entries, pool, now_nanos);
@@ -473,16 +597,21 @@ impl InstanceRegistry {
         // program to feed the one already holding the most memory.
         // Other instances become the pick on later attempts as they
         // accumulate memory.
-        let victim = best_victim(&entries, pool).filter(|victim| victim.id != requester);
+        let victim = best_victim(&entries, pool, residency).filter(|victim| victim.id != requester);
         let Some(victim) = victim else {
             return OomKillDecision {
                 outcome: OomKillOutcome::NoVictim,
                 condemned,
             };
         };
-        let condemned_bytes =
-            condemn_entry(&entries, victim.id, KillReason::OutOfMemory, now_nanos)
-                .expect("victim selected under the registry lock must still be condemnable");
+        let condemned_bytes = condemn_entry(
+            &entries,
+            victim.id,
+            KillReason::OutOfMemory,
+            now_nanos,
+            residency,
+        )
+        .expect("victim selected under the registry lock must still be condemnable");
         condemned.pending_bytes = condemned
             .pending_bytes
             .saturating_add(condemned_bytes.of(pool));
@@ -503,6 +632,8 @@ impl InstanceRegistry {
     /// ledger, timestamped with `now_nanos`: whatever the reason for the
     /// kill, those bytes are on their way back and the OOM killer must
     /// not condemn a second instance for memory it is already getting.
+    /// Its user-pool bytes are what `residency` says it holds, taken
+    /// before the call as for [`Self::condemn_for_oom`].
     ///
     /// The registry records the condemnation and wakes every turn of the
     /// instance, and a turn whose call is suspended drops it (see
@@ -512,10 +643,16 @@ impl InstanceRegistry {
     /// instead of running on. The same holds for
     /// [`Self::condemn_for_oom`], and together they are what bounds the
     /// ledger's grace period: see [`OOM_RECLAIM_GRACE`].
-    pub fn request_kill(&self, id: InstanceId, reason: KillReason, now_nanos: u64) -> KillOutcome {
+    pub fn request_kill(
+        &self,
+        id: InstanceId,
+        reason: KillReason,
+        now_nanos: u64,
+        residency: &UserResidency,
+    ) -> KillOutcome {
         let entries = self.inner.entries.lock();
         let outcome = if entries.iter().any(|(_, entry)| entry.id == id) {
-            match condemn_entry(&entries, id, reason, now_nanos) {
+            match condemn_entry(&entries, id, reason, now_nanos, residency) {
                 Some(_) => KillOutcome::Requested,
                 None => KillOutcome::AlreadyStopping,
             }
@@ -534,6 +671,11 @@ impl InstanceRegistry {
     /// condemned by the OOM killer is skipped: its memory is about to
     /// come back for free, and writing it to disk first would be work
     /// thrown away.
+    ///
+    /// The answer is a snapshot, true when the lock is released and no
+    /// later: any instance in it may begin a turn the next moment. It
+    /// picks candidates; an action that needs the instance to stay off
+    /// every processor takes [`Self::while_off_processor`] for it.
     pub fn idle_instances(&self, now_nanos: u64, idle_after_nanos: u64) -> Vec<InstanceId> {
         let entries = self.inner.entries.lock();
         let mut idle: Vec<(u64, InstanceId)> = entries
@@ -553,6 +695,77 @@ impl InstanceRegistry {
             .collect();
         idle.sort_unstable();
         idle.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Run `work` while no store of `id` is on any processor, and none
+    /// can begin a turn until `work` returns.
+    ///
+    /// # Concurrency
+    ///
+    /// Taking a hold is lock-free against turns. The holder raises the
+    /// instance's hold count and then reads every live store's clock; a
+    /// turn begin marks its store's clock on a processor and then reads
+    /// the hold count. All four accesses are sequentially consistent, so
+    /// in their single order one of the two sees the other: either the
+    /// holder sees the store on a processor and the hold is refused, or
+    /// the turn sees the hold and waits in [`StoreTurns::begin`] until it
+    /// is released. A store created after the clocks were read reaches
+    /// its first turn begin only after the hold was raised, so it waits
+    /// too.
+    ///
+    /// The waiting turn keeps its clock marked, so a second hold taken
+    /// while it waits is refused: a turn waits for at most the holds
+    /// that were already granted when it began. That wait spins on
+    /// another processor's critical section, so `work` is synchronous —
+    /// a closure, which cannot await — and bounded: the swap service
+    /// detaching one page, its address-space lock and TLB shootdown
+    /// included. The processor that spins keeps taking interrupts, which
+    /// is what lets that shootdown complete; [`StoreTurns::begin`] is
+    /// never called with interrupts masked or the address-space lock
+    /// held. The holder takes the registry lock and the instance's store
+    /// lock only to look up and read, and holds neither while `work`
+    /// runs.
+    ///
+    /// Holds do not exclude each other: several may be in force at
+    /// once, and what serialises the work they guard is that work's own
+    /// lock.
+    pub fn while_off_processor<Output>(
+        &self,
+        id: InstanceId,
+        work: impl FnOnce(&OffProcessor<'_>) -> Output,
+    ) -> Result<Output, OffProcessorRefused> {
+        let instance = self.handle(id).ok_or(OffProcessorRefused::NoSuchInstance)?;
+        let entry = instance.entry();
+        let hold = OffProcessorHold::raise(entry);
+        if entry.stores.lock().any_on_processor() {
+            return Err(OffProcessorRefused::OnProcessor);
+        }
+        let output = work(&OffProcessor {
+            instance: id,
+            _hold: &hold,
+        });
+        drop(hold);
+        Ok(output)
+    }
+
+    /// A new handle on the live instance `id`.
+    fn handle(&self, id: InstanceId) -> Option<RegisteredInstance> {
+        let entries = self.inner.entries.lock();
+        let (entry_slot, entry) = entries.iter().find(|(_, entry)| entry.id == id)?;
+        // The last handle's drop takes the count to zero before it takes
+        // this lock to remove the entry, so an entry found at zero is on
+        // its way out and must not be revived.
+        entry
+            .handle_count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count != 0).then(|| count + 1)
+            })
+            .ok()?;
+        Some(RegisteredInstance {
+            registry: self.clone(),
+            entry_slot,
+            entry: NonNull::from(entry.as_ref()),
+        })
     }
 
     pub fn snapshot(&self, now_nanos: u64) -> Vec<InstanceSnapshot> {
@@ -626,14 +839,19 @@ impl Default for InstanceRegistry {
 /// Highest-scoring OOM candidate in `entries` for the pool that ran
 /// out.
 ///
-/// Called with the registry's `entries` lock held.
-fn best_victim(entries: &Slab<Box<InstanceEntry>>, pool: MemoryPool) -> Option<OomVictim> {
+/// Called with the registry's `entries` lock held; `residency` was
+/// taken before it.
+fn best_victim(
+    entries: &Slab<Box<InstanceEntry>>,
+    pool: MemoryPool,
+    residency: &UserResidency,
+) -> Option<OomVictim> {
     let mut best: Option<OomVictim> = None;
     for (_, entry) in entries.iter() {
-        let memory_bytes = entry.memory_bytes.load(Ordering::Acquire);
+        let user_bytes = entry.user_bytes(residency);
         let kernel_bytes = entry.kernel_heap_bytes();
         let pool_bytes = match pool {
-            MemoryPool::User => memory_bytes,
+            MemoryPool::User => user_bytes,
             MemoryPool::Kernel => kernel_bytes,
         };
         if pool_bytes == 0 {
@@ -655,7 +873,8 @@ fn best_victim(entries: &Slab<Box<InstanceEntry>>, pool: MemoryPool) -> Option<O
                     id: entry.id,
                     name: entry.name.clone(),
                     pool,
-                    memory_bytes,
+                    memory_bytes: entry.memory_bytes.load(Ordering::Acquire),
+                    user_bytes,
                     kernel_bytes,
                     policy: entry.policy,
                     score,
@@ -716,12 +935,14 @@ impl CondemnedBytes {
 /// gone or was already condemned.
 ///
 /// Called with the registry's `entries` lock held, which is what keeps
-/// the flag and its ledger entry from being observed out of step.
+/// the flag and its ledger entry from being observed out of step;
+/// `residency` was taken before it.
 fn condemn_entry(
     entries: &Slab<Box<InstanceEntry>>,
     id: InstanceId,
     reason: KillReason,
     now_nanos: u64,
+    residency: &UserResidency,
 ) -> Option<CondemnedBytes> {
     let entry = entries
         .iter()
@@ -732,7 +953,7 @@ fn condemn_entry(
         .compare_exchange(KILL_FLAG_NONE, encoded, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
     let condemned = CondemnedBytes {
-        user: entry.memory_bytes.load(Ordering::Acquire),
+        user: entry.user_bytes(residency),
         kernel: entry.kernel_heap_bytes(),
     };
     entry.condemned_at.store(now_nanos, Ordering::Release);
@@ -784,6 +1005,11 @@ impl RegisteredInstance {
 
     pub fn oom_policy(&self) -> OomPolicy {
         self.entry().policy
+    }
+
+    /// The instance's home, for a spawner that queues its tasks.
+    pub(crate) fn home(&self) -> Arc<InstanceHome> {
+        self.entry().home.clone()
     }
 
     pub fn memory_bytes(&self) -> u64 {
@@ -911,10 +1137,12 @@ impl Drop for RegisteredInstance {
 ///
 /// One writer: the turn that holds the store, which is one task on one
 /// processor at a time, because a store is driven through `&mut`. It
-/// writes with plain stores, never a read-modify-write. Readers are the
-/// registry's stats, profile and swap passes on any processor, under the
-/// owning entry's [`StoreClocks`] lock; the word is a single atomic, so
-/// they need no retry loop. The clock is cache-padded, so the line a
+/// writes with plain stores, never a read-modify-write; the store that
+/// marks a turn's start is sequentially consistent, because it is half
+/// of the exchange with [`InstanceRegistry::while_off_processor`].
+/// Readers are the registry's stats, profile and swap passes and its
+/// holds, on any processor, under the owning entry's [`StoreClocks`]
+/// lock; the word is a single atomic, so they need no retry loop. The clock is cache-padded, so the line a
 /// store's turns write is that store's alone: guest threads of one
 /// instance, each on its own store and processor, never share it.
 struct StoreClock {
@@ -993,6 +1221,63 @@ impl StoreClocks {
                 .max(clock.last_active_at.load(Ordering::Acquire));
         }
         time
+    }
+
+    /// Whether any live store is on a processor, read in the order
+    /// [`InstanceRegistry::while_off_processor`] states.
+    fn any_on_processor(&self) -> bool {
+        self.live
+            .iter()
+            .any(|clock| clock.word.load(Ordering::SeqCst) & ON_PROCESSOR != 0)
+    }
+}
+
+/// Proof that no store of [`Self::instance`] is on a processor or can
+/// begin a turn, for as long as it is borrowed.
+///
+/// Only [`InstanceRegistry::while_off_processor`] makes one, and it lends
+/// it to synchronous work only, so the proof cannot be held across an
+/// await. An operation that is unsound on a running instance takes it as
+/// a parameter.
+pub struct OffProcessor<'a> {
+    instance: InstanceId,
+    _hold: &'a OffProcessorHold<'a>,
+}
+
+impl OffProcessor<'_> {
+    /// The instance held off every processor.
+    pub const fn instance(&self) -> InstanceId {
+        self.instance
+    }
+}
+
+/// Why [`InstanceRegistry::while_off_processor`] did not run its work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum OffProcessorRefused {
+    #[error("a store of the instance is on a processor")]
+    OnProcessor,
+    #[error("no live instance carries that identifier")]
+    NoSuchInstance,
+}
+
+/// One raised hold on an instance's turn begins, released when it drops.
+struct OffProcessorHold<'a> {
+    holds: &'a AtomicUsize,
+}
+
+impl<'a> OffProcessorHold<'a> {
+    fn raise(entry: &'a InstanceEntry) -> Self {
+        let holds = &*entry.off_processor_holds;
+        holds.fetch_add(1, Ordering::SeqCst);
+        Self { holds }
+    }
+}
+
+impl Drop for OffProcessorHold<'_> {
+    fn drop(&mut self) {
+        // Release: a turn that reads the count at zero sees everything
+        // the work did under the hold.
+        self.holds.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -1148,7 +1433,18 @@ impl StoreTurns {
     ///
     /// Until the turn ends, user memory this processor commits belongs to
     /// the owner this store's activity was opened with: see
-    /// [`ProcessorTurn`].
+    /// [`ProcessorTurn`]. The instance's first turn, of any of its stores,
+    /// fixes its home here (`InstanceHome`), whichever owner the store
+    /// names.
+    ///
+    /// A hold of [`InstanceRegistry::while_off_processor`] granted on the
+    /// instance before this turn was marked is waited out here, spinning:
+    /// it is another processor's bounded synchronous critical section,
+    /// and the turn cannot start until it ends. With no hold in force the
+    /// cost over an unheld turn is one sequentially consistent store and
+    /// one load of a line only holders write. Callers keep interrupts
+    /// unmasked and hold no address-space lock, which the holder's work
+    /// may need from this processor to finish.
     pub fn begin(&self, now_nanos: u64) -> ProcessorTurn<'_> {
         let word = self.clock.word.load(Ordering::Relaxed);
         // Turns of one store cannot nest: the driver holds the store by
@@ -1161,11 +1457,20 @@ impl StoreTurns {
         );
         // The owner scope is entered before the clock is marked, so a
         // processor without identity fails before the store is on it.
-        let owner = enter_user_memory_owner(current_processor(), self.memory_owner);
+        let processor = current_processor();
+        let owner = enter_user_memory_owner(processor, self.memory_owner);
+        self.instance.entry().home.settle(processor);
+        // Marked first and then the holds read, both sequentially
+        // consistent: the half of the exchange the holder's raise-then-
+        // read pairs with (`InstanceRegistry::while_off_processor`).
         self.clock.word.store(
             ON_PROCESSOR | now_nanos.saturating_sub(word),
-            Ordering::Release,
+            Ordering::SeqCst,
         );
+        let holds = &*self.instance.entry().off_processor_holds;
+        while holds.load(Ordering::SeqCst) != 0 {
+            spin_loop();
+        }
         ProcessorTurn {
             turns: self,
             resumed_at: now_nanos,
@@ -1208,6 +1513,13 @@ impl ProcessorTurn<'_> {
 }
 
 impl InstanceEntry {
+    /// User-pool bytes this instance holds, as `residency` saw them: the
+    /// pages its owner scope committed that are still resident, which is
+    /// what tearing it down returns to the pool.
+    fn user_bytes(&self, residency: &UserResidency) -> u64 {
+        residency.bytes_of(MemoryOwner::new(self.id.raw()))
+    }
+
     /// Kernel heap attributed to this instance.
     ///
     /// Two terms, because the kernel knows about its own allocations in
@@ -1232,8 +1544,11 @@ impl InstanceEntry {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::time::Duration;
+    use std::time::Instant as WallClock;
 
-    use super::{InstanceActivity, InstanceRegistry};
+    use super::{InstanceActivity, InstanceRegistry, OffProcessorRefused};
 
     #[test]
     fn assigns_stable_ids() {
@@ -1300,6 +1615,36 @@ mod tests {
         assert_eq!(registry.idle_instances(5_000, 2_990), vec![instance.id()]);
     }
 
+    /// The home is provisional until the instance's first turn, of any
+    /// of its stores, and fixed where that turn ran from then on.
+    #[test]
+    fn the_first_turn_of_any_store_fixes_the_home() {
+        let processor = helios_hal::cpu::ProcessorId::new;
+        crate::test_processor_identity::set(processor(2));
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("homed", 0);
+        let main = InstanceActivity::new(instance.clone(), 0);
+        let thread = InstanceActivity::new(instance.clone(), 0);
+        assert_eq!(
+            instance.home().processor(),
+            processor(2),
+            "provisionally the registering processor"
+        );
+
+        crate::test_processor_identity::set(processor(1));
+        thread.turns().begin(1).end(2);
+        assert_eq!(instance.home().processor(), processor(1));
+
+        crate::test_processor_identity::set(processor(0));
+        main.turns().begin(3).end(4);
+        thread.turns().begin(5).end(6);
+        assert_eq!(
+            instance.home().processor(),
+            processor(1),
+            "a later turn elsewhere does not move it"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "began a processor turn inside another")]
     fn a_store_cannot_begin_a_turn_inside_another() {
@@ -1311,6 +1656,117 @@ mod tests {
         core::mem::forget(activity);
         let _outer = turns.begin(1);
         let _inner = turns.begin(2);
+    }
+
+    /// A hold is refused while a store is on a processor, granted once
+    /// it is off, and refused for an instance that is gone.
+    #[test]
+    fn a_hold_is_granted_only_while_every_store_is_off() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("held", 0);
+        let id = instance.id();
+        let activity = InstanceActivity::new(instance.clone(), 0);
+        let turns = activity.turns();
+
+        let turn = turns.begin(10);
+        assert_eq!(
+            registry.while_off_processor(id, |_| ()),
+            Err(OffProcessorRefused::OnProcessor)
+        );
+        assert_eq!(turn.end(20), 10);
+        assert_eq!(
+            registry.while_off_processor(id, |off| off.instance()),
+            Ok(id)
+        );
+
+        drop(turns);
+        drop(activity);
+        drop(instance);
+        assert_eq!(
+            registry.while_off_processor(id, |_| ()),
+            Err(OffProcessorRefused::NoSuchInstance)
+        );
+    }
+
+    /// No turn of a store runs while a hold on its instance is in force,
+    /// however a turn begin on one processor and a hold on another race:
+    /// either the hold sees the store on and is refused, or the turn
+    /// waits until the hold has ended.
+    #[test]
+    fn a_turn_never_runs_inside_a_hold() {
+        const ROUNDS: usize = 100_000;
+        // How long the race may go on before both outcomes have been seen:
+        // a third of the three 60-second periods `.config/nextest.toml`
+        // allows a test before killing it, so this bound fires first.
+        const RACE_DEADLINE: Duration = Duration::from_secs(60);
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("raced", 0);
+        let id = instance.id();
+        let activity = InstanceActivity::new(instance.clone(), 0);
+        let turns = activity.turns();
+        let inside_hold = AtomicBool::new(false);
+        let (granted, refused, overlaps) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let done = AtomicBool::new(false);
+
+        let raced = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    let held = registry.while_off_processor(id, |_| {
+                        inside_hold.store(true, Ordering::SeqCst);
+                        for _ in 0..64 {
+                            core::hint::spin_loop();
+                        }
+                        inside_hold.store(false, Ordering::SeqCst);
+                    });
+                    match held {
+                        Ok(()) => granted.fetch_add(1, Ordering::Relaxed),
+                        Err(OffProcessorRefused::OnProcessor) => {
+                            refused.fetch_add(1, Ordering::Relaxed)
+                        }
+                        Err(other) => panic!("the instance is alive: {other}"),
+                    };
+                }
+            });
+            let started = WallClock::now();
+            let mut round = 0_u64;
+            // Leaves the loop rather than panicking in it: the scope
+            // joins the holding thread, which stops only on `done`.
+            let raced = loop {
+                let both_seen =
+                    granted.load(Ordering::Relaxed) > 0 && refused.load(Ordering::Relaxed) > 0;
+                if round >= ROUNDS as u64 && both_seen {
+                    break true;
+                }
+                if started.elapsed() >= RACE_DEADLINE {
+                    break false;
+                }
+                let turn = turns.begin(round);
+                for _ in 0..16 {
+                    if inside_hold.load(Ordering::SeqCst) {
+                        overlaps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    core::hint::spin_loop();
+                }
+                let _ = turn.end(round + 1);
+                round += 1;
+            };
+            done.store(true, Ordering::Relaxed);
+            raced
+        });
+        assert_eq!(
+            overlaps.load(Ordering::Relaxed),
+            0,
+            "a turn ran while a hold was in force"
+        );
+        assert!(
+            raced,
+            "holds were not both granted and refused within {RACE_DEADLINE:?}, \
+             so the race went untested"
+        );
     }
 
     #[test]

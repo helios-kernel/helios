@@ -200,6 +200,7 @@ use spin::{Mutex, Once};
 
 use super::executor::ExecutorGroup;
 use super::wheel::{NodeState, SleepNode, TimingWheel, WheelLock};
+use crate::memory::{PerProcessor, UserMemoryPool};
 
 /// How long a guest holds its processor before it is preempted and
 /// yields to the executor.
@@ -285,8 +286,12 @@ pub struct Sleep<CpuImpl: Cpu + Clone> {
 /// its own: a sleep's node names a base's wheel lock as its home, so no
 /// base may ever be freed, and the processor finds its base again when it
 /// comes back.
+///
+/// Each slot is a [`PerProcessor`] block: on a cache line of its own and
+/// in memory of its processor's node, since the owner walks its base on
+/// every pass.
 pub(crate) struct TimerBases {
-    bases: Box<[CachePadded<Once<TimerShared>>]>,
+    bases: PerProcessor<Once<TimerShared>>,
 }
 
 /// One processor's timer base. The module docs give its concurrency
@@ -357,24 +362,22 @@ impl WakeBatch {
 }
 
 impl TimerBases {
-    pub(crate) fn new(possible_processors: usize) -> Self {
+    /// One empty slot per possible processor of the machine `pool`
+    /// describes.
+    pub(crate) fn new(pool: &UserMemoryPool) -> Self {
         Self {
-            bases: (0..possible_processors)
-                .map(|_| CachePadded::new(Once::new()))
-                .collect(),
+            bases: PerProcessor::new(pool, |_, _| Once::new()),
         }
     }
 
     fn slot(&self, processor: ProcessorId) -> &Once<TimerShared> {
-        self.bases
-            .get(usize::from(processor.id()))
-            .unwrap_or_else(|| {
-                panic!(
-                    "processor {} is outside the {} possible processors' timer bases",
-                    processor.id(),
-                    self.bases.len()
-                )
-            })
+        self.bases.try_get(processor).unwrap_or_else(|| {
+            panic!(
+                "processor {} is outside the {} possible processors' timer bases",
+                processor.id(),
+                self.bases.len()
+            )
+        })
     }
 
     fn get(&self, processor: ProcessorId) -> &TimerShared {
@@ -655,7 +658,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     pub fn handle_interrupt(&self) -> usize {
         let base = self.base();
         let now = self.now();
-        let interval = if self.group.needs_wake(usize::from(base.processor.id())) {
+        let interval = if self.group.needs_wake(base.processor) {
             base.idle_interval_ticks
         } else {
             base.tick_ticks
@@ -702,7 +705,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         if current_processor() == owner {
             self.arm_earlier(base, deadline);
         } else if CpuImpl::TIMER_INTERRUPT == TimerInterrupt::Deadline
-            && self.group.needs_wake(usize::from(owner.id()))
+            && self.group.needs_wake(owner)
         {
             self.cpu.wake_processor(owner);
         }
@@ -902,6 +905,7 @@ mod tests {
     }
 
     impl Cpu for TestCpu {
+        type Hypervisor = core::convert::Infallible;
         const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
         fn processor_count(&self) -> usize {

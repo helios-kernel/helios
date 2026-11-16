@@ -297,7 +297,9 @@ def three_images(driver, tmp_path) -> list:
     return [*images, rebuild]
 
 
-def run_three(driver, tmp_path, images: list, unit_orders: dict[str, str] | None) -> list[str]:
+def run_three(
+    driver, tmp_path, images: list, unit_orders: dict[str, str] | None, *, skip_build=False
+) -> list[str]:
     driver.run_helios(
         Path("tools/wasi-apps/workloads.json"),
         images,
@@ -309,13 +311,26 @@ def run_three(driver, tmp_path, images: list, unit_orders: dict[str, str] | None
         timeout_seconds=60,
         side_timeout_seconds=600,
         build_timeout_seconds=60,
-        skip_build=False,
+        skip_build=skip_build,
         control_workload=None,
         keep_going=True,
         unit_orders=unit_orders,
         profile_boot=False,
     )
     return [guest for _, guest, _, _ in boot_order(tmp_path / "order")]
+
+
+def test_repeat_measurement_boots_the_same_three_images_without_building(driver, tmp_path, monkeypatch):
+    images = three_images(driver, tmp_path)
+    first_order = run_three(driver, tmp_path, images, None)
+    first_builds = (tmp_path / "builds").read_text()
+    assert first_builds.splitlines() == ["built"] * 3
+    artifacts = [driver.guest_artifact_digest(image, "x86-64", "kvm") for image in images]
+    monkeypatch.setattr(driver, "build_helios", lambda *args: pytest.fail("repeat pass rebuilt an image"))
+
+    assert run_three(driver, tmp_path, images, None, skip_build=True) == first_order * 2
+    assert (tmp_path / "builds").read_text() == first_builds
+    assert [driver.guest_artifact_digest(image, "x86-64", "kvm") for image in images] == artifacts
 
 
 def test_a_rebuilt_side_boots_three_images_with_the_baseline_in_the_middle(driver, tmp_path) -> None:
@@ -1504,6 +1519,29 @@ def test_a_sampled_candidate_refuses_the_cross_run_table_and_keeps_the_paired_on
     assert "neither blocks nor passes" in text
     with pytest.raises(SystemExit, match="cross-run comparison is refused"):
         evaluate(baseline_report, paired_regression_report)
+
+
+def test_standalone_gate_reports_no_revision_comparison(baseline_report: Report, tmp_path, capsys) -> None:
+    candidate = tmp_path / "candidate.json"
+    output = tmp_path / "gate.md"
+    save_report(baseline_report, candidate)
+    with pytest.raises(SystemExit) as result:
+        cli_main(["gate", "--candidate", str(candidate), "--out", str(output)])
+    assert result.value.code == 0
+    text = output.read_text(encoding="utf-8")
+    assert capsys.readouterr().out == text
+    assert "Revision comparison not evaluated" in text
+    assert "No significant regression" not in text
+
+
+def test_paired_regression_still_fails_without_dev_report(paired_regression_report: Report, tmp_path) -> None:
+    candidate = tmp_path / "candidate.json"
+    output = tmp_path / "gate.md"
+    save_report(paired_regression_report, candidate)
+    with pytest.raises(SystemExit) as result:
+        cli_main(["gate", "--candidate", str(candidate), "--out", str(output)])
+    assert result.value.code == 1
+    assert "Revision comparison not evaluated" not in output.read_text(encoding="utf-8")
 
 
 def test_an_unpaired_sampled_run_against_dev_is_refused(

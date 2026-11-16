@@ -15,12 +15,12 @@ mod lifecycle_tests;
 mod memory_policy_tests;
 mod net;
 mod oom_killer_tests;
-mod pmm_tests;
 mod rtc;
 mod runtime;
 mod swap;
 #[cfg(test)]
 mod swap_tests;
+mod test_pool;
 #[cfg(test)]
 mod timer_cross_processor_tests;
 mod timer_tests;
