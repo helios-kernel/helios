@@ -399,6 +399,7 @@ async fn main() -> Result<()> {
         Ok(())
     }
     .await;
+    console.console_output(&memory).await?;
     if !early_console.is_empty() {
         helios_api::io::stdout().write_all(early_console).await?;
     }
