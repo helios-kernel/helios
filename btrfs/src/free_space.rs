@@ -392,16 +392,29 @@ impl FreeTree {
                 }
                 bitmap_modes.insert(group.range.start, decoded.bitmaps);
             }
+            // A record inside a group was validated by that group's decode. One
+            // wholly outside every group is the residue of a removed block group:
+            // btrfs-progs before commit 3fc9f1ed ("remove block group free
+            // space") never deleted it, so every mkfs image of those releases
+            // carries one for its temporary 1 MiB chunk. Linux never reads it;
+            // `sync` deletes it with the first commit. A record that reaches
+            // into a group from outside is corruption.
             for &key in records.keys() {
-                if !expected
+                let end = key.objectid.checked_add(key.offset);
+                let inside = expected
                     .iter()
-                    .any(|group| group.range.contains(&key.objectid))
-                {
+                    .any(|group| group.range.contains(&key.objectid));
+                let reaches = end.is_none_or(|end| {
+                    expected
+                        .iter()
+                        .any(|group| key.objectid < group.range.end && group.range.start < end)
+                });
+                if !inside && reaches {
                     return Err(WriteError::FreeSpace {
                         key,
                         defect: FreeSpaceDefect::Range {
                             start: key.objectid,
-                            end: key.objectid.saturating_add(key.offset),
+                            end: end.unwrap_or(u64::MAX),
                         },
                     });
                 }
