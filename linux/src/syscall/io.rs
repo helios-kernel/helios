@@ -35,14 +35,22 @@ pub(super) fn descriptor_errno(error: DescriptorTableError) -> u64 {
         DescriptorTableError::RightsWidening => EPERM,
     })
 }
-fn insert(table: &mut DescriptorSlots<Entry>, descriptor: Descriptor, flags: u64) -> u64 {
+fn insert<File: Clone>(
+    table: &mut Descriptors<File>,
+    descriptor: Descriptor<File>,
+    flags: u64,
+) -> u64 {
     let entry = Entry::new(descriptor, flags & CLOEXEC != 0);
     entry.set_fdflags(flags as u16 & NONBLOCK);
     table
         .insert_entry(entry)
         .map_or_else(descriptor_errno, u64::from)
 }
-pub(super) fn event(table: &mut DescriptorSlots<Entry>, args: [u64; 6], has_flags: bool) -> u64 {
+pub(super) fn event<File: Clone>(
+    table: &mut Descriptors<File>,
+    args: [u64; 6],
+    has_flags: bool,
+) -> u64 {
     let flags = if has_flags { args[1] as u32 as u64 } else { 0 };
     if flags & !(CLOEXEC | u64::from(NONBLOCK) | 1) != 0 {
         return errno(EINVAL);
@@ -53,8 +61,8 @@ pub(super) fn event(table: &mut DescriptorSlots<Entry>, args: [u64; 6], has_flag
         flags,
     )
 }
-pub(super) fn pipe<M: UserMemory>(
-    table: &mut DescriptorSlots<Entry>,
+pub(super) fn pipe<File: Clone, M: UserMemory>(
+    table: &mut Descriptors<File>,
     args: [u64; 6],
     memory: &mut M,
     has_flags: bool,
@@ -83,7 +91,7 @@ pub(super) fn pipe<M: UserMemory>(
     }
     0
 }
-pub(super) fn duplicate(table: &mut DescriptorSlots<Entry>, call: Call) -> u64 {
+pub(super) fn duplicate<File: Clone>(table: &mut Descriptors<File>, call: Call) -> u64 {
     let [fd, arg, flags, ..] = call.arguments;
     let Some(mut entry) = table.get_entry(fd as u32 as i32).cloned() else {
         return errno(EBADF);
@@ -135,8 +143,8 @@ pub(super) fn duplicate(table: &mut DescriptorSlots<Entry>, call: Call) -> u64 {
         _ => unreachable!("only duplication syscalls reach this dispatcher"),
     }
 }
-pub(super) async fn write_resource<M: UserMemory>(
-    entry: &Entry,
+pub(super) async fn write_resource<File: Clone, M: UserMemory>(
+    entry: &Entry<File>,
     args: [u64; 6],
     memory: &M,
 ) -> u64 {
@@ -196,8 +204,8 @@ pub(super) async fn write_resource<M: UserMemory>(
         _ => errno(EBADF),
     }
 }
-pub(super) async fn read<M: UserMemory>(
-    table: &mut DescriptorSlots<Entry>,
+pub(super) async fn read<File: Clone, M: UserMemory>(
+    table: &mut Descriptors<File>,
     args: [u64; 6],
     memory: &mut M,
 ) -> u64 {
@@ -253,8 +261,8 @@ pub(super) async fn read<M: UserMemory>(
         _ => errno(EBADF),
     }
 }
-pub(super) fn epoll_create(
-    table: &mut DescriptorSlots<Entry>,
+pub(super) fn epoll_create<File: Clone>(
+    table: &mut Descriptors<File>,
     args: [u64; 6],
     has_flags: bool,
 ) -> u64 {
@@ -271,8 +279,8 @@ pub(super) fn epoll_create(
     }
     insert(table, Descriptor::Epoll(Epoll::new()), flags)
 }
-pub(super) fn epoll_ctl<M: UserMemory>(
-    table: &mut DescriptorSlots<Entry>,
+pub(super) fn epoll_ctl<File: Clone, M: UserMemory>(
+    table: &mut Descriptors<File>,
     args: [u64; 6],
     memory: &M,
 ) -> u64 {
@@ -359,7 +367,7 @@ pub(super) fn epoll_ctl<M: UserMemory>(
         Err(InterestError::NotFound) => errno(ENOENT),
     }
 }
-fn ready_mask(entry: &Entry, table: &DescriptorSlots<Entry>) -> u32 {
+fn ready_mask<File: Clone>(entry: &Entry<File>, table: &Descriptors<File>) -> u32 {
     match &entry.descriptor {
         Descriptor::Event(event) => {
             (if event.is_readable() { EPOLLIN } else { 0 })
@@ -401,10 +409,10 @@ fn ready_mask(entry: &Entry, table: &DescriptorSlots<Entry>) -> u32 {
     }
 }
 // Linux limits nested epoll traversal to five levels (eventpoll.c EP_MAX_NESTS).
-fn valid_nesting(
+fn valid_nesting<File: Clone>(
     target: &Epoll<u64>,
     parent: &Epoll<u64>,
-    table: &DescriptorSlots<Entry>,
+    table: &Descriptors<File>,
     depth: usize,
 ) -> bool {
     depth <= 4
@@ -416,7 +424,7 @@ fn valid_nesting(
             }
         })
 }
-fn arm_waits(epoll: &Epoll<u64>, table: &DescriptorSlots<Entry>, waits: &mut Vec<Wait>) {
+fn arm_waits<File: Clone>(epoll: &Epoll<u64>, table: &Descriptors<File>, waits: &mut Vec<Wait>) {
     for interest in epoll.interests() {
         if let Some(entry) = table.get_entry(interest.fd) {
             match &entry.descriptor {
@@ -438,7 +446,7 @@ enum Wait {
     Write(ByteWriter, ByteWriteWait),
 }
 impl Wait {
-    fn arm(entry: &Entry, events: u32) -> Option<Self> {
+    fn arm<File: Clone>(entry: &Entry<File>, events: u32) -> Option<Self> {
         match &entry.descriptor {
             Descriptor::Event(event) => Some(Self::Event(event.clone(), event.wait_state())),
             Descriptor::PipeRead { reader, .. } if events & EPOLLIN != 0 => {
@@ -458,8 +466,8 @@ impl Wait {
         }
     }
 }
-pub(super) async fn epoll_wait<M: UserMemory, C: Clock>(
-    table: &DescriptorSlots<Entry>,
+pub(super) async fn epoll_wait<File: Clone, M: UserMemory, C: Clock>(
+    table: &Descriptors<File>,
     args: [u64; 6],
     memory: &mut M,
     clock: &C,
@@ -602,7 +610,7 @@ mod tests {
                 one_shot: false,
             })
             .unwrap();
-        let table = DescriptorSlots::from_entries(alloc::vec![
+        let table = Descriptors::<Infallible>::from_entries(alloc::vec![
             Some(Entry::new(Descriptor::Event(event.clone()), false)),
             Some(Entry::new(Descriptor::Epoll(child), false)),
             Some(Entry::new(Descriptor::Epoll(parent), false)),

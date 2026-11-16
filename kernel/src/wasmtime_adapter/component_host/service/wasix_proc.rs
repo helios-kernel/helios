@@ -1026,7 +1026,7 @@ where
     }
     let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
     if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
-        descriptor_flags |= fs_types::DescriptorFlags::WRITE;
+        descriptor_flags |= FsDescriptorFlags::WRITE;
     }
     p1_path_open_resolved(
         caller,
@@ -2364,7 +2364,7 @@ pub(super) fn wasix_proc_spawn_resolve_child_cwd(
             .map_err(p1_errno_from_component_path)?;
         (guest_name, source_path, cwd.descriptor.flags)
     };
-    if !flags.contains(fs_types::DescriptorFlags::READ) {
+    if !flags.contains(FsDescriptorFlags::READ) {
         return Err(p1::errno::NOTCAPABLE);
     }
     Ok(Preview1Cwd {
@@ -2382,7 +2382,7 @@ pub(super) fn wasix_proc_spawn_resolve_child_cwd(
 pub(super) fn wasix_authority_resolve_absolute_guest_path(
     authority: &ProcessAuthority,
     guest_name: &str,
-) -> Result<(String, fs_types::DescriptorFlags), i32> {
+) -> Result<(String, FsDescriptorFlags), i32> {
     let mut best: Option<(&str, &str, DirectoryAuthorityRights)> = None;
     for preopen in authority.directory_preopens() {
         let preopen_guest = preopen.guest_name();
@@ -3123,18 +3123,12 @@ where
         p1_descriptor_flags(rights, fdflags),
     )
     .await?;
-    snapshot
-        .descriptors
-        .insert_at(
-            fd,
-            Preview1Descriptor::File {
-                descriptor,
-                offset: 0,
-                fdflags,
-            },
-            close_on_exec,
-        )
-        .map(drop)
+    let entry = Preview1DescriptorEntry::new(
+        Preview1Descriptor::File(OpenFile::new(descriptor)),
+        close_on_exec,
+    );
+    entry.set_fdflags(fdflags);
+    snapshot.descriptors.insert_entry_at(fd, entry).map(drop)
 }
 
 pub(super) fn wasix_spawn_resolve_open_base<Net: ComponentHostNetwork>(
@@ -3151,14 +3145,10 @@ pub(super) fn wasix_spawn_resolve_open_base<Net: ComponentHostNetwork>(
         return Ok((cwd.descriptor.clone(), path.to_owned()));
     }
     let base = match snapshot.descriptors.get(source_fd) {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. })
-            if descriptor.kind == FsNodeKind::Directory =>
-        {
-            descriptor.clone()
-        }
-        Some(_) => return Err(p1::errno::NOTDIR),
         None => return Err(p1::errno::BADF),
+        descriptor => p1_directory_descriptor(descriptor)
+            .ok_or(p1::errno::NOTDIR)?
+            .clone(),
     };
     Ok((base, path.to_owned()))
 }
@@ -3200,13 +3190,11 @@ pub(super) fn wasix_apply_spawn_fchdir<Net: ComponentHostNetwork>(
             guest_name: guest_name.clone(),
             descriptor: descriptor.clone(),
         },
-        Some(Preview1Descriptor::File { descriptor, .. })
-            if descriptor.kind == FsNodeKind::Directory =>
-        {
-            let guest_name = wasix_spawn_guest_name_for_source(snapshot, &descriptor.path)?;
+        Some(Preview1Descriptor::File(file)) if file.node().kind == FsNodeKind::Directory => {
+            let guest_name = wasix_spawn_guest_name_for_source(snapshot, &file.node().path)?;
             Preview1Cwd {
                 guest_name,
-                descriptor: descriptor.clone(),
+                descriptor: file.node().clone(),
             }
         }
         Some(_) => return Err(p1::errno::NOTDIR),
@@ -3245,14 +3233,10 @@ pub(super) fn wasix_spawn_resolve_cwd_target<Net: ComponentHostNetwork>(
         (guest_name, source_path, descriptor.flags)
     } else {
         let base = match snapshot.descriptors.get(fd) {
-            Some(Preview1Descriptor::Preopen { descriptor, .. })
-            | Some(Preview1Descriptor::File { descriptor, .. })
-                if descriptor.kind == FsNodeKind::Directory =>
-            {
-                descriptor.clone()
-            }
-            Some(_) => return Err(p1::errno::NOTDIR),
             None => return Err(p1::errno::BADF),
+            descriptor => p1_directory_descriptor(descriptor)
+                .ok_or(p1::errno::NOTDIR)?
+                .clone(),
         };
         let base_guest = wasix_spawn_guest_name_for_source(snapshot, &base.path)?;
         let guest_name =
@@ -3262,7 +3246,7 @@ pub(super) fn wasix_spawn_resolve_cwd_target<Net: ComponentHostNetwork>(
         (guest_name, source_path, base.flags)
     };
 
-    if !flags.contains(fs_types::DescriptorFlags::READ) {
+    if !flags.contains(FsDescriptorFlags::READ) {
         return Err(p1::errno::NOTCAPABLE);
     }
     Ok(Preview1Cwd {

@@ -40,6 +40,7 @@ mod btrfs;
 mod erofs;
 mod host;
 mod memory;
+mod node;
 mod request;
 mod root;
 mod storage;
@@ -48,6 +49,7 @@ pub use btrfs::BtrfsFs;
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
 pub use memory::{MemoryFs, MemoryWrite};
+pub use node::{FsDescriptor, FsDescriptorFlags};
 pub use request::{
     AttachedStorage, MountRequestError, MountSource, request_mount, request_unmount,
 };

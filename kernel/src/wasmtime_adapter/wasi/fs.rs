@@ -14,9 +14,10 @@ use helios_hal::fs::{
 };
 use pin_project_lite::pin_project;
 
+use super::fs_types::DescriptorFlags as WasiDescriptorFlags;
 use crate::{
-    ComponentHostNetwork, FileContents, Follow, HeldPath, MountHold, MountedWrite, Namespace,
-    Resolved, object_identity,
+    ComponentHostNetwork, FileContents, Follow, HeldPath, MountedWrite, Namespace, Resolved,
+    object_identity,
 };
 
 use super::*;
@@ -72,23 +73,47 @@ pub(super) fn record_component_fs_profile<CpuImpl, Net, StorageImpl>(
     }
 }
 
-/// An open guest descriptor: the guest path it names, what it named when
-/// it was opened, and the rights it was opened with.
-#[derive(Clone)]
-pub struct FsDescriptor {
-    pub(crate) path: String,
-    pub(crate) kind: FsNodeKind,
-    pub(crate) flags: fs_types::DescriptorFlags,
-    pub(crate) identity: Option<ObjectIdentity>,
-    /// The hold on the mount `open-at` resolved this through, which keeps
-    /// that mount from being unmounted while the descriptor lives. `None`
-    /// for a preopen or a working directory, which the process's authority
-    /// names rather than an open, and for the namespace's root.
-    #[expect(
-        dead_code,
-        reason = "held for its effect: a live share is what makes unmount busy"
-    )]
-    pub(crate) mount: Option<MountHold>,
+/// The `wasi:filesystem` `descriptor-flags` bit that names each
+/// [`FsDescriptorFlags`] bit; the node handle's flags carry the same set.
+const WASI_DESCRIPTOR_FLAGS: [(WasiDescriptorFlags, FsDescriptorFlags); 6] = [
+    (WasiDescriptorFlags::READ, FsDescriptorFlags::READ),
+    (WasiDescriptorFlags::WRITE, FsDescriptorFlags::WRITE),
+    (
+        WasiDescriptorFlags::FILE_INTEGRITY_SYNC,
+        FsDescriptorFlags::FILE_INTEGRITY_SYNC,
+    ),
+    (
+        WasiDescriptorFlags::DATA_INTEGRITY_SYNC,
+        FsDescriptorFlags::DATA_INTEGRITY_SYNC,
+    ),
+    (
+        WasiDescriptorFlags::REQUESTED_WRITE_SYNC,
+        FsDescriptorFlags::REQUESTED_WRITE_SYNC,
+    ),
+    (
+        WasiDescriptorFlags::MUTATE_DIRECTORY,
+        FsDescriptorFlags::MUTATE_DIRECTORY,
+    ),
+];
+
+/// The node-handle flags a `wasi:filesystem` caller asked for.
+pub(crate) fn descriptor_flags_from_wasi(flags: WasiDescriptorFlags) -> FsDescriptorFlags {
+    WASI_DESCRIPTOR_FLAGS
+        .iter()
+        .filter(|(wasi, _)| flags.contains(*wasi))
+        .fold(FsDescriptorFlags::empty(), |result, (_, node)| {
+            result | *node
+        })
+}
+
+/// A node handle's flags as `wasi:filesystem` reports them.
+pub(crate) fn descriptor_flags_to_wasi(flags: FsDescriptorFlags) -> WasiDescriptorFlags {
+    WASI_DESCRIPTOR_FLAGS
+        .iter()
+        .filter(|(_, node)| flags.contains(*node))
+        .fold(WasiDescriptorFlags::empty(), |result, (wasi, _)| {
+            result | *wasi
+        })
 }
 
 /// What every filesystem operation here resolves with.
@@ -194,7 +219,7 @@ pub(crate) async fn open_at<StorageImpl>(
     path_flags: fs_types::PathFlags,
     path: &str,
     open_flags: fs_types::OpenFlags,
-    requested: fs_types::DescriptorFlags,
+    requested: FsDescriptorFlags,
     now: u64,
 ) -> FsOpResult<FsDescriptor>
 where
@@ -214,7 +239,7 @@ async fn open_prepared<StorageImpl, D>(
     path_flags: fs_types::PathFlags,
     absolute: &str,
     open_flags: fs_types::OpenFlags,
-    requested: fs_types::DescriptorFlags,
+    requested: FsDescriptorFlags,
     now: u64,
 ) -> FsOpResult<FsDescriptor>
 where
@@ -286,7 +311,7 @@ where
     target: FsOpResult<(OpenGrant<FsDescriptor>, Namespace<StorageImpl>, String)>,
     path_flags: fs_types::PathFlags,
     open_flags: fs_types::OpenFlags,
-    flags: fs_types::DescriptorFlags,
+    flags: FsDescriptorFlags,
     now: u64,
     profile: Option<ComponentFsProfile<CpuImpl, Net, StorageImpl>>,
 }
@@ -297,7 +322,7 @@ pub(crate) fn prepare_open<CpuImpl, Net, StorageImpl>(
     path_flags: fs_types::PathFlags,
     path: &str,
     open_flags: fs_types::OpenFlags,
-    flags: fs_types::DescriptorFlags,
+    flags: FsDescriptorFlags,
 ) -> PreparedOpenAt<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -1580,27 +1605,26 @@ pub(crate) fn preopen_descriptor(preopen: &crate::DirectoryPreopen) -> FsDescrip
 
 pub(super) fn descriptor_flags_from_authority(
     rights: crate::DirectoryAuthorityRights,
-) -> fs_types::DescriptorFlags {
-    let mut flags = fs_types::DescriptorFlags::empty();
+) -> FsDescriptorFlags {
+    let mut flags = FsDescriptorFlags::empty();
     if rights.contains(crate::DirectoryAuthorityRights::READ) {
-        flags |= fs_types::DescriptorFlags::READ;
+        flags |= FsDescriptorFlags::READ;
     }
     if rights.contains(crate::DirectoryAuthorityRights::WRITE) {
-        flags |= fs_types::DescriptorFlags::WRITE;
+        flags |= FsDescriptorFlags::WRITE;
     }
     if rights.contains(crate::DirectoryAuthorityRights::MUTATE_DIRECTORY) {
-        flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+        flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     flags
 }
 
 pub(crate) fn validate_descriptor_flags_within_base(
-    base_flags: fs_types::DescriptorFlags,
-    requested: fs_types::DescriptorFlags,
+    base_flags: FsDescriptorFlags,
+    requested: FsDescriptorFlags,
 ) -> FsOpResult<()> {
-    let authority_flags = fs_types::DescriptorFlags::READ
-        | fs_types::DescriptorFlags::WRITE
-        | fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    let authority_flags =
+        FsDescriptorFlags::READ | FsDescriptorFlags::WRITE | FsDescriptorFlags::MUTATE_DIRECTORY;
     if !base_flags.contains(requested & authority_flags) {
         return Err(fs_types::ErrorCode::ReadOnly);
     }
@@ -1608,21 +1632,19 @@ pub(crate) fn validate_descriptor_flags_within_base(
 }
 
 pub(crate) fn effective_open_descriptor_flags(
-    base_flags: fs_types::DescriptorFlags,
-    requested: fs_types::DescriptorFlags,
+    base_flags: FsDescriptorFlags,
+    requested: FsDescriptorFlags,
     kind: FsNodeKind,
-) -> FsOpResult<fs_types::DescriptorFlags> {
-    let mut effective = fs_types::DescriptorFlags::empty();
-    if requested.contains(fs_types::DescriptorFlags::READ) {
-        effective |= fs_types::DescriptorFlags::READ;
+) -> FsOpResult<FsDescriptorFlags> {
+    let mut effective = FsDescriptorFlags::empty();
+    if requested.contains(FsDescriptorFlags::READ) {
+        effective |= FsDescriptorFlags::READ;
     }
-    if requested.contains(fs_types::DescriptorFlags::WRITE) {
-        effective |= fs_types::DescriptorFlags::WRITE;
+    if requested.contains(FsDescriptorFlags::WRITE) {
+        effective |= FsDescriptorFlags::WRITE;
     }
-    if kind == FsNodeKind::Directory
-        && requested.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-    {
-        effective |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    if kind == FsNodeKind::Directory && requested.contains(FsDescriptorFlags::MUTATE_DIRECTORY) {
+        effective |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     validate_descriptor_flags_within_base(base_flags, effective)?;
     Ok(effective)
@@ -1797,10 +1819,10 @@ where
     async fn get_flags(
         accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
-    ) -> Result<fs_types::DescriptorFlags, FsError> {
+    ) -> Result<WasiDescriptorFlags, FsError> {
         accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            Ok(descriptor.flags)
+            Ok(descriptor_flags_to_wasi(descriptor.flags))
         })
     }
 
@@ -2024,10 +2046,15 @@ where
         path_flags: fs_types::PathFlags,
         path: &str,
         open_flags: fs_types::OpenFlags,
-        flags: fs_types::DescriptorFlags,
+        flags: WasiDescriptorFlags,
     ) -> Result<Self::OpenAtPrepared> {
         Ok(prepare_open(
-            store, descriptor, path_flags, path, open_flags, flags,
+            store,
+            descriptor,
+            path_flags,
+            path,
+            open_flags,
+            descriptor_flags_from_wasi(flags),
         ))
     }
 
@@ -2497,9 +2524,9 @@ mod borrowed_request_tests {
         let root = FsDescriptor {
             path: String::from("/"),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -2515,7 +2542,7 @@ mod borrowed_request_tests {
             fs_types::PathFlags::empty(),
             "中文-日本語-한국어/file",
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ,
+            FsDescriptorFlags::READ,
             2,
         ))
         .unwrap();
@@ -2616,9 +2643,9 @@ mod borrowed_request_tests {
         let root = FsDescriptor {
             path: String::from("/"),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -2661,7 +2688,7 @@ mod borrowed_request_tests {
             Err(fs_types::ErrorCode::NotPermitted)
         ));
         let readonly = FsDescriptor {
-            flags: fs_types::DescriptorFlags::READ,
+            flags: FsDescriptorFlags::READ,
             ..root
         };
         assert!(matches!(
@@ -2678,9 +2705,9 @@ mod borrowed_request_tests {
             .push(FsDescriptor {
                 path: String::from("/"),
                 kind: FsNodeKind::Directory,
-                flags: fs_types::DescriptorFlags::READ
-                    | fs_types::DescriptorFlags::WRITE
-                    | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+                flags: FsDescriptorFlags::READ
+                    | FsDescriptorFlags::WRITE
+                    | FsDescriptorFlags::MUTATE_DIRECTORY,
                 identity: None,
                 mount: None,
             })
@@ -2692,7 +2719,7 @@ mod borrowed_request_tests {
             fs_types::PathFlags::empty(),
             &path,
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ,
+            FsDescriptorFlags::READ,
         );
         drop(path);
         let opened = block_on(execute_open(request)).unwrap();
@@ -2714,20 +2741,20 @@ mod borrowed_request_tests {
             fs_types::PathFlags::empty(),
             "../outside",
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ,
+            FsDescriptorFlags::READ,
         );
         assert!(matches!(
             block_on(execute_open(escaped)),
             Err(fs_types::ErrorCode::NotPermitted)
         ));
-        store.table.get_mut(&root).unwrap().flags = fs_types::DescriptorFlags::READ;
+        store.table.get_mut(&root).unwrap().flags = FsDescriptorFlags::READ;
         let denied = prepare_open(
             &mut store,
             Resource::new_borrow(root.rep()),
             fs_types::PathFlags::empty(),
             "refused",
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ,
+            FsDescriptorFlags::READ,
         );
         assert!(matches!(
             block_on(execute_open(denied)),

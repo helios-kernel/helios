@@ -1105,15 +1105,6 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         self.insert_entry_at(to_fd, entry)
     }
 
-    pub(super) fn insert_at(
-        &mut self,
-        fd: i32,
-        descriptor: Preview1Descriptor<Net>,
-        close_on_exec: bool,
-    ) -> Result<u32, i32> {
-        self.insert_entry_at(fd, Preview1DescriptorEntry::new(descriptor, close_on_exec))
-    }
-
     pub(super) fn insert_entry_at(
         &mut self,
         fd: i32,
@@ -1333,7 +1324,7 @@ fn unbindable_stdio<Net: ComponentHostNetwork>(
         | Preview1Descriptor::Stderr
         | Preview1Descriptor::PipeWrite { .. }
         | Preview1Descriptor::NullDevice => UnbindableStdio::WrongDirection,
-        Preview1Descriptor::File { .. } => UnbindableStdio::File,
+        Preview1Descriptor::File(_) => UnbindableStdio::File,
         Preview1Descriptor::Preopen { .. } => UnbindableStdio::Directory,
         Preview1Descriptor::Socket(_) => UnbindableStdio::Socket,
         Preview1Descriptor::Event(_) => UnbindableStdio::Event,
@@ -1363,31 +1354,31 @@ impl WasixTtyState {
 
 pub(super) fn directory_authority_to_descriptor_flags(
     rights: DirectoryAuthorityRights,
-) -> fs_types::DescriptorFlags {
-    let mut flags = fs_types::DescriptorFlags::empty();
+) -> FsDescriptorFlags {
+    let mut flags = FsDescriptorFlags::empty();
     if rights.contains(DirectoryAuthorityRights::READ) {
-        flags |= fs_types::DescriptorFlags::READ;
+        flags |= FsDescriptorFlags::READ;
     }
     if rights.contains(DirectoryAuthorityRights::WRITE) {
-        flags |= fs_types::DescriptorFlags::WRITE;
+        flags |= FsDescriptorFlags::WRITE;
     }
     if rights.contains(DirectoryAuthorityRights::MUTATE_DIRECTORY) {
-        flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+        flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     flags
 }
 
 pub(super) fn descriptor_flags_to_directory_authority(
-    flags: fs_types::DescriptorFlags,
+    flags: FsDescriptorFlags,
 ) -> DirectoryAuthorityRights {
     let mut rights = DirectoryAuthorityRights::empty();
-    if flags.contains(fs_types::DescriptorFlags::READ) {
+    if flags.contains(FsDescriptorFlags::READ) {
         rights |= DirectoryAuthorityRights::READ;
     }
-    if flags.contains(fs_types::DescriptorFlags::WRITE) {
+    if flags.contains(FsDescriptorFlags::WRITE) {
         rights |= DirectoryAuthorityRights::WRITE;
     }
-    if flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
+    if flags.contains(FsDescriptorFlags::MUTATE_DIRECTORY) {
         rights |= DirectoryAuthorityRights::MUTATE_DIRECTORY;
     }
     rights
@@ -1417,36 +1408,39 @@ pub(super) fn p1_descriptor_rights<Net: ComponentHostNetwork>(
         Preview1Descriptor::Socket(_) => {
             P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
         }
-        Preview1Descriptor::Preopen { descriptor, .. }
-        | Preview1Descriptor::File { descriptor, .. } => {
-            let mut rights = P1_RIGHT_FD_ADVISE | P1_RIGHT_FD_FILESTAT_GET;
-            if descriptor.flags.contains(fs_types::DescriptorFlags::READ) {
-                rights |= P1_RIGHT_FD_READ
-                    | P1_RIGHT_FD_SEEK
-                    | P1_RIGHT_FD_TELL
-                    | P1_RIGHT_FD_READDIR
-                    | P1_RIGHT_POLL_FD_READWRITE
-                    | P1_RIGHT_PATH_READ_MASK;
-            }
-            if descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-                rights |= P1_RIGHT_FD_DATASYNC
-                    | P1_RIGHT_FD_SYNC
-                    | P1_RIGHT_FD_WRITE
-                    | P1_RIGHT_FD_ALLOCATE
-                    | P1_RIGHT_FD_FDSTAT_SET_FLAGS
-                    | P1_RIGHT_FD_FILESTAT_SET_SIZE
-                    | P1_RIGHT_FD_FILESTAT_SET_TIMES
-                    | P1_RIGHT_PATH_FILE_WRITE_MASK;
-            }
-            if descriptor
-                .flags
-                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-            {
-                rights |= P1_RIGHT_PATH_MUTATE_MASK;
-            }
-            rights
-        }
+        Preview1Descriptor::Preopen { descriptor, .. } => p1_node_rights(descriptor),
+        Preview1Descriptor::File(file) => p1_node_rights(file.node()),
     }
+}
+
+/// The preview1 rights a filesystem node handle's flags grant.
+fn p1_node_rights(descriptor: &FsDescriptor) -> u64 {
+    let mut rights = P1_RIGHT_FD_ADVISE | P1_RIGHT_FD_FILESTAT_GET;
+    if descriptor.flags.contains(FsDescriptorFlags::READ) {
+        rights |= P1_RIGHT_FD_READ
+            | P1_RIGHT_FD_SEEK
+            | P1_RIGHT_FD_TELL
+            | P1_RIGHT_FD_READDIR
+            | P1_RIGHT_POLL_FD_READWRITE
+            | P1_RIGHT_PATH_READ_MASK;
+    }
+    if descriptor.flags.contains(FsDescriptorFlags::WRITE) {
+        rights |= P1_RIGHT_FD_DATASYNC
+            | P1_RIGHT_FD_SYNC
+            | P1_RIGHT_FD_WRITE
+            | P1_RIGHT_FD_ALLOCATE
+            | P1_RIGHT_FD_FDSTAT_SET_FLAGS
+            | P1_RIGHT_FD_FILESTAT_SET_SIZE
+            | P1_RIGHT_FD_FILESTAT_SET_TIMES
+            | P1_RIGHT_PATH_FILE_WRITE_MASK;
+    }
+    if descriptor
+        .flags
+        .contains(FsDescriptorFlags::MUTATE_DIRECTORY)
+    {
+        rights |= P1_RIGHT_PATH_MUTATE_MASK;
+    }
+    rights
 }
 
 pub(super) fn p1_filetype(kind: FsNodeKind) -> u8 {
@@ -1471,11 +1465,7 @@ pub(super) fn p1_filetype_from_descriptor_type(type_: fs_types::DescriptorType) 
 pub(super) fn p1_descriptor_path<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&str> {
-    match descriptor {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. }) => Some(&descriptor.path),
-        _ => None,
-    }
+    p1_fs_descriptor(descriptor).map(|descriptor| descriptor.path.as_str())
 }
 
 pub(super) fn p1_null_device_stat() -> fs_types::DescriptorStat {
@@ -1501,15 +1491,7 @@ pub(super) fn p1_null_device_identity() -> crate::ObjectIdentity {
 pub(super) fn p1_directory_descriptor<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&FsDescriptor> {
-    match descriptor {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. })
-            if descriptor.kind == FsNodeKind::Directory =>
-        {
-            Some(descriptor)
-        }
-        _ => None,
-    }
+    p1_fs_descriptor(descriptor).filter(|descriptor| descriptor.kind == FsNodeKind::Directory)
 }
 
 /// Readiness of one descriptor for a single `poll_oneoff`/`epoll` interest.
@@ -1629,7 +1611,7 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // carry a cached size, so report readiness without one rather than
         // paying a filesystem round-trip per poll.
         (
-            Some(Preview1Descriptor::File { .. }) | Some(Preview1Descriptor::Preopen { .. }),
+            Some(Preview1Descriptor::File(_)) | Some(Preview1Descriptor::Preopen { .. }),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
         ) => local(P1Readiness::Ready { bytes: 0 }),
         // A guest-owned pipe or socketpair write end is a bounded channel:

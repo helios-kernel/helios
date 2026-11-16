@@ -4,8 +4,12 @@ use core::num::NonZeroU32;
 use helios_unix::{DescriptorSlots, FileDescriptor, FileDescriptorEntry, ProcessIdentity};
 mod io;
 pub use io::Clock;
-type Descriptor = FileDescriptor<Infallible, Infallible, u64>;
-type Entry = FileDescriptorEntry<Infallible, Infallible, u64>;
+/// A descriptor whose file slot holds the platform's filesystem node through
+/// the shared [`helios_unix::OpenFile`], the same open file description WASIX
+/// descriptors hold.
+type Descriptor<File> = FileDescriptor<File, Infallible, u64>;
+type Entry<File> = FileDescriptorEntry<File, Infallible, u64>;
+type Descriptors<File> = DescriptorSlots<Entry<File>>;
 use core::ops::ControlFlow;
 
 /// A fault reported by the address-space owner, before any bytes are exposed.
@@ -98,13 +102,15 @@ const MAX_RW_COUNT: u64 = 0x7fff_f000; // Linux INT_MAX rounded down to a page.
 /// State of a single-threaded Linux process, exclusively owned by its task.
 /// No syscall or user-memory mutation runs concurrently with guest execution.
 /// The execution owner supplies a unique nonzero ID for each live process.
-pub struct Process {
+/// `File` is the platform's filesystem node handle; a descriptor that names a
+/// file holds it through the open file description every duplicate shares.
+pub struct Process<File: Clone> {
     identity: ProcessIdentity,
-    descriptors: DescriptorSlots<Entry>,
+    descriptors: Descriptors<File>,
     fs_base: u64,
     clear_child_tid: u64,
 }
-impl Process {
+impl<File: Clone> Process<File> {
     pub fn new(id: NonZeroU32) -> Self {
         Self {
             identity: ProcessIdentity::new(id.into()),
@@ -136,8 +142,8 @@ fn errno(value: u64) -> u64 {
 
 /// A single-threaded process's initial ABI surface. Exit consumes the execution
 /// loop through `Break`; it is never returned to the guest as a syscall result.
-pub async fn dispatch<M: VirtualMemory, O: Output + Clock>(
-    process: &mut Process,
+pub async fn dispatch<File: Clone, M: VirtualMemory, O: Output + Clock>(
+    process: &mut Process<File>,
     call: Call,
     memory: &mut M,
     output: &mut O,
@@ -218,8 +224,8 @@ pub async fn dispatch<M: VirtualMemory, O: Output + Clock>(
     }
 }
 
-async fn write<M: UserMemory, O: Output>(
-    descriptors: &DescriptorSlots<Entry>,
+async fn write<File: Clone, M: UserMemory, O: Output>(
+    descriptors: &Descriptors<File>,
     args: [u64; 6],
     memory: &M,
     output: &mut O,
@@ -277,7 +283,11 @@ async fn write<M: UserMemory, O: Output>(
     written
 }
 
-fn arch_prctl<M: UserMemory>(process: &mut Process, args: [u64; 6], memory: &mut M) -> u64 {
+fn arch_prctl<File: Clone, M: UserMemory>(
+    process: &mut Process<File>,
+    args: [u64; 6],
+    memory: &mut M,
+) -> u64 {
     // Linux UAPI asm/prctl.h: ARCH_SET_FS and ARCH_GET_FS.
     match args[0] as u32 {
         0x1002 => {
@@ -295,8 +305,8 @@ fn arch_prctl<M: UserMemory>(process: &mut Process, args: [u64; 6], memory: &mut
     }
 }
 
-async fn writev<M: UserMemory, O: Output>(
-    descriptors: &DescriptorSlots<Entry>,
+async fn writev<File: Clone, M: UserMemory, O: Output>(
+    descriptors: &Descriptors<File>,
     args: [u64; 6],
     memory: &M,
     output: &mut O,
@@ -402,5 +412,69 @@ fn mmap<M: VirtualMemory>(args: [u64; 6], memory: &mut M) -> u64 {
         Err(MapError::OutOfMemory) => errno(ENOMEM),
         Err(MapError::Permission) => errno(EPERM),
         Err(MapError::Invalid) => errno(EINVAL),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_unix::OpenFile;
+
+    // Linux UAPI syscall_64.tbl: dup and dup3; fcntl.h: O_CLOEXEC.
+    const SYS_DUP: u64 = 32;
+    const SYS_DUP3: u64 = 292;
+    const O_CLOEXEC: u64 = 0x80000;
+
+    /// A node handle as the platform would supply one; only its identity
+    /// matters here.
+    #[derive(Clone)]
+    struct Node;
+
+    fn open_file(descriptors: &Descriptors<Node>, fd: i32) -> &OpenFile<Node> {
+        match descriptors.get_entry(fd).map(|entry| &entry.descriptor) {
+            Some(Descriptor::File(file)) => file,
+            _ => panic!("descriptor {fd} must name the file"),
+        }
+    }
+
+    #[test]
+    fn duplicated_file_descriptors_share_one_open_file_description() {
+        let mut process = Process::<Node>::new(NonZeroU32::new(1).unwrap());
+        let fd = process
+            .descriptors
+            .insert_entry(Entry::new(Descriptor::File(OpenFile::new(Node)), false))
+            .expect("the table has room");
+        let duplicate = io::duplicate(
+            &mut process.descriptors,
+            Call {
+                number: SYS_DUP,
+                arguments: [u64::from(fd), 0, 0, 0, 0, 0],
+            },
+        );
+        let target = io::duplicate(
+            &mut process.descriptors,
+            Call {
+                number: SYS_DUP3,
+                arguments: [u64::from(fd), 9, O_CLOEXEC, 0, 0, 0],
+            },
+        );
+        assert_eq!(target, 9);
+
+        let original = open_file(&process.descriptors, fd as i32);
+        original.set_offset(7);
+        for copy in [duplicate as i32, 9] {
+            let shared = open_file(&process.descriptors, copy);
+            assert!(shared.same_description(original));
+            assert_eq!(shared.offset(), 7);
+        }
+        // Only close-on-exec belongs to the slot.
+        assert!(process.descriptors.get_entry(9).unwrap().close_on_exec);
+        assert!(
+            !process
+                .descriptors
+                .get_entry(fd as i32)
+                .unwrap()
+                .close_on_exec
+        );
     }
 }
