@@ -19,7 +19,7 @@ mod iommu;
 mod memory_type;
 mod mtrr;
 #[cfg(feature = "native-users")]
-pub mod native;
+mod native;
 mod net;
 mod pci;
 mod rtc;
@@ -164,36 +164,10 @@ unsafe impl critical_section::Impl for X86CriticalSection {
     }
 }
 
-/// Statically selected kernel-image composition, invoked after platform setup.
-pub trait BootHook {
-    fn start(
-        cpu: X86Cpu,
-        spawner: helios_kernel::Spawner<X86Cpu>,
-        timer: helios_kernel::Timer<X86Cpu>,
-        payload: helios_kernel::BootPayload,
-        entropy: helios_kernel::RootEntropyHandle,
-    );
-}
-
-#[cfg(not(feature = "native-users"))]
-struct NoBootHook;
-#[cfg(not(feature = "native-users"))]
-impl BootHook for NoBootHook {
-    fn start(
-        _: X86Cpu,
-        _: helios_kernel::Spawner<X86Cpu>,
-        _: helios_kernel::Timer<X86Cpu>,
-        _: helios_kernel::BootPayload,
-        _: helios_kernel::RootEntropyHandle,
-    ) {
-    }
-}
-
-#[cfg(not(feature = "native-users"))]
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 extern "C" fn _start() -> ! {
-    core::arch::naked_asm!("jmp {start}", start = sym start::<NoBootHook>);
+    core::arch::naked_asm!("jmp {start}", start = sym start);
 }
 
 /// Kernel entry from the bootloader. The kernel is compiled with SSE
@@ -205,12 +179,10 @@ extern "C" fn _start() -> ! {
 /// `x86_kernel_main` enables OSXSAVE and the CPUID-reported XCR0 in Rust
 /// after it has configured COM1.
 ///
-/// Boot entry for the kernel image's statically selected composition hook.
-///
 /// # Safety
 /// Called only by the bootloader entry, with the Limine handoff installed.
 #[unsafe(naked)]
-pub unsafe extern "C" fn start<Hook: BootHook>() -> ! {
+unsafe extern "C" fn start() -> ! {
     core::arch::naked_asm!(
         "mov rax, cr0",
         "and eax, {cr0_clear}",
@@ -225,11 +197,11 @@ pub unsafe extern "C" fn start<Hook: BootHook>() -> ! {
         cr0_set = const CR0_SET.bits() as u32,
         cr4_set = const (Cr4Flags::OSFXSR.bits() as u32
             | Cr4Flags::OSXMMEXCPT_ENABLE.bits() as u32),
-        main = sym x86_kernel_main::<Hook>,
+        main = sym x86_kernel_main,
     )
 }
 
-fn x86_kernel_main<Hook: BootHook>() -> ! {
+fn x86_kernel_main() -> ! {
     // Before anything else: every line below may read this processor's
     // identity at `fs:0`, and the bootstrap processor has no runtime to point
     // `IA32_FS_BASE` at until the heap and the ACPI tables exist.
@@ -535,13 +507,6 @@ fn x86_kernel_main<Hook: BootHook>() -> ! {
             }
         }
     }
-    Hook::start(
-        cpu.clone(),
-        kernel.spawner(),
-        kernel.timer(),
-        payload,
-        root_entropy,
-    );
     run_current_processor(cpu, kernel, debug_state)
 }
 
@@ -1060,6 +1025,14 @@ impl Drop for X86WakeOnlyMask {
 
 impl Cpu for X86Cpu {
     type Hypervisor = core::convert::Infallible;
+    #[cfg(feature = "native-users")]
+    type Native = native::X86Native;
+    #[cfg(not(feature = "native-users"))]
+    type Native = core::convert::Infallible;
+    #[cfg(feature = "native-users")]
+    fn native(&self) -> Option<&Self::Native> {
+        Some(&native::X86Native)
+    }
     // The local APIC timer runs in periodic mode at the scheduler tick;
     // `set_deadline` only starts it.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Periodic;
@@ -1663,10 +1636,4 @@ extern "C" fn wasmtime_parking_unpark() {
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_monotonic_nanos() -> u64 {
     helios_kernel::wasmtime_monotonic_nanos(smp::current_runtime().timer())
-}
-
-/// The debug output capability supplied by this platform.
-#[cfg(feature = "native-users")]
-pub fn debug_serial_writer() -> helios_kernel::DebugSerialWriter {
-    DEBUG_SERIAL_WRITER
 }
