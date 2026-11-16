@@ -498,6 +498,7 @@ impl Drop for RiscvWakeOnlyMask {
 
 impl Cpu for RiscvCpu {
     type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     // SBI `set_timer` programs this hart's one-shot comparator.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 

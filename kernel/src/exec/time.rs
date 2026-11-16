@@ -215,6 +215,7 @@ mod tests {
 
     impl Cpu for TestCpu {
         type Hypervisor = core::convert::Infallible;
+        type Native = core::convert::Infallible;
         const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
         fn processor_count(&self) -> usize {

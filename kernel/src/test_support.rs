@@ -82,6 +82,7 @@ impl TestCpu {
 
 impl Cpu for TestCpu {
     type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn has_lazy_commit_virtual_memory(&self) -> bool {
@@ -377,6 +378,7 @@ impl ManualClockCpu {
 
 impl Cpu for ManualClockCpu {
     type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
@@ -492,6 +494,7 @@ impl RecordingSmpCpu {
 
 impl Cpu for RecordingSmpCpu {
     type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
