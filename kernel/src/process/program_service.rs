@@ -252,6 +252,29 @@ pub enum ProgramExecErrorDetail {
     InternalInvariant,
     #[error("{0}")]
     ComponentStdioUnbindable(ComponentStdioRefusal),
+    #[error("this platform has no native user execution")]
+    NativeExecutionUnavailable,
+    #[error("no Linux ABI is decoded for this platform's instruction set")]
+    LinuxAbiUnsupported,
+    #[error("the Linux executable is not a static image this kernel loads: {0}")]
+    LinuxImageInvalid(LinuxImageRefusal),
+    #[error("user memory for a native process is exhausted")]
+    NativeMemoryExhausted,
+}
+
+/// Why a Linux executable was refused before any of it was mapped.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum LinuxImageRefusal {
+    #[error("it is not a well-formed ELF file")]
+    Malformed,
+    #[error("it is not a little-endian static x86-64 ET_EXEC image")]
+    Unsupported,
+    #[error("it needs an interpreter or dynamic relocation")]
+    Dynamic,
+    #[error("a load segment's range, alignment or permissions are invalid")]
+    Segment,
+    #[error("its entry point is not in executable file-backed bytes")]
+    Entry,
 }
 
 /// A standard descriptor a launching process hands to a component
@@ -354,6 +377,16 @@ impl ProgramExecErrorDetail {
             Self::ComponentStdioUnbindable(_) => {
                 "a standard descriptor cannot be a component's standard stream"
             }
+            Self::NativeExecutionUnavailable => "this platform has no native user execution",
+            Self::LinuxAbiUnsupported => {
+                "no Linux ABI is decoded for this platform's instruction set"
+            }
+            // The refusal is in the error's `Display`; `as_str` has no
+            // storage to format it into.
+            Self::LinuxImageInvalid(_) => {
+                "the Linux executable is not a static image this kernel loads"
+            }
+            Self::NativeMemoryExhausted => "user memory for a native process is exhausted",
         }
     }
 }

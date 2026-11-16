@@ -15,6 +15,6 @@ pub use authority::{
     TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap, UnmountCap,
 };
 pub use program_service::{
-    ComponentStdioRefusal, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind,
-    ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
+    ComponentStdioRefusal, LinuxImageRefusal, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
 };
