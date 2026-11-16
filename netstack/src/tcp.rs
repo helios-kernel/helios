@@ -25,9 +25,11 @@ use alloc::collections::VecDeque;
 use bytes::{Bytes, BytesMut};
 use heapless::{Deque, Vec as HeapVec};
 
+use crate::delivery_rate::{AckDelivery, DeliveryRateSampler, SendSnapshot};
 use crate::{
-    AckSample, CongestionControl, CongestionEvent, IpAddress, RecoveryAction, TcpFlags, TcpHeader,
-    TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSackBlock, TcpSackBlocks, TcpTimestampOption,
+    AckSample, CongestionControl, CongestionEvent, IpAddress, LostPacket, PacketSent,
+    RecoveryAction, RecoveryTrigger, TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket,
+    TcpReceiveBuffer, TcpSackBlock, TcpSackBlocks, TcpTimestampOption,
 };
 
 pub(crate) const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
@@ -283,9 +285,206 @@ struct TcpInFlightSegment {
     options: TcpHeaderOptions,
     payload: Bytes,
     sequence_len: u32,
-    sent_at_nanos: u64,
+    /// The connection's delivery state when this segment was last
+    /// transmitted, its send time included. Held inline: the record the
+    /// retransmission queue already keeps is where the delivery-rate
+    /// sampler's per-segment state lives.
+    sent: SendSnapshot,
     retransmissions: u8,
     sacked: bool,
+    /// Counted into the connection's delivered total, by a SACK block
+    /// or the cumulative acknowledgement. Never cleared: a SACK the
+    /// retransmission timer forgets (`sacked` goes false) does not make
+    /// the bytes undelivered for the rate sampler, and nothing is
+    /// counted twice.
+    delivered: bool,
+    /// Declared lost and not retransmitted since.
+    lost: bool,
+}
+
+impl TcpInFlightSegment {
+    const fn new(
+        header: TcpHeader,
+        options: TcpHeaderOptions,
+        payload: Bytes,
+        sequence_len: u32,
+        sent: SendSnapshot,
+    ) -> Self {
+        Self {
+            header,
+            options,
+            payload,
+            sequence_len,
+            sent,
+            retransmissions: 0,
+            sacked: false,
+            delivered: false,
+            lost: false,
+        }
+    }
+
+    const fn sent_at_nanos(&self) -> u64 {
+        self.sent.send_time_nanos
+    }
+}
+
+/// A loss-recovery episode: it ends when the cumulative acknowledgement
+/// reaches `point`, the highest sequence sent when it began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpRecovery {
+    point: u32,
+    phase: TcpRecoveryPhase,
+}
+
+/// How a loss-recovery episode began, and what it still owes the
+/// retransmission timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpRecoveryPhase {
+    /// Fast retransmit and fast recovery (RFC 5681 section 3.2, RFC 6582
+    /// section 3.2).
+    Fast(TcpFastRecoveryTimer),
+    /// The retransmission timer expired. Everything outstanding was
+    /// declared lost, and is resent from `SND.UNA` as the congestion
+    /// window opens (RFC 5681 section 3.1).
+    Timeout,
+}
+
+impl TcpRecoveryPhase {
+    const fn trigger(self) -> RecoveryTrigger {
+        match self {
+            Self::Fast(_) => RecoveryTrigger::FastRetransmit,
+            Self::Timeout => RecoveryTrigger::RetransmissionTimeout,
+        }
+    }
+}
+
+/// RFC 6582's `recover`: the highest sequence number transmitted when the
+/// last loss-recovery episode began, kept after the episode ends.
+///
+/// Section 3.2 step 2: on the third duplicate ACK the sender "checks the
+/// value of recover", and if the cumulative acknowledgement does not
+/// cover more than it, "the TCP does not enter fast retransmit".
+/// Section 4 gives the reason after a timeout: the sender resent
+/// segments the receiver already held, and the duplicates those draw
+/// "are simply an indication that the sender has unnecessarily
+/// retransmitted at least three packets". Some of those resends arrive
+/// after the episode's own cumulative ACK, so the check outlives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpRecover {
+    sequence: u32,
+    /// The episode was a timeout's: duplicates at or below `sequence`
+    /// answer its unnecessary resends, so they report no delivery
+    /// either.
+    after_timeout: bool,
+}
+
+impl TcpRecover {
+    /// Whether a duplicate ACK for `acknowledgement` comes from before
+    /// `recover`, and so may not start fast retransmit.
+    fn covers(self, acknowledgement: u32) -> bool {
+        sequence_leq(acknowledgement, self.sequence)
+    }
+}
+
+/// The retransmission timer during fast recovery.
+///
+/// RFC 6582 section 3.2 step 3 resets the timer "for the first partial
+/// ACK that arrives during fast recovery" and for no later one. Each
+/// partial ACK still resends the next hole, but the timer keeps running
+/// from the first, so a run of holes longer than a timeout's worth of
+/// round trips falls to the timeout and is resent as the window opens,
+/// rather than one segment per round trip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpFastRecoveryTimer {
+    /// No partial ACK yet: the timer runs from the oldest outstanding
+    /// segment's last transmission, as outside recovery.
+    AwaitingPartialAck,
+    /// The first partial ACK restarted the timer, which now expires at
+    /// `deadline_nanos` whatever later partial ACKs resend.
+    Restarted { deadline_nanos: u64 },
+}
+
+/// Bytes a peer that sends no SACK reported received past the hole, one
+/// segment per duplicate ACK, as the pipe estimate counts them: Linux's
+/// Reno `sacked_out`, which `tcp_add_reno_sack` raises.
+///
+/// It is an estimate of what is in the network, so it ends with the
+/// state it describes. `tcp_fastretrans_alert` resets it
+/// (`tcp_reset_reno_sack`) in its `TCP_CA_Recovery` case once `snd_una`
+/// reaches `high_seq`, and `tcp_timeout_mark_lost` resets it when a
+/// timeout declares everything outstanding lost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TcpRenoLeftNetwork(u32);
+
+impl TcpRenoLeftNetwork {
+    const fn bytes(self) -> u32 {
+        self.0
+    }
+
+    fn add(&mut self, bytes: u32) {
+        self.0 += bytes;
+    }
+
+    /// A cumulative ACK covered `bytes` the estimate may have counted;
+    /// they have left the outstanding data, so they leave it too
+    /// (`tcp_remove_reno_sacks`).
+    fn cover(&mut self, bytes: u32) {
+        self.0 = self.0.saturating_sub(bytes);
+    }
+}
+
+/// Bytes duplicate ACKs from a peer that sends no SACK counted into
+/// `C.delivered` that no cumulative acknowledgement has covered yet.
+///
+/// Each duplicate reports one segment delivered past the hole, so it is
+/// counted when it arrives; the cumulative ACK that later covers those
+/// segments counts only what the duplicates did not. Without that, a
+/// recovery round on such a path delivers nothing until the hole is
+/// repaired and then a window at once, and every rate and volume sample
+/// of the round reads as a few segments.
+///
+/// Unlike [`TcpRenoLeftNetwork`] it is accounting, not an estimate: it
+/// outlives a recovery episode and a timeout until cumulative ACKs have
+/// set all of it against what they cover, so each byte enters
+/// `C.delivered` once. Linux keeps one counter for both, and its
+/// `tcp_remove_reno_sacks` counts `max(acked - sacked_out, 1)`, which
+/// counts again what a reset `sacked_out` no longer remembers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TcpRenoDeliveredCredit(u32);
+
+impl TcpRenoDeliveredCredit {
+    #[cfg(test)]
+    const fn bytes(self) -> u32 {
+        self.0
+    }
+
+    fn add(&mut self, bytes: u32) {
+        self.0 += bytes;
+    }
+
+    /// Sets the credit against `bytes` a cumulative ACK covers, and
+    /// returns how many of them it had already counted.
+    fn consume(&mut self, bytes: u32) -> u32 {
+        let counted = bytes.min(self.0);
+        self.0 -= counted;
+        counted
+    }
+}
+
+/// Why a segment already sent goes out again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpRetransmissionCause {
+    /// The retransmission timer expired, and RFC 6298 section 5.4 resends
+    /// the earliest unacknowledged segment.
+    Timeout,
+    /// The third duplicate ACK (RFC 5681 section 3.2) or a partial ACK
+    /// (RFC 6582 section 3.2 step 3) named this hole.
+    FastRetransmit,
+    /// A smaller path MTU left this segment too large to arrive.
+    PathMtu,
+    /// The last timeout declared this segment lost, and the congestion
+    /// window has room for it (RFC 5681 section 3.1).
+    LostAfterTimeout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -666,12 +865,6 @@ impl TcpReceiveQueue {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TcpAckTiming {
-    rtt_nanos: u64,
-    interval_nanos: u64,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TcpRetransmissionTimer {
     smoothed_rtt_nanos: Option<u64>,
@@ -806,7 +999,33 @@ where
     transmit_queue: Option<TcpTransmitQueue>,
     in_flight: Option<TcpInFlightQueue>,
     bytes_in_flight: u32,
-    delivered_bytes: u64,
+    /// The connection's delivery-rate state (draft-ietf-ccwg-bbr
+    /// section 4.1): what it has delivered and lost, and whether it is
+    /// application-limited.
+    rate: DeliveryRateSampler,
+    /// The loss-recovery episode in progress.
+    recovery: Option<TcpRecovery>,
+    /// RFC 6582's `recover`; `None` until the first episode, which
+    /// matches the RFC's initial value, the initial send sequence.
+    recover: Option<TcpRecover>,
+    /// Bytes of the in-flight segments declared lost and not
+    /// retransmitted since.
+    lost_bytes: u32,
+    /// What duplicate ACKs from a peer that sends no SACK say has left
+    /// the network past the hole, as the pipe counts it.
+    reno_left_network: TcpRenoLeftNetwork,
+    /// What those duplicate ACKs counted into `C.delivered` that no
+    /// cumulative acknowledgement has covered yet.
+    reno_delivered_credit: TcpRenoDeliveredCredit,
+    /// Bytes of the in-flight segments a SACK block covers.
+    sacked_bytes: u32,
+    /// `C.is_cwnd_limited`: the congestion window was full after some
+    /// transmission in the window of data that ends at
+    /// `cwnd_usage_sequence`. Latched as Linux's `tcp_cwnd_validate`
+    /// latches it: a limited transmission sets it, and it is recomputed
+    /// by the first transmission after that window is acknowledged.
+    cwnd_limited: bool,
+    cwnd_usage_sequence: Option<u32>,
     syn_queued: bool,
     syn_ack_queued: bool,
     fin_queued: bool,
@@ -820,7 +1039,9 @@ where
     retransmission_timer: TcpRetransmissionTimer,
     persist_timer: Option<TcpPersistTimer>,
     persist_probe: Option<TcpPersistProbe>,
-    next_pacing_send_nanos: Option<u64>,
+    /// What the pacing rate has been charged for; `None` while the
+    /// controller reports no rate.
+    pacing: Option<TcpPacingBudget>,
     /// While set, the socket has something to send and no link-layer
     /// address to send it to, and this is when the stack asks again. It
     /// replaces the pacing deadline in [`Self::next_deadline_nanos`]: a
@@ -1001,7 +1222,15 @@ where
             transmit_queue: None,
             in_flight: None,
             bytes_in_flight: 0,
-            delivered_bytes: 0,
+            rate: DeliveryRateSampler::new(),
+            recovery: None,
+            recover: None,
+            lost_bytes: 0,
+            reno_left_network: TcpRenoLeftNetwork::default(),
+            reno_delivered_credit: TcpRenoDeliveredCredit::default(),
+            sacked_bytes: 0,
+            cwnd_limited: false,
+            cwnd_usage_sequence: None,
             syn_queued: false,
             syn_ack_queued: false,
             fin_queued: false,
@@ -1012,7 +1241,7 @@ where
             retransmission_timer: TcpRetransmissionTimer::new(),
             persist_timer: None,
             persist_probe: None,
-            next_pacing_send_nanos: None,
+            pacing: None,
             resolution_retry_nanos: None,
             delayed_ack_deadline_nanos: None,
             time_wait_deadline_nanos: None,
@@ -1134,6 +1363,18 @@ where
         &self.congestion
     }
 
+    /// `C.is_cwnd_limited` as the last acknowledgement reported it.
+    #[cfg(test)]
+    pub(crate) const fn cwnd_limited(&self) -> bool {
+        self.cwnd_limited
+    }
+
+    /// RFC 6298's RTO before any backoff.
+    #[cfg(test)]
+    pub(crate) const fn retransmission_timeout_nanos(&self) -> u64 {
+        self.retransmission_timer.timeout_nanos()
+    }
+
     pub fn pending_syn(&self) -> Option<TcpHeader> {
         if self.state != TcpState::SynSent || self.syn_queued {
             return None;
@@ -1175,20 +1416,22 @@ where
         );
         let header = self.pending_syn().expect("SYN header disappeared");
         self.syn_queued = true;
-        self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
+        // A SYN carries no data and nothing can be queued behind it, so
+        // the connection is application-limited from its first
+        // transmission: the handshake's acknowledgement measures one
+        // byte over a round trip, and seeding the bandwidth model with
+        // that would be "one byte per round trip" (#158).
+        self.check_if_application_limited();
+        let sent = self.note_packet_sent(1, now_nanos);
         self.in_flight_mut()
-            .push_back(TcpInFlightSegment {
+            .push_back(TcpInFlightSegment::new(
                 header,
-                options: syn_header_options(now_nanos, None),
-                payload: Bytes::new(),
-                sequence_len: 1,
-                sent_at_nanos: now_nanos,
-                retransmissions: 0,
-                sacked: false,
-            })
+                syn_header_options(now_nanos, None),
+                Bytes::new(),
+                1,
+                sent,
+            ))
             .expect("TCP in-flight queue is full");
-        self.congestion
-            .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
 
     pub fn mark_syn_ack_queued(&mut self, now_nanos: u64) {
@@ -1202,20 +1445,17 @@ where
             self.peer_timestamp.map(|timestamp| timestamp.value),
         );
         self.syn_ack_queued = true;
-        self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
+        self.check_if_application_limited();
+        let sent = self.note_packet_sent(1, now_nanos);
         self.in_flight_mut()
-            .push_back(TcpInFlightSegment {
+            .push_back(TcpInFlightSegment::new(
                 header,
                 options,
-                payload: Bytes::new(),
-                sequence_len: 1,
-                sent_at_nanos: now_nanos,
-                retransmissions: 0,
-                sacked: false,
-            })
+                Bytes::new(),
+                1,
+                sent,
+            ))
             .expect("TCP in-flight queue is full");
-        self.congestion
-            .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
 
     /// The reset this socket owes its peer when the local side tears
@@ -1368,6 +1608,13 @@ where
         self.peer_max_segment_size
     }
 
+    /// Bytes sent and not yet acknowledged, for tests that compare what
+    /// a drive marked in flight with what it queued.
+    #[cfg(test)]
+    pub(crate) const fn bytes_in_flight(&self) -> u32 {
+        self.bytes_in_flight
+    }
+
     pub const fn peer_window_scale(&self) -> u8 {
         self.peer_window_scale
     }
@@ -1451,6 +1698,10 @@ where
         if !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
             return 0;
         }
+        // Draft-ietf-ccwg-bbr section 4.1.2.4: on each write, before the
+        // data is queued, a connection that had run dry while its window
+        // was open has put a bubble in the pipe.
+        self.check_if_application_limited();
         let writable = bytes.len().min(self.transmit_queue.as_ref().map_or(
             TCP_TRANSMIT_BUFFER_BYTES,
             TcpTransmitQueue::remaining_bytes_capacity,
@@ -1488,12 +1739,28 @@ where
         let local = self.local?;
         let remote = self.remote?;
         let persist_probe = self.pending_persist_probe(now_nanos);
+        // After a timeout the window goes to what it declared lost first;
+        // new sequence space waits until none is left unsent.
+        if persist_probe.is_none() && self.awaiting_lost_resend() {
+            return None;
+        }
         let available_window = if persist_probe.is_some() {
             1
         } else {
-            self.sendable_window()
+            self.available_send_window()
         };
         if available_window == 0 {
+            return None;
+        }
+        // A full in-flight queue closes the effective send window until
+        // ACKs drain it; emitting another segment would have nowhere to
+        // record its retransmission state.
+        if persist_probe.is_none()
+            && self
+                .in_flight
+                .as_ref()
+                .is_some_and(TcpInFlightQueue::is_full)
+        {
             return None;
         }
         if matches!(
@@ -1562,21 +1829,18 @@ where
         } else {
             self.fin_queued = true;
             self.send_next = self.send_next.wrapping_add(1);
-            self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
             self.persist_timer = None;
-            self.congestion
-                .on_packet_sent(1, self.bytes_in_flight, now_nanos);
+            let sent = self.note_packet_sent(1, now_nanos);
             self.in_flight_mut()
-                .push_back(TcpInFlightSegment {
+                .push_back(TcpInFlightSegment::new(
                     header,
                     options,
-                    payload: Bytes::new(),
-                    sequence_len: 1,
-                    sent_at_nanos: now_nanos,
-                    retransmissions: 0,
-                    sacked: false,
-                })
+                    Bytes::new(),
+                    1,
+                    sent,
+                ))
                 .expect("TCP in-flight queue is full");
+            self.note_cwnd_usage();
         }
         Some(TcpTransmitSegment {
             local,
@@ -1628,23 +1892,27 @@ where
     }
 
     pub fn next_deadline_nanos(&self) -> Option<u64> {
-        let rto_deadline = self.in_flight.as_ref().and_then(|in_flight| {
-            in_flight.front().map(|segment| {
-                segment.sent_at_nanos.saturating_add(
-                    self.retransmission_timer
-                        .backed_off_timeout_nanos(segment.retransmissions),
-                )
-            })
-        });
+        let rto_deadline = self.retransmission_deadline_nanos();
         // A socket waiting for a link-layer address cannot send at its
-        // pacing time, so the time it asks again stands in for it.
-        // A pacing time is only a promise when a segment could go out at
-        // it: with the send window shut the take refuses regardless of
-        // the clock, and the persist or retransmission deadline is the
-        // next thing that can change that.
+        // pacing time, so the time it asks again stands in for it. The
+        // pacing time, when the budget's debt has drained, is when the
+        // socket next sends only while the windows would let it: a
+        // window-blocked socket waits on an ACK, and its passed pacing
+        // time would otherwise report a timer that is always due. After
+        // a timeout, the next send may be a segment declared lost.
         let transmit_deadline = self.resolution_retry_nanos.or_else(|| {
-            self.next_pacing_send_nanos
-                .filter(|_| !self.transmit_queue_is_empty() && self.sendable_window() > 0)
+            self.pacing
+                .map(TcpPacingBudget::drained_at_nanos)
+                .filter(|_| {
+                    self.lost_resend_open()
+                        || (!self.awaiting_lost_resend()
+                            && !self.transmit_queue_is_empty()
+                            && self.available_send_window() != 0
+                            && !self
+                                .in_flight
+                                .as_ref()
+                                .is_some_and(TcpInFlightQueue::is_full))
+                })
         });
         let persist_deadline = self.persist_timer.map(TcpPersistTimer::deadline_nanos);
         min_deadline(
@@ -1668,11 +1936,7 @@ where
         now_nanos: u64,
         persist_probe: Option<TcpPersistProbe>,
     ) -> Option<TcpTransmitSegment> {
-        if self
-            .next_pacing_send_nanos
-            .is_some_and(|deadline| now_nanos < deadline)
-            && persist_probe.is_none()
-        {
+        if persist_probe.is_none() && self.pacing.is_some_and(|pacing| !pacing.is_open(now_nanos)) {
             return None;
         }
         let options = self.timestamped_options(now_nanos);
@@ -1683,6 +1947,10 @@ where
         if payload_mtu == 0 {
             return None;
         }
+        // The segment size the pacing budget is sized in: what a full
+        // segment on this path carries, whatever the window leaves
+        // room for right now.
+        let pacing_segment = self.peer_max_segment_size.min(payload_mtu);
         // Coalescing is on only when the interface asked for a frame
         // wider than one wire segment; otherwise the socket emits
         // exactly one segment per call, as it always has.
@@ -1754,23 +2022,23 @@ where
                     ..header
                 };
                 self.send_next = self.send_next.wrapping_add(chunk_sequence_len);
-                self.bytes_in_flight = self.bytes_in_flight.saturating_add(chunk_sequence_len);
-                self.congestion
-                    .on_packet_sent(chunk_sequence_len, self.bytes_in_flight, now_nanos);
+                // Every segment of a coalesced burst shares this send
+                // time; the rate sampler's newest-segment rule breaks
+                // the tie by sequence.
+                let sent = self.note_packet_sent(chunk_sequence_len, now_nanos);
                 self.in_flight_mut()
-                    .push_back(TcpInFlightSegment {
-                        header: chunk_header,
+                    .push_back(TcpInFlightSegment::new(
+                        chunk_header,
                         options,
-                        payload: payload.slice(offset..offset + chunk_len),
-                        sequence_len: chunk_sequence_len,
-                        sent_at_nanos: now_nanos,
-                        retransmissions: 0,
-                        sacked: false,
-                    })
+                        payload.slice(offset..offset + chunk_len),
+                        chunk_sequence_len,
+                        sent,
+                    ))
                     .expect("TCP in-flight queue is full");
                 offset += chunk_len;
             }
-            self.schedule_next_pacing_send(sequence_len, now_nanos);
+            self.note_cwnd_usage();
+            self.charge_pacing(sequence_len, pacing_segment, now_nanos);
         }
         self.note_ack_emitted();
         Some(TcpTransmitSegment {
@@ -1794,25 +2062,7 @@ where
         now_nanos: u64,
         tcp_segment_mtu: usize,
     ) -> Option<TcpTransmitSegment> {
-        let in_flight = if self.fast_retransmit_pending {
-            self.first_unsacked_in_flight()?
-        } else if let Some(sequence) = self.pending_pmtu_retransmit_sequence {
-            self.in_flight.as_ref()?.iter().find(|segment| {
-                sequence_leq(segment.header.sequence, sequence)
-                    && sequence_lt(sequence, segment_end(segment))
-                    && !segment.sacked
-            })?
-        } else {
-            let in_flight = self.in_flight.as_ref()?.front()?;
-            if now_nanos.saturating_sub(in_flight.sent_at_nanos)
-                < self
-                    .retransmission_timer
-                    .backed_off_timeout_nanos(in_flight.retransmissions)
-            {
-                return None;
-            }
-            in_flight
-        };
+        let (_, in_flight) = self.next_retransmission(now_nanos)?;
         let local = self.local?;
         let remote = self.remote?;
         let payload_mtu = tcp_segment_mtu.checked_sub(
@@ -1860,38 +2110,183 @@ where
             .find(|segment| !segment.sacked)
     }
 
+    /// The segment this socket resends next at `now_nanos`, and why.
+    ///
+    /// An expired timer comes first: RFC 6298 section 5.4 resends the
+    /// earliest unacknowledged segment, whatever else is pending. A hole
+    /// fast retransmit or a partial ACK named comes next, then a segment
+    /// a smaller path MTU left too large. After a timeout, the segments
+    /// it declared lost go out front first while the congestion window
+    /// exceeds the pipe, at the pacing rate, ahead of any new data.
+    fn next_retransmission(
+        &self,
+        now_nanos: u64,
+    ) -> Option<(TcpRetransmissionCause, &TcpInFlightSegment)> {
+        if self
+            .retransmission_deadline_nanos()
+            .is_some_and(|deadline| now_nanos >= deadline)
+        {
+            let front = self.in_flight.as_ref()?.front()?;
+            return Some((TcpRetransmissionCause::Timeout, front));
+        }
+        if self.fast_retransmit_pending {
+            return self
+                .first_unsacked_in_flight()
+                .map(|segment| (TcpRetransmissionCause::FastRetransmit, segment));
+        }
+        if let Some(sequence) = self.pending_pmtu_retransmit_sequence {
+            return self
+                .in_flight
+                .as_ref()?
+                .iter()
+                .find(|segment| {
+                    sequence_leq(segment.header.sequence, sequence)
+                        && sequence_lt(sequence, segment_end(segment))
+                        && !segment.sacked
+                })
+                .map(|segment| (TcpRetransmissionCause::PathMtu, segment));
+        }
+        if self.lost_resend_open() && self.pacing.is_none_or(|pacing| pacing.is_open(now_nanos)) {
+            return self
+                .in_flight
+                .as_ref()?
+                .iter()
+                .find(|segment| segment.lost)
+                .map(|segment| (TcpRetransmissionCause::LostAfterTimeout, segment));
+        }
+        None
+    }
+
+    /// When the retransmission timer expires, if anything is timed.
+    ///
+    /// Outside recovery the timer runs from the oldest outstanding
+    /// segment's last transmission, backed off by how often it has been
+    /// sent. In fast recovery the first partial ACK restarts it once
+    /// ([`TcpFastRecoveryTimer`]). After a timeout, segments it declared
+    /// lost are not timed: they are known lost and wait only for the
+    /// window. The oldest segment the episode has resent, or sent new,
+    /// carries the timer, and its expiry is a new timeout.
+    fn retransmission_deadline_nanos(&self) -> Option<u64> {
+        let timed = |segment: &TcpInFlightSegment| {
+            segment.sent_at_nanos().saturating_add(
+                self.retransmission_timer
+                    .backed_off_timeout_nanos(segment.retransmissions),
+            )
+        };
+        let in_flight = self.in_flight.as_ref()?;
+        match self.recovery.map(|recovery| recovery.phase) {
+            Some(TcpRecoveryPhase::Fast(TcpFastRecoveryTimer::Restarted { deadline_nanos })) => {
+                in_flight.front().map(|_| deadline_nanos)
+            }
+            Some(TcpRecoveryPhase::Timeout) => {
+                in_flight.iter().find(|segment| !segment.lost).map(timed)
+            }
+            Some(TcpRecoveryPhase::Fast(TcpFastRecoveryTimer::AwaitingPartialAck)) | None => {
+                in_flight.front().map(timed)
+            }
+        }
+    }
+
+    /// The socket is in a timeout's episode and still holds segments the
+    /// timeout declared lost that it has not resent. New data waits for
+    /// them (RFC 5681 section 3.1's retransmission from `SND.UNA`).
+    fn awaiting_lost_resend(&self) -> bool {
+        self.lost_bytes != 0 && self.in_timeout_recovery()
+    }
+
+    /// A segment a timeout declared lost may be resent now: the
+    /// congestion window exceeds the pipe, which excludes what is lost.
+    fn lost_resend_open(&self) -> bool {
+        self.awaiting_lost_resend()
+            && self.pipe_bytes() < self.congestion.congestion_window().bytes()
+    }
+
+    /// Records that the segment at `sequence`, the one
+    /// [`Self::pending_retransmission_with_mtu`] returned at
+    /// `now_nanos`, was queued for the wire.
     pub fn mark_retransmission_queued(&mut self, sequence: u32, now_nanos: u64) {
-        let fast_retransmit = self.fast_retransmit_pending;
-        if fast_retransmit {
-            self.fast_retransmit_pending = false;
-        }
-        let pmtu_retransmit = self.pending_pmtu_retransmit_sequence == Some(sequence);
-        if pmtu_retransmit {
-            self.pending_pmtu_retransmit_sequence = None;
-        }
-        let Some(in_flight_queue) = self.in_flight.as_mut() else {
+        let Some((cause, segment)) = self.next_retransmission(now_nanos) else {
             return;
         };
-        let Some(in_flight) = in_flight_queue
-            .iter_mut()
-            .find(|segment| segment.header.sequence == sequence)
-        else {
+        assert_eq!(
+            segment.header.sequence, sequence,
+            "a TCP retransmission was marked that the socket did not ask for"
+        );
+        match cause {
+            TcpRetransmissionCause::FastRetransmit => self.fast_retransmit_pending = false,
+            TcpRetransmissionCause::PathMtu => self.pending_pmtu_retransmit_sequence = None,
+            TcpRetransmissionCause::Timeout | TcpRetransmissionCause::LostAfterTimeout => {}
+        }
+        let new_timeout = cause == TcpRetransmissionCause::Timeout;
+        let Some(in_flight) = self.in_flight.as_mut().and_then(|queue| {
+            queue
+                .iter_mut()
+                .find(|segment| segment.header.sequence == sequence)
+        }) else {
             return;
         };
-        in_flight.sent_at_nanos = now_nanos;
         in_flight.retransmissions = in_flight.retransmissions.saturating_add(1);
         if in_flight.retransmissions > TCP_MAX_RETRANSMISSIONS {
             self.set_state(TcpState::Closed, TcpStateChangeReason::RetransmissionLimit);
             self.bytes_in_flight = 0;
+            self.lost_bytes = 0;
+            self.reno_left_network = TcpRenoLeftNetwork::default();
+            self.reno_delivered_credit = TcpRenoDeliveredCredit::default();
+            self.sacked_bytes = 0;
+            self.recovery = None;
             if let Some(in_flight) = self.in_flight.as_mut() {
                 in_flight.clear();
             }
             return;
         }
-        if !fast_retransmit && !pmtu_retransmit {
+        if new_timeout {
             self.on_retransmission_timeout();
-            self.congestion
-                .on_congestion_event(CongestionEvent::RetransmissionTimeout { now_nanos });
+            self.declare_outstanding_lost(now_nanos);
+        }
+        // Resent, a segment declared lost is back in the pipe.
+        let in_flight = self
+            .in_flight
+            .as_mut()
+            .and_then(|queue| {
+                queue
+                    .iter_mut()
+                    .find(|segment| segment.header.sequence == sequence)
+            })
+            .expect("declaring losses removes nothing from the in-flight queue");
+        if in_flight.lost {
+            in_flight.lost = false;
+            self.lost_bytes -= in_flight.sequence_len;
+        }
+        let pipe = self.pipe_bytes();
+        let outstanding = self.bytes_in_flight;
+        let in_flight = self
+            .in_flight
+            .as_mut()
+            .and_then(|queue| {
+                queue
+                    .iter_mut()
+                    .find(|segment| segment.header.sequence == sequence)
+            })
+            .expect("the segment being resent is in flight");
+        in_flight.sent = self.rate.on_packet_sent(outstanding, pipe, now_nanos);
+        let packet = PacketSent {
+            bytes: in_flight.sequence_len,
+            bytes_in_flight: pipe,
+            delivered: self.rate.delivered(),
+            app_limited: in_flight.sent.is_app_limited,
+            now_nanos,
+        };
+        self.congestion.on_packet_sent(packet);
+        match cause {
+            TcpRetransmissionCause::Timeout => {
+                self.start_recovery(TcpRecoveryPhase::Timeout, now_nanos);
+            }
+            // It takes the place of new data, so it takes new data's
+            // place in the pacing schedule too.
+            TcpRetransmissionCause::LostAfterTimeout => {
+                self.charge_pacing(packet.bytes, packet.bytes as usize, now_nanos);
+            }
+            TcpRetransmissionCause::FastRetransmit | TcpRetransmissionCause::PathMtu => {}
         }
     }
 
@@ -2020,6 +2415,18 @@ where
         }
     }
 
+    /// Whether `packet` would move this connection out of `SYN-RECEIVED`:
+    /// an ACK, not a RST, of exactly the SYN-ACK this socket sent.
+    ///
+    /// Lets the stack decide whether it can take the connection on before
+    /// the segment is applied, since applying it is irreversible.
+    pub(crate) fn completes_handshake(&self, packet: TcpPacket<'_>) -> bool {
+        self.state == TcpState::SynReceived
+            && packet.flags.contains(TcpFlags::ACK)
+            && !packet.flags.contains(TcpFlags::RST)
+            && packet.acknowledgement == self.send_next
+    }
+
     pub fn on_segment(
         &mut self,
         packet: TcpPacket<'_>,
@@ -2034,12 +2441,10 @@ where
                     return TcpSegmentOutcome::default();
                 }
                 self.set_state(TcpState::Closed, TcpStateChangeReason::SynSentReset);
+                // A reset is not a timeout: the controller is told
+                // nothing, and the outcome reports where it stands.
                 TcpSegmentOutcome {
-                    recovery: Some(
-                        self.congestion.on_congestion_event(
-                            CongestionEvent::RetransmissionTimeout { now_nanos },
-                        ),
-                    ),
+                    recovery: Some(self.congestion_state()),
                     readable: false,
                     receive_backpressure: false,
                     reset: None,
@@ -2061,22 +2466,14 @@ where
                     remote
                 });
                 self.set_receive_base(packet.sequence.wrapping_add(1));
+                // The SYN was sent application-limited (see
+                // `mark_syn_queued`), so this acknowledgement's sample is
+                // too.
                 let action = self.acknowledge_sent(
                     packet.acknowledgement,
                     now_nanos,
-                    // Application-limited, exactly as the passive-open
-                    // sibling below declares its own handshake. A SYN
-                    // carries no payload and nothing can be queued
-                    // behind it while the socket is still connecting,
-                    // so this acknowledgement covers one byte over one
-                    // round trip: it measures the application, not the
-                    // path. Declared bandwidth-limited it seeded the
-                    // congestion controller's model with "one byte per
-                    // round trip", and no later acknowledgement of a
-                    // request/response flow can revise that, because
-                    // those are application-limited too (#158).
-                    true,
                     packet.options.timestamp(),
+                    false,
                     false,
                 );
                 self.set_state(
@@ -2103,7 +2500,7 @@ where
                 TcpSegmentOutcome::default()
             }
             TcpState::SynReceived if packet.flags.contains(TcpFlags::ACK) => {
-                if packet.acknowledgement != self.send_next {
+                if !self.completes_handshake(packet) {
                     return TcpSegmentOutcome {
                         reset: self.unacceptable_ack_reset(packet.acknowledgement),
                         ..TcpSegmentOutcome::default()
@@ -2114,8 +2511,8 @@ where
                 let action = self.acknowledge_sent(
                     packet.acknowledgement,
                     now_nanos,
-                    true,
                     packet.options.timestamp(),
+                    false,
                     false,
                 );
                 self.set_state(
@@ -2146,9 +2543,7 @@ where
                     if packet.sequence == self.receive_next {
                         self.set_state(TcpState::Closed, TcpStateChangeReason::PeerReset);
                         return TcpSegmentOutcome {
-                            recovery: Some(self.congestion.on_congestion_event(
-                                CongestionEvent::RetransmissionTimeout { now_nanos },
-                            )),
+                            recovery: Some(self.congestion_state()),
                             readable: false,
                             receive_backpressure: false,
                             reset: None,
@@ -2194,13 +2589,13 @@ where
                 } else {
                     self.update_peer_receive_window(packet.window_size);
                     self.record_peer_timestamp(packet.options.timestamp());
-                    self.apply_sack_blocks(packet.options.sack_blocks());
+                    let newly_sacked = self.apply_sack_blocks(packet.options.sack_blocks());
                     self.acknowledge_sent(
                         packet.acknowledgement,
                         now_nanos,
-                        self.transmit_queue_is_empty(),
                         packet.options.timestamp(),
                         duplicate_ack_eligible,
+                        newly_sacked,
                     )
                 };
                 let mut readable = false;
@@ -2317,6 +2712,12 @@ where
         self.out_of_order_queued_bytes = 0;
         self.transmit_queue = None;
         self.in_flight = None;
+        self.lost_bytes = 0;
+        self.reno_left_network = TcpRenoLeftNetwork::default();
+        self.reno_delivered_credit = TcpRenoDeliveredCredit::default();
+        self.sacked_bytes = 0;
+        self.recovery = None;
+        self.recover = None;
         self.syn_queued = false;
         self.syn_ack_queued = false;
         self.fin_queued = false;
@@ -2326,7 +2727,7 @@ where
         self.pending_pmtu_retransmit_sequence = None;
         self.persist_timer = None;
         self.persist_probe = None;
-        self.next_pacing_send_nanos = None;
+        self.pacing = None;
         self.resolution_retry_nanos = None;
         self.delayed_ack_deadline_nanos = None;
         self.time_wait_deadline_nanos = None;
@@ -2342,6 +2743,9 @@ where
                 return;
             };
             if sequence_leq(segment_end(front), acknowledgement) {
+                if front.sacked {
+                    self.sacked_bytes -= front.sequence_len;
+                }
                 let Some(in_flight) = self.in_flight.as_mut() else {
                     return;
                 };
@@ -2365,9 +2769,11 @@ where
                     );
                     let _ = front.payload.split_to(trim);
                 }
-                front.sequence_len = front
-                    .sequence_len
-                    .saturating_sub(u32::try_from(trim).expect("TCP partial ACK trim exceeds u32"));
+                let trim = u32::try_from(trim).expect("TCP partial ACK trim exceeds u32");
+                front.sequence_len = front.sequence_len.saturating_sub(trim);
+                if front.sacked {
+                    self.sacked_bytes -= trim;
+                }
             }
             return;
         }
@@ -2499,22 +2905,49 @@ where
         u32::from(self.advertised_window) << self.local_window_scale
     }
 
+    /// Processes an acknowledgement at or above `SND.UNA`.
+    ///
+    /// `newly_sacked` says the SACK blocks it carried marked segments
+    /// that were not marked before; only then does delivery accounting
+    /// look past the cumulative point.
     fn acknowledge_sent(
         &mut self,
         acknowledgement: u32,
         now_nanos: u64,
-        app_limited: bool,
         timestamp: Option<TcpTimestampOption>,
         duplicate_ack_eligible: bool,
+        newly_sacked: bool,
     ) -> Option<RecoveryAction> {
+        // Draft-ietf-ccwg-bbr section 4.1.2.4: at the start of ACK
+        // processing, before the estimate of what is in flight moves.
+        self.check_if_application_limited();
+        let mut delivery = AckDelivery::default();
         if sequence_leq(acknowledgement, self.send_unacknowledged) {
-            let action = (acknowledgement == self.send_unacknowledged && duplicate_ack_eligible)
+            let newest_original =
+                self.deliver_acknowledged(None, newly_sacked, &mut delivery, now_nanos);
+            let duplicate = acknowledgement == self.send_unacknowledged && duplicate_ack_eligible;
+            // After a timeout the sender resends segments the peer may
+            // already hold, and each such resend draws a duplicate that
+            // reports no new delivery (RFC 6582 section 4). Linux's
+            // `tcp_process_loss` counts a duplicate delivered only for new
+            // data sent past the episode; this sender sends none until
+            // the episode's losses are resent, so a duplicate at or below
+            // the timeout's `recover` counts nothing.
+            let answers_timeout_resend = self.recover.is_some_and(|recover| {
+                recover.after_timeout && recover.covers(self.send_unacknowledged)
+            });
+            if duplicate && !self.peer_sack_permitted && !answers_timeout_resend {
+                self.count_reno_sack(&mut delivery, now_nanos);
+            }
+            let loss = duplicate
                 .then(|| self.note_duplicate_ack(now_nanos))
                 .flatten();
             // A window update carried by an ACK that acknowledges
             // nothing new still reopens the window the probe asked about.
             self.refresh_persist_after_ack(now_nanos);
-            return action;
+            return self
+                .finish_ack(&delivery, newest_original, timestamp, now_nanos)
+                .or(loss);
         }
         let mut acked = acknowledgement.wrapping_sub(self.send_unacknowledged);
         if let Some(probe) = self.persist_probe
@@ -2526,8 +2959,17 @@ where
         {
             acked = self.send_next.wrapping_sub(self.send_unacknowledged);
         }
-        let timing = self.ack_sample_timing(acknowledgement, now_nanos, timestamp);
-        self.retransmission_timer.note_rtt(timing.rtt_nanos);
+        let newest_original = self.deliver_acknowledged(
+            Some(acknowledgement),
+            newly_sacked,
+            &mut delivery,
+            now_nanos,
+        );
+        self.retransmission_timer.note_rtt(self.ack_rtt_nanos(
+            acknowledgement,
+            now_nanos,
+            timestamp,
+        ));
         self.send_unacknowledged = acknowledgement;
         self.duplicate_ack_count = 0;
         self.fast_retransmit_pending = false;
@@ -2539,9 +2981,48 @@ where
         let probe_acked = self.discard_acked_persist_probe(acknowledgement);
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked);
         self.discard_acked_segments(acknowledgement);
-        self.delivered_bytes = self
-            .delivered_bytes
-            .saturating_add(u64::from(acked.saturating_add(probe_acked)));
+        if probe_acked != 0 {
+            self.rate
+                .on_unrecorded_delivered(&mut delivery, probe_acked, now_nanos);
+        }
+        let recovery_ended = self
+            .recovery
+            .is_some_and(|recovery| sequence_leq(recovery.point, acknowledgement))
+            .then(|| {
+                self.recovery = None;
+                // `tcp_fastretrans_alert` leaving `TCP_CA_Recovery`.
+                self.reno_left_network = TcpRenoLeftNetwork::default();
+                self.congestion
+                    .on_congestion_event(CongestionEvent::RecoveryEnded { now_nanos })
+            });
+        // RFC 6582 section 3.2, step 3: an acknowledgement that advances
+        // but stops short of the recovery point names the next hole, and
+        // the sender resends it without waiting for three more
+        // duplicates; the first such acknowledgement of the episode, and
+        // only the first, also restarts the retransmission timer. A
+        // timeout's episode needs no such rule: it declared everything
+        // outstanding lost, and resends it as the window opens.
+        let restarted_deadline =
+            now_nanos.saturating_add(self.retransmission_timer.timeout_nanos());
+        let partial_ack_loss = match self.recovery.as_mut() {
+            Some(TcpRecovery {
+                phase: TcpRecoveryPhase::Fast(timer),
+                ..
+            }) => {
+                if *timer == TcpFastRecoveryTimer::AwaitingPartialAck {
+                    *timer = TcpFastRecoveryTimer::Restarted {
+                        deadline_nanos: restarted_deadline,
+                    };
+                }
+                self.fast_retransmit_pending = self.first_unsacked_in_flight().is_some();
+                self.declare_first_unsacked_lost(now_nanos)
+            }
+            Some(TcpRecovery {
+                phase: TcpRecoveryPhase::Timeout,
+                ..
+            })
+            | None => None,
+        };
         if self.fin_queued && sequence_leq(self.send_next, acknowledgement) {
             match self.state {
                 TcpState::FinWait1 => {
@@ -2555,52 +3036,328 @@ where
             }
         }
         self.refresh_persist_after_ack(now_nanos);
-        Some(self.congestion.on_ack(AckSample {
-            acked_bytes: acked,
-            delivered_bytes: self.delivered_bytes,
-            bytes_in_flight: self.bytes_in_flight,
-            rtt_nanos: timing.rtt_nanos,
-            interval_nanos: timing.interval_nanos,
-            now_nanos,
-            app_limited,
-        }))
+        self.finish_ack(&delivery, newest_original, timestamp, now_nanos)
+            .or(partial_ack_loss)
+            .or(recovery_ended)
     }
 
+    /// Counts what an acknowledgement delivered into the rate sampler:
+    /// every segment the cumulative acknowledgement `cumulative` covers,
+    /// the acknowledged prefix of one it splits, and every segment a
+    /// SACK block marked, each once over the connection's lifetime.
+    ///
+    /// Returns the send time of the most recently sent delivered segment
+    /// that was never retransmitted: the one whose round trip is
+    /// unambiguous (RFC 6298 section 3's Karn's algorithm).
+    fn deliver_acknowledged(
+        &mut self,
+        cumulative: Option<u32>,
+        newly_sacked: bool,
+        delivery: &mut AckDelivery,
+        now_nanos: u64,
+    ) -> Option<u64> {
+        let in_flight = self.in_flight.as_mut()?;
+        let mut newest_original = None;
+        // `tcp_remove_reno_sacks`: what the duplicates already counted is
+        // not counted again. A first covered segment that was resent is
+        // the hole they were waiting for, which no duplicate reports, and
+        // counts in full; every other covered byte is set against the
+        // credit first, since credit left from an earlier episode
+        // describes segments past that episode, not this one's hole.
+        let mut first = true;
+        for segment in in_flight.iter_mut() {
+            let covered = cumulative.is_some_and(|ack| sequence_leq(segment_end(segment), ack));
+            let split =
+                cumulative.filter(|ack| !covered && sequence_lt(segment.header.sequence, *ack));
+            if !covered && split.is_none() && !segment.sacked {
+                if newly_sacked {
+                    continue;
+                }
+                // The queue is in sequence order: past the cumulative
+                // point only a SACK delivers anything.
+                break;
+            }
+            if segment.delivered {
+                continue;
+            }
+            let mut bytes = match split {
+                Some(ack) if !segment.sacked => ack.wrapping_sub(segment.header.sequence),
+                _ => {
+                    segment.delivered = true;
+                    if segment.lost {
+                        segment.lost = false;
+                        self.lost_bytes -= segment.sequence_len;
+                    }
+                    segment.sequence_len
+                }
+            };
+            let repaired_hole = first && segment.retransmissions != 0;
+            first = false;
+            if !repaired_hole {
+                self.reno_left_network.cover(bytes);
+                bytes -= self.reno_delivered_credit.consume(bytes);
+            }
+            self.rate
+                .on_packet_delivered(delivery, &segment.sent, bytes, now_nanos);
+            if segment.retransmissions == 0 {
+                newest_original = Some(
+                    newest_original.map_or(segment.sent_at_nanos(), |newest: u64| {
+                        newest.max(segment.sent_at_nanos())
+                    }),
+                );
+            }
+        }
+        newest_original
+    }
+
+    /// `tcp_add_reno_sack`: a duplicate ACK from a peer that sends no
+    /// SACK reports one segment past the hole delivered. It counts into
+    /// `C.delivered` now, bounded, as Linux's `tcp_limit_reno_sacked`
+    /// bounds it, by what is outstanding past the holes. No segment
+    /// record says which segment it was, so it times nothing.
+    fn count_reno_sack(&mut self, delivery: &mut AckDelivery, now_nanos: u64) {
+        let Some(front) = self.in_flight.as_ref().and_then(TcpInFlightQueue::front) else {
+            return;
+        };
+        let holes = front.sequence_len.max(self.lost_bytes);
+        let limit = self.bytes_in_flight.saturating_sub(holes);
+        let segment = u32::try_from(self.peer_max_segment_size).unwrap_or(u32::MAX);
+        let credited = segment.min(limit.saturating_sub(self.reno_left_network.bytes()));
+        if credited == 0 {
+            return;
+        }
+        self.reno_left_network.add(credited);
+        self.reno_delivered_credit.add(credited);
+        self.rate
+            .on_unrecorded_delivered(delivery, credited, now_nanos);
+    }
+
+    /// Generates the acknowledgement's rate sample and hands it to the
+    /// congestion controller, if it delivered anything.
+    fn finish_ack(
+        &mut self,
+        delivery: &AckDelivery,
+        newest_original_sent: Option<u64>,
+        timestamp: Option<TcpTimestampOption>,
+        now_nanos: u64,
+    ) -> Option<RecoveryAction> {
+        if delivery.newly_acked() == 0 {
+            return None;
+        }
+        let send_time_rtt = newest_original_sent.map(|sent| now_nanos.saturating_sub(sent));
+        // The sampler's minimum round trip bounds believable sampling
+        // intervals from below, so it takes only send-time round trips,
+        // at the clock's resolution: a millisecond timestamp echo would
+        // round a sub-millisecond path up and discard its samples.
+        let rate = self.rate.generate(delivery, send_time_rtt);
+        let action = self.congestion.on_ack(AckSample {
+            newly_acked: delivery.newly_acked(),
+            delivered: self.rate.delivered(),
+            bytes_in_flight: self.pipe_bytes(),
+            rtt_nanos: send_time_rtt.or_else(|| timestamp_rtt_nanos(now_nanos, timestamp)),
+            smoothed_rtt_nanos: self.retransmission_timer.smoothed_rtt_nanos,
+            rate,
+            cwnd_limited: self.cwnd_limited,
+            has_selective_acks: self.peer_sack_permitted,
+            now_nanos,
+        });
+        if self.congestion.limits_delivery() {
+            self.rate.mark_app_limited(self.pipe_bytes());
+        }
+        Some(action)
+    }
+
+    /// RFC 5681 section 3.2: the third duplicate ACK retransmits the
+    /// first unacknowledged segment, once. Every duplicate after it
+    /// reports a segment that left the network and resends nothing; a
+    /// further hole is repaired by the partial ACK the retransmission
+    /// draws (RFC 6582 section 3.2, step 3). Without SACK, duplicates
+    /// that do not acknowledge past [`TcpRecover`] start nothing (step
+    /// 2); a SACK sender's loss detection is its scoreboard's.
     fn note_duplicate_ack(&mut self, now_nanos: u64) -> Option<RecoveryAction> {
-        let lost_bytes = self
-            .first_unsacked_in_flight()
-            .map(|segment| segment.sequence_len)?;
+        self.first_unsacked_in_flight()?;
         self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
-        if self.duplicate_ack_count < 3 || self.fast_retransmit_pending {
+        if self.duplicate_ack_count != 3 || self.fast_retransmit_pending {
+            return None;
+        }
+        if !self.peer_sack_permitted
+            && self
+                .recover
+                .is_some_and(|recover| recover.covers(self.send_unacknowledged))
+        {
             return None;
         }
         self.fast_retransmit_pending = true;
-        Some(
-            self.congestion
-                .on_congestion_event(CongestionEvent::PacketLoss {
-                    lost_bytes,
-                    bytes_in_flight: self.bytes_in_flight,
-                    now_nanos,
-                }),
+        let lost = self.declare_first_unsacked_lost(now_nanos);
+        let started = self.recovery.is_none().then(|| {
+            self.start_recovery(
+                TcpRecoveryPhase::Fast(TcpFastRecoveryTimer::AwaitingPartialAck),
+                now_nanos,
+            )
+        });
+        started.or(lost)
+    }
+
+    /// Declares lost the segment fast retransmit is about to resend.
+    fn declare_first_unsacked_lost(&mut self, now_nanos: u64) -> Option<RecoveryAction> {
+        let segment = self
+            .in_flight
+            .as_mut()?
+            .iter_mut()
+            .find(|segment| !segment.sacked)?;
+        Self::declare_lost(
+            segment,
+            &mut self.rate,
+            &mut self.congestion,
+            &mut self.lost_bytes,
+            self.peer_sack_permitted,
+            now_nanos,
         )
     }
 
-    fn apply_sack_blocks(&mut self, blocks: TcpSackBlocks) {
+    /// Declares lost everything outstanding that was not delivered, as a
+    /// retransmission timeout does (RFC 6298 section 5, RFC 5681's loss
+    /// window).
+    fn declare_outstanding_lost(&mut self, now_nanos: u64) {
+        let Some(in_flight) = self.in_flight.as_mut() else {
+            return;
+        };
+        for segment in in_flight.iter_mut() {
+            let _ = Self::declare_lost(
+                segment,
+                &mut self.rate,
+                &mut self.congestion,
+                &mut self.lost_bytes,
+                self.peer_sack_permitted,
+                now_nanos,
+            );
+        }
+    }
+
+    /// Marks one segment lost, counts it into `C.lost` and reports it,
+    /// unless it was delivered or is already marked.
+    fn declare_lost(
+        segment: &mut TcpInFlightSegment,
+        rate: &mut DeliveryRateSampler,
+        congestion: &mut C,
+        lost_bytes: &mut u32,
+        has_selective_acks: bool,
+        now_nanos: u64,
+    ) -> Option<RecoveryAction> {
+        if segment.delivered || segment.lost {
+            return None;
+        }
+        segment.lost = true;
+        *lost_bytes += segment.sequence_len;
+        let lost = rate.mark_lost(segment.sequence_len);
+        Some(
+            congestion.on_congestion_event(CongestionEvent::PacketLost(LostPacket {
+                bytes: segment.sequence_len,
+                sent: segment.sent,
+                lost,
+                delivered: rate.delivered(),
+                has_selective_acks,
+                now_nanos,
+            })),
+        )
+    }
+
+    /// Opens a loss-recovery episode that lasts until everything sent so
+    /// far is acknowledged.
+    fn start_recovery(&mut self, phase: TcpRecoveryPhase, now_nanos: u64) -> RecoveryAction {
+        let point = self.highest_sent_sequence();
+        self.recovery = Some(TcpRecovery { point, phase });
+        // RFC 6582 section 3.2 steps 2 and 4: fast retransmit and a
+        // timeout both record the highest sequence transmitted.
+        self.recover = Some(TcpRecover {
+            sequence: point,
+            after_timeout: phase == TcpRecoveryPhase::Timeout,
+        });
+        self.congestion
+            .on_congestion_event(CongestionEvent::RecoveryStarted {
+                trigger: phase.trigger(),
+                outstanding_bytes: self.bytes_in_flight,
+                bytes_in_flight: self.pipe_bytes(),
+                now_nanos,
+            })
+    }
+
+    /// The congestion controller's current window and pacing rate.
+    fn congestion_state(&self) -> RecoveryAction {
+        RecoveryAction {
+            cwnd: self.congestion.congestion_window(),
+            pacing_rate: self.congestion.pacing_rate(),
+        }
+    }
+
+    /// Draft-ietf-ccwg-bbr's `CheckIfApplicationLimited`: nothing left
+    /// to send, no lost data waiting to be resent, and room in the
+    /// window means the connection is about to leave a gap in the pipe.
+    /// Segments this socket has taken are on the wire, so there is no
+    /// lower-layer queue (`C.pending_transmissions`) to wait for.
+    fn check_if_application_limited(&mut self) {
+        if !self.has_pending_transmit()
+            && self.lost_bytes == 0
+            && self.pending_pmtu_retransmit_sequence.is_none()
+            && self.pipe_bytes() < self.congestion.congestion_window().bytes()
+        {
+            self.rate.mark_app_limited(self.pipe_bytes());
+        }
+    }
+
+    /// Counts a transmission of `bytes` new sequence space into what is
+    /// outstanding, snapshots the delivery state for it, and reports it
+    /// to the congestion controller.
+    fn note_packet_sent(&mut self, bytes: u32, now_nanos: u64) -> SendSnapshot {
+        let in_flight_before = self.bytes_in_flight;
+        self.bytes_in_flight = self.bytes_in_flight.saturating_add(bytes);
+        let pipe = self.pipe_bytes();
+        let sent = self.rate.on_packet_sent(in_flight_before, pipe, now_nanos);
+        self.congestion.on_packet_sent(PacketSent {
+            bytes,
+            bytes_in_flight: pipe,
+            delivered: self.rate.delivered(),
+            app_limited: sent.is_app_limited,
+            now_nanos,
+        });
+        sent
+    }
+
+    /// Updates `cwnd_limited` after a transmission.
+    fn note_cwnd_usage(&mut self) {
+        let limited = self.pipe_bytes() >= self.congestion.congestion_window().bytes();
+        let window_acknowledged = self
+            .cwnd_usage_sequence
+            .is_none_or(|sequence| sequence_leq(sequence, self.send_unacknowledged));
+        if limited || window_acknowledged {
+            self.cwnd_limited = limited;
+            self.cwnd_usage_sequence = Some(self.send_next);
+        }
+    }
+
+    /// Marks the segments `blocks` fully covers as selectively
+    /// acknowledged, and says whether any was not marked before.
+    fn apply_sack_blocks(&mut self, blocks: TcpSackBlocks) -> bool {
+        let mut newly_sacked = false;
         for block in blocks.as_slice() {
             if !self.sack_block_in_send_range(*block) {
                 continue;
             }
             let Some(in_flight) = self.in_flight.as_mut() else {
-                return;
+                return newly_sacked;
             };
             for segment in in_flight.iter_mut() {
                 if sequence_leq(block.left_edge, segment.header.sequence)
                     && sequence_leq(segment_end(segment), block.right_edge)
+                    && !segment.sacked
                 {
+                    newly_sacked = true;
                     segment.sacked = true;
+                    self.sacked_bytes += segment.sequence_len;
                 }
             }
         }
+        newly_sacked
     }
 
     fn sack_block_in_send_range(&self, block: TcpSackBlock) -> bool {
@@ -2617,62 +3374,64 @@ where
                 segment.sacked = false;
             }
         }
+        self.sacked_bytes = 0;
+        // `tcp_timeout_mark_lost`: everything outstanding is about to be
+        // declared lost, which the estimate would otherwise overlap.
+        self.reno_left_network = TcpRenoLeftNetwork::default();
     }
 
-    fn ack_sample_timing(
+    /// `C.inflight`, RFC 6675's pipe: what was sent and is still
+    /// believed in the network. Outstanding data less what the peer
+    /// selectively acknowledged, what was declared lost and not resent,
+    /// and, from a peer that sends no SACK, what its duplicate ACKs
+    /// reported delivered.
+    ///
+    /// The duplicate-ACK estimate is bounded against the losses known
+    /// when each duplicate arrived, and losses declared after it may
+    /// overlap it, so that last term saturates as Linux's
+    /// `tcp_packets_in_flight` relies on `tcp_limit_reno_sacked` to.
+    fn pipe_bytes(&self) -> u32 {
+        (self.bytes_in_flight - self.sacked_bytes - self.lost_bytes)
+            .saturating_sub(self.reno_left_network.bytes())
+    }
+
+    fn in_timeout_recovery(&self) -> bool {
+        self.recovery
+            .is_some_and(|recovery| recovery.phase == TcpRecoveryPhase::Timeout)
+    }
+
+    /// The round trip the retransmission timer learns from an
+    /// acknowledgement of `acknowledgement`: the timestamp echo when the
+    /// peer sent one, else the send time of the last segment it covers,
+    /// else zero (no sample).
+    ///
+    /// An acknowledgement that covers a retransmitted segment gives no
+    /// send-time sample at all (RFC 6298 section 3, Karn's algorithm).
+    /// It may answer the retransmission rather than the original, and
+    /// the segments it covers past that one were waiting at the peer for
+    /// the hole to fill, so their send times measure the repair, not the
+    /// path. Linux skips the sample on the same condition
+    /// (`FLAG_RETRANS_DATA_ACKED` in `tcp_clean_rtx_queue`).
+    fn ack_rtt_nanos(
         &self,
         acknowledgement: u32,
         now_nanos: u64,
         timestamp: Option<TcpTimestampOption>,
-    ) -> TcpAckTiming {
+    ) -> u64 {
         let mut rtt_nanos = 0;
-        let mut first_sent_at = None;
-        let mut last_sent_at = None;
         if let Some(in_flight) = self.in_flight.as_ref() {
             for segment in in_flight.iter() {
                 if !sequence_leq(segment_end(segment), acknowledgement) {
                     break;
                 }
                 if segment.retransmissions != 0 {
-                    continue;
+                    rtt_nanos = 0;
+                    break;
                 }
-                first_sent_at.get_or_insert(segment.sent_at_nanos);
-                last_sent_at = Some(segment.sent_at_nanos);
-                rtt_nanos = now_nanos.saturating_sub(segment.sent_at_nanos);
+                rtt_nanos = now_nanos.saturating_sub(segment.sent_at_nanos());
             }
         }
-        let interval_nanos = first_sent_at
-            .zip(last_sent_at)
-            .map(|(first, last)| {
-                now_nanos
-                    .saturating_sub(first)
-                    .max(last.saturating_sub(first))
-            })
-            .unwrap_or(0);
-        // The timestamp option's clock ticks in milliseconds, so an echo
-        // that comes back inside the same tick resolves to zero. Zero is
-        // not a round-trip time, it is "shorter than this clock can
-        // say", and it must not replace the send-time measurement, which
-        // has nanosecond resolution: a path fast enough to answer inside
-        // a millisecond would otherwise report no round trip at all and
-        // leave every consumer of the sample — the retransmission timer
-        // and the congestion controller's minimum-RTT estimate — with
-        // nothing to work from.
-        let timestamp_rtt_nanos = timestamp
-            .and_then(|timestamp| {
-                (timestamp.echo_reply != 0).then(|| timestamp_echo_rtt_nanos(now_nanos, timestamp))
-            })
-            .filter(|rtt_nanos| *rtt_nanos != 0);
-        let rtt_nanos = timestamp_rtt_nanos.unwrap_or(rtt_nanos);
-        let interval_nanos = if interval_nanos == 0 {
-            timestamp_rtt_nanos.unwrap_or(0)
-        } else {
-            interval_nanos
-        };
-        TcpAckTiming {
-            rtt_nanos,
-            interval_nanos,
-        }
+        timestamp_rtt_nanos(now_nanos, timestamp).unwrap_or(rtt_nanos)
     }
 
     /// Anchors the receive window on the sequence number the peer's SYN
@@ -3145,40 +3904,41 @@ where
             && self.scaled_peer_receive_window(packet.window_size) == self.peer_receive_window
     }
 
-    /// The bytes a data segment that is not a persist probe may carry
-    /// now: what the congestion and peer receive windows leave, or none
-    /// while the in-flight queue has no entry left to record another
-    /// segment's retransmission state. [`Self::take_transmit_segment`]
-    /// refuses at zero and [`Self::next_deadline_nanos`] promises no
-    /// pacing time at zero.
-    fn sendable_window(&self) -> usize {
-        if self
-            .in_flight
-            .as_ref()
-            .is_some_and(TcpInFlightQueue::is_full)
-        {
-            return 0;
-        }
-        self.available_send_window()
-    }
-
+    /// What may be sent now: the congestion window bounds the pipe
+    /// (RFC 6675 section 5, step 4.3's `cwnd - pipe`), and the peer's
+    /// window bounds the sequence space outstanding.
     fn available_send_window(&self) -> usize {
         let congestion_window = self
             .congestion
             .congestion_window()
             .bytes()
-            .saturating_sub(self.bytes_in_flight);
+            .saturating_sub(self.pipe_bytes());
         let receive_window = self
             .peer_receive_window
             .saturating_sub(self.bytes_in_flight);
         congestion_window.min(receive_window) as usize
     }
 
-    fn schedule_next_pacing_send(&mut self, bytes: u32, now_nanos: u64) {
-        self.next_pacing_send_nanos = self
-            .congestion
-            .pacing_rate()
-            .map(|rate| now_nanos.saturating_add(pacing_interval_nanos(bytes, rate)));
+    /// Charges the pacing budget for `bytes` just sent. `segment` is the
+    /// payload of a full segment on this path, which sizes the burst
+    /// allowance.
+    fn charge_pacing(&mut self, bytes: u32, segment: usize, now_nanos: u64) {
+        self.pacing = self.congestion.pacing_rate().map(|rate| {
+            let (paid_until_nanos, burst_end_nanos) = match self.pacing {
+                Some(pacing) if now_nanos < pacing.paid_until_nanos => {
+                    (pacing.paid_until_nanos, pacing.burst_end_nanos)
+                }
+                _ => (
+                    now_nanos,
+                    now_nanos.saturating_add(pacing_burst_allowance_nanos(segment, rate)),
+                ),
+            };
+            TcpPacingBudget {
+                paid_until_nanos: paid_until_nanos
+                    .saturating_add(pacing_interval_nanos(bytes, rate)),
+                burst_end_nanos,
+            }
+        });
     }
 
     fn timestamped_options(&self, now_nanos: u64) -> TcpHeaderOptions {
@@ -3372,8 +4132,72 @@ fn timestamp_echo_rtt_nanos(now_nanos: u64, timestamp: TcpTimestampOption) -> u6
     u64::from(timestamp_value(now_nanos).wrapping_sub(timestamp.echo_reply)) * 1_000_000
 }
 
+/// The round trip a timestamp echo measures, if the peer echoed one.
+///
+/// The timestamp option's clock ticks in milliseconds, so an echo that
+/// comes back inside the same tick resolves to zero. Zero is not a
+/// round-trip time, it is "shorter than this clock can say", and it must
+/// not replace a send-time measurement, which has nanosecond resolution:
+/// a path fast enough to answer inside a millisecond would otherwise
+/// report no round trip at all and leave every consumer of the sample —
+/// the retransmission timer and the congestion controller's minimum-RTT
+/// estimate — with nothing to work from.
+fn timestamp_rtt_nanos(now_nanos: u64, timestamp: Option<TcpTimestampOption>) -> Option<u64> {
+    timestamp
+        .filter(|timestamp| timestamp.echo_reply != 0)
+        .map(|timestamp| timestamp_echo_rtt_nanos(now_nanos, timestamp))
+        .filter(|rtt_nanos| *rtt_nanos != 0)
+}
+
 fn pacing_interval_nanos(bytes: u32, rate: crate::PacingRate) -> u64 {
     ((u64::from(bytes) * 1_000_000_000) / rate.bytes_per_second()).max(1)
+}
+
+/// Longest stretch of line time one pass may send ahead of the pacing
+/// rate: one millisecond, the quantum Linux sizes a TSO burst to
+/// (`sk_pacing_rate >> sk_pacing_shift`, with `sk_pacing_shift` 10, in
+/// `tcp_tso_autosize`).
+const TCP_PACING_BURST_NANOS: u64 = 1_000_000;
+
+/// Segments a burst may never be smaller than: `tcp_min_tso_segs` in
+/// Linux's `tcp_tso_autosize`, so a low rate still sends in pairs.
+const TCP_PACING_MIN_BURST_SEGMENTS: u32 = 2;
+
+/// How far ahead of the pacing rate a socket may send: a millisecond
+/// of line time, but never less than two segments' worth.
+fn pacing_burst_allowance_nanos(segment: usize, rate: crate::PacingRate) -> u64 {
+    let minimum_bytes = u32::try_from(segment)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(TCP_PACING_MIN_BURST_SEGMENTS);
+    TCP_PACING_BURST_NANOS.max(pacing_interval_nanos(minimum_bytes, rate))
+}
+
+/// A socket's pacing budget: what the rate has been charged for.
+///
+/// Sending `n` bytes at rate `r` pays for `n / r` of line time, so
+/// `paid_until_nanos` is the instant the bytes sent so far would have
+/// finished leaving at the rate. A burst starts only once everything
+/// sent has been paid for (`now >= paid_until_nanos`, so idle time
+/// banks no credit) and runs while `paid_until_nanos` is below
+/// `burst_end_nanos`, one burst allowance past the instant it started.
+/// The socket then waits for the debt to drain before the next burst,
+/// so a pass emits a burst rather than a segment, and the bytes sent
+/// by any instant exceed rate times time by at most one allowance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpPacingBudget {
+    paid_until_nanos: u64,
+    burst_end_nanos: u64,
+}
+
+impl TcpPacingBudget {
+    fn is_open(self, now_nanos: u64) -> bool {
+        now_nanos >= self.paid_until_nanos || self.paid_until_nanos < self.burst_end_nanos
+    }
+
+    /// The instant a socket that has used its burst may send again.
+    fn drained_at_nanos(self) -> u64 {
+        self.paid_until_nanos
+    }
 }
 
 fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -3388,7 +4212,8 @@ fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::{
-        BbrV3, CongestionWindow, Ipv4Address, PacingRate, TcpOptions, TcpSackBlock, TcpSackBlocks,
+        BbrV3, CongestionWindow, Ipv4Address, NewReno, PacingRate, TcpOptions, TcpSackBlock,
+        TcpSackBlocks,
     };
 
     /// Test fixture that derives the owning `Bytes` payload from a
@@ -3422,7 +4247,7 @@ mod tests {
             "fixed-pacing-test"
         }
 
-        fn on_packet_sent(&mut self, _bytes: u32, _bytes_in_flight: u32, _now_nanos: u64) {}
+        fn on_packet_sent(&mut self, _packet: PacketSent) {}
 
         fn on_ack(&mut self, _sample: AckSample) -> RecoveryAction {
             RecoveryAction {
@@ -3444,6 +4269,23 @@ mod tests {
 
         fn pacing_rate(&self) -> Option<PacingRate> {
             self.pacing_rate
+        }
+
+        fn limits_delivery(&self) -> bool {
+            false
+        }
+    }
+
+    /// A send record for an in-flight segment a test builds by hand.
+    fn test_send_snapshot(send_time_nanos: u64) -> SendSnapshot {
+        SendSnapshot {
+            delivered: 0,
+            delivered_time_nanos: send_time_nanos,
+            first_send_time_nanos: send_time_nanos,
+            send_time_nanos,
+            lost: 0,
+            tx_in_flight: 1,
+            is_app_limited: false,
         }
     }
 
@@ -3515,11 +4357,18 @@ mod tests {
     }
 
     fn established_fixed_pacing_socket(rate: PacingRate) -> TcpSocket<FixedPacing> {
+        established_fixed_pacing_socket_with_window(16, rate)
+    }
+
+    fn established_fixed_pacing_socket_with_window(
+        window_bytes: u32,
+        rate: PacingRate,
+    ) -> TcpSocket<FixedPacing> {
         let mut socket = TcpSocket::connect(
             endpoint(49152),
             peer(80),
             7,
-            FixedPacing::new(CongestionWindow::new(16), Some(rate)),
+            FixedPacing::new(CongestionWindow::new(window_bytes), Some(rate)),
         );
         socket.mark_syn_queued(0);
         let _ = deliver_segment(
@@ -3803,7 +4652,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_sample_timing_uses_in_flight_send_timestamp() {
+    fn ack_rtt_uses_in_flight_send_timestamp() {
         let mut socket = established_socket();
         assert_eq!(socket.queue_send(b"hello"), 5);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
@@ -3812,16 +4661,9 @@ mod tests {
             .expect("established socket should transmit queued bytes");
         let acked_at = sent_at + 123;
 
-        let timing =
-            socket.ack_sample_timing(data.header.sequence + data.sequence_len, acked_at, None);
+        let rtt = socket.ack_rtt_nanos(data.header.sequence + data.sequence_len, acked_at, None);
 
-        assert_eq!(
-            timing,
-            TcpAckTiming {
-                rtt_nanos: 123,
-                interval_nanos: 123,
-            }
-        );
+        assert_eq!(rtt, 123);
     }
 
     #[test]
@@ -3862,7 +4704,7 @@ mod tests {
 
         let round_trip = 3_000_000;
         let acked_at = retransmitted_at + round_trip;
-        let timing = socket.ack_sample_timing(
+        let rtt_nanos = socket.ack_rtt_nanos(
             first.header.sequence + first.sequence_len,
             acked_at,
             Some(TcpTimestampOption {
@@ -3872,17 +4714,16 @@ mod tests {
         );
 
         assert!(
-            timing.rtt_nanos <= round_trip,
-            "a sample of {} ns is longer than the {round_trip} ns since the retransmission",
-            timing.rtt_nanos
+            rtt_nanos <= round_trip,
+            "a sample of {rtt_nanos} ns is longer than the {round_trip} ns since the retransmission",
         );
         assert_eq!(echoed.value, timestamp_value(retransmitted_at));
     }
 
     #[test]
-    fn ack_sample_timing_uses_timestamp_echo_when_present() {
+    fn ack_rtt_uses_timestamp_echo_when_present() {
         let socket = established_socket();
-        let timing = socket.ack_sample_timing(
+        let rtt_nanos = socket.ack_rtt_nanos(
             8,
             TCP_INITIAL_RTO_NANOS + 7_000_000,
             Some(TcpTimestampOption {
@@ -3891,13 +4732,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(
-            timing,
-            TcpAckTiming {
-                rtt_nanos: 7_000_000,
-                interval_nanos: 7_000_000,
-            }
-        );
+        assert_eq!(rtt_nanos, 7_000_000);
     }
 
     #[test]
@@ -3932,6 +4767,397 @@ mod tests {
         assert!(retransmit.retransmission);
         assert_eq!(retransmit.header.sequence, data.header.sequence);
         assert_eq!(retransmit.payload, data.payload);
+    }
+
+    /// A connection whose congestion window is `segments` full segments
+    /// and which does not pace, so a test of what ACKs do can send a
+    /// whole flight at one instant. `options` is what the peer's SYN-ACK
+    /// carries.
+    fn established_window_socket(segments: u32, options: TcpOptions<'_>) -> TcpSocket<FixedPacing> {
+        let window = segments * TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let mut socket = TcpSocket::connect(
+            endpoint(49152),
+            peer(80),
+            7,
+            FixedPacing::new(CongestionWindow::new(window), None),
+        );
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        socket
+    }
+
+    /// One full segment on the wire: the TCP header and an MSS.
+    fn full_segment_budget() -> TcpSegmentBudget {
+        TcpSegmentBudget::wire_segments(TcpPacket::MIN_HEADER_LEN + TCP_RECEIVE_SEGMENT_BYTES)
+    }
+
+    /// Queues and sends `segments` full segments at `now`, and returns
+    /// the sequence number of the first.
+    fn send_flight<C: CongestionControl>(
+        socket: &mut TcpSocket<C>,
+        segments: u32,
+        now: u64,
+    ) -> u32 {
+        let payload = alloc::vec![0x5a; segments as usize * TCP_RECEIVE_SEGMENT_BYTES];
+        assert_eq!(socket.queue_send(&payload), payload.len());
+        let first = socket.send_next;
+        for _ in 0..segments {
+            let segment = socket
+                .take_transmit_segment(now, full_segment_budget())
+                .expect("the window holds the flight");
+            assert_eq!(segment.sequence_len as usize, TCP_RECEIVE_SEGMENT_BYTES);
+        }
+        first
+    }
+
+    #[test]
+    fn duplicates_past_the_third_resend_nothing() {
+        let mut socket = established_window_socket(6, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 6, sent_at);
+
+        for duplicate in 1..=5 {
+            let now = sent_at + duplicate;
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), now);
+            let pending = socket.pending_retransmission(now);
+            if duplicate == 3 {
+                let retransmit = pending.expect("the third duplicate ACK retransmits the hole");
+                assert_eq!(retransmit.header.sequence, hole);
+                socket.mark_retransmission_queued(hole, now);
+            } else {
+                assert_eq!(pending, None, "duplicate {duplicate} resends nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn an_ack_covering_a_retransmission_takes_no_round_trip_sample() {
+        // The peer holds five segments behind a lost first one; the ACK
+        // the resend draws covers all six, and the originals' send
+        // times are the repair's length, not the path's round trip.
+        let mut socket = established_window_socket(6, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 6, sent_at);
+        for duplicate in 1..=3 {
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), sent_at + duplicate);
+        }
+        socket.mark_retransmission_queued(hole, sent_at + 3);
+        let before = socket.retransmission_timer;
+        // Two seconds: far past any round trip the flight measured.
+        let repaired_at = sent_at + 2_000_000_000;
+        let everything = socket.send_next;
+        let _ = deliver_segment(&mut socket, peer_ack(everything, u16::MAX), repaired_at);
+        assert_eq!(socket.send_unacknowledged, socket.send_next);
+        assert_eq!(
+            socket.retransmission_timer, before,
+            "Karn's algorithm: no sample from an acknowledgement of a retransmission"
+        );
+    }
+
+    #[test]
+    fn only_the_first_partial_ack_restarts_the_retransmission_timer() {
+        // RFC 6582 section 3.2 step 3: every partial ACK resends the next
+        // hole, but only the first restarts the timer, so a long run of
+        // holes reaches the timeout instead of one segment a round trip.
+        let mss = TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let mut socket = established_window_socket(8, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 8, sent_at);
+        for duplicate in 1..=3 {
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), sent_at + duplicate);
+        }
+        socket.mark_retransmission_queued(hole, sent_at + 3);
+        let timeout = socket.retransmission_timer.timeout_nanos();
+
+        let first_partial = sent_at + 10;
+        let _ = deliver_segment(&mut socket, peer_ack(hole + mss, u16::MAX), first_partial);
+        socket.mark_retransmission_queued(hole + mss, first_partial);
+        let second_partial = first_partial + 20;
+        let _ = deliver_segment(
+            &mut socket,
+            peer_ack(hole + 2 * mss, u16::MAX),
+            second_partial,
+        );
+        let retransmit = socket
+            .pending_retransmission(second_partial)
+            .expect("every partial ACK resends the next hole");
+        assert_eq!(retransmit.header.sequence, hole + 2 * mss);
+        socket.mark_retransmission_queued(hole + 2 * mss, second_partial);
+
+        let expiry = first_partial + timeout;
+        assert_eq!(
+            socket.next_deadline_nanos(),
+            Some(expiry),
+            "the timer runs from the first partial ACK, not the last resend"
+        );
+        assert_eq!(socket.pending_retransmission(expiry - 1), None);
+        let timed_out = socket
+            .pending_retransmission(expiry)
+            .expect("the timer restarted by the first partial ACK expires");
+        assert_eq!(
+            timed_out.header.sequence,
+            hole + 2 * mss,
+            "a timeout resends the earliest unacknowledged segment"
+        );
+    }
+
+    #[test]
+    fn after_a_timeout_lost_segments_go_before_new_data() {
+        // RFC 5681 section 3.1: after a timeout the sender resends from
+        // SND.UNA as the window allows; new data waits for the losses.
+        let mss = TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let mut socket = established_window_socket(4, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let first = send_flight(&mut socket, 4, sent_at);
+        let more = alloc::vec![0x5a; 2 * TCP_RECEIVE_SEGMENT_BYTES];
+        assert_eq!(socket.queue_send(&more), more.len());
+
+        let expiry = sent_at + socket.retransmission_timer.timeout_nanos();
+        let timed_out = socket
+            .pending_retransmission(expiry)
+            .expect("the timer expires with the flight unacknowledged");
+        assert_eq!(timed_out.header.sequence, first);
+        socket.mark_retransmission_queued(first, expiry);
+
+        // The timeout declared the rest of the flight lost, so one
+        // segment is in the pipe and the window has room for three.
+        for index in 1..4 {
+            assert_eq!(
+                socket.take_transmit_segment(expiry, full_segment_budget()),
+                None,
+                "new data waits while a lost segment is unsent"
+            );
+            let resend = socket
+                .pending_retransmission(expiry)
+                .expect("the window has room for the next lost segment");
+            assert_eq!(resend.header.sequence, first + index * mss);
+            socket.mark_retransmission_queued(resend.header.sequence, expiry);
+        }
+        assert_eq!(
+            socket.pending_retransmission(expiry),
+            None,
+            "the window is full of resends"
+        );
+
+        let acknowledged = first + 4 * mss;
+        let _ = deliver_segment(&mut socket, peer_ack(acknowledged, u16::MAX), expiry + 20);
+        let new_data = socket
+            .take_transmit_segment(expiry + 20, full_segment_budget())
+            .expect("with every loss repaired, new data goes");
+        assert_eq!(new_data.header.sequence, acknowledged);
+    }
+
+    #[test]
+    fn a_partial_ack_resends_the_next_hole() {
+        let mss = TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let mut socket = established_window_socket(6, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 6, sent_at);
+        for duplicate in 1..=3 {
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), sent_at + duplicate);
+        }
+        socket.mark_retransmission_queued(hole, sent_at + 3);
+
+        // The resend fills the first hole, and the ACK it draws stops at
+        // the second, short of everything sent before recovery began.
+        let now = sent_at + 4;
+        let _ = deliver_segment(&mut socket, peer_ack(hole + mss, u16::MAX), now);
+        let retransmit = socket
+            .pending_retransmission(now)
+            .expect("a partial ACK resends the next hole at once");
+        assert_eq!(retransmit.header.sequence, hole + mss);
+    }
+
+    #[test]
+    fn selective_acks_open_the_congestion_window_by_what_they_cover() {
+        let mss = TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let sack_permitted = TcpOptions::parse(&[4, 2, 0, 0]).expect("SACK-permitted should parse");
+        let mut socket = established_window_socket(4, sack_permitted);
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 4, sent_at);
+        let more = [0x5a; TCP_RECEIVE_SEGMENT_BYTES];
+        assert_eq!(socket.queue_send(&more), more.len());
+        assert_eq!(
+            socket.take_transmit_segment(sent_at, full_segment_budget()),
+            None,
+            "four segments fill a four-segment window"
+        );
+
+        let block = sack_options_bytes(TcpSackBlock {
+            left_edge: hole + mss,
+            right_edge: hole + 3 * mss,
+        });
+        let now = sent_at + 1;
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                options: TcpOptions::parse(&block).expect("SACK block should parse"),
+                ..peer_ack(hole, u16::MAX)
+            },
+            now,
+        );
+        let segment = socket
+            .take_transmit_segment(now, full_segment_budget())
+            .expect("two segments left the network, so new data may follow");
+        assert_eq!(segment.header.sequence, hole + 4 * mss);
+    }
+
+    #[test]
+    fn duplicates_without_sack_count_one_segment_delivered_each() {
+        let mss = TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let mut socket = established_window_socket(6, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 6, sent_at);
+        let delivered_before = socket.rate.delivered();
+
+        for duplicate in 1..=5 {
+            let now = sent_at + duplicate;
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), now);
+            if duplicate == 3 {
+                socket.mark_retransmission_queued(hole, now);
+            }
+        }
+        // Each duplicate reported one segment past the hole delivered,
+        // and only the resent hole is still in the network.
+        assert_eq!(
+            socket.rate.delivered() - delivered_before,
+            u64::from(5 * mss)
+        );
+        assert_eq!(socket.pipe_bytes(), mss);
+
+        // The cumulative ACK that covers everything counts only the hole.
+        let _ = deliver_segment(&mut socket, peer_ack(hole + 6 * mss, u16::MAX), sent_at + 6);
+        assert_eq!(
+            socket.rate.delivered() - delivered_before,
+            u64::from(6 * mss)
+        );
+        assert_eq!(socket.reno_left_network.bytes(), 0);
+        assert_eq!(socket.reno_delivered_credit.bytes(), 0);
+        assert_eq!(socket.pipe_bytes(), 0);
+    }
+
+    #[test]
+    fn duplicate_credit_left_after_recovery_counts_once_and_leaves_the_pipe() {
+        // Two segments sent during recovery, past its recovery point,
+        // draw duplicates of their own; the ACK that ends the episode
+        // does not cover them, so their credit outlives it.
+        let mss = TCP_RECEIVE_SEGMENT_BYTES as u32;
+        let mut socket = established_window_socket(6, TcpOptions::empty());
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let hole = send_flight(&mut socket, 4, sent_at);
+        let delivered_before = socket.rate.delivered();
+        for duplicate in 1..=3 {
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), sent_at + duplicate);
+        }
+        socket.mark_retransmission_queued(hole, sent_at + 3);
+        let past_recovery = send_flight(&mut socket, 2, sent_at + 4);
+        assert_eq!(past_recovery, hole + 4 * mss);
+        for duplicate in 5..=6 {
+            let _ = deliver_segment(&mut socket, peer_ack(hole, u16::MAX), sent_at + duplicate);
+        }
+        assert_eq!(
+            socket.rate.delivered() - delivered_before,
+            u64::from(5 * mss),
+            "every duplicate reported one segment delivered"
+        );
+
+        let _ = deliver_segment(&mut socket, peer_ack(hole + 4 * mss, u16::MAX), sent_at + 7);
+        assert_eq!(socket.recovery, None, "the recovery point is acknowledged");
+        assert_eq!(
+            socket.pipe_bytes(),
+            2 * mss,
+            "the estimate ended with the episode: the pipe is what is outstanding"
+        );
+        assert_eq!(
+            socket.rate.delivered() - delivered_before,
+            u64::from(6 * mss)
+        );
+
+        let _ = deliver_segment(&mut socket, peer_ack(hole + 6 * mss, u16::MAX), sent_at + 8);
+        assert_eq!(
+            socket.rate.delivered() - delivered_before,
+            u64::from(6 * mss),
+            "the segments the duplicates counted are not counted again"
+        );
+        assert_eq!(socket.reno_delivered_credit.bytes(), 0);
+    }
+
+    #[test]
+    fn a_window_blocked_socket_reports_no_passed_pacing_deadline() {
+        let rate = PacingRate::from_bytes_per_second(1_000_000);
+        // A 16-byte window: one 16-byte segment fills it.
+        let mut socket = established_fixed_pacing_socket(rate);
+        assert_eq!(socket.queue_send(&[0x5a; 64]), 64);
+        let sent_at = TCP_INITIAL_RTO_NANOS + 1;
+        let segment = socket
+            .take_transmit_segment(sent_at, full_segment_budget())
+            .expect("the window holds one segment");
+        assert_eq!(segment.sequence_len, 16);
+
+        // Well past the 16 µs the pacing rate spaces segments by, the
+        // window is still full: the socket's next deadline is its
+        // retransmission timer, not a pacing deadline already behind it.
+        let now = sent_at + 1_000_000;
+        assert_eq!(
+            socket.take_transmit_segment(now, full_segment_budget()),
+            None
+        );
+        let deadline = socket
+            .next_deadline_nanos()
+            .expect("the segment's retransmission timer is armed");
+        assert!(
+            deadline > now,
+            "a deadline of {deadline} at {now} would fire at once and send nothing"
+        );
+    }
+
+    #[test]
+    fn a_peer_reset_leaves_the_congestion_window_alone() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, NewReno::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        let window = socket.congestion().congestion_window();
+
+        let outcome = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                flags: TcpFlags::RST,
+                ..peer_ack(8, u16::MAX)
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+        assert_eq!(socket.state(), TcpState::Closed);
+        // A reset ends the connection; it says nothing about the path.
+        assert_eq!(outcome.recovery.map(|action| action.cwnd), Some(window));
+        assert_eq!(socket.congestion().congestion_window(), window);
     }
 
     #[test]
@@ -4235,9 +5461,17 @@ mod tests {
                 retransmit_at + 2 + index,
             );
         }
+        // RFC 6582 section 4: duplicates that arrive before the cumulative
+        // ACK passes what was outstanding at the timeout infer no drop,
+        // so they resend nothing; the second segment, its SACK mark
+        // cleared, is still resent, by its own timer.
+        assert_eq!(socket.pending_retransmission(retransmit_at + 5), None);
+        let second_expiry = socket
+            .next_deadline_nanos()
+            .expect("the second segment is still timed");
         let retransmit = socket
-            .pending_retransmission(retransmit_at + 5)
-            .expect("second segment should remain eligible for fast retransmit after RTO");
+            .pending_retransmission(second_expiry)
+            .expect("second segment should remain eligible for retransmission after RTO");
         assert_eq!(retransmit.header.sequence, second.header.sequence);
         assert_eq!(retransmit.payload, second.payload);
     }
@@ -4375,8 +5609,8 @@ mod tests {
         for value in 0..MAX_TCP_IN_FLIGHT_SEGMENTS {
             socket
                 .in_flight_mut()
-                .push_back(TcpInFlightSegment {
-                    header: TcpHeader {
+                .push_back(TcpInFlightSegment::new(
+                    TcpHeader {
                         source_port: local.port,
                         destination_port: remote.port,
                         sequence: value as u32,
@@ -4384,13 +5618,11 @@ mod tests {
                         flags: TcpFlags::ACK,
                         window_size: u16::MAX,
                     },
-                    options: TcpHeaderOptions::empty(),
-                    payload: Bytes::from_static(b"x"),
-                    sequence_len: 1,
-                    sent_at_nanos: 0,
-                    retransmissions: 0,
-                    sacked: false,
-                })
+                    TcpHeaderOptions::empty(),
+                    Bytes::from_static(b"x"),
+                    1,
+                    test_send_snapshot(0),
+                ))
                 .expect("in-flight fill within capacity");
         }
 
@@ -4431,8 +5663,8 @@ mod tests {
         let remote = peer(80);
         for value in 0..MAX_TCP_IN_FLIGHT_SEGMENTS {
             in_flight
-                .push_back(TcpInFlightSegment {
-                    header: TcpHeader {
+                .push_back(TcpInFlightSegment::new(
+                    TcpHeader {
                         source_port: local.port,
                         destination_port: remote.port,
                         sequence: value as u32,
@@ -4440,19 +5672,17 @@ mod tests {
                         flags: TcpFlags::ACK,
                         window_size: u16::MAX,
                     },
-                    options: TcpHeaderOptions::empty(),
-                    payload: Bytes::copy_from_slice(&[value as u8]),
-                    sequence_len: 1,
-                    sent_at_nanos: value as u64,
-                    retransmissions: 0,
-                    sacked: false,
-                })
+                    TcpHeaderOptions::empty(),
+                    Bytes::copy_from_slice(&[value as u8]),
+                    1,
+                    test_send_snapshot(value as u64),
+                ))
                 .expect("in-flight queue should accept capacity segment");
         }
         assert!(
             in_flight
-                .push_back(TcpInFlightSegment {
-                    header: TcpHeader {
+                .push_back(TcpInFlightSegment::new(
+                    TcpHeader {
                         source_port: local.port,
                         destination_port: remote.port,
                         sequence: MAX_TCP_IN_FLIGHT_SEGMENTS as u32,
@@ -4460,13 +5690,11 @@ mod tests {
                         flags: TcpFlags::ACK,
                         window_size: u16::MAX,
                     },
-                    options: TcpHeaderOptions::empty(),
-                    payload: Bytes::from_static(b"full"),
-                    sequence_len: 1,
-                    sent_at_nanos: 0,
-                    retransmissions: 0,
-                    sacked: false,
-                })
+                    TcpHeaderOptions::empty(),
+                    Bytes::from_static(b"full"),
+                    1,
+                    test_send_snapshot(0),
+                ))
                 .is_err()
         );
         for value in 0..MAX_TCP_QUEUED_SEGMENTS {
@@ -4619,7 +5847,7 @@ mod tests {
         let data = socket
             .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("queued data should transmit");
-        let delivered_before = socket.delivered_bytes;
+        let delivered_before = socket.rate.delivered();
         let send_unacknowledged_before = socket.send_unacknowledged;
         let peer_receive_window_before = socket.peer_receive_window();
         let mut blocks = TcpSackBlocks::empty();
@@ -4649,7 +5877,7 @@ mod tests {
         assert_eq!(outcome, TcpSegmentOutcome::default());
         assert_eq!(socket.send_unacknowledged, send_unacknowledged_before);
         assert_eq!(socket.bytes_in_flight, data.sequence_len);
-        assert_eq!(socket.delivered_bytes, delivered_before);
+        assert_eq!(socket.rate.delivered(), delivered_before);
         assert_eq!(socket.peer_receive_window(), peer_receive_window_before);
         let in_flight = socket
             .in_flight
@@ -5639,9 +6867,11 @@ mod tests {
             .congestion()
             .pacing_rate()
             .expect("the handshake round trip is enough to pace the first window");
+        // Draft-ietf-ccwg-bbr `InitPacingRate`: the startup pacing gain
+        // (2.77) over the initial window per smoothed round trip.
         assert_eq!(
             rate.bytes_per_second(),
-            1460 * 10 * 1_000_000_000 / HANDSHAKE_RTT_NANOS * 2885 / 1000,
+            1460 * 10 * 1_000_000_000 / HANDSHAKE_RTT_NANOS * 2770 / 1000,
             "the initial rate is the initial window over the handshake round trip, \
              with the startup gain"
         );
@@ -5733,44 +6963,14 @@ mod tests {
             .congestion()
             .pacing_rate()
             .expect("a delivered window paces the flow");
+        // `SetPacingRateWithGain`: the startup gain (2.77) over the
+        // measured bandwidth, less the 1% pacing margin. The one segment
+        // left an idle connection, so its sample runs from its own send.
         assert_eq!(
             rate.bytes_per_second(),
-            u64::from(acked) * 1_000_000_000 / delivery_rtt_nanos * 2885 / 1000,
+            u64::from(acked) * 1_000_000_000 / delivery_rtt_nanos * 2770 / 1000 * 99 / 100,
             "a bandwidth-limited sample must replace the initial estimate"
         );
-    }
-
-    #[test]
-    fn pacing_rate_delays_next_data_segment() {
-        let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
-        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
-        let first = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
-            .expect("first paced segment should transmit immediately");
-        assert_eq!(first.payload.as_ref(), b"abcdefgh");
-        assert_eq!(socket.queue_send(b"ijkl"), 4);
-        assert_eq!(
-            socket.next_deadline_nanos(),
-            Some(TCP_INITIAL_RTO_NANOS + 1 + 8_000_000)
-        );
-        assert_eq!(
-            socket.take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 2,
-                TcpSegmentBudget::wire_segments(usize::MAX)
-            ),
-            None
-        );
-
-        let second = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1 + 8_000_000,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
-            .expect("paced deadline should release the next segment");
-        assert_eq!(second.payload.as_ref(), b"ijkl");
     }
 
     #[test]
@@ -5818,41 +7018,121 @@ mod tests {
     }
 
     #[test]
+    fn pacing_rate_delays_next_data_segment() {
+        // Four payload bytes a segment at 1000 B/s: 4 ms of line time a
+        // segment and, at two segments, an 8 ms burst allowance.
+        let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
+        let start = TCP_INITIAL_RTO_NANOS + 1;
+        assert_eq!(socket.queue_send(b"abcdefghijkl"), 12);
+        for expected in [b"abcd", b"efgh"] {
+            let segment = socket
+                .take_transmit_segment(start, FOUR_BYTE_SEGMENTS)
+                .expect("the burst allowance covers two segments");
+            assert_eq!(segment.payload.as_ref(), expected);
+        }
+        assert_eq!(socket.next_deadline_nanos(), Some(start + 8_000_000));
+        assert_eq!(
+            socket.take_transmit_segment(start + 1, FOUR_BYTE_SEGMENTS),
+            None,
+            "the burst is spent and its line time is not yet paid back"
+        );
+
+        let third = socket
+            .take_transmit_segment(start + 8_000_000, FOUR_BYTE_SEGMENTS)
+            .expect("paying the burst back releases the next one");
+        assert_eq!(third.payload.as_ref(), b"ijkl");
+    }
+
+    /// One segment carries four payload bytes: a bare header and no
+    /// options.
+    const FOUR_BYTE_SEGMENTS: TcpSegmentBudget =
+        TcpSegmentBudget::wire_segments(TcpPacket::MIN_HEADER_LEN + 4);
+
+    #[test]
+    fn a_pacing_burst_is_a_millisecond_and_never_under_two_segments() {
+        let rate = PacingRate::from_bytes_per_second(1_000_000_000);
+        // 1 ms at 1 GB/s is 1,000,000 bytes, far over two segments.
+        assert_eq!(pacing_burst_allowance_nanos(1460, rate), 1_000_000);
+        // At 1000 B/s a millisecond is one byte, so two 4-byte segments
+        // (8 ms) set the allowance.
+        let slow = PacingRate::from_bytes_per_second(1_000);
+        assert_eq!(pacing_burst_allowance_nanos(4, slow), 8_000_000);
+    }
+
+    #[test]
+    fn a_paced_socket_sends_a_burst_then_holds_the_average_rate() {
+        // 1 MB/s with full-size segments: 1 ms is 1000 bytes, under two
+        // segments, so the allowance is two segments.
+        let mut socket = established_fixed_pacing_socket_with_window(
+            u32::from(u16::MAX),
+            PacingRate::from_bytes_per_second(1_000_000),
+        );
+        let mss = socket.peer_max_segment_size();
+        let payload = alloc::vec![0x5a; 8 * 1024];
+        assert_eq!(socket.queue_send(&payload), payload.len());
+        let budget = TcpSegmentBudget::wire_segments(usize::MAX);
+        let start = TCP_INITIAL_RTO_NANOS + 1;
+        let mut sent = 0usize;
+        let mut sent_by_pass = alloc::vec::Vec::new();
+        // Every 100 us for 20 ms.
+        for step in 0..200u64 {
+            let now = start + step * 100_000;
+            let before = sent;
+            while let Some(segment) = socket.take_transmit_segment(now, budget) {
+                sent += segment.payload.len();
+                // Keep the window and the in-flight queue open.
+                let _ = deliver_segment(
+                    &mut socket,
+                    peer_ack(
+                        segment.header.sequence.wrapping_add(segment.sequence_len),
+                        u16::MAX,
+                    ),
+                    now,
+                );
+            }
+            if sent != before {
+                sent_by_pass.push(sent - before);
+            }
+            let elapsed = now - start;
+            // 1 MB/s is one byte per 1000 ns. Bytes sent never exceed
+            // rate x time by more than one burst.
+            assert!(
+                sent as u64 <= elapsed / 1_000 + 2 * mss as u64,
+                "{sent} bytes by {elapsed} ns is over the rate plus one burst"
+            );
+        }
+        // Whole bursts, each after the previous one's line time has
+        // been paid back, until the 8 KiB payload is out.
+        assert_eq!(sent_by_pass, [2 * mss, 2 * mss, 8 * 1024 - 4 * mss]);
+    }
+
+    #[test]
     fn paced_close_waits_for_queued_data_before_fin() {
         let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
+        let start = TCP_INITIAL_RTO_NANOS + 1;
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
-        let first = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
-            .expect("first paced segment should transmit immediately");
-        assert_eq!(first.payload.as_ref(), b"abcdefgh");
+        for expected in [b"abcd", b"efgh"] {
+            let segment = socket
+                .take_transmit_segment(start, FOUR_BYTE_SEGMENTS)
+                .expect("the burst allowance covers two segments");
+            assert_eq!(segment.payload.as_ref(), expected);
+        }
         assert_eq!(socket.queue_send(b"ijkl"), 4);
 
         socket.close_send();
         assert_eq!(socket.state(), TcpState::FinWait1);
         assert_eq!(
-            socket.take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 2,
-                TcpSegmentBudget::wire_segments(usize::MAX)
-            ),
+            socket.take_transmit_segment(start + 1, FOUR_BYTE_SEGMENTS),
             None
         );
 
         let second = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1 + 8_000_000,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
+            .take_transmit_segment(start + 8_000_000, FOUR_BYTE_SEGMENTS)
             .expect("paced data must be transmitted before FIN");
         assert_eq!(second.payload.as_ref(), b"ijkl");
 
         let fin = socket
-            .take_transmit_segment(
-                TCP_INITIAL_RTO_NANOS + 1 + 12_000_000,
-                TcpSegmentBudget::wire_segments(usize::MAX),
-            )
+            .take_transmit_segment(start + 12_000_000, FOUR_BYTE_SEGMENTS)
             .expect("FIN should follow drained queued data");
         assert!(fin.payload.is_empty());
         assert!(fin.header.flags.contains(TcpFlags::FIN));

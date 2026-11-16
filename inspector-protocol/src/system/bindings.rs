@@ -1,6 +1,6 @@
 wit_bindgen::generate!({
     path: "../wit",
-    world: "debugger",
+    world: "inspector-system",
     generate_all,
     additional_derives: [serde::Serialize, serde::Deserialize],
 });

@@ -1,11 +1,24 @@
 use crate::wit_bindgen;
 
+#[cfg(all(feature = "hv", any(feature = "http-handler", feature = "compositor")))]
+compile_error!(
+    "`hv` is part of the `init` and `debugger` worlds; `http-handler` and `compositor` do not import it"
+);
+
 #[cfg(all(
     feature = "mounts",
     any(feature = "http-handler", feature = "compositor")
 ))]
 compile_error!(
     "`mounts` is part of the `init` and `debugger` worlds; `http-handler` and `compositor` do not import it"
+);
+
+#[cfg(all(
+    feature = "processors",
+    any(feature = "http-handler", feature = "compositor")
+))]
+compile_error!(
+    "`processors` is part of the `init` and `debugger` worlds; `http-handler` and `compositor` do not import it"
 );
 
 #[cfg(any(

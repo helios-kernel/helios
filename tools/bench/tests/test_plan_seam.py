@@ -124,3 +124,17 @@ def test_the_cli_threads_no_profile_boot_into_the_run_options(tmp_path, monkeypa
         with pytest.raises(SystemExit):
             cli.main(["run", "--lane", "x86-64-kvm", "--out-dir", str(tmp_path), "--sides", "helios", *flags])
         assert seen[-1].profile_boot is expected
+
+
+def test_cli_memory_override_reaches_both_guests(tmp_path, monkeypatch) -> None:
+    seen = []
+    monkeypatch.setattr(cli, "run_suite", lambda options, manifest, dry_run: seen.append(options))
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--lane", "aarch64-hvf", "--out-dir", str(tmp_path), "--memory", "1G"])
+    options = seen.pop()
+    commands = plan(options, load_manifest(), load_workloads()["workloads"])
+    helios = next(command for command in commands if "--skip-linux" in command.argv)
+    linux = next(command for command in commands if "--skip-helios" in command.argv)
+    assert helios.env["HELIOS_WORKLOAD_BENCH_VM_MEMORY"] == "1G"
+    args = gap_bench().build_parser().parse_args(linux.argv[2:])
+    assert args.linux_vm_memory == "1G"

@@ -309,7 +309,7 @@ mod tests {
     use crate::test_support::{ManualClockCpu, TestCpu, TestNetworkService, TestRuntimeState};
     use crate::wasmtime_adapter::engine::build_component_engine_for_platform;
     use crate::{
-        InstanceActivity, InstanceRegistry, KillOutcome, KillReason, MemoryOwner,
+        InstanceActivity, InstanceRegistry, KillOutcome, KillReason, MemoryOwner, UserResidency,
         configure_user_memory_owner_processors, current_user_memory_owner,
     };
 
@@ -382,7 +382,7 @@ mod tests {
     /// memory it commits, nested in the turn of a store that does.
     #[test]
     fn a_turn_of_an_unowned_store_names_no_memory_owner() {
-        configure_user_memory_owner_processors(1);
+        configure_user_memory_owner_processors(crate::test_support::single_node_pool(1));
         let processor = current_processor();
         let registry = InstanceRegistry::new();
         let requester = registry.register("requester", 0);
@@ -428,7 +428,7 @@ mod tests {
     /// processor back to the parent.
     #[test]
     fn a_turn_names_its_instance_as_the_memory_owner() {
-        configure_user_memory_owner_processors(1);
+        configure_user_memory_owner_processors(crate::test_support::single_node_pool(1));
         let processor = current_processor();
         let registry = InstanceRegistry::new();
         let parent = registry.register("parent", 0);
@@ -498,7 +498,12 @@ mod tests {
 
         assert!(poll_once(driven.as_mut()).is_pending());
         assert_eq!(
-            registry.request_kill(instance.id(), KillReason::Operator, 5),
+            registry.request_kill(
+                instance.id(),
+                KillReason::Operator,
+                5,
+                &UserResidency::default()
+            ),
             KillOutcome::Requested
         );
         assert_eq!(
@@ -527,7 +532,12 @@ mod tests {
         let condemner = registry.clone();
         let call = poll_fn(move |_| {
             assert_eq!(
-                condemner.request_kill(instance.id(), KillReason::OutOfMemory, 0),
+                condemner.request_kill(
+                    instance.id(),
+                    KillReason::OutOfMemory,
+                    0,
+                    &UserResidency::default()
+                ),
                 KillOutcome::Requested
             );
             Poll::Ready(Ok::<u32, InstanceKilled>(0))
@@ -641,7 +651,12 @@ mod tests {
         assert!(!dropped.load(Ordering::Acquire));
 
         assert_eq!(
-            registry.request_kill(instance.id(), KillReason::OutOfMemory, 5),
+            registry.request_kill(
+                instance.id(),
+                KillReason::OutOfMemory,
+                5,
+                &UserResidency::default()
+            ),
             KillOutcome::Requested
         );
         assert_eq!(wakes.wakes(), 1, "the condemnation wakes the turn");
@@ -670,7 +685,12 @@ mod tests {
         let instance = registry.register("condemned", 0);
         let activity = InstanceActivity::new(instance.clone(), 0);
         assert_eq!(
-            registry.request_kill(instance.id(), KillReason::SupervisorRestart, 0),
+            registry.request_kill(
+                instance.id(),
+                KillReason::SupervisorRestart,
+                0,
+                &UserResidency::default()
+            ),
             KillOutcome::Requested
         );
         let call = poll_fn(|_| -> Poll<Result<u32, InstanceKilled>> {
@@ -744,7 +764,12 @@ mod tests {
             );
 
             assert_eq!(
-                registry.request_kill(instance.id(), KillReason::Operator, 0),
+                registry.request_kill(
+                    instance.id(),
+                    KillReason::Operator,
+                    0,
+                    &UserResidency::default()
+                ),
                 KillOutcome::Requested
             );
             assert_eq!(wakes.wakes(), 1, "the condemnation wakes the turn");
@@ -822,7 +847,12 @@ mod tests {
             assert_eq!(live_stacks(), 1, "the blocked guest holds its fiber stack");
 
             assert_eq!(
-                registry.request_kill(instance.id(), KillReason::Operator, 0),
+                registry.request_kill(
+                    instance.id(),
+                    KillReason::Operator,
+                    0,
+                    &UserResidency::default()
+                ),
                 KillOutcome::Requested
             );
             assert_eq!(wakes.wakes(), 1, "the condemnation wakes the turn");

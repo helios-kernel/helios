@@ -4,9 +4,14 @@
 //! test that needs one should not have to spell a whole `Cpu`
 //! implementation out again.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, Timebase, TimerInterrupt};
+use helios_hal::numa::{MemoryAffinity, NodeDistance, NodeId, NumaTopology};
+
+use crate::memory::{Locality, NodeRun, UserMemoryPool};
 
 /// The processor-local interrupt mask for the kernel's own unit tests.
 ///
@@ -76,6 +81,7 @@ impl TestCpu {
 }
 
 impl Cpu for TestCpu {
+    type Hypervisor = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn has_lazy_commit_virtual_memory(&self) -> bool {
@@ -171,10 +177,177 @@ pub(crate) fn test_root_entropy() -> crate::RootEntropyHandle {
 pub(crate) fn test_timer<CpuImpl: Cpu + Clone>(cpu: CpuImpl) -> crate::Timer<CpuImpl> {
     crate::Executor::isolated(
         helios_hal::watchdog::ProgressCounter::new(),
-        cpu.processor_count(),
+        single_node_pool(cpu.processor_count()),
         helios_hal::cpu::current_processor(),
     )
     .timer(cpu)
+}
+
+/// Host memory each node of a test pool owns: enough for the per-processor
+/// tables and task arenas of a few processors, and for the largest arena
+/// the executor tests size, which is all the kernel's unit tests carve
+/// from it.
+pub(crate) const TEST_POOL_NODE_BYTES: usize = 256 << 20;
+
+/// A user pool over a machine of `processors` processors on one node.
+///
+/// One pool per processor count for the whole test process: a test that
+/// builds its executor or per-processor tables from it shares the host
+/// block with the others that do, instead of leaking one per call.
+pub(crate) fn single_node_pool(processors: usize) -> &'static UserMemoryPool {
+    static POOLS: std::sync::Mutex<Vec<(usize, &'static UserMemoryPool)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut pools = POOLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, pool)) = pools.iter().find(|(count, _)| *count == processors) {
+        return pool;
+    }
+    let pool = TestMachine::round_robin(processors, 1).pool(TEST_POOL_NODE_BYTES);
+    pools.push((processors, pool));
+    pool
+}
+
+/// Node memory over one leaked, naturally aligned host block per node,
+/// lent from the bottom, recording what comes back.
+pub(crate) struct HostNodeMemory {
+    /// Per node: `(next, end)`.
+    nodes: core::cell::RefCell<Vec<(usize, usize)>>,
+    /// Every `(start, bytes)` given back.
+    returned: core::cell::RefCell<Vec<(usize, usize)>>,
+    /// Per node: where its block starts and ends.
+    regions: Vec<(usize, usize)>,
+}
+
+impl HostNodeMemory {
+    pub(crate) fn new(nodes: usize, bytes_per_node: usize) -> Self {
+        let regions: Vec<(usize, usize)> = (0..nodes)
+            .map(|_| {
+                let layout = core::alloc::Layout::from_size_align(bytes_per_node, bytes_per_node)
+                    .expect("host node memory layout");
+                // SAFETY: `layout` has a non-zero size; the block is
+                // leaked, which is the life a test machine's memory has.
+                let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+                assert!(start != 0, "host allocation for node memory failed");
+                (start, start + bytes_per_node)
+            })
+            .collect();
+        Self {
+            nodes: core::cell::RefCell::new(regions.clone()),
+            returned: core::cell::RefCell::new(Vec::new()),
+            regions,
+        }
+    }
+
+    /// Per node, the block its memory is in.
+    pub(crate) fn regions(&self) -> &[(usize, usize)] {
+        &self.regions
+    }
+
+    pub(crate) fn returned(&self) -> Vec<(usize, usize)> {
+        self.returned.borrow().clone()
+    }
+}
+
+impl crate::memory::NodeMemory for HostNodeMemory {
+    fn lend(&self, node: NodeId, bytes: usize) -> Option<usize> {
+        let mut nodes = self.nodes.borrow_mut();
+        let (next, end) = &mut nodes[node.index()];
+        let start = next.next_multiple_of(bytes);
+        (start + bytes <= *end).then(|| {
+            *next = start + bytes;
+            start
+        })
+    }
+
+    unsafe fn give_back(&self, start: usize, bytes: usize) {
+        assert!(bytes.is_power_of_two(), "a piece is a power of two");
+        self.returned.borrow_mut().push((start, bytes));
+    }
+}
+
+/// A machine a test spells out: which node each processor is on and
+/// the distance matrix. It names no memory affinity.
+pub(crate) struct TestMachine {
+    /// Index: processor.
+    pub(crate) processor_nodes: Vec<usize>,
+    /// Row-major, `node_count²`.
+    pub(crate) distances: Vec<u8>,
+}
+
+impl TestMachine {
+    /// `processors` processors spread round-robin over `nodes` nodes,
+    /// every remote distance equal.
+    pub(crate) fn round_robin(processors: usize, nodes: usize) -> Self {
+        Self {
+            processor_nodes: (0..processors).map(|processor| processor % nodes).collect(),
+            distances: (0..nodes * nodes)
+                .map(|cell| {
+                    if cell / nodes == cell % nodes {
+                        NodeDistance::LOCAL.get()
+                    } else {
+                        NodeDistance::UNIFORM_REMOTE.get()
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// A user pool over this machine with `bytes_per_node` of host
+    /// memory on every node, leaked because the kernel holds the
+    /// machine's pool for the machine's life and a test process is that
+    /// life. Per-processor tables and executors carve from it.
+    pub(crate) fn pool(&self, bytes_per_node: usize) -> &'static UserMemoryPool {
+        let runs: Vec<NodeRun> = (0..self.node_count())
+            .map(|node| {
+                let layout = core::alloc::Layout::from_size_align(bytes_per_node, bytes_per_node)
+                    .expect("host pool layout");
+                // SAFETY: a non-zero layout, leaked for the test machine's life.
+                let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+                assert!(start != 0, "host allocation for the test pool failed");
+                NodeRun {
+                    start,
+                    end: start + bytes_per_node,
+                    node: NodeId::new(node),
+                }
+            })
+            .collect();
+        Box::leak(Box::new(UserMemoryPool::new(
+            self,
+            ProcessorId::new(0),
+            &runs,
+        )))
+    }
+
+    /// The machine's locality, leaked like [`Self::pool`]'s pool, with
+    /// no user memory.
+    pub(crate) fn locality(&self) -> &'static Locality {
+        Box::leak(Box::new(Locality::new(self, &[])))
+    }
+}
+
+impl NumaTopology for TestMachine {
+    type MemoryAffinities<'a> = core::iter::Empty<MemoryAffinity>;
+
+    fn node_count(&self) -> usize {
+        self.distances.len().isqrt()
+    }
+
+    fn processor_count(&self) -> usize {
+        self.processor_nodes.len()
+    }
+
+    fn processor_node(&self, processor: ProcessorId) -> NodeId {
+        NodeId::new(self.processor_nodes[usize::from(processor.id())])
+    }
+
+    fn distance(&self, from: NodeId, to: NodeId) -> NodeDistance {
+        NodeDistance::new(self.distances[from.index() * self.node_count() + to.index()])
+    }
+
+    fn memory_affinity(&self) -> Self::MemoryAffinities<'_> {
+        core::iter::empty()
+    }
 }
 
 /// A CPU whose clock a test moves by hand.
@@ -203,6 +376,7 @@ impl ManualClockCpu {
 }
 
 impl Cpu for ManualClockCpu {
+    type Hypervisor = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
@@ -317,6 +491,7 @@ impl RecordingSmpCpu {
 }
 
 impl Cpu for RecordingSmpCpu {
+    type Hypervisor = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {
@@ -616,6 +791,13 @@ struct RecordingInterfaceState {
     /// The drain count past which the next drain panics, so a test of a
     /// loop that must not spin ends at a message instead of never.
     receive_drain_ceiling: AtomicU64,
+    /// The pair each taken frame was submitted on, in the same order.
+    transmitted_on: spin::Mutex<alloc::vec::Vec<usize>>,
+    /// The live pair count the device was last told.
+    live_pairs: AtomicUsize,
+    /// Every pair whose interrupt was steered, with its destination, in
+    /// order.
+    steered: spin::Mutex<alloc::vec::Vec<(usize, helios_hal::cpu::ProcessorId)>>,
 }
 
 impl RecordingNetworkInterface {
@@ -649,6 +831,9 @@ impl RecordingNetworkInterface {
                 transmitted: spin::Mutex::new(alloc::vec::Vec::new()),
                 receive_drains: AtomicU64::new(0),
                 receive_drain_ceiling: AtomicU64::new(u64::MAX),
+                transmitted_on: spin::Mutex::new(alloc::vec::Vec::new()),
+                live_pairs: AtomicUsize::new(queue_pairs),
+                steered: spin::Mutex::new(alloc::vec::Vec::new()),
             }),
         }
     }
@@ -670,6 +855,22 @@ impl RecordingNetworkInterface {
     /// built, each with its scatter payload appended to its headers.
     pub(crate) fn transmitted_frames(&self) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         self.inner.transmitted.lock().clone()
+    }
+
+    /// The pair each frame in [`Self::transmitted_frames`] was
+    /// submitted on.
+    pub(crate) fn transmitted_pairs(&self) -> alloc::vec::Vec<usize> {
+        self.inner.transmitted_on.lock().clone()
+    }
+
+    /// The live pair count the device was last told.
+    pub(crate) fn live_pairs(&self) -> usize {
+        self.inner.live_pairs.load(Ordering::Acquire)
+    }
+
+    /// Every steering the interface was asked for, in order.
+    pub(crate) fn steered(&self) -> alloc::vec::Vec<(usize, helios_hal::cpu::ProcessorId)> {
+        self.inner.steered.lock().clone()
     }
 
     /// Puts a frame in one queue pair's receive ring, where the next
@@ -857,21 +1058,47 @@ impl helios_netstack::NetworkInterface for RecordingNetworkInterface {
         Some(drain)
     }
 
+    fn set_active_queue_pairs(&self, pairs: usize) -> helios_hal::io::IoResult<()> {
+        assert!(
+            (1..=self.inner.queues.len()).contains(&pairs),
+            "{pairs} live pairs out of {}",
+            self.inner.queues.len()
+        );
+        self.inner.live_pairs.store(pairs, Ordering::Release);
+        Ok(())
+    }
+
+    fn steer_queue_pair(&self, pair: usize, processor: helios_hal::cpu::ProcessorId) {
+        assert!(
+            pair < self.inner.queues.len(),
+            "pair {pair} was never brought up"
+        );
+        self.inner.steered.lock().push((pair, processor));
+    }
+
     fn try_transmit_scatter_immediate_on(
         &self,
-        _: usize,
+        queue_idx: usize,
         frames: &[helios_netstack::TxFrameRef<'_>],
     ) -> helios_hal::io::IoResult<Option<usize>> {
         if !self.inner.accept_transmissions {
             return Ok(Some(0));
         }
+        let pair = self.inner.pair(queue_idx);
+        assert!(
+            pair < self.live_pairs(),
+            "a frame was submitted on pair {pair}, which the device does not read: {} pairs are live",
+            self.live_pairs()
+        );
         let mut transmitted = self.inner.transmitted.lock();
+        let mut transmitted_on = self.inner.transmitted_on.lock();
         for frame in frames {
             let mut bytes = frame.bytes.to_vec();
             if let Some(payload) = frame.payload {
                 bytes.extend_from_slice(payload);
             }
             transmitted.push(bytes);
+            transmitted_on.push(pair);
         }
         Ok(Some(frames.len()))
     }
@@ -1246,6 +1473,24 @@ mod network {
             Ok(crate::TcpReadProgress::Data(Bytes::from_static(&[4, 2])))
         }
 
+        /// The same reply as [`Self::tcp_read`], as much of it as the
+        /// buffer takes: the peer this models always has it to send.
+        fn tcp_read_into<'a>(
+            &'a self,
+            _: Self::TcpStream,
+            buffer: &'a mut crate::RegisteredTcpReadBuffer<'_>,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<crate::TcpReadInto, crate::TcpError>> + Send + 'a
+        {
+            let failure = self.drive_error();
+            core::future::ready(match failure {
+                Some(error) => Err(error),
+                None => Ok(crate::TcpReadInto::Data(
+                    helios_netstack::TcpReceiveBuffer::write_from(buffer, &[4, 2]),
+                )),
+            })
+        }
+
         fn tcp_send_room(
             &self,
             _: Self::TcpStream,
@@ -1516,6 +1761,13 @@ mod network {
         /// pump to own — whichever processor calls, the answer is that
         /// there is nothing to drive.
         async fn run_packet_pump(&self, _: helios_hal::cpu::ProcessorId) {}
+
+        /// No pairs, so a departing processor has none to hand off.
+        fn hand_off_queue_pair(&self, _: helios_hal::cpu::ProcessorId, _: &crate::exec::OnlineSet) {
+        }
+
+        /// No pairs, so an arriving processor has none to take up.
+        fn take_up_queue_pair(&self, _: helios_hal::cpu::ProcessorId) {}
     }
 }
 

@@ -38,6 +38,7 @@ use futures::channel::oneshot::Sender;
 use super::CompilerCompileLease;
 use super::CompilerCompileSlot;
 use crate::wasmtime_adapter::preemption::GuestInterrupts;
+use crate::wasmtime_adapter::store::user_residency;
 use crate::{InstanceId, InstanceRegistry, KillOutcome, KillReason};
 
 /// Runs one compile for the requester at the other end of `reply`.
@@ -130,7 +131,8 @@ pub(super) fn condemn_compile(
     reason: KillReason,
     now_nanos: u64,
 ) -> KillOutcome {
-    let outcome = registry.request_kill(instance, reason, now_nanos);
+    let residency = user_residency();
+    let outcome = registry.request_kill(instance, reason, now_nanos, &residency);
     interrupts.interrupt_instance(instance);
     outcome
 }

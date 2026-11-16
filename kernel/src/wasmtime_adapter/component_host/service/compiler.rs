@@ -428,7 +428,7 @@ where
     /// The handle the code driving this store accounts its processor
     /// turns through. Taken before the store is borrowed for the call;
     /// see [`crate::component::GuestTurns::drive`].
-    fn guest_turns(
+    pub(super) fn guest_turns(
         &self,
     ) -> crate::component::GuestTurns<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>, ()>
     {
@@ -709,22 +709,6 @@ where
     Ok(ptr as u32)
 }
 
-/// Reads the response header the plugin returned. The header is all `u32`
-/// fields, so every byte pattern in plugin memory decodes to a header; what
-/// its enumerated fields mean is checked by [`decode_compiler_response`].
-pub(super) fn read_compiler_response(
-    memory: &SharedMemory,
-    ptr: GuestAddress,
-) -> Result<CompilerResponseHeader, ProgramExecError> {
-    let bytes = read_shared_memory(memory, ptr, CompilerResponseHeader::SIZE as u32)?;
-    let bytes: &[u8; CompilerResponseHeader::SIZE] =
-        bytes.as_slice().try_into().map_err(|_| ProgramExecError {
-            kind: ProgramExecErrorKind::Internal,
-            detail: ProgramExecErrorDetail::InternalInvariant,
-        })?;
-    Ok(CompilerResponseHeader::from_bytes(bytes))
-}
-
 /// The typed error for a wire value the plugin sent that names no variant.
 pub(super) fn compiler_abi_value_error(error: UnknownDiscriminant) -> ProgramExecError {
     tracing::error!(
@@ -754,7 +738,13 @@ pub(super) fn decode_compiler_response(
 /// the caller. The response buffers are adopted into `allocations` as soon as
 /// the header's layout is known to be this ABI's, before anything else can
 /// fail, so a rejected or malformed response is freed too.
-pub(super) fn accept_compiler_response<CpuImpl, Net, StorageImpl>(
+///
+/// The plugin's memory is read during the store's turns
+/// ([`in_guest_turn`]): `compile` has returned, so the instance is off every
+/// processor between them. The header is all `u32` fields, so every byte
+/// pattern in plugin memory decodes to a header; what its enumerated fields
+/// mean is checked by [`decode_compiler_response`].
+pub(super) async fn accept_compiler_response<CpuImpl, Net, StorageImpl>(
     store: &CompilerCoreStore<CpuImpl, Net, StorageImpl>,
     allocations: &mut CompilerAllocations,
     response_ptr: u32,
@@ -766,8 +756,13 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let memory = store.memory();
-    let header = read_compiler_response(memory, GuestAddress::wasm32(response_ptr))?;
+    let memory = Preview1AsyncMemory::of_shared(store.memory());
+    let header = in_guest_turn(
+        store.guest_turns(),
+        memory.read_array::<{ CompilerResponseHeader::SIZE }>(GuestAddress::wasm32(response_ptr)),
+    )
+    .await?;
+    let header = CompilerResponseHeader::from_bytes(&header);
     if header.abi_version != HELIOS_COMPILER_ABI_VERSION {
         return Err(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
@@ -782,11 +777,14 @@ where
     allocations.adopt(header.diagnostic_ptr, header.diagnostic_len as usize, 1);
     allocations.adopt(header.precompiled_ptr, header.precompiled_len as usize, 1);
     let (status, _output_kind) = decode_compiler_response(&header)?;
-    let diagnostic = read_shared_memory(
-        memory,
-        GuestAddress::wasm32(header.diagnostic_ptr),
-        header.diagnostic_len,
-    )?;
+    let diagnostic = in_guest_turn(
+        store.guest_turns(),
+        memory.read_bytes(
+            GuestAddress::wasm32(header.diagnostic_ptr),
+            header.diagnostic_len as usize,
+        ),
+    )
+    .await?;
     if status != CompilerStatus::Ok {
         if !diagnostic.is_empty() {
             tracing::error!(
@@ -807,11 +805,14 @@ where
     } else {
         0
     };
-    let output = read_shared_memory(
-        memory,
-        GuestAddress::wasm32(header.precompiled_ptr),
-        header.precompiled_len,
-    )?;
+    let output = in_guest_turn(
+        store.guest_turns(),
+        memory.read_bytes(
+            GuestAddress::wasm32(header.precompiled_ptr),
+            header.precompiled_len as usize,
+        ),
+    )
+    .await?;
     phases.response_done_ns = if profile {
         monotonic_nanos(&store.context.cpu)
     } else {
@@ -1068,7 +1069,7 @@ mod tests {
             ));
             let executor = crate::Executor::new(
                 helios_hal::watchdog::ProgressCounter::new(),
-                1,
+                crate::test_support::single_node_pool(1),
                 helios_hal::cpu::ProcessorId::new(0),
             );
             let registry = crate::InstanceRegistry::new();
@@ -1169,9 +1170,12 @@ mod tests {
         ] {
             let fixture = CompileFixture::new();
             let (store, _drive) = fixture.open_store();
-            fixture
-                .registry
-                .request_kill(fixture.instance.id(), reason, 0);
+            fixture.registry.request_kill(
+                fixture.instance.id(),
+                reason,
+                0,
+                &crate::UserResidency::default(),
+            );
             let Err(error) = store.data().on_interrupt() else {
                 panic!("a condemned instance's guest traps at its next check");
             };
@@ -1223,9 +1227,12 @@ mod tests {
         assert!(!dropped.load(Ordering::SeqCst));
 
         assert_eq!(
-            fixture
-                .registry
-                .request_kill(fixture.instance.id(), crate::KillReason::Operator, 0),
+            fixture.registry.request_kill(
+                fixture.instance.id(),
+                crate::KillReason::Operator,
+                0,
+                &crate::UserResidency::default()
+            ),
             crate::KillOutcome::Requested
         );
         assert_eq!(wakes.count(), 1, "the condemnation wakes the parked turn");
@@ -1416,9 +1423,12 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         let mut call = pin!(drive.call(&mut worker, &wait, ()));
         assert!(call.as_mut().poll(&mut cx).is_pending());
-        fixture
-            .registry
-            .request_kill(fixture.instance.id(), crate::KillReason::Operator, 0);
+        fixture.registry.request_kill(
+            fixture.instance.id(),
+            crate::KillReason::Operator,
+            0,
+            &crate::UserResidency::default(),
+        );
         let Poll::Ready(Err(error)) = call.as_mut().poll(&mut cx) else {
             panic!("the kill ends the parked worker");
         };

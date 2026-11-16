@@ -255,6 +255,7 @@ fn is_supported_component_import(name: &str) -> bool {
         || name.starts_with("wasi:random/")
         || name.starts_with("wasi:sockets/")
         || name.starts_with("helios:system/")
+        || name == "helios:hv/virtualization@0.1.0"
         || name.starts_with("import-func-")
 }
 
@@ -270,6 +271,16 @@ mod tests {
     use super::{
         ArtifactKind, ArtifactProfile, ArtifactProfileError, classify_component, classify_raw_wasm,
     };
+
+    #[test]
+    fn accepts_hardware_virtualization_component_import() {
+        assert!(super::is_supported_component_import(
+            "helios:hv/virtualization@0.1.0"
+        ));
+        assert!(!super::is_supported_component_import(
+            "helios:hv/unknown@0.1.0"
+        ));
+    }
 
     #[test]
     fn classifies_preview1_core_module() {
