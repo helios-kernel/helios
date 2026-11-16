@@ -9,7 +9,7 @@
 //! them and only translate types.
 
 use helios_hal::fs::{
-    FileSystem, FsError as VfsError, FsResult, Metadata, NodeKind, OpenFlags, WritePosition,
+    FileSystem, FsError as VfsError, FsResult, Landed, Metadata, NodeKind, OpenFlags, WritePosition,
 };
 use pin_project_lite::pin_project;
 
@@ -110,6 +110,7 @@ pub(crate) fn fs_error_code(error: VfsError) -> fs_types::ErrorCode {
         VfsError::IllegalByteSequence => fs_types::ErrorCode::IllegalByteSequence,
         VfsError::NameTooLong => fs_types::ErrorCode::NameTooLong,
         VfsError::Unsupported => fs_types::ErrorCode::Unsupported,
+        VfsError::NoSpace => fs_types::ErrorCode::InsufficientSpace,
         VfsError::Io => fs_types::ErrorCode::Io,
     }
 }
@@ -426,15 +427,16 @@ where
     read_resolved(&held.resolved(), offset, max_bytes).await
 }
 
-/// Writes `bytes` to the file `descriptor` names, and resolves with the
-/// offset just past them: where a sequential writer continues.
+/// Writes `bytes` to the file `descriptor` names, and resolves with where
+/// they landed and how many did: fewer than `bytes` only when the
+/// filesystem ran out of space after storing a prefix.
 pub(crate) async fn write<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     file: Granted<'_, RegularFile, Write>,
     position: WritePosition,
     bytes: &[u8],
     now: u64,
-) -> FsOpResult<u64>
+) -> FsOpResult<Landed>
 where
     StorageImpl: crate::Storage,
 {
@@ -452,14 +454,14 @@ where
     resolve(namespace, &file.descriptor().path)
 }
 
-/// Writes `bytes` through `resolved`, and resolves with the offset just
-/// past them.
+/// Writes `bytes` through `resolved`, and resolves with where they landed
+/// and how many did ([`Landed`]).
 pub(crate) async fn write_resolved<StorageImpl>(
     resolved: &Resolved<'_, StorageImpl>,
     position: WritePosition,
     bytes: &[u8],
     now: u64,
-) -> FsOpResult<u64>
+) -> FsOpResult<Landed>
 where
     StorageImpl: crate::Storage,
 {
@@ -494,7 +496,8 @@ where
 
 /// Writes `len` bytes that `source` copies straight into the
 /// filesystem's destination ([`helios_hal::fs::write_with`]), and
-/// resolves with the offset just past them. An append lands at the end of
+/// resolves with where they landed and how many did ([`Landed::end`] is
+/// where a sequential writer continues). An append lands at the end of
 /// the file as the filesystem sees it when the write arrives, so its end
 /// is the filesystem's answer, never the caller's idea of where the file
 /// ended.
@@ -509,18 +512,15 @@ pub(crate) async fn write_resolved_with<StorageImpl, S>(
     len: usize,
     now: u64,
     source: S,
-) -> FsOpResult<u64>
+) -> FsOpResult<Landed>
 where
     StorageImpl: crate::Storage,
     S: FnMut(usize, &mut [u8]),
 {
     let fs = resolved.writable().map_err(fs_error_code)?;
-    let landed = helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source)
+    helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source)
         .await
-        .map_err(fs_error_code)?;
-    landed
-        .checked_add(len as u64)
-        .ok_or(fs_types::ErrorCode::Overflow)
+        .map_err(fs_error_code)
 }
 
 pub(crate) async fn set_size<StorageImpl>(
@@ -829,15 +829,19 @@ where
     )
     .await
     .map_err(fs_error_code)?;
-    write_resolved(&resolved, WritePosition::At(0), bytes, now)
-        .await
-        .map(drop)
+    let landed = write_resolved(&resolved, WritePosition::At(0), bytes, now).await?;
+    // A file replaced in part is not the file the caller asked for.
+    if landed.len != bytes.len() {
+        return Err(fs_types::ErrorCode::InsufficientSpace);
+    }
+    Ok(())
 }
 
 /// What one bounded read resolves with.
 type ChunkReadResult = FsOpResult<Bytes>;
 
-/// What one write resolves with: the number of bytes handed over.
+/// What one write resolves with: the number of bytes handed over, all of
+/// which landed.
 type ChunkWriteResult = FsOpResult<usize>;
 
 /// One write of a stream's batch, as a future the consumer owns by value.
@@ -850,8 +854,14 @@ async fn write_chunk<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    write_resolved(&held.resolved(), mode, &bytes, now).await?;
-    Ok(bytes.len())
+    let landed = write_resolved(&held.resolved(), mode, &bytes, now).await?;
+    // A stream takes its bytes before they land, so a prefix the
+    // filesystem stored is all the stream can report: the stream ends
+    // with the out-of-space error, and its offset is not used again.
+    if landed.len != bytes.len() {
+        return Err(fs_types::ErrorCode::InsufficientSpace);
+    }
+    Ok(landed.len)
 }
 
 /// Answers the `future<result>` a `read-via-stream`, `write-via-stream`,

@@ -427,9 +427,20 @@ where
         };
         let now = self.now_nanos();
         match super::write_resolved(&self.file.resolved(), self.mode, &bytes, now).await {
-            Ok(end) => {
+            Ok(landed) => {
                 if let WritePosition::At(offset) = &mut self.mode {
-                    *offset = end;
+                    match landed.end() {
+                        Some(end) => *offset = end,
+                        None => {
+                            self.failure = Some(p2fs::ErrorCode::Overflow);
+                            return;
+                        }
+                    }
+                }
+                // The batch was accepted before it landed; what the
+                // filesystem could not store is lost, and the stream fails.
+                if landed.len != bytes.len() {
+                    self.failure = Some(p2fs::ErrorCode::InsufficientSpace);
                 }
             }
             Err(error) => self.failure = Some(error_code_from_p3(error)),

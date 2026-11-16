@@ -30,7 +30,7 @@ use core::ops::Bound;
 use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
+    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeId,
     NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
 };
 use spin::Mutex;
@@ -521,7 +521,7 @@ impl<'a> MemoryWrite<'a> {
     /// Lands the write and resolves with the offset it began at. The
     /// checks of [`Self::prepare`] are made again under the lock, since
     /// the file may have changed in between.
-    pub(super) fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<u64> {
+    pub(super) fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
         self.fs.write_now(
             self.path,
             self.position,
@@ -557,7 +557,7 @@ impl MemoryFs {
         len: usize,
         now: u64,
         fill: impl FnOnce(&mut [u8]),
-    ) -> FsResult<u64> {
+    ) -> FsResult<Landed> {
         let mut landed = 0;
         self.state.lock().edit_contents(path, now, |contents| {
             let at = match position {
@@ -574,7 +574,10 @@ impl MemoryFs {
             landed = at as u64;
             Ok(())
         })?;
-        Ok(landed)
+        Ok(Landed {
+            offset: landed,
+            len,
+        })
     }
 }
 
@@ -772,8 +775,8 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags, PreparedWrite,
-        WritePosition, WriteProgress,
+        DeviceId, DirCookie, FileSystem, FsError, FsPath, Landed, NodeKind, OpenFlags,
+        PreparedWrite, WritePosition, WriteProgress,
     };
 
     use super::MemoryFs;
@@ -906,7 +909,7 @@ mod tests {
                 assert_eq!((at, &*destination), (0, &[0, 0][..]));
                 destination.copy_from_slice(b"ef");
             })),
-            Ok(WriteProgress::Done(4))
+            Ok(WriteProgress::Done(Landed { offset: 4, len: 2 }))
         ));
         let read = block_on(fs.read_at(path("f"), 0, 64)).expect("reads");
         assert_eq!(read.as_ref(), b"\0\0cdef");

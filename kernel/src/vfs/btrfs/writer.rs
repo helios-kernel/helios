@@ -7,9 +7,11 @@ use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 
 use futures::channel::oneshot;
-use helios_btrfs::write::{Attributes, InodeHandle, Name, WriteError, WriteTransaction, Writer};
+use helios_btrfs::write::{
+    Attributes, ChunkError, InodeHandle, Name, SpaceError, WriteError, WriteTransaction, Writer,
+};
 use helios_btrfs::{BlockSink, Error, FileKind, Timestamp};
-use helios_hal::fs::{BlockDevice, FsError, FsResult, OpenFlags, WritePosition};
+use helios_hal::fs::{BlockDevice, FsError, FsResult, Landed, OpenFlags, WritePosition};
 use triomphe::Arc;
 
 use super::{Image, Snapshot};
@@ -18,7 +20,7 @@ use crate::{BlockPages, RootEntropyHandle};
 
 pub(super) enum Response {
     Done,
-    Written(u64),
+    Written(Landed),
     Opened {
         inode: InodeHandle,
         metadata: helios_btrfs::Metadata,
@@ -282,18 +284,19 @@ async fn apply<S: BlockSink>(
                 )
                 .await
                 .map_err(fs_error)?;
-            // A device with no more free sectors stores a prefix. This round
-            // has no way to report one, so the whole write fails as it did
-            // before short writes existed, and its transaction is dropped.
+            // A device with no more free sectors stores a prefix, which the
+            // transaction keeps and the caller learns the length of.
             if written != bytes.len() {
                 tracing::warn!(
                     written,
                     requested = bytes.len(),
                     "btrfs write ran out of space"
                 );
-                return Err(FsError::Io);
             }
-            return Ok(Response::Written(offset));
+            return Ok(Response::Written(Landed {
+                offset,
+                len: written,
+            }));
         }
         Operation::Open { flags } => {
             let file = match inode(transaction, path).await {
@@ -462,6 +465,12 @@ pub(super) fn fs_error(error: WriteError) -> FsError {
             FsError::Invalid
         }
         WriteError::FileOverflow => FsError::Overflow,
+        WriteError::NoSpace { .. }
+        | WriteError::IdentifierExhausted { .. }
+        | WriteError::Chunk(
+            ChunkError::NoDeviceSpace { .. } | ChunkError::SystemArrayFull { .. },
+        )
+        | WriteError::Space(SpaceError::Exhausted { .. }) => FsError::NoSpace,
         WriteError::Read(Error::WrongKind {
             expected: FileKind::Directory,
             ..

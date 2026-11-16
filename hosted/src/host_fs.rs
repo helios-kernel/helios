@@ -5,12 +5,15 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{self as unix_fs, FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
-use helios_hal::fs::{WritePosition, WriteProgress};
+use helios_hal::fs::{Landed, WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use helios_kernel::{
     AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
     HostMetadata, HostWrite, ObjectIdentity,
 };
+
+/// Linux `ENOSPC`, the code a host-share server answers a full device with.
+const ENOSPC: u32 = 28;
 
 /// Host-OS backed filesystem for the hosted backend.
 ///
@@ -43,6 +46,10 @@ impl HostedFileSystem {
 }
 
 fn map_io_error(error: io::Error) -> HostFsError {
+    if error.kind() == io::ErrorKind::StorageFull {
+        // The host-share error a 9p server's `ENOSPC` reply becomes.
+        return HostFsError::Server(ENOSPC);
+    }
     let io_error = match error.kind() {
         io::ErrorKind::NotFound => IoError::NotFound,
         io::ErrorKind::AlreadyExists => IoError::AlreadyExists,
@@ -378,6 +385,7 @@ impl HostFilledWrite for FilledHostedWrite {
             position,
             bytes,
         } = self.write;
+        let len = bytes.len();
         blocking::unblock(move || {
             let landed = match position {
                 WritePosition::At(offset) => {
@@ -393,7 +401,10 @@ impl HostFilledWrite for FilledHostedWrite {
                     offset
                 }
             };
-            Ok(WriteProgress::Done(landed))
+            Ok(WriteProgress::Done(Landed {
+                offset: landed,
+                len,
+            }))
         })
         .await
     }
@@ -464,7 +475,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use helios_hal::fs::{WritePosition, WriteProgress};
+    use helios_hal::fs::{Landed, WritePosition, WriteProgress};
     use helios_kernel::{HostFileSystem, HostFilledWrite, HostFsError, HostWrite};
 
     use super::HostedFileSystem;
@@ -598,7 +609,10 @@ mod tests {
                 .submit()
                 .await
                 .expect("write must land");
-            assert!(matches!(landed, WriteProgress::Done(3)));
+            assert!(matches!(
+                landed,
+                WriteProgress::Done(Landed { offset: 3, len: 4 })
+            ));
             assert_eq!(
                 std::fs::read(root.path().join("data")).expect("file must be readable"),
                 b"012abcd789"
@@ -640,7 +654,7 @@ mod tests {
             .submit()
             .await?
         {
-            WriteProgress::Done(landed) => Ok(landed),
+            WriteProgress::Done(landed) => Ok(landed.offset),
             WriteProgress::More(_) => panic!("a hosted write lands in one round"),
         }
     }

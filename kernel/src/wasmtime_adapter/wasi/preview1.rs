@@ -102,6 +102,7 @@ pub(crate) mod errno {
     pub(crate) const HOSTUNREACH: i32 = 23;
     pub(crate) const NOMEM: i32 = 48;
     pub(crate) const NOENT: i32 = 44;
+    pub(crate) const NOSPC: i32 = 51;
     pub(crate) const NOTDIR: i32 = 54;
     pub(crate) const NOTEMPTY: i32 = 55;
     pub(crate) const NOTSOCK: i32 = 57;

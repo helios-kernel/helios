@@ -8,7 +8,7 @@ use ferrosys::btrfs::{FormatOptions, SubvolumeRequest, format_to};
 use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
-    BlockSerial, DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags,
+    BlockSerial, DeviceId, DirCookie, FileSystem, FsError, FsPath, Landed, NodeKind, OpenFlags,
     PreparedWrite, WritePosition, WriteProgress, write_with,
 };
 
@@ -351,7 +351,13 @@ fn writable_service_publishes_namespace_and_survives_remount() {
             )
             .await
             .expect("multiple rounds");
-            assert_eq!(start, 0);
+            assert_eq!(
+                start,
+                Landed {
+                    offset: 0,
+                    len: payload.len()
+                }
+            );
             assert_eq!(
                 fs.read_at(path("created"), 0, payload.len()).await.unwrap(),
                 payload.as_slice()
@@ -381,8 +387,20 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 second.submit(|_, bytes| bytes.fill(0x42)),
             )
             .await;
-            assert!(matches!(first, Ok(WriteProgress::Done(19_000))));
-            assert!(matches!(second, Ok(WriteProgress::Done(19_003))));
+            assert!(matches!(
+                first,
+                Ok(WriteProgress::Done(Landed {
+                    offset: 19_000,
+                    len: 3
+                }))
+            ));
+            assert!(matches!(
+                second,
+                Ok(WriteProgress::Done(Landed {
+                    offset: 19_003,
+                    len: 2
+                }))
+            ));
             assert_eq!(
                 fs.read_at(path("renamed"), 19_000, 5).await.unwrap(),
                 &b"AAABB"[..]
@@ -461,5 +479,102 @@ fn writable_service_publishes_namespace_and_survives_remount() {
             reopened.read_link(path("dir/symlink")).await.unwrap(),
             "moved"
         );
+    });
+}
+
+/// The byte every sector of the full-device test's file holds at `offset`:
+/// one value per 4 KiB sector, so a shifted or repeated sector reads wrong.
+fn sector_pattern(offset: usize) -> u8 {
+    ((offset / 4096) % 251) as u8 + 1
+}
+
+#[test]
+fn a_full_device_stores_a_prefix_then_refuses_with_no_space() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+    let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
+    // Far more than the 128 MiB image can hold.
+    const REQUESTED: usize = 160 << 20;
+    const NAME: &str = "容量-容量-용량";
+    let stored = block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache.disk(0),
+            || DeviceId::new(100),
+            crate::test_support::test_root_entropy(),
+            core::num::NonZeroUsize::new(64).unwrap(),
+        )
+        .await
+        .expect("writable mount");
+        let client = async move {
+            fs.open(
+                path(NAME),
+                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                1_000_000_000,
+            )
+            .await
+            .expect("create file");
+            let landed = write_with(
+                &fs,
+                path(NAME),
+                WritePosition::At(0),
+                REQUESTED,
+                1_000_000_001,
+                |offset, bytes| {
+                    // Rounds and sectors both start on sector boundaries.
+                    for (index, sector) in bytes.chunks_mut(4096).enumerate() {
+                        sector.fill(sector_pattern(offset + index * 4096));
+                    }
+                },
+            )
+            .await
+            .expect("a prefix of the write lands");
+            assert_eq!(landed.offset, 0);
+            assert!(landed.len > 0, "something landed");
+            assert!(landed.len < REQUESTED, "the device ran out of space");
+            assert_eq!(
+                fs.stat(path(NAME)).await.unwrap().size,
+                landed.len as u64,
+                "the file holds exactly the prefix"
+            );
+            // No sector is left, so the next write stores nothing.
+            let refused = write_with(
+                &fs,
+                path(NAME),
+                WritePosition::End,
+                4096,
+                1_000_000_002,
+                |_, bytes| bytes.fill(0x5a),
+            )
+            .await;
+            assert_eq!(refused, Err(FsError::NoSpace));
+            fs.sync(path(NAME)).await.expect("the prefix commits");
+            drop(fs);
+            landed.len
+        };
+        futures::future::join(client, service.run()).await.0
+    });
+    block_on(async {
+        let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
+            .await
+            .expect("remount");
+        assert_eq!(reopened.stat(path(NAME)).await.unwrap().size, stored as u64);
+        const READ: usize = 1 << 20;
+        let mut offset = 0;
+        while offset < stored {
+            let chunk = reopened
+                .read_at(path(NAME), offset as u64, READ)
+                .await
+                .expect("reads the prefix");
+            assert!(!chunk.is_empty(), "the file is shorter than its size");
+            for (index, sector) in chunk.chunks(4096).enumerate() {
+                let at = offset + index * 4096;
+                assert!(
+                    sector.iter().all(|byte| *byte == sector_pattern(at)),
+                    "sector at {at}"
+                );
+            }
+            offset += chunk.len();
+        }
+        assert_eq!(offset, stored);
     });
 }

@@ -177,7 +177,7 @@ fn writing_a_boot_image_file_writes_the_trees_own_copy() {
         1,
     ))
     .expect("the write lands in the tree's copy");
-    assert_eq!(end, 1);
+    assert_eq!(end.end(), Some(1));
     assert_eq!(read_all(&namespace, &descriptor), b"Tool");
     assert_eq!(read_all(&other_tree, &descriptor), b"tool");
 }
@@ -885,7 +885,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
         2,
     ))
     .expect("the second writer extends the file");
-    assert_eq!(end, 3 + "日本語".len() as u64);
+    assert_eq!(end.end(), Some(3 + "日本語".len() as u64));
 
     let end = block_on(super::write(
         &namespace,
@@ -896,7 +896,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
     ))
     .expect("the append lands");
     let contents = read_all(&namespace, &appender);
-    assert_eq!(end, contents.len() as u64);
+    assert_eq!(end.end(), Some(contents.len() as u64));
     assert_eq!(contents, "abc日本語한국어".as_bytes());
 }
 

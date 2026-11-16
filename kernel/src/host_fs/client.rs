@@ -71,7 +71,7 @@ use bytes::BytesMut;
 use core::future::Future;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters};
-use helios_hal::fs::{WritePosition, WriteProgress};
+use helios_hal::fs::{Landed, WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use objectpool::{Pool, ReusableObject};
 use slab::Slab;
@@ -2258,7 +2258,10 @@ impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
         write.staged_from = write.round_end();
         if write.staged_from == write.len {
             write.finish(true).await;
-            return Ok(WriteProgress::Done(write.landed));
+            return Ok(WriteProgress::Done(Landed {
+                offset: write.landed,
+                len: write.len,
+            }));
         }
         write.stage_round();
         Ok(WriteProgress::More(write))
@@ -3113,7 +3116,10 @@ mod tests {
             });
             match filled.submit().await? {
                 WriteProgress::More(next) => write = next,
-                WriteProgress::Done(landed) => return Ok((landed, rounds)),
+                WriteProgress::Done(landed) => {
+                    assert_eq!(landed.len, bytes.len());
+                    return Ok((landed.offset, rounds));
+                }
             }
         }
     }
@@ -3204,7 +3210,13 @@ mod tests {
         ))
         .expect("write");
 
-        assert_eq!(landed, 0);
+        assert_eq!(
+            landed,
+            Landed {
+                offset: 0,
+                len: bytes.len()
+            }
+        );
         assert_eq!(regions, [(0, chunk), (chunk, chunk), (chunk * 2, 3)]);
         let sent: Vec<u8> = transport
             .log()

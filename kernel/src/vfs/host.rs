@@ -70,6 +70,7 @@ pub(crate) fn fs_error_from_host(error: HostFsError) -> FsError {
         HostFsErrorKind::ReadOnly => FsError::ReadOnly,
         HostFsErrorKind::Unsupported => FsError::Unsupported,
         HostFsErrorKind::NameTooLong => FsError::NameTooLong,
+        HostFsErrorKind::NoSpace => FsError::NoSpace,
         HostFsErrorKind::Io => FsError::Io,
     }
 }

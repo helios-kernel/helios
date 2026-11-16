@@ -36,8 +36,8 @@ use core::future::Future;
 
 use bytes::Bytes;
 use helios_hal::fs::{
-    DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeKind, OpenFlags,
-    PreparedWrite, WritePosition, WriteProgress,
+    DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeKind,
+    OpenFlags, PreparedWrite, WritePosition, WriteProgress,
 };
 
 use super::memory::{MemoryWrite, UpperView};
@@ -258,7 +258,7 @@ impl<'a> RootWrite<'a> {
         })
     }
 
-    fn land(self, fill: impl FnMut(usize, &mut [u8])) -> FsResult<u64> {
+    fn land(self, fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
         self.root.copy_up(self.path)?;
         MemoryWrite::prepare(
             &self.root.upper,

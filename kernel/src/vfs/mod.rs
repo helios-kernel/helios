@@ -293,7 +293,7 @@ macro_rules! mount_kinds {
 
 /// Writes `data` at `position` through [`helios_hal::fs::write_with`],
 /// and resolves with the offset it landed at: the filesystem tests'
-/// write.
+/// write. It asserts that every byte landed.
 #[cfg(test)]
 pub(crate) async fn write_bytes<F: FileSystem>(
     fs: &F,
@@ -302,10 +302,13 @@ pub(crate) async fn write_bytes<F: FileSystem>(
     data: &[u8],
     now: u64,
 ) -> FsResult<u64> {
-    helios_hal::fs::write_with(fs, path, position, data.len(), now, |at, destination| {
-        destination.copy_from_slice(&data[at..at + destination.len()]);
-    })
-    .await
+    let landed =
+        helios_hal::fs::write_with(fs, path, position, data.len(), now, |at, destination| {
+            destination.copy_from_slice(&data[at..at + destination.len()]);
+        })
+        .await?;
+    assert_eq!(landed.len, data.len(), "the write landed in full");
+    Ok(landed.offset)
 }
 
 mount_kinds! {

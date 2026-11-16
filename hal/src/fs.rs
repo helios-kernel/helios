@@ -138,6 +138,9 @@ pub enum FsError {
     NameTooLong,
     #[error("operation not supported by this filesystem")]
     Unsupported,
+    /// The filesystem has no free space for what the operation needs.
+    #[error("no space left on device")]
+    NoSpace,
     #[error("input/output error")]
     Io,
 }
@@ -232,8 +235,32 @@ pub enum WriteProgress<W> {
     /// The round landed and bytes remain: the next round, staged and
     /// waiting for its own submit.
     More(W),
-    /// Every byte landed; the write began at this offset.
-    Done(u64),
+    /// The write is over: [`Landed`] says where it began and how much of
+    /// it is stored.
+    Done(Landed),
+}
+
+/// Where a finished write began and how many of its bytes landed.
+///
+/// `len` is the prepared length, except when the filesystem ran out of
+/// space after storing a prefix: then `len` is that prefix, nonzero and
+/// shorter than the prepared length, as a POSIX short write. A write that
+/// stores no byte at all fails with [`FsError::NoSpace`] instead, so a
+/// `Landed` with `len == 0` exists only for a prepared length of zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landed {
+    /// The offset the write began at.
+    pub offset: u64,
+    /// The bytes stored, from `offset` on.
+    pub len: usize,
+}
+
+impl Landed {
+    /// The offset just past the stored bytes: where a sequential writer
+    /// continues. `None` when it does not fit a `u64`.
+    pub fn end(self) -> Option<u64> {
+        self.offset.checked_add(self.len as u64)
+    }
 }
 
 /// A write [`FileSystem::prepare_write`] staged.
@@ -246,6 +273,13 @@ pub enum WriteProgress<W> {
 /// never by the write's length, so a write larger than that lands in
 /// several rounds over one prepare. The rounds' lengths sum to the
 /// prepared length, and the rounds land in order at consecutive offsets.
+///
+/// A write that runs out of space ends early: when a round stores only a
+/// prefix of what it staged, the submit resolves with
+/// [`WriteProgress::Done`] carrying the bytes stored so far, and no later
+/// round runs. Only running out of space after at least one byte ends a
+/// write short; when no byte is stored the submit fails with
+/// [`FsError::NoSpace`], and any other failure is its own error.
 ///
 /// Dropping a prepared write before its submit releases what it staged
 /// and leaves the file as it was: the bytes of earlier rounds have
@@ -293,9 +327,10 @@ impl PreparedWrite for core::convert::Infallible {
     }
 }
 
-/// Writes `len` bytes at `position` and resolves with the offset they
-/// landed at, staging them through [`FileSystem::prepare_write`] and
-/// landing every round.
+/// Writes `len` bytes at `position` and resolves with where they landed
+/// and how many did (fewer than `len` only after running out of space,
+/// see [`Landed`]), staging them through [`FileSystem::prepare_write`]
+/// and landing every round.
 ///
 /// `source` copies the bytes of the write that start at its first
 /// argument into its second, straight into the filesystem's destination,
@@ -309,7 +344,7 @@ pub async fn write_with<F, S>(
     len: usize,
     now: u64,
     mut source: S,
-) -> FsResult<u64>
+) -> FsResult<Landed>
 where
     F: FileSystem,
     S: FnMut(usize, &mut [u8]),
