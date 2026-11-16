@@ -12,7 +12,9 @@ exec 3<>/run/console-ready
 mdev -d
 modprobe virtio_mmio
 modprobe virtio_blk
-timeout 30 sh -c 'read -r ready <&3'
+# Keep the deadline in this process: an orphan timeout watchdog can
+# interrupt init console writes with SIGCHLD after readiness completes.
+read -r -t 30 ready <&3
 exec 3>&-
 rm /run/console-ready
 hostname helios-vm
