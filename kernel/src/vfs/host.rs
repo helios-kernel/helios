@@ -24,9 +24,6 @@ use crate::{
     HostWrite,
 };
 
-/// 9p `QTDIR`: the qid type bit that marks a directory.
-const P9_QID_TYPE_DIRECTORY: u8 = 0x80;
-
 /// The most of one host directory a listing holds in kernel memory.
 ///
 /// The share lists a whole directory per request and pages the guest's
@@ -70,26 +67,26 @@ pub(crate) fn fs_error_from_host(error: HostFsError) -> FsError {
         HostFsErrorKind::Unsupported => FsError::Unsupported,
         HostFsErrorKind::NameTooLong => FsError::NameTooLong,
         HostFsErrorKind::Io => FsError::Io,
+        HostFsErrorKind::Refused(refusal) => refusal,
     }
 }
 
-fn metadata_from_host(metadata: &HostMetadata) -> Metadata {
-    Metadata {
+/// The host's attributes as the contract's metadata. The kind comes from
+/// the file type bits of the mode: the qid type names no device, FIFO or
+/// socket, and would pass each of them off as a regular file.
+fn metadata_from_host(metadata: &HostMetadata) -> FsResult<Metadata> {
+    Ok(Metadata {
         id: NodeId::new(
             DeviceId::new(metadata.identity.domain().raw()),
             metadata.identity.local(),
         ),
-        kind: if metadata.qid_type & P9_QID_TYPE_DIRECTORY != 0 {
-            NodeKind::Directory
-        } else {
-            NodeKind::File
-        },
+        kind: metadata.kind().map_err(fs_error_from_host)?,
         link_count: metadata.link_count,
         size: metadata.size,
         access_nanos: metadata.access_nanos,
         modified_nanos: metadata.modified_nanos,
         status_nanos: metadata.status_nanos,
-    }
+    })
 }
 
 /// A host-share write, staged by the client: the filler writes the
@@ -135,11 +132,12 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
     type Write = HostShareWrite<H::Write>;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
-        self.client
+        let metadata = self
+            .client
             .stat_path(host_path(path))
             .await
-            .map(|metadata| metadata_from_host(&metadata))
-            .map_err(fs_error_from_host)
+            .map_err(fs_error_from_host)?;
+        metadata_from_host(&metadata)
     }
 
     async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _now: u64) -> FsResult<Metadata> {
@@ -151,9 +149,12 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
         {
             Ok(metadata) => {
-                let metadata = metadata_from_host(&metadata);
+                let metadata = metadata_from_host(&metadata)?;
                 if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
                     return Err(FsError::Exists);
+                }
+                if let Some(refusal) = metadata.kind.open_refusal() {
+                    return Err(refusal);
                 }
                 if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != NodeKind::Directory {
                     return Err(FsError::NotDirectory);
@@ -240,22 +241,33 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .read_dir(host_path(path), HOST_DIRECTORY_LIMIT)
             .await
             .map_err(fs_error_from_host)?;
-        Ok(entries
-            .into_iter()
-            .enumerate()
-            .skip(skip)
-            .take(max_entries)
-            .map(|(position, entry)| DirEntry {
+        let mut listed = Vec::new();
+        for (position, entry) in entries.into_iter().enumerate().skip(skip).take(max_entries) {
+            let kind = match entry.kind {
+                Some(kind) => kind,
+                // The host's listing did not say: its attributes do.
+                None => {
+                    let child = if path.is_root() {
+                        alloc::format!("/{}", entry.name)
+                    } else {
+                        alloc::format!("{}/{}", path.as_str(), entry.name)
+                    };
+                    let metadata = self
+                        .client
+                        .stat_path(&child)
+                        .await
+                        .map_err(fs_error_from_host)?;
+                    metadata_from_host(&metadata)?.kind
+                }
+            };
+            listed.push(DirEntry {
                 name: entry.name,
-                kind: if entry.is_directory {
-                    NodeKind::Directory
-                } else {
-                    NodeKind::File
-                },
+                kind,
                 inode: 0,
                 next: DirCookie::new(position as u64 + 1),
-            })
-            .collect())
+            });
+        }
+        Ok(listed)
     }
 
     async fn create_directory(&self, path: FsPath<'_>, _now: u64) -> FsResult<()> {
@@ -325,7 +337,7 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
 mod tests {
     use helios_hal::fs::{FsError, NodeKind};
 
-    use super::{P9_QID_TYPE_DIRECTORY, fs_error_from_host, metadata_from_host};
+    use super::{fs_error_from_host, metadata_from_host};
     use crate::{AuthorityDomain, HostFsError, HostMetadata, ObjectIdentity, object_identity};
 
     /// A name the host share's wire cannot carry stays "name too long"
@@ -339,12 +351,12 @@ mod tests {
         assert_eq!(fs_error_from_host(error), FsError::NameTooLong);
     }
 
-    fn host_metadata(identity: ObjectIdentity, qid_type: u8) -> HostMetadata {
+    fn host_metadata(identity: ObjectIdentity, qid_type: u8, mode: u32) -> HostMetadata {
         HostMetadata {
             identity,
             qid_path: identity.local(),
             qid_type,
-            mode: 0o100_644,
+            mode,
             size: 17,
             link_count: 2,
             access_nanos: 3_000_000_004,
@@ -360,7 +372,8 @@ mod tests {
     fn host_metadata_keeps_timestamps_link_count_and_identity() {
         let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 4242);
 
-        let metadata = metadata_from_host(&host_metadata(identity, 0));
+        let metadata =
+            metadata_from_host(&host_metadata(identity, 0, 0o100_644)).expect("a regular file");
 
         assert_eq!(metadata.kind, NodeKind::File);
         assert_eq!(metadata.link_count, 2);
@@ -371,12 +384,22 @@ mod tests {
         assert_eq!(object_identity(&metadata), identity);
     }
 
+    /// The kind is the mode's, not the qid's: the qid type of a device,
+    /// FIFO or socket is that of a regular file.
     #[test]
-    fn host_directory_metadata_is_a_directory() {
+    fn host_metadata_kind_is_the_modes_file_type() {
         let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 9);
-
-        let metadata = metadata_from_host(&host_metadata(identity, P9_QID_TYPE_DIRECTORY));
-
-        assert_eq!(metadata.kind, NodeKind::Directory);
+        for (mode, kind) in [
+            (0o040_755, NodeKind::Directory),
+            (0o100_644, NodeKind::File),
+            (0o120_777, NodeKind::Symlink),
+            (0o020_666, NodeKind::CharacterDevice),
+            (0o060_660, NodeKind::BlockDevice),
+            (0o010_644, NodeKind::Fifo),
+            (0o140_755, NodeKind::Socket),
+        ] {
+            let metadata = metadata_from_host(&host_metadata(identity, 0, mode)).expect("a kind");
+            assert_eq!(metadata.kind, kind, "mode {mode:o}");
+        }
     }
 }

@@ -145,6 +145,10 @@ pub(crate) fn node_kind(kind: NodeKind) -> FsNodeKind {
         NodeKind::Directory => FsNodeKind::Directory,
         NodeKind::File => FsNodeKind::File,
         NodeKind::Symlink => FsNodeKind::Symlink,
+        NodeKind::CharacterDevice => FsNodeKind::CharacterDevice,
+        NodeKind::BlockDevice => FsNodeKind::BlockDevice,
+        NodeKind::Fifo => FsNodeKind::Fifo,
+        NodeKind::Socket => FsNodeKind::Socket,
     }
 }
 
@@ -153,6 +157,10 @@ pub(crate) fn descriptor_type_from_node_kind(kind: FsNodeKind) -> fs_types::Desc
         FsNodeKind::Directory => fs_types::DescriptorType::Directory,
         FsNodeKind::File => fs_types::DescriptorType::RegularFile,
         FsNodeKind::Symlink => fs_types::DescriptorType::SymbolicLink,
+        FsNodeKind::CharacterDevice => fs_types::DescriptorType::CharacterDevice,
+        FsNodeKind::BlockDevice => fs_types::DescriptorType::BlockDevice,
+        FsNodeKind::Fifo => fs_types::DescriptorType::Fifo,
+        FsNodeKind::Socket => fs_types::DescriptorType::Socket,
     }
 }
 

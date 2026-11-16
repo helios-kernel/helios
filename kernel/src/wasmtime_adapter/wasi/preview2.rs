@@ -3277,6 +3277,10 @@ fn descriptor_type_from_kind(kind: FsNodeKind) -> p2fs::DescriptorType {
         FsNodeKind::Directory => p2fs::DescriptorType::Directory,
         FsNodeKind::File => p2fs::DescriptorType::RegularFile,
         FsNodeKind::Symlink => p2fs::DescriptorType::SymbolicLink,
+        FsNodeKind::CharacterDevice => p2fs::DescriptorType::CharacterDevice,
+        FsNodeKind::BlockDevice => p2fs::DescriptorType::BlockDevice,
+        FsNodeKind::Fifo => p2fs::DescriptorType::Fifo,
+        FsNodeKind::Socket => p2fs::DescriptorType::Socket,
     }
 }
 

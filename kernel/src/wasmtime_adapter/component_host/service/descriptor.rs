@@ -1448,6 +1448,11 @@ pub(super) fn p1_filetype(kind: FsNodeKind) -> u8 {
         FsNodeKind::Directory => 3,
         FsNodeKind::File => 4,
         FsNodeKind::Symlink => 7,
+        FsNodeKind::CharacterDevice => 2,
+        FsNodeKind::BlockDevice => 1,
+        // `filetype` has no FIFO, and a socket there is a datagram or a
+        // stream one, which a filesystem node does not say: `unknown`.
+        FsNodeKind::Fifo | FsNodeKind::Socket => 0,
     }
 }
 
