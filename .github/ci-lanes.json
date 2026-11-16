@@ -118,6 +118,13 @@
     ],
     "exclusive": true
   },
+  "test-btrfs-fstests": {
+    "heavy": true,
+    "surfaces": [
+      "btrfs"
+    ],
+    "exclusive": true
+  },
   "test-btrfs-fuzz": {
     "surfaces": [
       "btrfs"

@@ -69,6 +69,7 @@ pub struct Superblock {
     chunk_root: RootPointer,
     log_root: u64,
     total_bytes: u64,
+    bytes_used: u64,
     num_devices: u64,
     sectorsize: u32,
     nodesize: u32,
@@ -170,6 +171,7 @@ impl Superblock {
             },
             log_root: raw.log_root.get(),
             total_bytes: raw.total_bytes.get(),
+            bytes_used: raw.bytes_used.get(),
             num_devices: raw.num_devices.get(),
             sectorsize,
             nodesize,
@@ -255,6 +257,12 @@ impl Superblock {
 
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+
+    /// Bytes of the device's block groups in use, as the superblock records
+    /// them at its commit.
+    pub fn bytes_used(&self) -> u64 {
+        self.bytes_used
     }
 
     pub fn sectorsize(&self) -> u32 {

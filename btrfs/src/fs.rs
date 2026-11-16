@@ -255,6 +255,14 @@ impl<S: BlockSource> Filesystem<S> {
             .await
     }
 
+    /// Inode `number` of subvolume `tree`, as of this view's commit. For a
+    /// caller that holds an inode's identity across commits and needs its
+    /// current state, such as a network or FUSE server.
+    pub async fn inode(&self, tree: u64, number: u64) -> Result<Inode, Error> {
+        let record = find_root(&self.volume, self.snapshot.root_tree, tree).await?;
+        self.load_inode(record.root, number, &self.snapshot).await
+    }
+
     async fn load_inode(
         &self,
         root: TreeRoot,

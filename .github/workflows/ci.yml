@@ -2696,6 +2696,42 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  test-btrfs-fstests:
+    name: test-btrfs-fstests
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-fstests')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install fstests, btrfs-progs and FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            acl attr automake bc dbench dump e2fsprogs fio gawk gcc git indent \
+            libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin \
+            liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev \
+            uuid-runtime xfsprogs "linux-headers-$(uname -r)" sqlite3 \
+            libgdbm-compat-dev btrfs-progs fuse3 libclang-dev \
+            "linux-modules-extra-$(uname -r)"
+      - name: Build the FUSE adapter
+        working-directory: helios
+        run: cargo build --locked -p helios-btrfs --example fuse-btrfs --features test-support,write
+      - name: Run fstests against the FUSE mount
+        working-directory: helios
+        run: sudo env "PATH=$PATH" tools/btrfs/fstests/run.sh
+      - name: Preserve fstests results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-fstests-results
+          path: helios/target/fstests/results
+          if-no-files-found: warn
+          retention-days: 14
+
   test-btrfs-fuzz:
     name: test-btrfs-fuzz (${{ matrix.target }})
     needs: [changes, test-btrfs-upstream]
@@ -2739,7 +2775,7 @@ jobs:
   gate:
     name: CI result
     if: always()
-    needs: [changes, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fuzz]
+    needs: [changes, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fstests, test-btrfs-fuzz]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -41,6 +41,15 @@ futures-lite = { version = "2.6.1", default-features = false, features = ["std"]
 lzokay = { version = "2.0.1", default-features = false, features = ["compress", "alloc"] }
 tempfile.workspace = true
 
+# Only the FUSE adapter example needs these, and only on Linux: fuser mounts
+# through `fusermount3` with no libfuse.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+fuser = { version = "0.18.0", default-features = false }
+getrandom = { version = "0.4.3", default-features = false }
+libc = { version = "0.2.191", default-features = false }
+tracing-log = { version = "0.2.0", default-features = false, features = ["log-tracer", "std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+
 [lints]
 workspace = true
 
@@ -61,3 +70,7 @@ bench = false
 [[example]]
 name = "btrfs-corpus"
 required-features = ["test-support"]
+
+[[example]]
+name = "fuse-btrfs"
+required-features = ["test-support", "write"]
