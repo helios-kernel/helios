@@ -268,10 +268,13 @@ fn stat_impl(path: &Path) -> Result<HostMetadata, HostFsError> {
     let meta = fs::symlink_metadata(path).map_err(map_io_error)?;
     let mode = meta.mode();
     // 9p `QTDIR` and `QTSYMLINK`.
-    let qid_type = match mode & libc::S_IFMT as u32 {
-        mode if mode == libc::S_IFDIR as u32 => 0x80,
-        mode if mode == libc::S_IFLNK as u32 => 0x02,
-        _ => 0x00,
+    let file_type = meta.file_type();
+    let qid_type = if file_type.is_dir() {
+        0x80
+    } else if file_type.is_symlink() {
+        0x02
+    } else {
+        0x00
     };
     let inode = meta.ino();
     Ok(HostMetadata {
