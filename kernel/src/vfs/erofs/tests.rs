@@ -18,7 +18,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use erofs_rs::build::{Compression, Options};
+use erofs_rs::build::{Builder, Compression, Metadata, Options, SpecialFile};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
     BlockSerial, DeviceId, DirCookie, FileSystem, FsError, FsPath, IoError, NodeKind, OpenFlags,
@@ -349,6 +349,96 @@ fn builder_images_mount_and_read_their_tree() {
 #[test]
 fn corrupted_builder_images_fail_with_typed_errors() {
     assert_corruptions_fail(&built(Compression::None));
+}
+
+/// What a special node of the image is called, what it is, and what
+/// opening it answers.
+const SPECIAL_NODES: [(&str, SpecialFile, NodeKind, FsError); 4] = [
+    (
+        "tty0",
+        SpecialFile::CharacterDevice { major: 4, minor: 0 },
+        NodeKind::CharacterDevice,
+        FsError::NotPermitted,
+    ),
+    (
+        "sda",
+        SpecialFile::BlockDevice { major: 8, minor: 0 },
+        NodeKind::BlockDevice,
+        FsError::NotPermitted,
+    ),
+    (
+        "fifo",
+        SpecialFile::Fifo,
+        NodeKind::Fifo,
+        FsError::Unsupported,
+    ),
+    (
+        "socket",
+        SpecialFile::Socket,
+        NodeKind::Socket,
+        FsError::Unsupported,
+    ),
+];
+
+/// One directory holding a device node of each kind, a FIFO, a socket and
+/// the Chinese, Japanese and Korean files, written by the `erofs-rs`
+/// builder, which needs neither privileges nor `mkfs.erofs`.
+fn special_nodes_image() -> Vec<u8> {
+    let metadata = Metadata::default();
+    let mut builder = Builder::new(std::io::Cursor::new(Vec::new())).unwrap();
+    builder.append_dir("/", &metadata).unwrap();
+    for (name, content) in CJK_FILES {
+        builder
+            .append_file(name, &metadata, content.len() as u64, content.as_bytes())
+            .unwrap();
+    }
+    for (name, kind, ..) in SPECIAL_NODES {
+        builder.append_special(name, &metadata, kind).unwrap();
+    }
+    builder.finish().unwrap().into_inner()
+}
+
+/// A directory holding a device node, a FIFO or a socket lists, with each
+/// entry's kind, and each is statted as what it is; opening or reading one
+/// is refused and its regular siblings are untouched.
+#[test]
+fn special_nodes_are_listed_and_statted_and_never_opened() {
+    let fs = mount(&special_nodes_image()).expect("the image mounts");
+
+    let mut listed = list(&fs, "").expect("the directory lists");
+    listed.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected: Vec<(String, NodeKind)> = CJK_FILES
+        .iter()
+        .map(|(name, _)| ((*name).into(), NodeKind::File))
+        .chain(
+            SPECIAL_NODES
+                .iter()
+                .map(|(name, _, kind, _)| ((*name).into(), *kind)),
+        )
+        .collect();
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(listed, expected);
+
+    for (name, _, kind, refusal) in SPECIAL_NODES {
+        let metadata = block_on(fs.stat(path(name))).expect("stat reports the node");
+        assert_eq!(metadata.kind, kind, "{name}");
+        assert_eq!(metadata.size, 0, "{name} holds no bytes");
+        assert_eq!(
+            block_on(fs.open(path(name), OpenFlags::empty(), 0)).map(|_| ()),
+            Err(refusal),
+            "open {name}"
+        );
+        assert_eq!(
+            block_on(fs.read_at(path(name), 0, 16)).map(|_| ()),
+            Err(refusal),
+            "read {name}"
+        );
+    }
+
+    for (name, content) in CJK_FILES {
+        assert_eq!(read_all(&fs, name).unwrap(), content.as_bytes());
+        block_on(fs.open(path(name), OpenFlags::empty(), 0)).expect("a regular file opens");
+    }
 }
 
 /// The block cache's own error for a read the device refused.

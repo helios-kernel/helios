@@ -17,7 +17,7 @@ use crate::wasmtime_adapter::component_host::ProgramSource;
 use crate::wasmtime_adapter::cwasm::{self, UntrustedCwasm};
 use crate::{
     AuthorityDomain, BOOT_DEVICE, BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-    FileContents, Follow, HostShare, MemoryFs, MountTable, MountedFs, Namespace,
+    FileContents, Follow, FsDescriptorFlags, HostShare, MemoryFs, MountTable, MountedFs, Namespace,
     UnsupportedHostFileSystem, UnsupportedStorage, object_identity,
 };
 
@@ -39,9 +39,9 @@ fn root() -> FsDescriptor {
     FsDescriptor {
         path: String::from("/"),
         kind: FsNodeKind::Directory,
-        flags: fs_types::DescriptorFlags::READ
-            | fs_types::DescriptorFlags::WRITE
-            | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+        flags: FsDescriptorFlags::READ
+            | FsDescriptorFlags::WRITE
+            | FsDescriptorFlags::MUTATE_DIRECTORY,
         identity: None,
         mount: None,
     }
@@ -49,7 +49,7 @@ fn root() -> FsDescriptor {
 
 fn readonly_root() -> FsDescriptor {
     FsDescriptor {
-        flags: fs_types::DescriptorFlags::READ,
+        flags: FsDescriptorFlags::READ,
         ..root()
     }
 }
@@ -66,7 +66,7 @@ fn open(
     base: &FsDescriptor,
     path: &str,
     open_flags: fs_types::OpenFlags,
-    flags: fs_types::DescriptorFlags,
+    flags: FsDescriptorFlags,
 ) -> Result<FsDescriptor, fs_types::ErrorCode> {
     block_on(async {
         open_at(
@@ -88,7 +88,7 @@ fn create_file(namespace: &TestNamespace, path: &str, bytes: &[u8]) -> FsDescrip
         &root(),
         path,
         fs_types::OpenFlags::CREATE,
-        fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+        FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
     )
     .expect("file creation must succeed");
     block_on(super::write(
@@ -165,7 +165,7 @@ fn writing_a_boot_image_file_writes_the_trees_own_copy() {
         &root(),
         "bin/tool",
         fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+        FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
     )
     .expect("a boot image file opens for writing");
 
@@ -190,7 +190,7 @@ fn open_at_rejects_descriptor_right_widening() {
         &readonly_root(),
         "bin/tool",
         fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+        FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
     )
     .err()
     .expect("open_at must not grant write through a read-only base descriptor");
@@ -208,7 +208,7 @@ fn opening_existing_directory_without_directory_flag_fails() {
         &root(),
         "tmp",
         fs_types::OpenFlags::CREATE,
-        fs_types::DescriptorFlags::WRITE,
+        FsDescriptorFlags::WRITE,
     )
     .err()
     .expect("opening an existing directory as a file must fail");
@@ -243,7 +243,7 @@ fn descriptors_carry_stable_object_identity() {
             &root(),
             "bin/tool",
             fs_types::OpenFlags::empty(),
-            fs_types::DescriptorFlags::READ,
+            FsDescriptorFlags::READ,
         )
         .expect("open must succeed")
     };
@@ -301,12 +301,12 @@ fn hardlink_preserves_identity_and_shared_contents() {
         &root(),
         "alias",
         fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::READ,
+        FsDescriptorFlags::READ,
     )
     .expect("alias open must succeed");
 
     assert_eq!(original.identity, alias.identity);
-    assert!(!alias.flags.contains(fs_types::DescriptorFlags::WRITE));
+    assert!(!alias.flags.contains(FsDescriptorFlags::WRITE));
     assert_eq!(
         block_on(stat_path(&namespace, "/tmp", Follow::No))
             .expect("stat must succeed")
@@ -337,7 +337,7 @@ fn set_size_resizes_all_links_without_widening_descriptor_rights() {
         &root(),
         "alias",
         fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::READ,
+        FsDescriptorFlags::READ,
     )
     .expect("alias open must succeed");
     assert_eq!(read_all(&namespace, &alias), b"data\0\0");
@@ -349,7 +349,7 @@ fn set_size_resizes_all_links_without_widening_descriptor_rights() {
     );
 
     let read_only = FsDescriptor {
-        flags: fs_types::DescriptorFlags::READ,
+        flags: FsDescriptorFlags::READ,
         ..original
     };
     let error = read_only
@@ -482,7 +482,7 @@ fn symlink_follow_is_confined_and_loop_limited() {
         fs_types::PathFlags::SYMLINK_FOLLOW,
         "tool-link",
         fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::READ,
+        FsDescriptorFlags::READ,
         1,
     ))
     .expect("symlink follow must open the target");
@@ -498,7 +498,7 @@ fn symlink_follow_is_confined_and_loop_limited() {
         fs_types::PathFlags::SYMLINK_FOLLOW,
         "loop-a",
         fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::READ,
+        FsDescriptorFlags::READ,
         1,
     ))
     .err()
@@ -733,7 +733,7 @@ fn writing_a_bootfs_node_drops_its_provenance() {
             &root(),
             "bin/prog",
             fs_types::OpenFlags::empty(),
-            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
         )
         .expect("opening the node for writing must succeed");
         change(&namespace, &descriptor).expect("the change lands in a copy");
@@ -808,7 +808,7 @@ fn a_link_at_the_base_does_not_lead_out_of_it() {
             fs_types::PathFlags::SYMLINK_FOLLOW,
             path,
             fs_types::OpenFlags::DIRECTORY,
-            fs_types::DescriptorFlags::READ,
+            FsDescriptorFlags::READ,
             1,
         ));
         assert!(matches!(opened, Err(fs_types::ErrorCode::NotPermitted)));
@@ -834,7 +834,7 @@ fn a_link_at_the_base_does_not_lead_out_of_it() {
         fs_types::PathFlags::SYMLINK_FOLLOW,
         "work",
         fs_types::OpenFlags::DIRECTORY,
-        fs_types::DescriptorFlags::READ,
+        FsDescriptorFlags::READ,
         1,
     ))
     .expect("the root's descriptor follows a link inside the root");
@@ -874,7 +874,7 @@ fn an_append_resolves_with_the_end_of_file_it_reached() {
         &root(),
         "log",
         fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::WRITE,
+        FsDescriptorFlags::WRITE,
     )
     .expect("a second writer opens the file");
     let end = block_on(super::write(
@@ -968,7 +968,7 @@ fn mount_unreachable_host(namespace: &TestNamespace, point: &str) {
 }
 
 /// A directory descriptor at `path` that holds exactly `flags`.
-fn directory_holding(path: &str, flags: fs_types::DescriptorFlags) -> FsDescriptor {
+fn directory_holding(path: &str, flags: FsDescriptorFlags) -> FsDescriptor {
     FsDescriptor {
         path: String::from(path),
         flags,
@@ -982,7 +982,7 @@ fn host_bases() -> (FsDescriptor, FsDescriptor) {
     let rights = root().flags;
     (
         directory_holding("/mnt/a", rights),
-        directory_holding("/mnt/a", fs_types::DescriptorFlags::READ),
+        directory_holding("/mnt/a", FsDescriptorFlags::READ),
     )
 }
 
@@ -1029,8 +1029,8 @@ fn a_read_only_base_renames_nothing_on_the_host_share() {
     // A source that may be read but not changed, into a destination that
     // may change but not write: only the source's `mutate-directory` is
     // missing.
-    let read = fs_types::DescriptorFlags::READ;
-    let no_write = directory_holding("/mnt/a", read | fs_types::DescriptorFlags::MUTATE_DIRECTORY);
+    let read = FsDescriptorFlags::READ;
+    let no_write = directory_holding("/mnt/a", read | FsDescriptorFlags::MUTATE_DIRECTORY);
     let from_read_only = rename(&namespace, &ro, "old", &no_write, "new");
     assert!(matches!(from_read_only, Err(fs_types::ErrorCode::ReadOnly)));
     let into_read_only = rename(&namespace, &rw, "old", &ro, "new");
@@ -1064,7 +1064,7 @@ fn set_times_needs_write_on_the_descriptor() {
     let file = create_file(&namespace, "tmp", b"");
     let before = times_of(&namespace, "/tmp");
     let read_only = FsDescriptor {
-        flags: fs_types::DescriptorFlags::READ,
+        flags: FsDescriptorFlags::READ,
         ..file.clone()
     };
 
@@ -1073,7 +1073,7 @@ fn set_times_needs_write_on_the_descriptor() {
     assert_eq!(times_of(&namespace, "/tmp"), before);
 
     let writer = FsDescriptor {
-        flags: fs_types::DescriptorFlags::WRITE,
+        flags: FsDescriptorFlags::WRITE,
         ..file
     };
     block_on(set_times(
@@ -1092,12 +1092,12 @@ fn set_times_needs_write_on_the_descriptor() {
     block_on(create_directory_at(&namespace, held(&root()), "dir", 1)).expect("creates /dir");
     let directory = |flags| directory_holding("/dir", flags);
     assert!(matches!(
-        directory(fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE)
+        directory(FsDescriptorFlags::READ | FsDescriptorFlags::WRITE)
             .grant_touch()
             .err(),
         Some(fs_types::ErrorCode::ReadOnly)
     ));
-    let mutator = directory(fs_types::DescriptorFlags::MUTATE_DIRECTORY);
+    let mutator = directory(FsDescriptorFlags::MUTATE_DIRECTORY);
     block_on(set_times(
         &namespace,
         mutator.grant_touch().expect("a mutable directory"),
@@ -1123,7 +1123,7 @@ fn set_times_asks_the_host_only_with_the_right() {
     let reached = block_on(async {
         set_times(
             &namespace,
-            file(fs_types::DescriptorFlags::WRITE).grant_touch()?,
+            file(FsDescriptorFlags::WRITE).grant_touch()?,
             Some(1),
             Some(2),
             3,
@@ -1135,7 +1135,7 @@ fn set_times_asks_the_host_only_with_the_right() {
     let refused = block_on(async {
         set_times(
             &namespace,
-            file(fs_types::DescriptorFlags::READ).grant_touch()?,
+            file(FsDescriptorFlags::READ).grant_touch()?,
             Some(1),
             Some(2),
             3,
@@ -1167,8 +1167,8 @@ fn set_times_at_needs_write_or_mutate_on_the_base() {
     assert_eq!(times_of(&namespace, "/tmp"), before);
 
     for (flags, times) in [
-        (fs_types::DescriptorFlags::WRITE, (11, 17)),
-        (fs_types::DescriptorFlags::MUTATE_DIRECTORY, (23, 29)),
+        (FsDescriptorFlags::WRITE, (11, 17)),
+        (FsDescriptorFlags::MUTATE_DIRECTORY, (23, 29)),
     ] {
         let base = base(flags);
         block_on(set_times_at(
@@ -1201,7 +1201,7 @@ fn a_read_only_base_creates_or_truncates_nothing_before_asking_the_host() {
     let namespace = namespace();
     mount_unreachable_host(&namespace, "/mnt");
     let (rw, ro) = host_bases();
-    let read = fs_types::DescriptorFlags::READ;
+    let read = FsDescriptorFlags::READ;
 
     // The control: a base that may create and truncate reaches the share.
     for open_flags in [fs_types::OpenFlags::CREATE, fs_types::OpenFlags::TRUNCATE] {
@@ -1221,9 +1221,9 @@ fn a_read_only_base_creates_or_truncates_nothing_in_memory() {
     let namespace = namespace();
     mount_memory(&namespace, "/mnt");
     let notes = create_file(&namespace, "mnt/notes", "日本語 한국어".as_bytes());
-    let read = fs_types::DescriptorFlags::READ;
+    let read = FsDescriptorFlags::READ;
     let read_only = directory_holding("/mnt", read);
-    let no_write = directory_holding("/mnt", read | fs_types::DescriptorFlags::MUTATE_DIRECTORY);
+    let no_write = directory_holding("/mnt", read | FsDescriptorFlags::MUTATE_DIRECTORY);
 
     // A new name, and an existing one: creating is refused either way.
     for name in ["new", "notes"] {
@@ -1318,7 +1318,7 @@ fn secret_in_a() -> TestNamespace {
 #[test]
 fn a_link_needs_the_read_right_on_its_source() {
     let namespace = secret_in_a();
-    let write_only = fs_types::DescriptorFlags::WRITE | fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    let write_only = FsDescriptorFlags::WRITE | FsDescriptorFlags::MUTATE_DIRECTORY;
     let source = directory_holding("/a", write_only);
     let destination = directory_holding("/b", root().flags);
 
@@ -1333,7 +1333,7 @@ fn a_link_needs_the_read_right_on_its_source() {
 #[test]
 fn a_link_cannot_make_a_read_only_file_writable() {
     let namespace = secret_in_a();
-    let read = fs_types::DescriptorFlags::READ;
+    let read = FsDescriptorFlags::READ;
     let read_only = directory_holding("/a", read);
     let read_write = directory_holding("/b", root().flags);
 
@@ -1366,7 +1366,7 @@ fn a_link_cannot_make_a_read_only_file_writable() {
 
     // A destination that cannot write takes a read-only source, and a
     // writable source feeds a writable destination.
-    let no_write = directory_holding("/b", read | fs_types::DescriptorFlags::MUTATE_DIRECTORY);
+    let no_write = directory_holding("/b", read | FsDescriptorFlags::MUTATE_DIRECTORY);
     link(&namespace, &read_only, "secret", &no_write, "view").expect("read-only to no-write");
     let writable = directory_holding("/a", root().flags);
     link(&namespace, &writable, "secret", &read_write, "copy").expect("read-write to read-write");
@@ -1385,10 +1385,7 @@ fn a_link_cannot_make_a_read_only_file_writable() {
 fn a_link_needs_mutate_on_its_destination() {
     let namespace = secret_in_a();
     let source = directory_holding("/a", root().flags);
-    let destination = directory_holding(
-        "/b",
-        fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
-    );
+    let destination = directory_holding("/b", FsDescriptorFlags::READ | FsDescriptorFlags::WRITE);
 
     let refused = link(&namespace, &source, "secret", &destination, "copy");
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
@@ -1442,7 +1439,7 @@ fn lookups_through(
         base,
         "secret",
         fs_types::OpenFlags::empty(),
-        fs_types::DescriptorFlags::READ,
+        FsDescriptorFlags::READ,
     )
     .map(drop);
     [stat, readlink, open]
@@ -1451,10 +1448,10 @@ fn lookups_through(
 #[test]
 fn a_lookup_needs_the_read_right_on_its_base() {
     let namespace = secret_on_a_memory_mount();
-    let readable = directory_holding("/mnt/a", fs_types::DescriptorFlags::READ);
+    let readable = directory_holding("/mnt/a", FsDescriptorFlags::READ);
     let unreadable = directory_holding(
         "/mnt/a",
-        fs_types::DescriptorFlags::WRITE | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+        FsDescriptorFlags::WRITE | FsDescriptorFlags::MUTATE_DIRECTORY,
     );
 
     // The control: a readable base looks everything up.
@@ -1484,7 +1481,7 @@ fn a_lookup_needs_the_read_right_on_its_base() {
     }
     let unreadable = directory_holding(
         "/mnt/a",
-        fs_types::DescriptorFlags::WRITE | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+        FsDescriptorFlags::WRITE | FsDescriptorFlags::MUTATE_DIRECTORY,
     );
     for answer in lookups_through(&host_namespace, &unreadable) {
         assert!(
@@ -1499,7 +1496,7 @@ fn a_rename_needs_the_read_right_on_its_source() {
     let namespace = secret_on_a_memory_mount();
     let source = directory_holding(
         "/mnt/a",
-        fs_types::DescriptorFlags::WRITE | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+        FsDescriptorFlags::WRITE | FsDescriptorFlags::MUTATE_DIRECTORY,
     );
     let destination = directory_holding("/mnt/b", root().flags);
 
@@ -1527,8 +1524,8 @@ fn a_rename_needs_the_read_right_on_its_source() {
 #[test]
 fn a_rename_cannot_make_a_read_only_file_writable() {
     let namespace = secret_on_a_memory_mount();
-    let read = fs_types::DescriptorFlags::READ;
-    let mutate = fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    let read = FsDescriptorFlags::READ;
+    let mutate = FsDescriptorFlags::MUTATE_DIRECTORY;
     let read_only = directory_holding("/mnt/a", read | mutate);
     let read_write = directory_holding("/mnt/b", root().flags);
 
@@ -1581,8 +1578,8 @@ fn namespace_with_host() -> TestNamespace {
 #[test]
 fn listing_a_directory_needs_the_read_right() {
     let namespace = secret_in_a();
-    let mutate_only = fs_types::DescriptorFlags::MUTATE_DIRECTORY;
-    let readable = directory_holding("/a", fs_types::DescriptorFlags::READ);
+    let mutate_only = FsDescriptorFlags::MUTATE_DIRECTORY;
+    let readable = directory_holding("/a", FsDescriptorFlags::READ);
     let names: alloc::vec::Vec<_> = list(&namespace, &readable)
         .expect("a readable directory lists")
         .into_iter()
@@ -1621,11 +1618,11 @@ fn reads_need_the_read_right_on_every_backing() {
 
     for file in [&on_root, &in_memory, &on_host] {
         let write_only = FsDescriptor {
-            flags: fs_types::DescriptorFlags::WRITE,
+            flags: FsDescriptorFlags::WRITE,
             ..file.clone()
         };
         let read_only = FsDescriptor {
-            flags: fs_types::DescriptorFlags::READ,
+            flags: FsDescriptorFlags::READ,
             ..file.clone()
         };
         let path = &file.path;
@@ -1654,7 +1651,7 @@ fn reads_need_the_read_right_on_every_backing() {
 
     // The control: with the right, the host share is the one that answers.
     let readable = FsDescriptor {
-        flags: fs_types::DescriptorFlags::READ,
+        flags: FsDescriptorFlags::READ,
         ..on_host
     };
     let reached = block_on(async { read(&namespace, readable.grant()?, 0, 64).await });
@@ -1675,7 +1672,7 @@ fn a_create_lands_on_the_mount_that_owns_the_new_entry() {
         &root(),
         "mnt/new",
         fs_types::OpenFlags::CREATE,
-        fs_types::DescriptorFlags::READ,
+        FsDescriptorFlags::READ,
     );
     assert!(matches!(created, Err(fs_types::ErrorCode::ReadOnly)));
     let directory = block_on(create_directory_at(&namespace, held(&root()), "mnt/d", 1));

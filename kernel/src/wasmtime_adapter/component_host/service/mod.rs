@@ -71,7 +71,7 @@ use crate::wasmtime_adapter::{
 use crate::{
     BootfsBytes, ComponentStdioRefusal, ProgramExecErrorDetail, RuntimeMessage, UnbindableStdio,
 };
-use crate::{FileContents, MemoryFs, Namespace};
+use crate::{FileContents, FsDescriptorFlags, MemoryFs, Namespace};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -92,6 +92,7 @@ use helios_compiler_abi::{
 use helios_hal::fs::WritePosition;
 use helios_hal::measured_boot::{MeasuredBoot, Sha256Digest};
 use helios_hal::watchdog::Watchdog;
+use helios_unix::OpenFile;
 use helios_unix::{DescriptorLimit, GuestAddress};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -2837,14 +2838,14 @@ mod tests {
         let root = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ,
+            flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
         };
         let work = FsDescriptor {
             path: "/work".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ,
+            flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
         };
@@ -2889,17 +2890,13 @@ mod tests {
 
     #[test]
     fn fd_renumber_replaces_stdio_descriptor() {
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/redirected".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::WRITE,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/redirected".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+        }));
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
@@ -2920,8 +2917,8 @@ mod tests {
 
         assert_eq!(table.renumber(3, 1), p1::errno::SUCCESS);
         match table.get(1) {
-            Some(Preview1Descriptor::File { descriptor, .. }) => {
-                assert_eq!(descriptor.path, "/redirected");
+            Some(Preview1Descriptor::File(file)) => {
+                assert_eq!(file.node().path, "/redirected");
             }
             _ => panic!("fd 1 should be redirected to the file descriptor"),
         }
@@ -3113,18 +3110,17 @@ mod tests {
             crate::TryWrite::Closed
         ));
 
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/redirected".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::WRITE,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
-        assert_eq!(table.insert_at(1, file, false), Ok(1));
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/redirected".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+        }));
+        assert_eq!(
+            table.insert_entry_at(1, Preview1DescriptorEntry::new(file, false)),
+            Ok(1)
+        );
         assert_eq!(
             table.component_output_mode(&session).err(),
             Some(ComponentStdioRefusal {
@@ -3174,7 +3170,10 @@ mod tests {
             Err(p1::errno::BADF)
         );
         assert_eq!(
-            snapshot.insert_at(i32::MAX - 1, Preview1Descriptor::NullDevice, false),
+            snapshot.insert_entry_at(
+                i32::MAX - 1,
+                Preview1DescriptorEntry::new(Preview1Descriptor::NullDevice, false)
+            ),
             Err(p1::errno::BADF)
         );
         assert_eq!(snapshot.target_index(i32::MAX - 1), Err(p1::errno::BADF));
@@ -3248,17 +3247,13 @@ mod tests {
 
     #[test]
     fn fd_dup2_replaces_exact_target_descriptor() {
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/redirected".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::WRITE,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/redirected".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+        }));
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
@@ -3279,8 +3274,8 @@ mod tests {
 
         assert_eq!(table.dup_to(3, 1, true), Ok(1));
         match table.get(1) {
-            Some(Preview1Descriptor::File { descriptor, .. }) => {
-                assert_eq!(descriptor.path, "/redirected");
+            Some(Preview1Descriptor::File(file)) => {
+                assert_eq!(file.node().path, "/redirected");
             }
             _ => panic!("fd 1 should be duplicated to the file descriptor"),
         }
@@ -3289,20 +3284,17 @@ mod tests {
 
     #[test]
     fn descriptor_table_preserves_fdflags_across_dup_and_exec_snapshot() {
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/nonblock".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: P1_FDFLAG_NONBLOCK,
-        };
-        let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![Some(
-            Preview1DescriptorEntry::new(file, false),
-        )]);
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/nonblock".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+        }));
+        let entry = Preview1DescriptorEntry::new(file, false);
+        entry.set_fdflags(P1_FDFLAG_NONBLOCK);
+        let mut table: TestDescriptorTable =
+            Preview1DescriptorTable::from_entries(vec![Some(entry)]);
 
         assert_eq!(table.fdflags(0), Ok(P1_FDFLAG_NONBLOCK));
         assert_eq!(table.dup(0), Ok(1));
@@ -3396,7 +3388,7 @@ mod tests {
             descriptor: FsDescriptor {
                 path: "/mnt/workspace".into(),
                 kind: FsNodeKind::Directory,
-                flags: fs_types::DescriptorFlags::READ,
+                flags: FsDescriptorFlags::READ,
                 identity: None,
                 mount: None,
             },
@@ -3515,34 +3507,26 @@ mod tests {
             .expect("guest path should resolve inside chroot root");
 
         assert_eq!(source, "/mnt/workspace/app/bin/tool");
-        assert!(flags.contains(fs_types::DescriptorFlags::READ));
-        assert!(flags.contains(fs_types::DescriptorFlags::WRITE));
+        assert!(flags.contains(FsDescriptorFlags::READ));
+        assert!(flags.contains(FsDescriptorFlags::WRITE));
     }
 
     #[test]
     fn exec_descriptor_snapshot_drops_close_on_exec_entries() {
-        let closed = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/closed-on-exec".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
-        let retained = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/retained".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
+        let closed = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/closed-on-exec".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+        }));
+        let retained = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/retained".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+        }));
         let table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
@@ -3558,8 +3542,8 @@ mod tests {
 
         assert!(exec_table.get(1).is_none());
         match exec_table.get(2) {
-            Some(Preview1Descriptor::File { descriptor, .. }) => {
-                assert_eq!(descriptor.path, "/retained");
+            Some(Preview1Descriptor::File(file)) => {
+                assert_eq!(file.node().path, "/retained");
             }
             _ => panic!("fd 2 should be retained across exec"),
         }
@@ -3575,7 +3559,7 @@ mod tests {
                         descriptor: FsDescriptor {
                             path: "/mnt/workspace".into(),
                             kind: FsNodeKind::Directory,
-                            flags: fs_types::DescriptorFlags::READ,
+                            flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
                         },
@@ -3604,7 +3588,7 @@ mod tests {
             descriptor: FsDescriptor {
                 path: "/mnt/workspace".into(),
                 kind: FsNodeKind::Directory,
-                flags: fs_types::DescriptorFlags::READ,
+                flags: FsDescriptorFlags::READ,
                 identity: None,
                 mount: None,
             },
@@ -3647,7 +3631,7 @@ mod tests {
                         descriptor: FsDescriptor {
                             path: "/source/root".into(),
                             kind: FsNodeKind::Directory,
-                            flags: fs_types::DescriptorFlags::READ,
+                            flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
                         },
@@ -3661,7 +3645,7 @@ mod tests {
                 descriptor: FsDescriptor {
                     path: "/source/workspace".into(),
                     kind: FsNodeKind::Directory,
-                    flags: fs_types::DescriptorFlags::READ,
+                    flags: FsDescriptorFlags::READ,
                     identity: None,
                     mount: None,
                 },
@@ -3685,7 +3669,7 @@ mod tests {
                         descriptor: FsDescriptor {
                             path: "/source/workspace".into(),
                             kind: FsNodeKind::Directory,
-                            flags: fs_types::DescriptorFlags::READ,
+                            flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
                         },

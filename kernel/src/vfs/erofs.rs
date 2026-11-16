@@ -174,7 +174,12 @@ where
             kind,
             link_count: u64::from(inode.nlink()),
             size: match kind {
-                NodeKind::Directory => 0,
+                // A device inode's data field holds its device number.
+                NodeKind::Directory
+                | NodeKind::CharacterDevice
+                | NodeKind::BlockDevice
+                | NodeKind::Fifo
+                | NodeKind::Socket => 0,
                 NodeKind::File | NodeKind::Symlink => inode.data_size(),
             },
             access_nanos: modified_nanos,
@@ -214,19 +219,19 @@ where
     }
 }
 
-/// The kernel's kind for an inode's type. The kernel's filesystem
-/// contract names no device, FIFO or socket node, so an image's are
-/// refused rather than passed off as something they are not.
+/// The kernel's kind for an inode's type. Device, FIFO and socket nodes
+/// are reported as what they are and never opened (see [`NodeKind`]); a
+/// type the image does not name is refused.
 fn node_kind(file_type: FileType) -> FsResult<NodeKind> {
     match file_type {
         FileType::Directory => Ok(NodeKind::Directory),
         FileType::RegularFile => Ok(NodeKind::File),
         FileType::Symlink => Ok(NodeKind::Symlink),
-        FileType::Fifo
-        | FileType::Socket
-        | FileType::CharacterDevice
-        | FileType::BlockDevice
-        | FileType::Unknown => Err(FsError::Unsupported),
+        FileType::Fifo => Ok(NodeKind::Fifo),
+        FileType::Socket => Ok(NodeKind::Socket),
+        FileType::CharacterDevice => Ok(NodeKind::CharacterDevice),
+        FileType::BlockDevice => Ok(NodeKind::BlockDevice),
+        FileType::Unknown => Err(FsError::Unsupported),
     }
 }
 
@@ -291,6 +296,9 @@ where
         if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
             return Err(FsError::Exists);
         }
+        if let Some(refusal) = metadata.kind.open_refusal() {
+            return Err(refusal);
+        }
         if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != NodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
@@ -302,11 +310,7 @@ where
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
         let inode = self.inode(path).await?;
-        match node_kind(inode.file_type())? {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        node_kind(inode.file_type())?.require_regular()?;
         let size = inode.data_size();
         if offset >= size {
             return Ok(Bytes::new());
@@ -400,6 +404,10 @@ where
                 DirentFileType::Directory => NodeKind::Directory,
                 DirentFileType::RegularFile => NodeKind::File,
                 DirentFileType::Symlink => NodeKind::Symlink,
+                DirentFileType::CharacterDevice => NodeKind::CharacterDevice,
+                DirentFileType::BlockDevice => NodeKind::BlockDevice,
+                DirentFileType::Fifo => NodeKind::Fifo,
+                DirentFileType::Socket => NodeKind::Socket,
                 // The entry carries no type of its own; the inode does.
                 DirentFileType::Unknown => {
                     let inode = self
@@ -409,10 +417,6 @@ where
                         .map_err(|error| self.fs_error(error))?;
                     node_kind(inode.file_type())?
                 }
-                DirentFileType::CharacterDevice
-                | DirentFileType::BlockDevice
-                | DirentFileType::Fifo
-                | DirentFileType::Socket => return Err(FsError::Unsupported),
             };
             entries.push(DirEntry {
                 name,

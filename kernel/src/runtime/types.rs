@@ -9,7 +9,7 @@ use core::ptr;
 use crate::InstanceId;
 use crate::memory::{GuestResidency, SwapFaultError};
 use bytes::Bytes;
-use helios_hal::fs::{WritePosition, WriteProgress};
+use helios_hal::fs::{FsError, NodeKind, WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{VirtAddr, VirtRange};
@@ -1106,7 +1106,10 @@ where
 #[derive(Clone, Debug)]
 pub struct HostDirEntry {
     pub name: String,
-    pub is_directory: bool,
+    /// What the host's listing says the entry is, or `None` when it does
+    /// not say (`DT_UNKNOWN` with a qid type that decides nothing): the
+    /// caller then asks for the entry's attributes.
+    pub kind: Option<NodeKind>,
 }
 
 /// How much of one directory the caller of [`HostFileSystem::read_dir`] is
@@ -1205,6 +1208,46 @@ pub struct HostMetadata {
     pub status_nanos: u64,
 }
 
+impl HostMetadata {
+    /// The object's kind, from the file type bits of `mode` (`S_IFMT`).
+    /// The qid type cannot say: it names no device, FIFO or socket.
+    pub fn kind(&self) -> Result<NodeKind, HostFsError> {
+        node_kind_from_mode(self.mode)
+    }
+
+    /// Refuses, before anything is opened, the objects the host's open
+    /// must not reach: the kinds [`NodeKind::open_refusal`] names, and a
+    /// symbolic link, which the kernel resolves by `read_link` and a host
+    /// that followed it on open could point at any of them.
+    pub fn require_openable(&self) -> Result<(), HostFsError> {
+        let kind = self.kind()?;
+        let refusal = match kind {
+            NodeKind::Symlink => Some(FsError::Loop),
+            kind => kind.open_refusal(),
+        };
+        match refusal {
+            None => Ok(()),
+            Some(refusal) => Err(HostFsError::Refused { kind, refusal }),
+        }
+    }
+}
+
+/// The kind a POSIX `st_mode` names. A value whose file type bits are none
+/// of the seven is a host that broke the protocol.
+fn node_kind_from_mode(mode: u32) -> Result<NodeKind, HostFsError> {
+    // `S_IFMT` and its values, from `<sys/stat.h>` and the Linux `stat(7)`.
+    match mode & 0o170_000 {
+        0o140_000 => Ok(NodeKind::Socket),
+        0o120_000 => Ok(NodeKind::Symlink),
+        0o100_000 => Ok(NodeKind::File),
+        0o060_000 => Ok(NodeKind::BlockDevice),
+        0o040_000 => Ok(NodeKind::Directory),
+        0o020_000 => Ok(NodeKind::CharacterDevice),
+        0o010_000 => Ok(NodeKind::Fifo),
+        _ => Err(HostFsError::Protocol("getattr mode has no file type")),
+    }
+}
+
 #[derive(Clone, Debug, Error)]
 pub enum HostFsError {
     #[error("transport error: {0}")]
@@ -1228,6 +1271,10 @@ pub enum HostFsError {
         max_entries: usize,
         max_name_bytes: usize,
     },
+    /// The object is a kind the kernel never opens, so nothing was
+    /// sent to the host to open it.
+    #[error("host share object is a {kind:?}, which the kernel never opens")]
+    Refused { kind: NodeKind, refusal: FsError },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1242,6 +1289,8 @@ pub enum HostFsErrorKind {
     NameTooLong,
     NoSpace,
     Io,
+    /// A kind the kernel never opens, with the error that refuses it.
+    Refused(FsError),
 }
 
 impl HostFsError {
@@ -1256,6 +1305,7 @@ impl HostFsError {
             | HostFsError::Transport(IoError::ReadOnly) => HostFsErrorKind::ReadOnly,
             HostFsError::Transport(IoError::Unsupported) => HostFsErrorKind::Unsupported,
             HostFsError::NameTooLong { .. } => HostFsErrorKind::NameTooLong,
+            HostFsError::Refused { refusal, .. } => HostFsErrorKind::Refused(*refusal),
             HostFsError::Transport(IoError::InvalidBufferLength { .. })
             | HostFsError::Transport(IoError::InvalidDeviceConfig(_))
             | HostFsError::Transport(IoError::OutOfBounds)

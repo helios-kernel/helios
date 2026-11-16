@@ -1,13 +1,16 @@
 #![cfg(feature = "runtime")]
 
+use core::convert::Infallible;
 use core::future::Future;
 use core::ops::ControlFlow;
 use core::task::{Context, Poll, Waker};
 use helios_linux::elf::{Error, Image};
 use helios_linux::syscall::{
-    Call, MemoryFault, Output, Process, Stream, UserMemory, WriteError,
-    dispatch as process_dispatch,
+    Call, MemoryFault, Output, Stream, UserMemory, WriteError, dispatch as process_dispatch,
 };
+
+/// These tests open no files, so the file slot holds no node type.
+type Process = helios_linux::syscall::Process<Infallible>;
 
 #[derive(Clone)]
 struct Memory(Vec<u8>);

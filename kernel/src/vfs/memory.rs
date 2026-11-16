@@ -322,8 +322,14 @@ impl MemoryState {
             kind: inode.kind,
             link_count: inode.link_count,
             size: match inode.kind {
-                NodeKind::Directory => 0,
                 NodeKind::File | NodeKind::Symlink => inode.contents.len() as u64,
+                // The tree creates only files, directories and symlinks;
+                // a report-only node has no contents here.
+                NodeKind::Directory
+                | NodeKind::CharacterDevice
+                | NodeKind::BlockDevice
+                | NodeKind::Fifo
+                | NodeKind::Socket => 0,
             },
             access_nanos: inode.access_nanos,
             modified_nanos: inode.modified_nanos,
@@ -341,7 +347,12 @@ impl MemoryState {
         }
         match self.inode(parent)?.1.kind {
             NodeKind::Directory => Ok(()),
-            NodeKind::File | NodeKind::Symlink => Err(FsError::NotDirectory),
+            NodeKind::File
+            | NodeKind::Symlink
+            | NodeKind::CharacterDevice
+            | NodeKind::BlockDevice
+            | NodeKind::Fifo
+            | NodeKind::Socket => Err(FsError::NotDirectory),
         }
     }
 
@@ -465,11 +476,7 @@ impl MemoryState {
         edit: impl FnOnce(&mut BytesMut) -> FsResult<()>,
     ) -> FsResult<()> {
         let inode = self.inode_mut(path)?;
-        match inode.kind {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        inode.kind.require_regular()?;
         let contents = core::mem::take(&mut inode.contents);
         let mut contents = contents
             .try_into_mut()
@@ -504,11 +511,7 @@ impl MemoryWrite {
         len: usize,
         now: u64,
     ) -> FsResult<Self> {
-        match fs.state.lock().inode(path)?.1.kind {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        fs.state.lock().inode(path)?.1.kind.require_regular()?;
         Ok(Self {
             fs: fs.clone(),
             path: path.into(),
@@ -621,11 +624,7 @@ impl FileSystem for MemoryFs {
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
         let state = self.state.lock();
         let (_, inode) = state.inode(path)?;
-        match inode.kind {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        inode.kind.require_regular()?;
         let offset = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
         if offset >= inode.contents.len() {
             return Ok(Bytes::new());

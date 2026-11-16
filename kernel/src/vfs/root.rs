@@ -150,6 +150,12 @@ impl RootFs {
             NodeKind::File => self.lower.file_contents(path)?.to_bytes(),
             NodeKind::Symlink => Bytes::from(self.lower.link_target(path)?),
             NodeKind::Directory => Bytes::new(),
+            // The boot image holds none, and the upper tree cannot hold a
+            // report-only node.
+            NodeKind::CharacterDevice
+            | NodeKind::BlockDevice
+            | NodeKind::Fifo
+            | NodeKind::Socket => return Err(FsError::Unsupported),
         };
         if let Some((parent, _)) = path.split_last() {
             self.copy_up_directories(parent)?;
@@ -244,11 +250,7 @@ impl RootWrite {
         len: usize,
         now: u64,
     ) -> FsResult<Self> {
-        match root.find(path)?.metadata.kind {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        root.find(path)?.metadata.kind.require_regular()?;
         Ok(Self {
             root: root.clone(),
             path: path.into(),

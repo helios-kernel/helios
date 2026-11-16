@@ -15,7 +15,7 @@ pub(crate) use http::*;
 
 // The bindgen `with:` mappings re-export these resource types with `pub use`,
 // which requires a fully `pub` path; the globs above are only crate-visible.
-pub use fs::FsDescriptor;
+pub use crate::FsDescriptor;
 pub use host_env::{TerminalInput, TerminalOutput};
 pub use http::{WasiRequest, WasiResponse};
 pub use net::{
@@ -33,7 +33,10 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use crate::{ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, ObjectIdentity};
+use crate::{
+    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, FsDescriptorFlags,
+    ObjectIdentity,
+};
 use bytes::Bytes;
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;

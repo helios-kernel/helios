@@ -304,9 +304,10 @@ fn node_kind(kind: FileKind) -> FsResult<NodeKind> {
         FileKind::Regular => Ok(NodeKind::File),
         FileKind::Directory => Ok(NodeKind::Directory),
         FileKind::Symlink => Ok(NodeKind::Symlink),
-        FileKind::CharDevice | FileKind::BlockDevice | FileKind::Fifo | FileKind::Socket => {
-            Err(FsError::Unsupported)
-        }
+        FileKind::CharDevice => Ok(NodeKind::CharacterDevice),
+        FileKind::BlockDevice => Ok(NodeKind::BlockDevice),
+        FileKind::Fifo => Ok(NodeKind::Fifo),
+        FileKind::Socket => Ok(NodeKind::Socket),
     }
 }
 
@@ -349,6 +350,9 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
             return Err(FsError::Exists);
         }
+        if let Some(refusal) = metadata.kind.open_refusal() {
+            return Err(refusal);
+        }
         if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != NodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
@@ -361,11 +365,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
         let reader = self.snapshot();
         let inode = self.inode(&reader, path).await?;
-        match node_kind(inode.kind())? {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        node_kind(inode.kind())?.require_regular()?;
         let len = inode
             .metadata()
             .size
