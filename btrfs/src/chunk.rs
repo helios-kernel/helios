@@ -150,6 +150,12 @@ impl Chunk {
         self.logical + self.length
     }
 
+    /// Where each copy starts on the device.
+    #[cfg(feature = "write")]
+    pub(crate) fn copies(&self) -> &[u64] {
+        &self.copies
+    }
+
     /// A chunk the writer allocated. The caller has placed every copy inside
     /// the device and chosen a length the sector size divides.
     #[cfg(feature = "write")]
@@ -229,6 +235,17 @@ impl ChunkMap {
     #[cfg(feature = "write")]
     pub(crate) fn next_logical(&self) -> u64 {
         self.chunks.last().map_or(0, Chunk::end)
+    }
+
+    /// Forgets the chunk starting at `logical` and returns it
+    /// (`btrfs_remove_chunk` removes the mapping the same way).
+    #[cfg(feature = "write")]
+    pub(crate) fn remove(&mut self, logical: u64) -> Option<Chunk> {
+        let index = self
+            .chunks
+            .binary_search_by_key(&logical, |chunk| chunk.logical)
+            .ok()?;
+        Some(self.chunks.remove(index))
     }
 
     pub(crate) fn insert(&mut self, chunk: Chunk) -> Result<(), ChunkDefect> {

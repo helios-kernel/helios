@@ -27,6 +27,7 @@ use crate::volume::{Mapping, Volume};
 use crate::{EntryTarget, Metadata};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 /// Produced only once the new roots are durable, or for an unchanged view.
 pub(crate) struct Committed {
@@ -47,6 +48,11 @@ pub(crate) struct Transaction<'a, S> {
     pub(crate) roots: Roots,
     /// The chunk tree's root. The superblock, not the root tree, records it.
     chunk_root: TreeRoot,
+    /// Device ranges of chunks this transaction removed. They stay out of
+    /// reach of chunk allocation until the transaction publishes
+    /// (`btrfs_dev_extent_hole` skips `pending_chunks`). Only `commit` removes
+    /// chunks, so no operation checkpoint covers it.
+    released: Vec<core::ops::Range<u64>>,
     pub(crate) trees: Trees,
     pub(crate) space: Space,
     pub(crate) accounting: Accounting,
@@ -182,6 +188,7 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
             volume,
             image,
             roots,
+            released: Vec::new(),
             chunk_root: TreeRoot {
                 tree: objectid::CHUNK_TREE,
                 bytenr: chunk.bytenr,
@@ -202,6 +209,9 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         concurrency: NonZeroUsize,
         publishing: impl FnOnce(),
     ) -> Result<Committed, WriteError> {
+        // Block groups nothing uses leave first, as the cleaner does after a
+        // commit; what they free is out of reach of this commit's chunks.
+        self.remove_unused_groups().await?;
         // A metadata chunk the commit may need exists before it starts.
         if self.trees.blocks().next().is_some() {
             self.grow_metadata().await?;

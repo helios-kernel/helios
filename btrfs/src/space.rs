@@ -79,9 +79,33 @@ struct Group {
     found_used: u64,
     free: Intervals,
     excluded_free: Intervals,
+    /// Allocated by the running transaction: not yet published, so never
+    /// removed by it.
+    fresh: bool,
 }
 
 impl Group {
+    /// Nothing in the group is allocated, reserved, or held back for a reader:
+    /// every byte is free, or lies in a superblock `stripe`, which is free by
+    /// definition. Ranges `Space::pin` took out for a reader are neither.
+    fn is_unused(&self, stripes: &[Range<u64>]) -> bool {
+        let free: u64 = self.free.iter().map(|range| range.end - range.start).sum();
+        let end = self.start + self.length;
+        let reserved: u64 = stripes
+            .iter()
+            .map(|stripe| {
+                stripe
+                    .end
+                    .min(end)
+                    .saturating_sub(stripe.start.max(self.start))
+            })
+            .sum();
+        !self.fresh
+            && self.declared_used == 0
+            && self.found_used == 0
+            && free + reserved == self.length
+    }
+
     fn contains(&self, range: &Range<u64>) -> bool {
         self.start <= range.start && range.end <= self.start + self.length
     }
@@ -219,6 +243,7 @@ impl Space {
                     found_used: 0,
                     free: Intervals::whole(key.objectid..key.objectid + key.offset),
                     excluded_free: Intervals::default(),
+                    fresh: false,
                 });
             }
             cursor.advance(volume).await?;
@@ -361,6 +386,7 @@ impl Space {
                 found_used: used,
                 free: free.free,
                 excluded_free: Intervals::default(),
+                fresh: false,
             })
             .collect();
         Ok(Self {
@@ -439,6 +465,48 @@ impl Space {
             .map(|group| group.flags)
     }
 
+    /// The groups `btrfs_delete_unused_bgs` would delete: unused ones, except
+    /// that a group is kept while it is the last of its type (`flags` holding
+    /// the data, system or metadata bit) and while this transaction made it.
+    /// A group a reader still pins is not unused: the pinned extents are
+    /// absent from its free ranges.
+    pub(crate) fn unused_groups(&self, chunks: &crate::chunk::ChunkMap) -> Vec<(u64, u64, u64)> {
+        let stripes = chunks.superblock_stripes();
+        let mut per_type = [DATA, SYSTEM, METADATA].map(|kind| {
+            self.groups
+                .iter()
+                .filter(|group| group.flags & kind != 0)
+                .count()
+        });
+        let index = |flags: u64| {
+            [DATA, SYSTEM, METADATA]
+                .iter()
+                .position(|&kind| flags & kind != 0)
+        };
+        let mut unused = Vec::new();
+        for group in self.groups.iter().filter(|group| group.is_unused(&stripes)) {
+            let Some(kind) = index(group.flags) else {
+                continue;
+            };
+            if per_type[kind] > 1 {
+                per_type[kind] -= 1;
+                unused.push((group.start, group.length, group.flags));
+            }
+        }
+        unused
+    }
+
+    /// Drops a group `unused_groups` named, so no later reservation can take a
+    /// block from it.
+    pub(crate) fn remove_group(&mut self, start: u64) {
+        self.groups = self
+            .groups
+            .iter()
+            .filter(|group| group.start != start)
+            .cloned()
+            .collect();
+    }
+
     /// Adds the block group of a chunk this transaction allocated. Its logical
     /// range is above every existing group, so order is preserved.
     pub(crate) fn push_group(
@@ -463,6 +531,7 @@ impl Space {
             found_used: 0,
             free: Intervals::whole(start..end),
             excluded_free: Intervals::default(),
+            fresh: true,
         };
         for range in chunks.superblock_stripes() {
             if range.start < end && start < range.end {

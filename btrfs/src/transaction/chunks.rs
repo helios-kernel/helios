@@ -91,6 +91,8 @@ pub enum ChunkError {
         needed: usize,
         capacity: usize,
     },
+    #[error("the superblock's system chunk array has no entry for the chunk at {logical:#x}")]
+    NotInSystemArray { logical: u64 },
     #[error("the chunk tree has no device item for device {devid}")]
     MissingDevice { devid: u64 },
     #[error("a device-tree or chunk-tree item of {len} bytes is too short")]
@@ -368,11 +370,113 @@ impl<S: BlockSink> Transaction<'_, S> {
             };
             key.offset = next;
         }
+        // Ranges released by removed chunks stay allocated until publication.
+        extents.extend(self.released.iter().cloned());
+        extents.sort_unstable_by_key(|extent| extent.start);
         Ok(Device {
             item,
             extents,
             chunk_tree_uuid,
         })
+    }
+
+    /// Removes every unused block group (`btrfs_delete_unused_bgs`), each as
+    /// `btrfs_remove_chunk` does. Returns how many left.
+    pub(crate) async fn remove_unused_groups(&mut self) -> Result<usize, WriteError> {
+        let unused = self.space.unused_groups(self.volume.chunks());
+        for &(logical, length, flags) in &unused {
+            self.remove_chunk(logical, length, flags).await?;
+        }
+        Ok(unused.len())
+    }
+
+    /// Removes the chunk at `logical` and its block group, in this transaction:
+    /// the group leaves the allocator first, so no tree block this removal COWs
+    /// can land in it, then its device extents, device item usage, chunk item
+    /// (and bootstrap entry for SYSTEM), block-group item and free-space
+    /// records go. `unused_groups` established the group is empty.
+    async fn remove_chunk(
+        &mut self,
+        logical: u64,
+        length: u64,
+        flags: u64,
+    ) -> Result<(), WriteError> {
+        let devid = self.volume.superblock().devid();
+        let device = self.device(devid).await?;
+        let dev: RawDevItem = *view(&device.item).ok_or(ChunkError::Truncated {
+            len: device.item.len(),
+        })?;
+        self.space.remove_group(logical);
+        let chunk = self
+            .volume
+            .remove_chunk(logical)
+            .expect("an unused block group has its chunk in the map");
+        let group_key = Key::new(logical, item_type::BLOCK_GROUP_ITEM, length);
+        self.accounting
+            .set_group_item(
+                &self.volume,
+                &mut self.trees,
+                &mut self.space,
+                group_key,
+                None,
+            )
+            .await?;
+        self.accounting.forget_group(&group_key);
+
+        // Each copy's device extent is `length` bytes (`create_chunk`).
+        let mut root = self.roots.get(objectid::DEV_TREE)?;
+        for &physical in chunk.copies() {
+            root = self
+                .trees
+                .apply(
+                    &self.volume,
+                    root,
+                    Key::new(devid, item_type::DEV_EXTENT, physical),
+                    None,
+                    &mut self.space,
+                )
+                .await?;
+            self.released.push(physical..physical + length);
+        }
+        self.roots.set(root)?;
+
+        let used = length * chunk.copies().len() as u64;
+        let mut updated = dev;
+        updated.bytes_used.set(
+            dev.bytes_used
+                .get()
+                .checked_sub(used)
+                .expect("a removed chunk was counted as allocated"),
+        );
+        let mut device_item = device.item.clone();
+        device_item[..size_of::<RawDevItem>()].copy_from_slice(updated.as_bytes());
+        for (key, bytes) in [
+            (
+                Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, devid),
+                Some(&device_item),
+            ),
+            (
+                Key::new(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM, logical),
+                None,
+            ),
+        ] {
+            self.chunk_root = self
+                .trees
+                .apply(
+                    &self.volume,
+                    self.chunk_root,
+                    key,
+                    bytes.map(Vec::as_slice),
+                    &mut self.space,
+                )
+                .await?;
+        }
+        self.image.sub_device_used(used);
+        if flags & SYSTEM != 0 {
+            self.image.remove_system_chunk(logical)?;
+        }
+        tracing::debug!(logical, length, flags, "removed an unused chunk");
+        Ok(())
     }
 
     /// `btrfs_create_chunk` and the items `btrfs_create_pending_block_groups`

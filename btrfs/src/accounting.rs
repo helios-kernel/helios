@@ -443,6 +443,11 @@ impl Accounting {
         Ok(changed)
     }
 
+    /// Forget the usage recorded for a block group that no longer exists.
+    pub(crate) fn forget_group(&mut self, key: &Key) {
+        self.group_used.remove_mut(key);
+    }
+
     /// Insert, replace or delete a block-group item in whichever tree holds
     /// them, the extent tree or the block-group tree.
     pub(crate) async fn set_group_item<S: BlockSource>(

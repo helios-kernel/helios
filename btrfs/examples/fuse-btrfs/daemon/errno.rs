@@ -86,6 +86,9 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::Chunk(ChunkError::MissingDevice { .. }) => {
             defect("Chunk::MissingDevice", error)
         }
+        WriteError::Chunk(ChunkError::NotInSystemArray { .. }) => {
+            defect("Chunk::NotInSystemArray", error)
+        }
         WriteError::Chunk(ChunkError::Truncated { .. }) => defect("Chunk::Truncated", error),
         WriteError::Chunk(ChunkError::Map { .. }) => defect("Chunk::Map", error),
         WriteError::Read(error) => read_errno(error),

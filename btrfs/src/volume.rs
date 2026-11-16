@@ -85,6 +85,19 @@ impl<S: BlockSource> Volume<S> {
         Ok(())
     }
 
+    /// Forget a chunk the transaction removed. Readers of older generations
+    /// keep the mapping they opened.
+    #[cfg(feature = "write")]
+    pub(crate) fn remove_chunk(&mut self, logical: u64) -> Option<crate::chunk::Chunk> {
+        let mut chunks = (*self.mapping.chunks).clone();
+        let removed = chunks.remove(logical)?;
+        self.mapping = Arc::new(Mapping {
+            superblock: self.mapping.superblock.clone(),
+            chunks: Arc::new(chunks),
+        });
+        Some(removed)
+    }
+
     pub(crate) fn mapping(&self) -> Arc<Mapping> {
         self.mapping.clone()
     }

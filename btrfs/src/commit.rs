@@ -5,7 +5,8 @@ use alloc::sync::Arc;
 use zerocopy::{FromZeros, IntoBytes};
 
 use crate::ondisk::{
-    RawKey, RawRootBackup, RawSuperblock, SUPERBLOCK_BYTES, SYS_CHUNK_ARRAY_BYTES, objectid, view,
+    RawChunk, RawKey, RawRootBackup, RawStripe, RawSuperblock, SUPERBLOCK_BYTES,
+    SYS_CHUNK_ARRAY_BYTES, objectid, view,
 };
 use crate::roots::Roots;
 use crate::transaction::chunks::ChunkError;
@@ -51,6 +52,49 @@ impl CommitImage {
             .set(raw.dev_item.bytes_used.get() + bytes);
         Arc::make_mut(&mut self.bytes)[..size_of::<RawSuperblock>()]
             .copy_from_slice(raw.as_bytes());
+    }
+
+    /// Records `bytes` fewer allocated on the device (`add_device_used`'s
+    /// counterpart, for a removed chunk).
+    pub(crate) fn sub_device_used(&mut self, bytes: u64) {
+        let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
+        raw.dev_item.bytes_used.set(
+            raw.dev_item
+                .bytes_used
+                .get()
+                .checked_sub(bytes)
+                .expect("a removed chunk was counted as allocated"),
+        );
+        Arc::make_mut(&mut self.bytes)[..size_of::<RawSuperblock>()]
+            .copy_from_slice(raw.as_bytes());
+    }
+
+    /// Removes the SYSTEM chunk starting at `logical` from the bootstrap
+    /// array, as Linux's `remove_sys_chunk_from_array` does: the following
+    /// entries move down over it.
+    pub(crate) fn remove_system_chunk(&mut self, logical: u64) -> Result<(), ChunkError> {
+        let mut raw = *view::<RawSuperblock>(&self.bytes[..]).expect("validated superblock image");
+        let used = raw.sys_chunk_array_size.get() as usize;
+        let mut at = 0;
+        while at < used {
+            let key: &RawKey = view(&raw.sys_chunk_array[at..used])
+                .ok_or(ChunkError::Truncated { len: used - at })?;
+            let chunk: &RawChunk = view(&raw.sys_chunk_array[at + size_of::<RawKey>()..used])
+                .ok_or(ChunkError::Truncated { len: used - at })?;
+            let entry = size_of::<RawKey>()
+                + size_of::<RawChunk>()
+                + usize::from(chunk.num_stripes.get()) * size_of::<RawStripe>();
+            if key.offset.get() == logical {
+                raw.sys_chunk_array.copy_within(at + entry..used, at);
+                raw.sys_chunk_array[used - entry..used].fill(0);
+                raw.sys_chunk_array_size.set((used - entry) as u32);
+                Arc::make_mut(&mut self.bytes)[..size_of::<RawSuperblock>()]
+                    .copy_from_slice(raw.as_bytes());
+                return Ok(());
+            }
+            at += entry;
+        }
+        Err(ChunkError::NotInSystemArray { logical })
     }
 
     /// Appends a SYSTEM chunk to the bootstrap array the superblock carries,

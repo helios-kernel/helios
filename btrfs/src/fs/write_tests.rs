@@ -3981,6 +3981,184 @@ fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sec
     });
 }
 
+/// One commit that changes a little metadata, so the writer publishes.
+#[cfg(feature = "write")]
+async fn touch(writer: &mut super::writer::Writer<Disk>, name: &str) {
+    use super::writer::{Attributes, Name};
+    let when = crate::Timestamp {
+        seconds: 1_700_000_300,
+        nanoseconds: 0,
+    };
+    let mut tx = writer.begin().await.unwrap();
+    let root = tx.root().await.unwrap();
+    tx.create_file(
+        Name {
+            parent: &root,
+            bytes: name.as_bytes(),
+        },
+        Attributes {
+            permissions: 0o600,
+            uid: 0,
+            gid: 0,
+        },
+        when,
+    )
+    .await
+    .unwrap();
+    tx.commit(|| panic!("valid fixture UUID"), NonZeroUsize::MIN)
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn unused_block_groups_leave_after_their_extents_are_free_and_no_reader_pins_them() {
+    use super::writer::{Attributes, Name, Writer};
+    use ferrosys::btrfs::Profile;
+
+    block_on(async {
+        let (_, image) = profile_image(Profile::Dup, Profile::Single);
+        let before = assert_device_layout(&image).await;
+        let mut writer = Writer::mount(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        let concurrency = NonZeroUsize::MIN;
+        let when = crate::Timestamp {
+            seconds: 1_700_000_100,
+            nanoseconds: 0,
+        };
+        const MIB: usize = 1 << 20;
+        let data_bytes: u64 = before
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.2 & 1 != 0)
+            .map(|chunk| chunk.1)
+            .sum();
+        let content: Vec<u8> = (0..(data_bytes as usize / MIB) + 8)
+            .flat_map(|seed| noise(MIB, seed as u8))
+            .collect();
+        let name = "巨大-巨大-거대";
+        let mut tx = writer.begin().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let file = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: name.as_bytes(),
+                },
+                Attributes {
+                    permissions: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                when,
+            )
+            .await
+            .unwrap();
+        for (index, piece) in content.chunks(MIB).enumerate() {
+            tx.write_file(
+                &file,
+                (index * MIB) as u64,
+                piece,
+                WriteOptions::plain(when, concurrency),
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        let full = assert_device_layout(&image).await;
+        assert!(count_kind(&full, 1) > count_kind(&before, 1));
+
+        // A reader of the generation that holds the file pins its extents.
+        let reader = writer.snapshot().unwrap();
+        let mut tx = writer.begin().await.unwrap();
+        let root = tx.root().await.unwrap();
+        tx.unlink_name(
+            Name {
+                parent: &root,
+                bytes: name.as_bytes(),
+            },
+            when,
+        )
+        .await
+        .unwrap();
+        tx.commit(|| panic!("valid fixture UUID"), concurrency)
+            .await
+            .unwrap();
+        // The unlink's own commit still counts the extents as used, and the
+        // next one finds them pinned by the reader.
+        touch(&mut writer, "一-1-일").await;
+        touch(&mut writer, "二-2-이").await;
+        assert_eq!(
+            count_kind(&assert_device_layout(&image).await, 1),
+            count_kind(&full, 1),
+            "a reader pinning the old generation keeps the group"
+        );
+
+        drop(reader);
+        touch(&mut writer, "三-3-삼").await;
+        let after = assert_device_layout(&image).await;
+        assert_eq!(count_kind(&after, 1), count_kind(&before, 1));
+        let fresh = Filesystem::mount(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        assert!(*writer.committed_allocation() == allocation_of(&fresh).await);
+        // The freed device range is available again.
+        touch(&mut writer, "四-4-사").await;
+        assert_device_layout(&image).await;
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn removal_keeps_the_last_group_of_a_type_and_a_group_made_in_the_same_transaction() {
+    use super::writer::Writer;
+    use crate::space::{METADATA, SYSTEM};
+    use ferrosys::btrfs::Profile;
+
+    for metadata in [Profile::Dup, Profile::Single] {
+        block_on(async {
+            let (_, image) = profile_image(metadata, Profile::Single);
+            let before = assert_device_layout(&image).await;
+            let mut writer = Writer::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            // Nothing is removable on a fresh image: the empty data group is
+            // the last of its type.
+            let mut tx = writer.begin().await.unwrap();
+            assert_eq!(tx.edits().remove_unused_groups().await.unwrap(), 0);
+            // A group this transaction allocated stays until it publishes.
+            tx.edits().allocate_chunk(SYSTEM).await.unwrap();
+            tx.edits().allocate_chunk(METADATA).await.unwrap();
+            assert_eq!(tx.edits().remove_unused_groups().await.unwrap(), 0);
+            tx.commit(|| panic!("valid fixture UUID"), NonZeroUsize::MIN)
+                .await
+                .unwrap();
+            let grown = assert_device_layout(&image).await;
+            assert_eq!(count_kind(&grown, 2), count_kind(&before, 2) + 1);
+            assert_eq!(count_kind(&grown, 4), count_kind(&before, 4) + 1);
+
+            // The next commit finds the new system and metadata groups
+            // published and unused, and removes both: the bootstrap array
+            // gives the entry back and the device item the bytes.
+            touch(&mut writer, "整理-整理-정리").await;
+            let after = assert_device_layout(&image).await;
+            assert_eq!(count_kind(&after, 2), count_kind(&before, 2));
+            assert_eq!(count_kind(&after, 4), count_kind(&before, 4));
+            assert_eq!(after.sys_chunk_array, before.sys_chunk_array);
+            assert_eq!(after.bootstrap, before.bootstrap);
+            let fresh = Filesystem::mount(Disk(image.try_clone().unwrap()))
+                .await
+                .unwrap();
+            assert!(*writer.committed_allocation() == allocation_of(&fresh).await);
+            touch(&mut writer, "続行-继续-계속").await;
+            assert_device_layout(&image).await;
+        });
+    }
+}
+
 #[cfg(feature = "write")]
 #[test]
 fn empty_transaction_does_not_publish() {

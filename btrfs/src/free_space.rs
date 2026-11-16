@@ -484,7 +484,38 @@ impl FreeTree {
             self.records.remove_mut(&key);
             changed = true;
         }
-        for mut group in space.committed_free(retired)? {
+        let live = space.committed_free(retired)?;
+        // A block group the transaction removed leaves no records
+        // (`remove_block_group_free_space`): its info item gives its length.
+        let vanished: Vec<u64> = self
+            .groups
+            .keys()
+            .copied()
+            .filter(|start| {
+                live.binary_search_by_key(start, |group| group.range.start)
+                    .is_err()
+            })
+            .collect();
+        for start in vanished {
+            let end = self
+                .records
+                .range(Key::new(start, 0, 0)..)
+                .next()
+                .map(|(key, _)| start + key.offset)
+                .expect("a group the tree encodes has its info record");
+            let records: Vec<Key> = self
+                .records
+                .range(Key::new(start, 0, 0)..Key::new(end, 0, 0))
+                .map(|(&key, _)| key)
+                .collect();
+            for key in records {
+                self.root = trees.apply(volume, self.root, key, None, space).await?;
+                self.records.remove_mut(&key);
+            }
+            self.groups.remove_mut(&start);
+            changed = true;
+        }
+        for mut group in live {
             let start = group.range.start;
             let previous = self.groups.get(&start);
             if previous.is_some_and(|previous| previous.free == group.free) {
