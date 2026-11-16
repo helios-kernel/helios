@@ -7,6 +7,11 @@ on:
   push:
     branches: [dev]
   workflow_dispatch:
+    inputs:
+      lanes:
+        description: "Lanes to run, comma-separated names from .github/ci-lanes.json; empty runs every lane"
+        type: string
+        default: ""
   schedule:
     - cron: "37 3 * * *"
 
@@ -169,6 +174,8 @@ jobs:
           DRAFT: ${{ github.event.pull_request.draft == true }}
           EVENT: ${{ github.event_name }}
           HEAVY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          # A dispatch may name the lanes it wants instead of every lane.
+          REQUESTED: ${{ inputs.lanes || '' }}
         run: |
           set -euo pipefail
           lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --arg event "${EVENT:-}" --argjson heavy "${HEAVY}" '
@@ -180,6 +187,15 @@ jobs:
             | map(select($heavy or (.value.heavy != true)))
             | map(.key)
             | if $draft then map(select(. == "lint-fmt")) else . end' .github/ci-lanes.json)"
+          if [ -n "${REQUESTED}" ]; then
+            requested="$(jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))' <<< "${REQUESTED}")"
+            unknown="$(jq -r --argjson requested "${requested}" '$requested - keys | join(", ")' .github/ci-lanes.json)"
+            if [ -n "${unknown}" ]; then
+              echo "::error::lanes input names lanes .github/ci-lanes.json does not define: ${unknown}"
+              exit 1
+            fi
+            lanes="$(jq -c --argjson requested "${requested}" 'map(select(. as $lane | $requested | index($lane)))' <<< "${lanes}")"
+          fi
           checks="$(jq -c --argjson lanes "${lanes}" '
             to_entries
             | map(select(.value.command and (.key as $name | $lanes | index($name))))
