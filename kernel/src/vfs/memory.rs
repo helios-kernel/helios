@@ -182,7 +182,13 @@ impl MemoryFs {
     /// so the layer below stays hidden. With `whiteout`, a path the tree
     /// has no object at is the layer below's alone, and only the whiteout
     /// is recorded.
-    pub(super) fn remove(&self, path: FsPath<'_>, directory: bool, whiteout: bool) -> FsResult<()> {
+    pub(super) fn remove(
+        &self,
+        path: FsPath<'_>,
+        directory: bool,
+        whiteout: bool,
+        now: u64,
+    ) -> FsResult<()> {
         if path.is_root() {
             return Err(if directory {
                 FsError::NotPermitted
@@ -201,6 +207,17 @@ impl MemoryFs {
                     }
                     _ => {}
                 }
+                let number = state.inode_of(path).expect("removed name exists");
+                let (parent, _) = path.split_last().expect("root removal was rejected");
+                let parent = state.inode_of(parent).expect("removed name has a parent");
+                state
+                    .inodes
+                    .get_mut(&number)
+                    .expect("removed inode exists")
+                    .status_nanos = now;
+                let parent = state.inodes.get_mut(&parent).expect("parent inode exists");
+                parent.modified_nanos = now;
+                parent.status_nanos = now;
                 state.remove_name(path);
             }
             Err(FsError::NoEntry) if whiteout && state.beneath(path) => {}
@@ -684,12 +701,12 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.remove(path, true, false)
+    async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.remove(path, true, false, now)
     }
 
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.remove(path, false, false)
+    async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.remove(path, false, false, now)
     }
 
     async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -923,7 +940,7 @@ mod tests {
             (a.link_count, a.id),
             (2, block_on(fs.stat(path("b"))).expect("stats").id)
         );
-        block_on(fs.unlink(path("a"))).expect("unlinks");
+        block_on(fs.unlink(path("a"), 7_000_000_000)).expect("unlinks");
         assert_eq!(block_on(fs.stat(path("b"))).expect("stats").link_count, 1);
     }
 
@@ -943,7 +960,7 @@ mod tests {
         assert_eq!(names(&fs, ""), ["d.x", "dx", "e"]);
         assert_eq!(names(&fs, "e"), ["f"]);
         assert_eq!(
-            block_on(fs.remove_directory(path("e"))),
+            block_on(fs.remove_directory(path("e"), 7_000_000_000)),
             Err(FsError::NotEmpty)
         );
     }

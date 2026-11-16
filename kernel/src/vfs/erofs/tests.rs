@@ -259,7 +259,7 @@ fn assert_refusals(fs: &ErofsFs<MemoryDisk>) {
         Err(FsError::ReadOnly)
     );
     assert_eq!(
-        block_on(fs.unlink(path("hello.txt"))),
+        block_on(fs.unlink(path("hello.txt"), 7_000_000_000)),
         Err(FsError::ReadOnly)
     );
     // `docs/` holds six entries, `.` and `..` among them, in one block:

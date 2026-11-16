@@ -497,10 +497,15 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     fn remove_directory<'a>(
         &'a self,
         path: FsPath<'a>,
+        now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Removes a non-directory name.
-    fn unlink<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
+    fn unlink<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Moves `source` to `destination` within this filesystem.
     fn rename<'a>(

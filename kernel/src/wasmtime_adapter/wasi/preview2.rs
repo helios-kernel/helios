@@ -1560,12 +1560,18 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        let now = self.now_nanos();
         let target = self.p2_descriptor(&descriptor);
         Ok(async {
             let (base, namespace) = target?;
-            super::remove_directory_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
-                .await
-                .map_err(error_code_from_p3)
+            super::remove_directory_at(
+                &namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                &path,
+                now,
+            )
+            .await
+            .map_err(error_code_from_p3)
         }
         .await)
     }
@@ -1629,12 +1635,18 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        let now = self.now_nanos();
         let target = self.p2_descriptor(&descriptor);
         Ok(async {
             let (base, namespace) = target?;
-            super::unlink_file_at(&namespace, base.grant().map_err(error_code_from_p3)?, &path)
-                .await
-                .map_err(error_code_from_p3)
+            super::unlink_file_at(
+                &namespace,
+                base.grant().map_err(error_code_from_p3)?,
+                &path,
+                now,
+            )
+            .await
+            .map_err(error_code_from_p3)
         }
         .await)
     }

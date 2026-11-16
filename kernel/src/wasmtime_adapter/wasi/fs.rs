@@ -651,13 +651,14 @@ pub(crate) async fn remove_directory_at<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
+    now: u64,
 ) -> FsOpResult<()>
 where
     StorageImpl: crate::Storage,
 {
     let absolute = child_below(base.descriptor(), path)?;
     namespace
-        .remove_directory(&absolute)
+        .remove_directory(&absolute, now)
         .await
         .map_err(fs_error_code)
 }
@@ -666,6 +667,7 @@ pub(crate) async fn unlink_file_at<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Mutate>,
     path: &str,
+    now: u64,
 ) -> FsOpResult<()>
 where
     StorageImpl: crate::Storage,
@@ -678,7 +680,7 @@ where
     resolved
         .writable()
         .map_err(fs_error_code)?
-        .unlink(resolved.path())
+        .unlink(resolved.path(), now)
         .await
         .map_err(fs_error_code)
 }
@@ -1639,9 +1641,11 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::remove_directory_at(&namespace, base.grant()?, &path).await?)
+        let (base, namespace, now) = accessor.with(|mut access| {
+            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
+        })?;
+        Ok(self::remove_directory_at(&namespace, base.grant()?, &path, now).await?)
     }
 
     async fn rename_at(
@@ -1695,9 +1699,11 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
-        let (base, namespace) =
-            accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        Ok(self::unlink_file_at(&namespace, base.grant()?, &path).await?)
+        let (base, namespace, now) = accessor.with(|mut access| {
+            let (base, namespace) = descriptor_in(access.get(), &descriptor)?;
+            Ok::<_, fs_types::ErrorCode>((base, namespace, access.get().now_nanos()))
+        })?;
+        Ok(self::unlink_file_at(&namespace, base.grant()?, &path, now).await?)
     }
 
     async fn is_same_object(

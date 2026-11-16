@@ -181,12 +181,12 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.create_directory(path, now).await,)+ }
             }
 
-            async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.remove_directory(path).await,)+ }
+            async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.remove_directory(path, now).await,)+ }
             }
 
-            async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.unlink(path).await,)+ }
+            async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.unlink(path, now).await,)+ }
             }
 
             async fn rename(
@@ -1289,12 +1289,15 @@ impl<S: Storage> Namespace<S> {
     /// Removes the empty directory `absolute`. A mount point, or a
     /// directory with a mount point below it, is in use:
     /// [`FsError::Busy`].
-    pub async fn remove_directory(&self, absolute: &str) -> FsResult<()> {
+    pub async fn remove_directory(&self, absolute: &str, now: u64) -> FsResult<()> {
         let resolved = self.resolve(absolute)?;
         if resolved.is_mount_root() || self.holds_mounts(absolute) {
             return Err(FsError::Busy);
         }
-        resolved.writable()?.remove_directory(resolved.path()).await
+        resolved
+            .writable()?
+            .remove_directory(resolved.path(), now)
+            .await
     }
 
     /// Renames within one mount; across two, [`FsError::CrossDevice`]. A

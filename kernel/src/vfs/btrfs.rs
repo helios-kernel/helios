@@ -465,12 +465,12 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
     async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
         self.mutate(path, now, Operation::CreateDirectory).await
     }
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.mutate(path, 0, Operation::Remove { directory: true })
+    async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.mutate(path, now, Operation::Remove { directory: true })
             .await
     }
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-        self.mutate(path, 0, Operation::Remove { directory: false })
+    async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+        self.mutate(path, now, Operation::Remove { directory: false })
             .await
     }
     async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {

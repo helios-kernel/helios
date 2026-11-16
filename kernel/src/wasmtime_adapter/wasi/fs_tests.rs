@@ -758,11 +758,21 @@ fn the_base_itself_is_never_removed_renamed_or_replaced_through_it() {
 
     for path in ["", ".", "sub/.."] {
         assert!(matches!(
-            block_on(remove_directory_at(&namespace, held(&work()), path)),
+            block_on(remove_directory_at(
+                &namespace,
+                held(&work()),
+                path,
+                7_000_000_000
+            )),
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
-            block_on(unlink_file_at(&namespace, held(&work()), path)),
+            block_on(unlink_file_at(
+                &namespace,
+                held(&work()),
+                path,
+                7_000_000_000
+            )),
             Err(fs_types::ErrorCode::Invalid)
         ));
         assert!(matches!(
@@ -901,7 +911,12 @@ fn a_directory_holding_a_mount_point_is_busy() {
     for (source, path) in [("the holder", "a"), ("the mount point", "a/b")] {
         assert!(
             matches!(
-                block_on(remove_directory_at(&namespace, held(&root()), path)),
+                block_on(remove_directory_at(
+                    &namespace,
+                    held(&root()),
+                    path,
+                    7_000_000_000
+                )),
                 Err(fs_types::ErrorCode::Busy)
             ),
             "removing {source} must be refused as busy"
@@ -991,10 +1006,14 @@ fn a_read_only_base_removes_no_directory_on_the_host_share() {
     mount_unreachable_host(&namespace, "/mnt");
     let (rw, ro) = host_bases();
 
-    let reached = block_on(async { remove_directory_at(&namespace, rw.grant()?, "old").await });
+    let reached = block_on(async {
+        remove_directory_at(&namespace, rw.grant()?, "old", 7_000_000_000).await
+    });
     assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
 
-    let refused = block_on(async { remove_directory_at(&namespace, ro.grant()?, "old").await });
+    let refused = block_on(async {
+        remove_directory_at(&namespace, ro.grant()?, "old", 7_000_000_000).await
+    });
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
 }
 
@@ -1024,10 +1043,12 @@ fn a_read_only_base_unlinks_nothing_on_the_host_share() {
     mount_unreachable_host(&namespace, "/mnt");
     let (rw, ro) = host_bases();
 
-    let reached = block_on(async { unlink_file_at(&namespace, rw.grant()?, "old").await });
+    let reached =
+        block_on(async { unlink_file_at(&namespace, rw.grant()?, "old", 7_000_000_000).await });
     assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
 
-    let refused = block_on(async { unlink_file_at(&namespace, ro.grant()?, "old").await });
+    let refused =
+        block_on(async { unlink_file_at(&namespace, ro.grant()?, "old", 7_000_000_000).await });
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
 }
 

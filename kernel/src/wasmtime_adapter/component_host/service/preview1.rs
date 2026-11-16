@@ -3403,7 +3403,7 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::remove_directory_at(&namespace, granted, &path)
+    wasi_fs::remove_directory_at(&namespace, granted, &path, caller.data().now_nanos())
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3565,7 +3565,7 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::unlink_file_at(&namespace, granted, &path)
+    wasi_fs::unlink_file_at(&namespace, granted, &path, caller.data().now_nanos())
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }

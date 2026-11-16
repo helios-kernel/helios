@@ -36,6 +36,21 @@ fn options(time: Timestamp) -> FormatOptions {
 }
 
 fn formatted_image(tree: TreeBuilder, options: FormatOptions) -> crate::BlockCache<MemoryDisk> {
+    formatted_cache(tree, options, true)
+}
+
+fn formatted_writable_image(
+    tree: TreeBuilder,
+    options: FormatOptions,
+) -> crate::BlockCache<MemoryDisk> {
+    formatted_cache(tree, options, false)
+}
+
+fn formatted_cache(
+    tree: TreeBuilder,
+    options: FormatOptions,
+    read_only: bool,
+) -> crate::BlockCache<MemoryDisk> {
     // ferrosys' default geometry requires a volume above 109 MiB.
     let size = 128 << 20;
     let mut image = tempfile::tempfile().expect("image file");
@@ -44,7 +59,11 @@ fn formatted_image(tree: TreeBuilder, options: FormatOptions) -> crate::BlockCac
     image.seek(SeekFrom::Start(0)).expect("rewinds");
     let mut bytes = Vec::new();
     image.read_to_end(&mut bytes).expect("reads image");
-    let disk = MemoryDisk::holding("btrfs-test", &bytes, false);
+    let disk = if read_only {
+        MemoryDisk::holding("btrfs-test", &bytes, false)
+    } else {
+        MemoryDisk::holding_writable("btrfs-test", &bytes)
+    };
     drop(bytes);
     cache_over(&disk, 256, 1)
 }
@@ -176,7 +195,7 @@ fn writable_service_publishes_namespace_and_survives_remount() {
         b"durable contents",
         Metadata::new(0o644, time),
     );
-    let cache = formatted_image(tree, FormatOptions::new([0x61; 16], time));
+    let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
     block_on(async {
         let (fs, service) = BtrfsFs::mount_writable(
             cache.disk(0),
@@ -280,10 +299,20 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 .await
                 .expect("symlink");
             assert_eq!(
-                fs.remove_directory(path("dir")).await,
+                fs.remove_directory(path("dir"), 7_000_000_000).await,
                 Err(FsError::NotEmpty)
             );
-            assert_eq!(fs.unlink(path("dir")).await, Err(FsError::IsDirectory));
+            assert_eq!(
+                fs.unlink(path("dir"), 7_000_000_000).await,
+                Err(FsError::IsDirectory)
+            );
+            fs.open(path("dir/deleted"), OpenFlags::CREATE, 7_000_000_000)
+                .await
+                .unwrap();
+            fs.unlink(path("dir/deleted"), 8_000_000_000).await.unwrap();
+            let parent = fs.stat(path("dir")).await.unwrap();
+            assert_eq!(parent.modified_nanos, 8_000_000_000);
+            assert_eq!(parent.status_nanos, 8_000_000_000);
             fs.sync(path("file")).await.expect("sync commit");
             assert_eq!(
                 fs.read_at(path("file"), 0, 99).await.unwrap(),

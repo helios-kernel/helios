@@ -384,7 +384,7 @@ impl FileSystem for RootFs {
         self.upper.create_directory(path, now).await
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
         let Some((parent, _)) = path.split_last() else {
             return Err(FsError::NotPermitted);
         };
@@ -401,10 +401,10 @@ impl FileSystem for RootFs {
         if whiteout {
             self.copy_up_directories(parent)?;
         }
-        self.upper.remove(path, true, whiteout)
+        self.upper.remove(path, true, whiteout, now)
     }
 
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
         let Some((parent, _)) = path.split_last() else {
             return Err(FsError::IsDirectory);
         };
@@ -416,7 +416,7 @@ impl FileSystem for RootFs {
         if whiteout {
             self.copy_up_directories(parent)?;
         }
-        self.upper.remove(path, false, whiteout)
+        self.upper.remove(path, false, whiteout, now)
     }
 
     async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -596,22 +596,23 @@ mod tests {
     fn removing_a_boot_object_leaves_a_whiteout() {
         let fs = root();
         assert_eq!(
-            block_on(fs.remove_directory(path("bin"))),
+            block_on(fs.remove_directory(path("bin"), 7_000_000_000)),
             Err(FsError::NotEmpty)
         );
-        block_on(fs.unlink(path("bin/tool"))).expect("removes a boot file");
+        block_on(fs.unlink(path("bin/tool"), 7_000_000_000)).expect("removes a boot file");
         assert_eq!(
             block_on(fs.stat(path("bin/tool"))).map(drop),
             Err(FsError::NoEntry)
         );
         assert_eq!(listing(&fs, "bin", 1), ["empty"]);
-        block_on(fs.remove_directory(path("bin/empty"))).expect("removes a boot directory");
-        block_on(fs.remove_directory(path("bin"))).expect("now empty");
+        block_on(fs.remove_directory(path("bin/empty"), 7_000_000_000))
+            .expect("removes a boot directory");
+        block_on(fs.remove_directory(path("bin"), 7_000_000_000)).expect("now empty");
         assert_eq!(listing(&fs, "", 8), ["etc", "init.txt"]);
 
         // A copied-up file removed is hidden too, not uncovered.
         write(&fs, "init.txt", WritePosition::At(0), b"J", 1);
-        block_on(fs.unlink(path("init.txt"))).expect("removes the copy");
+        block_on(fs.unlink(path("init.txt"), 7_000_000_000)).expect("removes the copy");
         assert_eq!(
             block_on(fs.stat(path("init.txt"))).map(drop),
             Err(FsError::NoEntry)
@@ -625,8 +626,8 @@ mod tests {
     #[test]
     fn a_directory_made_over_a_whiteout_shows_nothing_beneath() {
         let fs = root();
-        block_on(fs.unlink(path("etc/motd"))).expect("removes");
-        block_on(fs.remove_directory(path("etc"))).expect("removes");
+        block_on(fs.unlink(path("etc/motd"), 7_000_000_000)).expect("removes");
+        block_on(fs.remove_directory(path("etc"), 7_000_000_000)).expect("removes");
         block_on(fs.create_directory(path("etc"), 1)).expect("makes it again");
         assert_eq!(listing(&fs, "etc", 8), Vec::<String>::new());
         assert_eq!(
@@ -683,7 +684,7 @@ mod tests {
         let first = RootFs::new(MemoryFs::new(DeviceId::new(4)), lower.clone());
         let second = RootFs::new(MemoryFs::new(DeviceId::new(4)), lower);
         block_on(first.open(path("mine"), OpenFlags::CREATE, 1)).expect("creates");
-        block_on(first.unlink(path("bin/tool"))).expect("removes");
+        block_on(first.unlink(path("bin/tool"), 7_000_000_000)).expect("removes");
         assert_eq!(
             block_on(second.stat(path("mine"))).map(drop),
             Err(FsError::NoEntry)

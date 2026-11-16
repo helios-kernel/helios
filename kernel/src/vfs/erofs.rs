@@ -428,11 +428,11 @@ where
         Err(FsError::ReadOnly)
     }
 
-    async fn remove_directory(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn unlink(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
