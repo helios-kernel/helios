@@ -20,7 +20,7 @@ mod lifecycle;
 mod observer;
 pub(crate) mod phases;
 mod ready;
-mod sync;
+use helios_sync as sync;
 mod task;
 mod time;
 mod timer;

@@ -270,15 +270,13 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Copies into owned writable pages while this space is inactive.
-    pub fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
-        let end = address
-            .checked_add(bytes.len() as u64)
-            .ok_or(Error::Address)?;
+    /// Validates writable pages in this exclusively owned inactive space.
+    pub fn check_writable(&self, address: u64, length: usize) -> Result<(), Error> {
+        let end = address.checked_add(length as u64).ok_or(Error::Address)?;
         if end > USER_END {
             return Err(Error::Address);
         }
-        if bytes.is_empty() {
+        if length == 0 {
             return Ok(());
         }
         for cursor in (address & !(PAGE_BYTES as u64 - 1)..end).step_by(PAGE_BYTES) {
@@ -290,6 +288,12 @@ impl AddressSpace {
                 return Err(Error::Address);
             }
         }
+        Ok(())
+    }
+
+    /// Copies into owned writable pages while this space is inactive.
+    pub fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.check_writable(address, bytes.len())?;
         let mut done = 0;
         while done < bytes.len() {
             let cursor = address + done as u64;
