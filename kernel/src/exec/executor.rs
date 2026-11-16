@@ -3339,7 +3339,11 @@ mod tests {
     fn a_global_task_runs_within_the_service_interval_behind_a_self_rewaking_local_task() {
         let _serialized = super::executor_test_guard();
         crate::test_processor_identity::set(ProcessorId::new(0));
-        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
         let timer = executor.timer(TestCpu::new());
         let spawner = executor.spawner(TestCpu::new());
         let spins = Arc::new(AtomicUsize::new(0));
@@ -3381,7 +3385,11 @@ mod tests {
         let _serialized = super::executor_test_guard();
         crate::test_processor_identity::set(ProcessorId::new(0));
         let cpu = ManualClockCpu::new();
-        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
         let timer = executor.timer(cpu.clone());
         let spawner = executor.spawner(cpu.clone());
         let slice_nanos = u64::try_from(GUEST_TIME_SLICE.as_nanos())
@@ -3432,7 +3440,11 @@ mod tests {
 
         crate::test_processor_identity::set(ProcessorId::new(0));
         let cpu = ManualClockCpu::new();
-        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let executor = Executor::new(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
         let timer = executor.timer(cpu.clone());
         let spawner = executor.spawner(cpu.clone());
         let spins = Arc::new(AtomicUsize::new(0));
