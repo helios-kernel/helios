@@ -3278,15 +3278,19 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<(), VmConfigError>
 
 fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
     let repo_root = repo_root()?;
-    run_step(
-        "building helios-cli",
-        command
-            .kind
-            .host()
-            .cargo_build_command(&repo_root)
-            .arg("-p")
-            .arg("helios-cli"),
-    )?;
+    // A `helios-cli` named by `HELIOS_CLI_BIN` is the one the prebuild
+    // runs (`discover_helios_cli`), so building the workspace's is waste.
+    if std::env::var_os("HELIOS_CLI_BIN").is_none() {
+        run_step(
+            "building helios-cli",
+            command
+                .kind
+                .host()
+                .cargo_build_command(&repo_root)
+                .arg("-p")
+                .arg("helios-cli"),
+        )?;
+    }
     run_kernel_prebuild(command)?;
     let kernel_label = match &command.profile_use {
         // Which profile a PGO kernel was built from is part of what it
