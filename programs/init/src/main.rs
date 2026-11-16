@@ -123,6 +123,7 @@ async fn run_rc() -> io::Result<()> {
         hint: None,
         capability_grants: vec![
             programs::root_directory_grant(),
+            programs::root_link_grant(),
             programs::root_process_grant(),
         ],
     })

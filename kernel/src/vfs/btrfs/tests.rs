@@ -187,6 +187,110 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
     );
 }
 
+/// The guest smoke's sequence through a writable namespace mount and the
+/// WASI link path a preview1 program reaches.
+#[test]
+fn a_writable_mount_links_a_file_created_through_the_namespace() {
+    use crate::wasmtime_adapter::wasi::{
+        FsDescriptor, FsNodeKind, bindings::filesystem::types as fs_types, link_at,
+    };
+
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+    let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
+    const BOOT: EmbeddedBootFs = EmbeddedBootFs::new(&[EmbeddedBootDirectory::new("mnt", 0)], &[]);
+    let namespace =
+        Namespace::<MemoryStorage>::new(MountTable::new(BootFs::new(BOOT, BOOT_DEVICE), 1));
+    let service = block_on(request_mount(
+        &ProcessAuthority::root(),
+        &namespace,
+        AttachedStorage {
+            host_share: None,
+            disks: Some(cache),
+        },
+        MountSource::Btrfs {
+            serial: BlockSerial::new(b"btrfs-test").unwrap(),
+        },
+        "/mnt",
+        false,
+        crate::vfs::BtrfsWriteOptions {
+            entropy: crate::test_support::test_root_entropy(),
+            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+        },
+    ))
+    .expect("mount request")
+    .expect("a writable btrfs mount returns its service");
+    let client = async {
+        let resolved = namespace.resolve("/mnt/written").unwrap();
+        resolved
+            .writable()
+            .unwrap()
+            .create_directory(resolved.path(), 1_000_000_000)
+            .await
+            .expect("mkdir");
+        let resolved = namespace.resolve("/mnt/written/original").unwrap();
+        let fs = resolved.writable().unwrap();
+        fs.open(
+            resolved.path(),
+            OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            1_000_000_001,
+        )
+        .await
+        .expect("create");
+        write_with(
+            fs,
+            resolved.path(),
+            WritePosition::At(0),
+            4096,
+            1_000_000_002,
+            |_, bytes| bytes.fill(0x50),
+        )
+        .await
+        .expect("write");
+        fs.sync(resolved.path()).await.expect("fsync");
+        let root = FsDescriptor {
+            path: alloc::string::String::from("/"),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        let proof = root
+            .grant()
+            .unwrap()
+            .alias_into(root.grant().unwrap())
+            .unwrap();
+        link_at(
+            &namespace,
+            proof,
+            "mnt/written/original",
+            "mnt/written/hard",
+            1_000_000_003,
+        )
+        .await
+        .expect("link through the WASI path");
+        assert_eq!(
+            namespace
+                .resolve("/mnt/written/hard")
+                .unwrap()
+                .fs()
+                .stat(path("written/hard"))
+                .await
+                .unwrap()
+                .link_count,
+            2
+        );
+    };
+    let service = service.run();
+    futures::pin_mut!(client, service);
+    match block_on(futures::future::select(client, service)) {
+        futures::future::Either::Left(((), _)) => {}
+        futures::future::Either::Right(_) => panic!("the write service stopped first"),
+    }
+}
+
 #[test]
 fn writable_service_publishes_namespace_and_survives_remount() {
     let time = Timestamp::from_secs(1_700_000_000);
