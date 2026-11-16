@@ -32,8 +32,10 @@ pub enum FreeSpaceDefect {
     AllocationMismatch,
     #[error("invalid free-space info key, size, or flags")]
     Info,
-    #[error("empty, unaligned, overflowing, or out-of-group free-space range")]
-    Range,
+    #[error(
+        "free-space range {start}..{end} is empty, unaligned, overflowing, or out of its group"
+    )]
+    Range { start: u64, end: u64 },
     #[error("overlapping free-space records")]
     Overlap,
     #[error("free-space item type does not match the group's representation")]
@@ -81,7 +83,10 @@ impl Intervals {
     /// Inserts a disjoint range and coalesces its adjacent neighbours.
     pub(crate) fn release(&mut self, mut range: Range<u64>) -> Result<(), FreeSpaceDefect> {
         if range.start >= range.end {
-            return Err(FreeSpaceDefect::Range);
+            return Err(FreeSpaceDefect::Range {
+                start: range.start,
+                end: range.end,
+            });
         }
         let before = self
             .0
@@ -153,7 +158,10 @@ impl FreeGroup {
         let end = key
             .objectid
             .checked_add(key.offset)
-            .ok_or(FreeSpaceDefect::Range)?;
+            .ok_or(FreeSpaceDefect::Range {
+                start: key.objectid,
+                end: u64::MAX,
+            })?;
         let range = key.objectid..end;
         validate_range(&range, &range, sector)?;
         let bitmaps = info.flags.get() == 1;
@@ -168,7 +176,10 @@ impl FreeGroup {
             let end = item
                 .objectid
                 .checked_add(item.offset)
-                .ok_or(FreeSpaceDefect::Range)?;
+                .ok_or(FreeSpaceDefect::Range {
+                    start: item.objectid,
+                    end: u64::MAX,
+                })?;
             let extent = item.objectid..end;
             validate_range(&extent, &range, sector)?;
             if !bitmaps && item.item_type == item_type::FREE_SPACE_EXTENT {
@@ -325,7 +336,10 @@ fn validate_range(
         || !range.start.is_multiple_of(sector)
         || !range.end.is_multiple_of(sector)
     {
-        return Err(FreeSpaceDefect::Range);
+        return Err(FreeSpaceDefect::Range {
+            start: range.start,
+            end: range.end,
+        });
     }
     Ok(())
 }
@@ -385,7 +399,10 @@ impl FreeTree {
                 {
                     return Err(WriteError::FreeSpace {
                         key,
-                        defect: FreeSpaceDefect::Range,
+                        defect: FreeSpaceDefect::Range {
+                            start: key.objectid,
+                            end: key.objectid.saturating_add(key.offset),
+                        },
                     });
                 }
             }
