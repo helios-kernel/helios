@@ -20,6 +20,8 @@ helios-venus-gen = { workspace = true, features = ["generate"] }
 thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# The driver's unit tests compare Vulkan values with `assert_eq!`.
+ash = { version = "0.38.0", default-features = false, features = ["std", "debug"] }
 askama = { version = "0.15.6", default-features = false, features = ["derive", "std"] }
 cc = { version = "1.11.1", default-features = false }
 helios-venus-gen = { workspace = true, features = ["generate"] }

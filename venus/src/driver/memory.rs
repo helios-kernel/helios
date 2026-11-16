@@ -8,6 +8,7 @@ use ash::vk::{self, Handle};
 
 use super::Factory;
 use super::allocator::HostAllocator;
+use super::chain::Rewritten;
 use super::instance::{TransportError, invoke_result, invoke_void, object, shared};
 use crate::connection::Error;
 use crate::protocol as wire;
@@ -54,6 +55,10 @@ unsafe extern "system" fn allocate<F: Factory>(
             Ok(allocation) => allocation,
             Err(_) => return Ok(vk::Result::ERROR_OUT_OF_HOST_MEMORY),
         };
+        let external = state.devices.get(&device_id).unwrap().external;
+        // SAFETY: the allocate-info and its chain are live for this call.
+        let rewritten = unsafe { super::external::allocate_info(external, &*info) };
+        let renderer_info = rewritten.as_ref().map_or(info, Rewritten::head);
         let mut handle = wire::VkDeviceMemory(state.connection.object_id()?);
         // SAFETY: callback pointers are guest-only; the renderer allocates
         // using its own allocator and the already assigned memory ID.
@@ -61,7 +66,7 @@ unsafe extern "system" fn allocate<F: Factory>(
             wire::vn_call_vkAllocateMemory(
                 &mut state.connection,
                 wire::VkDevice(object(device)),
-                info.cast(),
+                renderer_info.cast(),
                 null(),
                 &mut handle,
             )

@@ -1,4 +1,3 @@
-use core::ffi::c_void;
 use core::ptr::null;
 use std::collections::BTreeMap;
 
@@ -6,6 +5,7 @@ use ash::vk::{self, Handle};
 
 use super::Factory;
 use super::allocator::HostAllocator;
+use super::chain::next;
 use super::device::Queue;
 use super::instance::{invoke_result, object, shared, wait_for_points};
 use crate::connection::{Connection, Error};
@@ -67,18 +67,6 @@ unsafe fn slice<'a, T>(pointer: *const T, count: u32) -> &'a [T] {
         // SAFETY: Vulkan supplies count live elements; zero counts may use null.
         unsafe { core::slice::from_raw_parts(pointer, count as usize) }
     }
-}
-
-unsafe fn next<'a, T: vk::TaggedStructure>(mut pointer: *const c_void) -> Option<&'a T> {
-    while !pointer.is_null() {
-        // SAFETY: Vulkan pNext chains contain live structures with this common header.
-        let header = unsafe { &*pointer.cast::<vk::BaseInStructure<'_>>() };
-        if header.s_type == T::STRUCTURE_TYPE {
-            return Some(unsafe { &*pointer.cast::<T>() });
-        }
-        pointer = header.p_next.cast();
-    }
-    None
 }
 
 unsafe extern "system" fn create_fence<F: Factory>(

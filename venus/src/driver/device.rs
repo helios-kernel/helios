@@ -7,6 +7,7 @@ use ash::vk::{self, Handle};
 
 use super::Factory;
 use super::allocator::HostAllocator;
+use super::external::{ExternalMemory, enables_external_memory, renderer_device_extensions};
 use super::instance::{Dispatch, TransportError, invoke_void, object, shared, wait_for_points};
 use crate::connection::Error;
 use crate::protocol as wire;
@@ -18,6 +19,8 @@ pub(super) struct Device<F: Factory> {
     dispatch: Dispatch<F>,
     pub(super) allocator: HostAllocator,
     pub(super) memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// Immutable after creation, so entry points read it without the lock.
+    pub(super) external: ExternalMemory,
     queues: Vec<Box<Queue<F>, HostAllocator>>,
     pub(super) memories: BTreeMap<u64, Box<super::memory::Memory<F::Transport>, HostAllocator>>,
     pub(super) fences: BTreeMap<u64, Box<super::sync::Fence<F::Transport>, HostAllocator>>,
@@ -88,6 +91,35 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
                 (&raw mut memory_properties).cast(),
             )
         }?;
+        // The guest implements the external memory extensions; the renderer
+        // enables the ones its own handle type needs.
+        // SAFETY: Vulkan's device create-info specifies live extension names.
+        let application: Vec<&CStr> = unsafe {
+            (0..(*info).enabled_extension_count as usize)
+                .map(|index| CStr::from_ptr(*(*info).pp_enabled_extension_names.add(index)))
+                .collect()
+        };
+        let external = if enables_external_memory(&application) {
+            match state.physical_external(physical)? {
+                Ok(physical) => physical.memory,
+                Err(result) => return Ok(result),
+            }
+        } else {
+            ExternalMemory::NONE
+        };
+        let renderer_extensions = match renderer_device_extensions(&application, external) {
+            Ok(extensions) => extensions,
+            Err(result) => return Ok(result),
+        };
+        let renderer_names: Option<Vec<*const c_char>> = renderer_extensions
+            .map(|extensions| extensions.iter().map(|name| name.as_ptr()).collect());
+        // SAFETY: the copy shares the application's chain and queue array,
+        // which stay live for this call.
+        let mut renderer_info = unsafe { *info };
+        if let Some(names) = &renderer_names {
+            renderer_info.enabled_extension_count = names.len() as u32;
+            renderer_info.pp_enabled_extension_names = names.as_ptr();
+        }
         let id = state.connection.object_id()?;
         let mut device = match Box::try_new_in(
             Device::<F> {
@@ -97,6 +129,7 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
                 },
                 allocator,
                 memory_properties,
+                external,
                 queues: Vec::new(),
                 memories: BTreeMap::new(),
                 pools: BTreeMap::new(),
@@ -155,7 +188,7 @@ pub(super) unsafe extern "system" fn create_device<F: Factory>(
             wire::vn_call_vkCreateDevice(
                 &mut state.connection,
                 wire::VkPhysicalDevice(object(physical)),
-                info.cast(),
+                (&raw const renderer_info).cast(),
                 null(),
                 &mut handle,
             )
@@ -336,6 +369,7 @@ pub(super) fn lookup<F: Factory>(name: &[u8]) -> vk::PFN_vkVoidFunction {
         _ => {
             return super::sync::lookup::<F>(name)
                 .or_else(|| super::memory::lookup::<F>(name))
+                .or_else(|| super::external::lookup::<F>(name))
                 .or_else(|| super::command::lookup::<F>(name));
         }
     };

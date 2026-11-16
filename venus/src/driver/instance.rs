@@ -38,6 +38,8 @@ pub(super) struct State<F: Factory> {
     pub(super) fault: Option<Error<TransportError<F>>>,
     pub(super) devices: BTreeMap<u64, Box<super::device::Device<F>, HostAllocator>>,
     pub(super) timelines: u64,
+    /// Each physical device's external memory, by object ID, from first use.
+    pub(super) external: BTreeMap<u64, super::external::PhysicalExternal>,
 }
 
 pub(super) fn object<H: Handle>(handle: H) -> *mut ObjectBase {
@@ -80,7 +82,7 @@ impl<F: Factory> State<F> {
     }
 }
 
-unsafe fn invoke<F: Factory, R>(
+pub(super) unsafe fn invoke<F: Factory, R>(
     object: *mut ObjectBase,
     call: impl FnOnce(&mut State<F>) -> Result<R, Error<TransportError<F>>>,
 ) -> Result<R, vk::Result> {
@@ -206,34 +208,44 @@ unsafe extern "system" fn enumerate_extensions(
     if !layer.is_null() {
         return vk::Result::ERROR_LAYER_NOT_PRESENT;
     }
-    let extensions = supported_extensions();
     // The renderer enumerates private wire extensions, not guest Vulkan
     // extensions. These queries are core in the renderer's required Vulkan 1.1.
+    let extensions = supported_extensions().map(|(name, version)| {
+        vk::ExtensionProperties::default()
+            .extension_name(name)
+            .expect("extension names fit VK_MAX_EXTENSION_NAME_SIZE")
+            .spec_version(version)
+    });
     // SAFETY: Vulkan supplies a writable count and the declared output capacity.
-    unsafe {
-        if properties.is_null() {
-            *count = extensions.len() as u32;
+    unsafe { write_properties(count, properties, &extensions) }
+}
+
+/// Answer a Vulkan enumeration of `items`: the count alone when `output` is
+/// null, else as many as `count` holds, INCOMPLETE when that is not all.
+///
+/// # Safety
+/// `count` is writable and, unless `output` is null, `output` has room for
+/// the `count` it points to.
+pub(super) unsafe fn write_properties<T: Copy>(
+    count: *mut u32,
+    output: *mut T,
+    items: &[T],
+) -> vk::Result {
+    // SAFETY: forwarded from the caller.
+    let written = unsafe {
+        if output.is_null() {
+            *count = items.len() as u32;
             return vk::Result::SUCCESS;
         }
-        let written = (*count as usize).min(extensions.len());
-        for (index, (name, version)) in extensions.iter().take(written).enumerate() {
-            let mut property = vk::ExtensionProperties::default();
-            for (slot, byte) in property
-                .extension_name
-                .iter_mut()
-                .zip(name.to_bytes_with_nul())
-            {
-                *slot = *byte as c_char;
-            }
-            property.spec_version = *version;
-            properties.add(index).write(property);
-        }
+        let written = (*count as usize).min(items.len());
+        core::ptr::copy_nonoverlapping(items.as_ptr(), output, written);
         *count = written as u32;
-        if written < extensions.len() {
-            vk::Result::INCOMPLETE
-        } else {
-            vk::Result::SUCCESS
-        }
+        written
+    };
+    if written < items.len() {
+        vk::Result::INCOMPLETE
+    } else {
+        vk::Result::SUCCESS
     }
 }
 
@@ -299,6 +311,7 @@ pub(super) unsafe fn create_on_connection<F: Factory>(
         devices: BTreeMap::new(),
         // Virtio's CPU timeline occupies ring zero.
         timelines: 1,
+        external: BTreeMap::new(),
     }));
     let mut state = owner.lock();
     let id = match state.connection.object_id() {
@@ -471,7 +484,8 @@ pub(super) unsafe extern "system" fn get_instance_proc_addr<F: Factory>(
         b"vkEnumeratePhysicalDevices" => enumerate_physical_devices::<F> as *const (),
         b"vkCreateDevice" => super::device::create_device::<F> as *const (),
         _ => {
-            return super::device::lookup::<F>(name)
+            return super::external::instance_lookup::<F>(name)
+                .or_else(|| super::device::lookup::<F>(name))
                 .or_else(|| super::generated::lookup::<F>(name, false));
         }
     };

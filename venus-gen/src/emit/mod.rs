@@ -88,6 +88,7 @@ pub fn protocol_tokens(an: &Analysis) -> Result<TokenStream, RegistryError> {
     let aggregates = items::aggregate_items(an, &set)?;
     let assertions = items::layout_assertions(an, &set)?;
     let info = items::info_items(an)?;
+    let layouts = items::struct_layout_items(an)?;
 
     let mut functions = TokenStream::new();
     for &id in an
@@ -117,6 +118,7 @@ pub fn protocol_tokens(an: &Analysis) -> Result<TokenStream, RegistryError> {
         #aggregates
         #assertions
         #info
+        #layouts
         #functions
     })
 }

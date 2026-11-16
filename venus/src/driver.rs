@@ -6,9 +6,11 @@
 //! asynchronous. There is no process-global registry or current connection.
 
 mod allocator;
+mod chain;
 mod command;
 mod device;
 mod exclusive;
+mod external;
 mod instance;
 mod memory;
 mod sync;

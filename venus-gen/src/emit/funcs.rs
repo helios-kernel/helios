@@ -133,8 +133,10 @@ impl<'a> Wire<'a> {
                 venus_result.inspect_err(|_| { #clear })
             }
         };
+        // Visible to the driver, whose hand-written entry points rewrite an
+        // input before forwarding it to the generated one.
         Ok(Some(quote! {
-            unsafe extern "system" fn #entry<F: Factory>(#(#params),*) #ret {
+            pub(super) unsafe extern "system" fn #entry<F: Factory>(#(#params),*) #ret {
                 unsafe {
                     #clear
                     super::instance::#invocation::<F>(#dispatch.0, |venus_state| {
