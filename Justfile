@@ -130,6 +130,7 @@ test-libraries:
     cargo nextest run -p helios-unix --features runtime
     cargo nextest run -p helios-linux --features runtime
     cargo nextest run -p helios-firmware
+    cargo nextest run -p helios-vmm
     cargo nextest run -p helios-workspace-root --lib
     # The TPM driver: both interfaces against register models that
     # enforce their state machines, and the sealing scenario replayed

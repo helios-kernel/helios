@@ -26,6 +26,7 @@ use tables::Tables;
 use vgic::Vgic;
 
 mod context;
+mod debug;
 mod exit;
 mod features;
 #[cfg(helios_hv_self_test)]
@@ -65,6 +66,7 @@ struct Hardware {
     vtcr: u64,
     vgic: vgic::Capabilities,
     features: features::Features,
+    debug: debug::Capabilities,
 }
 
 pub struct Hypervisor {
@@ -116,6 +118,7 @@ impl Hypervisor {
                 vtcr,
                 vgic: vgic::Capabilities::read(),
                 features: features::Features::discover(ps as u64),
+                debug: debug::Capabilities::discover(),
             }),
         })
     }
@@ -205,6 +208,7 @@ unsafe impl Stage2Space for Space {
                 target: CachePadded::new(AtomicUsize::new(0)),
             }),
             context: Context::new(GUEST_HCR),
+            debug: debug::State::new(space.lease.hardware.debug),
             vgic: Vgic::new(space.lease.hardware.vgic),
             id,
             prepared: None,
@@ -249,6 +253,7 @@ pub struct Vcpu {
     space: Arc<Space>,
     kick: Arc<Kick>,
     context: Context,
+    debug: debug::State,
     vgic: Vgic,
     id: u32,
     prepared: Option<(ProcessorId, Duration)>,
@@ -301,7 +306,8 @@ impl Vcpu {
         let saved_mdcr = read!(mdcr_el2);
         write!(vtcr_el2, self.space.lease.hardware.vtcr);
         write!(vttbr_el2, self.space.tables.vttbr() as u64);
-        tables::flush();
+        // VMIDs retain translations across switches. Table mutations and
+        // final VMID release complete their own broadcast invalidation.
         write!(cntvoff_el2, 0u64);
         // E2H shifts EL1 physical-counter/timer access enables to bits 10/11.
         write!(cnthctl_el2, 3u64 << 10);
@@ -312,10 +318,11 @@ impl Vcpu {
         // Permit FP/SIMD. SVE/SME accesses remain trapped; their state is not
         // part of this virtual CPU's advertised feature set.
         write!(cptr_el2, 3u64 << 20);
-        // Trap debug, PMU and OS debug registers rather than sharing host state.
-        write!(mdcr_el2, (1u64 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
+        // Trap debug register access, PMU and OS Lock. Debug exceptions remain
+        // directed to guest EL1 (TDE=0), where its own debugger handles them.
+        write!(mdcr_el2, (1u64 << 6) | (1 << 9) | (1 << 10));
         self.vgic.install();
-        let ticks = self
+        self.context.slice_ticks = self
             .space
             .lease
             .hardware
@@ -323,31 +330,29 @@ impl Vcpu {
             .duration_to_ticks(slice)
             .max(1);
         let now = read!(cntpct_el0);
-        let slice_deadline = now.saturating_add(ticks);
-        // A single host-owned timer bounds execution and observes the next
-        // guest timer deadline. Guest timer PPIs are masked in the GIC so
-        // an expired level cannot repeatedly exit before the guest handles
-        // its virtual interrupt.
-        let deadline = self
+        // The switch arms the host timer after context restoration, so host
+        // setup cannot consume the guest's execution slice. It also observes
+        // the next guest deadline; guest timer PPIs stay masked in the GIC.
+        self.context.timer_deadline = self
             .timer_state()
             .into_iter()
             .filter(|(control, deadline, _)| control & 3 == 1 && *deadline > now)
             .map(|(_, deadline, _)| deadline)
-            .fold(slice_deadline, u64::min);
-        write!(cnthp_cval_el2, deadline);
-        write!(cnthp_ctl_el2, 1u64);
+            .min()
+            .unwrap_or(0);
         unsafe {
             asm!("isb", options(nostack, preserves_flags));
         }
         // SAFETY: preparation validated the mode, Stage-2 owns all guest
         // translations, and CNTHP plus HCR.IMO bound entry independently of
         // the guest's interrupt masks. The assembly restores the host first.
+        let host_debug = self.debug.enter();
         unsafe {
             helios_aarch64_enter_guest(&mut self.context);
         }
+        host_debug.restore();
         write!(cnthp_ctl_el2, 0u64);
         self.vgic.detach();
-        tables::flush();
         write!(vttbr_el2, saved_vttbr);
         write!(vtcr_el2, saved_vtcr);
         write!(cntvoff_el2, saved_offset);
@@ -373,10 +378,44 @@ impl Vcpu {
                     register,
                     access: helios_hal::hv::IoAccess::Read { .. },
                 } = exit
-                    && let Some(value) = self.space.lease.hardware.features.register(register)
+                    && let Some(value) = if register == 0xc028 {
+                        Some(self.space.lease.hardware.debug.id)
+                    } else {
+                        self.space.lease.hardware.features.register(register)
+                    }
                 {
                     completion
                         .expect("ID register trap carries completion")
+                        .apply(&mut self.context.registers, value);
+                    return Ok(VmExit::Preempted);
+                }
+                // MDSCR_EL1 is already banked with the guest context. TDA
+                // traps access so no guest can access host debug state.
+                if let VmExit::SysReg {
+                    register: 0x8012,
+                    access,
+                } = exit
+                {
+                    let value = match access {
+                        helios_hal::hv::IoAccess::Read { .. } => self.context.system.mdscr,
+                        helios_hal::hv::IoAccess::Write { value, .. } => {
+                            self.context.system.mdscr = value;
+                            0
+                        }
+                    };
+                    completion
+                        .expect("MDSCR trap carries completion")
+                        .apply(&mut self.context.registers, value);
+                    return Ok(VmExit::Preempted);
+                }
+                if let VmExit::SysReg { register, access } = exit
+                    && let Some(value) = self
+                        .debug
+                        .register(register, access)
+                        .or_else(|| self.vgic.register(register, access))
+                {
+                    completion
+                        .expect("GIC CPU-interface trap carries completion")
                         .apply(&mut self.context.registers, value);
                     return Ok(VmExit::Preempted);
                 }
@@ -453,6 +492,17 @@ unsafe impl GuestVcpu for Vcpu {
     }
     fn set_irq_window(&mut self, enabled: bool) {
         self.vgic.set_window(enabled);
+    }
+    fn reset(&mut self) -> Result<(), HvError> {
+        self.context = Context::new(GUEST_HCR);
+        self.debug = debug::State::new(self.space.lease.hardware.debug);
+        self.vgic = Vgic::new(self.space.lease.hardware.vgic);
+        self.prepared = None;
+        self.completion = None;
+        self.timer_signalled = [false; 2];
+        self.failed = false;
+        self.kick.pending.store(false, Ordering::Release);
+        Ok(())
     }
     fn get_regs(&mut self) -> Result<Registers, HvError> {
         if self.failed {
