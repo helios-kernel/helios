@@ -376,6 +376,7 @@ async fn main() -> Result<()> {
                     response = Some((cpu, action));
                 }
             }
+            console.console_control(&memory)?;
             console.console_output(&memory).await?;
             console.console_input(&memory, &mut input)?;
             if input_waiting && input.is_empty() {

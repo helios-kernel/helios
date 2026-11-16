@@ -9,11 +9,20 @@ use std::collections::VecDeque;
 // advertises 256 entries, and implements neither indirect nor event-index.
 const QUEUE_MAX: u16 = 256;
 const VERSION_1: u64 = 1 << 32;
+const CONSOLE_SIZE: u64 = 1;
+const CONSOLE_MULTIPORT: u64 = 1 << 1;
 const DRIVER_OK: u32 = 4;
 const FEATURES_OK: u32 = 8;
+// Virtio 1.2 console control events, section 5.3.6.2.
+const DEVICE_READY: u16 = 0;
+const PORT_ADD: u16 = 1;
+const PORT_READY: u16 = 3;
+const CONSOLE_PORT: u16 = 4;
+const RESIZE: u16 = 5;
+const PORT_OPEN: u16 = 6;
 
 #[derive(Default)]
-struct Queue {
+pub(super) struct Queue {
     size: u16,
     ready: bool,
     descriptor: u64,
@@ -99,34 +108,132 @@ impl Queue {
     }
 }
 
-pub struct Device {
-    id: u32,
-    features: u64,
+pub(super) trait Model: Default {
+    const ID: u32;
+    const FEATURES: u64;
+    const REQUIRED: u64;
+    fn queues(&self) -> &[Queue];
+    fn queues_mut(&mut self) -> &mut [Queue];
+    fn configuration(&self, offset: u64, width: IoWidth, capacity: u64) -> u64;
+}
+
+#[derive(Default)]
+pub(super) struct Console {
+    queues: [Queue; 4],
+    device_ready: bool,
+    port_ready: bool,
+    guest_open: bool,
+    // One pending response per handshake event; repeats coalesce.
+    pending: u8,
+}
+
+#[derive(Default)]
+pub(super) struct Block {
+    queues: [Queue; 1],
+}
+
+impl Console {
+    fn receive_control(&mut self, packet: [u8; 8]) -> Result<()> {
+        let id = u32::from_le_bytes(packet[..4].try_into().unwrap());
+        let event = u16::from_le_bytes(packet[4..6].try_into().unwrap());
+        let value = u16::from_le_bytes(packet[6..].try_into().unwrap());
+        match event {
+            DEVICE_READY if value == 1 => {
+                self.device_ready = true;
+                self.pending |= 1;
+            }
+            PORT_READY if id == 0 && value == 1 && self.device_ready => {
+                self.port_ready = true;
+                // Identify the console, connect its host end, then size it.
+                self.pending |= 0b1110;
+            }
+            PORT_OPEN if id == 0 && value <= 1 && self.port_ready => {
+                self.guest_open = value == 1;
+            }
+            _ => return Err(Error::Queue("invalid console control transition")),
+        }
+        Ok(())
+    }
+
+    fn response(&self) -> ([u8; 12], usize, u8) {
+        let index = self.pending.trailing_zeros();
+        let event = [PORT_ADD, CONSOLE_PORT, PORT_OPEN, RESIZE][index as usize];
+        let mut bytes = [0; 12];
+        bytes[4..6].copy_from_slice(&event.to_le_bytes());
+        bytes[6..8].copy_from_slice(&1u16.to_le_bytes());
+        let length = if event == RESIZE {
+            bytes[8..10].copy_from_slice(&25u16.to_le_bytes());
+            bytes[10..12].copy_from_slice(&80u16.to_le_bytes());
+            12
+        } else {
+            8
+        };
+        (bytes, length, 1 << index)
+    }
+}
+
+impl Model for Console {
+    const ID: u32 = 3;
+    const FEATURES: u64 = VERSION_1 | CONSOLE_SIZE | CONSOLE_MULTIPORT;
+    const REQUIRED: u64 = VERSION_1 | CONSOLE_MULTIPORT;
+    fn queues(&self) -> &[Queue] {
+        &self.queues
+    }
+    fn queues_mut(&mut self) -> &mut [Queue] {
+        &mut self.queues
+    }
+    fn configuration(&self, offset: u64, _: IoWidth, _: u64) -> u64 {
+        match offset {
+            0x100 => 80 | (25 << 16),
+            0x102 => 25,
+            0x104 => 1, // One console port, with the four multiport queues.
+            _ => 0,
+        }
+    }
+}
+
+impl Model for Block {
+    const ID: u32 = 2;
+    const FEATURES: u64 = VERSION_1;
+    const REQUIRED: u64 = VERSION_1;
+    fn queues(&self) -> &[Queue] {
+        &self.queues
+    }
+    fn queues_mut(&mut self) -> &mut [Queue] {
+        &mut self.queues
+    }
+    fn configuration(&self, offset: u64, width: IoWidth, capacity: u64) -> u64 {
+        if !(0x100..=0x107).contains(&offset) {
+            return 0;
+        }
+        let mask = match width {
+            IoWidth::Byte => 0xff,
+            IoWidth::Word => 0xffff,
+            IoWidth::Dword => 0xffff_ffff,
+            IoWidth::Qword => u64::MAX,
+        };
+        (capacity >> ((offset - 0x100) * 8)) & mask
+    }
+}
+
+pub(super) struct Device<M: Model> {
+    model: M,
     feature_select: u32,
     driver_select: u32,
     driver_features: u64,
     queue_select: u32,
-    queues: [Queue; 2],
     status: u32,
     pub interrupt: u32,
 }
 
-impl Device {
-    pub fn console() -> Self {
-        Self::new(3, VERSION_1 | 1)
-    }
-    pub fn block() -> Self {
-        Self::new(2, VERSION_1)
-    }
-    fn new(id: u32, features: u64) -> Self {
+impl<M: Model> Device<M> {
+    fn new() -> Self {
         Self {
-            id,
-            features,
+            model: M::default(),
             feature_select: 0,
             driver_select: 0,
             driver_features: 0,
             queue_select: 0,
-            queues: Default::default(),
             status: 0,
             interrupt: 0,
         }
@@ -146,7 +253,7 @@ impl Device {
         if offset < 0x100 && (!matches!(width, IoWidth::Dword) || offset & 3 != 0) {
             return Err(Error::Queue("MMIO transport register access width"));
         }
-        let queue_count = if self.id == 3 { 2 } else { 1 };
+        let queue_count = self.model.queues().len() as u32;
         if let Some(value) = value {
             match offset {
                 0x014 => self.feature_select = value,
@@ -162,7 +269,8 @@ impl Device {
                 0x030 => self.queue_select = value,
                 0x038 | 0x044 | 0x080 | 0x084 | 0x090 | 0x094 | 0x0a0 | 0x0a4 => {
                     let queue = self
-                        .queues
+                        .model
+                        .queues_mut()
                         .get_mut(self.queue_select as usize)
                         .filter(|_| self.queue_select < queue_count)
                         .ok_or(Error::Queue("queue selector"))?;
@@ -218,12 +326,12 @@ impl Device {
                 0x064 => self.interrupt &= !value,
                 0x070 => {
                     if value == 0 {
-                        *self = Self::new(self.id, self.features);
+                        *self = Self::new();
                     } else {
                         self.status = value;
                         if value & FEATURES_OK != 0
-                            && (self.driver_features & !self.features != 0
-                                || self.driver_features & VERSION_1 == 0)
+                            && (self.driver_features & !M::FEATURES != 0
+                                || self.driver_features & M::REQUIRED != M::REQUIRED)
                         {
                             self.status &= !FEATURES_OK;
                         }
@@ -235,17 +343,18 @@ impl Device {
             return Ok(0);
         }
         let queue = self
-            .queues
+            .model
+            .queues()
             .get(self.queue_select as usize)
             .filter(|_| self.queue_select < queue_count);
         Ok(match offset {
             0x000 => 0x7472_6976,
             0x004 => 2,
-            0x008 => u64::from(self.id),
+            0x008 => u64::from(M::ID),
             0x00c => 0x4845_4c49,
             0x010 => {
                 if self.feature_select < 2 {
-                    (self.features >> (self.feature_select * 32)) & u64::from(u32::MAX)
+                    (M::FEATURES >> (self.feature_select * 32)) & u64::from(u32::MAX)
                 } else {
                     0
                 }
@@ -261,27 +370,73 @@ impl Device {
             0x060 => u64::from(self.interrupt),
             0x070 => u64::from(self.status),
             0x0fc => 0,
-            0x100..=0x107 if self.id == 2 => {
-                let shift = (offset - 0x100) * 8;
-                let mask = match width {
-                    IoWidth::Byte => 0xff,
-                    IoWidth::Word => 0xffff,
-                    IoWidth::Dword => 0xffff_ffff,
-                    IoWidth::Qword => u64::MAX,
-                };
-                (capacity >> shift) & mask
-            }
-            0x100 if self.id == 3 => 80 | (25 << 16),
-            0x102 if self.id == 3 => 25,
-            _ => 0,
+            _ => self.model.configuration(offset, width, capacity),
         })
+    }
+}
+
+impl Device<Console> {
+    pub fn console() -> Self {
+        Self::new()
+    }
+
+    pub fn console_control(&mut self, memory: &impl GuestMemory) -> Result<()> {
+        if self.status & DRIVER_OK == 0 {
+            return Ok(());
+        }
+        while let Some(chain) = self.model.queues[3].pop(memory)? {
+            let mut packet = [0; 8];
+            let mut copied = 0;
+            for descriptor in chain.descriptors {
+                let end = copied + descriptor.length as usize;
+                if descriptor.writable || end > packet.len() {
+                    return Err(Error::Queue("console control request direction or length"));
+                }
+                packet[copied..end]
+                    .copy_from_slice(&memory.read(descriptor.address, descriptor.length)?);
+                copied = end;
+            }
+            if copied != packet.len() {
+                return Err(Error::Queue("short console control request"));
+            }
+            self.model.receive_control(packet)?;
+            if self.model.queues[3].complete(memory, chain.head, 0)? {
+                self.interrupt |= 1;
+            }
+        }
+        while self.model.pending != 0 {
+            let Some(chain) = self.model.queues[2].pop(memory)? else {
+                break;
+            };
+            let (bytes, length, bit) = self.model.response();
+            let mut copied = 0;
+            for descriptor in chain.descriptors {
+                if !descriptor.writable {
+                    return Err(Error::Queue("read-only console control response"));
+                }
+                let count = (descriptor.length as usize).min(length - copied);
+                memory.write(descriptor.address, &bytes[copied..copied + count])?;
+                copied += count;
+                if copied == length {
+                    break;
+                }
+            }
+            if copied != length {
+                return Err(Error::Queue("short console control response buffer"));
+            }
+            if self.model.queues[2].complete(memory, chain.head, length as u32)? {
+                self.interrupt |= 1;
+            }
+            self.model.pending &= !bit;
+        }
+        Ok(())
     }
 
     pub async fn console_output(&mut self, memory: &impl GuestMemory) -> Result<()> {
         if self.status & DRIVER_OK == 0 {
             return Ok(());
         }
-        while let Some(chain) = self.queues[1].pop(memory)? {
+        while let Some(chain) = self.model.queues[1].pop(memory)? {
             for descriptor in chain.descriptors {
                 if descriptor.writable {
                     return Err(Error::Queue("writable console output"));
@@ -295,7 +450,7 @@ impl Device {
                 }
             }
             // Output descriptors are read-only: no bytes are written by device.
-            if self.queues[1].complete(memory, chain.head, 0)? {
+            if self.model.queues[1].complete(memory, chain.head, 0)? {
                 self.interrupt |= 1;
             }
         }
@@ -307,11 +462,11 @@ impl Device {
         memory: &impl GuestMemory,
         input: &mut VecDeque<u8>,
     ) -> Result<()> {
-        if self.status & DRIVER_OK == 0 {
+        if self.status & DRIVER_OK == 0 || !self.model.guest_open {
             return Ok(());
         }
         while !input.is_empty() {
-            let Some(chain) = self.queues[0].pop(memory)? else {
+            let Some(chain) = self.model.queues[0].pop(memory)? else {
                 break;
             };
             let mut length = 0;
@@ -327,18 +482,24 @@ impl Device {
                     break;
                 }
             }
-            if self.queues[0].complete(memory, chain.head, length)? {
+            if self.model.queues[0].complete(memory, chain.head, length)? {
                 self.interrupt |= 1;
             }
         }
         Ok(())
+    }
+}
+
+impl Device<Block> {
+    pub fn block() -> Self {
+        Self::new()
     }
 
     pub async fn block_requests(&mut self, memory: &impl GuestMemory, file: &File) -> Result<()> {
         if self.status & DRIVER_OK == 0 {
             return Ok(());
         }
-        while let Some(chain) = self.queues[0].pop(memory)? {
+        while let Some(chain) = self.model.queues[0].pop(memory)? {
             let descriptors = &chain.descriptors;
             if descriptors.len() < 2 {
                 return Err(Error::Queue("block header/status descriptors"));
@@ -393,7 +554,7 @@ impl Device {
                 2
             };
             memory.write(status.address, &[result])?;
-            if self.queues[0].complete(memory, chain.head, written)? {
+            if self.model.queues[0].complete(memory, chain.head, written)? {
                 self.interrupt |= 1;
             }
         }
@@ -440,19 +601,28 @@ mod tests {
         queue.enable(&ram).unwrap();
         (ram, queue)
     }
-    fn descriptor(ram: &Ram, index: u16, address: u64, length: u32, flags: u16, next: u16) {
+    fn descriptor(
+        ram: &Ram,
+        queue: &Queue,
+        index: u16,
+        address: u64,
+        length: u32,
+        flags: u16,
+        next: u16,
+    ) {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&address.to_le_bytes());
         bytes[8..12].copy_from_slice(&length.to_le_bytes());
         bytes[12..14].copy_from_slice(&flags.to_le_bytes());
         bytes[14..].copy_from_slice(&next.to_le_bytes());
-        ram.write(u64::from(index) * 16, &bytes).unwrap();
+        ram.write(queue.descriptor + u64::from(index) * 16, &bytes)
+            .unwrap();
     }
     #[test]
     fn rejects_reconfiguring_an_enabled_ring() {
         let (ram, queue) = ring();
         let mut device = Device::console();
-        device.queues[0] = queue;
+        device.model.queues[0] = queue;
         let write = IoAccess::Write(helios_api::hv::IoWrite {
             width: IoWidth::Dword,
             value: u64::MAX,
@@ -461,16 +631,16 @@ mod tests {
             device.access(0x080, write, 0, &ram),
             Err(Error::Queue(_))
         ));
-        assert_eq!(device.queues[0].descriptor, 0);
+        assert_eq!(device.model.queues[0].descriptor, 0);
     }
 
     #[test]
     fn rejects_cyclic_and_out_of_ram_chains() {
         let (ram, mut queue) = ring();
         ram.write(130, &1u16.to_le_bytes()).unwrap();
-        descriptor(&ram, 0, 1024, 16, 1, 0);
+        descriptor(&ram, &queue, 0, 1024, 16, 1, 0);
         assert!(matches!(queue.pop(&ram), Err(Error::Queue(_))));
-        descriptor(&ram, 0, 4090, 16, 0, 0);
+        descriptor(&ram, &queue, 0, 4090, 16, 0, 0);
         assert!(matches!(queue.pop(&ram), Err(Error::Memory(_, _))));
         assert_eq!(queue.next_available, 0);
     }
@@ -480,28 +650,105 @@ mod tests {
         ram.write(130, &5u16.to_le_bytes()).unwrap();
         assert!(matches!(queue.pop(&ram), Err(Error::Queue(_))));
     }
+    fn control_packet(event: u16, value: u16) -> [u8; 8] {
+        let mut bytes = [0; 8];
+        bytes[4..6].copy_from_slice(&event.to_le_bytes());
+        bytes[6..8].copy_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
     #[test]
-    fn console_input_writes_payload_then_used_ring() {
-        let (ram, queue) = ring();
+    fn console_buffers_input_until_multiport_handshake_opens_port() {
+        let (ram, data) = ring();
         let mut device = Device::console();
         device.status = DRIVER_OK;
-        device.queues[0] = queue;
-        descriptor(&ram, 0, 1024, 16, 2, 0);
+        device.model.queues[0] = data;
+        for (index, base) in [(2, 512), (3, 1024)] {
+            let mut queue = Queue {
+                size: 4,
+                descriptor: base,
+                available: base + 128,
+                used: base + 256,
+                ..Queue::default()
+            };
+            queue.enable(&ram).unwrap();
+            device.model.queues[index] = queue;
+        }
+        descriptor(&ram, &device.model.queues[0], 0, 2048, 16, 2, 0);
         ram.write(130, &1u16.to_le_bytes()).unwrap();
+        for index in 0..4u16 {
+            descriptor(
+                &ram,
+                &device.model.queues[2],
+                index,
+                3072 + u64::from(index) * 16,
+                16,
+                2,
+                0,
+            );
+            ram.write(644 + u64::from(index) * 2, &index.to_le_bytes())
+                .unwrap();
+        }
+        ram.write(642, &4u16.to_le_bytes()).unwrap();
         let mut input = VecDeque::from(Vec::from(b"uname\n"));
+        for (index, event) in [DEVICE_READY, PORT_READY, PORT_OPEN]
+            .into_iter()
+            .enumerate()
+        {
+            device.console_input(&ram, &mut input).unwrap();
+            assert_eq!(input.len(), 6);
+            assert_eq!(ram.u16(258).unwrap(), 0);
+            let address = 2304 + index as u64 * 16;
+            ram.write(address, &control_packet(event, 1)).unwrap();
+            descriptor(
+                &ram,
+                &device.model.queues[3],
+                index as u16,
+                address,
+                8,
+                0,
+                0,
+            );
+            ram.write(1156 + index as u64 * 2, &(index as u16).to_le_bytes())
+                .unwrap();
+            ram.write(1154, &(index as u16 + 1).to_le_bytes()).unwrap();
+            device.console_control(&ram).unwrap();
+            assert_eq!(ram.u16(1282).unwrap(), index as u16 + 1);
+            assert_eq!(ram.u16(770).unwrap(), if index == 0 { 1 } else { 4 });
+        }
+        for (index, event) in [PORT_ADD, CONSOLE_PORT, PORT_OPEN, RESIZE]
+            .into_iter()
+            .enumerate()
+        {
+            let address = 3072 + index as u64 * 16;
+            assert_eq!(ram.read(address, 8).unwrap(), control_packet(event, 1));
+            let length = if event == RESIZE { 12u32 } else { 8 };
+            assert_eq!(
+                ram.read(776 + index as u64 * 8, 4).unwrap(),
+                length.to_le_bytes()
+            );
+        }
+        assert_eq!(ram.read(3128, 4).unwrap(), [25, 0, 80, 0]);
         device.console_input(&ram, &mut input).unwrap();
         assert!(input.is_empty());
-        assert_eq!(ram.read(1024, 6).unwrap(), b"uname\n");
+        assert_eq!(ram.read(2048, 6).unwrap(), b"uname\n");
         assert_eq!(ram.u16(258).unwrap(), 1);
         assert_eq!(ram.read(264, 4).unwrap(), 6u32.to_le_bytes());
         assert_eq!(device.interrupt, 1);
+        device
+            .model
+            .receive_control(control_packet(PORT_OPEN, 0))
+            .unwrap();
+        input.push_back(b'x');
+        device.console_input(&ram, &mut input).unwrap();
+        assert_eq!(input.len(), 1);
     }
     #[test]
     fn queue_wrap_and_interrupt_suppression() {
         let (ram, mut queue) = ring();
         queue.next_available = u16::MAX;
         queue.next_used = u16::MAX;
-        descriptor(&ram, 0, 1024, 16, 0, 0);
+        descriptor(&ram, &queue, 0, 1024, 16, 0, 0);
         ram.write(128, &1u16.to_le_bytes()).unwrap();
         ram.write(130, &0u16.to_le_bytes()).unwrap();
         let chain = queue.pop(&ram).unwrap().unwrap();
