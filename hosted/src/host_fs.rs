@@ -2,10 +2,10 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{self as unix_fs, FileExt, MetadataExt};
+use std::os::unix::fs::{self as unix_fs, FileExt, FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
-use helios_hal::fs::{WritePosition, WriteProgress};
+use helios_hal::fs::{NodeKind, WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use helios_kernel::{
     AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
@@ -124,6 +124,7 @@ impl HostFileSystem for HostedFileSystem {
         path: &str,
     ) -> impl core::future::Future<Output = Result<Vec<u8>, HostFsError>> + Send + '_ {
         blocking_path(self.resolve(path), |path| {
+            require_openable(&path)?;
             fs::read(path).map_err(map_io_error)
         })
     }
@@ -260,10 +261,21 @@ impl HostFileSystem for HostedFileSystem {
     }
 }
 
+/// The attributes of the object `path` names, itself and not what a
+/// symbolic link there points at: the kernel resolves links through
+/// `read_link`, as the 9p share's `Tgetattr` does.
 fn stat_impl(path: &Path) -> Result<HostMetadata, HostFsError> {
-    let meta = fs::metadata(path).map_err(map_io_error)?;
-    let qid_type = if meta.is_dir() { 0x80 } else { 0x00 };
-    let mode = if meta.is_dir() { 0o040755 } else { 0o100644 };
+    let meta = fs::symlink_metadata(path).map_err(map_io_error)?;
+    let mode = meta.mode();
+    // 9p `QTDIR` and `QTSYMLINK`.
+    let file_type = meta.file_type();
+    let qid_type = if file_type.is_dir() {
+        0x80
+    } else if file_type.is_symlink() {
+        0x02
+    } else {
+        0x00
+    };
     let inode = meta.ino();
     Ok(HostMetadata {
         identity: ObjectIdentity::new(AuthorityDomain::host_device(meta.dev()), inode),
@@ -298,16 +310,33 @@ fn read_dir_impl(path: &Path, limit: HostDirLimit) -> Result<Vec<HostDirEntry>, 
             .file_name()
             .into_string()
             .unwrap_or_else(|os| os.to_string_lossy().into_owned());
-        let is_directory = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let kind = entry.file_type().ok().map(|file_type| {
+            if file_type.is_dir() {
+                NodeKind::Directory
+            } else if file_type.is_symlink() {
+                NodeKind::Symlink
+            } else if file_type.is_file() {
+                NodeKind::File
+            } else if file_type.is_char_device() {
+                NodeKind::CharacterDevice
+            } else if file_type.is_block_device() {
+                NodeKind::BlockDevice
+            } else if file_type.is_fifo() {
+                NodeKind::Fifo
+            } else {
+                NodeKind::Socket
+            }
+        });
         name_bytes = name_bytes.saturating_add(name.len());
         limit.check(result.len() + 1, name_bytes)?;
-        result.push(HostDirEntry { name, is_directory });
+        result.push(HostDirEntry { name, kind });
     }
     Ok(result)
 }
 
 fn read_file_range_impl(path: &Path, offset: u64, max_bytes: u32) -> Result<Vec<u8>, HostFsError> {
     use std::io::{Read, Seek, SeekFrom};
+    require_openable(path)?;
     let mut file = fs::File::open(path).map_err(map_io_error)?;
     file.seek(SeekFrom::Start(offset)).map_err(map_io_error)?;
     let mut buf = vec![0u8; max_bytes as usize];
@@ -340,6 +369,7 @@ fn open_for_write(
     position: WritePosition,
     len: usize,
 ) -> Result<HostedWrite, HostFsError> {
+    require_openable(path)?;
     let mut options = fs::OpenOptions::new();
     match position {
         WritePosition::At(_) => options.write(true),
@@ -399,7 +429,14 @@ impl HostFilledWrite for FilledHostedWrite {
     }
 }
 
+/// Refuses, before opening it, a device, FIFO, socket or symbolic link:
+/// the host would open it with this process's privileges.
+fn require_openable(path: &Path) -> Result<(), HostFsError> {
+    stat_impl(path)?.require_openable()
+}
+
 fn sync_file_impl(path: &Path) -> Result<(), HostFsError> {
+    require_openable(path)?;
     fs::File::open(path)
         .map_err(map_io_error)?
         .sync_all()
@@ -407,6 +444,7 @@ fn sync_file_impl(path: &Path) -> Result<(), HostFsError> {
 }
 
 fn set_file_size_impl(path: &Path, size: u64) -> Result<(), HostFsError> {
+    require_openable(path)?;
     let file = fs::OpenOptions::new()
         .write(true)
         .open(path)
@@ -465,7 +503,7 @@ mod tests {
     use tempfile::TempDir;
 
     use helios_hal::fs::{WritePosition, WriteProgress};
-    use helios_kernel::{HostFileSystem, HostFilledWrite, HostFsError, HostWrite};
+    use helios_kernel::{HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError, HostWrite};
 
     use super::HostedFileSystem;
 
@@ -620,6 +658,91 @@ mod tests {
                 .map(drop)
                 .expect_err("a missing file cannot be written");
             assert_eq!(error.kind(), helios_kernel::HostFsErrorKind::NoEntry);
+        });
+    }
+
+    /// A FIFO in the share is listed and statted as one, and opening it
+    /// for any data path is refused without opening it (opening a FIFO
+    /// with no peer would block the host thread).
+    #[test]
+    fn hosted_filesystem_reports_a_fifo_and_refuses_to_open_it() {
+        run_hosted_fs_test(async {
+            let root = test_root();
+            std::fs::write(root.path().join("plain"), b"data").expect("file must be written");
+            let fifo = std::ffi::CString::new(
+                root.path()
+                    .join("pipe")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            )
+            .expect("path has no NUL");
+            // SAFETY: `fifo` is a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+            std::os::unix::fs::symlink("plain", root.path().join("link"))
+                .expect("symlink must be created");
+            let filesystem = filesystem(&root);
+
+            let metadata = filesystem.stat_path("pipe").await.expect("stat the FIFO");
+            assert_eq!(
+                metadata.kind().expect("a kind"),
+                helios_hal::fs::NodeKind::Fifo
+            );
+            let link = filesystem.stat_path("link").await.expect("stat the link");
+            assert_eq!(
+                link.kind().expect("a kind"),
+                helios_hal::fs::NodeKind::Symlink
+            );
+
+            let mut listed: Vec<_> = filesystem
+                .read_dir(
+                    "/",
+                    HostDirLimit {
+                        max_entries: 64,
+                        max_name_bytes: 4096,
+                    },
+                )
+                .await
+                .expect("the directory lists")
+                .into_iter()
+                .map(|entry| (entry.name, entry.kind))
+                .collect();
+            listed.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                listed,
+                [
+                    ("link".to_owned(), Some(helios_hal::fs::NodeKind::Symlink)),
+                    ("pipe".to_owned(), Some(helios_hal::fs::NodeKind::Fifo)),
+                    ("plain".to_owned(), Some(helios_hal::fs::NodeKind::File)),
+                ]
+            );
+
+            let refusal =
+                helios_kernel::HostFsErrorKind::Refused(helios_hal::fs::FsError::Unsupported);
+            let error = filesystem.read_file("pipe").await.expect_err("refused");
+            assert_eq!(error.kind(), refusal);
+            let error = filesystem
+                .read_file_range("pipe", 0, 4)
+                .await
+                .expect_err("refused");
+            assert_eq!(error.kind(), refusal);
+            let error = filesystem
+                .prepare_write("pipe", WritePosition::At(0), 4)
+                .await
+                .map(drop)
+                .expect_err("refused");
+            assert_eq!(error.kind(), refusal);
+            let error = filesystem.sync_file("pipe").await.expect_err("refused");
+            assert_eq!(error.kind(), refusal);
+            // The entry itself is still removable.
+            filesystem.remove("pipe", false).await.expect("unlink");
+
+            // A link is refused for data too: the kernel follows it itself.
+            let error = filesystem.read_file("link").await.expect_err("refused");
+            assert_eq!(
+                error.kind(),
+                helios_kernel::HostFsErrorKind::Refused(helios_hal::fs::FsError::Loop)
+            );
         });
     }
 

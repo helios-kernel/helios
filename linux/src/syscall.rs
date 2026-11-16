@@ -456,3 +456,71 @@ fn mmap<M: VirtualMemory>(args: [u64; 6], memory: &mut M) -> u64 {
         Err(MapError::Invalid) => errno(EINVAL),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_unix::OpenFile;
+
+    // fcntl.h: O_CLOEXEC.
+    const O_CLOEXEC: u64 = 0x80000;
+
+    /// A node handle as the platform would supply one; only its identity
+    /// matters here.
+    #[derive(Clone)]
+    struct Node;
+
+    struct Files;
+    impl Resources for Files {
+        type File = Node;
+        type Socket = Infallible;
+        type Data = u64;
+    }
+
+    fn open_file(descriptors: &Descriptors<Files>, fd: i32) -> &OpenFile<Node> {
+        match descriptors.get_entry(fd).map(|entry| &entry.descriptor) {
+            Some(Descriptor::<Files>::File(file)) => file,
+            _ => panic!("descriptor {fd} must name the file"),
+        }
+    }
+
+    #[test]
+    fn duplicated_file_descriptors_share_one_open_file_description() {
+        let mut process = Process::<Files>::new(Abi::X86_64, NonZeroU32::new(1).unwrap());
+        let fd = process
+            .descriptors
+            .insert_entry(Entry::<Files>::new(
+                Descriptor::<Files>::File(OpenFile::new(Node)),
+                false,
+            ))
+            .expect("the table has room");
+        let duplicate = io::duplicate::<Files>(
+            &mut process.descriptors,
+            Operation::Dup,
+            [u64::from(fd), 0, 0, 0, 0, 0],
+        );
+        let target = io::duplicate::<Files>(
+            &mut process.descriptors,
+            Operation::Dup3,
+            [u64::from(fd), 9, O_CLOEXEC, 0, 0, 0],
+        );
+        assert_eq!(target, 9);
+
+        let original = open_file(&process.descriptors, fd as i32);
+        original.set_offset(7);
+        for copy in [duplicate as i32, 9] {
+            let shared = open_file(&process.descriptors, copy);
+            assert!(shared.same_description(original));
+            assert_eq!(shared.offset(), 7);
+        }
+        // Only close-on-exec belongs to the slot.
+        assert!(process.descriptors.get_entry(9).unwrap().close_on_exec);
+        assert!(
+            !process
+                .descriptors
+                .get_entry(fd as i32)
+                .unwrap()
+                .close_on_exec
+        );
+    }
+}

@@ -145,11 +145,55 @@ pub enum FsError {
 pub type FsResult<T> = Result<T, FsError>;
 
 /// What kind of object a path names.
+///
+/// [`CharacterDevice`](Self::CharacterDevice),
+/// [`BlockDevice`](Self::BlockDevice), [`Fifo`](Self::Fifo) and
+/// [`Socket`](Self::Socket) are report-only: a filesystem names them in
+/// `stat` and directory listings so that a tree holding one stays
+/// readable, and the kernel never opens, creates or reads through them.
+/// Opening a device is refused with [`FsError::NotPermitted`], because
+/// hardware is reached only through device grants; opening a FIFO or a
+/// socket is refused with [`FsError::Unsupported`]. Operations that touch
+/// only the directory entry (unlink, rename, stat) work on them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     Directory,
     File,
     Symlink,
+    CharacterDevice,
+    BlockDevice,
+    Fifo,
+    Socket,
+}
+
+impl NodeKind {
+    /// Succeeds for a regular file and otherwise says why its bytes cannot
+    /// be read or written: a directory is `IsDirectory`, a symbolic link
+    /// `Invalid`, and the report-only kinds fail as
+    /// [`open_refusal`](Self::open_refusal) says.
+    pub const fn require_regular(self) -> FsResult<()> {
+        match self {
+            NodeKind::File => Ok(()),
+            NodeKind::Directory => Err(FsError::IsDirectory),
+            NodeKind::Symlink => Err(FsError::Invalid),
+            NodeKind::CharacterDevice | NodeKind::BlockDevice => Err(FsError::NotPermitted),
+            NodeKind::Fifo | NodeKind::Socket => Err(FsError::Unsupported),
+        }
+    }
+
+    /// Why the kernel never opens an object of this kind, or `None` for
+    /// the kinds a filesystem's `open` answers (files, directories and
+    /// symbolic links, which resolution follows before a filesystem
+    /// opens anything).
+    ///
+    /// Devices are `NotPermitted` and FIFOs and sockets `Unsupported`.
+    pub const fn open_refusal(self) -> Option<FsError> {
+        match self {
+            NodeKind::File | NodeKind::Directory | NodeKind::Symlink => None,
+            NodeKind::CharacterDevice | NodeKind::BlockDevice => Some(FsError::NotPermitted),
+            NodeKind::Fifo | NodeKind::Socket => Some(FsError::Unsupported),
+        }
+    }
 }
 
 /// Names one filesystem instance: what `st_dev` reports.

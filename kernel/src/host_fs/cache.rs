@@ -640,7 +640,7 @@ mod tests {
             "/",
             &[HostDirEntry {
                 name: "greeting.txt".to_string(),
-                is_directory: false,
+                kind: Some(helios_hal::fs::NodeKind::File),
             }],
             0,
         );
@@ -688,7 +688,7 @@ mod tests {
             "/alpha",
             &[HostDirEntry {
                 name: "beta".to_string(),
-                is_directory: false,
+                kind: Some(helios_hal::fs::NodeKind::File),
             }],
             0,
         );
@@ -710,7 +710,7 @@ mod tests {
             "/alpha",
             &[HostDirEntry {
                 name: "beta".to_string(),
-                is_directory: false,
+                kind: Some(helios_hal::fs::NodeKind::File),
             }],
             0,
         );
@@ -788,7 +788,7 @@ mod tests {
         let listing: Vec<HostDirEntry> = (0..DIRECTORY_CACHE_ENTRY_BUDGET)
             .map(|index| HostDirEntry {
                 name: index.to_string(),
-                is_directory: false,
+                kind: Some(helios_hal::fs::NodeKind::File),
             })
             .collect();
 

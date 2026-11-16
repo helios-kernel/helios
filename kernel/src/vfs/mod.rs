@@ -40,6 +40,7 @@ mod btrfs;
 mod erofs;
 mod host;
 mod memory;
+mod node;
 mod request;
 mod root;
 mod storage;
@@ -48,6 +49,7 @@ pub use btrfs::BtrfsFs;
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
 pub use memory::{MemoryFs, MemoryWrite};
+pub use node::{FsDescriptor, FsDescriptorFlags};
 pub use request::{
     AttachedStorage, MountRequestError, MountSource, request_mount, request_unmount,
 };
@@ -1026,11 +1028,7 @@ pub enum FileContents {
 /// The whole of the regular file at `path` on `fs`.
 pub(crate) async fn read_all<F: FileSystem>(fs: &F, path: FsPath<'_>) -> FsResult<Bytes> {
     let metadata = fs.stat(path).await?;
-    match metadata.kind {
-        NodeKind::File => {}
-        NodeKind::Directory => return Err(FsError::IsDirectory),
-        NodeKind::Symlink => return Err(FsError::Invalid),
-    }
+    metadata.kind.require_regular()?;
     let size = usize::try_from(metadata.size).map_err(|_| FsError::Overflow)?;
     let first = fs.read_at(path, 0, size).await?;
     if first.len() == size {
@@ -1363,14 +1361,13 @@ impl<S: Storage> Namespace<S> {
         let parent = crate::parent_path(point);
         // The cap is the authority over where a mount goes, so the parent's
         // links are followed anywhere in the namespace.
-        match self
+        let parent_kind = self
             .stat(parent, Follow::Within("/"))
             .await
             .map_err(refuse)?
-            .kind
-        {
-            NodeKind::Directory => {}
-            NodeKind::File | NodeKind::Symlink => return Err(refuse(FsError::NotDirectory)),
+            .kind;
+        if parent_kind != NodeKind::Directory {
+            return Err(refuse(FsError::NotDirectory));
         }
         match self.stat(point, Follow::No).await {
             Ok(metadata) if metadata.kind != NodeKind::Directory => {

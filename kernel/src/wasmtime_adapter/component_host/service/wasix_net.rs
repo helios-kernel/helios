@@ -2413,7 +2413,7 @@ where
     StorageImpl: crate::Storage,
 {
     let file = match caller.data().descriptors.get(in_fd) {
-        Some(Preview1Descriptor::File { descriptor, .. }) => descriptor.clone(),
+        Some(Preview1Descriptor::File(file)) => file.node().clone(),
         Some(_) => return Err(p1::errno::BADF),
         None => return Err(p1::errno::BADF),
     };
