@@ -60,7 +60,7 @@ use crate::gpu::{
 };
 use crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu as gpu_wit;
 
-use super::super::{PendingReply, StoreData, guest_memory, view_trap};
+use super::super::{PendingReply, StoreData, caller_memory, view_trap};
 
 /// Register `helios:system/gpu` in a linker.
 ///
@@ -308,7 +308,7 @@ where
     }
 }
 
-/// The calling instance's linear memory, read through `access`.
+/// The linear memory of the call `access` serves, read through it.
 fn memory_of<U, CpuImpl, Net, StorageImpl>(
     access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
 ) -> Result<GuestMemory, Gpu3dServiceError>
@@ -318,18 +318,17 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let linear_memory = access.get().linear_memory;
-    Ok(guest_memory(linear_memory, &*access)?)
+    Ok(caller_memory(&*access)?)
 }
 
-/// The calling instance's memory in the last step of a call whose early
-/// half already read it.
+/// The call's memory in the last step of a call whose early half already
+/// read it.
 ///
 /// # Panics
 ///
-/// Panics when the store has no unshared memory: the handle is recorded
-/// once, when the instance is built, and the early half of the call
-/// already found it.
+/// Panics when the call has no unshared memory: the memory belongs to
+/// the call, so every step of it answers the same, and the early half
+/// of the call already found it.
 fn checked_memory<U, CpuImpl, Net, StorageImpl>(
     access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
 ) -> GuestMemory

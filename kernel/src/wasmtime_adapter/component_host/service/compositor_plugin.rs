@@ -276,7 +276,11 @@ where
         .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
         .await
         .map_err(map_program_runtime_error)?;
-    crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, &wasm_instance);
+    // The memory a span the compositor *returns* from `create` is in. It
+    // is no host call's caller, so it is not the call's memory but the
+    // instance's: a compositor that lowers through more than one memory,
+    // or a shared one, has none, and every window it answers is refused.
+    let memory = wasm_instance.get_default_memory(&mut store);
     let host =
         CompositorHost::new(&mut store, &wasm_instance).map_err(map_program_runtime_error)?;
     let guest = host.helios_system_compositor().clone();
@@ -311,7 +315,15 @@ where
                 _marker: core::marker::PhantomData,
             })?;
             while let Some(request) = receiver.recv().await {
-                serve_request(accessor, &serve_guest, desktop, &serve_registry, request).await?;
+                serve_request(
+                    accessor,
+                    &serve_guest,
+                    desktop,
+                    memory,
+                    &serve_registry,
+                    request,
+                )
+                .await?;
             }
             Ok::<(), wasmtime::Error>(())
         })))
@@ -320,11 +332,13 @@ where
         .map_err(map_program_runtime_error)
 }
 
-/// Serve one surface call against the live compositor.
+/// Serve one surface call against the live compositor, whose spans are in
+/// `memory`.
 async fn serve_request<CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
     desktop: ResourceAny,
+    memory: Option<wasmtime::Memory>,
     registry: &SurfaceService,
     request: SurfaceRequest,
 ) -> wasmtime::Result<()>
@@ -392,7 +406,7 @@ where
             Ok(())
         }
         SurfaceRequest::Create(create) => {
-            serve_create(accessor, guest, desktop, registry, create).await
+            serve_create(accessor, guest, desktop, memory, registry, create).await
         }
         SurfaceRequest::Commit { id, region, reply } => {
             let answer = guest
@@ -421,11 +435,12 @@ where
 /// The compositor names the span, so it is told about the window before
 /// the buffer is shown; the interface promises it no `commit` for the
 /// window before the buffer is there, and this task serves the commit
-/// queue, so none is served in between.
+/// queue, so none is served in between. The span is in `memory`.
 async fn serve_create<CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
     desktop: ResourceAny,
+    memory: Option<wasmtime::Memory>,
     registry: &SurfaceService,
     create: SurfaceCreate,
 ) -> wasmtime::Result<()>
@@ -479,8 +494,7 @@ where
         if registry.lookup(id).is_none() {
             return Err(SurfaceServiceError::Gone);
         }
-        let linear_memory = access.get().linear_memory;
-        let memory = guest_memory(linear_memory, &access)?;
+        let memory = guest_memory(memory, &access)?;
         let data = access.get();
         data.device
             .surfaces_mut()

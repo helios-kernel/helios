@@ -467,17 +467,11 @@ pub(crate) struct ComponentExecutionContext<FileSystem> {
 
 /// One instance's store data.
 ///
-/// `LinearMemoryImpl` is the runtime's handle on the instance's one
-/// unshared linear memory: the kernel never looks inside it, and the
-/// runtime adapter reads the memory's current extent through it each
-/// time a guest names a span.
-pub struct ComponentStoreData<
-    CpuImpl,
-    RuntimeStateImpl,
-    FileSystem,
-    ResourceTableImpl,
-    LinearMemoryImpl,
-> where
+/// It holds no linear memory: a span a guest names is in the memory of
+/// the call that names it, which the runtime adapter takes from that
+/// call.
+pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
@@ -499,11 +493,6 @@ pub struct ComponentStoreData<
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
     serial_writer: crate::DebugSerialWriter,
-    /// The runtime's handle on this instance's linear memory, once the
-    /// instance is built. Absent when its component lowers through a
-    /// shared memory, or through more than one: nothing is ever shown
-    /// in such a memory.
-    pub linear_memory: Option<LinearMemoryImpl>,
     /// Every buffer and device region shown in this instance's linear
     /// memory.
     ///
@@ -564,8 +553,8 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
-    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
+impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -613,7 +602,6 @@ where
             ),
             serial_reader,
             serial_writer,
-            linear_memory: None,
             views: crate::buffer::ViewTable::new(),
             device: crate::device::DeviceOwnership::new(),
             input: crate::input::InputOwnership::new(),

@@ -52,7 +52,7 @@ use crate::surface::{
 use crate::wasmtime_adapter::bindings::surface::bindings::helios::system::surface as surface_wit;
 use crate::{ComponentHostNetwork, SharedTimeline, SignalTimeline, Timeline, TimelineSource};
 
-use super::super::{StoreData, guest_memory, view_trap};
+use super::super::{StoreData, caller_memory, view_trap};
 
 /// Register `helios:system/surface` in a linker.
 ///
@@ -389,8 +389,7 @@ where
         // that drops this call's future hands back to the compositor's
         // supervisor as it goes.
         let prepared = accessor.with(|mut access| {
-            let linear_memory = access.get().linear_memory;
-            let memory = guest_memory(linear_memory, &access);
+            let memory = caller_memory(&access);
             let data = access.get();
             let registry = data.runtime_state.surface_service();
             let runtime_state = data.runtime_state.clone();
@@ -438,11 +437,10 @@ where
         // together, with no wait in between that a cancellation could
         // land in.
         accessor.with(|mut access| {
-            let linear_memory = access.get().linear_memory;
-            // The store's memory handle is recorded once, when the
-            // instance is built, and `prepare` already read it.
-            let memory = guest_memory(linear_memory, &access)
-                .expect("a store whose memory took the span when the window was prepared has one");
+            // The memory belongs to the call, so every step of it
+            // answers the same, and `prepare` already read it.
+            let memory = caller_memory(&access)
+                .expect("a call whose memory took the span when the window was prepared has one");
             let data = access.get();
             let registry = data.runtime_state.surface_service();
             let surfaces = data.device.surfaces_mut();

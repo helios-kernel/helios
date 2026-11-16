@@ -1091,12 +1091,6 @@ where
             instantiate_instance_started,
         );
     }
-    let instance = instance.inspect(|instance| {
-        // Every call that shows a view checks its span against this
-        // instance's linear memory, so the store records the memory's
-        // handle here, the first moment the runtime can name it.
-        crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, instance);
-    });
     let executor = instance.and_then(|instance| {
         let resolve_started = profile_runtime_state
             .profiling_enabled()

@@ -55,7 +55,7 @@ use crate::exec::SequenceSignal;
 use crate::gpu::GpuImage;
 use crate::wasmtime_adapter::bindings::display::bindings::helios::system::display as display_wit;
 
-use super::super::{PendingReply, StoreData, guest_memory, view_trap};
+use super::super::{PendingReply, StoreData, caller_memory, view_trap};
 
 /// Register `helios:system/display` in a linker.
 ///
@@ -207,8 +207,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let linear_memory = access.get().linear_memory;
-    let memory = guest_memory(linear_memory, &access)?;
+    let memory = caller_memory(&access)?;
     let data = access.get();
     data.views.validate(memory, span, bytes)?;
     let buffer = Buffer::pinned(bytes)?;
@@ -233,11 +232,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let linear_memory = access.get().linear_memory;
-    // The store's memory handle is recorded once, when the instance is
-    // built, and `prepare_frame` already read it.
-    let memory = guest_memory(linear_memory, &access)
-        .expect("a store whose memory took the span when the frame was pinned has one");
+    // The memory belongs to the call, so every step of it answers the
+    // same, and `prepare_frame` already read it.
+    let memory = caller_memory(&access)
+        .expect("a call whose memory took the span when the frame was pinned has one");
     let data = access.get();
     let view = match data.views.show_buffer(memory, span, buffer, None) {
         Ok(view) => view,
