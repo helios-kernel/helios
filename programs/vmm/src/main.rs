@@ -228,158 +228,182 @@ async fn main() -> Result<()> {
     let mut block = virtio::Device::block();
     let mut input = VecDeque::new();
     let mut input_waiting = false;
-    while let Ok(event) = receiver.recv().await {
-        let mut response = None;
-        match event {
-            Event::Failed(error) => return Err(error),
-            Event::Input(bytes) => {
-                input.extend(bytes);
-                input_waiting = true;
-            }
-            Event::Exit { cpu, exit } => {
-                let vcpu = &cpus[cpu as usize];
-                let mut action = Action::Run;
-                match exit {
-                    VmExit::Preempted | VmExit::IrqWindow => {}
-                    VmExit::Hypercall(function) => {
-                        let args = vcpu.get_regs(&[
-                            RegisterId::Aarch64X(1),
-                            RegisterId::Aarch64X(2),
-                            RegisterId::Aarch64X(3),
-                        ])?;
-                        let a = args[0].value;
-                        let b = args[1].value;
-                        let c = args[2].value;
-                        let result = match function as u32 {
-                            0x8400_0000 => 0x0001_0001, // PSCI_VERSION: 1.1.
-
-                            0x8400_0002 => {
-                                online[cpu as usize] = false;
-                                action = Action::Park;
-                                0
-                            }
-                            0x8400_0003 | 0xc400_0003 => {
-                                if a >= u64::from(config.cpus) {
-                                    -2i64 as u64
-                                } else if online[a as usize] {
-                                    -4i64 as u64
-                                } else {
-                                    memory.offset(b, 4)?;
-                                    online[a as usize] = true;
-                                    commands[a as usize]
-                                        .send(Action::Start {
-                                            entry: b,
-                                            context: c,
-                                        })
-                                        .await
-                                        .map_err(|_| Error::Channel)?;
-                                    0
-                                }
-                            }
-                            0x8400_0004 | 0xc400_0004 => {
-                                if b != 0 || a >= u64::from(config.cpus) {
-                                    -2i64 as u64
-                                } else {
-                                    u64::from(!online[a as usize])
-                                }
-                            }
-                            0x8400_0008 | 0x8400_0009 => {
-                                println!("vmm: guest requested shutdown");
-                                break;
-                            }
-                            0x8400_000a => match a as u32 {
-                                0x8400_0000 | 0x8400_0002 | 0x8400_0003 | 0xc400_0003
-                                | 0x8400_0004 | 0xc400_0004 | 0x8400_0008 | 0x8400_0009
-                                | 0x8400_000a => 0,
-                                _ => -1i64 as u64,
-                            },
-                            _ => -1i64 as u64,
-                        };
-                        vcpu.set_regs(&[RegisterValue {
-                            id: RegisterId::Aarch64X(0),
-                            value: result,
-                        }])?;
-                    }
-                    VmExit::Mmio(mmio) => {
-                        let value = if (boot::UART..boot::UART + 0x1000).contains(&mmio.address) {
-                            match (mmio.address - boot::UART, mmio.access) {
-                                (0, IoAccess::Write(write)) => {
-                                    helios_api::io::stdout()
-                                        .write_all(vec![write.value as u8])
-                                        .await?;
-                                    0
-                                }
-                                (0x18, IoAccess::Read(_)) => 0x90, // TXFE | RXFE.
-                                (0xfe0, IoAccess::Read(_)) => 0x11,
-                                (0xfe4, IoAccess::Read(_)) => 0x10,
-                                (0xfe8, IoAccess::Read(_)) => 0x14,
-                                (0xfec, IoAccess::Read(_)) => 0,
-                                (0xff0, IoAccess::Read(_)) => 0x0d,
-                                (0xff4, IoAccess::Read(_)) => 0xf0,
-                                (0xff8, IoAccess::Read(_)) => 0x05,
-                                (0xffc, IoAccess::Read(_)) => 0xb1,
-                                _ => 0,
-                            }
-                        } else if (boot::CONSOLE..boot::CONSOLE + 0x1000).contains(&mmio.address) {
-                            console.access(mmio.address - boot::CONSOLE, mmio.access, 0, &memory)?
-                        } else if let Some(file) = disk.as_ref()
-                            && (boot::BLOCK..boot::BLOCK + 0x1000).contains(&mmio.address)
-                        {
-                            block.access(
-                                mmio.address - boot::BLOCK,
-                                mmio.access,
-                                file.size / 512,
-                                &memory,
-                            )?
-                        } else if (boot::GICD..boot::GICD + 0x10000).contains(&mmio.address)
-                            || (boot::GICR..boot::GICR + u64::from(config.cpus) * 0x20000)
-                                .contains(&mmio.address)
-                        {
-                            gic.access(mmio.address, mmio.access)?
-                        } else {
-                            return Err(Error::Device(mmio.address));
-                        };
-                        vcpu.complete_exit(value)?;
-                    }
-                    VmExit::SystemRegister(register) => {
-                        // Architectural op0:op1:CRn:CRm:op2 encodings.
-                        let value = match (register.register, register.access) {
-                            (0xc65d, IoAccess::Write(write)) => {
-                                gic.sgi(cpu, write.value);
-                                0
-                            } // ICC_SGI1R_EL1.
-                            _ => return Err(Error::Register(register.register)),
-                        };
-                        vcpu.complete_exit(value)?;
-                    }
-                    VmExit::Shutdown => break,
-                    other => return Err(Error::Exit(cpu, other)),
+    let mut early_console = Vec::new();
+    let outcome: Result<()> = async {
+        while let Ok(event) = receiver.recv().await {
+            let mut response = None;
+            match event {
+                Event::Failed(error) => return Err(error),
+                Event::Input(bytes) => {
+                    input.extend(bytes);
+                    input_waiting = true;
                 }
-                response = Some((cpu, action));
+                Event::Exit { cpu, exit } => {
+                    let vcpu = &cpus[cpu as usize];
+                    let mut action = Action::Run;
+                    match exit {
+                        VmExit::Preempted | VmExit::IrqWindow => {}
+                        VmExit::Hypercall(function) => {
+                            let args = vcpu.get_regs(&[
+                                RegisterId::Aarch64X(1),
+                                RegisterId::Aarch64X(2),
+                                RegisterId::Aarch64X(3),
+                            ])?;
+                            let a = args[0].value;
+                            let b = args[1].value;
+                            let c = args[2].value;
+                            let result = match function as u32 {
+                                0x8400_0000 => 0x0001_0001, // PSCI_VERSION: 1.1.
+
+                                0x8400_0002 => {
+                                    online[cpu as usize] = false;
+                                    action = Action::Park;
+                                    0
+                                }
+                                0x8400_0003 | 0xc400_0003 => {
+                                    if a >= u64::from(config.cpus) {
+                                        -2i64 as u64
+                                    } else if online[a as usize] {
+                                        -4i64 as u64
+                                    } else {
+                                        memory.offset(b, 4)?;
+                                        online[a as usize] = true;
+                                        commands[a as usize]
+                                            .send(Action::Start {
+                                                entry: b,
+                                                context: c,
+                                            })
+                                            .await
+                                            .map_err(|_| Error::Channel)?;
+                                        0
+                                    }
+                                }
+                                0x8400_0004 | 0xc400_0004 => {
+                                    if b != 0 || a >= u64::from(config.cpus) {
+                                        -2i64 as u64
+                                    } else {
+                                        u64::from(!online[a as usize])
+                                    }
+                                }
+                                0x8400_0008 | 0x8400_0009 => {
+                                    println!("vmm: guest requested shutdown");
+                                    break;
+                                }
+                                0x8400_000a => match a as u32 {
+                                    0x8400_0000 | 0x8400_0002 | 0x8400_0003 | 0xc400_0003
+                                    | 0x8400_0004 | 0xc400_0004 | 0x8400_0008 | 0x8400_0009
+                                    | 0x8400_000a => 0,
+                                    _ => -1i64 as u64,
+                                },
+                                _ => -1i64 as u64,
+                            };
+                            vcpu.set_regs(&[RegisterValue {
+                                id: RegisterId::Aarch64X(0),
+                                value: result,
+                            }])?;
+                        }
+                        VmExit::Mmio(mmio) => {
+                            let value = if (boot::UART..boot::UART + 0x1000).contains(&mmio.address)
+                            {
+                                match (mmio.address - boot::UART, mmio.access) {
+                                    (0, IoAccess::Write(write)) => {
+                                        let byte = write.value as u8;
+                                        early_console.push(byte);
+                                        // PL011 is the early boot log console. Coalesce
+                                        // complete lines instead of awaiting a component
+                                        // stream transfer for every trapped character.
+                                        if byte == b'\n' || early_console.len() == memory::TRANSFER
+                                        {
+                                            helios_api::io::stdout()
+                                                .write_all(std::mem::take(&mut early_console))
+                                                .await?;
+                                        }
+                                        0
+                                    }
+                                    (0x18, IoAccess::Read(_)) => 0x90, // TXFE | RXFE.
+                                    (0xfe0, IoAccess::Read(_)) => 0x11,
+                                    (0xfe4, IoAccess::Read(_)) => 0x10,
+                                    (0xfe8, IoAccess::Read(_)) => 0x14,
+                                    (0xfec, IoAccess::Read(_)) => 0,
+                                    (0xff0, IoAccess::Read(_)) => 0x0d,
+                                    (0xff4, IoAccess::Read(_)) => 0xf0,
+                                    (0xff8, IoAccess::Read(_)) => 0x05,
+                                    (0xffc, IoAccess::Read(_)) => 0xb1,
+                                    _ => 0,
+                                }
+                            } else if (boot::CONSOLE..boot::CONSOLE + 0x1000)
+                                .contains(&mmio.address)
+                            {
+                                console.access(
+                                    mmio.address - boot::CONSOLE,
+                                    mmio.access,
+                                    0,
+                                    &memory,
+                                )?
+                            } else if let Some(file) = disk.as_ref()
+                                && (boot::BLOCK..boot::BLOCK + 0x1000).contains(&mmio.address)
+                            {
+                                block.access(
+                                    mmio.address - boot::BLOCK,
+                                    mmio.access,
+                                    file.size / 512,
+                                    &memory,
+                                )?
+                            } else if (boot::GICD..boot::GICD + 0x10000).contains(&mmio.address)
+                                || (boot::GICR..boot::GICR + u64::from(config.cpus) * 0x20000)
+                                    .contains(&mmio.address)
+                            {
+                                gic.access(mmio.address, mmio.access)?
+                            } else {
+                                return Err(Error::Device(mmio.address));
+                            };
+                            vcpu.complete_exit(value)?;
+                        }
+                        VmExit::SystemRegister(register) => {
+                            // Architectural op0:op1:CRn:CRm:op2 encodings.
+                            let value = match (register.register, register.access) {
+                                (0xc65d, IoAccess::Write(write)) => {
+                                    gic.sgi(cpu, write.value);
+                                    0
+                                } // ICC_SGI1R_EL1.
+                                _ => return Err(Error::Register(register.register)),
+                            };
+                            vcpu.complete_exit(value)?;
+                        }
+                        VmExit::Shutdown => break,
+                        other => return Err(Error::Exit(cpu, other)),
+                    }
+                    response = Some((cpu, action));
+                }
+            }
+            console.console_output(&memory).await?;
+            console.console_input(&memory, &mut input)?;
+            if input_waiting && input.is_empty() {
+                input_done.send(()).await.map_err(|_| Error::Channel)?;
+                input_waiting = false;
+            }
+            if let Some(file) = &disk {
+                block.block_requests(&memory, file).await?;
+            }
+            gic.line(boot::CONSOLE_IRQ, console.interrupt != 0);
+            gic.line(boot::BLOCK_IRQ, block.interrupt != 0);
+            gic.sync(&vm)?;
+            if let Some((cpu, action)) = response {
+                commands[cpu as usize]
+                    .send(action)
+                    .await
+                    .map_err(|_| Error::Channel)?;
             }
         }
-        console.console_output(&memory).await?;
-        console.console_input(&memory, &mut input)?;
-        if input_waiting && input.is_empty() {
-            input_done.send(()).await.map_err(|_| Error::Channel)?;
-            input_waiting = false;
-        }
-        if let Some(file) = &disk {
-            block.block_requests(&memory, file).await?;
-        }
-        gic.line(boot::CONSOLE_IRQ, console.interrupt != 0);
-        gic.line(boot::BLOCK_IRQ, block.interrupt != 0);
-        gic.sync(&vm)?;
-        if let Some((cpu, action)) = response {
-            commands[cpu as usize]
-                .send(action)
-                .await
-                .map_err(|_| Error::Channel)?;
-        }
+        Ok(())
+    }
+    .await;
+    if !early_console.is_empty() {
+        helios_api::io::stdout().write_all(early_console).await?;
     }
     for (cpu, command) in cpus.iter().zip(commands) {
         cpu.kick();
         let _ = command.try_send(Action::Stop);
     }
-    Ok(())
+    outcome
 }
