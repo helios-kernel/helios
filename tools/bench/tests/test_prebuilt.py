@@ -72,10 +72,12 @@ def host(tmp_path, monkeypatch) -> dict[str, Path]:
         "bootfs": prebuild / "helios-bootfs",
         "plugin": prebuild / "compiler_plugin.wasm",
         "native": tmp_path / "native",
+        "root": tmp_path,
     }
     monkeypatch.setenv("HELIOS_INSPECTOR_BIN", str(paths["inspector"]))
     monkeypatch.setenv("HELIOS_CLI_BIN", str(paths["cli"]))
     monkeypatch.setattr(runner, "NATIVE_ARTIFACTS", paths["native"])
+    monkeypatch.setattr(runner, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(runner, "compiler_plugin_wasm", lambda lane, kernel_build: paths["plugin"])
     return paths
 
@@ -110,7 +112,21 @@ def test_nothing_is_missing_once_everything_is_in_place(tmp_path, host) -> None:
     (host["native"] / "aarch64").mkdir(parents=True)
     for name in runner.native_counterparts(options, workloads):
         (host["native"] / "aarch64" / name).write_text("", encoding="utf-8")
+    for artifact in gap_bench().artifact_provenance(load_workloads(), workloads):
+        path = host["root"] / artifact["wasm"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
     assert missing_prebuilt_files(options, workloads) == []
+
+
+def test_selected_inputs_and_unselected_control_are_checked(tmp_path, host) -> None:
+    manifest = load_workloads()
+    workloads = runner.select_workloads(manifest, ["aot-curl"])
+    options = options_for(tmp_path, prebuilt=True, sides=frozenset({Side.HELIOS}))
+    missing = missing_prebuilt_files(options, workloads)
+    assert any("artifacts/wasi-tools/curl.wasm" in line for line in missing)
+    assert any("artifacts/wasix/quickjs/qjs.wasm" in line for line in missing)
+    assert not any("python3.wasm" in line for line in missing)
 
 
 def test_a_missing_inspector_is_listed_with_the_paths_it_would_have_answered(tmp_path, host) -> None:

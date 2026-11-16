@@ -99,6 +99,7 @@ impl BenchCpu {
 }
 
 impl Cpu for BenchCpu {
+    type Hypervisor = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {

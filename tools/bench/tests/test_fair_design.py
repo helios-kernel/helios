@@ -103,6 +103,7 @@ def test_consecutive_rounds_swap_which_side_goes_first(tmp_path: Path) -> None:
     # Only the first Helios pass takes the untimed profile boot.
     helios = [command for command in commands if command.side == "helios"]
     assert ["--helios-no-profile-boot" in command.argv for command in helios] == [False, True, True, True]
+    assert ["--helios-skip-build" in command.argv for command in helios] == [False, True, True, True]
 
 
 def test_the_driver_parses_every_round_the_plan_emits(tmp_path: Path) -> None:

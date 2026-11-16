@@ -6,10 +6,13 @@ pub mod debugger {
             path: "../wit",
             world: "debugger",
             imports: {
+                "helios:system/serial.debug-port": immediate | trappable,
+                "helios:system/serial.[method]serial-port.rights": immediate | trappable,
+                "helios:system/serial.[method]serial-port.flush": immediate | trappable,
                 "helios:system/programs.[method]child.stdin": store | trappable,
                 "helios:system/programs.[method]child.stdout": store | trappable,
                 "helios:system/programs.[method]child.stderr": store | trappable,
-                default: async | store | trappable
+                default: store | trappable
             },
             exports: { default: async },
             with: {
@@ -36,10 +39,13 @@ pub mod program {
             path: "../wit",
             world: "init",
             imports: {
+                "helios:system/serial.debug-port": immediate | trappable,
+                "helios:system/serial.[method]serial-port.rights": immediate | trappable,
+                "helios:system/serial.[method]serial-port.flush": immediate | trappable,
                 "helios:system/programs.[method]child.stdin": store | trappable,
                 "helios:system/programs.[method]child.stdout": store | trappable,
                 "helios:system/programs.[method]child.stderr": store | trappable,
-                default: async | store | trappable
+                default: store | trappable
             },
             exports: { default: async },
             with: {
@@ -279,6 +285,20 @@ pub mod audio {
                 "helios:system/audio.playback":
                     crate::wasmtime_adapter::component_host::PlaybackHandle,
             },
+            require_store_data_send: true,
+        });
+    }
+}
+
+/// Hardware virtualization resources shared by both program worlds.
+pub mod hv {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "hv-host",
+            imports: { default: trappable },
             require_store_data_send: true,
         });
     }

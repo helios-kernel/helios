@@ -65,6 +65,7 @@ use qmp::{QmpClient, QmpError, SizeError};
 use raw_profile::{ProfileCommand, RawProfileCollectError};
 use tpm::{Swtpm, SwtpmError, VmTpm, VmTpmBackend, VmTpmError, VmTpmProfile};
 pub(crate) use vcpu_state::VcpuStateCapture;
+use vcpu_state::VcpuStateError;
 
 /// Why a `vm` session did not run.
 ///
@@ -82,6 +83,8 @@ pub(crate) enum VmError {
     Build(#[from] VmBuildError),
     #[error("{0}")]
     Runtime(#[from] VmRuntimeError),
+    #[error("{0}")]
+    VcpuState(#[from] VcpuStateCommandError),
     /// A session that failed, with the runtime directory it left behind
     /// and QEMU's own account of the machine.
     ///
@@ -95,6 +98,30 @@ pub(crate) enum VmError {
         #[source]
         source: VmSessionError,
     },
+}
+
+/// Why `vm vcpu-state` could not reach the guest it was pointed at, or
+/// could not capture it.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VcpuStateCommandError {
+    #[error(
+        "vcpu-state captures a running guest, and names it by the --runtime-dir its session \
+         keeps; none was given"
+    )]
+    NoRuntimeDir,
+    #[error(
+        "the runtime directory {runtime_dir} has no `{SOCKET_DIR_LINK_NAME}` link to the \
+         guest's sockets (is it a kept runtime directory of a running guest?): {source}"
+    )]
+    NoSocketDir {
+        runtime_dir: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("--qmp {endpoint} is not a `unix:<path>` socket the inspector can speak to")]
+    QmpNotUnix { endpoint: String },
+    #[error("{0}")]
+    Capture(#[from] VcpuStateError),
 }
 
 /// Why the flags, the config file and this host do not describe a VM
@@ -1882,6 +1909,10 @@ pub(crate) struct VmCommand {
     #[arg(long = "enable-target", value_name = "TARGET")]
     enable_targets: Vec<String>,
 
+    /// Extra Cargo feature for the kernel image. Repeat to select several.
+    #[arg(long = "kernel-feature")]
+    kernel_features: Vec<String>,
+
     /// Restrict bootfs program prebuilds to a named program. Repeat for multiple programs.
     #[arg(long = "boot-program")]
     boot_programs: Vec<String>,
@@ -2046,6 +2077,19 @@ enum VmSessionCommand {
     /// file's `bootfs` if named, else the build's prebuild directory. A
     /// release uses it to attach the payload its kernel trusts.
     BootfsPath,
+    /// Capture what every vCPU of a running guest is doing, and stop
+    /// there.
+    ///
+    /// The guest is the one whose session keeps `--runtime-dir`: the
+    /// capture speaks to QEMU over that session's QMP socket (or the
+    /// `unix:` endpoint `--qmp` names), appends the register file, each
+    /// local APIC and each vCPU's stacks to `vcpu-state.log` there, and
+    /// names on stderr the kernel function each vCPU is executing and
+    /// the return addresses on its stacks, against the kernel this
+    /// checkout's build spec resolves. It is what a session does for
+    /// itself when one of its own guest steps times out, offered to a
+    /// check whose wait on the guest is its own.
+    VcpuState(VcpuStateCommand),
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
@@ -2073,6 +2117,16 @@ pub(crate) struct BalloonCommand {
     /// How long to hold each target before moving to the next one.
     #[arg(long, default_value_t = 0)]
     hold_seconds: u64,
+}
+
+/// Captures every vCPU of a running guest through its session's QMP
+/// socket; see [`VmSessionCommand::VcpuState`].
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct VcpuStateCommand {
+    /// What the capture is taken after, such as the wait that expired.
+    /// It heads the capture in `vcpu-state.log`.
+    #[arg(long, value_name = "TEXT")]
+    after: String,
 }
 
 /// Captures the machine's scanout through QMP.
@@ -2248,6 +2302,10 @@ struct AotBenchCommand {
     #[arg(long, default_value_t = 1)]
     iterations: u16,
 
+    /// Deadline for each guest RPC step, including upload and profile collection.
+    #[arg(long, default_value_t = DEFAULT_WORKLOAD_TIMEOUT_SECONDS)]
+    timeout_seconds: u32,
+
     /// Ask the guest compiler plugin to emit Wasmtime/Cranelift timing diagnostics.
     #[arg(long, default_value_t = false)]
     compiler_timing: bool,
@@ -2419,6 +2477,44 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
             println!("{}", bootfs.display());
             return Ok(());
         }
+        // Speaks to a guest another session booted, so it boots nothing
+        // and needs no accelerator.
+        Some(VmSessionCommand::VcpuState(capture)) => {
+            let file = load_config_file(command.config.as_deref())?;
+            let build = resolve_build(&command, &file, None)?;
+            let kernel = resolve_kernel_path(command.kernel, file.kernel, &build)
+                .map_err(VmConfigError::from)?;
+            let runtime_dir = command
+                .runtime_dir
+                .or(file.runtime_dir)
+                .ok_or(VcpuStateCommandError::NoRuntimeDir)?;
+            let qmp_socket = match command.qmp.or(file.qmp) {
+                Some(endpoint) => unix_socket_of(&endpoint)
+                    .ok_or(VcpuStateCommandError::QmpNotUnix { endpoint })?,
+                // The link, resolved: the path through it can be longer
+                // than a socket address holds.
+                None => fs::read_link(runtime_dir.join(SOCKET_DIR_LINK_NAME))
+                    .map_err(|source| VcpuStateCommandError::NoSocketDir {
+                        runtime_dir: runtime_dir.display().to_string(),
+                        source,
+                    })?
+                    .join(QMP_SOCKET_NAME),
+            };
+            let debug_serial_log = command
+                .debug_serial_log
+                .or(file.debug_serial_log)
+                .unwrap_or_else(|| runtime_dir.join(DEBUG_SERIAL_LOG_NAME));
+            VcpuStateCapture::new(
+                build.profile.arch,
+                Some(qmp_socket),
+                &runtime_dir,
+                Some(debug_serial_log),
+                kernel,
+            )
+            .capture_after(&capture.after)
+            .map_err(VcpuStateCommandError::from)?;
+            return Ok(());
+        }
         session => command.command = session,
     }
     let command = resolve(command)?;
@@ -2446,6 +2542,7 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
 /// state (#179).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct KernelBuildSpec {
+    kernel_features: Vec<String>,
     profile: &'static VmProfile,
     kind: KernelBuildProfile,
     /// The merged profile a [`KernelBuildProfile::ProfileUse`] build
@@ -2674,6 +2771,7 @@ fn resolve_build(
         profile,
         kind,
         profile_use,
+        kernel_features: command.kernel_features.clone(),
         boot_programs,
         no_compiler_plugin,
         root_secret_key,
@@ -3265,6 +3363,9 @@ fn cargo_build_command(repo_root: &Path, build: KernelBuildProfile) -> Command {
 fn kernel_build_command(repo_root: &Path, command: &KernelBuildSpec) -> Command {
     let mut cargo = cargo_build_command(repo_root, command.kind);
     cargo.args(command.profile.arch.build_std_arguments());
+    for feature in &command.kernel_features {
+        cargo.arg("--features").arg(feature);
+    }
     // The guest build alone moves. The host tools compiled beside it
     // read no profile and are looked up beside the running inspector,
     // so they stay in the two directories a host build ever uses
@@ -3518,7 +3619,7 @@ fn connect_and_run(
                     crate::vsock::connect(guest_cid, helios_inspector_protocol::VSOCK_RPC_PORT)
                         .await?;
                 let mut client =
-                    helios_inspector_protocol::transport::Client::new(vsock_read, vsock_write);
+                    RpcClient::new(vsock_read, vsock_write).map_err(ConnectError::from)?;
                 crate::ready::wait_until_ready(&mut client)
                     .await
                     .map_err(ConnectError::from)?;
@@ -3750,17 +3851,7 @@ async fn serve_guest_requests(
         }
         core::future::pending().await
     };
-    // A session that asks the guest nothing reads nothing, and a guest
-    // that keeps talking into a transport nobody drains blocks on it —
-    // which for a compositor writing its own account of every frame
-    // means a desktop that stops after its first two lines. Holding the
-    // reader role for as long as the session lasts is what keeps it
-    // running.
-    let route = async {
-        let _ = client.route_frames().await;
-        core::future::pending().await
-    };
-    futures_lite::future::or(serve, route).await
+    serve.await
 }
 
 /// The `--run` program one host-side action is performed alongside.
@@ -4457,12 +4548,18 @@ fn run_aot_bench(
         if command.iterations == 0 {
             return Err(AotBenchError::ZeroIterations.into());
         }
-        debugger_fs::write(&client, &command.remote_path, &wasm, false)
-            .await
-            .map_err(|source| AotBenchError::Upload {
-                path: command.wasm.display().to_string(),
-                source,
-            })?;
+        let seconds = command.timeout_seconds;
+        guest_step_under_deadline("the AOT upload", seconds, &vcpus, async {
+            Ok::<_, VmSessionError>(
+                debugger_fs::write(&client, &command.remote_path, &wasm, false)
+                    .await
+                    .map_err(|source| AotBenchError::Upload {
+                        path: command.wasm.display().to_string(),
+                        source,
+                    })?,
+            )
+        })
+        .await?;
         let profile_filter = system_profiling::Filter {
             scope: None,
             stack_prefixes: Vec::new(),
@@ -4475,20 +4572,35 @@ fn run_aot_bench(
             || command.user_profile_output.is_some()
             || command.perf_metrics_output.is_some();
         let before_profile = if collect_profile {
-            profiling_control_step(
-                "clear remote profile samples",
-                system_profiling::clear(&client),
-            )
+            guest_step_under_deadline("the profile reset", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    profiling_control_step(
+                        "clear remote profile samples",
+                        system_profiling::clear(&client),
+                    )
+                    .await?,
+                )
+            })
             .await?;
-            profiling_control_step(
-                "enable remote profiling",
-                system_profiling::set_enabled(&client, true),
-            )
+            guest_step_under_deadline("the profiler hand-off", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    profiling_control_step(
+                        "enable remote profiling",
+                        system_profiling::set_enabled(&client, true),
+                    )
+                    .await?,
+                )
+            })
             .await?;
-            profiling_read_step(
-                "read initial remote profile samples",
-                system_profiling::folded(&client, &profile_filter, 0),
-            )
+            guest_step_under_deadline("the initial profile read", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    profiling_read_step(
+                        "read initial remote profile samples",
+                        system_profiling::folded(&client, &profile_filter, 0),
+                    )
+                    .await?,
+                )
+            })
             .await?
         } else {
             Vec::new()
@@ -4507,33 +4619,37 @@ fn run_aot_bench(
         }
         let instruction_profile_output = command.instruction_profile_output();
         if instruction_profile_output.is_some() {
-            instruction_profile::start(&client).await?;
+            guest_step_under_deadline("the instruction sampling start", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(instruction_profile::start(&client).await?)
+            })
+            .await?;
         }
         for iteration in 1..=command.iterations {
             let started = Instant::now();
-            let outcome = system_programs::aot(
-                &client,
-                &system_programs::AotRequest {
-                    source_path: command.remote_path.clone(),
-                    destination_path: command.destination_path.clone(),
-                    hint: system_programs::AotHint::Performance,
-                    profile: command.compiler_timing,
-                },
-            )
-            .await
-            .map_err(|source| AotBenchError::Compile { iteration, source })?;
+            let outcome =
+                guest_step_under_deadline("the AOT compilation", seconds, &vcpus, async {
+                    Ok::<_, VmSessionError>(
+                        system_programs::aot(
+                            &client,
+                            &system_programs::AotRequest {
+                                source_path: command.remote_path.clone(),
+                                destination_path: command.destination_path.clone(),
+                                hint: system_programs::AotHint::Performance,
+                                profile: command.compiler_timing,
+                            },
+                        )
+                        .await
+                        .map_err(|source| AotBenchError::Compile { iteration, source })?,
+                    )
+                })
+                .await?;
             let result = match outcome {
                 Ok(result) => result,
                 Err(error) => {
                     // Surface the guest-side error events before failing:
                     // the RPC error kind alone (e.g. `Internal`) does not
                     // say which runtime operation actually failed.
-                    print_recent_guest_errors(
-                        &mut client,
-                        DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
-                        &vcpus,
-                    )
-                    .await;
+                    print_recent_guest_errors(&mut client, seconds, &vcpus).await;
                     return Err(AotBenchError::Refused {
                         iteration,
                         kind: error.kind,
@@ -4553,31 +4669,64 @@ fn run_aot_bench(
             .map_err(|source| AotBenchError::Report { source })?;
         }
         if instruction_profile_output.is_some() {
-            instruction_profile::stop(&client).await?;
+            guest_step_under_deadline("the instruction sampling stop", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(instruction_profile::stop(&client).await?)
+            })
+            .await?;
         }
         if collect_profile {
-            profiling_control_step(
-                "disable remote profiling",
-                system_profiling::set_enabled(&client, false),
-            )
+            guest_step_under_deadline("the profiler stop", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(
+                    profiling_control_step(
+                        "disable remote profiling",
+                        system_profiling::set_enabled(&client, false),
+                    )
+                    .await?,
+                )
+            })
             .await?;
-            let after_profile = profiling_read_step(
-                "read final remote profile samples",
-                system_profiling::folded(&client, &profile_filter, 0),
-            )
-            .await?;
-            let metrics = profiling_read_step(
-                "read final remote perf metrics",
-                system_profiling::metrics(&client, &metric_filter, 0),
-            )
-            .await?;
+            let after_profile =
+                guest_step_under_deadline("the final profile read", seconds, &vcpus, async {
+                    Ok::<_, VmSessionError>(
+                        profiling_read_step(
+                            "read final remote profile samples",
+                            system_profiling::folded(&client, &profile_filter, 0),
+                        )
+                        .await?,
+                    )
+                })
+                .await?;
+            let metrics =
+                guest_step_under_deadline("the final metrics read", seconds, &vcpus, async {
+                    Ok::<_, VmSessionError>(
+                        profiling_read_step(
+                            "read final remote perf metrics",
+                            system_profiling::metrics(&client, &metric_filter, 0),
+                        )
+                        .await?,
+                    )
+                })
+                .await?;
             write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
         if let Some(output) = instruction_profile_output {
-            instruction_profile::collect(&client, &kernel, output).await?;
+            guest_step_under_deadline(
+                "the instruction profile collection",
+                seconds,
+                &vcpus,
+                async {
+                    Ok::<_, VmSessionError>(
+                        instruction_profile::collect(&client, &kernel, output).await?,
+                    )
+                },
+            )
+            .await?;
         }
         if let Some(output) = command.llvm_raw_profile_output() {
-            raw_profile::collect_beside(&client, output).await?;
+            guest_step_under_deadline("the raw profile collection", seconds, &vcpus, async {
+                Ok::<_, VmSessionError>(raw_profile::collect_beside(&client, output).await?)
+            })
+            .await?;
         }
         Ok(())
     })
@@ -5802,14 +5951,15 @@ fn qmp_socket_path(
     command: &ResolvedVmCommand,
     socket_dir: &Path,
 ) -> Result<Option<PathBuf>, SocketPathTooLong> {
-    let Some(endpoint) = qmp_endpoint(command, socket_dir)? else {
-        return Ok(None);
-    };
-    let Some(path) = endpoint.strip_prefix("unix:") else {
-        return Ok(None);
-    };
+    Ok(qmp_endpoint(command, socket_dir)?.and_then(|endpoint| unix_socket_of(&endpoint)))
+}
+
+/// The socket path of a QEMU `unix:<path>[,option…]` endpoint, or `None`
+/// for any other form.
+fn unix_socket_of(endpoint: &str) -> Option<PathBuf> {
+    let path = endpoint.strip_prefix("unix:")?;
     let path = path.split(',').next().unwrap_or(path);
-    Ok(Some(PathBuf::from(path)))
+    Some(PathBuf::from(path))
 }
 
 fn unix_endpoint(socket_dir: &Path, name: &str) -> Result<String, SocketPathTooLong> {
@@ -6558,10 +6708,12 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath
             | VmSessionCommand::BootfsPath
+            | VmSessionCommand::VcpuState(_)
             | VmSessionCommand::NetSetup(_)
             | VmSessionCommand::NetTeardown(_) => {
                 unreachable!(
-                    "the build, the artifact query and the network helpers never reach a guest session"
+                    "the build, the artifact queries, the vCPU capture and the network helpers \
+                     never reach a guest session"
                 )
             }
         }
@@ -7182,6 +7334,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aot_bench_deadline_is_configurable() {
+        #[derive(clap::Parser)]
+        struct AotBenchLine {
+            #[command(flatten)]
+            command: AotBenchCommand,
+        }
+        let default = <AotBenchLine as clap::Parser>::try_parse_from(["aot-bench", "sample.wasm"])
+            .expect("default deadline");
+        assert_eq!(
+            default.command.timeout_seconds,
+            DEFAULT_WORKLOAD_TIMEOUT_SECONDS
+        );
+        let configured = <AotBenchLine as clap::Parser>::try_parse_from([
+            "aot-bench",
+            "sample.wasm",
+            "--timeout-seconds",
+            "900",
+        ])
+        .expect("configured deadline");
+        assert_eq!(configured.command.timeout_seconds, 900);
+    }
+
     /// A bench guest that stops answering is captured through QMP before
     /// QEMU is torn down, so every bench session asks for the socket
     /// although it drives no QMP action of its own.
@@ -7192,6 +7367,7 @@ mod tests {
             remote_path: "/aot-bench-input.wasm".to_owned(),
             destination_path: "/aot-bench-output.cwasm".to_owned(),
             iterations: 5,
+            timeout_seconds: DEFAULT_WORKLOAD_TIMEOUT_SECONDS,
             compiler_timing: false,
             profile_output: None,
             kernel_profile_output: None,
@@ -7691,6 +7867,7 @@ mod tests {
             profile: &X86_64_VM_PROFILE,
             kind,
             profile_use: None,
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: true,
             root_secret_key: None,
@@ -7739,6 +7916,7 @@ mod tests {
                     profile: arch.profile(),
                     kind,
                     profile_use: None,
+                    kernel_features: Vec::new(),
                     boot_programs: Vec::new(),
                     no_compiler_plugin: true,
                     root_secret_key: None,
@@ -8262,6 +8440,7 @@ mod tests {
             profile: &X86_64_VM_PROFILE,
             kind: KernelBuildProfile::Release,
             profile_use: None,
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             root_secret_key: Some(PathBuf::from("/run/release/root.key")),
@@ -8332,6 +8511,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             bootfs_root: None,
@@ -8403,6 +8583,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             bootfs_root: None,
@@ -9083,6 +9264,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             bootfs_root: None,
@@ -9129,6 +9311,39 @@ mod tests {
             })?;
         }
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires QEMU and a cross-compiled native-users kernel"]
+    fn native_linux_syscalls_x86() -> Result<(), GuestTestFailure> {
+        let root = repo_root()?;
+        let bootfs = root.join("target/native-linux-bootfs");
+        run_step(
+            "building Linux ABI fixtures",
+            Command::new("bash")
+                .current_dir(&root)
+                .arg("linux/tests/build-fixtures.sh")
+                .arg(&bootfs),
+        )?;
+        let mut command = guest_test_command(&X86_64_VM_PROFILE);
+        command.accel =
+            vec![std::env::var("HELIOS_NATIVE_TEST_ACCEL").unwrap_or_else(|_| "kvm".to_owned())];
+        command.cpu = default_cpu(command.profile, &command.accel).map(str::to_owned);
+        command.build.kernel_features = vec!["linux-prototype".to_owned()];
+        command.build.bootfs_root = Some(bootfs);
+        command.runtime_dir = Some(root.join("target/native-linux-runtime"));
+        command.keep_runtime_dir = true;
+        command.debug_serial_log = Some(root.join("target/native-linux-serial.log"));
+        build_self_test_kernel(&command, &[])?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let marker = b"native Linux prototype passed:";
+        let result = wait_for_console_matches(
+            runtime.socket_path(),
+            |line| line.windows(marker.len()).any(|window| window == marker),
+            1,
+        );
+        runtime.shutdown();
+        result
     }
 
     /// The aarch64 kernel built with `HELIOS_CFI_SELF_TEST` corrupts a signed
@@ -9208,12 +9423,10 @@ mod tests {
                 .arg("helios-cli"),
         )?;
         run_kernel_prebuild(&command.build)?;
-        let mut cargo = std::process::Command::new("cargo");
+        let mut cargo = kernel_build_command(&repo_root()?, &command.build);
         export_trusted_root_public_key(&mut cargo, &command.build)?;
         let status = cargo
             .current_dir(repo_root()?)
-            .arg("build")
-            .args(profile.arch.build_std_arguments())
             .arg("--target")
             .arg(profile.cargo_target)
             .arg("--bin")
@@ -9238,6 +9451,7 @@ mod tests {
             profile,
             kind: KernelBuildProfile::Debug,
             profile_use: None,
+            kernel_features: Vec::new(),
             boot_programs: vec!["debugger".to_owned()],
             no_compiler_plugin: true,
             root_secret_key: None,
@@ -9457,6 +9671,7 @@ mod tests {
             profile,
             kind: KernelBuildProfile::Release,
             profile_use: None,
+            kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
             root_secret_key: None,
@@ -9560,6 +9775,14 @@ mod tests {
         marker: &[u8],
         expected: usize,
     ) -> Result<(), GuestTestFailure> {
+        wait_for_console_matches(socket_path, |line| line == marker, expected)
+    }
+
+    fn wait_for_console_matches(
+        socket_path: &Path,
+        matches: impl Fn(&[u8]) -> bool,
+        expected: usize,
+    ) -> Result<(), GuestTestFailure> {
         let deadline = Instant::now() + WATCHDOG_STAGE_TIMEOUT;
         let mut serial = connect_serial_socket(socket_path)?;
         let mut line = Vec::new();
@@ -9592,7 +9815,7 @@ mod tests {
                                         observed_stages.remove(0);
                                     }
                                 }
-                                if line.as_slice() == marker {
+                                if matches(&line) {
                                     seen += 1;
                                     if seen == expected {
                                         return Ok(());

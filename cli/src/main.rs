@@ -643,6 +643,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Prepare the root keypair that compile and lint checks read,
+    /// without building a boot payload.
+    KernelKeys {
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
     KernelPrebuild(KernelPrebuildCommand),
     LimineUefiImage(LimineUefiImageCommand),
     ProfileFetch(ProfileFetchCommand),
@@ -969,6 +975,10 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
+        Commands::KernelKeys { out_dir } => {
+            prepare_root_key(&out_dir, None)?;
+            Ok(())
+        }
         Commands::KernelPrebuild(command) => {
             Ok(run_kernel_prebuild(command, cli.workspace_root.as_deref())?)
         }
@@ -992,23 +1002,11 @@ fn run_kernel_prebuild(
     explicit_workspace_root: Option<&Path>,
 ) -> Result<(), PrebuildError> {
     let workspace_root = WorkspaceRoot::resolve(explicit_workspace_root)?;
-    fs::create_dir_all(&command.out_dir).map_err(|source| PrebuildError::CreateOutDir {
-        path: command.out_dir.display().to_string(),
-        source,
-    })?;
-
-    let root_public_path = command.out_dir.join(ROOT_PUBLIC_FILE);
-    let (root_secret_path, root_signing_key) = match &command.root_secret_key {
-        Some(supplied) => (
-            supplied.clone(),
-            supplied_root_keypair(supplied, &root_public_path)?,
-        ),
-        None => {
-            let generated = command.out_dir.join(ROOT_SECRET_FILE);
-            let key = ensure_root_keypair(&generated, &root_public_path)?;
-            (generated, key)
-        }
-    };
+    let PreparedRootKey {
+        root_public_path,
+        root_secret_path,
+        root_signing_key,
+    } = prepare_root_key(&command.out_dir, command.root_secret_key.as_deref())?;
 
     let init_manifest = workspace_root.join(&command.init_manifest);
     let bootfs_root = workspace_root.join(&command.bootfs_root);
@@ -2314,6 +2312,41 @@ fn encode_component(path: &Path) -> Result<Vec<u8>, WasmBuildError> {
         })
 }
 
+struct PreparedRootKey {
+    root_public_path: PathBuf,
+    root_secret_path: PathBuf,
+    root_signing_key: SigningKey,
+}
+
+fn prepare_root_key(
+    out_dir: &Path,
+    supplied: Option<&Path>,
+) -> Result<PreparedRootKey, PrebuildError> {
+    fs::create_dir_all(out_dir).map_err(|source| PrebuildError::CreateOutDir {
+        path: out_dir.display().to_string(),
+        source,
+    })?;
+
+    let root_public_path = out_dir.join(ROOT_PUBLIC_FILE);
+    let (root_secret_path, root_signing_key) = match supplied {
+        Some(supplied) => (
+            supplied.to_path_buf(),
+            supplied_root_keypair(supplied, &root_public_path)?,
+        ),
+        None => {
+            let generated = out_dir.join(ROOT_SECRET_FILE);
+            let key = ensure_root_keypair(&generated, &root_public_path)?;
+            (generated, key)
+        }
+    };
+
+    Ok(PreparedRootKey {
+        root_public_path,
+        root_secret_path,
+        root_signing_key,
+    })
+}
+
 fn ensure_root_keypair(
     root_secret_path: &Path,
     root_public_path: &Path,
@@ -2844,6 +2877,31 @@ mod tests {
                 if path.ends_with("debug/helios_init.wasm") && profile == "debug"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn kernel_keys_prepares_only_a_stable_keypair() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let out_dir = root.path().join("keys");
+        let prepare = || {
+            let cli = Cli::try_parse_from([
+                "helios-cli",
+                "kernel-keys",
+                "--out-dir",
+                out_dir.to_str().expect("a UTF-8 test path"),
+            ])
+            .expect("the keys command parses");
+            run(cli).expect("the keys are prepared without a payload");
+        };
+        prepare();
+        let secret = fs::read(out_dir.join(ROOT_SECRET_FILE)).unwrap();
+        let public = fs::read(out_dir.join(ROOT_PUBLIC_FILE)).unwrap();
+        let key = read_signing_key(&out_dir.join(ROOT_SECRET_FILE)).unwrap();
+        assert_eq!(public, key.verifying_key().to_bytes());
+        assert_eq!(fs::read_dir(&out_dir).unwrap().count(), 2);
+        prepare();
+        assert_eq!(fs::read(out_dir.join(ROOT_SECRET_FILE)).unwrap(), secret);
+        assert_eq!(fs::read(out_dir.join(ROOT_PUBLIC_FILE)).unwrap(), public);
     }
 
     #[test]

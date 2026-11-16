@@ -3084,6 +3084,10 @@ impl OutboundFrameQueue {
         !self.free.is_empty()
     }
 
+    fn free_slots(&self) -> usize {
+        self.free.len()
+    }
+
     fn frame_mut(&mut self, slot: usize) -> &mut PacketBuffer {
         self.frames
             .get_mut(slot)
@@ -4306,14 +4310,23 @@ where
     /// reassembly cache's expiry.
     ///
     /// Every active socket has its timers run and then, while the
-    /// outbound queue has room, its turn on the wire. Turns go round the
-    /// active set from the socket whose turn the last full queue cut
-    /// short, so when the queue fills on every drive a socket still waits
-    /// at most one lap of the set, however busy the sockets ahead of it
-    /// are. A full queue ends the turns, not the drive: whatever a socket
-    /// did not emit stays pending on it for its next turn, and the timers
-    /// and the orphan sweep still run. Nothing is marked sent before it
-    /// has an outbound slot.
+    /// outbound queue has room, its turn on the wire. A turn lasts until
+    /// the socket's send window, its pacing budget or the queue's room
+    /// closes, so one pass puts a socket's whole burst on the queue and
+    /// the device sees it as one batch.
+    ///
+    /// Turns go round the active set from the socket a full queue
+    /// refused, so when the queue fills on every drive a socket still
+    /// waits at most one lap of the set. A socket that filled the queue
+    /// with its own burst was served, not refused: the next drive starts
+    /// after it, because starting at it again would let the first socket
+    /// of a lap take the whole queue every pass while the rest starve.
+    /// With that rule a burst needs no cap of its own beyond the queue
+    /// and the pacing budget; the socket that was refused leads the next
+    /// pass and takes its turn at the whole queue. A full queue ends the
+    /// turns, not the drive: whatever a socket did not emit stays pending
+    /// on it for its next turn, and the timers and the orphan sweep
+    /// still run. Nothing is marked sent before it has an outbound slot.
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
         self.ipv4_reassembly.expire(now);
         // Nothing below inserts into or removes from the active set
@@ -4326,11 +4339,20 @@ where
         for offset in 0..active {
             let position = (start + offset) % active;
             let index = self.tcp.active_index(position);
+            let free_before = self.outbound.free_slots();
             match self.drive_tcp_socket(index, emitting, now) {
                 Ok(()) => {}
                 Err(StackError::OutputQueueFull) => {
                     emitting = false;
-                    self.tcp_drive_start = position;
+                    // Only the first refusal of a pass arrives here:
+                    // sockets after it do not emit. A turn that took
+                    // slots before the queue filled was served, and the
+                    // next pass leads with the socket after it.
+                    self.tcp_drive_start = if self.outbound.free_slots() == free_before {
+                        position
+                    } else {
+                        position + 1
+                    };
                 }
                 // Anything else belongs to this socket's path and ends
                 // its turn, not the others'.
@@ -4396,14 +4418,10 @@ where
         turn
     }
 
-    /// Socket `index`'s turn on the wire, in the order a connection
-    /// needs its segments: a due retransmission, or else its handshake
-    /// and its next data segment; then the acknowledgements it still
-    /// owes. Data carries an acknowledgement, so a socket that sent data
-    /// owes one fewer afterwards.
-    ///
-    /// The first error ends the turn with the rest still pending on the
-    /// socket.
+    /// Send due retransmissions until the window or pacing schedule stops
+    /// them, then handshake, new data and the remaining acknowledgements.
+    /// The outbound queue bounds the turn; its first refusal leaves the
+    /// rest pending for a later drive.
     fn emit_tcp_turn(
         &mut self,
         index: usize,
@@ -4411,32 +4429,34 @@ where
         now: StackInstant,
     ) -> Result<(), StackError> {
         let (local, remote) = self.active_tcp_endpoints(index);
-        let socket = self.active_tcp_socket(index);
-        if let Some(segment) =
-            socket.pending_retransmission_with_mtu(now.nanos(), budget.wire_segment())
+        while let Some(segment) = self
+            .active_tcp_socket(index)
+            .pending_retransmission_with_mtu(now.nanos(), budget.wire_segment())
         {
-            self.emit_tcp_retransmission(index, &segment, now)?;
+            if !self.emit_tcp_retransmission(index, &segment, now)? {
+                return Ok(());
+            }
             // The retransmission limit closes the connection, and a
             // closed connection owes its peer nothing more.
             if self.active_tcp_socket(index).state() == crate::TcpState::Closed {
                 return Ok(());
             }
-        } else {
-            if let Some(header) = socket.pending_syn() {
-                let options = socket.pending_syn_options(now.nanos());
-                if self.queue_tcp_control(index, local, remote, header, options, now)? {
-                    self.active_tcp_socket_mut(index)
-                        .mark_syn_queued(now.nanos());
-                }
-            } else if let Some(header) = socket.pending_syn_ack() {
-                let options = socket.pending_syn_ack_options(now.nanos());
-                if self.queue_tcp_control(index, local, remote, header, options, now)? {
-                    self.active_tcp_socket_mut(index)
-                        .mark_syn_ack_queued(now.nanos());
-                }
-            }
-            self.emit_tcp_data(index, local, remote, budget, now)?;
         }
+        let socket = self.active_tcp_socket(index);
+        if let Some(header) = socket.pending_syn() {
+            let options = socket.pending_syn_options(now.nanos());
+            if self.queue_tcp_control(index, local, remote, header, options, now)? {
+                self.active_tcp_socket_mut(index)
+                    .mark_syn_queued(now.nanos());
+            }
+        } else if let Some(header) = socket.pending_syn_ack() {
+            let options = socket.pending_syn_ack_options(now.nanos());
+            if self.queue_tcp_control(index, local, remote, header, options, now)? {
+                self.active_tcp_socket_mut(index)
+                    .mark_syn_ack_queued(now.nanos());
+            }
+        }
+        self.emit_tcp_data(index, local, remote, budget, now)?;
         self.emit_tcp_acks(index, local, remote, now)
     }
 
@@ -4465,7 +4485,7 @@ where
         index: usize,
         segment: &TcpTransmitSegment,
         now: StackInstant,
-    ) -> Result<(), StackError> {
+    ) -> Result<bool, StackError> {
         let sequence = segment.header.sequence;
         let identification = segment.sequence_len as u16;
         let hop_limit = self.tcp_socket_hop_limit(index);
@@ -4484,8 +4504,10 @@ where
             self.active_tcp_socket_mut(index)
                 .mark_retransmission_queued(sequence, now.nanos());
             self.tcp_transmit_counters.retransmits_sent += 1;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     /// Queues a segment that has no payload and no sequence-space
@@ -4514,13 +4536,20 @@ where
         )
     }
 
-    /// Sends the next segment `index` has queued, if any.
+    /// Sends the segments `index` has queued, until its send window, its
+    /// pacing budget or the outbound queue's room closes.
     ///
     /// Taking a segment moves it into flight, so the slot it will leave
     /// through and the link address it is bound for are secured before
-    /// the take, and the frame is built for that address without a
-    /// second lookup. A socket with nothing to send is still asked,
-    /// because asking is also what arms and clears its persist timer.
+    /// each take, and the frame is built for that address without a
+    /// second lookup. The next hop is resolved once for the whole burst:
+    /// every segment of a connection goes to the same one. A socket with
+    /// nothing to send is still asked once, because asking is also what
+    /// arms and clears its persist timer.
+    ///
+    /// A queue that fills while the socket still has data pending ends
+    /// the turn with [`StackError::OutputQueueFull`], the rest staying
+    /// owed on the socket.
     fn emit_tcp_data(
         &mut self,
         index: usize,
@@ -4529,55 +4558,62 @@ where
         budget: TcpSegmentBudget,
         now: StackInstant,
     ) -> Result<(), StackError> {
-        let link = if self.active_tcp_socket(index).has_pending_transmit() {
-            if !self.outbound.has_free_slot() {
-                return Err(StackError::OutputQueueFull);
-            }
-            // Unresolved, the next hop has been solicited and the data
-            // stays queued on the socket until it answers.
-            match self.resolve_tcp_link_address(local, remote, now)? {
-                TcpLink::Resolved(link) => Some(link),
-                TcpLink::Unresolved { next_request_at } => {
-                    // The socket's deadline becomes the next request
-                    // rather than a pacing time its writer would be
-                    // woken on again and again.
-                    self.active_tcp_socket_mut(index)
-                        .await_resolution(next_request_at.nanos());
-                    return Ok(());
+        let mut link = None;
+        let mut first = true;
+        loop {
+            if self.active_tcp_socket(index).has_pending_transmit() {
+                if !self.outbound.has_free_slot() {
+                    return Err(StackError::OutputQueueFull);
                 }
+                if link.is_none() {
+                    // Unresolved, the next hop has been solicited and
+                    // the data stays queued on the socket until it
+                    // answers.
+                    match self.resolve_tcp_link_address(local, remote, now)? {
+                        TcpLink::Resolved(resolved) => link = Some(resolved),
+                        TcpLink::Unresolved { next_request_at } => {
+                            // The socket's deadline becomes the next
+                            // request rather than a pacing time its
+                            // writer would be woken on again and again.
+                            self.active_tcp_socket_mut(index)
+                                .await_resolution(next_request_at.nanos());
+                            return Ok(());
+                        }
+                    }
+                }
+            } else if !first {
+                return Ok(());
             }
-        } else {
-            None
-        };
-        let Some(segment) = self
-            .active_tcp_socket_mut(index)
-            .take_transmit_segment(now.nanos(), budget)
-        else {
-            return Ok(());
-        };
-        let link = link.expect("a TCP socket with nothing pending produced a segment");
-        let identification = segment.sequence_len as u16;
-        let hop_limit = self.tcp_socket_hop_limit(index);
-        // The segment is in flight from here on, so a failure would lose
-        // it. Its slot and link address are secured above and `budget`
-        // sized it to the path MTU this drive read, so nothing is left
-        // that can refuse it.
-        self.queue_tcp_frame(
-            link,
-            segment.local,
-            segment.remote,
-            TcpEgress {
-                header: segment.header,
-                options: segment.options,
-                payload: self.tcp_tx_payload(&segment),
-                hop_limit,
-            },
-            identification,
-        )
-        .unwrap_or_else(|error| {
-            panic!("TCP segment taken into flight could not be queued: {error:?}")
-        });
-        Ok(())
+            first = false;
+            let Some(segment) = self
+                .active_tcp_socket_mut(index)
+                .take_transmit_segment(now.nanos(), budget)
+            else {
+                return Ok(());
+            };
+            let link = link.expect("a TCP socket with nothing pending produced a segment");
+            let identification = segment.sequence_len as u16;
+            let hop_limit = self.tcp_socket_hop_limit(index);
+            // The segment is in flight from here on, so a failure would
+            // lose it. Its slot and link address are secured above and
+            // `budget` sized it to the path MTU this drive read, so
+            // nothing is left that can refuse it.
+            self.queue_tcp_frame(
+                link,
+                segment.local,
+                segment.remote,
+                TcpEgress {
+                    header: segment.header,
+                    options: segment.options,
+                    payload: self.tcp_tx_payload(&segment),
+                    hop_limit,
+                },
+                identification,
+            )
+            .unwrap_or_else(|error| {
+                panic!("TCP segment taken into flight could not be queued: {error:?}")
+            });
+        }
     }
 
     /// Sends the acknowledgements `index` still owes.
@@ -14227,14 +14263,20 @@ mod tests {
         stack
             .drive_tcp(StackInstant::from_nanos(2))
             .expect("the close should queue the data and a FIN");
-        while take_tcp_segment(&mut stack).is_some() {}
+        // The turn runs until the socket has nothing left to send, so
+        // the FIN follows the data in the same pass.
+        let mut sent = Vec::new();
+        while let Some(segment) = take_tcp_segment(&mut stack) {
+            sent.push(segment);
+        }
         assert!(
             stack.tcp_counters().orphan_send_queued_bytes > 0,
             "sent but unacknowledged data is still owed"
         );
 
-        // The FIN follows the data's acknowledgement. This side's data
-        // starts at sequence 8 (see `open_established_tcp_stack`).
+        // The peer acknowledges the data but not yet the FIN. This
+        // side's data starts at sequence 8 (see
+        // `open_established_tcp_stack`).
         let (ack, ack_len) = tcp_segment(
             peer,
             local,
@@ -14258,9 +14300,17 @@ mod tests {
             .expect("the peer's acknowledgement should be accepted");
         stack
             .drive_tcp(StackInstant::from_nanos(3))
-            .expect("the acknowledged data should release the FIN");
-        let (flags, fin_sequence, _) =
-            take_tcp_segment(&mut stack).expect("the close owes its peer a FIN");
+            .expect("the acknowledged data leaves only the FIN in flight");
+        assert_eq!(
+            take_tcp_segment(&mut stack),
+            None,
+            "the FIN went out with the data and is not resent"
+        );
+        let (flags, fin_sequence, _) = sent
+            .iter()
+            .copied()
+            .find(|(flags, ..)| flags.contains(TcpFlags::FIN))
+            .expect("the close owes its peer a FIN");
         assert!(flags.contains(TcpFlags::FIN));
         let finishing = stack.tcp_counters();
         assert_eq!(
@@ -20140,11 +20190,14 @@ mod tests {
     }
 
     fn flow_stack(peer_resolved: bool) -> Stack {
-        let mut stack = Stack::new(StackConfig::new(
-            LOCAL_MAC,
-            crate::ETHERNET_FRAME_BYTES,
-            TEST_SECRET,
-        ));
+        flow_stack_with(BbrV3::new(1460), peer_resolved)
+    }
+
+    fn flow_stack_with<C: CongestionControl>(congestion: C, peer_resolved: bool) -> Stack<C> {
+        let mut stack = Stack::new_with_congestion(
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET),
+            congestion,
+        );
         stack
             .add_ipv4_address(Ipv4Cidr::new(FLOW_LOCAL, 24))
             .expect("test address should be accepted");
@@ -20154,7 +20207,7 @@ mod tests {
         stack
     }
 
-    fn flow_connect(stack: &mut Stack, flow: u16) -> SocketId {
+    fn flow_connect<C: CongestionControl>(stack: &mut Stack<C>, flow: u16) -> SocketId {
         stack
             .open_tcp_connect(
                 TcpEndpoint {
@@ -20170,7 +20223,7 @@ mod tests {
             .expect("test TCP connect should allocate a socket")
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct FlowFrame {
         flow: u16,
         flags: TcpFlags,
@@ -20181,7 +20234,7 @@ mod tests {
 
     /// Every TCP frame the stack has queued, oldest first; frames that
     /// are not TCP from a flow (ARP and the like) are discarded.
-    fn drain_flow_frames(stack: &mut Stack) -> Vec<FlowFrame> {
+    fn drain_flow_frames<C: CongestionControl>(stack: &mut Stack<C>) -> Vec<FlowFrame> {
         let mut frames = Vec::new();
         while let Some(frame) = stack.take_outbound() {
             let Some(ethernet) = EthernetFrame::parse(frame.as_slice()) else {
@@ -20205,8 +20258,8 @@ mod tests {
         frames
     }
 
-    fn flow_receive(
-        stack: &mut Stack,
+    fn flow_receive<C: CongestionControl>(
+        stack: &mut Stack<C>,
         flow: u16,
         flags: TcpFlags,
         sequence: u32,
@@ -20216,8 +20269,8 @@ mod tests {
         flow_receive_payload(stack, flow, flags, sequence, acknowledgement, &[], now);
     }
 
-    fn flow_receive_payload(
-        stack: &mut Stack,
+    fn flow_receive_payload<C: CongestionControl>(
+        stack: &mut Stack<C>,
         flow: u16,
         flags: TcpFlags,
         sequence: u32,
@@ -20254,9 +20307,13 @@ mod tests {
     /// collections held. Every socket ends established; with
     /// `owing_acks` each still owes the ACK of its handshake, all at
     /// once, and without it the ACKs have gone out.
-    fn establish_flows(stack: &mut Stack, count: u16, owing_acks: bool) -> Vec<SocketId> {
+    fn establish_flows<C: CongestionControl>(
+        stack: &mut Stack<C>,
+        count: u16,
+        owing_acks: bool,
+    ) -> Vec<SocketId> {
         let mut sockets = Vec::new();
-        let syn_ack = |stack: &mut Stack, flows: core::ops::Range<u16>| {
+        let syn_ack = |stack: &mut Stack<C>, flows: core::ops::Range<u16>| {
             for flow in flows {
                 flow_receive(
                     stack,
@@ -20289,7 +20346,7 @@ mod tests {
 
     /// Drives until a drive queues nothing more, and returns every TCP
     /// frame the drives produced.
-    fn settle(stack: &mut Stack, now: u64) -> Vec<FlowFrame> {
+    fn settle<C: CongestionControl>(stack: &mut Stack<C>, now: u64) -> Vec<FlowFrame> {
         let mut frames = Vec::new();
         for _ in 0..32 {
             stack.drive_tcp(at(now)).expect("drive should succeed");
@@ -20583,23 +20640,368 @@ mod tests {
 
         // A millisecond apart: past any pacing gap, far inside the RTO.
         let mut late_frames = Vec::new();
-        for drive in 0..2 {
+        let mut drives = 0;
+        while late_frames.is_empty() {
+            assert!(
+                drives < CROWD,
+                "the late socket waited more than a lap of the active set"
+            );
             stack
-                .drive_tcp(at(2 + drive * 1_000_000))
+                .drive_tcp(at(2 + u64::from(drives) * 1_000_000))
                 .expect("a full outbound queue ends the turns, not the drive");
+            let frames = drain_flow_frames(&mut stack);
+            late_frames.extend(frames.iter().filter(|frame| frame.flow == late).cloned());
+            // The queue stays contended until the late socket has been
+            // served: the sockets ahead of it use whole drives.
+            assert!(
+                frames.len() == MAX_OUTBOUND_FRAMES || !late_frames.is_empty(),
+                "drive {drives} fills the queue"
+            );
+            drives += 1;
+        }
+        // A turn takes as much of the queue as its window allows, so a
+        // lap of the set takes several drives; each drive resumes after
+        // the socket it served or at the one it refused, never back at
+        // the front.
+        assert_eq!(late_frames.len(), 1);
+        assert_eq!(late_frames[0].payload, payload);
+        assert_eq!(late_frames[0].sequence, FLOW_LOCAL_NEXT);
+    }
+
+    /// A controller with a window far wider than the peer's, so the
+    /// peer's receive window is the only one that closes, and a pacing
+    /// rate the test sets or leaves out.
+    #[derive(Clone, Debug)]
+    struct OpenWindow {
+        pacing_rate: Option<crate::PacingRate>,
+    }
+
+    impl CongestionControl for OpenWindow {
+        fn algorithm_name(&self) -> &'static str {
+            "open-window-test"
+        }
+
+        fn on_packet_sent(&mut self, _packet: crate::congestion::PacketSent) {}
+
+        fn on_ack(&mut self, _sample: crate::AckSample) -> crate::congestion::RecoveryAction {
+            self.recovery()
+        }
+
+        fn on_congestion_event(
+            &mut self,
+            _event: crate::CongestionEvent,
+        ) -> crate::congestion::RecoveryAction {
+            self.recovery()
+        }
+
+        fn congestion_window(&self) -> crate::CongestionWindow {
+            crate::CongestionWindow::new(1 << 20)
+        }
+
+        fn pacing_rate(&self) -> Option<crate::PacingRate> {
+            self.pacing_rate
+        }
+
+        fn limits_delivery(&self) -> bool {
+            false
+        }
+    }
+
+    impl OpenWindow {
+        fn recovery(&self) -> crate::congestion::RecoveryAction {
+            crate::congestion::RecoveryAction {
+                cwnd: self.congestion_window(),
+                pacing_rate: self.pacing_rate,
+            }
+        }
+    }
+
+    /// Bytes a flow may have in flight: the peer's whole advertised
+    /// window, which the flow helpers never scale.
+    const FLOW_WINDOW: usize = u16::MAX as usize;
+
+    fn bulk_payload() -> Vec<u8> {
+        (0..FLOW_WINDOW - 1000)
+            .map(|byte| (byte % 251) as u8)
+            .collect()
+    }
+
+    /// The peer acknowledges every byte of `flow` that `frames` carry.
+    fn acknowledge_flow(stack: &mut Stack<OpenWindow>, flow: u16, frames: &[FlowFrame], now: u64) {
+        let acknowledged = frames
+            .iter()
+            .filter(|frame| frame.flow == flow)
+            .map(|frame| frame.sequence.wrapping_add(frame.payload.len() as u32))
+            .max_by_key(|end| end.wrapping_sub(FLOW_LOCAL_NEXT))
+            .expect("the flow sent nothing to acknowledge");
+        flow_receive(
+            stack,
+            flow,
+            TcpFlags::ACK,
+            FLOW_PEER_SEQUENCE + 1,
+            acknowledged,
+            now,
+        );
+    }
+
+    #[test]
+    fn a_wide_open_unpaced_sender_fills_the_queue_in_one_drive() {
+        let mut stack = flow_stack_with(OpenWindow { pacing_rate: None }, true);
+        let socket = establish_flows(&mut stack, 1, false)[0];
+        let payload = bulk_payload();
+        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+
+        stack.drive_tcp(at(2)).expect("one drive");
+        let frames = drain_flow_frames(&mut stack);
+
+        assert_eq!(
+            frames.len(),
+            MAX_OUTBOUND_FRAMES,
+            "one drive hands the device a whole queue of segments"
+        );
+        let mut next = FLOW_LOCAL_NEXT;
+        let mut sent = Vec::new();
+        for frame in &frames {
+            assert_eq!(frame.sequence, next, "segments go out in sequence order");
+            next = next.wrapping_add(frame.payload.len() as u32);
+            sent.extend_from_slice(&frame.payload);
+        }
+        assert_eq!(sent, payload[..sent.len()]);
+    }
+
+    #[test]
+    fn a_paced_sender_emits_its_burst_allowance_and_holds_the_rate() {
+        // 5 MB/s: a millisecond is 5,000 bytes, over two segments, so
+        // the allowance is the millisecond and a segment is 292 us of
+        // it.
+        let rate = crate::PacingRate::from_bytes_per_second(5_000_000);
+        let mut stack = flow_stack_with(
+            OpenWindow {
+                pacing_rate: Some(rate),
+            },
+            true,
+        );
+        let socket = establish_flows(&mut stack, 1, false)[0];
+        let payload = bulk_payload();
+        assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+
+        let start = 2;
+        stack.drive_tcp(at(start)).expect("first drive");
+        let burst = drain_flow_frames(&mut stack);
+        let segment = burst[0].payload.len();
+        let segment_nanos = (segment as u64 * 1_000_000_000).div_ceil(rate.bytes_per_second());
+        assert!(burst.len() >= 2, "a burst is never under two segments");
+        assert_eq!(
+            burst.len() as u64,
+            1_000_000_u64.div_ceil(segment_nanos),
+            "the burst is a millisecond of line time, rounded up to a segment"
+        );
+
+        // Before the burst's line time is paid back nothing more goes.
+        stack.drive_tcp(at(start + 100_000)).expect("second drive");
+        assert!(drain_flow_frames(&mut stack).is_empty());
+
+        // Over 20 ms, polled every 10 us with the peer acknowledging
+        // promptly, the stream goes out at the pacing rate to within
+        // one burst.
+        let mut frames = burst;
+        for step in 0..2_000u64 {
+            let now = start + step * 10_000;
+            // The application always has more to send.
+            let _ = stack.tcp_send(socket, &payload);
+            stack.drive_tcp(at(now)).expect("drive");
+            let more = drain_flow_frames(&mut stack);
+            if !more.is_empty() {
+                frames.extend(more);
+                acknowledge_flow(&mut stack, 0, &frames, now);
+            }
+        }
+        let sent: usize = frames.iter().map(|frame| frame.payload.len()).sum();
+        let expected = (rate.bytes_per_second() * 20_000_000 / 1_000_000_000) as usize;
+        let burst_bytes = 5_000 + segment;
+        assert!(
+            sent.abs_diff(expected) <= burst_bytes,
+            "{sent} bytes in 20 ms against {expected} at the rate"
+        );
+    }
+
+    #[test]
+    fn senders_sharing_a_queue_too_small_for_both_bursts_both_progress() {
+        let mut stack = flow_stack_with(OpenWindow { pacing_rate: None }, true);
+        let sockets = establish_flows(&mut stack, 2, false);
+        let payload = bulk_payload();
+        for socket in &sockets {
+            assert_eq!(stack.tcp_send(*socket, &payload), Ok(payload.len()));
+        }
+
+        let mut served = [0usize; 2];
+        for drive in 0..4u64 {
+            // Both senders always have more to send.
+            for socket in &sockets {
+                let _ = stack.tcp_send(*socket, &payload);
+            }
+            stack.drive_tcp(at(2 + drive)).expect("drive");
             let frames = drain_flow_frames(&mut stack);
             assert_eq!(
                 frames.len(),
                 MAX_OUTBOUND_FRAMES,
-                "drive {drive} fills the queue"
+                "each sender alone could fill the queue"
             );
-            late_frames.extend(frames.into_iter().filter(|frame| frame.flow == late));
+            for frame in &frames {
+                served[usize::from(frame.flow)] += 1;
+            }
+            // The peer acknowledges at once, so a socket's window is
+            // never what ends its turn.
+            for flow in 0..2 {
+                if frames.iter().any(|frame| frame.flow == flow) {
+                    acknowledge_flow(&mut stack, flow, &frames, 2 + drive);
+                }
+            }
+            if drive == 1 {
+                assert!(
+                    served.iter().all(|frames| *frames != 0),
+                    "both senders were served within two drives: {served:?}"
+                );
+            }
         }
-        // Two drives are one lap of the active set: the second starts at
-        // the turn the first cut short.
-        assert_eq!(late_frames.len(), 1);
-        assert_eq!(late_frames[0].payload, payload);
-        assert_eq!(late_frames[0].sequence, FLOW_LOCAL_NEXT);
+        assert!(served.iter().all(|frames| *frames >= MAX_OUTBOUND_FRAMES));
+    }
+
+    #[test]
+    fn a_queue_filled_mid_burst_leaves_the_rest_owed_and_unsent() {
+        let mut stack = flow_stack_with(OpenWindow { pacing_rate: None }, true);
+        let sockets = establish_flows(&mut stack, 2, false);
+        let data: Vec<Vec<u8>> = (0..2u8)
+            .map(|flow| bulk_payload().into_iter().map(|byte| byte ^ flow).collect())
+            .collect();
+        for (socket, data) in sockets.iter().zip(&data) {
+            assert_eq!(stack.tcp_send(*socket, data), Ok(data.len()));
+        }
+
+        // The first flow's burst fills the queue with data still owed,
+        // and the second flow's turn finds it full.
+        stack.drive_tcp(at(2)).expect("a full queue ends the turns");
+        let mut frames = drain_flow_frames(&mut stack);
+        assert_eq!(frames.len(), MAX_OUTBOUND_FRAMES);
+        assert!(frames.iter().all(|frame| frame.flow == 0));
+        let in_flight: usize = frames.iter().map(|frame| frame.payload.len()).sum();
+        assert_eq!(
+            stack
+                .tcp_socket(sockets[0])
+                .expect("socket")
+                .bytes_in_flight() as usize,
+            in_flight,
+            "exactly what was queued is in flight"
+        );
+        assert_eq!(
+            stack
+                .tcp_socket(sockets[1])
+                .expect("socket")
+                .bytes_in_flight(),
+            0,
+            "the refused turn sent nothing"
+        );
+
+        // The pump drains, the peer acknowledges, and the stream goes on.
+        // Within the retransmission timeout, so any repeated sequence
+        // would be a segment marked sent twice.
+        let mut now = 3;
+        let mut delivered: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+        let mut next = [FLOW_LOCAL_NEXT; 2];
+        for round in 0..16 {
+            for flow in 0..2u16 {
+                if frames.iter().any(|frame| frame.flow == flow) {
+                    acknowledge_flow(&mut stack, flow, &frames, now);
+                }
+            }
+            for frame in frames.drain(..) {
+                let flow = usize::from(frame.flow);
+                assert_eq!(frame.sequence, next[flow], "round {round}: {frame:?}");
+                next[flow] = next[flow].wrapping_add(frame.payload.len() as u32);
+                delivered[flow].extend_from_slice(&frame.payload);
+            }
+            now += 1;
+            stack.drive_tcp(at(now)).expect("drive");
+            frames = drain_flow_frames(&mut stack);
+            if frames.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(delivered[0], data[0]);
+        assert_eq!(delivered[1], data[1]);
+    }
+
+    #[test]
+    fn a_turn_resends_every_loss_the_window_allows_before_new_data() {
+        const MSS: usize = crate::ETHERNET_FRAME_BYTES
+            - EthernetFrame::HEADER_LEN
+            - Ipv4Packet::MIN_HEADER_LEN
+            - TcpPacket::MIN_HEADER_LEN;
+        for slots in [1, MAX_OUTBOUND_FRAMES] {
+            let mut stack = Stack::new_with_congestion(
+                StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES, TEST_SECRET),
+                NewReno::new(MSS as u32),
+            );
+            stack
+                .add_ipv4_address(Ipv4Cidr::new(FLOW_LOCAL, 24))
+                .unwrap();
+            stack.learn_neighbor(flow_peer_neighbor());
+            let socket = establish_flows(&mut stack, 1, false)[0];
+            let payload = vec![0x5a; 4 * MSS];
+            assert_eq!(stack.tcp_send(socket, &payload), Ok(payload.len()));
+            let original = settle(&mut stack, 2);
+            assert_eq!(original.len(), 4);
+
+            // Drop all four. The timeout's loss window admits one resend.
+            let expired = 2 + 2 * crate::tcp::TCP_INITIAL_RTO_NANOS;
+            stack.drive_tcp(at(expired)).unwrap();
+            let first = drain_flow_frames(&mut stack);
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].sequence, original[0].sequence);
+            flow_receive(
+                &mut stack,
+                0,
+                TcpFlags::ACK,
+                FLOW_PEER_SEQUENCE + 1,
+                original[1].sequence,
+                expired + 1,
+            );
+            // Slow start has room for two lost segments. New data waits
+            // behind the losses, even if the outbound queue fills midway.
+            assert_eq!(stack.tcp_send(socket, b"new data"), Ok(8));
+            for _ in slots..MAX_OUTBOUND_FRAMES {
+                stack
+                    .queue_arp_reply(FLOW_LOCAL, FLOW_PEER, PEER_MAC)
+                    .unwrap();
+            }
+            stack.drive_tcp(at(expired + 1)).unwrap();
+            let mut repaired = drain_flow_frames(&mut stack);
+            assert_eq!(repaired.len(), slots.min(2));
+            if slots == 1 {
+                stack.drive_tcp(at(expired + 1)).unwrap();
+                repaired.extend(drain_flow_frames(&mut stack));
+            }
+            assert_eq!(repaired.len(), 2);
+            for (actual, expected) in repaired.iter().zip(&original[1..3]) {
+                assert_eq!(actual.sequence, expected.sequence);
+                assert_eq!(actual.payload, expected.payload);
+            }
+            flow_receive(
+                &mut stack,
+                0,
+                TcpFlags::ACK,
+                FLOW_PEER_SEQUENCE + 1,
+                original[3].sequence,
+                expired + 2,
+            );
+            stack.drive_tcp(at(expired + 2)).unwrap();
+            let last = drain_flow_frames(&mut stack);
+            assert_eq!(last.len(), 2, "the last loss and new data share a turn");
+            assert_eq!(last[0].sequence, original[3].sequence);
+            assert_eq!(last[0].payload, original[3].payload);
+            assert_eq!(last[1].sequence, FLOW_LOCAL_NEXT + payload.len() as u32);
+            assert_eq!(last[1].payload, b"new data");
+        }
     }
 
     #[test]

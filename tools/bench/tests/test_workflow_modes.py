@@ -62,12 +62,12 @@ CANDIDATE_SHA = "0123456789abcdef0123456789abcdef01234567"
         ("workflow_dispatch", "false", "", "profile-use", "", "false", "false", "false", "false", "false"),
         # The TCP probe pairs for diagnosis and reads the fetched profile.
         ("workflow_dispatch", "true", "baseline", "profile-use", "", "true", "true", "true", "false", "true"),
-        # A labelled pull request is paired against the commit it is
-        # merged against and collects a profile for each column (#384);
-        # an unlabelled one runs nothing.
-        ("pull_request", "", "", "", "true", "", "true", "false", "true", "true"),
+        # Pull requests run tooling only, regardless of their labels.
+        ("pull_request", "", "", "", "true", "", "true", "false", "false", "false"),
         ("pull_request", "", "", "", "false", "", "true", "false", "false", "false"),
         ("push", "", "", "", "", "", "false", "false", "false", "false"),
+        ("schedule", "true", "", "", "", "", "true", "false", "false", "false"),
+        ("schedule", "false", "", "", "", "", "false", "false", "false", "false"),
     ],
 )
 def test_workflow_mode(
@@ -106,9 +106,8 @@ def test_workflow_mode(
     assert outputs["paired_acceptance"] == paired
     assert outputs["per_column_profiles"] == per_column
     assert outputs["baseline_profile"] == baseline_profile
-    # The ref the suite pairs against: the dispatch's, or the first
-    # parent of a labelled pull request's merge commit (#384, #773).
-    assert outputs["pairing_ref"] == (f"{CANDIDATE_SHA}^1" if pr_bench == "true" else baseline)
+    # Pairing uses the dispatch's explicit ref.
+    assert outputs["pairing_ref"] == baseline
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -229,7 +228,7 @@ def test_profile_columns_resolve_the_pairing_ref_to_its_commit(
         assert outputs["baseline_fork_root"] == ""
 
 
-def test_a_pull_request_pairs_against_the_commit_it_is_merged_against(jobs, history, tmp_path: Path):
+def test_dispatch_can_pair_a_merge_against_its_first_parent(jobs, history, tmp_path: Path):
     """#773: run 43091069072 timed a pull request's merge commit against
     the tip `dev` had when the pull request was opened, 21 merges behind
     the one it was built on. The baseline is the merge commit's first
@@ -252,13 +251,11 @@ def test_a_pull_request_pairs_against_the_commit_it_is_merged_against(jobs, hist
         check=True,
         env=os.environ
         | {
-            "EVENT_NAME": "pull_request",
-            "REQUESTED_ADVISORY": "",
-            "BASELINE_REF": "",
+            "EVENT_NAME": "workflow_dispatch",
+            "REQUESTED_ADVISORY": "true",
+            "BASELINE_REF": f"{merge}^1",
             "BASELINE_KERNEL_BUILD": "",
             "TCP_PROBE": "",
-            "PR_BENCH": "true",
-            "PR_MERGE_SHA": merge,
             "GITHUB_OUTPUT": str(mode_output),
         },
     )
@@ -527,7 +524,11 @@ def test_kernel_profile_collects_the_ref_it_is_asked_for():
     group = workflow["jobs"]["kernel-profile"]["concurrency"]["group"]
     assert "inputs.artifact" in group
     steps = workflow["jobs"]["kernel-profile"]["steps"]
-    checkout = next(step for step in steps if step.get("uses") == "actions/checkout@v4")
+    checkout = next(
+        step
+        for step in steps
+        if step.get("uses") == "actions/checkout@v4" and step["with"]["path"] == "helios"
+    )
     assert checkout["with"]["ref"] == "${{ inputs.ref || github.sha }}"
     upload = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
     assert "inputs.artifact" in upload["with"]["name"]
@@ -703,9 +704,9 @@ def test_every_vsock_boot_is_preceded_by_the_device_provisioning():
         (REPO_ROOT / ".github/actions/collect-kernel-profile/action.yml").read_text(),
         Loader=yaml.BaseLoader,
     )
-    boots = [step["run"] for step in collect["runs"]["steps"] if "workload-bench" in step.get("run", "")]
+    boots = [step["run"] for step in collect["runs"]["steps"] if "collect-profile" in step.get("run", "")]
     assert boots
-    assert all('--rpc-transport "${{ steps.lane.outputs.rpc-transport }}"' in run for run in boots)
+    assert all('--lane "${{ inputs.lane }}"' in run for run in boots)
 
 
 def test_the_baseline_builds_against_the_fork_its_commit_pins(jobs):
@@ -746,9 +747,15 @@ def test_the_baseline_builds_against_the_fork_its_commit_pins(jobs):
         by_uses["./helios/.github/actions/bench-host"]["with"]["checkout-path"] == "${{ env.CHECKOUT_PATH }}"
     )
     assert (
-        by_uses["./helios/.github/actions/collect-kernel-profile"]["with"]["checkout-path"]
+        by_uses["./profile-tooling/.github/actions/collect-kernel-profile"]["with"]["checkout-path"]
         == "${{ env.CHECKOUT_PATH }}"
     )
+    collect = by_uses["./profile-tooling/.github/actions/collect-kernel-profile"]["with"]
+    assert collect["tooling-path"] == "profile-tooling"
+    tooling = next(
+        step for step in job["steps"] if step.get("name") == "Check out the shared collection tools"
+    )
+    assert tooling["with"]["ref"] == "${{ github.sha }}"
 
 
 def evaluate(expression: str, event_name: str, action: str = "", labels=(), label: str = "") -> bool:
@@ -768,7 +775,7 @@ def evaluate(expression: str, event_name: str, action: str = "", labels=(), labe
     return eval(python, {"__builtins__": {}}, scope)  # noqa: S307 - the expression is the repository's own
 
 
-PULL_REQUEST_ACTIONS = ["opened", "synchronize", "reopened", "labeled", "ready_for_review"]
+PULL_REQUEST_ACTIONS = ["opened", "synchronize", "reopened", "ready_for_review"]
 
 
 @pytest.mark.parametrize(
@@ -800,32 +807,13 @@ def test_only_a_new_head_cancels_a_run(workflow, event_name, action, cancels):
         assert evaluate(ci_cancel, event_name, action) is cancels
 
 
-@pytest.mark.parametrize("action", PULL_REQUEST_ACTIONS)
-@pytest.mark.parametrize("carries_bench", [True, False])
-def test_a_labelled_pull_request_is_measured_by_its_label_event(jobs, action, carries_bench):
-    """`changes` is the root every other job needs, so its condition is
-    what starts a run. A pull request opened with `bench` gets `opened`
-    and `labeled` together; only `labeled` measures the head, and
-    `ready_for_review` on a labelled pull request starts nothing either.
-    A new head or a reopening of one that carries `bench` still runs."""
-    labels = ["bench"] if carries_bench else []
-    runs = evaluate(
-        jobs["changes"]["if"],
-        "pull_request",
-        action,
-        labels=labels,
-        label="bench" if action == "labeled" else "",
-    )
-    expected = not (carries_bench and action in {"opened", "ready_for_review"})
-    assert runs is expected
-
-
-def test_a_foreign_label_and_other_events_still_decide_as_before(jobs):
-    condition = jobs["changes"]["if"]
-    assert not evaluate(condition, "pull_request", "labeled", labels=["docs"], label="docs")
-    assert evaluate(condition, "pull_request", "opened", labels=["docs"])
-    assert evaluate(condition, "push")
-    assert evaluate(condition, "workflow_dispatch")
+def test_pull_requests_only_trigger_tooling(workflow, jobs):
+    assert workflow["on"]["pull_request"]["types"] == PULL_REQUEST_ACTIONS
+    assert "if" not in jobs["changes"]
+    assert "pull_request" not in jobs["suite"]["if"]
+    assert "pull_request" not in jobs["profile-generate"]["if"]
+    assert "schedule" in jobs["suite"]["if"]
+    assert "schedule" in jobs["profile-generate"]["if"]
 
 
 def test_release_signs_the_boot_payload_with_the_secret_key_and_removes_it_last():

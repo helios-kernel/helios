@@ -1170,9 +1170,12 @@ mod tests {
         ] {
             let fixture = CompileFixture::new();
             let (store, _drive) = fixture.open_store();
-            fixture
-                .registry
-                .request_kill(fixture.instance.id(), reason, 0);
+            fixture.registry.request_kill(
+                fixture.instance.id(),
+                reason,
+                0,
+                &crate::UserResidency::default(),
+            );
             let Err(error) = store.data().on_interrupt() else {
                 panic!("a condemned instance's guest traps at its next check");
             };
@@ -1224,9 +1227,12 @@ mod tests {
         assert!(!dropped.load(Ordering::SeqCst));
 
         assert_eq!(
-            fixture
-                .registry
-                .request_kill(fixture.instance.id(), crate::KillReason::Operator, 0),
+            fixture.registry.request_kill(
+                fixture.instance.id(),
+                crate::KillReason::Operator,
+                0,
+                &crate::UserResidency::default()
+            ),
             crate::KillOutcome::Requested
         );
         assert_eq!(wakes.count(), 1, "the condemnation wakes the parked turn");
@@ -1417,9 +1423,12 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         let mut call = pin!(drive.call(&mut worker, &wait, ()));
         assert!(call.as_mut().poll(&mut cx).is_pending());
-        fixture
-            .registry
-            .request_kill(fixture.instance.id(), crate::KillReason::Operator, 0);
+        fixture.registry.request_kill(
+            fixture.instance.id(),
+            crate::KillReason::Operator,
+            0,
+            &crate::UserResidency::default(),
+        );
         let Poll::Ready(Err(error)) = call.as_mut().poll(&mut cx) else {
             panic!("the kill ends the parked worker");
         };
