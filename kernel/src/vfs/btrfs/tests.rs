@@ -187,14 +187,10 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
     );
 }
 
-/// The guest smoke's sequence through a writable namespace mount and the
-/// WASI link path a preview1 program reaches.
+/// The guest smoke's sequence through a writable namespace mount, ending in
+/// the namespace link every guest ABI's link call reaches.
 #[test]
 fn a_writable_mount_links_a_file_created_through_the_namespace() {
-    use crate::wasmtime_adapter::wasi::{
-        FsDescriptor, FsNodeKind, bindings::filesystem::types as fs_types, link_at,
-    };
-
     let time = Timestamp::from_secs(1_700_000_000);
     let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
     let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
@@ -248,29 +244,10 @@ fn a_writable_mount_links_a_file_created_through_the_namespace() {
         .await
         .expect("write");
         fs.sync(resolved.path()).await.expect("fsync");
-        let root = FsDescriptor {
-            path: alloc::string::String::from("/"),
-            kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
-            identity: None,
-            mount: None,
-        };
-        let proof = root
-            .grant()
-            .unwrap()
-            .alias_into(root.grant().unwrap())
-            .unwrap();
-        link_at(
-            &namespace,
-            proof,
-            "mnt/written/original",
-            "mnt/written/hard",
-            1_000_000_003,
-        )
-        .await
-        .expect("link through the WASI path");
+        namespace
+            .link("/mnt/written/original", "/mnt/written/hard", 1_000_000_003)
+            .await
+            .expect("link through the namespace");
         assert_eq!(
             namespace
                 .resolve("/mnt/written/hard")
