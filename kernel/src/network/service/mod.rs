@@ -5133,6 +5133,7 @@ mod tests {
         let cpu = ManualClockCpu::new();
         let service = super::NetworkService::new(
             cpu.clone(),
+            crate::test_support::single_node_pool(1),
             crate::test_support::test_profile_sink(),
             crate::test_support::test_uptime_clock(),
             crate::test_support::test_timer(cpu.clone()),
