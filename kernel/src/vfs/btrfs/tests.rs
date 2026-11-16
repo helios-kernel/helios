@@ -313,6 +313,27 @@ fn writable_service_publishes_namespace_and_survives_remount() {
             let parent = fs.stat(path("dir")).await.unwrap();
             assert_eq!(parent.modified_nanos, 8_000_000_000);
             assert_eq!(parent.status_nanos, 8_000_000_000);
+            fs.open(
+                path("dir/fresh"),
+                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                9_000_000_000,
+            )
+            .await
+            .expect("create in a created directory");
+            write_with(
+                &fs,
+                path("dir/fresh"),
+                WritePosition::At(0),
+                4096,
+                9_000_000_001,
+                |_, bytes| bytes.fill(0x46),
+            )
+            .await
+            .expect("write the fresh file");
+            fs.sync(path("dir/fresh")).await.expect("fsync");
+            fs.link(path("dir/fresh"), path("dir/fresh-link"), 9_000_000_002)
+                .await
+                .expect("link a file created and synced in this mount");
             fs.sync(path("file")).await.expect("sync commit");
             assert_eq!(
                 fs.read_at(path("file"), 0, 99).await.unwrap(),

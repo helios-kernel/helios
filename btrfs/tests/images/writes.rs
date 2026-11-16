@@ -87,6 +87,88 @@ fn writer_commits_over_a_mkfs_image() {
         let mut output = [0; 11];
         snapshot.read(&written, 0, &mut output).await.unwrap();
         assert_eq!(&output, b"guest bytes");
+
+        // The guest smoke's sequence: a directory, a file in it, then a hard
+        // link to that file once both are committed.
+        let mut tx = writer.begin().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let directory = tx
+            .create_directory(
+                Name {
+                    parent: &root,
+                    bytes: "目录-ディレクトリ-디렉터리".as_bytes(),
+                },
+                Attributes {
+                    permissions: 0o755,
+                    uid: 0,
+                    gid: 0,
+                },
+                when,
+            )
+            .await
+            .unwrap();
+        let original = tx
+            .create_file(
+                Name {
+                    parent: &directory,
+                    bytes: b"original",
+                },
+                Attributes {
+                    permissions: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                when,
+            )
+            .await
+            .unwrap();
+        tx.write_file(
+            &original,
+            0,
+            &[0x47; 8192],
+            WriteOptions::plain(when, concurrency),
+        )
+        .await
+        .unwrap();
+        tx.commit(|| panic!("mkfs UUIDs are valid"), concurrency)
+            .await
+            .unwrap();
+        let mut tx = writer.begin().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let directory = tx
+            .lookup(&root, "目录-ディレクトリ-디렉터리".as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        let original = tx.lookup(&directory, b"original").await.unwrap().unwrap();
+        assert_eq!(
+            tx.metadata(&original).await.unwrap().kind,
+            helios_btrfs::FileKind::Regular
+        );
+        tx.hard_link(
+            Name {
+                parent: &directory,
+                bytes: b"hard",
+            },
+            &original,
+            when,
+        )
+        .await
+        .unwrap();
+        tx.commit(|| panic!("mkfs UUIDs are valid"), concurrency)
+            .await
+            .unwrap();
+        assert_eq!(
+            writer
+                .snapshot()
+                .unwrap()
+                .resolve("/目录-ディレクトリ-디렉터리/hard".as_bytes())
+                .await
+                .unwrap()
+                .metadata()
+                .nlink,
+            2
+        );
     });
 }
 
