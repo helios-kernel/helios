@@ -49,11 +49,10 @@ def write(root):
         stream.truncate(17)
         stream.flush()
         os.fsync(stream.fileno())
-    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    # No directory fsync: CPython runs through wasmtime's preview1 component
+    # adapter, whose fd_sync refuses a directory descriptor with EBADF before
+    # the call reaches the kernel. The Linux readback after shutdown checks
+    # that the namespace changes above are durable.
     verify(root)
     print("btrfs:guest-write-synced", flush=True)
 
