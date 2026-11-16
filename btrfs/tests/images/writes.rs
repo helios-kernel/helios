@@ -37,6 +37,59 @@ impl BlockSink for WritableImage {
 
 fn assert_send<T: Send>(_: &T) {}
 
+/// A writer over the image `mkfs.btrfs` produces for the guest smoke (128 MiB,
+/// default features) commits a created file and reads it back.
+#[test]
+#[ignore = "needs mkfs.btrfs from btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn writer_commits_over_a_mkfs_image() {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("hello.txt"), b"hello btrfs\n").unwrap();
+    let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &[]);
+    block_on(async {
+        let mut writer = Writer::mount(WritableImage(Mutex::new(image)))
+            .await
+            .unwrap();
+        let mut tx = writer.begin().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let when = Timestamp {
+            seconds: 1_700_000_100,
+            nanoseconds: 0,
+        };
+        let concurrency = std::thread::available_parallelism().unwrap();
+        let file = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: b"written",
+                },
+                Attributes {
+                    permissions: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                when,
+            )
+            .await
+            .unwrap();
+        tx.write_file(
+            &file,
+            0,
+            b"guest bytes",
+            WriteOptions::plain(when, concurrency),
+        )
+        .await
+        .unwrap();
+        tx.commit(|| panic!("mkfs UUIDs are valid"), concurrency)
+            .await
+            .unwrap();
+        let snapshot = writer.snapshot().unwrap();
+        let written = snapshot.resolve(b"/written").await.unwrap();
+        let mut output = [0; 11];
+        snapshot.read(&written, 0, &mut output).await.unwrap();
+        assert_eq!(&output, b"guest bytes");
+    });
+}
+
 #[test]
 fn public_writer_preserves_snapshots_and_committed_handles() {
     block_on(async {

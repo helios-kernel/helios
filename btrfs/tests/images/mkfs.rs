@@ -44,12 +44,14 @@ fn populate(root: &Path) {
 
 /// Runs `mkfs.btrfs` over `root` and loads the image it wrote.
 fn mkfs(root: &Path, args: &[&str]) -> SparseImage {
+    mkfs_sized(root, IMAGE_BYTES, args)
+}
+
+/// `mkfs` over an image of `bytes`; the guest smoke formats 128 MiB.
+pub(crate) fn mkfs_sized(root: &Path, bytes: u64, args: &[&str]) -> SparseImage {
     let scratch = tempfile::tempdir().unwrap();
     let path = scratch.path().join("image");
-    fs::File::create(&path)
-        .unwrap()
-        .set_len(IMAGE_BYTES)
-        .unwrap();
+    fs::File::create(&path).unwrap().set_len(bytes).unwrap();
     let output = Command::new("mkfs.btrfs")
         .args(["-q", "-f", "--rootdir"])
         .arg(root)
@@ -63,7 +65,7 @@ fn mkfs(root: &Path, args: &[&str]) -> SparseImage {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let mut image = SparseImage::new(IMAGE_BYTES);
+    let mut image = SparseImage::new(bytes);
     let mut file = fs::File::open(&path).unwrap();
     let mut block = vec![0; 1 << 16];
     let mut offset = 0;
