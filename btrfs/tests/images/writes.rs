@@ -309,9 +309,10 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
     });
 }
 
-/// `mkfs.btrfs -O quota` (and `-O squota`) create the quota tree. A writable
-/// mount refuses it, since the writer keeps no qgroup counts, and a read-only
-/// mount still opens the image.
+/// `mkfs.btrfs -O quota` creates the quota tree. A writable mount refuses it,
+/// since the writer keeps no qgroup counts, and a read-only mount still opens
+/// the image. `-O squota` sets the simple-quota incompat bit, which neither
+/// mount supports.
 #[test]
 #[ignore = "needs mkfs.btrfs from btrfs-progs; the Linux CI lane runs it with --run-ignored"]
 fn writer_refuses_mkfs_images_with_quotas_and_the_reader_mounts_them() {
@@ -319,14 +320,31 @@ fn writer_refuses_mkfs_images_with_quotas_and_the_reader_mounts_them() {
 
     let tree = tempfile::tempdir().unwrap();
     std::fs::write(tree.path().join("hello.txt"), b"hello btrfs\n").unwrap();
-    for feature in ["quota", "squota"] {
-        let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &["-O", feature]);
-        super::fixture::mount(image.clone()).expect("a read-only mount ignores quotas");
-        let refused = block_on(Writer::mount(WritableImage(Mutex::new(image))));
-        assert!(
-            matches!(refused, Err(WriteError::QuotaTreePresent)),
-            "-O {feature}: refused with {:?}",
-            refused.err()
-        );
-    }
+
+    let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &["-O", "quota"]);
+    super::fixture::mount(image.clone()).expect("a read-only mount ignores quotas");
+    let refused = block_on(Writer::mount(WritableImage(Mutex::new(image))));
+    assert!(
+        matches!(refused, Err(WriteError::QuotaTreePresent)),
+        "-O quota: refused with {:?}",
+        refused.err()
+    );
+
+    let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &["-O", "squota"]);
+    let squota = |error: &helios_btrfs::Error| {
+        matches!(
+            error,
+            helios_btrfs::Error::UnsupportedIncompat { name: "squota", .. }
+        )
+    };
+    let read = super::fixture::mount(image.clone()).err();
+    assert!(
+        read.as_ref().is_some_and(squota),
+        "-O squota read-only: {read:?}"
+    );
+    let write = block_on(Writer::mount(WritableImage(Mutex::new(image)))).err();
+    assert!(
+        matches!(&write, Some(WriteError::Read(error)) if squota(error)),
+        "-O squota writable: {write:?}"
+    );
 }

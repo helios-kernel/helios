@@ -3,7 +3,7 @@
 
 use crate::compress::decompress;
 use crate::items::{ExtentData, FileExtent, INODE_NODATASUM, Metadata};
-use crate::ondisk::{MAX_COMPRESSED_EXTENT, RawFileExtentHead, item_type, objectid, view};
+use crate::ondisk::{MAX_COMPRESSED_EXTENT, item_type, objectid};
 use crate::source::BlockSource;
 use crate::tree::{Cursor, NodeSource, TreeRoot};
 use crate::volume::Volume;
@@ -47,6 +47,7 @@ impl<'a, S: BlockSource, N: NodeSource> Reader<'a, S, N> {
         file: File<'_>,
     ) -> Result<Vec<crate::fs::ExtentInfo>, Error> {
         use crate::fs::{ExtentInfo, ExtentKind};
+        use crate::ondisk::{RawFileExtentHead, view};
         let mut cursor = Cursor::floor(
             self.nodes,
             file.root,
