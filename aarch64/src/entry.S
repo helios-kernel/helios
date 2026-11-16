@@ -37,10 +37,19 @@ __helios_aarch64_exception_vectors:
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
+    // Lower EL, AArch64: a native user slice (`native.S`), whose SP_EL1
+    // is the slice's register record.
+.if {native_users}
+    b helios_aarch64_native_lower_sync
+    .balign 128
+    b helios_aarch64_native_lower_irq
+    .balign 128
+.else
     b __helios_aarch64_sync_exception
     .balign 128
     b __helios_aarch64_irq
     .balign 128
+.endif
     b __helios_aarch64_sync_exception
     .balign 128
     b __helios_aarch64_sync_exception

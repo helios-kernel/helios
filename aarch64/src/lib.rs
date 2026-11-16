@@ -102,6 +102,7 @@ global_asm!(
     exception_stack_bytes = const EXCEPTION_STACK_BYTES,
     irq_frame_bytes = const IRQ_FRAME_BYTES,
     sync_frame_bytes = const SYNC_FRAME_BYTES,
+    native_users = const cfg!(feature = "native-users") as u8,
 );
 
 unsafe extern "C" {
@@ -190,6 +191,8 @@ mod host_fs;
 pub mod hv;
 mod input;
 mod lifecycle;
+#[cfg(feature = "native-users")]
+mod native;
 mod net;
 mod platform;
 mod rtc;
@@ -1131,6 +1134,14 @@ impl Cpu for Aarch64Cpu {
     type Hypervisor = hv::Hypervisor;
     #[cfg(not(feature = "hv"))]
     type Hypervisor = core::convert::Infallible;
+    #[cfg(feature = "native-users")]
+    type Native = native::Aarch64Native;
+    #[cfg(not(feature = "native-users"))]
+    type Native = core::convert::Infallible;
+    #[cfg(feature = "native-users")]
+    fn native(&self) -> Option<&Self::Native> {
+        Some(&native::Aarch64Native)
+    }
     #[cfg(feature = "hv")]
     fn hv(&self) -> Option<&Self::Hypervisor> {
         self.state.hypervisor.get()
@@ -1751,11 +1762,20 @@ extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address:
 extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
     let runtime = current_processor_runtime();
     runtime.hand_over_probe.record_interrupt(frame as usize);
+    handle_pending_interrupts();
+}
+
+/// Handles every interrupt pending at this processor's CPU interface, with
+/// IRQs masked, and reports whether its timer interrupt was among them.
+fn handle_pending_interrupts() -> bool {
+    let runtime = current_processor_runtime();
+    let mut timer = false;
     while let Some(intid) = gic::acknowledge_interrupt() {
         if intid == gic::WAKE_SGI {
             // The wake carries no payload: returning from `wfi` is the
             // whole message, and `park_current` owns the flag.
         } else if intid == runtime.timer_interrupt {
+            timer = true;
             // Every processor's timer interrupt ends the slice of every
             // guest on the machine that has run one.
             if let Some(program_service) = runtime.program_service.get() {
@@ -1779,6 +1799,7 @@ extern "C" fn aarch64_handle_irq(frame: *const IrqTrapFrame) {
         }
         gic::end_interrupt(intid);
     }
+    timer
 }
 
 /// Masks IRQ delivery on the calling processor. Debug, SError and FIQ
