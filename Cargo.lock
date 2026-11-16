@@ -7410,8 +7410,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wit-bindgen"
 version = "0.61.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e473fd0095479f9689ac7d2a52c427cc96bb2b973ace50238dfcc1ab1cd52d93"
+source = "git+https://github.com/lexoliu/wit-bindgen?branch=helios%2Fatomics-type-guard#2d5259ff1851bdf604bab16be759175dcaf3bc92"
 dependencies = [
  "futures",
  "wit-bindgen-rust-macro",
@@ -7420,8 +7419,7 @@ dependencies = [
 [[package]]
 name = "wit-bindgen-core"
 version = "0.61.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87445680dfe6d6b5369e884bd63c03a3335268e855365b2fc3f7bcdce96a630e"
+source = "git+https://github.com/lexoliu/wit-bindgen?branch=helios%2Fatomics-type-guard#2d5259ff1851bdf604bab16be759175dcaf3bc92"
 dependencies = [
  "anyhow",
  "heck",
@@ -7431,8 +7429,7 @@ dependencies = [
 [[package]]
 name = "wit-bindgen-rust"
 version = "0.61.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f2fe494de0d898216caf0fd0ae76af75753fcb3ff4f465b46131537cf24cf8"
+source = "git+https://github.com/lexoliu/wit-bindgen?branch=helios%2Fatomics-type-guard#2d5259ff1851bdf604bab16be759175dcaf3bc92"
 dependencies = [
  "anyhow",
  "heck",
@@ -7447,8 +7444,7 @@ dependencies = [
 [[package]]
 name = "wit-bindgen-rust-macro"
 version = "0.61.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59283a01aec94f60f92ada22ffe182a5cea8acfce43be3be688de8d52df55312"
+source = "git+https://github.com/lexoliu/wit-bindgen?branch=helios%2Fatomics-type-guard#2d5259ff1851bdf604bab16be759175dcaf3bc92"
 dependencies = [
  "anyhow",
  "prettyplease 0.2.37",
