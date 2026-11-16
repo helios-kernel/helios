@@ -37,8 +37,8 @@ use crate::wasmtime_adapter::store::{
     ChannelInputStream, ChannelOutputStream, SerialOutputStream, StdioOutputStream,
 };
 use crate::{
-    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, HeldPath, Namespace,
-    NetworkHandle, ProfileScope,
+    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, FsDescriptorFlags,
+    HeldPath, Namespace, NetworkHandle, ProfileScope,
 };
 
 #[cfg(test)]
@@ -1466,7 +1466,7 @@ where
             path_flags_to_p3(path_flags),
             path,
             open_flags_to_p3(open_flags),
-            descriptor_flags_to_p3(flags),
+            descriptor_flags_from_p2(flags),
         ))
     }
 
@@ -1594,7 +1594,7 @@ where
     ) -> Result<core::result::Result<p2fs::DescriptorFlags, p2fs::ErrorCode>> {
         Ok(self
             .p2_descriptor(&descriptor)
-            .map(|(descriptor, _)| descriptor_flags_from_p3(descriptor.flags)))
+            .map(|(descriptor, _)| descriptor_flags_to_p2(descriptor.flags)))
     }
 
     fn get_type(
@@ -3293,50 +3293,45 @@ fn descriptor_type_from_p3(kind: p3fs::DescriptorType) -> p2fs::DescriptorType {
     }
 }
 
-fn descriptor_flags_from_p3(flags: p3fs::DescriptorFlags) -> p2fs::DescriptorFlags {
-    let mut result = p2fs::DescriptorFlags::empty();
-    if flags.contains(p3fs::DescriptorFlags::READ) {
-        result |= p2fs::DescriptorFlags::READ;
-    }
-    if flags.contains(p3fs::DescriptorFlags::WRITE) {
-        result |= p2fs::DescriptorFlags::WRITE;
-    }
-    if flags.contains(p3fs::DescriptorFlags::FILE_INTEGRITY_SYNC) {
-        result |= p2fs::DescriptorFlags::FILE_INTEGRITY_SYNC;
-    }
-    if flags.contains(p3fs::DescriptorFlags::DATA_INTEGRITY_SYNC) {
-        result |= p2fs::DescriptorFlags::DATA_INTEGRITY_SYNC;
-    }
-    if flags.contains(p3fs::DescriptorFlags::REQUESTED_WRITE_SYNC) {
-        result |= p2fs::DescriptorFlags::REQUESTED_WRITE_SYNC;
-    }
-    if flags.contains(p3fs::DescriptorFlags::MUTATE_DIRECTORY) {
-        result |= p2fs::DescriptorFlags::MUTATE_DIRECTORY;
-    }
-    result
+/// The `wasi:filesystem@0.2` `descriptor-flags` bit that names each
+/// node-handle flag.
+const P2_DESCRIPTOR_FLAGS: [(p2fs::DescriptorFlags, FsDescriptorFlags); 6] = [
+    (p2fs::DescriptorFlags::READ, FsDescriptorFlags::READ),
+    (p2fs::DescriptorFlags::WRITE, FsDescriptorFlags::WRITE),
+    (
+        p2fs::DescriptorFlags::FILE_INTEGRITY_SYNC,
+        FsDescriptorFlags::FILE_INTEGRITY_SYNC,
+    ),
+    (
+        p2fs::DescriptorFlags::DATA_INTEGRITY_SYNC,
+        FsDescriptorFlags::DATA_INTEGRITY_SYNC,
+    ),
+    (
+        p2fs::DescriptorFlags::REQUESTED_WRITE_SYNC,
+        FsDescriptorFlags::REQUESTED_WRITE_SYNC,
+    ),
+    (
+        p2fs::DescriptorFlags::MUTATE_DIRECTORY,
+        FsDescriptorFlags::MUTATE_DIRECTORY,
+    ),
+];
+
+fn descriptor_flags_to_p2(flags: FsDescriptorFlags) -> p2fs::DescriptorFlags {
+    P2_DESCRIPTOR_FLAGS
+        .iter()
+        .filter(|(_, node)| flags.contains(*node))
+        .fold(p2fs::DescriptorFlags::empty(), |result, (p2, _)| {
+            result | *p2
+        })
 }
 
-fn descriptor_flags_to_p3(flags: p2fs::DescriptorFlags) -> p3fs::DescriptorFlags {
-    let mut result = p3fs::DescriptorFlags::empty();
-    if flags.contains(p2fs::DescriptorFlags::READ) {
-        result |= p3fs::DescriptorFlags::READ;
-    }
-    if flags.contains(p2fs::DescriptorFlags::WRITE) {
-        result |= p3fs::DescriptorFlags::WRITE;
-    }
-    if flags.contains(p2fs::DescriptorFlags::FILE_INTEGRITY_SYNC) {
-        result |= p3fs::DescriptorFlags::FILE_INTEGRITY_SYNC;
-    }
-    if flags.contains(p2fs::DescriptorFlags::DATA_INTEGRITY_SYNC) {
-        result |= p3fs::DescriptorFlags::DATA_INTEGRITY_SYNC;
-    }
-    if flags.contains(p2fs::DescriptorFlags::REQUESTED_WRITE_SYNC) {
-        result |= p3fs::DescriptorFlags::REQUESTED_WRITE_SYNC;
-    }
-    if flags.contains(p2fs::DescriptorFlags::MUTATE_DIRECTORY) {
-        result |= p3fs::DescriptorFlags::MUTATE_DIRECTORY;
-    }
-    result
+fn descriptor_flags_from_p2(flags: p2fs::DescriptorFlags) -> FsDescriptorFlags {
+    P2_DESCRIPTOR_FLAGS
+        .iter()
+        .filter(|(p2, _)| flags.contains(*p2))
+        .fold(FsDescriptorFlags::empty(), |result, (_, node)| {
+            result | *node
+        })
 }
 
 fn open_flags_to_p3(flags: p2fs::OpenFlags) -> p3fs::OpenFlags {
@@ -3487,7 +3482,7 @@ mod tests {
         map_p2_tcp_socket_error, p2fs, p2net, p2tcp, p2tcp_create, p2udp,
         parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
     };
-    use super::{FsDescriptor, FsNodeKind, p3fs};
+    use super::{FsDescriptor, FsDescriptorFlags, FsNodeKind, p3fs};
 
     #[test]
     fn p2_empty_stdin_signals_eof_instead_of_starving_blocking_read() {
@@ -3517,9 +3512,9 @@ mod tests {
         let root = FsDescriptor {
             path: String::from("/"),
             kind: FsNodeKind::Directory,
-            flags: p3fs::DescriptorFlags::READ
-                | p3fs::DescriptorFlags::WRITE
-                | p3fs::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -3529,7 +3524,7 @@ mod tests {
             p3fs::PathFlags::empty(),
             "copy",
             p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
-            p3fs::DescriptorFlags::READ | p3fs::DescriptorFlags::WRITE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
         ))
         .expect("creating a file at the root must succeed");
@@ -3594,9 +3589,9 @@ mod tests {
         let root = FsDescriptor {
             path: String::from("/"),
             kind: FsNodeKind::Directory,
-            flags: p3fs::DescriptorFlags::READ
-                | p3fs::DescriptorFlags::WRITE
-                | p3fs::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -3606,7 +3601,7 @@ mod tests {
             p3fs::PathFlags::empty(),
             "doomed",
             p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
-            p3fs::DescriptorFlags::READ | p3fs::DescriptorFlags::WRITE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
         ))
         .expect("creating a file at the root must succeed");

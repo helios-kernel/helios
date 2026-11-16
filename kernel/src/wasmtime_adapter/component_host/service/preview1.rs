@@ -640,7 +640,7 @@ where
             crate::resolve_child_path(&base.path, &suffix).map_err(p1_errno_from_component_path)?;
         let flags = base.flags;
 
-        if !flags.contains(fs_types::DescriptorFlags::READ) {
+        if !flags.contains(FsDescriptorFlags::READ) {
             return Err(p1::errno::NOTCAPABLE);
         }
         // chdir follows a symbolic link to the directory it names, inside
@@ -670,7 +670,7 @@ where
     pub(super) fn resolve_absolute_guest_path(
         &self,
         guest_name: &str,
-    ) -> Result<(String, fs_types::DescriptorFlags), i32> {
+    ) -> Result<(String, FsDescriptorFlags), i32> {
         let (descriptor, suffix) = self.resolve_absolute_guest_base(guest_name)?;
         let source_path = if suffix.is_empty() {
             descriptor.path.clone()
@@ -735,14 +735,10 @@ where
             return Ok((cwd.descriptor.clone(), path.to_owned()));
         }
         let base = match self.descriptors.get(fd) {
-            Some(Preview1Descriptor::Preopen { descriptor, .. })
-            | Some(Preview1Descriptor::File { descriptor, .. })
-                if descriptor.kind == FsNodeKind::Directory =>
-            {
-                descriptor.clone()
-            }
-            Some(_) => return Err(p1::errno::NOTDIR),
             None => return Err(p1::errno::BADF),
+            descriptor => p1_directory_descriptor(descriptor)
+                .ok_or(p1::errno::NOTDIR)?
+                .clone(),
         };
         Ok((base, path.to_owned()))
     }
@@ -2131,18 +2127,16 @@ where
         Some(Preview1Descriptor::PipeRead { .. }) => {
             caller.data_mut().read_pipe(fd, capacity as usize).await?
         }
-        Some(Preview1Descriptor::File {
-            descriptor, offset, ..
-        }) => {
-            let descriptor = descriptor.clone();
-            let offset = *offset;
+        Some(Preview1Descriptor::File(file)) => {
+            let file = file.clone();
+            let offset = file.offset();
             let namespace = p1_namespace(caller);
-            let file = p1_grant(&descriptor)?;
-            let bytes = match wasi_fs::read(&namespace, file, offset, capacity as usize).await {
+            let grant = p1_grant(file.node())?;
+            let bytes = match wasi_fs::read(&namespace, grant, offset, capacity as usize).await {
                 Ok(bytes) => bytes,
                 Err(error) => return Ok(p1_errno_from_fs(error)),
             };
-            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
+            file.set_offset(offset.saturating_add(bytes.len() as u64));
             bytes
         }
         _ => p1_read_descriptor(caller, fd, capacity).await?,
@@ -2233,7 +2227,7 @@ where
         Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => 2,
         Preview1Descriptor::Event(_) | Preview1Descriptor::Epoll(_) => 2,
         Preview1Descriptor::Preopen { .. } => 3,
-        Preview1Descriptor::File { descriptor, .. } => p1_filetype(descriptor.kind),
+        Preview1Descriptor::File(file) => p1_filetype(file.node().kind),
         Preview1Descriptor::NullDevice => 2,
         Preview1Descriptor::Socket(_) => 6,
     };
@@ -2260,7 +2254,7 @@ where
     StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File { .. } | Preview1Descriptor::NullDevice)
+        Some(Preview1Descriptor::File(_) | Preview1Descriptor::NullDevice)
             if p1_file_fdflags_supported(fdflags) =>
         {
             caller.data_mut().descriptors.set_fdflags(fd, fdflags)
@@ -2294,15 +2288,33 @@ where
         return p1::errno::NOTCAPABLE;
     }
     let lowered_flags = p1_descriptor_flags(requested, 0);
-    match caller.data_mut().descriptors.get_mut(fd) {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. }) => {
+    let Some(entry) = caller.data_mut().descriptors.get_entry_mut(fd) else {
+        return p1::errno::BADF;
+    };
+    match &mut entry.descriptor {
+        Preview1Descriptor::Preopen { descriptor, .. } => {
             descriptor.flags &= lowered_flags;
-            p1::errno::SUCCESS
         }
-        Some(_) => p1::errno::SUCCESS,
-        None => p1::errno::BADF,
+        // Rights belong to the descriptor in preview1, and a node handle
+        // carries the rights it was opened with, so a file descriptor whose
+        // rights narrow becomes its own open of the same node, at the offset
+        // and with the status flags it had; its duplicates keep the rights
+        // and the description they shared.
+        Preview1Descriptor::File(file) => {
+            let mut node = file.node().clone();
+            node.flags &= lowered_flags;
+            let narrowed = OpenFile::new(node);
+            narrowed.set_offset(file.offset());
+            let own = Preview1DescriptorEntry::new(
+                Preview1Descriptor::File(narrowed),
+                entry.close_on_exec,
+            );
+            own.set_fdflags(entry.fdflags());
+            *entry = own;
+        }
+        _ => {}
     }
+    p1::errno::SUCCESS
 }
 
 pub(super) async fn p1_fd_filestat_get<CpuImpl, Net, StorageImpl>(
@@ -2403,28 +2415,10 @@ pub(super) fn p1_fs_descriptor<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&FsDescriptor> {
     match descriptor {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. }) => Some(descriptor),
+        Some(Preview1Descriptor::Preopen { descriptor, .. }) => Some(descriptor),
+        Some(Preview1Descriptor::File(file)) => Some(file.node()),
         _ => None,
     }
-}
-
-/// Moves the offset of the open file `fd` after one of its own reads or
-/// writes.
-fn p1_set_file_offset<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    fd: i32,
-    next: u64,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
-    else {
-        panic!("Preview1 file descriptor {fd} disappeared during its own operation");
-    };
-    *offset = next;
 }
 
 pub(super) async fn p1_fd_filestat_set_size<CpuImpl, Net, StorageImpl>(
@@ -2437,11 +2431,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
         return p1::errno::BADF;
     };
-    let descriptor = descriptor.clone();
+    let descriptor = file.node().clone();
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
     let file = match p1_grant(&descriptor) {
@@ -2542,11 +2535,10 @@ where
         Some(end) => end,
         None => return p1::errno::OVERFLOW,
     };
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
         return p1::errno::BADF;
     };
-    let descriptor = descriptor.clone();
+    let descriptor = file.node().clone();
     let namespace = p1_namespace(caller);
     let current = match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
         Ok(metadata) => metadata.size,
@@ -2632,11 +2624,10 @@ where
         return Ok(p1::errno::FAULT);
     };
     let layout = p1_read_iovs_with_byte_len(&memory, GuestAddress::wasm32(iovs), iovs_len).await?;
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
         return Ok(p1::errno::BADF);
     };
-    let descriptor = descriptor.clone();
+    let descriptor = file.node().clone();
     let namespace = p1_namespace(caller);
     let file = p1_grant(&descriptor)?;
     let bytes = match wasi_fs::read(&namespace, file, offset, layout.byte_len as usize).await {
@@ -2690,26 +2681,37 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::File {
-        descriptor, offset, ..
-    }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
         return Err(P1Stop::Errno(p1::errno::BADF));
     };
-    let position = match at {
-        Some(at) => WritePosition::At(at),
-        None if caller.data().descriptors.fdflags(fd)? & P1_FDFLAG_APPEND != 0 => {
-            WritePosition::End
-        }
-        None => WritePosition::At(*offset),
-    };
-    let descriptor = descriptor.clone();
-    let mut gather = Preview1Gather::new(memory, layout)?;
+    let open = file.clone();
+    let append = caller.data().descriptors.fdflags(fd)? & P1_FDFLAG_APPEND != 0;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    p1_write_open_file(&namespace, &open, append, memory, layout, at, now_nanos).await
+}
+
+/// Writes the bytes `layout` names through the open file description
+/// `open`, as [`p1_write_file`] describes; `append` is the description's
+/// `APPEND` status flag.
+async fn p1_write_open_file<StorageImpl: crate::Storage>(
+    namespace: &Namespace<StorageImpl>,
+    open: &OpenFile<FsDescriptor>,
+    append: bool,
+    memory: &Preview1AsyncMemory,
+    layout: &Preview1IovLayout,
+    at: Option<u64>,
+    now_nanos: u64,
+) -> Result<u32, P1Stop> {
+    let position = match at {
+        Some(at) => WritePosition::At(at),
+        None if append => WritePosition::End,
+        None => WritePosition::At(open.offset()),
+    };
+    let mut gather = Preview1Gather::new(memory, layout)?;
     let (end, written) = {
         let file =
-            wasi_fs::writable_file(&namespace, p1_grant(&descriptor)?).map_err(p1_errno_from_fs)?;
+            wasi_fs::writable_file(namespace, p1_grant(open.node())?).map_err(p1_errno_from_fs)?;
         let mut file = ResolvedFileChunks {
             file: &file,
             now_nanos,
@@ -2720,8 +2722,9 @@ where
     };
     if at.is_none() {
         // After an append the offset is the end of the file the write
-        // reached, which another writer may have moved meanwhile.
-        p1_set_file_offset(caller, fd, end);
+        // reached, which another writer may have moved meanwhile. Every
+        // descriptor sharing the open file description sees it.
+        open.set_offset(end);
     }
     Ok(written)
 }
@@ -2860,19 +2863,17 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let (descriptor, current) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File {
-            descriptor, offset, ..
-        }) => (descriptor.clone(), *offset),
+    let file = match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::File(file)) => file.clone(),
         Some(_) => return Ok(p1::errno::SPIPE),
         None => return Ok(p1::errno::BADF),
     };
     let base = match whence {
         0 => 0,
-        1 => current,
+        1 => file.offset(),
         2 => {
             let namespace = p1_namespace(caller);
-            match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
+            match wasi_fs::stat_path(&namespace, &file.node().path, crate::Follow::No).await {
                 Ok(metadata) => metadata.size,
                 Err(error) => return Ok(p1_errno_from_fs(error)),
             }
@@ -2887,11 +2888,7 @@ where
     let Some(next) = next else {
         return Ok(p1::errno::INVAL);
     };
-    let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
-    else {
-        return Ok(p1::errno::BADF);
-    };
-    *offset = next;
+    file.set_offset(next);
     let Some(memory) = p1_async_memory(caller) else {
         return Ok(p1::errno::FAULT);
     };
@@ -2912,7 +2909,7 @@ where
     StorageImpl: crate::Storage,
 {
     let offset = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File { offset, .. }) => *offset,
+        Some(Preview1Descriptor::File(file)) => file.offset(),
         Some(_) => return p1::errno::SPIPE,
         None => return p1::errno::BADF,
     };
@@ -2952,14 +2949,11 @@ where
         }
     } else {
         let base = match caller.data().descriptors.get(fd) {
-            Some(Preview1Descriptor::Preopen { descriptor, .. })
-            | Some(Preview1Descriptor::File { descriptor, .. })
-                if descriptor.kind == FsNodeKind::Directory =>
-            {
-                descriptor.clone()
-            }
-            Some(_) => return Ok(p1::errno::NOTDIR),
             None => return Ok(p1::errno::BADF),
+            descriptor => match p1_directory_descriptor(descriptor) {
+                Some(descriptor) => descriptor.clone(),
+                None => return Ok(p1::errno::NOTDIR),
+            },
         };
         (base, path)
     };
@@ -2970,7 +2964,7 @@ where
     }
     let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
     if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
-        descriptor_flags |= fs_types::DescriptorFlags::WRITE;
+        descriptor_flags |= FsDescriptorFlags::WRITE;
     }
     p1_path_open_resolved(
         caller,
@@ -2994,7 +2988,7 @@ pub(super) async fn p1_path_open_resolved<CpuImpl, Net, StorageImpl>(
     path: String,
     path_flags: fs_types::PathFlags,
     open_flags: fs_types::OpenFlags,
-    descriptor_flags: fs_types::DescriptorFlags,
+    descriptor_flags: FsDescriptorFlags,
     fdflags: u16,
     opened_fd: u32,
 ) -> Result<i32, P1Stop>
@@ -3034,14 +3028,11 @@ where
         Ok(descriptor) => descriptor,
         Err(errno) => return Ok(errno),
     };
-    let fd = match caller
-        .data_mut()
-        .descriptors
-        .insert(Preview1Descriptor::File {
-            descriptor: opened,
-            offset: 0,
-            fdflags,
-        }) {
+    let fd = match caller.data_mut().descriptors.insert_with_fdflags(
+        Preview1Descriptor::File(OpenFile::new(opened)),
+        false,
+        fdflags,
+    ) {
         Ok(fd) => fd,
         Err(errno) => return Ok(errno),
     };
@@ -3078,7 +3069,7 @@ pub(super) async fn p1_open_descriptor_resolved<CpuImpl, Net, StorageImpl>(
     path_flags: fs_types::PathFlags,
     path: &str,
     open_flags: fs_types::OpenFlags,
-    descriptor_flags: fs_types::DescriptorFlags,
+    descriptor_flags: FsDescriptorFlags,
 ) -> Result<FsDescriptor, i32>
 where
     CpuImpl: Cpu + Clone,
@@ -4487,7 +4478,7 @@ where
 {
     // Every sink takes the guest's bytes gathered, one bounded chunk at a
     // time.
-    if let Some(Preview1Descriptor::File { .. }) = caller.data().descriptors.get(fd) {
+    if let Some(Preview1Descriptor::File(_)) = caller.data().descriptors.get(fd) {
         return p1_write_file(caller, fd, memory, layout, None).await;
     }
     // A descriptor whose sink is a bounded channel blocks the guest while
@@ -4612,21 +4603,19 @@ where
             Ok(Bytes::copy_from_slice(&event.read().await.to_le_bytes()))
         }
         Some(Preview1Descriptor::NullDevice) => Ok(Bytes::new()),
-        Some(Preview1Descriptor::File {
-            descriptor, offset, ..
-        }) => {
-            let descriptor = descriptor.clone();
-            let offset = *offset;
+        Some(Preview1Descriptor::File(file)) => {
+            let file = file.clone();
+            let offset = file.offset();
             let namespace = p1_namespace(caller);
             let bytes = wasi_fs::read(
                 &namespace,
-                p1_grant(&descriptor)?,
+                p1_grant(file.node())?,
                 offset,
                 capacity as usize,
             )
             .await
             .map_err(p1_errno_from_fs)?;
-            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
+            file.set_offset(offset.saturating_add(bytes.len() as u64));
             Ok(bytes)
         }
         Some(_) => Err(p1::errno::BADF),
@@ -4659,18 +4648,18 @@ pub(super) fn p1_open_flags(flags: u16) -> fs_types::OpenFlags {
     result
 }
 
-pub(super) fn p1_descriptor_flags(rights: u64, fdflags: u16) -> fs_types::DescriptorFlags {
-    let mut flags = fs_types::DescriptorFlags::empty();
+pub(super) fn p1_descriptor_flags(rights: u64, fdflags: u16) -> FsDescriptorFlags {
+    let mut flags = FsDescriptorFlags::empty();
     if rights & P1_RIGHT_FD_READ != 0 || rights & P1_RIGHT_FD_READDIR != 0 {
-        flags |= fs_types::DescriptorFlags::READ;
+        flags |= FsDescriptorFlags::READ;
     }
     if rights & (P1_RIGHT_FD_WRITE | P1_RIGHT_FD_FILESTAT_SET_SIZE | P1_RIGHT_FD_FILESTAT_SET_TIMES)
         != 0
     {
-        flags |= fs_types::DescriptorFlags::WRITE;
+        flags |= FsDescriptorFlags::WRITE;
     }
     if rights & P1_RIGHT_PATH_MUTATE_MASK != 0 {
-        flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+        flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     let _ = fdflags;
     flags
@@ -4862,17 +4851,13 @@ mod tests {
     use super::*;
 
     fn regular_file() -> Preview1Descriptor<crate::test_support::TestNetworkService> {
-        Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/data".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        }
+        Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/data".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+        }))
     }
 
     /// `path_open(O_TRUNC)` against a preopen that may read and change its
@@ -4890,9 +4875,9 @@ mod tests {
         let owner = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -4902,7 +4887,7 @@ mod tests {
             fs_types::PathFlags::empty(),
             "notes.txt",
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
         ))
         .expect("the owner creates the file");
@@ -4916,7 +4901,7 @@ mod tests {
         .expect("the owner writes the file");
 
         let preopen = FsDescriptor {
-            flags: fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ | FsDescriptorFlags::MUTATE_DIRECTORY,
             ..owner
         };
         for rights in [P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE, P1_RIGHT_FD_READ] {
@@ -4953,9 +4938,9 @@ mod tests {
         let owner = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -4965,11 +4950,103 @@ mod tests {
             fs_types::PathFlags::empty(),
             "data",
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ,
+            FsDescriptorFlags::READ,
             1,
         ))
         .expect("the owner creates the file");
         namespace
+    }
+
+    /// `cmd > out 2>&1`: stdout and the stderr `dup2` points at it, and a
+    /// further `fd_dup` of stdout, share one open file description, so each
+    /// write lands where the previous one through any of them ended and the
+    /// file reads back every write in order.
+    #[test]
+    fn writes_through_duplicated_descriptors_share_one_offset() {
+        use futures_lite::future::block_on;
+
+        let namespace = namespace_with_file();
+        let node = FsDescriptor {
+            path: "/data".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+        };
+        let mut table =
+            Preview1DescriptorTable::<crate::test_support::TestNetworkService>::from_entries(
+                alloc::vec![
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stdin {
+                            carry: Bytes::new(),
+                        },
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::File(OpenFile::new(node.clone())),
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stderr,
+                        false,
+                    )),
+                ],
+            );
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+        let duplicate = table.dup(1).expect("the table has room") as i32;
+
+        let writes: [(i32, &str); 3] = [
+            (1, "標準出力 "),
+            (2, "標準エラー出力 "),
+            (duplicate, "표준 출력"),
+        ];
+        let mut guest: Vec<u8> = writes
+            .iter()
+            .flat_map(|(_, text)| text.as_bytes().iter().copied())
+            .collect();
+        let memory = Preview1AsyncMemory::new(Preview1Memory {
+            base: guest.as_mut_ptr() as usize,
+            len: guest.len(),
+        });
+        let mut start = 0_u32;
+        for (fd, text) in writes {
+            let len = text.len() as u32;
+            let layout = Preview1IovLayout {
+                iovs: SmallVec::from_slice(&[(start, len)]),
+                byte_len: len,
+            };
+            let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
+                panic!("descriptor {fd} must name the file");
+            };
+            let written = block_on(p1_write_open_file(
+                &namespace,
+                file,
+                table.fdflags(fd).expect("the descriptor is open") & P1_FDFLAG_APPEND != 0,
+                &memory,
+                &layout,
+                None,
+                2,
+            ))
+            .expect("the write lands");
+            assert_eq!(written, len);
+            start += len;
+        }
+
+        let expected: String = writes.iter().map(|(_, text)| *text).collect();
+        for (fd, _) in writes {
+            let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
+                panic!("descriptor {fd} must name the file");
+            };
+            assert_eq!(file.offset(), expected.len() as u64);
+        }
+        let contents = block_on(wasi_fs::read(
+            &namespace,
+            p1_grant(&node).expect("the node may be read"),
+            0,
+            expected.len() + 1,
+        ))
+        .expect("the file reads back");
+        assert_eq!(contents.as_ref(), expected.as_bytes());
     }
 
     fn modified_nanos(namespace: &crate::Namespace<crate::UnsupportedStorage>) -> u64 {
@@ -4990,7 +5067,7 @@ mod tests {
         let file = |rights| FsDescriptor {
             flags: p1_descriptor_flags(rights, 0),
             ..match regular_file() {
-                Preview1Descriptor::File { descriptor, .. } => descriptor,
+                Preview1Descriptor::File(file) => file.node().clone(),
                 _ => unreachable!("regular_file is a file"),
             }
         };

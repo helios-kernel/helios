@@ -160,7 +160,9 @@ async fn run(
             _ => &[],
         },
     };
-    let mut process = syscall::Process::new(id);
+    // The descriptor table holds the kernel's filesystem node handle, the
+    // one WASI and WASIX descriptors hold.
+    let mut process = syscall::Process::<helios_kernel::FsDescriptor>::new(id);
     loop {
         context
             .set_thread_pointer(process.fs_base())
