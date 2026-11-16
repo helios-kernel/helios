@@ -2,6 +2,10 @@ set shell := ["bash", "-uc"]
 
 repo_root := justfile_directory()
 
+# The `helios-cli` the recipes run: the binary `HELIOS_CLI_BIN` names (CI's
+# `helios-cli` action exports the run's prebuilt one), else this checkout's.
+cli := env_var_or_default("HELIOS_CLI_BIN", "cargo run -p helios-cli --quiet --")
+
 # Default profile directory used by `kernel-prebuild --profile`.
 default_profile := "debug"
 
@@ -21,7 +25,7 @@ check-target target package:
     #!/usr/bin/env bash
     set -euo pipefail
     out_dir="{{ repo_root }}/target/kernel-prebuild/{{ target }}/{{ default_profile }}"
-    cargo run -p helios-cli --quiet -- kernel-keys --out-dir "${out_dir}"
+    {{ cli }} kernel-keys --out-dir "${out_dir}"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     build_std="{{ if target == build_std_target { build_std_flag } else { "" } }}"
     # Unquoted on purpose: an empty value must expand to no argument.
@@ -64,12 +68,12 @@ clippy-host:
     # `clippy-programs`.
     target="$(rustc -vV | sed -n 's/^host: //p')"
     out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
-    cargo run -p helios-cli --quiet -- kernel-keys --out-dir "${out_dir}"
+    {{ cli }} kernel-keys --out-dir "${out_dir}"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     # `helios-venus` generates its protocol module from the pinned
     # venus-protocol inputs when it builds.
-    cargo run -p helios-cli --quiet -- venus-protocol-fetch
+    {{ cli }} venus-protocol-fetch
     cargo clippy -p helios-linux --all-targets --features runtime -- -D warnings
     cargo clippy \
         --workspace --all-targets \
@@ -107,7 +111,7 @@ test-kernel run_ignored="default":
     set -euo pipefail
     target="$(rustc -vV | sed -n 's/^host: //p')"
     out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
+    {{ cli }} kernel-prebuild \
         --out-dir "${out_dir}" \
         --target "${target}" \
         --profile "{{ default_profile }}" \
@@ -145,7 +149,7 @@ test-libraries:
     # The Venus protocol is generated from pinned venus-protocol inputs that
     # the CLI fetches and hash-verifies; the parity test then compares the
     # generated encoders with the pinned Mesa generator's output.
-    cargo run -p helios-cli --quiet -- venus-protocol-fetch
+    {{ cli }} venus-protocol-fetch
     cargo nextest run -p helios-venus -p helios-venus-gen
     # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
     # tables the fetch below hash-verifies.
@@ -161,7 +165,7 @@ test-host-tools:
     else
         target="$(rustc -vV | sed -n 's/^host: //p')"
         out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
-        cargo run -p helios-cli --quiet -- kernel-prebuild \
+        {{ cli }} kernel-prebuild \
             --out-dir "${out_dir}" \
             --target "${target}" \
             --profile "{{ default_profile }}" \
@@ -214,7 +218,7 @@ clippy-target target package:
     #!/usr/bin/env bash
     set -euo pipefail
     out_dir="{{ repo_root }}/target/kernel-prebuild/{{ target }}/{{ default_profile }}"
-    cargo run -p helios-cli --quiet -- kernel-keys --out-dir "${out_dir}"
+    {{ cli }} kernel-keys --out-dir "${out_dir}"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     # Two invocations, for the same reason `check-target` uses explicit
     # features: cargo would otherwise unify helios-kernel's host defaults with
@@ -278,7 +282,7 @@ check-host:
         exit 1
     fi
     out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
-    cargo run -p helios-cli --quiet -- kernel-keys --out-dir "${out_dir}"
+    {{ cli }} kernel-keys --out-dir "${out_dir}"
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     cargo check -p helios-kernel
     cargo check -p helios-hosted
@@ -295,7 +299,7 @@ test-embedded-debugger:
         exit 1
     fi
     out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
-    cargo run -p helios-cli --quiet -- kernel-prebuild \
+    {{ cli }} kernel-prebuild \
         --out-dir "${out_dir}" \
         --target "${target}" \
         --profile "{{ default_profile }}" \
