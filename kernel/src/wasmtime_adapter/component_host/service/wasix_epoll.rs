@@ -72,9 +72,8 @@ where
     let fd = match caller
         .data_mut()
         .descriptors
-        .insert(Preview1Descriptor::Epoll(EpollDescriptor {
-            interests: Vec::new(),
-        })) {
+        .insert(Preview1Descriptor::Epoll(EpollDescriptor::new()))
+    {
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
@@ -115,26 +114,16 @@ where
     let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd) else {
         return p1::errno::BADF;
     };
-    let existing = epoll
-        .interests
-        .iter()
-        .position(|registered| registered.fd == fd);
-    match (op, existing, interest) {
-        (WASIX_EPOLL_CTL_ADD, Some(_), _) => p1::errno::EXIST,
-        (WASIX_EPOLL_CTL_ADD, None, Some(interest)) => {
-            epoll.interests.push(interest);
-            p1::errno::SUCCESS
-        }
-        (WASIX_EPOLL_CTL_MOD, Some(index), Some(interest)) => {
-            epoll.interests[index] = interest;
-            p1::errno::SUCCESS
-        }
-        (WASIX_EPOLL_CTL_MOD, None, _) | (WASIX_EPOLL_CTL_DEL, None, _) => p1::errno::NOENT,
-        (WASIX_EPOLL_CTL_DEL, Some(index), None) => {
-            epoll.interests.remove(index);
-            p1::errno::SUCCESS
-        }
-        _ => p1::errno::INVAL,
+    let result = match (op, interest) {
+        (WASIX_EPOLL_CTL_ADD, Some(interest)) => epoll.add(interest),
+        (WASIX_EPOLL_CTL_MOD, Some(interest)) => epoll.modify(interest),
+        (WASIX_EPOLL_CTL_DEL, None) => epoll.remove(fd),
+        _ => return p1::errno::INVAL,
+    };
+    match result {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(helios_unix::InterestError::Exists) => p1::errno::EXIST,
+        Err(helios_unix::InterestError::NotFound) => p1::errno::NOENT,
     }
 }
 
@@ -278,7 +267,7 @@ where
     StorageImpl: crate::Storage,
 {
     let interests = match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests.clone(),
+        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests(),
         Some(_) => return Err(p1::errno::INVAL),
         None => return Err(p1::errno::BADF),
     };
@@ -330,6 +319,7 @@ pub(super) fn wasix_read_epoll_event<T>(
     Ok(EpollInterest {
         fd,
         events,
+        one_shot: events & WASIX_EPOLL_TYPE_EPOLLONESHOT != 0,
         data: user_data,
     })
 }
@@ -370,7 +360,7 @@ where
     StorageImpl: crate::Storage,
 {
     let interests = match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests.clone(),
+        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests(),
         _ => return Vec::new(),
     };
     let mut ready = Vec::new();
@@ -383,7 +373,7 @@ where
         if events == 0 {
             continue;
         }
-        let oneshot = interest.events & WASIX_EPOLL_TYPE_EPOLLONESHOT != 0;
+        let oneshot = interest.one_shot;
         interest.events = events;
         if oneshot {
             oneshot_fds.push(interest.fd);
@@ -393,9 +383,9 @@ where
     if !oneshot_fds.is_empty()
         && let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd)
     {
-        epoll
-            .interests
-            .retain(|interest| !oneshot_fds.contains(&interest.fd));
+        for fd in oneshot_fds {
+            epoll.delivered(fd);
+        }
     }
     ready
 }
@@ -466,6 +456,7 @@ mod tests {
         let event = EpollInterest {
             fd: 3,
             events: WASIX_EPOLL_TYPE_EPOLLIN,
+            one_shot: false,
             data: EpollUserData {
                 ptr: 0x1122_3344,
                 fd: 7,
@@ -590,6 +581,7 @@ mod tests {
         let ready = [3, 4].map(|fd| EpollInterest {
             fd,
             events: WASIX_EPOLL_TYPE_EPOLLIN,
+            one_shot: false,
             data: EpollUserData {
                 ptr: 0x1000 + fd as u32,
                 fd: fd as u32,

@@ -1,5 +1,11 @@
+use core::convert::Infallible;
 use core::future::Future;
 use core::num::NonZeroU32;
+use helios_unix::{DescriptorSlots, FileDescriptor, FileDescriptorEntry, ProcessIdentity};
+mod io;
+pub use io::Clock;
+type Descriptor = FileDescriptor<Infallible, Infallible, u64>;
+type Entry = FileDescriptorEntry<Infallible, Infallible, u64>;
 use core::ops::ControlFlow;
 
 /// A fault reported by the address-space owner, before any bytes are exposed.
@@ -11,6 +17,9 @@ pub trait UserMemory {
     /// Copies exactly `output.len()` readable bytes. The implementation owns
     /// mapping synchronization; no user reference may escape this operation.
     fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault>;
+    /// Validates a writable range without modifying it. The exclusive memory
+    /// borrow keeps its mappings stable until the syscall completes.
+    fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault>;
     /// Copies bytes only into writable user mappings while execution is stopped.
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault>;
 }
@@ -90,14 +99,20 @@ const MAX_RW_COUNT: u64 = 0x7fff_f000; // Linux INT_MAX rounded down to a page.
 /// No syscall or user-memory mutation runs concurrently with guest execution.
 /// The execution owner supplies a unique nonzero ID for each live process.
 pub struct Process {
-    id: NonZeroU32,
+    identity: ProcessIdentity,
+    descriptors: DescriptorSlots<Entry>,
     fs_base: u64,
     clear_child_tid: u64,
 }
 impl Process {
     pub fn new(id: NonZeroU32) -> Self {
         Self {
-            id,
+            identity: ProcessIdentity::new(id.into()),
+            descriptors: DescriptorSlots::from_entries(alloc::vec![
+                None,
+                Some(Entry::new(Descriptor::Stdout, false)),
+                Some(Entry::new(Descriptor::Stderr, false))
+            ]),
             fs_base: 0,
             clear_child_tid: 0,
         }
@@ -121,7 +136,7 @@ fn errno(value: u64) -> u64 {
 
 /// A single-threaded process's initial ABI surface. Exit consumes the execution
 /// loop through `Break`; it is never returned to the guest as a syscall result.
-pub async fn dispatch<M: VirtualMemory, O: Output>(
+pub async fn dispatch<M: VirtualMemory, O: Output + Clock>(
     process: &mut Process,
     call: Call,
     memory: &mut M,
@@ -136,30 +151,87 @@ pub async fn dispatch<M: VirtualMemory, O: Output>(
             }
             ControlFlow::Break(call.arguments[0] as u8)
         }
+        0 => {
+            ControlFlow::Continue(io::read(&mut process.descriptors, call.arguments, memory).await)
+        }
+        3 => ControlFlow::Continue(
+            process
+                .descriptors
+                .close(call.arguments[0] as u32 as i32)
+                .map_or_else(io::descriptor_errno, |_| 0),
+        ),
+        22 | 293 => ControlFlow::Continue(io::pipe(
+            &mut process.descriptors,
+            call.arguments,
+            memory,
+            call.number == 293,
+        )),
+        32 | 33 | 292 | 72 => ControlFlow::Continue(io::duplicate(&mut process.descriptors, call)),
+        284 | 290 => ControlFlow::Continue(io::event(
+            &mut process.descriptors,
+            call.arguments,
+            call.number == 290,
+        )),
+        213 | 291 => ControlFlow::Continue(io::epoll_create(
+            &mut process.descriptors,
+            call.arguments,
+            call.number == 291,
+        )),
+        233 => ControlFlow::Continue(io::epoll_ctl(
+            &mut process.descriptors,
+            call.arguments,
+            memory,
+        )),
+        232 | 281 => ControlFlow::Continue(
+            io::epoll_wait(
+                &process.descriptors,
+                call.arguments,
+                memory,
+                output,
+                call.number == 281,
+            )
+            .await,
+        ),
         SYS_MMAP => ControlFlow::Continue(mmap(call.arguments, memory)),
-        SYS_GETPID | SYS_GETTID => ControlFlow::Continue(process.id.get().into()),
+        SYS_GETPID | SYS_GETTID => ControlFlow::Continue(process.identity.id().get()),
         SYS_SET_TID_ADDRESS => {
             process.clear_child_tid = call.arguments[0];
-            ControlFlow::Continue(process.id.get().into())
+            ControlFlow::Continue(process.identity.id().get())
         }
         SYS_ARCH_PRCTL => ControlFlow::Continue(arch_prctl(process, call.arguments, memory)),
-        SYS_WRITEV => ControlFlow::Continue(writev(call.arguments, memory, output).await),
-        SYS_IOCTL => ControlFlow::Continue(match call.arguments[0] as u32 {
-            // The inherited output descriptors are byte streams, not terminals.
-            1 | 2 => errno(ENOTTY),
-            _ => errno(EBADF),
-        }),
-        SYS_WRITE => ControlFlow::Continue(write(call.arguments, memory, output).await),
+        SYS_WRITEV => ControlFlow::Continue(
+            writev(&process.descriptors, call.arguments, memory, output).await,
+        ),
+        SYS_IOCTL => ControlFlow::Continue(
+            match process
+                .descriptors
+                .get_entry(call.arguments[0] as u32 as i32)
+            {
+                Some(_) => errno(ENOTTY),
+                None => errno(EBADF),
+            },
+        ),
+        SYS_WRITE => {
+            ControlFlow::Continue(write(&process.descriptors, call.arguments, memory, output).await)
+        }
         _ => ControlFlow::Continue(errno(ENOSYS)),
     }
 }
 
-async fn write<M: UserMemory, O: Output>(args: [u64; 6], memory: &M, output: &mut O) -> u64 {
+async fn write<M: UserMemory, O: Output>(
+    descriptors: &DescriptorSlots<Entry>,
+    args: [u64; 6],
+    memory: &M,
+    output: &mut O,
+) -> u64 {
     // Linux takes fd as an unsigned int, discarding the register's upper bits.
-    let stream = match args[0] as u32 {
-        1 => Stream::Stdout,
-        2 => Stream::Stderr,
-        _ => return errno(EBADF),
+    let Some(entry) = descriptors.get_entry(args[0] as u32 as i32) else {
+        return errno(EBADF);
+    };
+    let stream = match &entry.descriptor {
+        Descriptor::Stdout => Stream::Stdout,
+        Descriptor::Stderr => Stream::Stderr,
+        _ => return io::write_resource(entry, args, memory).await,
     };
     // Linux MAX_RW_COUNT is INT_MAX rounded down to PAGE_SIZE (x86-64: 4096).
     let count = args[2].min(MAX_RW_COUNT);
@@ -223,8 +295,13 @@ fn arch_prctl<M: UserMemory>(process: &mut Process, args: [u64; 6], memory: &mut
     }
 }
 
-async fn writev<M: UserMemory, O: Output>(args: [u64; 6], memory: &M, output: &mut O) -> u64 {
-    if !matches!(args[0] as u32, 1 | 2) {
+async fn writev<M: UserMemory, O: Output>(
+    descriptors: &DescriptorSlots<Entry>,
+    args: [u64; 6],
+    memory: &M,
+    output: &mut O,
+) -> u64 {
+    if descriptors.get_entry(args[0] as u32 as i32).is_none() {
         return errno(EBADF);
     }
     let count = args[2] as u32;
@@ -269,7 +346,13 @@ async fn writev<M: UserMemory, O: Output>(args: [u64; 6], memory: &M, output: &m
         if length == 0 {
             continue;
         }
-        let result = write([args[0], base, length, 0, 0, 0], memory, output).await;
+        let result = write(
+            descriptors,
+            [args[0], base, length, 0, 0, 0],
+            memory,
+            output,
+        )
+        .await;
         if (result as i64) < 0 {
             return if done == 0 { result } else { done };
         }

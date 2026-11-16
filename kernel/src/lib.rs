@@ -218,20 +218,16 @@ pub use network::{
 };
 pub use process::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, ComponentStdioRefusal,
-    ControlProcessorsCap, DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable,
-    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
+    ControlProcessorsCap, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap,
-    GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
-    LinkTargetDirectoryCap, MachineAuthorityRights, MountAuthorityRights, MountCap, MulticastCap,
-    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap,
-    ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
-    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
+    ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap, JoinAuthority, LinkAuthorityRights,
+    LinkSourceCap, LinkTargetDirectoryCap, MachineAuthorityRights, MountAuthorityRights, MountCap,
+    MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap,
+    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
     ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
     RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
-    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
-    UnbindableStdio, UnmountCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap,
+    TtyControlCap, UdpCap, UnbindableStdio, UnmountCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -2038,3 +2034,6 @@ mod tests {
         assert_eq!(stats.requested_live_bytes, 0);
     }
 }
+
+#[cfg(feature = "unix")]
+mod unix;
