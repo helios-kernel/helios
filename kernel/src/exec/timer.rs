@@ -185,7 +185,6 @@
 //! | `CachePadded<WheelLock>` | the lock word, `elapsed`, `pending`, the six occupancy words; the slot heads follow | every lock holder: the owner's registrations and fires, any canceller, a hand-over onto or off this base |
 //! | each [`SleepNode`] | in its holder's memory | links, tick, list and state: home-lock holders. `home`: its registrant, and a hand-over holding both locks. `waker`: the poller and the firer |
 
-use alloc::boxed::Box;
 use core::future::Future;
 use core::pin::Pin;
 use core::ptr::NonNull;
@@ -1240,7 +1239,11 @@ mod tests {
 
         let clock = ManualClockCpu::new();
         test_processor_identity::set(P0);
-        let executor0 = Executor::isolated(ProgressCounter::new(), 2, P0);
+        let executor0 = Executor::isolated(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(2),
+            P0,
+        );
         let timer0 = executor0.timer(clock.clone());
         test_processor_identity::set(P1);
         let executor1 = executor0.sibling(ProgressCounter::new(), P1);
