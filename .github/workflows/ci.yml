@@ -135,6 +135,13 @@ jobs:
               - 'wit/deps/helios-system/gpu.wit'
               - 'wit/deps/helios-system/display.wit'
               - 'programs/gpu-test/**'
+              - 'webgpu/**'
+              - 'venus/**'
+              - 'programs/webgpu/**'
+              - 'programs/pride-flag/**'
+              - 'programs/compositor/**'
+              - 'wit/deps/webgpu/**'
+              - 'wit/deps/helios-webgpu/**'
               - 'inspector/**'
               - '.github/qemu/x86_64-venus-configure.args'
               - '.github/qemu/virglrenderer-meson.args'
@@ -2625,6 +2632,41 @@ jobs:
               'gpu-test:instances=2' 'gpu-test:venus ring-reply ok'; do
             grep -Fq "$line" venus-smoke.out
           done
+      # The whole WebGPU path: the provider plugged into `pride-flag`
+      # draws over Venus, the canvas presents to the compositor, and the
+      # capture is what the scanout shows.
+      - name: Draw the pride flag through wasi:webgpu
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/pride-flag"
+          captures="$GITHUB_WORKSPACE/pride-flag-scanout"
+          mkdir -p "$runtime" "$captures"
+          ./target/debug/helios-inspector vm --arch x86-64 --memory 2G \
+            --accel kvm --runtime-dir "$runtime" --keep-runtime-dir \
+            --renderer virtio-gpu-gl --renderer-hostmem 256M \
+            --display egl-headless \
+            --boot-program dash --boot-program debugger \
+            --boot-program compositor --boot-program pride-flag \
+            --no-compiler-plugin \
+            screendump --settle-seconds 20 --run /bin/pride-flag \
+              "$captures/pride-flag.png" \
+            2>&1 | tee "$runtime/inspector.log"
+          for line in 'pride-flag:device' 'pride-flag:canvas' \
+              'pride-flag:frame 60' 'pride-flag:done'; do
+            grep -Fq "$line" "$runtime/inspector.log"
+          done
+          file "$captures/pride-flag.png" | grep -Fq 'PNG image data'
+      - name: Upload the pride flag capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pride-flag-scanout
+          path: pride-flag-scanout/*.png
+          if-no-files-found: warn
+          retention-days: 14
       - name: Upload the inspector runtime directory
         if: failure()
         uses: actions/upload-artifact@v4
