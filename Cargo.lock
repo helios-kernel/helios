@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "aarch64-paging"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33031af061bdc70425bc55be120e6ac1801d5613aeb84906a282febadf72176e"
+dependencies = [
+ "bitflags 2.13.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "acpi"
 version = "7.0.0-pre1"
 source = "git+https://github.com/lexoliu/acpi?branch=helios#a4207d9f8f7feccdc409232762953674a75f523d"
@@ -869,7 +879,7 @@ dependencies = [
 [[package]]
 name = "compio-buf"
 version = "0.8.3"
-source = "git+https://github.com/lexoliu/compio?branch=skyzen#e61491c7da76dd4ca71765e8cf2e5b1fa2ff6b6d"
+source = "git+https://github.com/lexoliu/compio?branch=skyzen#23ce721e472045310d6bf09894836698d8914ae9"
 dependencies = [
  "bytes",
  "libc",
@@ -2074,10 +2084,14 @@ name = "helios"
 version = "0.1.0"
 dependencies = [
  "helios-aarch64",
+ "helios-hal",
  "helios-hosted",
  "helios-inspector-protocol",
+ "helios-kernel",
+ "helios-linux",
  "helios-riscv",
  "helios-x86",
+ "tracing",
  "wasmtime",
 ]
 
@@ -2085,11 +2099,13 @@ dependencies = [
 name = "helios-aarch64"
 version = "0.1.0"
 dependencies = [
+ "aarch64-paging",
  "acpi",
  "arm-gic",
  "arm-sysregs",
  "bytes",
  "critical-section",
+ "crossbeam-utils",
  "fdt",
  "helios-acpi",
  "helios-artifact",
@@ -2476,6 +2492,7 @@ dependencies = [
  "object",
  "ratatui",
  "rustc-demangle",
+ "rustix",
  "rustyline",
  "serde",
  "serde_json",
@@ -2514,7 +2531,6 @@ dependencies = [
  "arc-swap",
  "arrayvec",
  "askama",
- "async-lock",
  "async-task",
  "atomic-waker",
  "bitflags 2.13.1",
@@ -2526,7 +2542,6 @@ dependencies = [
  "divan",
  "ed25519-dalek",
  "erofs-rs",
- "event-listener",
  "ferrosys",
  "frame-alloc",
  "futures",
@@ -2538,6 +2553,8 @@ dependencies = [
  "helios-compiler-abi",
  "helios-hal",
  "helios-netstack",
+ "helios-sync",
+ "helios-unix",
  "hkdf",
  "hmac",
  "lru 0.16.4",
@@ -2563,6 +2580,18 @@ dependencies = [
  "wasmtime-wasi-io",
  "zeroize",
  "zrip",
+]
+
+[[package]]
+name = "helios-linux"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "critical-section",
+ "helios-sync",
+ "helios-unix",
+ "object",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2667,6 +2696,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-sync"
+version = "0.1.0"
+dependencies = [
+ "async-lock",
+ "bytes",
+ "critical-section",
+ "event-listener",
+ "futures",
+ "futures-lite",
+ "heapless",
+ "spin 0.9.9",
+ "triomphe",
+]
+
+[[package]]
 name = "helios-tpm"
 version = "0.1.0"
 dependencies = [
@@ -2678,6 +2722,23 @@ dependencies = [
  "thiserror 2.0.21",
  "tpm2-protocol",
  "zeroize",
+]
+
+[[package]]
+name = "helios-unix"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "critical-section",
+ "futures",
+ "futures-lite",
+ "hashbrown 0.16.1",
+ "heapless",
+ "helios-hal",
+ "helios-sync",
+ "spin 0.9.9",
+ "thiserror 2.0.21",
+ "triomphe",
 ]
 
 [[package]]
@@ -2734,6 +2795,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-vmm"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "clap",
+ "futures-lite",
+ "helios-api",
+ "thiserror 2.0.21",
+ "vm-fdt",
+]
+
+[[package]]
 name = "helios-workspace-root"
 version = "0.1.0"
 dependencies = [
@@ -2762,6 +2835,7 @@ dependencies = [
  "limine 0.5.0",
  "pci_types",
  "spin 0.9.9",
+ "thiserror 2.0.21",
  "tracing",
  "x86",
  "x86_64",
@@ -2913,7 +2987,7 @@ dependencies = [
 [[package]]
 name = "http-kit"
 version = "0.8.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "bytes",
  "bytestr",
@@ -2934,7 +3008,7 @@ dependencies = [
 [[package]]
 name = "http-kit-h1"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "async-channel",
  "bytes",
@@ -2951,7 +3025,7 @@ dependencies = [
 [[package]]
 name = "http-kit-io"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "bytes",
  "compio-buf",
@@ -2964,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "http-kit-tls"
 version = "0.4.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#e840eb9c617dd0cfe57a6ba1c8b824745584954c"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
 dependencies = [
  "futures-lite",
  "http-kit-io",
@@ -5983,6 +6057,12 @@ checksum = "3f1840b0acd2ffbeee7d732177d235901d9ff7af369ed3f964055a97eff2b7bd"
 dependencies = [
  "xml-rs",
 ]
+
+[[package]]
+name = "vm-fdt"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
 
 [[package]]
 name = "volatile"

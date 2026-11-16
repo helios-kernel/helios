@@ -8,8 +8,8 @@ use ferrosys::btrfs::{FormatOptions, SubvolumeRequest, format_to};
 use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
-    BlockSerial, DeviceId, DirCookie, FileSystem, FsError, FsPath, Landed, NodeKind, OpenFlags,
-    PreparedWrite, WritePosition, WriteProgress, write_with,
+    BlockSerial, DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind,
+    OpenFlags, PreparedWrite, WritePosition, WriteProgress, write_with,
 };
 
 use super::BtrfsFs;
@@ -466,8 +466,8 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 .await
                 .expect("rename prepared inode");
             let (first, second) = futures::future::join(
-                first.submit(|_, bytes| bytes.fill(0x41)),
-                second.submit(|_, bytes| bytes.fill(0x42)),
+                first.fill(|_, bytes| bytes.fill(0x41)).submit(),
+                second.fill(|_, bytes| bytes.fill(0x42)).submit(),
             )
             .await;
             assert!(matches!(

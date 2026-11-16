@@ -456,6 +456,8 @@ def helios_command(
     unit_order: dict[str, UnitOrder],
     profile_boot: bool,
     helios_pass: bool = False,
+    *,
+    build_images: bool,
 ) -> PlannedCommand:
     """The driver invocation that times the Helios image, and the baseline
     images beside it when the run is paired, under ``out_root``.
@@ -488,9 +490,9 @@ def helios_command(
             "--helios-accel",
             lane.accelerator,
             "--skip-linux",
-            # The driver's boots never build; this is also the build it
-            # does before them, which a prebuilt run has no host for.
-            *(["--helios-skip-build"] if options.prebuilt else []),
+            # Only the first pass builds. Repeat measurements keep the
+            # same artifacts, including each column's profile and tooling.
+            *([] if build_images else ["--helios-skip-build"]),
             *([] if profile_boot else ["--helios-no-profile-boot"]),
             "--helios-timeout-seconds",
             str(options.helios_timeout_seconds),
@@ -608,6 +610,7 @@ def plan(options: RunOptions, manifest: Manifest, workloads: list[dict]) -> list
                         # The untimed profile boot is the first pass's artifact.
                         options.profile_boot and number == 1,
                         helios_pass=True,
+                        build_images=number == 1 and not options.prebuilt,
                     ),
                     side="helios",
                     round=number,
@@ -860,6 +863,17 @@ def missing_prebuilt_files(options: RunOptions, workloads: list[dict]) -> list[s
     """
     lane = options.lane
     missing = []
+    manifest = load_workloads()
+    inputs = list(workloads)
+    control = manifest["control_workload"]
+    if not any(workload["name"] == control for workload in inputs):
+        inputs.extend(select_workloads(manifest, [control]))
+    for source in sorted(
+        {artifact["wasm"] for artifact in gap_bench().artifact_provenance(manifest, inputs)}
+    ):
+        path = REPO_ROOT / source
+        if not path.is_file():
+            missing.append(f"{path} (workload or control wasm input)")
     if Side.HELIOS in options.sides:
         inspector = inspector_for(REPO_ROOT)
         cli = helios_cli_for_repo()
@@ -880,14 +894,14 @@ def missing_prebuilt_files(options: RunOptions, workloads: list[dict]) -> list[s
                 "the kernel image and helios-bootfs paths (they are asked of the inspector, which is missing)"
             )
     if options.sides & LINUX_SIDES:
-        for name in native_counterparts(options, workloads):
+        for name in native_counterparts(options, inputs):
             path = NATIVE_ARTIFACTS / lane.guest_arch / name
             if not path.is_file():
                 missing.append(f"{path} (native counterpart)")
         runner = workload_runner()
         hosts_plugin = any(
             runner.uses_placeholder(workload, side.value, runner.COMPILER_PLUGIN_PLACEHOLDER)
-            for workload in workloads
+            for workload in inputs
             if workload["name"] not in options.skip_linux_workloads
             for side in options.sides & LINUX_SIDES
         )
@@ -1271,6 +1285,7 @@ def retake_plan(
         f"measure {', '.join(names)} again on every Helios image: {reason}",
         unit_order,
         profile_boot=False,
+        build_images=False,
     )
 
 
@@ -1501,6 +1516,7 @@ def retry(
             f"the first pass's noise floor crossed the {result.floor_bound:.3f} bound",
             orders,
             profile_boot=False,
+            build_images=False,
         )
     )
     second_sides = read_sides(retry_options, thresholds)

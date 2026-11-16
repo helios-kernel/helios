@@ -319,7 +319,7 @@ fn nanos(time: Timestamp) -> FsResult<u64> {
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<Device> {
-    type Write<'a> = BtrfsWrite<Device>;
+    type Write = BtrfsWrite<Device>;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.metadata(&self.inode(&self.snapshot(), path).await?)
@@ -458,7 +458,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         position: WritePosition,
         len: usize,
         now: u64,
-    ) -> FsResult<Self::Write<'_>> {
+    ) -> FsResult<Self::Write> {
         prepared::prepare(self, path, position, len, now).await
     }
     async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {

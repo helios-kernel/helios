@@ -229,7 +229,7 @@ pub enum WritePosition {
     End,
 }
 
-/// What a [`PreparedWrite::submit`] leaves of its write.
+/// What a [`FilledWrite::submit`] leaves of its write.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriteProgress<W> {
     /// The round landed and bytes remain: the next round, staged and
@@ -266,8 +266,8 @@ impl Landed {
 /// A write [`FileSystem::prepare_write`] staged.
 ///
 /// A write lands in rounds. Each round stages [`Self::staged_len`] bytes
-/// of the write in the filesystem's own destination, and its submit
-/// fills and sends exactly those. A filesystem that keeps its bytes in
+/// of the write in the filesystem's own destination. Filling copies those
+/// bytes synchronously; submission sends the filled destinations. A filesystem that keeps its bytes in
 /// memory stages the whole write in one round; one that sends them
 /// elsewhere bounds a round by the destinations it can hold at once,
 /// never by the write's length, so a write larger than that lands in
@@ -281,7 +281,7 @@ impl Landed {
 /// write short; when no byte is stored the submit fails with
 /// [`FsError::NoSpace`], and any other failure is its own error.
 ///
-/// Dropping a prepared write before its submit releases what it staged
+/// Dropping a prepared write before filling releases what it staged
 /// and leaves the file as it was: the bytes of earlier rounds have
 /// landed, this round's have not. Dropping a submit's future part way
 /// may leave part of its round written.
@@ -289,41 +289,69 @@ impl Landed {
 /// Concurrency: a prepared write is owned by the task that prepared it
 /// and is moved, never shared; it may be submitted on another
 /// processor. Two writes to one file staged at once land in whatever
-/// order their submits do.
+/// order their fills or submits do.
 pub trait PreparedWrite: Send + Sized {
+    /// The filled round, independent of the source borrowed by `fill`.
+    type Filled: FilledWrite<Next = Self>;
+
     /// The bytes the next submit takes: all of the write's remaining
     /// bytes, or the most this filesystem stages in one round.
     fn staged_len(&self) -> usize;
 
-    /// Fills this round and sends it.
+    /// Fills this round synchronously.
     ///
-    /// `fill` runs before this returns, never from the future, so it
+    /// `fill` runs before this returns, so it
     /// may read memory that is valid only until the next await (a
     /// guest's) and need not be `Send`. It is called once for each of the
     /// round's destination regions, in write order, with the region's
     /// offset from the start of the whole write; the regions cover the
     /// round's [`Self::staged_len`] bytes exactly. A round refused before
     /// its bytes are needed does not run it.
-    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    fn fill<F>(self, fill: F) -> Self::Filled
     where
         F: FnMut(usize, &mut [u8]);
 }
 
-/// The write of a filesystem that refuses every write before it is
-/// staged.
+/// A filled round owns its destinations and retains no borrow of its source.
+/// Submission may suspend; dropping it may leave part of the round written.
+pub trait FilledWrite: Send + Sized {
+    /// The next round, if the prepared write has bytes remaining.
+    type Next: PreparedWrite;
+
+    fn submit(self) -> impl Future<Output = FsResult<WriteProgress<Self::Next>>> + Send;
+}
+
+/// Memory-backed writes finish while filling their destination. Submission
+/// reports that result without holding the source or the filesystem lock.
+impl<W: PreparedWrite> FilledWrite for FsResult<WriteProgress<W>> {
+    type Next = W;
+
+    fn submit(self) -> impl Future<Output = Self> + Send {
+        core::future::ready(self)
+    }
+}
+
+/// The write of a filesystem that refuses every write before staging.
 impl PreparedWrite for core::convert::Infallible {
+    type Filled = Self;
+
     fn staged_len(&self) -> usize {
         match *self {}
     }
 
-    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    fn fill<F>(self, _: F) -> Self
     where
         F: FnMut(usize, &mut [u8]),
     {
-        // Not `async fn`: that would carry `fill`, which need not be
-        // `Send`, into the future.
-        drop(fill);
-        async move { match self {} }
+        match self {}
+    }
+}
+
+impl FilledWrite for core::convert::Infallible {
+    type Next = Self;
+
+    async fn submit(self) -> FsResult<WriteProgress<Self>> {
+        match self {}
     }
 }
 
@@ -351,7 +379,7 @@ where
 {
     let mut write = fs.prepare_write(path, position, len, now).await?;
     loop {
-        match write.submit(&mut source).await? {
+        match write.fill(&mut source).submit().await? {
             WriteProgress::More(next) => write = next,
             WriteProgress::Done(landed) => return Ok(landed),
         }
@@ -443,6 +471,22 @@ impl<'a> FsPath<'a> {
     }
 }
 
+/// An owned, normalized path for a transfer that outlives its prepare call.
+#[derive(Clone, Debug)]
+pub struct OwnedFsPath(String);
+
+impl From<FsPath<'_>> for OwnedFsPath {
+    fn from(path: FsPath<'_>) -> Self {
+        Self(String::from(path.as_str()))
+    }
+}
+
+impl OwnedFsPath {
+    pub fn as_path(&self) -> FsPath<'_> {
+        FsPath(&self.0)
+    }
+}
+
 /// One filesystem: the operations every mount kind implements.
 ///
 /// Mutating operations take `now`, the caller's wall-clock time in
@@ -475,14 +519,12 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = FsResult<Bytes>> + Send + 'a;
 
     /// The write [`Self::prepare_write`] stages.
-    type Write<'a>: PreparedWrite
-    where
-        Self: 'a;
+    type Write: PreparedWrite + 'static;
 
     /// Stages a write of `len` bytes at `position`: everything the write
     /// needs before its bytes (resolving the file, an append's offset,
     /// the destination the bytes go into) is done here, and the bytes
-    /// themselves go in through [`PreparedWrite::submit`].
+    /// themselves go in through [`PreparedWrite::fill`].
     ///
     /// A filesystem that keeps its bytes in memory resolves at once; one
     /// that sends them elsewhere awaits whatever its destination needs
@@ -493,7 +535,7 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         position: WritePosition,
         len: usize,
         now: u64,
-    ) -> impl Future<Output = FsResult<Self::Write<'a>>> + Send + 'a;
+    ) -> impl Future<Output = FsResult<Self::Write>> + Send + 'a;
 
     /// Truncates or zero-extends a regular file to `size` bytes.
     fn set_size<'a>(

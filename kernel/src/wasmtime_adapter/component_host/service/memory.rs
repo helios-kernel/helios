@@ -1,4 +1,4 @@
-use helios_hal::fs::{FsResult, Landed, PreparedWrite, WriteProgress};
+use helios_hal::fs::{FilledWrite, FsResult, Landed, PreparedWrite, WriteProgress};
 use helios_hal::vmm::{VirtAddr, VirtRange};
 use thiserror::Error;
 
@@ -836,8 +836,8 @@ impl Preview1Gather {
     ///
     /// Before each round is submitted, every page its bytes come from is
     /// brought in, and the final check that finds them all present runs
-    /// in the poll that fills them: `submit` runs its fill before it
-    /// returns, so nothing awaits between the two.
+    /// in the poll that fills them: `fill` returns synchronously, so
+    /// nothing awaits between the two.
     pub(super) async fn submit_staged<Write: PreparedWrite>(
         &mut self,
         memory: &Preview1AsyncMemory,
@@ -845,8 +845,8 @@ impl Preview1Gather {
     ) -> Result<FsResult<Landed>, GuestAccessError> {
         loop {
             self.bring_in(memory, write.staged_len()).await?;
-            let submitted = write.submit(|_, destination| self.fill_present(memory, destination));
-            match submitted.await {
+            let submitted = write.fill(|_, destination| self.fill_present(memory, destination));
+            match submitted.submit().await {
                 Ok(WriteProgress::More(next)) => write = next,
                 Ok(WriteProgress::Done(landed)) => return Ok(Ok(landed)),
                 Err(error) => return Ok(Err(error)),
@@ -1338,24 +1338,23 @@ mod tests {
     }
 
     impl PreparedWrite for RecordingWrite {
+        type Filled = FsResult<WriteProgress<Self>>;
+
         fn staged_len(&self) -> usize {
             self.len
         }
 
-        fn submit<F>(
-            self,
-            mut fill: F,
-        ) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+        fn fill<F>(self, mut fill: F) -> Self::Filled
         where
             F: FnMut(usize, &mut [u8]),
         {
             let mut destination = vec![0_u8; self.len];
             fill(0, &mut destination);
             *self.landed.lock().expect("the record is not poisoned") = Some(destination);
-            core::future::ready(Ok(WriteProgress::Done(Landed {
+            Ok(WriteProgress::Done(Landed {
                 offset: 0,
                 len: self.len,
-            })))
+            }))
         }
     }
 

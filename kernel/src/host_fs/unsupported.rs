@@ -21,7 +21,7 @@ fn unsupported<T>() -> core::future::Ready<Result<T, HostFsError>> {
 }
 
 impl HostFileSystem for UnsupportedHostFileSystem {
-    type Write<'a> = core::convert::Infallible;
+    type Write = core::convert::Infallible;
 
     /// There is no share here, so there is nothing to have cached.
     fn cache_stats(&self) -> Option<crate::HostFsCacheStats> {
@@ -76,7 +76,7 @@ impl HostFileSystem for UnsupportedHostFileSystem {
         _path: &str,
         _position: helios_hal::fs::WritePosition,
         _len: usize,
-    ) -> impl core::future::Future<Output = Result<Self::Write<'_>, HostFsError>> + Send + '_ {
+    ) -> impl core::future::Future<Output = Result<Self::Write, HostFsError>> + Send + '_ {
         unsupported()
     }
     fn sync_file(

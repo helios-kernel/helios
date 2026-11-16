@@ -7,20 +7,9 @@ use helios_inspector_protocol::transport::Client;
 
 use crate::runtime;
 
-/// Holds a transport's reader role for as long as it lives.
-///
-/// A connection is read by whoever is waiting on a call, so a session
-/// that spends time waiting on something else (the operator's next line)
-/// reads nothing, and a guest that keeps talking fills the transport and
-/// blocks on it. This runs the client's `route_frames` on a thread of
-/// its own, the same reader the driven sessions hold on their executor:
-/// calls made meanwhile are answered by it, because it routes each frame
-/// into the invocation that named it, and a waiter that finds the reader
-/// busy parks on its own invocation's signal.
-///
-/// Dropping it stops the reader and joins the thread. The stop is a
-/// channel the reader's future races, so the thread leaves its read
-/// through the executor and nothing polls.
+/// Owns the connection driver independently of any RPC future. Dropping the
+/// last session handle stops the driver, closes the connection and joins its
+/// thread. The executor races a stop channel, without polling or a Tokio runtime.
 pub(crate) struct FrameReader {
     stop: async_channel::Sender<()>,
     thread: Option<JoinHandle<()>>,

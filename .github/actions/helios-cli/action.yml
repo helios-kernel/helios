@@ -1,0 +1,79 @@
+name: helios-cli for this run
+description: >-
+  Yields the `helios-cli` binary of the checked-out commit in one cargo
+  profile and exports its path as `HELIOS_CLI_BIN`. It takes the binary
+  another job of this run already uploaded for the same commit, profile and
+  runner, and otherwise builds it and uploads it for the jobs after it.
+  `helios-cli` links Wasmtime and Cranelift for every architecture, so each
+  job that builds its own pays that compile again. Call it after the
+  Wasmtime checkout, since a build needs it.
+inputs:
+  profile:
+    description: The cargo profile, `release` or `debug`.
+    required: true
+  root:
+    description: The Helios checkout, relative to the workspace.
+    required: false
+    default: helios
+outputs:
+  path:
+    description: The binary's absolute path.
+    value: ${{ steps.name.outputs.dir }}/helios-cli
+runs:
+  using: composite
+  steps:
+    - id: name
+      shell: bash
+      env:
+        ROOT: ${{ inputs.root }}
+        PROFILE: ${{ inputs.profile }}
+      run: |
+        set -euo pipefail
+        case "${PROFILE}" in
+          release | debug) ;;
+          *) echo "::error::profile must be release or debug, not '${PROFILE}'"; exit 1 ;;
+        esac
+        commit="$(git -C "${ROOT}" rev-parse HEAD)"
+        echo "artifact=helios-cli-${commit}-${PROFILE}-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+        echo "dir=${RUNNER_TEMP}/helios-cli-${PROFILE}" >> "$GITHUB_OUTPUT"
+    # Absent until some job of this run has built it; that is the case the
+    # build below covers, so a failed download is not a failure.
+    - id: download
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ steps.name.outputs.artifact }}
+        path: ${{ steps.name.outputs.dir }}
+    - if: steps.download.outcome != 'success'
+      shell: bash
+      working-directory: ${{ inputs.root }}
+      env:
+        PROFILE: ${{ inputs.profile }}
+        DIR: ${{ steps.name.outputs.dir }}
+      run: |
+        set -euo pipefail
+        if [[ "${PROFILE}" == release ]]; then
+          cargo build --release -p helios-cli
+        else
+          cargo build -p helios-cli
+        fi
+        mkdir -p "${DIR}"
+        cp "target/${PROFILE}/helios-cli" "${DIR}/helios-cli"
+    # Jobs that started before this upload built their own; the binaries
+    # are the same commit's, so whichever lands last is the one kept.
+    - if: steps.download.outcome != 'success'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.name.outputs.artifact }}
+        path: ${{ steps.name.outputs.dir }}/helios-cli
+        if-no-files-found: error
+        overwrite: true
+        retention-days: 1
+    - shell: bash
+      env:
+        DIR: ${{ steps.name.outputs.dir }}
+      run: |
+        set -euo pipefail
+        # An artifact keeps no file mode.
+        chmod +x "${DIR}/helios-cli"
+        echo "HELIOS_CLI_BIN=${DIR}/helios-cli" >> "$GITHUB_ENV"

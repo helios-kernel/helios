@@ -37,10 +37,10 @@ use core::future::Future;
 use bytes::Bytes;
 use helios_hal::fs::{
     DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeKind,
-    OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    OpenFlags, OwnedFsPath, PreparedWrite, WritePosition, WriteProgress,
 };
 
-use super::memory::{MemoryWrite, UpperView};
+use super::memory::UpperView;
 use super::{FileContents, MemoryFs, read_all};
 use crate::BootFs;
 
@@ -226,20 +226,20 @@ impl RootFs {
 }
 
 /// A write to a namespace's root, staged at once like the tree it lands
-/// in. A boot-image file is copied up when the write is submitted, so a
+/// in. A boot-image file is copied up when the write is filled, so a
 /// write dropped before then leaves the boot layer serving the file.
-pub struct RootWrite<'a> {
-    root: &'a RootFs,
-    path: FsPath<'a>,
+pub struct RootWrite {
+    root: RootFs,
+    path: OwnedFsPath,
     position: WritePosition,
     len: usize,
     now: u64,
 }
 
-impl<'a> RootWrite<'a> {
+impl RootWrite {
     fn prepare(
-        root: &'a RootFs,
-        path: FsPath<'a>,
+        root: &RootFs,
+        path: FsPath<'_>,
         position: WritePosition,
         len: usize,
         now: u64,
@@ -250,44 +250,44 @@ impl<'a> RootWrite<'a> {
             NodeKind::Symlink => return Err(FsError::Invalid),
         }
         Ok(Self {
-            root,
-            path,
+            root: root.clone(),
+            path: path.into(),
             position,
             len,
             now,
         })
     }
 
-    fn land(self, fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
-        self.root.copy_up(self.path)?;
-        MemoryWrite::prepare(
-            &self.root.upper,
-            self.path,
+    fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
+        self.root.copy_up(self.path.as_path())?;
+        self.root.upper.write_now(
+            self.path.as_path(),
             self.position,
             self.len,
             self.now,
-        )?
-        .land(fill)
+            |destination| fill(0, destination),
+        )
     }
 }
 
-impl PreparedWrite for RootWrite<'_> {
+impl PreparedWrite for RootWrite {
+    type Filled = FsResult<WriteProgress<Self>>;
+
     fn staged_len(&self) -> usize {
         self.len
     }
 
-    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    fn fill<F>(self, fill: F) -> Self::Filled
     where
         F: FnMut(usize, &mut [u8]),
     {
-        // The copy-up and the write are done here; the future only reports
-        // them, so it holds nothing of `fill`.
-        core::future::ready(self.land(fill).map(WriteProgress::Done))
+        // Copy-up and writing finish before the source borrow ends.
+        self.land(fill).map(WriteProgress::Done)
     }
 }
 
 impl FileSystem for RootFs {
-    type Write<'a> = RootWrite<'a>;
+    type Write = RootWrite;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.find(path).map(|found| found.metadata)
@@ -322,7 +322,7 @@ impl FileSystem for RootFs {
         position: WritePosition,
         len: usize,
         now: u64,
-    ) -> impl Future<Output = FsResult<RootWrite<'a>>> + Send + 'a {
+    ) -> impl Future<Output = FsResult<RootWrite>> + Send + 'a {
         core::future::ready(RootWrite::prepare(self, path, position, len, now))
     }
 

@@ -7,8 +7,8 @@ use bytes::BytesMut;
 use helios_btrfs::FileKind;
 use helios_btrfs::write::InodeHandle;
 use helios_hal::fs::{
-    BlockDevice, FsError, FsPath, FsResult, Landed, OpenFlags, PreparedWrite, WritePosition,
-    WriteProgress,
+    BlockDevice, FilledWrite, FsError, FsPath, FsResult, Landed, OpenFlags, PreparedWrite,
+    WritePosition, WriteProgress,
 };
 use triomphe::Arc;
 
@@ -101,82 +101,91 @@ pub(super) async fn prepare<Device: BlockDevice<Buffer = BlockPages>>(
     })
 }
 
+/// A round whose bytes are in place, waiting for its lease and its submit.
+pub struct BtrfsFilled<Device: BlockDevice<Buffer = BlockPages>>(BtrfsWrite<Device>);
+
 impl<Device: BlockDevice<Buffer = BlockPages>> PreparedWrite for BtrfsWrite<Device> {
+    type Filled = BtrfsFilled<Device>;
+
     fn staged_len(&self) -> usize {
         self.bytes.len()
     }
 
-    fn submit<F>(
-        mut self,
-        mut fill: F,
-    ) -> impl core::future::Future<Output = FsResult<WriteProgress<Self>>> + Send
+    fn fill<F>(mut self, mut fill: F) -> Self::Filled
     where
         F: FnMut(usize, &mut [u8]),
     {
         fill(self.completed, &mut self.bytes);
-        async move {
-            if self._lease.held.is_none() {
-                self._lease.held = Some(self._lease.mutex.lock_owned().await);
-            }
-            let length = self.bytes.len();
-            let bytes = self.bytes.split().freeze();
-            let writer = self
-                .fs
-                .inner
-                .writer
-                .as_ref()
-                .expect("prepared on writable mount");
-            let written = writer
-                .execute(
-                    "",
-                    self.now,
-                    Operation::Write {
-                        inode: self.inode.clone(),
-                        position: self.position,
-                        bytes,
-                    },
-                )
-                .await;
-            let landed = match written {
-                Ok(Response::Written(landed)) => landed,
-                Ok(_) => unreachable!("write request returns where and how much landed"),
-                // A device that filled exactly at a round's end refuses the
-                // next round whole; the rounds before it are stored.
-                Err(FsError::NoSpace) if self.completed > 0 => {
-                    let offset = self.start.expect("a round landed before this one");
-                    return Ok(WriteProgress::Done(Landed {
-                        offset,
-                        len: self.completed,
-                    }));
-                }
-                Err(error) => return Err(error),
-            };
-            let start = *self.start.get_or_insert(landed.offset);
-            self.completed += landed.len;
-            // A round that stores less than it staged found the device
-            // full: the write ends with what landed so far. Nothing landing
-            // at all is the error, so a short write is never empty.
-            if landed.len < length {
-                return match self.completed {
-                    0 => Err(FsError::NoSpace),
-                    len => Ok(WriteProgress::Done(Landed { offset: start, len })),
-                };
-            }
-            self.remaining -= length;
-            if self.remaining == 0 {
+        BtrfsFilled(self)
+    }
+}
+
+impl<Device: BlockDevice<Buffer = BlockPages>> FilledWrite for BtrfsFilled<Device> {
+    type Next = BtrfsWrite<Device>;
+
+    async fn submit(self) -> FsResult<WriteProgress<Self::Next>> {
+        let mut this = self.0;
+        if this._lease.held.is_none() {
+            this._lease.held = Some(this._lease.mutex.lock_owned().await);
+        }
+        let length = this.bytes.len();
+        let bytes = this.bytes.split().freeze();
+        let writer = this
+            .fs
+            .inner
+            .writer
+            .as_ref()
+            .expect("prepared on writable mount");
+        let written = writer
+            .execute(
+                "",
+                this.now,
+                Operation::Write {
+                    inode: this.inode.clone(),
+                    position: this.position,
+                    bytes,
+                },
+            )
+            .await;
+        let landed = match written {
+            Ok(Response::Written(landed)) => landed,
+            Ok(_) => unreachable!("write request returns where and how much landed"),
+            // A device that filled exactly at a round's end refuses the
+            // next round whole; the rounds before it are stored.
+            Err(FsError::NoSpace) if this.completed > 0 => {
+                let offset = this.start.expect("a round landed before this one");
                 return Ok(WriteProgress::Done(Landed {
-                    offset: start,
-                    len: self.completed,
+                    offset,
+                    len: this.completed,
                 }));
             }
-            self.position = WritePosition::At(
-                landed
-                    .offset
-                    .checked_add(length as u64)
-                    .ok_or(FsError::Overflow)?,
-            );
-            self.bytes = BytesMut::zeroed(self.remaining.min(self.fs.inner.write_round));
-            Ok(WriteProgress::More(self))
+            Err(error) => return Err(error),
+        };
+        let start = *this.start.get_or_insert(landed.offset);
+        this.completed += landed.len;
+        // A round that stores less than it staged found the device
+        // full: the write ends with what landed so far. Nothing landing
+        // at all is the error, so a short write is never empty.
+        if landed.len < length {
+            return match this.completed {
+                0 => Err(FsError::NoSpace),
+                len => Ok(WriteProgress::Done(Landed { offset: start, len })),
+            };
         }
+        this.remaining -= length;
+        if this.remaining == 0 {
+            return Ok(WriteProgress::Done(Landed {
+                offset: start,
+                len: this.completed,
+            }));
+        }
+        this.position = WritePosition::At(
+            landed
+                .offset
+                .checked_add(length as u64)
+                .ok_or(FsError::Overflow)?,
+        );
+        this.bytes = BytesMut::zeroed(this.remaining.min(this.fs.inner.write_round));
+        Ok(WriteProgress::More(this))
     }
 }

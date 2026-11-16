@@ -52,6 +52,11 @@ jobs:
       CHECKOUT_PATH: ${{ inputs.root && format('{0}/helios', inputs.root) || 'helios' }}
       WASMTIME_PATH: ${{ inputs.root && format('{0}/wasmtime', inputs.root) || 'wasmtime' }}
     steps:
+      - name: Check out the shared collection tools
+        uses: actions/checkout@v4
+        with:
+          path: profile-tooling
+          ref: ${{ github.sha }}
       - uses: actions/checkout@v4
         with:
           path: helios
@@ -67,9 +72,17 @@ jobs:
           checkout-path: ${{ env.CHECKOUT_PATH }}
           network-tools: "true"
           bench-tooling: "true"
-      - uses: ./helios/.github/actions/collect-kernel-profile
+      # Read from the shared tools, since the profiled checkout may predate
+      # the action; the binary is that checkout's own commit.
+      - uses: ./profile-tooling/.github/actions/helios-cli
+        with:
+          profile: release
+          root: ${{ env.CHECKOUT_PATH }}
+      - uses: ./profile-tooling/.github/actions/collect-kernel-profile
         with:
           checkout-path: ${{ env.CHECKOUT_PATH }}
+          tooling-path: profile-tooling
+          diagnostics-name: ${{ format('kernel-profile-diagnostics-{0}', inputs.artifact || 'helios-kernel-profdata') }}
           lane: ${{ env.BENCH_LANE }}
           limine-dir: ${{ github.workspace }}/limine
           output: ${{ github.workspace }}/profiles/helios-kernel.profdata

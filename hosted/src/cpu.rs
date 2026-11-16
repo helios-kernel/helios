@@ -71,6 +71,12 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
 }
 
 impl Cpu for HostedCpu {
+    type Hypervisor = core::convert::Infallible;
+
+    fn hv(&self) -> Option<&Self::Hypervisor> {
+        None
+    }
+
     // The timer thread wakes each processor at the deadline last set for it.
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 

@@ -368,7 +368,7 @@ const fn entry_inode(index: usize) -> u64 {
 }
 
 impl FileSystem for BootFs {
-    type Write<'a> = Infallible;
+    type Write = Infallible;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.index.metadata(path)

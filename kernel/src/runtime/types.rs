@@ -1366,9 +1366,7 @@ impl HostFilledWrite for core::convert::Infallible {
 
 pub trait HostFileSystem: Clone + Send + Sync + 'static {
     /// The write [`Self::prepare_write`] stages.
-    type Write<'a>: HostWrite
-    where
-        Self: 'a;
+    type Write: HostWrite + 'static;
 
     /// How this filesystem's caches have been serving the kernel, or
     /// `None` from an implementation that caches nothing.
@@ -1434,7 +1432,7 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         path: &'a str,
         position: WritePosition,
         len: usize,
-    ) -> impl Future<Output = Result<Self::Write<'a>, HostFsError>> + Send + 'a;
+    ) -> impl Future<Output = Result<Self::Write, HostFsError>> + Send + 'a;
     /// Flushes host-side buffers for `path` (9p `Tfsync`).
     fn sync_file<'a>(
         &'a self,

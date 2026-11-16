@@ -5,13 +5,35 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/data-host-task-fast-path`):
+The local checkout must be at (branch `helios/register-component-hosts`):
 
 ```text
-685697120ea7dcf237fb5b7ef6b08fc4456c6fab
+e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e
 ```
 
-That revision adds data-only synchronous host registration to
+This revision combines the register trampoline implementation with
+`helios/borrowed-sync-wit-inputs` at `6e4440eff80a35670c7622d4be28d422ab624461`.
+Typed synchronous scalar and resource-handle imports select precompiled native
+register trampolines; other imports retain the array ABI. Canonical validation,
+resource scopes, call hooks and traps remain in the existing runtime helpers.
+
+Borrowed-input preparation extends to synchronous WIT functions
+implemented by asynchronous Rust hosts. `func_wrap_async_prepare` and bindgen's
+`borrowed | async` option complete input validation and request construction
+before the host future starts, retaining only the owned request across suspension.
+
+`helios/borrowed-host-inputs` at
+`578de3c7598ded3a324f08cab7fb2d64e7e9401b` adds scoped guest-memory borrowing to
+`helios/data-host-task-fast-path` at
+`685697120ea7dcf237fb5b7ef6b08fc4456c6fab`. `func_wrap_data_memory` separates
+mutable host data from a read-only memory view that cannot reenter guest code.
+The `borrowed` bindgen import option uses validated cursors for string and
+byte-list inputs, including aggregates. Async WIT imports prepare an owned
+request synchronously before starting their host future; guest references cannot
+cross that boundary. UTF-16 decoding, resource scopes, traps and owned results
+retain their canonical ABI behavior.
+
+`helios/data-host-task-fast-path` adds data-only synchronous host registration to
 `helios/immediate-wit-imports` at
 `dd02866a754619ca217201a91a32d2a1f0bdb08b`. `func_wrap_data` exposes only
 store data to the callback, preventing same-store guest reentry. Synchronous

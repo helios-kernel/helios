@@ -21,7 +21,6 @@ use rustyline::{
     KeyCode as RustyKeyCode, KeyEvent as RustyKeyEvent, Modifiers as RustyModifiers,
 };
 
-use crate::frame_reader::FrameReader;
 use crate::programs::{self, ProgramError, REMOTE_SHELL_PATH};
 use crate::runtime;
 use crate::serial::RpcClient;
@@ -70,11 +69,6 @@ pub enum ReplError {
     },
     #[error("failed to listen for Ctrl+C during remote shell execution: {source}")]
     Interrupt {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to start the thread that reads the guest transport: {source}")]
-    StartFrameReader {
         #[source]
         source: std::io::Error,
     },
@@ -138,12 +132,6 @@ enum ReplBuiltin {
 }
 
 pub fn run(mut client: RpcClient) -> Result<(), ReplError> {
-    // Waiting for the operator's next line asks the guest for nothing,
-    // and a guest that keeps talking into a transport nobody drains
-    // wedges. The reader is held until the session ends; calls made
-    // meanwhile are answered through it.
-    let _frame_reader =
-        FrameReader::start(&client).map_err(|source| ReplError::StartFrameReader { source })?;
     let editor = Rc::new(RefCell::new(build_editor()?));
     let mut terminal = InteractiveTerminal::new(Rc::clone(&editor));
 

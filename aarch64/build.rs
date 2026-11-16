@@ -13,6 +13,15 @@ const ENCODED_RUSTFLAGS_SEPARATOR: char = '\x1f';
 /// and the language offers no `cfg` that reports the flag, so the build
 /// refuses it here.
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(helios_hv_self_test)");
+    println!("cargo:rerun-if-env-changed=HELIOS_HV_SELF_TEST");
+    if env::var_os("HELIOS_HV_SELF_TEST").is_some() {
+        assert!(
+            env::var_os("CARGO_FEATURE_HV").is_some(),
+            "HV self-test requires the hv feature"
+        );
+        println!("cargo:rustc-cfg=helios_hv_self_test");
+    }
     // The self-test image corrupts a signed return address on the
     // bootstrap processor and expects the machine to refuse it
     // (`cfi::self_test`).

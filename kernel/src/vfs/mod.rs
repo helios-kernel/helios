@@ -70,8 +70,8 @@ use bytes::{Bytes, BytesMut};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
-    Metadata, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FilledWrite, FsError, FsPath,
+    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -117,7 +117,7 @@ macro_rules! mount_kinds {
         }
 
         impl<S: Storage> FileSystem for MountedFs<S> {
-            type Write<'a> = MountedWrite<'a, S>;
+            type Write = MountedWrite<S>;
 
             async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
                 match self { $(Self::$kind(fs) => fs.stat(path).await,)+ }
@@ -142,7 +142,7 @@ macro_rules! mount_kinds {
                 position: WritePosition,
                 len: usize,
                 now: u64,
-            ) -> FsResult<MountedWrite<'a, S>> {
+            ) -> FsResult<MountedWrite<S>> {
                 match self {
                     $(Self::$kind(fs) => {
                         fs.prepare_write(path, position, len, now).await.map(MountedWrite::$kind)
@@ -220,32 +220,41 @@ macro_rules! mount_kinds {
         }
 
         /// A write staged by whichever kind a [`MountedFs`] holds.
-        pub enum MountedWrite<'a, S: Storage> {
-            $($kind(<$fs as FileSystem>::Write<'a>),)+
+        pub enum MountedWrite<S: Storage> {
+            $($kind(<$fs as FileSystem>::Write),)+
         }
 
-        impl<'a, S: Storage> PreparedWrite for MountedWrite<'a, S> {
+        impl<S: Storage> PreparedWrite for MountedWrite<S> {
+            type Filled = MountedFilledWrite<S>;
+
             fn staged_len(&self) -> usize {
                 match self { $(Self::$kind(write) => write.staged_len(),)+ }
             }
 
-            #[expect(
-                unreachable_code,
-                reason = "the boot image refuses every write, so its staged write is `Infallible` and its arm is never reached"
-            )]
-            fn submit<F>(
-                self,
-                fill: F,
-            ) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+            #[expect(unreachable_code, reason = "read-only filesystems cannot stage writes")]
+            fn fill<F>(self, fill: F) -> Self::Filled
             where
                 F: FnMut(usize, &mut [u8]),
             {
-                // Each kind runs `fill` in this call, so the dispatch must
-                // too: the arms' futures are carried in one enum rather
-                // than awaited in an async body that would hold `fill`.
+                match self {
+                    $(Self::$kind(write) => MountedFilledWrite::$kind(write.fill(fill)),)+
+                }
+            }
+        }
+
+        /// A filled round of the mounted filesystem, with no source borrow.
+        pub enum MountedFilledWrite<S: Storage> {
+            $($kind(<<$fs as FileSystem>::Write as PreparedWrite>::Filled),)+
+        }
+
+        impl<S: Storage> FilledWrite for MountedFilledWrite<S> {
+            type Next = MountedWrite<S>;
+
+            #[expect(unreachable_code, reason = "read-only filesystems cannot stage writes")]
+            fn submit(self) -> impl Future<Output = FsResult<WriteProgress<Self::Next>>> + Send {
                 match self {
                     $(Self::$kind(write) => MountedSubmit::$kind {
-                        future: write.submit(fill),
+                        future: write.submit(),
                         marker: PhantomData,
                     },)+
                 }
@@ -262,12 +271,12 @@ macro_rules! mount_kinds {
             }
         }
 
-        impl<'a, S: Storage, $($kind),+> Future
-            for MountedSubmit<MountedWrite<'a, S>, $($kind),+>
+        impl<S: Storage, $($kind),+> Future
+            for MountedSubmit<MountedWrite<S>, $($kind),+>
         where
-            $($kind: Future<Output = FsResult<WriteProgress<<$fs as FileSystem>::Write<'a>>>>,)+
+            $($kind: Future<Output = FsResult<WriteProgress<<$fs as FileSystem>::Write>>>,)+
         {
-            type Output = FsResult<WriteProgress<MountedWrite<'a, S>>>;
+            type Output = FsResult<WriteProgress<MountedWrite<S>>>;
 
             #[expect(
                 unreachable_code,

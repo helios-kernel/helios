@@ -31,7 +31,7 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeId,
-    NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, WritePosition, WriteProgress,
 };
 use spin::Mutex;
 use triomphe::Arc;
@@ -484,22 +484,22 @@ impl MemoryState {
 }
 
 /// A write to a [`MemoryFs`], staged at once: its one round is the whole
-/// write, and its submit has the filler write straight into the file's
+/// write, and filling writes straight into the file's
 /// own storage under the tree's lock.
-pub struct MemoryWrite<'a> {
-    fs: &'a MemoryFs,
-    path: FsPath<'a>,
+pub struct MemoryWrite {
+    fs: MemoryFs,
+    path: OwnedFsPath,
     position: WritePosition,
     len: usize,
     now: u64,
 }
 
-impl<'a> MemoryWrite<'a> {
+impl MemoryWrite {
     /// Stages a write of `len` bytes to the regular file at `path`,
     /// refusing it at once when `path` names none.
     pub(super) fn prepare(
-        fs: &'a MemoryFs,
-        path: FsPath<'a>,
+        fs: &MemoryFs,
+        path: FsPath<'_>,
         position: WritePosition,
         len: usize,
         now: u64,
@@ -510,8 +510,8 @@ impl<'a> MemoryWrite<'a> {
             NodeKind::Symlink => return Err(FsError::Invalid),
         }
         Ok(Self {
-            fs,
-            path,
+            fs: fs.clone(),
+            path: path.into(),
             position,
             len,
             now,
@@ -523,7 +523,7 @@ impl<'a> MemoryWrite<'a> {
     /// the file may have changed in between.
     pub(super) fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
         self.fs.write_now(
-            self.path,
+            self.path.as_path(),
             self.position,
             self.len,
             self.now,
@@ -532,25 +532,26 @@ impl<'a> MemoryWrite<'a> {
     }
 }
 
-impl PreparedWrite for MemoryWrite<'_> {
+impl PreparedWrite for MemoryWrite {
+    type Filled = FsResult<WriteProgress<Self>>;
+
     fn staged_len(&self) -> usize {
         self.len
     }
 
-    fn submit<F>(self, fill: F) -> impl Future<Output = FsResult<WriteProgress<Self>>> + Send
+    fn fill<F>(self, fill: F) -> Self::Filled
     where
         F: FnMut(usize, &mut [u8]),
     {
-        // The write is done here, under the lock; the future only reports
-        // it, so it holds nothing of `fill`.
-        core::future::ready(self.land(fill).map(WriteProgress::Done))
+        // The result retains neither the filler nor the tree lock.
+        self.land(fill).map(WriteProgress::Done)
     }
 }
 
 impl MemoryFs {
     /// Writes `len` bytes at `position` at once: `fill` writes straight
     /// into the file's storage.
-    fn write_now(
+    pub(super) fn write_now(
         &self,
         path: FsPath<'_>,
         position: WritePosition,
@@ -582,7 +583,7 @@ impl MemoryFs {
 }
 
 impl FileSystem for MemoryFs {
-    type Write<'a> = MemoryWrite<'a>;
+    type Write = MemoryWrite;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.state.lock().metadata(self.device, path)
@@ -639,7 +640,7 @@ impl FileSystem for MemoryFs {
         position: WritePosition,
         len: usize,
         now: u64,
-    ) -> impl Future<Output = FsResult<MemoryWrite<'a>>> + Send + 'a {
+    ) -> impl Future<Output = FsResult<MemoryWrite>> + Send + 'a {
         core::future::ready(MemoryWrite::prepare(self, path, position, len, now))
     }
 
@@ -775,7 +776,7 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FsError, FsPath, Landed, NodeKind, OpenFlags,
+        DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind, OpenFlags,
         PreparedWrite, WritePosition, WriteProgress,
     };
 
@@ -905,10 +906,14 @@ mod tests {
             block_on(fs.prepare_write(path("f"), WritePosition::End, 2, 7)).expect("stages");
         assert_eq!(staged.staged_len(), 2);
         assert!(matches!(
-            block_on(staged.submit(|at, destination| {
-                assert_eq!((at, &*destination), (0, &[0, 0][..]));
-                destination.copy_from_slice(b"ef");
-            })),
+            block_on(
+                staged
+                    .fill(|at, destination| {
+                        assert_eq!((at, &*destination), (0, &[0, 0][..]));
+                        destination.copy_from_slice(b"ef");
+                    })
+                    .submit()
+            ),
             Ok(WriteProgress::Done(Landed { offset: 4, len: 2 }))
         ));
         let read = block_on(fs.read_at(path("f"), 0, 64)).expect("reads");
@@ -917,6 +922,35 @@ mod tests {
         assert_eq!((stat.size, stat.modified_nanos), (6, 7));
         block_on(fs.open(path("f"), OpenFlags::TRUNCATE, 8)).expect("truncates");
         assert_eq!(block_on(fs.stat(path("f"))).expect("stats").size, 0);
+    }
+
+    #[test]
+    fn a_filled_write_outlives_its_source() {
+        let fs = tree();
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 0)).expect("creates");
+        let source = "文件・ファイル・파일".as_bytes().to_vec();
+        let staged = {
+            let preparing_fs = fs.clone();
+            let preparing_path = String::from("f");
+            block_on(preparing_fs.prepare_write(
+                path(&preparing_path),
+                WritePosition::At(0),
+                source.len(),
+                1,
+            ))
+            .expect("stages")
+        };
+        let filled = staged.fill(|at, destination| {
+            destination.copy_from_slice(&source[at..at + destination.len()]);
+        });
+        let len = source.len();
+        drop(source);
+        assert!(matches!(
+            block_on(filled.submit()),
+            Ok(WriteProgress::Done(Landed { offset: 0, len: landed })) if landed == len
+        ));
+        let bytes = block_on(fs.read_at(path("f"), 0, 128)).expect("reads");
+        assert_eq!(bytes.as_ref(), "文件・ファイル・파일".as_bytes());
     }
 
     #[test]

@@ -557,12 +557,31 @@ struct GateEntry<'a> {
 
 impl Drop for GateEntry<'_> {
     fn drop(&mut self) {
-        let before = self
-            .gate
-            .state
-            .fetch_sub(GATE_ONE_OPERATION, Ordering::AcqRel);
+        self.gate.leave();
+    }
+}
+
+/// An operation whose owner persists across stream polls.
+struct OwnedGateEntry(Arc<SnapshotGate>);
+
+impl Drop for OwnedGateEntry {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
+
+impl SnapshotGate {
+    async fn enter_owned(gate: Arc<Self>) -> OwnedGateEntry {
+        let entry = gate.enter().await;
+        // Transfer this operation's existing count to the owning token.
+        core::mem::forget(entry);
+        OwnedGateEntry(gate)
+    }
+
+    fn leave(&self) {
+        let before = self.state.fetch_sub(GATE_ONE_OPERATION, Ordering::AcqRel);
         if before == GATE_HELD | GATE_ONE_OPERATION {
-            self.gate.drained.notify_all();
+            self.drained.notify_all();
         }
     }
 }
@@ -588,7 +607,7 @@ struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     profiles: ProfileSink,
     session: SessionCell,
     /// Closed for the length of a VMM snapshot; see the module docs.
-    gate: SnapshotGate,
+    gate: Arc<SnapshotGate>,
     tags: HandleAllocator,
     fids: HandleAllocator,
     cache: HostFsCache,
@@ -634,7 +653,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         Self {
             inner: Arc::new(ClientInner {
                 session: SessionCell::new(),
-                gate: SnapshotGate::new(),
+                gate: Arc::new(SnapshotGate::new()),
                 tags: HandleAllocator::new(
                     depth,
                     u32::from(P9_NOTAG),
@@ -1423,8 +1442,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         path: &'a str,
         position: WritePosition,
         len: usize,
-    ) -> Result<HostFsWrite<'a, Transport, CpuImpl>, HostFsError> {
-        let inside = self.inner.gate.enter().await;
+    ) -> Result<HostFsWrite<Transport, CpuImpl>, HostFsError> {
+        let inside = SnapshotGate::enter_owned(self.inner.gate.clone()).await;
         self.clunk_abandoned().await;
         let started = self.profile_start();
         let phase = match position {
@@ -1434,10 +1453,10 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         match self.open_for_write(path, position, len).await {
             Ok((session, fid, landed)) => {
                 let mut write = HostFsWrite {
-                    client: self,
-                    path,
+                    client: self.clone(),
+                    path: String::from(path),
                     session,
-                    fid: Some(fid),
+                    fid: Some(fid.retain()),
                     _inside: inside,
                     started,
                     phase,
@@ -1909,7 +1928,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
 impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
     for HostFsClient<Transport, CpuImpl>
 {
-    type Write<'a> = HostFsWrite<'a, Transport, CpuImpl>;
+    type Write = HostFsWrite<Transport, CpuImpl>;
 
     fn cache_stats(&self) -> Option<HostFsCacheStats> {
         Some(self.cache_stats())
@@ -1974,7 +1993,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         path: &'a str,
         position: WritePosition,
         len: usize,
-    ) -> Result<HostFsWrite<'a, Transport, CpuImpl>, HostFsError> {
+    ) -> Result<HostFsWrite<Transport, CpuImpl>, HostFsError> {
         self.prepare_write_impl(path, position, len).await
     }
 
@@ -2111,14 +2130,14 @@ fn p9_optional_timestamp(flag: u32, nanos: Option<u64>) -> (u32, u64, u64) {
 /// sends, and the kernel memory a write holds is bounded
 /// by the request pool, never by the write's length. Each frame's tag is
 /// allocated when it is sent, so a staged frame holds no tag.
-pub struct HostFsWrite<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
-    client: &'a HostFsClient<Transport, CpuImpl>,
-    path: &'a str,
+pub struct HostFsWrite<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
+    client: HostFsClient<Transport, CpuImpl>,
+    path: String,
     session: Session,
     /// The fid open for writing, until the write is finished or dropped.
-    fid: Option<Handle<'a>>,
+    fid: Option<u32>,
     /// Counts the write as an operation in flight for a snapshot hold.
-    _inside: GateEntry<'a>,
+    _inside: OwnedGateEntry,
     started: Option<HostFsPerfStart>,
     /// `op-write` or `op-append`.
     phase: &'static str,
@@ -2132,20 +2151,19 @@ pub struct HostFsWrite<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
 }
 
 /// A round of a [`HostFsWrite`] whose frames are filled.
-pub struct FilledHostFsWrite<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
-    write: HostFsWrite<'a, Transport, CpuImpl>,
+pub struct FilledHostFsWrite<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
+    write: HostFsWrite<Transport, CpuImpl>,
 }
 
-impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<'_, Transport, CpuImpl> {
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<Transport, CpuImpl> {
     /// Readies the frames of the round that starts at `staged_from`: the
     /// header of each `Twrite`, and a payload region of its length.
     fn stage_round(&mut self) {
         let chunk = self.session.payload_chunk();
-        let fid = self
+        let fid = *self
             .fid
             .as_ref()
-            .expect("a write is staged only while its fid is open")
-            .value();
+            .expect("a write is staged only while its fid is open");
         let end = self.round_end();
         let mut at = self.staged_from;
         self.frames.clear();
@@ -2188,7 +2206,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<'_, Transport
     /// Sends this round's frames in order, each under a tag of its own,
     /// and checks that the host took every byte of each.
     async fn send_round(&mut self) -> Result<(), HostFsError> {
-        let client = self.client;
+        let client = &self.client;
         for mut frame in self.frames.drain(..) {
             let count = frame.len() - P9_TWRITE_HEADER_LEN;
             let tag = client.inner.tags.allocate()?;
@@ -2211,9 +2229,9 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<'_, Transport
     /// bytes that landed — all of them, or none for a failed write.
     async fn finish(&mut self, landed_all: bool) {
         if let Some(fid) = self.fid.take() {
-            self.client.clunk(fid).await;
+            self.client.clunk_value(fid).await;
         }
-        self.client.invalidate_contents(self.path).await;
+        self.client.invalidate_contents(&self.path).await;
         if let Some(started) = self.started {
             let bytes = if landed_all { self.len } else { 0 };
             self.client.record_phase(self.phase, started, 1, bytes);
@@ -2221,10 +2239,10 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<'_, Transport
     }
 }
 
-impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostWrite
-    for HostFsWrite<'a, Transport, CpuImpl>
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostWrite
+    for HostFsWrite<Transport, CpuImpl>
 {
-    type Filled = FilledHostFsWrite<'a, Transport, CpuImpl>;
+    type Filled = FilledHostFsWrite<Transport, CpuImpl>;
 
     fn staged_len(&self) -> usize {
         self.round_end() - self.staged_from
@@ -2244,10 +2262,10 @@ impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostWrite
     }
 }
 
-impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
-    for FilledHostFsWrite<'a, Transport, CpuImpl>
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
+    for FilledHostFsWrite<Transport, CpuImpl>
 {
-    type Next = HostFsWrite<'a, Transport, CpuImpl>;
+    type Next = HostFsWrite<Transport, CpuImpl>;
 
     async fn submit(self) -> Result<WriteProgress<Self::Next>, HostFsError> {
         let mut write = self.write;
@@ -2272,15 +2290,13 @@ impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
 /// with the vector that holds them, and its fid to the server through
 /// the abandoned list. The caches forget the file: a round may have
 /// landed, in whole or, if a submit was dropped part way, in part.
-impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> Drop
-    for HostFsWrite<'_, Transport, CpuImpl>
-{
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> Drop for HostFsWrite<Transport, CpuImpl> {
     fn drop(&mut self) {
         let Some(fid) = self.fid.take() else {
             return;
         };
-        self.client.abandon_fid(fid.retain());
-        if let Some(orphaned) = self.client.inner.cache.invalidate_contents(self.path) {
+        self.client.abandon_fid(fid);
+        if let Some(orphaned) = self.client.inner.cache.invalidate_contents(&self.path) {
             self.client.abandon_fid(orphaned);
         }
     }
@@ -3295,11 +3311,7 @@ mod tests {
                 .prepare_write("/alpha", WritePosition::At(0), 4)
                 .await
                 .expect("prepare");
-            let fid = staged
-                .fid
-                .as_ref()
-                .expect("a staged write holds its fid")
-                .value();
+            let fid = *staged.fid.as_ref().expect("a staged write holds its fid");
             drop(staged.fill(|_, destination| destination.fill(b'z')));
             assert_eq!(
                 client.inner.fids.live_count(),
@@ -3331,11 +3343,7 @@ mod tests {
                 .prepare_write("/alpha", WritePosition::End, 4)
                 .await
                 .expect("prepare");
-            let fid = staged
-                .fid
-                .as_ref()
-                .expect("a staged write holds its fid")
-                .value();
+            let fid = *staged.fid.as_ref().expect("a staged write holds its fid");
             drop(staged);
             client.prepare_snapshot().await;
             assert!(transport.log().clunked.contains(&fid));

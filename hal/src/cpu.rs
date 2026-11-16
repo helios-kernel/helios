@@ -306,6 +306,14 @@ pub struct ReturnAddressSigning {
 }
 
 pub trait Cpu: Send + Sync + 'static {
+    type Hypervisor: crate::hv::Hypervisor;
+
+    /// Hardware virtualization is absent unless the backend exposes a usable
+    /// factory, including Stage-2 translation and hardware-bounded entry.
+    fn hv(&self) -> Option<&Self::Hypervisor> {
+        None
+    }
+
     /// How this platform's timer interrupt is scheduled.
     ///
     /// A deadline published for another processor has to reach that
