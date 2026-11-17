@@ -432,12 +432,14 @@ impl ProgramSource {
     /// Classifies bytes no boot payload vouches for: a file a guest
     /// wrote, on whichever mount, or one a host shared.
     fn from_untrusted(bytes: Bytes) -> Self {
-        // A Wasmtime artifact is an ELF file too, so it is recognised first.
         if cwasm::is_cwasm(&bytes) {
             return Self::SignedArtifact(bytes);
         }
+        // A Wasmtime artifact is an ELF file too, so one without a
+        // signature is raw bytes for the wasm validator to refuse, never
+        // a Linux program.
         #[cfg(feature = "linux")]
-        if is_linux_elf(&bytes) {
+        if WasmtimePrecompiledKind::detect(&bytes).is_none() && is_linux_elf(&bytes) {
             return Self::LinuxElf(bytes);
         }
         Self::RawWasm(bytes)
