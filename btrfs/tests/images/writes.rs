@@ -468,7 +468,8 @@ fn linux_authority_survives_unrelated_writes() {
         let device = authority(&writer, "中文设备").await;
         assert_eq!(suid.permissions, 0o4755);
         assert_eq!(device.kind, helios_btrfs::FileKind::CharDevice);
-        assert_ne!(device.rdev, 0);
+        // `mkfs.btrfs --rootdir` stores every rdev as 0 (btrfs-progs
+        // mkfs/rootdir.c), so only its preservation below is checked.
         assert_eq!(suid.security.as_deref(), Some(LABEL));
         assert_eq!(device.security.as_deref(), Some(LABEL));
 
