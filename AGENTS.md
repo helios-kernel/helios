@@ -136,6 +136,13 @@ maintainer's decision and the fork's revision moves once, per §1.
   boot and sealing, and never data I/O.
 - A well-maintained, `no_std`-friendly third-party crate beats a hand-rolled
   implementation.
+- Kernel-mode code is safe Rust above two kinds of boundary: `hal/` and the
+  backends, where `unsafe` touches hardware, and a safe, ergonomic Rust API
+  whose implementation confines the `unsafe` it needs and states each
+  precondition. A component whose work needs `unsafe` throughout (a driver
+  speaking a C ABI, a parser of untrusted formats, a protocol engine over raw
+  memory) runs in user mode, inside the wasm sandbox, as a program or kernel
+  plugin, so that its defects end an instance rather than corrupt the kernel.
 
 ### 3.2 Rust style
 
