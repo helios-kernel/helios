@@ -19,7 +19,7 @@ use crate::key::Key;
 use crate::ondisk::{NAME_MAX, SYMLINK_MAX, item_type, objectid};
 use crate::source::BlockSource;
 use crate::superblock::{self, Superblock};
-use crate::tree::{Cursor, TreeRoot};
+use crate::tree::{Cursor, Node, TreeRoot};
 use crate::volume::{Mapping, Volume};
 
 /// Most symlinks one path resolution follows, as Linux's `MAXSYMLINKS`.
@@ -39,15 +39,17 @@ pub const MAX_SYMLINK_FOLLOWS: usize = 40;
 /// eight, each one node size) and a bounded data window, and frees them
 /// when it finishes.
 ///
-/// An [`Inode`] records the tree root of the commit it was read from, so
-/// operations on it see that commit's state whatever happens afterwards.
+/// An [`Inode`] records the view it was read from — a commit, or with the
+/// `write` feature the running transaction as of an accepted mutation — so
+/// operations on it see that view's state whatever happens afterwards.
 #[derive(Clone)]
 pub struct Filesystem<S> {
     snapshot: Arc<Snapshot>,
     volume: Volume<S>,
 }
 
-/// Every tree and address translation needed to read a committed generation.
+/// Every tree and address translation needed to read one view: a committed
+/// generation, or the running transaction as of an accepted mutation.
 /// Inodes retain this whole view, including its retirement pin.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
@@ -55,7 +57,53 @@ pub(crate) struct Snapshot {
     pub(crate) root_tree: TreeRoot,
     csum_tree: TreeRoot,
     default_subvolume: RootRecord,
+    /// The running transaction's state this view reads through; `None` for
+    /// a committed generation.
+    #[cfg(feature = "write")]
+    pub(crate) running: Option<Running>,
 }
+
+/// What a view of the running transaction holds beyond a committed
+/// generation's roots. Every collection is persistent, so taking a view is a
+/// handful of reference-count increments, and the writer's later edits copy
+/// only the paths they change.
+#[cfg(feature = "write")]
+pub(crate) struct Running {
+    /// The transaction's private tree blocks, read before the device.
+    trees: crate::tree::write::Trees,
+    /// The subvolume roots as the transaction has moved them. The root tree
+    /// records them only at commit, so a view looks them up here.
+    roots: crate::roots::Roots,
+    /// The private data extents this view reaches. The writer keeps them
+    /// from reuse while the view lives.
+    data: rpds::RedBlackTreeMapSync<u64, u64>,
+    /// The generation the transaction started from: blocks it retired stay
+    /// pinned while this view can still read them.
+    base: Arc<Snapshot>,
+}
+
+#[cfg(feature = "write")]
+impl core::fmt::Debug for Running {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Running")
+            .field("base", &self.base.mapping.superblock.generation())
+            .field("private_data_extents", &self.data.size())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Two views of a running transaction are the same view only when they are
+/// one value: an overlay has no cheaper identity.
+#[cfg(feature = "write")]
+impl PartialEq for Running {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self, other)
+    }
+}
+
+#[cfg(feature = "write")]
+impl Eq for Running {}
 
 #[cfg(feature = "write")]
 impl Snapshot {
@@ -73,7 +121,88 @@ impl Snapshot {
                 root: roots.get(self.default_subvolume.root.tree)?,
                 root_dirid: self.default_subvolume.root_dirid,
             },
+            running: None,
         }))
+    }
+
+    /// A view of the running transaction started from `base`, as its state
+    /// stands now.
+    pub(crate) fn running(
+        base: &Arc<Self>,
+        mapping: Arc<Mapping>,
+        roots: &crate::roots::Roots,
+        checksums: TreeRoot,
+        trees: &crate::tree::write::Trees,
+        data: rpds::RedBlackTreeMapSync<u64, u64>,
+    ) -> Result<Arc<Self>, crate::tree::write::WriteError> {
+        Ok(Arc::new(Self {
+            mapping,
+            root_tree: roots.root,
+            csum_tree: checksums,
+            default_subvolume: RootRecord {
+                root: roots.get(base.default_subvolume.root.tree)?,
+                root_dirid: base.default_subvolume.root_dirid,
+            },
+            running: Some(Running {
+                trees: trees.clone(),
+                roots: roots.clone(),
+                data,
+                base: base.clone(),
+            }),
+        }))
+    }
+
+    /// Whether this view reaches the private data extent at `address`.
+    pub(crate) fn reaches_private_data(&self, address: u64) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|running| running.data.contains_key(&address))
+    }
+}
+
+impl Snapshot {
+    /// The tree blocks this view reads, through its own mapping.
+    fn nodes<'a, S: BlockSource>(&'a self, volume: &'a Volume<S>) -> Nodes<'a, S> {
+        Nodes {
+            volume: volume.view(&self.mapping),
+            #[cfg(feature = "write")]
+            overlay: self.running.as_ref().map(|running| &running.trees),
+        }
+    }
+
+    /// The newest root record of `tree` as this view sees it.
+    async fn find_root<S: BlockSource>(
+        &self,
+        nodes: &Nodes<'_, S>,
+        tree: u64,
+    ) -> Result<RootRecord, Error> {
+        #[cfg(feature = "write")]
+        if let Some(running) = &self.running {
+            return running.roots.record(tree);
+        }
+        find_root(&nodes.volume, self.root_tree, tree).await
+    }
+}
+
+/// Where a view's tree blocks come from: the running transaction's private
+/// blocks first when the view has them, then the device.
+struct Nodes<'a, S> {
+    volume: Volume<&'a S>,
+    #[cfg(feature = "write")]
+    overlay: Option<&'a crate::tree::write::Trees>,
+}
+
+impl<S: BlockSource> crate::tree::NodeSource for Nodes<'_, S> {
+    async fn read_node(
+        &self,
+        logical: u64,
+        expected: crate::tree::Expected,
+    ) -> Result<Node, Error> {
+        #[cfg(feature = "write")]
+        if let Some(trees) = self.overlay {
+            return trees.read(&self.volume, logical, expected).await;
+        }
+        Node::read(&self.volume, logical, expected).await
     }
 }
 
@@ -209,6 +338,8 @@ impl<S: BlockSource> Filesystem<S> {
                 root_tree,
                 csum_tree,
                 default_subvolume,
+                #[cfg(feature = "write")]
+                running: None,
             }),
             volume,
         })
@@ -236,8 +367,9 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(u64, u64),
     {
+        let nodes = self.snapshot.nodes(&self.volume);
         let mut cursor =
-            Cursor::ceiling(&self.volume, self.snapshot.root_tree, Key::new(0, 0, 0)).await?;
+            Cursor::ceiling(&nodes, self.snapshot.root_tree, Key::new(0, 0, 0)).await?;
         let mut previous: Option<(u64, u64)> = None;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if key.item_type == item_type::ROOT_ITEM
@@ -257,7 +389,7 @@ impl<S: BlockSource> Filesystem<S> {
                 }
                 previous = Some((key.objectid, record.root_dirid));
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&nodes).await?;
         }
         if let Some((tree, root_inode)) = previous {
             visit(tree, root_inode);
@@ -277,16 +409,18 @@ impl<S: BlockSource> Filesystem<S> {
 
     /// The root directory of subvolume `tree`.
     pub async fn subvolume_root(&self, tree: u64) -> Result<Inode, Error> {
-        let record = find_root(&self.volume, self.snapshot.root_tree, tree).await?;
+        let nodes = self.snapshot.nodes(&self.volume);
+        let record = self.snapshot.find_root(&nodes, tree).await?;
         self.load_inode(record.root, record.root_dirid, &self.snapshot)
             .await
     }
 
-    /// Inode `number` of subvolume `tree`, as of this view's commit. For a
-    /// caller that holds an inode's identity across commits and needs its
-    /// current state, such as a network or FUSE server.
+    /// Inode `number` of subvolume `tree`, as of this view. For a caller
+    /// that holds an inode's identity across views and needs its current
+    /// state, such as a network or FUSE server.
     pub async fn inode(&self, tree: u64, number: u64) -> Result<Inode, Error> {
-        let record = find_root(&self.volume, self.snapshot.root_tree, tree).await?;
+        let nodes = self.snapshot.nodes(&self.volume);
+        let record = self.snapshot.find_root(&nodes, tree).await?;
         self.load_inode(record.root, number, &self.snapshot).await
     }
 
@@ -296,9 +430,9 @@ impl<S: BlockSource> Filesystem<S> {
         number: u64,
         snapshot: &Arc<Snapshot>,
     ) -> Result<Inode, Error> {
-        let volume = self.volume.view(&snapshot.mapping);
+        let nodes = snapshot.nodes(&self.volume);
         let key = Key::new(number, item_type::INODE_ITEM, 0);
-        let cursor = Cursor::ceiling(&volume, root, key).await?;
+        let cursor = Cursor::ceiling(&nodes, root, key).await?;
         let (Some(found), Some(item)) = (cursor.key(), cursor.item()) else {
             return Err(Error::MissingInode {
                 tree: root.tree,
@@ -328,8 +462,8 @@ impl<S: BlockSource> Filesystem<S> {
         match target {
             EntryTarget::Inode(number) => self.load_inode(dir.root, number, &dir.snapshot).await,
             EntryTarget::Subvolume(tree) => {
-                let volume = self.volume.view(&dir.snapshot.mapping);
-                let record = find_root(&volume, dir.snapshot.root_tree, tree).await?;
+                let nodes = dir.snapshot.nodes(&self.volume);
+                let record = dir.snapshot.find_root(&nodes, tree).await?;
                 self.load_inode(record.root, record.root_dirid, &dir.snapshot)
                     .await
             }
@@ -344,14 +478,14 @@ impl<S: BlockSource> Filesystem<S> {
     /// Looks `name` up in directory `dir`. `None` when no entry has that
     /// name; `.` and `..` are not stored and are never found.
     pub async fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Option<Inode>, Error> {
-        let volume = self.volume.view(&dir.snapshot.mapping);
+        let nodes = dir.snapshot.nodes(&self.volume);
         dir.expect_kind(FileKind::Directory)?;
         if name.is_empty() || name.len() > NAME_MAX {
             return Ok(None);
         }
         let key = Key::new(dir.number, item_type::DIR_ITEM, name_hash(name));
         let target = {
-            let cursor = Cursor::ceiling(&volume, dir.root, key).await?;
+            let cursor = Cursor::ceiling(&nodes, dir.root, key).await?;
             find_record(&cursor, key, name, RecordKind::Entry)?.map(|record| record.target())
         };
         match target {
@@ -375,10 +509,10 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(DirEntry<'_>) -> ControlFlow<()>,
     {
-        let volume = self.volume.view(&dir.snapshot.mapping);
+        let nodes = dir.snapshot.nodes(&self.volume);
         dir.expect_kind(FileKind::Directory)?;
         let start = Key::new(dir.number, item_type::DIR_INDEX, from.0);
-        let mut cursor = Cursor::ceiling(&volume, dir.root, start).await?;
+        let mut cursor = Cursor::ceiling(&nodes, dir.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if !key.is(dir.number, item_type::DIR_INDEX) {
                 break;
@@ -397,7 +531,7 @@ impl<S: BlockSource> Filesystem<S> {
             if visit(entry).is_break() {
                 return Ok(Some(DirPosition(key.offset)));
             }
-            cursor.advance(&volume).await?;
+            cursor.advance(&nodes).await?;
         }
         Ok(None)
     }
@@ -416,8 +550,8 @@ impl<S: BlockSource> Filesystem<S> {
     #[cfg(feature = "test-support")]
     pub async fn file_extents(&self, file: &Inode) -> Result<Vec<ExtentInfo>, Error> {
         file.expect_kind(FileKind::Regular)?;
-        let volume = self.volume.view(&file.snapshot.mapping);
-        crate::data::Reader::new(&volume, &volume, file.snapshot.csum_tree)
+        let nodes = file.snapshot.nodes(&self.volume);
+        crate::data::Reader::new(&nodes.volume, &nodes, file.snapshot.csum_tree)
             .extents(crate::data::File {
                 root: file.root,
                 number: file.number,
@@ -453,12 +587,12 @@ impl<S: BlockSource> Filesystem<S> {
         name: &[u8],
         buf: &mut [u8],
     ) -> Result<Option<usize>, Error> {
-        let volume = self.volume.view(&inode.snapshot.mapping);
+        let nodes = inode.snapshot.nodes(&self.volume);
         if name.is_empty() || name.len() > NAME_MAX {
             return Ok(None);
         }
         let key = Key::new(inode.number, item_type::XATTR_ITEM, name_hash(name));
-        let cursor = Cursor::ceiling(&volume, inode.root, key).await?;
+        let cursor = Cursor::ceiling(&nodes, inode.root, key).await?;
         let Some(record) = find_record(&cursor, key, name, RecordKind::Xattr)? else {
             return Ok(None);
         };
@@ -473,9 +607,9 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(&[u8]) -> ControlFlow<()>,
     {
-        let volume = self.volume.view(&inode.snapshot.mapping);
+        let nodes = inode.snapshot.nodes(&self.volume);
         let start = Key::new(inode.number, item_type::XATTR_ITEM, 0);
-        let mut cursor = Cursor::ceiling(&volume, inode.root, start).await?;
+        let mut cursor = Cursor::ceiling(&nodes, inode.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if !key.is(inode.number, item_type::XATTR_ITEM) {
                 break;
@@ -490,7 +624,7 @@ impl<S: BlockSource> Filesystem<S> {
                     return Ok(());
                 }
             }
-            cursor.advance(&volume).await?;
+            cursor.advance(&nodes).await?;
         }
         Ok(())
     }
@@ -566,8 +700,8 @@ impl<S: BlockSource> Filesystem<S> {
     }
 
     async fn read_range(&self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        let volume = self.volume.view(&inode.snapshot.mapping);
-        crate::data::Reader::new(&volume, &volume, inode.snapshot.csum_tree)
+        let nodes = inode.snapshot.nodes(&self.volume);
+        crate::data::Reader::new(&nodes.volume, &nodes, inode.snapshot.csum_tree)
             .read(
                 crate::data::File {
                     root: inode.root,
@@ -587,8 +721,8 @@ impl<S: BlockSource> Filesystem<S> {
         logical: u64,
         len: usize,
     ) -> Result<Vec<u8>, Error> {
-        let volume = self.volume.view(&snapshot.mapping);
-        crate::data::Reader::new(&volume, &volume, snapshot.csum_tree)
+        let nodes = snapshot.nodes(&self.volume);
+        crate::data::Reader::new(&nodes.volume, &nodes, snapshot.csum_tree)
             .lookup_checksums(logical, len)
             .await
     }
