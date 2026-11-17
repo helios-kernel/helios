@@ -4513,6 +4513,31 @@ mod tests {
     }
 
     #[test]
+    fn stdio_and_pipe_descriptors_report_character_device_filestat() {
+        let (writer, reader) = crate::byte_channel();
+        let descriptors: [TestDescriptor; 5] = [
+            Preview1Descriptor::Stdin {
+                carry: Bytes::new(),
+            },
+            Preview1Descriptor::Stdout,
+            Preview1Descriptor::Stderr,
+            Preview1Descriptor::PipeRead { reader },
+            Preview1Descriptor::PipeWrite { writer },
+        ];
+        for descriptor in &descriptors {
+            let (identity, stat) =
+                p1_synthetic_descriptor_stat(descriptor).expect("stdio/pipe must have filestat");
+            assert_eq!(identity.domain(), crate::AuthorityDomain::GUEST_DEVICES);
+            assert_ne!(identity.local(), 0);
+            assert_ne!(identity, p1_null_device_identity());
+            assert!(matches!(
+                stat.type_,
+                fs_types::DescriptorType::CharacterDevice
+            ));
+        }
+    }
+
+    #[test]
     fn wasix_socket_time_options_are_descriptor_local_state() {
         let mut descriptor: TestSocketDescriptor =
             WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {

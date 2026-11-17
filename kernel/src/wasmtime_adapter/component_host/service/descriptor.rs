@@ -1500,6 +1500,32 @@ pub(super) fn p1_null_device_identity() -> crate::ObjectIdentity {
     crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 1)
 }
 
+/// Synthetic `filestat` for open descriptors with no backing filesystem path
+/// (`/dev/null`, standard streams, and pipes), so `fstat(0..=2)` in Preview 1
+/// runtimes (`wasi-libc` / CPython `init_sys_streams`) sees valid character
+/// descriptors rather than `EBADF`.
+pub(super) fn p1_synthetic_descriptor_stat<Net: ComponentHostNetwork>(
+    descriptor: &Preview1Descriptor<Net>,
+) -> Option<(crate::ObjectIdentity, fs_types::DescriptorStat)> {
+    let identity = match descriptor {
+        Preview1Descriptor::NullDevice => p1_null_device_identity(),
+        Preview1Descriptor::Stdin { .. } => {
+            crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 2)
+        }
+        Preview1Descriptor::Stdout => {
+            crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 3)
+        }
+        Preview1Descriptor::Stderr => {
+            crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 4)
+        }
+        Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => {
+            crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 5)
+        }
+        _ => return None,
+    };
+    Some((identity, p1_null_device_stat()))
+}
+
 pub(super) fn p1_directory_descriptor<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&FsDescriptor> {
