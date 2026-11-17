@@ -191,7 +191,7 @@ maintainer's decision and the fork's revision moves once, per §1.
 - The HTTP client is a kernel plugin (`programs/http-client`): the kernel
   implements `wasi:http/types` only and forwards `wasi:http/client.send`
   through a typed provider slot to the plugin's `wasi:http/handler`; HTTP/1.1
-  framing, DNS and, later, TLS run in user memory. The provider slot is the
+  framing, DNS and TLS run in user memory. The provider slot is the
   route for any future interface a plugin serves.
 - Plugins share the user-memory and allocation contract of every program.
   There is no plugin-private allocator policy, memory floor, or oversized
