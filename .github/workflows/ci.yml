@@ -2843,6 +2843,12 @@ jobs:
         shell: bash
         run: |
           shopt -s nullglob
+          # The kernel logs each segfault with the faulting library and
+          # offset, and udmabuf logs the allocations it refuses.
+          echo "::group::kernel log"
+          sudo dmesg | tail -n 100
+          grep -H . /sys/module/udmabuf/parameters/* || true
+          echo "::endgroup::"
           # The kernel truncates %e to 15 bytes of the command name.
           for core in "$RUNNER_TEMP"/core.qemu-system-x86.*; do
             echo "::group::backtrace of $core"
