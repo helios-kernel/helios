@@ -1023,6 +1023,41 @@ jobs:
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      - name: Run static Linux programs through dash
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+        run: |
+          # The aarch64 half of the native Linux check (#1025): the same
+          # programs built for aarch64 run at EL0 under the lane's QEMU.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/linux"
+          mkdir -p "$runtime"
+          bash linux/tests/build-fixtures.sh "$runtime/bootfs" aarch64
+          # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
+          # shellcheck disable=SC2016
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg --kernel-feature linux \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --boot-program dash --boot-program debugger --boot-program cat \
+            --no-compiler-plugin \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"' \
+            2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
+          cat linux-smoke.out
+          grep -Fqx 'arg1=3' linux-smoke.out
+          grep -Fqx 'arg2=中文' linux-smoke.out
+          grep -Fqx 'arg3=日本語' linux-smoke.out
+          grep -Fqx 'arg4=한국어' linux-smoke.out
+          grep -Fqx 'environment:ok' linux-smoke.out
+          grep -Fqx 'status:3' linux-smoke.out
+          grep -Fqx 'native Linux syscall: ok' linux-smoke.out
+          grep -Fqx 'hello:0' linux-smoke.out
+          grep -Fqx 'Hello, World!' linux-smoke.out
+          grep -Fqx 'libc:0' linux-smoke.out
+          grep -Fqx 'fault:139' linux-smoke.out
       - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
@@ -1067,38 +1102,6 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
-      - name: Run static Linux programs through dash
-        timeout-minutes: 10
-        shell: bash
-        working-directory: helios
-        run: |
-          # The aarch64 half of the native Linux check (#1025): the same
-          # programs built for aarch64 run at EL0 under the lane's QEMU.
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/linux"
-          mkdir -p "$runtime"
-          bash linux/tests/build-fixtures.sh "$runtime/bootfs" aarch64
-          # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
-          # shellcheck disable=SC2016
-          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
-            --accel tcg --kernel-feature linux \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --bootfs-root "$runtime/bootfs" \
-            --boot-program dash --boot-program debugger --boot-program cat \
-            --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"' \
-            2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
-          cat linux-smoke.out
-          grep -Fqx 'arg1=3' linux-smoke.out
-          grep -Fqx 'arg2=中文' linux-smoke.out
-          grep -Fqx 'arg3=日本語' linux-smoke.out
-          grep -Fqx 'arg4=한국어' linux-smoke.out
-          grep -Fqx 'environment:ok' linux-smoke.out
-          grep -Fqx 'status:3' linux-smoke.out
-          grep -Fqx 'native Linux syscall: ok' linux-smoke.out
-          grep -Fqx 'hello:0' linux-smoke.out
-          grep -Fqx 'Hello, World!' linux-smoke.out
-          grep -Fqx 'libc:0' linux-smoke.out
-          grep -Fqx 'fault:139' linux-smoke.out
       - uses: ./helios/.github/actions/swtpm
       # Measured boot (#602): the kernel's signing seed is sealed in the
       # TPM to the boot chain. The ACPI description is the boot whose
