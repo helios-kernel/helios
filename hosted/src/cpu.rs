@@ -72,6 +72,7 @@ extern "Rust" fn helios_current_processor() -> ProcessorId {
 
 impl Cpu for HostedCpu {
     type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
 
     fn hv(&self) -> Option<&Self::Hypervisor> {
         None

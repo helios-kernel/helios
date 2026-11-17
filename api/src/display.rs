@@ -50,8 +50,6 @@ pub enum DisplayError {
     OutOfMemory,
     #[error("the display engine cannot scan out a blob")]
     NoBlobScanout,
-    #[error("the blob's gpu session has ended")]
-    StaleBlob,
     #[error("the display engine faulted")]
     DeviceFault,
     #[error("this program's heap cannot supply the frame buffer: {0}")]
@@ -71,7 +69,6 @@ impl From<raw::Error> for DisplayError {
             raw::Error::BadSpan => Self::BadSpan,
             raw::Error::OutOfMemory => Self::OutOfMemory,
             raw::Error::NoBlobScanout => Self::NoBlobScanout,
-            raw::Error::StaleBlob => Self::StaleBlob,
             raw::Error::DeviceFault => Self::DeviceFault,
         }
     }
@@ -144,30 +141,25 @@ impl Display {
         })
     }
 
-    /// Point `scanout` at a `mode` frame in `format` read straight out
-    /// of a renderer's blob, starting `offset` bytes in, `stride` bytes
-    /// from one row to the next.
-    ///
-    /// Nothing is copied or pinned: the frame is whatever was drawn into
-    /// the blob, and [`BlobSurface::present`] tells the scanout to
-    /// re-read it. The surface keeps the blob alive on the device, so
-    /// the two may be dropped in either order: the scanout is blanked
-    /// before the blob is destroyed.
-    pub async fn create_from_blob(
+    /// Scan out an image, retaining its storage until this surface is dropped.
+    pub async fn create_from_image(
         &self,
         scanout: u32,
-        mode: Mode,
-        format: PixelFormat,
-        blob: &crate::bindings::helios::system::gpu::Blob,
-        offset: u32,
-        stride: u32,
-    ) -> Result<BlobSurface, DisplayError> {
+        image: &crate::image::Image,
+    ) -> Result<ImageSurface, DisplayError> {
+        let layout = image.layout();
         let raw = self
             .raw
-            .create_from_blob(scanout, mode, format, blob, offset, stride)
+            .create_from_image(scanout, image.handle())
             .await
             .map_err(DisplayError::from)?;
-        Ok(BlobSurface { raw, mode })
+        Ok(ImageSurface {
+            raw,
+            mode: Mode {
+                width: layout.width,
+                height: layout.height,
+            },
+        })
     }
 
     /// Every change to the device's set of outputs, from now on.
@@ -176,16 +168,18 @@ impl Display {
     }
 }
 
-/// One output scanning a frame out of a renderer's blob.
-///
-/// The blob stays the renderer's: dropping the surface takes it off its
-/// output and leaves the blob as it was.
-pub struct BlobSurface {
+/// One output scanning an image whose storage is retained until it is blanked.
+pub struct ImageSurface {
     raw: raw::Surface,
     mode: Mode,
 }
 
-impl BlobSurface {
+impl ImageSurface {
+    /// Display this image again, retiring the output's previous surface.
+    pub async fn activate(&self) -> Result<(), DisplayError> {
+        self.raw.activate().await.map_err(DisplayError::from)
+    }
+
     /// The mode this surface was created at.
     pub const fn mode(&self) -> Mode {
         self.mode
@@ -215,6 +209,15 @@ pub struct Surface {
 }
 
 impl Surface {
+    /// Display this framebuffer again, retiring the output's previous surface.
+    pub async fn activate(&self) -> Result<(), DisplayError> {
+        self.frame
+            .resource()
+            .activate()
+            .await
+            .map_err(DisplayError::from)
+    }
+
     /// The mode this surface was created at.
     pub const fn mode(&self) -> Mode {
         self.mode

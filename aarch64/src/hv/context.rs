@@ -98,6 +98,8 @@ macro_rules! system_registers {
             hpfar = const offset_of!(Context, hpfar),
             exit_kind = const offset_of!(Context, exit_kind),
             host_vbar = const offset_of!(Context, host_vbar),
+            slice_ticks = const offset_of!(Context, slice_ticks),
+            timer_deadline = const offset_of!(Context, timer_deadline),
         );
     };
 }
@@ -114,6 +116,7 @@ system_registers! {
     cntv_cval: cntv_cval_el02, cntv_ctl: cntv_ctl_el02,
     cntp_cval: cntp_cval_el02, cntp_ctl: cntp_ctl_el02,
     csselr: csselr_el1, mdscr: mdscr_el1,
+    icc_sre: icc_sre_el1,
     apia_lo: apiakeylo_el1, apia_hi: apiakeyhi_el1,
     apib_lo: apibkeylo_el1, apib_hi: apibkeyhi_el1,
     apda_lo: apdakeylo_el1, apda_hi: apdakeyhi_el1,
@@ -134,6 +137,10 @@ pub(super) struct Context {
     pub(super) hpfar: u64,
     pub(super) exit_kind: u64,
     host_vbar: u64,
+    // Armed by the switch assembly after restoring the guest state.
+    pub(super) slice_ticks: u64,
+    // Zero means no future guest timer deadline; expired timers are injected.
+    pub(super) timer_deadline: u64,
 }
 
 impl Context {
@@ -143,6 +150,8 @@ impl Context {
             system: SystemRegisters {
                 // SCTLR_EL1 RES1 bits for an MMU-off AArch64 EL1 reset.
                 sctlr: 0x30d0_0800,
+                // SRE enables the GICv3 interface; DIB/DFB disable legacy bypass.
+                icc_sre: 7,
                 ..SystemRegisters::default()
             },
             vectors: [0; 32],
@@ -154,12 +163,15 @@ impl Context {
             hpfar: 0,
             exit_kind: 0,
             host_vbar: 0,
+            slice_ticks: 0,
+            timer_deadline: 0,
         }
     }
 }
 
 unsafe extern "C" {
-    /// Caller has masked host IRQs, installed Stage-2 and a bounded timer,
-    /// and validated the return mode. Restores host state before returning.
+    /// Caller has masked host IRQs, installed Stage-2, supplied timer bounds,
+    /// and validated the return mode. Arms the timer immediately before entry
+    /// and restores host state before returning.
     pub(super) fn helios_aarch64_enter_guest(context: *mut Context);
 }

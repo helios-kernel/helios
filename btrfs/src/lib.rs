@@ -1,4 +1,4 @@
-//! Read-only btrfs for Helios.
+//! Btrfs for Helios, with immutable read views and optional CoW transactions.
 //!
 //! [`Filesystem::mount`] takes any [`BlockSource`] — in the kernel, the
 //! block cache in front of a virtio-blk disk — and reads a single-device
@@ -31,29 +31,53 @@
 //!
 //! # Writing
 //!
-//! The read path is shaped for the copy-on-write transactions that follow
-//! it. Every lookup starts from a tree root captured once — the
-//! superblock's roots at mount, an [`Inode`]'s subvolume root after — so a
-//! commit that publishes new roots and flips the superblock leaves readers
-//! of the previous commit consistent, as long as the blocks those roots
-//! reach are not reused while they are read.
+//! The `write` feature exposes `write::Writer` and its running transaction,
+//! with per-operation rollback. As Linux's btrfs, a change is visible at once
+//! and durable at commit: every accepted mutation publishes a new immutable
+//! view of the transaction's private CoW blocks, and a commit writes them and
+//! then the superblocks. Existing readers retain the complete mapping and
+//! checksum roots of their view; blocks it reaches cannot be reused while any
+//! reader still holds it.
 
 #![no_std]
 
 extern crate alloc;
 
+#[cfg(feature = "write")]
+mod accounting;
+#[cfg(feature = "write")]
+mod allocation;
+#[cfg(feature = "write")]
+mod checksums;
 mod chunk;
+#[cfg(feature = "write")]
+mod commit;
 mod compress;
 mod csum;
+mod data;
 mod error;
+#[cfg(feature = "write")]
+mod free_space;
 mod fs;
 mod items;
 mod key;
 mod ondisk;
+#[cfg(feature = "write")]
+mod retirement;
+#[cfg(feature = "write")]
+mod roots;
 mod source;
+#[cfg(feature = "write")]
+mod space;
 mod superblock;
+#[cfg(feature = "write")]
+mod transaction;
 mod tree;
+#[cfg(feature = "write")]
+mod uuid_tree;
 mod volume;
+#[cfg(feature = "write")]
+pub mod write;
 
 pub use csum::{ChecksumType, Digest};
 pub use error::{
@@ -61,9 +85,11 @@ pub use error::{
     SuperblockDefect,
 };
 pub use fs::{DirEntry, DirPosition, Filesystem, Inode, MAX_SYMLINK_FOLLOWS};
+#[cfg(feature = "test-support")]
+pub use fs::{ExtentInfo, ExtentKind};
 pub use items::{EntryTarget, Metadata, Timestamp};
 pub use key::Key;
-pub use source::{BlockSource, READ_ALIGNMENT};
+pub use source::{BlockSink, BlockSource, READ_ALIGNMENT};
 pub use superblock::{MIRROR_OFFSETS, RootPointer, Superblock};
 
 #[cfg(feature = "test-support")]

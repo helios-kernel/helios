@@ -1,4 +1,20 @@
 use super::*;
+#[derive(Clone)]
+pub(super) struct SignalTarget {
+    pub(super) interrupts: Arc<GuestInterrupts>,
+    pub(super) instance: crate::InstanceId,
+}
+impl helios_unix::InterruptTarget for SignalTarget {
+    fn interrupt(&self) {
+        self.interrupts.interrupt_instance(self.instance);
+    }
+}
+pub(super) type WasixSignalState = helios_unix::SignalState<SignalTarget>;
+pub(super) type WasixProcessThreads<Image> =
+    helios_unix::ProcessThreads<SignalTarget, Image, ProgramExecError>;
+pub(super) type WasixProcessEnd<Image> = helios_unix::ProcessEnd<Image, ProgramExecError>;
+pub(super) type WasixThreadExit = helios_unix::ThreadExit;
+pub(super) type EventFd = helios_unix::EventFd;
 
 pub(super) struct WasixChildProcess {
     pub(super) pid: u32,
@@ -18,153 +34,6 @@ pub(super) struct WasixSignalDisposition {
 pub(super) enum WasixSignalDispositionAction {
     Default,
     Ignore,
-}
-
-/// One signal mailbox: a process's, shared by every store of the
-/// process (its threads' included), or one thread's, read only by that
-/// thread's store. It holds the one pending delivery, the interval
-/// timer's generation, the broadcast a raise sends to the turns driving
-/// the stores that read it, and the instance a raise interrupts. A
-/// thread's mailbox also carries the end of its process
-/// ([`Self::end_thread`]), which reaches the thread the way a signal
-/// does and is never taken.
-///
-/// # Concurrency
-///
-/// Any processor may raise (a parent's `proc_raise`, a sibling's
-/// `thread_signal`, the interval timer task) or end the thread (the
-/// process's last turn); one turn at a time takes. The pending signal,
-/// the end and the generation are single atomics and the broadcast is
-/// lock-free; only naming and reaching the interrupt target takes a
-/// spin lock, see [`WasixSignals::target`].
-#[derive(Clone)]
-pub(super) struct WasixSignalState {
-    shared: Arc<WasixSignals>,
-}
-
-struct WasixSignals {
-    pending: AtomicU32,
-    /// Set once, when the process this thread belongs to has ended. It
-    /// is a stop the thread's store owes its guest at every turn from
-    /// then on, so it is read and never taken.
-    thread_ended: AtomicBool,
-    interval_generation: AtomicU64,
-    /// Broadcast by every raise and by the thread's end, after either is
-    /// stored, so a turn whose guest is suspended in a host call ends the
-    /// call instead of waiting for the host call to resolve.
-    raised: crate::Notify,
-    /// The process a raise interrupts, once a store of it exists.
-    ///
-    /// Raises come from host calls and timer tasks, never from an
-    /// interrupt handler, so a spin lock is enough; it is also what orders
-    /// a raise against [`WasixSignalState::attach`], which see the comment
-    /// there.
-    target: Mutex<Option<SignalTarget>>,
-}
-
-struct SignalTarget {
-    interrupts: Arc<GuestInterrupts>,
-    instance: crate::InstanceId,
-}
-
-impl WasixSignalState {
-    pub(super) fn new() -> Self {
-        Self {
-            shared: Arc::new(WasixSignals {
-                pending: AtomicU32::new(WASIX_NO_PENDING_SIGNAL),
-                thread_ended: AtomicBool::new(false),
-                interval_generation: AtomicU64::new(0),
-                raised: crate::Notify::new(),
-                target: Mutex::new(None),
-            }),
-        }
-    }
-
-    /// Marks `signal` pending and brings it to the guest: a running
-    /// guest takes it at its next interrupt check, which interrupting
-    /// every store of the process makes immediate, and a suspended one
-    /// through the turn that waits on `raised`.
-    pub(super) fn raise(&self, signal: u32) {
-        self.shared.pending.store(signal, AtomicOrdering::Release);
-        self.deliver();
-    }
-
-    /// Ends the thread whose mailbox this is, because its process ended:
-    /// a running thread meets the end at its next interrupt check, which
-    /// interrupting the process's stores makes immediate, and a suspended
-    /// one through the turn that waits on `raised`, which drops the call
-    /// it is suspended in (a parked `memory.atomic.wait` included).
-    pub(super) fn end_thread(&self) {
-        self.shared
-            .thread_ended
-            .store(true, AtomicOrdering::Release);
-        self.deliver();
-    }
-
-    /// Whether [`Self::end_thread`] has ended the thread.
-    pub(super) fn thread_ended(&self) -> bool {
-        self.shared.thread_ended.load(AtomicOrdering::Acquire)
-    }
-
-    /// Brings what was just stored to the stores that read this mailbox:
-    /// wakes the turns whose guests are suspended and interrupts the
-    /// running ones.
-    fn deliver(&self) {
-        self.shared.raised.notify_all();
-        if let Some(target) = &*self.shared.target.lock() {
-            target.interrupts.interrupt_instance(target.instance);
-        }
-    }
-
-    /// Names `instance`, whose stores `interrupts` reaches, as the process
-    /// a raise interrupts. Every store of the process attaches when it is
-    /// created; a replacement image attaches its own instance.
-    ///
-    /// A raise or an end that came before the target was named left its
-    /// mark and interrupted nothing, so this interrupts on its behalf.
-    /// The lock orders the two: one that takes it after this released it
-    /// finds the target, and one that took it before had already stored
-    /// its mark, which the loads below then see.
-    pub(super) fn attach(&self, interrupts: Arc<GuestInterrupts>, instance: crate::InstanceId) {
-        *self.shared.target.lock() = Some(SignalTarget {
-            interrupts: interrupts.clone(),
-            instance,
-        });
-        if self.shared.pending.load(AtomicOrdering::Acquire) != WASIX_NO_PENDING_SIGNAL
-            || self.thread_ended()
-        {
-            interrupts.interrupt_instance(instance);
-        }
-    }
-
-    pub(super) fn take_pending(&self) -> Option<u32> {
-        match self
-            .shared
-            .pending
-            .swap(WASIX_NO_PENDING_SIGNAL, AtomicOrdering::AcqRel)
-        {
-            WASIX_NO_PENDING_SIGNAL => None,
-            signal => Some(signal),
-        }
-    }
-
-    pub(super) fn next_interval_generation(&self) -> u64 {
-        self.shared
-            .interval_generation
-            .fetch_add(1, AtomicOrdering::AcqRel)
-            .saturating_add(1)
-    }
-
-    pub(super) fn cancel_interval(&self) {
-        let _ = self.next_interval_generation();
-    }
-
-    pub(super) fn interval_generation_is_current(&self, generation: u64) -> bool {
-        self.shared
-            .interval_generation
-            .load(AtomicOrdering::Acquire)
-            == generation
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -189,61 +58,35 @@ pub(super) struct Preview1Cwd {
 
 #[derive(Clone)]
 pub(super) struct Preview1DescriptorTable<Net: ComponentHostNetwork> {
-    pub(super) entries: Vec<Option<Preview1DescriptorEntry<Net>>>,
-    pub(super) free: FreeDescriptorSlots,
-    /// Descriptor numbers at or past this are never handed out or accepted.
-    /// The table's owner assigns it; `from_entries` starts at the default
-    /// and `clone_for_exec` and `Clone` carry it to the child.
-    pub(super) limit: DescriptorLimit,
+    slots: helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>>,
 }
 
-#[derive(Clone)]
-pub(super) struct Preview1DescriptorEntry<Net: ComponentHostNetwork> {
-    pub(super) descriptor: Preview1Descriptor<Net>,
-    pub(super) close_on_exec: bool,
-    pub(super) fdflags: u16,
+impl<Net: ComponentHostNetwork> core::ops::Deref for Preview1DescriptorTable<Net> {
+    type Target = helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>>;
+    fn deref(&self) -> &Self::Target {
+        &self.slots
+    }
 }
+impl<Net: ComponentHostNetwork> core::ops::DerefMut for Preview1DescriptorTable<Net> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slots
+    }
+}
+fn descriptor_errno(error: helios_unix::DescriptorTableError) -> i32 {
+    match error {
+        helios_unix::DescriptorTableError::BadDescriptor(_) => p1::errno::BADF,
+        helios_unix::DescriptorTableError::TooManyDescriptors { .. } => p1::errno::MFILE,
+        helios_unix::DescriptorTableError::IndexOverflow => p1::errno::OVERFLOW,
+        helios_unix::DescriptorTableError::RightsWidening => p1::errno::NOTCAPABLE,
+    }
+}
+pub(super) type Preview1DescriptorEntry<Net> =
+    helios_unix::FileDescriptorEntry<FsDescriptor, WasixSocketDescriptor<Net>, EpollUserData>;
+pub(super) type Preview1Descriptor<Net> =
+    helios_unix::FileDescriptor<FsDescriptor, WasixSocketDescriptor<Net>, EpollUserData>;
 
-#[derive(Clone)]
-pub(super) enum Preview1Descriptor<Net: ComponentHostNetwork> {
-    Stdin {
-        carry: Bytes,
-    },
-    Stdout,
-    Stderr,
-    PipeRead {
-        reader: crate::ByteReader,
-        carry: Bytes,
-    },
-    PipeWrite {
-        writer: crate::ByteWriter,
-    },
-    Event(EventFd),
-    Preopen {
-        guest_name: String,
-        descriptor: FsDescriptor,
-    },
-    File {
-        descriptor: FsDescriptor,
-        offset: u64,
-        fdflags: u16,
-    },
-    NullDevice,
-    Socket(WasixSocketDescriptor<Net>),
-    Epoll(EpollDescriptor),
-}
-
-#[derive(Clone)]
-pub(super) struct EpollDescriptor {
-    pub(super) interests: Vec<EpollInterest>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct EpollInterest {
-    pub(super) fd: i32,
-    pub(super) events: u32,
-    pub(super) data: EpollUserData,
-}
+pub(super) type EpollDescriptor = helios_unix::Epoll<EpollUserData>;
+pub(super) type EpollInterest = helios_unix::Interest<EpollUserData>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct EpollUserData {
@@ -399,8 +242,13 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
     StorageImpl: crate::Storage,
 {
     match store.descriptors.get(fd) {
-        Some(Preview1Descriptor::PipeRead { reader, carry })
-        | Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. }))
+        Some(Preview1Descriptor::PipeRead { reader }) if event_type == P1_EVENTTYPE_FD_READ => {
+            wait.notified.push(EpollWaitTarget::ByteReader {
+                reader: reader.clone(),
+                wait: reader.wait_state(),
+            });
+        }
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. }))
             if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
         {
             wait.notified.push(EpollWaitTarget::ByteReader {
@@ -937,17 +785,6 @@ pub(super) enum WasixSocketAuthority {
     Udp,
 }
 
-#[derive(Clone)]
-pub(super) struct EventFd {
-    pub(super) state: Arc<Mutex<EventFdState>>,
-    pub(super) notify: Arc<crate::Notify>,
-    pub(super) semaphore: bool,
-}
-
-pub(super) struct EventFdState {
-    pub(super) value: u64,
-}
-
 #[derive(Debug, Error)]
 #[error("guest requested wasi preview1 exit")]
 pub(super) struct Preview1Exit;
@@ -1093,10 +930,7 @@ impl crate::component::StopWake for WasixStoreSignals {
     type Wait = (crate::NotifyWaiter, crate::NotifyWaiter);
 
     fn arm_stop_wait(&self) -> Self::Wait {
-        (
-            self.thread.shared.raised.waiter(),
-            self.process.shared.raised.waiter(),
-        )
+        (self.thread.wait_state(), self.process.wait_state())
     }
 
     fn poll_stop_wait(
@@ -1106,8 +940,8 @@ impl crate::component::StopWake for WasixStoreSignals {
     ) -> core::task::Poll<()> {
         // Both are polled, so each re-arms on `Ready` as the trait asks
         // and each registers its listener on `Pending`.
-        let thread = self.thread.shared.raised.poll_notified(cx, thread);
-        let process = self.process.shared.raised.poll_notified(cx, process);
+        let thread = self.thread.poll_changed(cx, thread);
+        let process = self.process.poll_changed(cx, process);
         if thread.is_ready() || process.is_ready() {
             core::task::Poll::Ready(())
         } else {
@@ -1202,23 +1036,15 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn from_entries(entries: Vec<Option<Preview1DescriptorEntry<Net>>>) -> Self {
-        let mut free = FreeDescriptorSlots::with_capacity(entries.len());
-        for (index, entry) in entries.iter().enumerate() {
-            if entry.is_none() {
-                free.release(index);
-            }
-        }
         Self {
-            entries,
-            free,
-            limit: DescriptorLimit::DEFAULT,
+            slots: helios_unix::DescriptorSlots::from_entries(entries),
         }
     }
 
     pub(super) fn get(&self, fd: i32) -> Option<&Preview1Descriptor<Net>> {
         usize::try_from(fd)
             .ok()
-            .and_then(|index| self.entries.get(index))
+            .and_then(|index| self.slots.entries.get(index))
             .and_then(Option::as_ref)
             .map(|entry| &entry.descriptor)
     }
@@ -1226,7 +1052,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     pub(super) fn get_mut(&mut self, fd: i32) -> Option<&mut Preview1Descriptor<Net>> {
         usize::try_from(fd)
             .ok()
-            .and_then(|index| self.entries.get_mut(index))
+            .and_then(|index| self.slots.entries.get_mut(index))
             .and_then(Option::as_mut)
             .map(|entry| &mut entry.descriptor)
     }
@@ -1249,17 +1075,13 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         close_on_exec: bool,
         fdflags: u16,
     ) -> Result<u32, i32> {
-        self.insert_entry(Preview1DescriptorEntry {
-            descriptor,
-            close_on_exec,
-            fdflags,
-        })
+        let entry = Preview1DescriptorEntry::new(descriptor, close_on_exec);
+        entry.set_fdflags(fdflags);
+        self.insert_entry(entry)
     }
 
     pub(super) fn insert_entry(&mut self, entry: Preview1DescriptorEntry<Net>) -> Result<u32, i32> {
-        let index = self.allocate_slot_index()?;
-        self.entries[index] = Some(entry);
-        u32::try_from(index).map_err(|_| p1::errno::OVERFLOW)
+        self.slots.insert_entry(entry).map_err(descriptor_errno)
     }
 
     /// The slot a guest-named descriptor number `fd` denotes as the target
@@ -1267,10 +1089,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     /// at or past the limit. Every caller that accepts a number checks it
     /// here before touching the table.
     pub(super) fn target_index(&self, fd: i32) -> Result<usize, i32> {
-        usize::try_from(fd)
-            .ok()
-            .filter(|index| self.limit.admits(*index))
-            .ok_or(p1::errno::BADF)
+        self.slots.target_index(fd).map_err(descriptor_errno)
     }
 
     pub(super) fn dup(&mut self, fd: i32) -> Result<u32, i32> {
@@ -1286,47 +1105,27 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         self.insert_entry_at(to_fd, entry)
     }
 
-    pub(super) fn insert_at(
-        &mut self,
-        fd: i32,
-        descriptor: Preview1Descriptor<Net>,
-        close_on_exec: bool,
-    ) -> Result<u32, i32> {
-        self.insert_entry_at(fd, Preview1DescriptorEntry::new(descriptor, close_on_exec))
-    }
-
     pub(super) fn insert_entry_at(
         &mut self,
         fd: i32,
         entry: Preview1DescriptorEntry<Net>,
     ) -> Result<u32, i32> {
-        let to = self.target_index(fd)?;
-        if self.entries.len() <= to {
-            let previous_len = self.entries.len();
-            self.entries.resize_with(to + 1, || None);
-            self.free.release_range(previous_len..to);
-        }
-        self.entries[to] = Some(entry);
-        u32::try_from(to).map_err(|_| p1::errno::OVERFLOW)
+        self.slots
+            .insert_entry_at(fd, entry)
+            .map_err(descriptor_errno)
     }
 
     pub(super) fn get_entry(&self, fd: i32) -> Option<&Preview1DescriptorEntry<Net>> {
-        usize::try_from(fd)
-            .ok()
-            .and_then(|index| self.entries.get(index))
-            .and_then(Option::as_ref)
+        self.slots.get_entry(fd)
     }
 
     pub(super) fn get_entry_mut(&mut self, fd: i32) -> Option<&mut Preview1DescriptorEntry<Net>> {
-        usize::try_from(fd)
-            .ok()
-            .and_then(|index| self.entries.get_mut(index))
-            .and_then(Option::as_mut)
+        self.slots.get_entry_mut(fd)
     }
 
     pub(super) fn fdflags(&self, fd: i32) -> Result<u16, i32> {
         self.get_entry(fd)
-            .map(|entry| entry.fdflags)
+            .map(|entry| entry.fdflags())
             .ok_or(p1::errno::BADF)
     }
 
@@ -1334,21 +1133,14 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         let Some(entry) = self.get_entry_mut(fd) else {
             return p1::errno::BADF;
         };
-        entry.fdflags = fdflags;
-        if let Preview1Descriptor::File {
-            fdflags: file_flags,
-            ..
-        } = &mut entry.descriptor
-        {
-            *file_flags = fdflags;
-        }
+        entry.set_fdflags(fdflags);
         p1::errno::SUCCESS
     }
 
     pub(super) fn close_on_exec(&self, fd: i32) -> Result<bool, i32> {
         usize::try_from(fd)
             .ok()
-            .and_then(|index| self.entries.get(index))
+            .and_then(|index| self.slots.entries.get(index))
             .and_then(Option::as_ref)
             .map(|entry| entry.close_on_exec)
             .ok_or(p1::errno::BADF)
@@ -1357,7 +1149,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     pub(super) fn set_close_on_exec(&mut self, fd: i32, close_on_exec: bool) -> i32 {
         match usize::try_from(fd)
             .ok()
-            .and_then(|index| self.entries.get_mut(index))
+            .and_then(|index| self.slots.entries.get_mut(index))
             .and_then(Option::as_mut)
         {
             Some(entry) => {
@@ -1368,9 +1160,17 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         }
     }
 
+    /// The descriptor slots themselves, for a process of another ABI that
+    /// takes this table over whole.
+    #[cfg(feature = "linux")]
+    pub(super) fn into_slots(self) -> helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>> {
+        self.slots
+    }
+
     pub(super) fn clone_for_exec(&self) -> Self {
         let mut table = Self::from_entries(
-            self.entries
+            self.slots
+                .entries
                 .iter()
                 .map(|entry| match entry {
                     Some(entry) if entry.close_on_exec => None,
@@ -1378,42 +1178,14 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                 })
                 .collect(),
         );
-        table.limit = self.limit;
+        table.limit = self.slots.limit;
         table
     }
 
     pub(super) fn close(&mut self, fd: i32) -> i32 {
-        let Some(index) = usize::try_from(fd).ok() else {
-            return p1::errno::BADF;
-        };
-        self.entries
-            .get_mut(index)
-            .and_then(Option::take)
-            .map(|_| self.free.release(index))
-            .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
-    }
-
-    /// The lowest free descriptor number below the limit, or `MFILE`;
-    /// nothing is allocated on failure.
-    pub(super) fn allocate_slot_index(&mut self) -> Result<usize, i32> {
-        while let Some(index) = self.free.allocate() {
-            if !self.limit.admits(index) {
-                // The heap pops the lowest number, so every other free
-                // number is at or past the limit too. Keep this one free
-                // for when the limit is raised.
-                self.free.release(index);
-                break;
-            }
-            if self.entries.get(index).is_some_and(Option::is_none) {
-                return Ok(index);
-            }
-        }
-        let index = self.entries.len();
-        if !self.limit.admits(index) {
-            return Err(p1::errno::MFILE);
-        }
-        self.entries.push(None);
-        Ok(index)
+        self.slots
+            .close(fd)
+            .map_or_else(descriptor_errno, |_| p1::errno::SUCCESS)
     }
 
     pub(super) fn get_owned_entry(
@@ -1422,6 +1194,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     ) -> Result<(usize, Preview1DescriptorEntry<Net>), i32> {
         let index = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
         let entry = self
+            .slots
             .entries
             .get_mut(index)
             .and_then(Option::take)
@@ -1430,8 +1203,8 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     }
 
     pub(super) fn close_slot(&mut self, index: usize) {
-        self.entries[index] = None;
-        self.free.release(index);
+        self.slots.entries[index] = None;
+        self.slots.free.release(index);
     }
 
     pub(super) fn renumber(&mut self, from: i32, to: i32) -> i32 {
@@ -1443,16 +1216,16 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         };
         entry.close_on_exec = false;
         if from == to {
-            self.entries[from] = Some(entry);
+            self.slots.entries[from] = Some(entry);
             return p1::errno::SUCCESS;
         }
-        if self.entries.len() <= to {
-            let previous_len = self.entries.len();
-            self.entries.resize_with(to + 1, || None);
-            self.free.release_range(previous_len..to);
+        if self.slots.entries.len() <= to {
+            let previous_len = self.slots.entries.len();
+            self.slots.entries.resize_with(to + 1, || None);
+            self.slots.free.release_range(previous_len..to);
         }
         self.close_slot(from);
-        self.entries[to] = Some(entry);
+        self.slots.entries[to] = Some(entry);
         p1::errno::SUCCESS
     }
 
@@ -1513,9 +1286,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
             Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty() => {
                 Ok(inherited.child_stdin().cloned().unwrap_or_else(closed))
             }
-            Some(Preview1Descriptor::PipeRead { reader, carry }) if carry.is_empty() => {
-                Ok(reader.clone())
-            }
+            Some(Preview1Descriptor::PipeRead { reader }) => Ok(reader.clone()),
             Some(descriptor) => Err(ComponentStdioRefusal {
                 fd: 0,
                 held: unbindable_stdio(descriptor),
@@ -1553,113 +1324,18 @@ fn unbindable_stdio<Net: ComponentHostNetwork>(
     descriptor: &Preview1Descriptor<Net>,
 ) -> UnbindableStdio {
     match descriptor {
-        Preview1Descriptor::Stdin { carry } | Preview1Descriptor::PipeRead { carry, .. }
-            if !carry.is_empty() =>
-        {
-            UnbindableStdio::ReadAhead
-        }
+        Preview1Descriptor::Stdin { carry } if !carry.is_empty() => UnbindableStdio::ReadAhead,
         Preview1Descriptor::Stdin { .. }
         | Preview1Descriptor::PipeRead { .. }
         | Preview1Descriptor::Stdout
         | Preview1Descriptor::Stderr
         | Preview1Descriptor::PipeWrite { .. }
         | Preview1Descriptor::NullDevice => UnbindableStdio::WrongDirection,
-        Preview1Descriptor::File { .. } => UnbindableStdio::File,
+        Preview1Descriptor::File(_) => UnbindableStdio::File,
         Preview1Descriptor::Preopen { .. } => UnbindableStdio::Directory,
         Preview1Descriptor::Socket(_) => UnbindableStdio::Socket,
         Preview1Descriptor::Event(_) => UnbindableStdio::Event,
         Preview1Descriptor::Epoll(_) => UnbindableStdio::Epoll,
-    }
-}
-
-impl<Net: ComponentHostNetwork> Preview1DescriptorEntry<Net> {
-    pub(super) fn new(descriptor: Preview1Descriptor<Net>, close_on_exec: bool) -> Self {
-        let fdflags = preview1_descriptor_initial_fdflags(&descriptor);
-        Self {
-            descriptor,
-            close_on_exec,
-            fdflags,
-        }
-    }
-}
-
-pub(super) fn preview1_descriptor_initial_fdflags<Net: ComponentHostNetwork>(
-    descriptor: &Preview1Descriptor<Net>,
-) -> u16 {
-    match descriptor {
-        Preview1Descriptor::File { fdflags, .. } => *fdflags,
-        _ => 0,
-    }
-}
-
-impl EventFd {
-    pub(super) fn new(value: u64, semaphore: bool) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(EventFdState { value })),
-            notify: Arc::new(crate::Notify::new()),
-            semaphore,
-        }
-    }
-
-    pub(super) fn write(&self, increment: u64) -> Result<(), i32> {
-        if increment == u64::MAX {
-            return Err(p1::errno::INVAL);
-        }
-        let mut state = self.state.lock();
-        let next = state
-            .value
-            .checked_add(increment)
-            .filter(|value| *value != u64::MAX)
-            .ok_or(p1::errno::AGAIN)?;
-        state.value = next;
-        drop(state);
-        self.notify.notify_all();
-        Ok(())
-    }
-
-    pub(super) fn is_readable(&self) -> bool {
-        self.state.lock().value != 0
-    }
-
-    pub(super) fn wait_state(&self) -> crate::NotifyWaiter {
-        self.notify.waiter()
-    }
-
-    pub(super) fn poll_readable(
-        &self,
-        cx: &mut Context<'_>,
-        wait: &mut crate::NotifyWaiter,
-    ) -> Poll<()> {
-        loop {
-            if self.is_readable() {
-                return Poll::Ready(());
-            }
-            match self.notify.poll_notified(cx, wait) {
-                Poll::Ready(()) => continue,
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-
-    pub(super) async fn read(&self) -> u64 {
-        loop {
-            // Armed before the counter is read: a write broadcasts to
-            // every reader and every `poll_readable` waiter at once and
-            // banks nothing, so a wait created after the write would
-            // park until the next one.
-            let written = self.notify.notified();
-            {
-                let mut state = self.state.lock();
-                if state.value != 0 {
-                    if self.semaphore {
-                        state.value -= 1;
-                        return 1;
-                    }
-                    return core::mem::take(&mut state.value);
-                }
-            }
-            written.await;
-        }
     }
 }
 
@@ -1685,31 +1361,31 @@ impl WasixTtyState {
 
 pub(super) fn directory_authority_to_descriptor_flags(
     rights: DirectoryAuthorityRights,
-) -> fs_types::DescriptorFlags {
-    let mut flags = fs_types::DescriptorFlags::empty();
+) -> FsDescriptorFlags {
+    let mut flags = FsDescriptorFlags::empty();
     if rights.contains(DirectoryAuthorityRights::READ) {
-        flags |= fs_types::DescriptorFlags::READ;
+        flags |= FsDescriptorFlags::READ;
     }
     if rights.contains(DirectoryAuthorityRights::WRITE) {
-        flags |= fs_types::DescriptorFlags::WRITE;
+        flags |= FsDescriptorFlags::WRITE;
     }
     if rights.contains(DirectoryAuthorityRights::MUTATE_DIRECTORY) {
-        flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+        flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     flags
 }
 
 pub(super) fn descriptor_flags_to_directory_authority(
-    flags: fs_types::DescriptorFlags,
+    flags: FsDescriptorFlags,
 ) -> DirectoryAuthorityRights {
     let mut rights = DirectoryAuthorityRights::empty();
-    if flags.contains(fs_types::DescriptorFlags::READ) {
+    if flags.contains(FsDescriptorFlags::READ) {
         rights |= DirectoryAuthorityRights::READ;
     }
-    if flags.contains(fs_types::DescriptorFlags::WRITE) {
+    if flags.contains(FsDescriptorFlags::WRITE) {
         rights |= DirectoryAuthorityRights::WRITE;
     }
-    if flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
+    if flags.contains(FsDescriptorFlags::MUTATE_DIRECTORY) {
         rights |= DirectoryAuthorityRights::MUTATE_DIRECTORY;
     }
     rights
@@ -1739,36 +1415,39 @@ pub(super) fn p1_descriptor_rights<Net: ComponentHostNetwork>(
         Preview1Descriptor::Socket(_) => {
             P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
         }
-        Preview1Descriptor::Preopen { descriptor, .. }
-        | Preview1Descriptor::File { descriptor, .. } => {
-            let mut rights = P1_RIGHT_FD_ADVISE | P1_RIGHT_FD_FILESTAT_GET;
-            if descriptor.flags.contains(fs_types::DescriptorFlags::READ) {
-                rights |= P1_RIGHT_FD_READ
-                    | P1_RIGHT_FD_SEEK
-                    | P1_RIGHT_FD_TELL
-                    | P1_RIGHT_FD_READDIR
-                    | P1_RIGHT_POLL_FD_READWRITE
-                    | P1_RIGHT_PATH_READ_MASK;
-            }
-            if descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-                rights |= P1_RIGHT_FD_DATASYNC
-                    | P1_RIGHT_FD_SYNC
-                    | P1_RIGHT_FD_WRITE
-                    | P1_RIGHT_FD_ALLOCATE
-                    | P1_RIGHT_FD_FDSTAT_SET_FLAGS
-                    | P1_RIGHT_FD_FILESTAT_SET_SIZE
-                    | P1_RIGHT_FD_FILESTAT_SET_TIMES
-                    | P1_RIGHT_PATH_FILE_WRITE_MASK;
-            }
-            if descriptor
-                .flags
-                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-            {
-                rights |= P1_RIGHT_PATH_MUTATE_MASK;
-            }
-            rights
-        }
+        Preview1Descriptor::Preopen { descriptor, .. } => p1_node_rights(descriptor),
+        Preview1Descriptor::File(file) => p1_node_rights(file.node()),
     }
+}
+
+/// The preview1 rights a filesystem node handle's flags grant.
+fn p1_node_rights(descriptor: &FsDescriptor) -> u64 {
+    let mut rights = P1_RIGHT_FD_ADVISE | P1_RIGHT_FD_FILESTAT_GET;
+    if descriptor.flags.contains(FsDescriptorFlags::READ) {
+        rights |= P1_RIGHT_FD_READ
+            | P1_RIGHT_FD_SEEK
+            | P1_RIGHT_FD_TELL
+            | P1_RIGHT_FD_READDIR
+            | P1_RIGHT_POLL_FD_READWRITE
+            | P1_RIGHT_PATH_READ_MASK;
+    }
+    if descriptor.flags.contains(FsDescriptorFlags::WRITE) {
+        rights |= P1_RIGHT_FD_DATASYNC
+            | P1_RIGHT_FD_SYNC
+            | P1_RIGHT_FD_WRITE
+            | P1_RIGHT_FD_ALLOCATE
+            | P1_RIGHT_FD_FDSTAT_SET_FLAGS
+            | P1_RIGHT_FD_FILESTAT_SET_SIZE
+            | P1_RIGHT_FD_FILESTAT_SET_TIMES
+            | P1_RIGHT_PATH_FILE_WRITE_MASK;
+    }
+    if descriptor
+        .flags
+        .contains(FsDescriptorFlags::MUTATE_DIRECTORY)
+    {
+        rights |= P1_RIGHT_PATH_MUTATE_MASK;
+    }
+    rights
 }
 
 pub(super) fn p1_filetype(kind: FsNodeKind) -> u8 {
@@ -1776,6 +1455,11 @@ pub(super) fn p1_filetype(kind: FsNodeKind) -> u8 {
         FsNodeKind::Directory => 3,
         FsNodeKind::File => 4,
         FsNodeKind::Symlink => 7,
+        FsNodeKind::CharacterDevice => 2,
+        FsNodeKind::BlockDevice => 1,
+        // `filetype` has no FIFO, and a socket there is a datagram or a
+        // stream one, which a filesystem node does not say: `unknown`.
+        FsNodeKind::Fifo | FsNodeKind::Socket => 0,
     }
 }
 
@@ -1793,11 +1477,7 @@ pub(super) fn p1_filetype_from_descriptor_type(type_: fs_types::DescriptorType) 
 pub(super) fn p1_descriptor_path<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&str> {
-    match descriptor {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. }) => Some(&descriptor.path),
-        _ => None,
-    }
+    p1_fs_descriptor(descriptor).map(|descriptor| descriptor.path.as_str())
 }
 
 pub(super) fn p1_null_device_stat() -> fs_types::DescriptorStat {
@@ -1823,15 +1503,7 @@ pub(super) fn p1_null_device_identity() -> crate::ObjectIdentity {
 pub(super) fn p1_directory_descriptor<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&FsDescriptor> {
-    match descriptor {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. })
-            if descriptor.kind == FsNodeKind::Directory =>
-        {
-            Some(descriptor)
-        }
-        _ => None,
-    }
+    p1_fs_descriptor(descriptor).filter(|descriptor| descriptor.kind == FsNodeKind::Directory)
 }
 
 /// Readiness of one descriptor for a single `poll_oneoff`/`epoll` interest.
@@ -1909,8 +1581,14 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
                 })
             }
         }
-        (Some(Preview1Descriptor::PipeRead { reader, carry }), P1_EVENTTYPE_FD_READ)
-        | (
+        (Some(Preview1Descriptor::PipeRead { reader }), P1_EVENTTYPE_FD_READ) => {
+            local(if reader.is_readable() {
+                P1Readiness::Ready { bytes: 1 }
+            } else {
+                P1Readiness::Pending
+            })
+        }
+        (
             Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })),
             P1_EVENTTYPE_FD_READ,
         ) => {
@@ -1945,7 +1623,7 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // carry a cached size, so report readiness without one rather than
         // paying a filesystem round-trip per poll.
         (
-            Some(Preview1Descriptor::File { .. }) | Some(Preview1Descriptor::Preopen { .. }),
+            Some(Preview1Descriptor::File(_)) | Some(Preview1Descriptor::Preopen { .. }),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
         ) => local(P1Readiness::Ready { bytes: 0 }),
         // A guest-owned pipe or socketpair write end is a bounded channel:

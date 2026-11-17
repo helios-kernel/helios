@@ -14,6 +14,7 @@ where
     /// threads' stores register with too.
     pub(super) interrupts: Arc<GuestInterrupts>,
     activity: crate::InstanceActivity,
+    pub(super) identity: helios_unix::ProcessIdentity,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
     pub(super) filesystem: Namespace<StorageImpl>,
     pub(super) clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>,
@@ -88,6 +89,9 @@ where
         threads: WasixImageThreads<CpuImpl, Net, StorageImpl>,
     ) -> Self {
         let filesystem = filesystem.unwrap_or_else(|| runtime_state.root_namespace().descend());
+        let identity = helios_unix::ProcessIdentity::new(
+            core::num::NonZeroU64::new(instance.id().raw()).expect("live instance ID is nonzero"),
+        );
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
         let descriptors =
             descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
@@ -105,6 +109,7 @@ where
                 instance,
                 crate::store_kernel_heap_bytes(size_of::<Self>()),
             ),
+            identity,
             parent_instance_id,
             filesystem,
             clock,
@@ -153,9 +158,9 @@ where
         self.timer.sleep_for(duration)
     }
 
-    pub(super) fn futex_key(&self, address: u32) -> crate::FutexKey {
-        crate::FutexKey::new(
-            crate::ProcessMemoryIdentity::new(self.instance().id().raw()),
+    pub(super) fn futex_key(&self, address: u32) -> helios_unix::FutexKey {
+        helios_unix::FutexKey::new(
+            helios_unix::ProcessMemoryIdentity::new(self.instance().id().raw()),
             GuestAddress::wasm32(address),
         )
     }
@@ -525,23 +530,10 @@ where
     }
 
     pub(super) async fn read_pipe(&mut self, fd: i32, max_bytes: usize) -> Result<Bytes, i32> {
-        let reader = match self.descriptors.get_mut(fd) {
-            Some(Preview1Descriptor::PipeRead { reader, carry }) => {
-                if !carry.is_empty() {
-                    return Ok(take_preview1_carry(carry, max_bytes));
-                }
-                reader.clone()
-            }
-            Some(_) => return Err(p1::errno::BADF),
-            None => return Err(p1::errno::BADF),
-        };
-
-        let bytes = reader.read().await.unwrap_or_default();
-        let Some(Preview1Descriptor::PipeRead { carry, .. }) = self.descriptors.get_mut(fd) else {
+        let Some(Preview1Descriptor::PipeRead { reader }) = self.descriptors.get(fd) else {
             return Err(p1::errno::BADF);
         };
-        *carry = bytes;
-        Ok(take_preview1_carry(carry, max_bytes))
+        Ok(reader.read_limit(max_bytes).await.unwrap_or_default())
     }
 
     pub(super) async fn read_socket_pair(
@@ -648,7 +640,7 @@ where
             crate::resolve_child_path(&base.path, &suffix).map_err(p1_errno_from_component_path)?;
         let flags = base.flags;
 
-        if !flags.contains(fs_types::DescriptorFlags::READ) {
+        if !flags.contains(FsDescriptorFlags::READ) {
             return Err(p1::errno::NOTCAPABLE);
         }
         // chdir follows a symbolic link to the directory it names, inside
@@ -678,7 +670,7 @@ where
     pub(super) fn resolve_absolute_guest_path(
         &self,
         guest_name: &str,
-    ) -> Result<(String, fs_types::DescriptorFlags), i32> {
+    ) -> Result<(String, FsDescriptorFlags), i32> {
         let (descriptor, suffix) = self.resolve_absolute_guest_base(guest_name)?;
         let source_path = if suffix.is_empty() {
             descriptor.path.clone()
@@ -743,14 +735,10 @@ where
             return Ok((cwd.descriptor.clone(), path.to_owned()));
         }
         let base = match self.descriptors.get(fd) {
-            Some(Preview1Descriptor::Preopen { descriptor, .. })
-            | Some(Preview1Descriptor::File { descriptor, .. })
-                if descriptor.kind == FsNodeKind::Directory =>
-            {
-                descriptor.clone()
-            }
-            Some(_) => return Err(p1::errno::NOTDIR),
             None => return Err(p1::errno::BADF),
+            descriptor => p1_directory_descriptor(descriptor)
+                .ok_or(p1::errno::NOTDIR)?
+                .clone(),
         };
         Ok((base, path.to_owned()))
     }
@@ -1037,11 +1025,14 @@ where
     let registration = interrupts.register(instance, store, store.data().cpu.clone());
     // The thread's mailbox needs a target as well, so a running thread
     // meets a signal raised on it at its next interrupt check.
-    store
-        .data()
-        .signal_state
-        .attach(interrupts.clone(), instance);
-    store.data().thread_signals.attach(interrupts, instance);
+    store.data().signal_state.attach(SignalTarget {
+        interrupts: interrupts.clone(),
+        instance,
+    });
+    store.data().thread_signals.attach(SignalTarget {
+        interrupts,
+        instance,
+    });
     registration
 }
 
@@ -2136,18 +2127,16 @@ where
         Some(Preview1Descriptor::PipeRead { .. }) => {
             caller.data_mut().read_pipe(fd, capacity as usize).await?
         }
-        Some(Preview1Descriptor::File {
-            descriptor, offset, ..
-        }) => {
-            let descriptor = descriptor.clone();
-            let offset = *offset;
+        Some(Preview1Descriptor::File(file)) => {
+            let file = file.clone();
+            let offset = file.offset();
             let namespace = p1_namespace(caller);
-            let file = p1_grant(&descriptor)?;
-            let bytes = match wasi_fs::read(&namespace, file, offset, capacity as usize).await {
+            let grant = p1_grant(file.node())?;
+            let bytes = match wasi_fs::read(&namespace, grant, offset, capacity as usize).await {
                 Ok(bytes) => bytes,
                 Err(error) => return Ok(p1_errno_from_fs(error)),
             };
-            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
+            file.set_offset(offset.saturating_add(bytes.len() as u64));
             bytes
         }
         _ => p1_read_descriptor(caller, fd, capacity).await?,
@@ -2238,7 +2227,7 @@ where
         Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => 2,
         Preview1Descriptor::Event(_) | Preview1Descriptor::Epoll(_) => 2,
         Preview1Descriptor::Preopen { .. } => 3,
-        Preview1Descriptor::File { descriptor, .. } => p1_filetype(descriptor.kind),
+        Preview1Descriptor::File(file) => p1_filetype(file.node().kind),
         Preview1Descriptor::NullDevice => 2,
         Preview1Descriptor::Socket(_) => 6,
     };
@@ -2265,7 +2254,7 @@ where
     StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File { .. } | Preview1Descriptor::NullDevice)
+        Some(Preview1Descriptor::File(_) | Preview1Descriptor::NullDevice)
             if p1_file_fdflags_supported(fdflags) =>
         {
             caller.data_mut().descriptors.set_fdflags(fd, fdflags)
@@ -2299,15 +2288,33 @@ where
         return p1::errno::NOTCAPABLE;
     }
     let lowered_flags = p1_descriptor_flags(requested, 0);
-    match caller.data_mut().descriptors.get_mut(fd) {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. }) => {
+    let Some(entry) = caller.data_mut().descriptors.get_entry_mut(fd) else {
+        return p1::errno::BADF;
+    };
+    match &mut entry.descriptor {
+        Preview1Descriptor::Preopen { descriptor, .. } => {
             descriptor.flags &= lowered_flags;
-            p1::errno::SUCCESS
         }
-        Some(_) => p1::errno::SUCCESS,
-        None => p1::errno::BADF,
+        // Rights belong to the descriptor in preview1, and a node handle
+        // carries the rights it was opened with, so a file descriptor whose
+        // rights narrow becomes its own open of the same node, at the offset
+        // and with the status flags it had; its duplicates keep the rights
+        // and the description they shared.
+        Preview1Descriptor::File(file) => {
+            let mut node = file.node().clone();
+            node.flags &= lowered_flags;
+            let narrowed = OpenFile::new(node);
+            narrowed.set_offset(file.offset());
+            let own = Preview1DescriptorEntry::new(
+                Preview1Descriptor::File(narrowed),
+                entry.close_on_exec,
+            );
+            own.set_fdflags(entry.fdflags());
+            *entry = own;
+        }
+        _ => {}
     }
+    p1::errno::SUCCESS
 }
 
 pub(super) async fn p1_fd_filestat_get<CpuImpl, Net, StorageImpl>(
@@ -2408,28 +2415,10 @@ pub(super) fn p1_fs_descriptor<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&FsDescriptor> {
     match descriptor {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. }) => Some(descriptor),
+        Some(Preview1Descriptor::Preopen { descriptor, .. }) => Some(descriptor),
+        Some(Preview1Descriptor::File(file)) => Some(file.node()),
         _ => None,
     }
-}
-
-/// Moves the offset of the open file `fd` after one of its own reads or
-/// writes.
-fn p1_set_file_offset<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    fd: i32,
-    next: u64,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
-    else {
-        panic!("Preview1 file descriptor {fd} disappeared during its own operation");
-    };
-    *offset = next;
 }
 
 pub(super) async fn p1_fd_filestat_set_size<CpuImpl, Net, StorageImpl>(
@@ -2442,11 +2431,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
         return p1::errno::BADF;
     };
-    let descriptor = descriptor.clone();
+    let descriptor = file.node().clone();
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
     let file = match p1_grant(&descriptor) {
@@ -2547,11 +2535,10 @@ where
         Some(end) => end,
         None => return p1::errno::OVERFLOW,
     };
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
         return p1::errno::BADF;
     };
-    let descriptor = descriptor.clone();
+    let descriptor = file.node().clone();
     let namespace = p1_namespace(caller);
     let current = match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
         Ok(metadata) => metadata.size,
@@ -2637,11 +2624,10 @@ where
         return Ok(p1::errno::FAULT);
     };
     let layout = p1_read_iovs_with_byte_len(&memory, GuestAddress::wasm32(iovs), iovs_len).await?;
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
         return Ok(p1::errno::BADF);
     };
-    let descriptor = descriptor.clone();
+    let descriptor = file.node().clone();
     let namespace = p1_namespace(caller);
     let file = p1_grant(&descriptor)?;
     let bytes = match wasi_fs::read(&namespace, file, offset, layout.byte_len as usize).await {
@@ -2695,26 +2681,37 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::File {
-        descriptor,
-        offset,
-        fdflags,
-    }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
         return Err(P1Stop::Errno(p1::errno::BADF));
     };
-    let position = match at {
-        Some(at) => WritePosition::At(at),
-        None if fdflags & P1_FDFLAG_APPEND != 0 => WritePosition::End,
-        None => WritePosition::At(*offset),
-    };
-    let descriptor = descriptor.clone();
-    let mut gather = Preview1Gather::new(memory, layout)?;
+    let open = file.clone();
+    let append = caller.data().descriptors.fdflags(fd)? & P1_FDFLAG_APPEND != 0;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
+    p1_write_open_file(&namespace, &open, append, memory, layout, at, now_nanos).await
+}
+
+/// Writes the bytes `layout` names through the open file description
+/// `open`, as [`p1_write_file`] describes; `append` is the description's
+/// `APPEND` status flag.
+async fn p1_write_open_file<StorageImpl: crate::Storage>(
+    namespace: &Namespace<StorageImpl>,
+    open: &OpenFile<FsDescriptor>,
+    append: bool,
+    memory: &Preview1AsyncMemory,
+    layout: &Preview1IovLayout,
+    at: Option<u64>,
+    now_nanos: u64,
+) -> Result<u32, P1Stop> {
+    let position = match at {
+        Some(at) => WritePosition::At(at),
+        None if append => WritePosition::End,
+        None => WritePosition::At(open.offset()),
+    };
+    let mut gather = Preview1Gather::new(memory, layout)?;
     let (end, written) = {
         let file =
-            wasi_fs::writable_file(&namespace, p1_grant(&descriptor)?).map_err(p1_errno_from_fs)?;
+            wasi_fs::writable_file(namespace, p1_grant(open.node())?).map_err(p1_errno_from_fs)?;
         let mut file = ResolvedFileChunks {
             file: &file,
             now_nanos,
@@ -2725,8 +2722,9 @@ where
     };
     if at.is_none() {
         // After an append the offset is the end of the file the write
-        // reached, which another writer may have moved meanwhile.
-        p1_set_file_offset(caller, fd, end);
+        // reached, which another writer may have moved meanwhile. Every
+        // descriptor sharing the open file description sees it.
+        open.set_offset(end);
     }
     Ok(written)
 }
@@ -2747,7 +2745,7 @@ impl<StorageImpl: crate::Storage> Preview1ChunkedFile for ResolvedFileChunks<'_,
         gather: &mut Preview1Gather,
         position: WritePosition,
         len: usize,
-    ) -> Result<Result<u64, fs_types::ErrorCode>, GuestAccessError> {
+    ) -> Result<Result<ChunkLanded, fs_types::ErrorCode>, GuestAccessError> {
         // The chunk's pages are brought in before the write is staged, so
         // waiting on swap holds up this write and never the file; each
         // round checks them again in the poll that fills it.
@@ -2759,9 +2757,10 @@ impl<StorageImpl: crate::Storage> Preview1ChunkedFile for ResolvedFileChunks<'_,
             };
         let landed = gather.submit_staged(memory, write).await?;
         Ok(landed.map_err(wasi_fs::fs_error_code).and_then(|landed| {
-            landed
-                .checked_add(len as u64)
-                .ok_or(fs_types::ErrorCode::Overflow)
+            Ok(ChunkLanded {
+                end: landed.end().ok_or(fs_types::ErrorCode::Overflow)?,
+                len: landed.len,
+            })
         }))
     }
 }
@@ -2865,19 +2864,17 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let (descriptor, current) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File {
-            descriptor, offset, ..
-        }) => (descriptor.clone(), *offset),
+    let file = match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::File(file)) => file.clone(),
         Some(_) => return Ok(p1::errno::SPIPE),
         None => return Ok(p1::errno::BADF),
     };
     let base = match whence {
         0 => 0,
-        1 => current,
+        1 => file.offset(),
         2 => {
             let namespace = p1_namespace(caller);
-            match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
+            match wasi_fs::stat_path(&namespace, &file.node().path, crate::Follow::No).await {
                 Ok(metadata) => metadata.size,
                 Err(error) => return Ok(p1_errno_from_fs(error)),
             }
@@ -2892,11 +2889,7 @@ where
     let Some(next) = next else {
         return Ok(p1::errno::INVAL);
     };
-    let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
-    else {
-        return Ok(p1::errno::BADF);
-    };
-    *offset = next;
+    file.set_offset(next);
     let Some(memory) = p1_async_memory(caller) else {
         return Ok(p1::errno::FAULT);
     };
@@ -2917,7 +2910,7 @@ where
     StorageImpl: crate::Storage,
 {
     let offset = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File { offset, .. }) => *offset,
+        Some(Preview1Descriptor::File(file)) => file.offset(),
         Some(_) => return p1::errno::SPIPE,
         None => return p1::errno::BADF,
     };
@@ -2957,14 +2950,11 @@ where
         }
     } else {
         let base = match caller.data().descriptors.get(fd) {
-            Some(Preview1Descriptor::Preopen { descriptor, .. })
-            | Some(Preview1Descriptor::File { descriptor, .. })
-                if descriptor.kind == FsNodeKind::Directory =>
-            {
-                descriptor.clone()
-            }
-            Some(_) => return Ok(p1::errno::NOTDIR),
             None => return Ok(p1::errno::BADF),
+            descriptor => match p1_directory_descriptor(descriptor) {
+                Some(descriptor) => descriptor.clone(),
+                None => return Ok(p1::errno::NOTDIR),
+            },
         };
         (base, path)
     };
@@ -2975,7 +2965,7 @@ where
     }
     let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
     if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
-        descriptor_flags |= fs_types::DescriptorFlags::WRITE;
+        descriptor_flags |= FsDescriptorFlags::WRITE;
     }
     p1_path_open_resolved(
         caller,
@@ -2999,7 +2989,7 @@ pub(super) async fn p1_path_open_resolved<CpuImpl, Net, StorageImpl>(
     path: String,
     path_flags: fs_types::PathFlags,
     open_flags: fs_types::OpenFlags,
-    descriptor_flags: fs_types::DescriptorFlags,
+    descriptor_flags: FsDescriptorFlags,
     fdflags: u16,
     opened_fd: u32,
 ) -> Result<i32, P1Stop>
@@ -3039,14 +3029,11 @@ where
         Ok(descriptor) => descriptor,
         Err(errno) => return Ok(errno),
     };
-    let fd = match caller
-        .data_mut()
-        .descriptors
-        .insert(Preview1Descriptor::File {
-            descriptor: opened,
-            offset: 0,
-            fdflags,
-        }) {
+    let fd = match caller.data_mut().descriptors.insert_with_fdflags(
+        Preview1Descriptor::File(OpenFile::new(opened)),
+        false,
+        fdflags,
+    ) {
         Ok(fd) => fd,
         Err(errno) => return Ok(errno),
     };
@@ -3083,7 +3070,7 @@ pub(super) async fn p1_open_descriptor_resolved<CpuImpl, Net, StorageImpl>(
     path_flags: fs_types::PathFlags,
     path: &str,
     open_flags: fs_types::OpenFlags,
-    descriptor_flags: fs_types::DescriptorFlags,
+    descriptor_flags: FsDescriptorFlags,
 ) -> Result<FsDescriptor, i32>
 where
     CpuImpl: Cpu + Clone,
@@ -3403,7 +3390,7 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::remove_directory_at(&namespace, granted, &path)
+    wasi_fs::remove_directory_at(&namespace, granted, &path, caller.data().now_nanos())
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3565,7 +3552,7 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::unlink_file_at(&namespace, granted, &path)
+    wasi_fs::unlink_file_at(&namespace, granted, &path, caller.data().now_nanos())
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3659,64 +3646,36 @@ where
             }
         }
 
-        let mut ready = Vec::new();
-        let mut earliest: Option<Duration> = None;
-
+        // Descriptor readiness is the only part of a pass that awaits, so
+        // it is resolved here and the pass itself stays a pure function of
+        // the subscriptions, their readiness and the two clocks.
+        let mut readiness = Vec::with_capacity(parsed.len());
         for subscription in &parsed {
-            match subscription {
-                P1Subscription::Failed {
-                    userdata,
-                    event_type,
-                    error,
-                } => ready.push(P1ReadyEvent {
-                    userdata: *userdata,
-                    error: *error,
-                    event_type: *event_type,
-                    nbytes: 0,
-                    fd_flags: 0,
-                }),
-                P1Subscription::Fd {
-                    userdata,
-                    event_type,
-                    fd,
-                } => {
-                    let readiness = p1_descriptor_readiness(caller, *fd, *event_type).await;
-                    if let Some(event) = p1_fd_event(*userdata, *event_type, readiness) {
-                        ready.push(event);
-                    }
+            readiness.push(match subscription {
+                P1Subscription::Fd { fd, event_type, .. } => {
+                    p1_descriptor_readiness(caller, *fd, *event_type).await
                 }
-                P1Subscription::Clock {
-                    userdata,
-                    monotonic,
-                    deadline_nanos,
-                } => {
-                    let now = if *monotonic {
-                        caller.data().now_nanos()
-                    } else {
-                        caller.data().system_time_nanos()
-                    };
-                    match p1_clock_progress(*userdata, *deadline_nanos, now) {
-                        P1ClockProgress::Elapsed(event) => ready.push(event),
-                        P1ClockProgress::Waiting(remaining) => {
-                            earliest = Some(
-                                earliest
-                                    .map_or(remaining, |current: Duration| current.min(remaining)),
-                            );
-                        }
-                    }
+                P1Subscription::Clock { .. } | P1Subscription::Failed { .. } => {
+                    Ok(P1Readiness::Pending)
                 }
-            }
+            });
         }
+        let pass = p1_poll_pass(
+            &parsed,
+            &readiness,
+            caller.data().now_nanos(),
+            caller.data().system_time_nanos(),
+        );
 
-        if !ready.is_empty() {
-            break ready;
+        if !pass.ready.is_empty() {
+            break pass.ready;
         }
 
         // Nothing is ready and no deadline has expired: sleep until one
         // of the armed descriptors makes progress or the earliest
         // deadline arrives.
         let timer = caller.data().timer();
-        p1_wait_step(&timer, &mut wait, earliest).await;
+        p1_wait_step(&timer, &mut wait, pass.earliest).await;
     };
 
     // The wait above awaited, so the guest's pages are checked again here,
@@ -3745,6 +3704,79 @@ where
         .write_u32(GuestAddress::wasm32(nevents), event_count)
         .await?;
     Ok(p1::errno::SUCCESS)
+}
+
+/// What one evaluation of a `poll_oneoff` subscription set found.
+struct P1PollPass {
+    /// The events to hand back to the guest; the call returns once this is
+    /// not empty.
+    ready: Vec<P1ReadyEvent>,
+    /// The time left until the earliest clock deadline that has not elapsed,
+    /// which bounds the next sleep; `None` when no clock is pending.
+    earliest: Option<Duration>,
+}
+
+/// One pass of the `poll_oneoff` wait loop over `subscriptions`.
+///
+/// `readiness` is index-aligned with `subscriptions` and holds the probed
+/// readiness of every `Fd` subscription (the other kinds ignore their
+/// entry); `monotonic_now` and `system_now` are the two clocks a `Clock`
+/// subscription is judged against.
+fn p1_poll_pass(
+    subscriptions: &[P1Subscription],
+    readiness: &[Result<P1Readiness, i32>],
+    monotonic_now: u64,
+    system_now: u64,
+) -> P1PollPass {
+    let mut pass = P1PollPass {
+        ready: Vec::new(),
+        earliest: None,
+    };
+    for (subscription, readiness) in subscriptions.iter().zip(readiness) {
+        match subscription {
+            P1Subscription::Failed {
+                userdata,
+                event_type,
+                error,
+            } => pass.ready.push(P1ReadyEvent {
+                userdata: *userdata,
+                error: *error,
+                event_type: *event_type,
+                nbytes: 0,
+                fd_flags: 0,
+            }),
+            P1Subscription::Fd {
+                userdata,
+                event_type,
+                ..
+            } => {
+                if let Some(event) = p1_fd_event(*userdata, *event_type, *readiness) {
+                    pass.ready.push(event);
+                }
+            }
+            P1Subscription::Clock {
+                userdata,
+                monotonic,
+                deadline_nanos,
+            } => {
+                let now = if *monotonic {
+                    monotonic_now
+                } else {
+                    system_now
+                };
+                match p1_clock_progress(*userdata, *deadline_nanos, now) {
+                    P1ClockProgress::Elapsed(event) => pass.ready.push(event),
+                    P1ClockProgress::Waiting(remaining) => {
+                        pass.earliest = Some(
+                            pass.earliest
+                                .map_or(remaining, |current| current.min(remaining)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    pass
 }
 
 /// Whether a clock subscription's deadline has arrived.
@@ -4492,7 +4524,7 @@ where
 {
     // Every sink takes the guest's bytes gathered, one bounded chunk at a
     // time.
-    if let Some(Preview1Descriptor::File { .. }) = caller.data().descriptors.get(fd) {
+    if let Some(Preview1Descriptor::File(_)) = caller.data().descriptors.get(fd) {
         return p1_write_file(caller, fd, memory, layout, None).await;
     }
     // A descriptor whose sink is a bounded channel blocks the guest while
@@ -4581,7 +4613,10 @@ where
                     .try_into()
                     .unwrap_or_else(|_| panic!("eventfd write length was checked")),
             );
-            event.write(increment)?;
+            event.write(increment).map_err(|error| match error {
+                helios_unix::EventError::InvalidIncrement => p1::errno::INVAL,
+                helios_unix::EventError::WouldBlock => p1::errno::AGAIN,
+            })?;
             Ok(8)
         }
         Some(Preview1Descriptor::NullDevice) => {
@@ -4614,21 +4649,19 @@ where
             Ok(Bytes::copy_from_slice(&event.read().await.to_le_bytes()))
         }
         Some(Preview1Descriptor::NullDevice) => Ok(Bytes::new()),
-        Some(Preview1Descriptor::File {
-            descriptor, offset, ..
-        }) => {
-            let descriptor = descriptor.clone();
-            let offset = *offset;
+        Some(Preview1Descriptor::File(file)) => {
+            let file = file.clone();
+            let offset = file.offset();
             let namespace = p1_namespace(caller);
             let bytes = wasi_fs::read(
                 &namespace,
-                p1_grant(&descriptor)?,
+                p1_grant(file.node())?,
                 offset,
                 capacity as usize,
             )
             .await
             .map_err(p1_errno_from_fs)?;
-            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
+            file.set_offset(offset.saturating_add(bytes.len() as u64));
             Ok(bytes)
         }
         Some(_) => Err(p1::errno::BADF),
@@ -4661,18 +4694,18 @@ pub(super) fn p1_open_flags(flags: u16) -> fs_types::OpenFlags {
     result
 }
 
-pub(super) fn p1_descriptor_flags(rights: u64, fdflags: u16) -> fs_types::DescriptorFlags {
-    let mut flags = fs_types::DescriptorFlags::empty();
+pub(super) fn p1_descriptor_flags(rights: u64, fdflags: u16) -> FsDescriptorFlags {
+    let mut flags = FsDescriptorFlags::empty();
     if rights & P1_RIGHT_FD_READ != 0 || rights & P1_RIGHT_FD_READDIR != 0 {
-        flags |= fs_types::DescriptorFlags::READ;
+        flags |= FsDescriptorFlags::READ;
     }
     if rights & (P1_RIGHT_FD_WRITE | P1_RIGHT_FD_FILESTAT_SET_SIZE | P1_RIGHT_FD_FILESTAT_SET_TIMES)
         != 0
     {
-        flags |= fs_types::DescriptorFlags::WRITE;
+        flags |= FsDescriptorFlags::WRITE;
     }
     if rights & P1_RIGHT_PATH_MUTATE_MASK != 0 {
-        flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+        flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     let _ = fdflags;
     flags
@@ -4807,6 +4840,7 @@ pub(super) fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
         fs_types::ErrorCode::Unsupported => p1::errno::NOTSUP,
         fs_types::ErrorCode::Overflow => p1::errno::OVERFLOW,
         fs_types::ErrorCode::NotPermitted => p1::errno::PERM,
+        fs_types::ErrorCode::InsufficientSpace => p1::errno::NOSPC,
         fs_types::ErrorCode::ReadOnly => p1::errno::ROFS,
         fs_types::ErrorCode::CrossDevice => p1::errno::XDEV,
         _ => p1::errno::IO,
@@ -4864,17 +4898,13 @@ mod tests {
     use super::*;
 
     fn regular_file() -> Preview1Descriptor<crate::test_support::TestNetworkService> {
-        Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/data".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        }
+        Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/data".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+        }))
     }
 
     /// `path_open(O_TRUNC)` against a preopen that may read and change its
@@ -4884,7 +4914,7 @@ mod tests {
     fn path_open_truncate_without_write_authority_leaves_the_file_untouched() {
         use futures_lite::future::block_on;
 
-        let namespace: crate::Namespace<crate::UnsupportedStorage> =
+        let namespace: crate::Namespace<crate::test_support::UnsupportedStorage> =
             crate::Namespace::new(crate::MountTable::new(
                 crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
                 1,
@@ -4892,9 +4922,9 @@ mod tests {
         let owner = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -4904,7 +4934,7 @@ mod tests {
             fs_types::PathFlags::empty(),
             "notes.txt",
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
         ))
         .expect("the owner creates the file");
@@ -4918,7 +4948,7 @@ mod tests {
         .expect("the owner writes the file");
 
         let preopen = FsDescriptor {
-            flags: fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ | FsDescriptorFlags::MUTATE_DIRECTORY,
             ..owner
         };
         for rights in [P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE, P1_RIGHT_FD_READ] {
@@ -4945,7 +4975,7 @@ mod tests {
 
     /// A namespace with one file, `/data`, and the time it was last
     /// modified.
-    fn namespace_with_file() -> crate::Namespace<crate::UnsupportedStorage> {
+    fn namespace_with_file() -> crate::Namespace<crate::test_support::UnsupportedStorage> {
         use futures_lite::future::block_on;
 
         let namespace = crate::Namespace::new(crate::MountTable::new(
@@ -4955,9 +4985,9 @@ mod tests {
         let owner = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -4967,14 +4997,108 @@ mod tests {
             fs_types::PathFlags::empty(),
             "data",
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ,
+            FsDescriptorFlags::READ,
             1,
         ))
         .expect("the owner creates the file");
         namespace
     }
 
-    fn modified_nanos(namespace: &crate::Namespace<crate::UnsupportedStorage>) -> u64 {
+    /// `cmd > out 2>&1`: stdout and the stderr `dup2` points at it, and a
+    /// further `fd_dup` of stdout, share one open file description, so each
+    /// write lands where the previous one through any of them ended and the
+    /// file reads back every write in order.
+    #[test]
+    fn writes_through_duplicated_descriptors_share_one_offset() {
+        use futures_lite::future::block_on;
+
+        let namespace = namespace_with_file();
+        let node = FsDescriptor {
+            path: "/data".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+        };
+        let mut table =
+            Preview1DescriptorTable::<crate::test_support::TestNetworkService>::from_entries(
+                alloc::vec![
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stdin {
+                            carry: Bytes::new(),
+                        },
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::File(OpenFile::new(node.clone())),
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stderr,
+                        false,
+                    )),
+                ],
+            );
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+        let duplicate = table.dup(1).expect("the table has room") as i32;
+
+        let writes: [(i32, &str); 3] = [
+            (1, "標準出力 "),
+            (2, "標準エラー出力 "),
+            (duplicate, "표준 출력"),
+        ];
+        let mut guest: Vec<u8> = writes
+            .iter()
+            .flat_map(|(_, text)| text.as_bytes().iter().copied())
+            .collect();
+        let memory = Preview1AsyncMemory::new(Preview1Memory {
+            base: guest.as_mut_ptr() as usize,
+            len: guest.len(),
+        });
+        let mut start = 0_u32;
+        for (fd, text) in writes {
+            let len = text.len() as u32;
+            let layout = Preview1IovLayout {
+                iovs: SmallVec::from_slice(&[(start, len)]),
+                byte_len: len,
+            };
+            let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
+                panic!("descriptor {fd} must name the file");
+            };
+            let written = block_on(p1_write_open_file(
+                &namespace,
+                file,
+                table.fdflags(fd).expect("the descriptor is open") & P1_FDFLAG_APPEND != 0,
+                &memory,
+                &layout,
+                None,
+                2,
+            ))
+            .expect("the write lands");
+            assert_eq!(written, len);
+            start += len;
+        }
+
+        let expected: String = writes.iter().map(|(_, text)| *text).collect();
+        for (fd, _) in writes {
+            let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
+                panic!("descriptor {fd} must name the file");
+            };
+            assert_eq!(file.offset(), expected.len() as u64);
+        }
+        let contents = block_on(wasi_fs::read(
+            &namespace,
+            p1_grant(&node).expect("the node may be read"),
+            0,
+            expected.len() + 1,
+        ))
+        .expect("the file reads back");
+        assert_eq!(contents.as_ref(), expected.as_bytes());
+    }
+
+    fn modified_nanos(
+        namespace: &crate::Namespace<crate::test_support::UnsupportedStorage>,
+    ) -> u64 {
         futures_lite::future::block_on(wasi_fs::stat_path(namespace, "/data", crate::Follow::No))
             .expect("the file exists")
             .modified_nanos
@@ -4992,7 +5116,7 @@ mod tests {
         let file = |rights| FsDescriptor {
             flags: p1_descriptor_flags(rights, 0),
             ..match regular_file() {
-                Preview1Descriptor::File { descriptor, .. } => descriptor,
+                Preview1Descriptor::File(file) => file.node().clone(),
                 _ => unreachable!("regular_file is a file"),
             }
         };
@@ -5059,39 +5183,33 @@ mod tests {
         service: Net,
         stream: Net::TcpStream,
     ) -> Preview1DescriptorEntry<Net> {
-        Preview1DescriptorEntry {
-            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Connected {
-                    family: WasixSocketFamily::Ipv4,
-                    stream: WasixOwnedTcpStream::new(service, stream),
-                    peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
-                        127, 0, 0, 1,
-                    ])),
-                    peer_port: 80,
-                    options: WasixSocketOptions::default(),
-                },
-            )),
-            close_on_exec: false,
-            fdflags: 0,
-        }
+        Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+                family: WasixSocketFamily::Ipv4,
+                stream: WasixOwnedTcpStream::new(service, stream),
+                peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                    127, 0, 0, 1,
+                ])),
+                peer_port: 80,
+                options: WasixSocketOptions::default(),
+            })),
+            false,
+        )
     }
 
     fn listening_socket_entry<Net: ComponentHostNetwork>(
         service: Net,
         listener: Net::TcpListener,
     ) -> Preview1DescriptorEntry<Net> {
-        Preview1DescriptorEntry {
-            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Listening {
-                    family: WasixSocketFamily::Ipv4,
-                    listener: WasixOwnedTcpListener::new(service, listener),
-                    local_port: 8080,
-                    options: WasixSocketOptions::default(),
-                },
-            )),
-            close_on_exec: false,
-            fdflags: 0,
-        }
+        Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Listening {
+                family: WasixSocketFamily::Ipv4,
+                listener: WasixOwnedTcpListener::new(service, listener),
+                local_port: 8080,
+                options: WasixSocketOptions::default(),
+            })),
+            false,
+        )
     }
 
     /// A program that exits with a listener open retires it.
@@ -5280,18 +5398,15 @@ mod tests {
         service: Net,
         socket: Net::UdpSocket,
     ) -> Preview1DescriptorEntry<Net> {
-        Preview1DescriptorEntry {
-            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(
-                WasixUdpSocket::Bound {
-                    family: WasixSocketFamily::Ipv4,
-                    socket: WasixOwnedUdpSocket::new(service, socket),
-                    local_port: 5353,
-                    options: WasixSocketOptions::default(),
-                },
-            )),
-            close_on_exec: false,
-            fdflags: 0,
-        }
+        Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+                family: WasixSocketFamily::Ipv4,
+                socket: WasixOwnedUdpSocket::new(service, socket),
+                local_port: 5353,
+                options: WasixSocketOptions::default(),
+            })),
+            false,
+        )
     }
 
     /// A program that exits with a datagram socket open retires it.
@@ -5418,42 +5533,62 @@ mod tests {
     /// deadline never arrived.
     #[test]
     fn poll_oneoff_returns_early_when_a_descriptor_becomes_ready() {
-        let mut ready = Vec::new();
-        let mut earliest: Option<Duration> = None;
-
-        if let Some(event) = p1_fd_event(
-            11,
-            P1_EVENTTYPE_FD_READ,
+        let subscriptions = [
+            P1Subscription::Fd {
+                userdata: 11,
+                event_type: P1_EVENTTYPE_FD_READ,
+                fd: 3,
+            },
+            P1Subscription::Clock {
+                userdata: 12,
+                monotonic: true,
+                deadline_nanos: 1_000_000,
+            },
+        ];
+        let readiness = [
             Ok(P1Readiness::Ready { bytes: 4 }),
-        ) {
-            ready.push(event);
-        }
-        match p1_clock_progress(12, 1_000_000, 0) {
-            P1ClockProgress::Elapsed(event) => ready.push(event),
-            P1ClockProgress::Waiting(remaining) => {
-                earliest =
-                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
-            }
-        }
+            Ok(P1Readiness::Pending),
+        ];
 
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].userdata, 11);
-        assert_eq!(ready[0].event_type, P1_EVENTTYPE_FD_READ);
+        let pass = p1_poll_pass(&subscriptions, &readiness, 0, 0);
+
+        assert_eq!(pass.ready.len(), 1);
+        assert_eq!(pass.ready[0].userdata, 11);
+        assert_eq!(pass.ready[0].event_type, P1_EVENTTYPE_FD_READ);
         // The clock only ever bounded the sleep; it never became an event.
-        assert_eq!(earliest, Some(Duration::from_nanos(1_000_000)));
+        assert_eq!(pass.earliest, Some(Duration::from_nanos(1_000_000)));
     }
 
-    /// The sleep is bounded by the earliest of several clock deadlines.
+    /// The sleep is bounded by the earliest of several clock deadlines, each
+    /// judged against its own timebase.
     #[test]
     fn poll_oneoff_sleeps_until_the_earliest_deadline() {
-        let mut earliest: Option<Duration> = None;
-        for deadline in [900u64, 300, 700] {
-            if let P1ClockProgress::Waiting(remaining) = p1_clock_progress(0, deadline, 100) {
-                earliest =
-                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
-            }
-        }
-        assert_eq!(earliest, Some(Duration::from_nanos(200)));
+        let clock = |userdata, monotonic, deadline_nanos| P1Subscription::Clock {
+            userdata,
+            monotonic,
+            deadline_nanos,
+        };
+        let subscriptions = [
+            clock(0, true, 900),
+            clock(1, true, 300),
+            clock(2, true, 700),
+            // On the system clock this one is 150ns away, nearer than any
+            // monotonic deadline above.
+            clock(3, false, 5_150),
+        ];
+        let readiness = [Ok(P1Readiness::Pending); 4];
+
+        let pass = p1_poll_pass(&subscriptions, &readiness, 100, 5_000);
+
+        assert!(pass.ready.is_empty(), "no deadline has arrived");
+        assert_eq!(pass.earliest, Some(Duration::from_nanos(150)));
+
+        // Once the earliest deadline passes, it is reported and the next one
+        // bounds the following sleep.
+        let pass = p1_poll_pass(&subscriptions, &readiness, 100, 5_150);
+        assert_eq!(pass.ready.len(), 1);
+        assert_eq!(pass.ready[0].userdata, 3);
+        assert_eq!(pass.earliest, Some(Duration::from_nanos(200)));
     }
 
     /// Regular files never block, in either direction. They used to fall
@@ -6143,6 +6278,9 @@ mod tests {
         accepts: usize,
         /// What another writer appends after the first chunk landed.
         other_writer: &'static [u8],
+        /// How many bytes the file can still store: a chunk past it is
+        /// stored in part, as a filesystem that runs out of space does.
+        room: usize,
     }
 
     impl ChunkedFile {
@@ -6152,6 +6290,7 @@ mod tests {
                 positions: Vec::new(),
                 accepts,
                 other_writer: b"",
+                room: usize::MAX,
             }
         }
     }
@@ -6165,7 +6304,7 @@ mod tests {
             gather: &mut Preview1Gather,
             position: WritePosition,
             len: usize,
-        ) -> Result<Result<u64, i32>, GuestAccessError> {
+        ) -> Result<Result<ChunkLanded, i32>, GuestAccessError> {
             if self.positions.len() == 1 {
                 self.bytes.extend_from_slice(self.other_writer);
             }
@@ -6178,11 +6317,18 @@ mod tests {
                 WritePosition::End => self.bytes.len(),
                 WritePosition::At(at) => at as usize,
             };
-            if self.bytes.len() < at + len {
-                self.bytes.resize(at + len, 0);
+            let stored = len.min(self.room);
+            self.room -= stored;
+            if self.bytes.len() < at + stored {
+                self.bytes.resize(at + stored, 0);
             }
-            gather.fill(memory, &mut self.bytes[at..at + len]).await?;
-            Ok(Ok((at + len) as u64))
+            gather
+                .fill(memory, &mut self.bytes[at..at + stored])
+                .await?;
+            Ok(Ok(ChunkLanded {
+                end: (at + stored) as u64,
+                len: stored,
+            }))
         }
     }
 
@@ -6281,6 +6427,32 @@ mod tests {
         .expect("the guest's pages are present");
         assert_eq!(landed, Ok((4, 0)));
         assert_eq!(file.positions, [WritePosition::End]);
+    }
+
+    /// A chunk the file stores only a prefix of ends the write there: the
+    /// guest is told how many bytes landed, and no later chunk is tried.
+    #[test]
+    fn a_chunk_stored_in_part_ends_the_write_after_the_prefix() {
+        let (guest, layout) = one_iovec(3 * P1_IO_CHUNK_BYTES);
+        let memory = async_memory_of(&guest);
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
+        let mut file = ChunkedFile::new(b"", usize::MAX);
+        let prefix = P1_IO_CHUNK_BYTES + 5;
+        file.room = prefix;
+        let landed = run(p1_write_gathered(
+            &memory,
+            &mut gather,
+            WritePosition::At(0),
+            &mut file,
+        ))
+        .expect("the guest's pages are present");
+        assert_eq!(landed, Ok((prefix as u64, prefix as u32)));
+        assert_eq!(
+            file.positions.len(),
+            2,
+            "no chunk is tried after the short one"
+        );
+        assert!(file.bytes == guest[..prefix]);
     }
 
     /// A receive whose buffers run from a present page onto one swap has

@@ -4,14 +4,24 @@ version = "0.1.0"
 edition.workspace = true
 build = "build.rs"
 
+[features]
+helios = ["dep:helios-api", "dep:wit-bindgen"]
+driver = ["dep:ash", "dep:tracing"]
+
 [dependencies]
+ash = { version = "0.38.0", default-features = false, features = ["std"], optional = true }
+tracing = { workspace = true, optional = true }
 thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
+helios-api = { path = "../api", optional = true, default-features = false, features = ["gpu"] }
+wit-bindgen = { workspace = true, optional = true, features = ["macros", "async", "std"] }
 
 [build-dependencies]
 helios-venus-gen = { workspace = true, features = ["generate"] }
 thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# The driver's unit tests compare Vulkan values with `assert_eq!`.
+ash = { version = "0.38.0", default-features = false, features = ["std", "debug"] }
 askama = { version = "0.15.6", default-features = false, features = ["derive", "std"] }
 cc = { version = "1.11.1", default-features = false }
 helios-venus-gen = { workspace = true, features = ["generate"] }

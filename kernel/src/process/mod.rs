@@ -1,18 +1,5 @@
-//! Process, thread, descriptor, and authority subsystem.
-//!
-//! `table` and `thread` track live processes and their threads.
-//! `authority` declares the capability rights granted to a process.
-//! `descriptor` is the per-process file/handle table. `futex` backs
-//! guest thread futex wait/wake. `program_service` exposes the
-//! program execution status types used by both the runtime backend
-//! and the kernel-facing API.
-
 mod authority;
-mod descriptor;
-mod futex;
 mod program_service;
-mod table;
-mod thread;
 
 #[cfg(test)]
 pub(crate) use authority::test_caps;
@@ -27,14 +14,7 @@ pub use authority::{
     SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
     TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap, UnmountCap,
 };
-pub(crate) use descriptor::FreeDescriptorSlots;
-pub use descriptor::{
-    DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable, DescriptorTableError,
-};
-pub use futex::{FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity};
 pub use program_service::{
-    ComponentStdioRefusal, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind,
-    ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
+    ComponentStdioRefusal, LinuxImageRefusal, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, UnbindableStdio,
 };
-pub use table::{ProcessId, ProcessRecord, ProcessState, ProcessTable, ProcessTableError};
-pub use thread::{ThreadId, ThreadRecord, ThreadState, ThreadTable, ThreadTableError};

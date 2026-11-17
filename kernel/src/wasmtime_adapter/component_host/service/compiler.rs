@@ -1019,7 +1019,7 @@ mod tests {
     type FixtureStore = CompilerCoreStore<
         crate::test_support::TestCpu,
         crate::test_support::TestNetworkService,
-        crate::UnsupportedStorage,
+        crate::test_support::UnsupportedStorage,
     >;
 
     /// A compile's context on the fixtures a kernel unit test carries, the
@@ -1032,7 +1032,7 @@ mod tests {
         context: CompilerCompileContext<
             crate::test_support::TestCpu,
             crate::test_support::TestNetworkService,
-            crate::UnsupportedStorage,
+            crate::test_support::UnsupportedStorage,
         >,
     }
 
@@ -1050,7 +1050,7 @@ mod tests {
             let runtime_state: HostRuntimeState<
                 TestCpu,
                 crate::test_support::TestNetworkService,
-                crate::UnsupportedStorage,
+                crate::test_support::UnsupportedStorage,
             > = crate::RuntimeState::new(
                 cpu.timebase(),
                 1,

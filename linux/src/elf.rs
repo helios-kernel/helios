@@ -1,12 +1,14 @@
+use object::Object;
 use object::elf::{ET_EXEC, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_TLS};
 use object::read::elf::{ElfFile64, FileHeader, ProgramHeader};
-use object::{Architecture, Object};
+
+use crate::abi::Abi;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid ELF: {0}")]
     Parse(#[from] object::Error),
-    #[error("prototype requires a little-endian static x86-64 ET_EXEC image")]
+    #[error("not a little-endian static ET_EXEC image of the process's ABI")]
     UnsupportedImage,
     #[error("prototype cannot load an interpreter or dynamic relocations")]
     UnsupportedSegment,
@@ -41,10 +43,12 @@ pub struct Image<'a> {
 }
 
 impl<'a> Image<'a> {
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
+    /// Validates `bytes` as a static executable of `abi` whose every
+    /// segment lies inside `user_end`, the end of the user range.
+    pub fn parse(bytes: &'a [u8], abi: Abi, user_end: u64) -> Result<Self, Error> {
         let file = ElfFile64::parse(bytes)?;
         let endian = file.endian();
-        if file.architecture() != Architecture::X86_64
+        if file.elf_header().e_machine(endian) != abi.elf_machine()
             || !file.is_little_endian()
             || file.elf_header().e_type(endian) != ET_EXEC
         {
@@ -63,7 +67,7 @@ impl<'a> Image<'a> {
                     if size > header.p_memsz(endian)
                         || address
                             .checked_add(header.p_memsz(endian))
-                            .is_none_or(|end| end > 1 << 47)
+                            .is_none_or(|end| end > user_end)
                         || (align > 1
                             && (!align.is_power_of_two()
                                 || address % align != header.p_offset(endian) % align))
@@ -100,13 +104,16 @@ impl<'a> Image<'a> {
             let flags = header.p_flags(endian);
             let align = header.p_align(endian);
             let end = address.checked_add(size).ok_or(Error::InvalidSegment)?;
-            // x86-64's four-level user half; page zero is deliberately unmapped.
+            // Page zero is deliberately unmapped.
             if address < 4096
-                || end > 1 << 47
+                || end > user_end
                 || bytes.len() as u64 > size
                 || flags & !(PF_R | PF_W | PF_X) != 0
                 || flags & PF_R == 0
-                || flags & (PF_W | PF_X) == PF_W | PF_X
+                // PF_W | PF_X loads writable and executable: fs/binfmt_elf.c
+                // `load_elf_binary` maps each PT_LOAD through `elf_map` with
+                // `make_prot(p_flags)`, which turns PF_W and PF_X into
+                // PROT_WRITE and PROT_EXEC together.
                 || (align > 1
                     && (!align.is_power_of_two()
                         || address % align != header.p_offset(endian) % align))
@@ -162,6 +169,18 @@ impl<'a> Image<'a> {
 
     pub fn entry(&self) -> u64 {
         self.file.entry()
+    }
+
+    /// Where the program break starts: the end of the highest load segment
+    /// rounded up to a page, as fs/binfmt_elf.c's `load_elf_binary` sets
+    /// `mm->start_brk` (`ELF_PAGEALIGN(elf_brk)`) when it does not
+    /// randomise the break.
+    pub fn program_break(&self, page_size: u64) -> u64 {
+        self.segments()
+            .map(|segment| segment.address + segment.memory_size)
+            .max()
+            .expect("a validated image has a load segment")
+            .next_multiple_of(page_size)
     }
 
     pub fn segments(&self) -> impl Iterator<Item = Segment<'a>> + '_ {

@@ -133,14 +133,43 @@ impl MemoryDisk {
     /// to whole cache blocks: an image a filesystem test mounts. With
     /// `fail_reads`, every read the disk is asked for fails.
     pub(crate) fn holding(serial: &'static str, image: &[u8], fail_reads: bool) -> Self {
+        Self::holding_image(serial, image, fail_reads, true)
+    }
+
+    /// Like [`Self::holding`], but the disk accepts writes: an image a
+    /// writable filesystem test mounts.
+    pub(crate) fn holding_writable(serial: &'static str, image: &[u8]) -> Self {
+        Self::holding_image(serial, image, false, false)
+    }
+
+    fn holding_image(
+        serial: &'static str,
+        image: &[u8],
+        fail_reads: bool,
+        read_only: bool,
+    ) -> Self {
         let blocks = image.len().div_ceil(CACHE_BLOCK_BYTES) * (CACHE_BLOCK_BYTES / 512);
         let mut state = Self::build(serial, 512, blocks);
         let bytes = state.bytes.get_mut();
         bytes.fill(0);
         bytes[..image.len()].copy_from_slice(image);
-        state.read_only = true;
+        state.read_only = read_only;
         *state.fail_reads.get_mut() = fail_reads;
         Self::from(state)
+    }
+
+    /// Like [`Self::holding_writable`], but the device refuses every write
+    /// that covers the 512-byte block `failing`.
+    pub(crate) fn holding_writable_failing_at(
+        serial: &'static str,
+        image: &[u8],
+        failing: usize,
+    ) -> Self {
+        let mut disk = Self::holding_image(serial, image, false, false);
+        Arc::get_mut(&mut disk.state)
+            .expect("a disk just built has no other owner")
+            .fail_writes_at = Some(failing);
+        disk
     }
 
     /// Makes every later read fail, or succeed again.
@@ -203,7 +232,7 @@ impl MemoryDisk {
             .collect()
     }
 
-    fn bytes_at(&self, offset: usize, len: usize) -> Vec<u8> {
+    pub(crate) fn bytes_at(&self, offset: usize, len: usize) -> Vec<u8> {
         self.state.bytes.lock()[offset..offset + len].to_vec()
     }
 

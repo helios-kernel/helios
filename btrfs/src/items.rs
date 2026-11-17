@@ -36,6 +36,16 @@ impl Timestamp {
 
 /// The inode flag marking a file whose data carries no checksums.
 pub(crate) const INODE_NODATASUM: u64 = 1 << 0;
+/// BTRFS_INODE_NODATACOW and BTRFS_INODE_NOCOMPRESS in btrfs_tree.h.
+#[cfg(feature = "write")]
+pub(crate) const INODE_NODATACOW: u64 = 1 << 1;
+#[cfg(feature = "write")]
+pub(crate) const INODE_NOCOMPRESS: u64 = 1 << 3;
+/// BTRFS_INODE_IMMUTABLE and BTRFS_INODE_APPEND in btrfs_tree.h.
+#[cfg(feature = "write")]
+pub(crate) const INODE_IMMUTABLE: u64 = 1 << 6;
+#[cfg(feature = "write")]
+pub(crate) const INODE_APPEND: u64 = 1 << 7;
 
 /// What an inode item records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +244,7 @@ pub(crate) fn dir_index_record(payload: &[u8]) -> Result<DirRecord<'_>, ItemDefe
 }
 
 /// A root item: where a tree starts and which inode is its top directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RootRecord {
     pub(crate) root: TreeRoot,
     pub(crate) root_dirid: u64,
@@ -378,15 +389,8 @@ impl<'a> FileExtent<'a> {
             .checked_add(num_bytes)
             .ok_or(ItemDefect::ExtentOverflow)?;
 
-        if head.extent_type == EXTENT_PREALLOC {
-            if compression.is_some() {
-                return Err(ItemDefect::Compression(head.compression));
-            }
-            return Ok(Self {
-                start,
-                end,
-                data: ExtentData::Zero,
-            });
+        if head.extent_type == EXTENT_PREALLOC && compression.is_some() {
+            return Err(ItemDefect::Compression(head.compression));
         }
         if disk_bytenr == 0 {
             return Ok(Self {
@@ -414,6 +418,13 @@ impl<'a> FileExtent<'a> {
                 offset,
                 len: num_bytes,
                 limit,
+            });
+        }
+        if head.extent_type == EXTENT_PREALLOC {
+            return Ok(Self {
+                start,
+                end,
+                data: ExtentData::Zero,
             });
         }
         Ok(Self {

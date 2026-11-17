@@ -5,7 +5,7 @@
 //! tasks on external events.
 
 mod block;
-mod child;
+use helios_sync as child;
 
 /// The block layer's test disk, for the filesystems mounted over it.
 #[cfg(test)]

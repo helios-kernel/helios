@@ -10,7 +10,7 @@
 //! Layouts follow the kernel's `include/uapi/linux/btrfs_tree.h`.
 
 use zerocopy::little_endian::{U16, U32, U64};
-use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Bytes of the checksum field at the head of a superblock and a tree block.
 pub(crate) const CSUM_FIELD_BYTES: usize = 32;
@@ -37,30 +37,78 @@ pub(crate) const STRIPE_LEN: u64 = 64 * 1024;
 /// Object ids with a fixed meaning.
 pub(crate) mod objectid {
     pub(crate) const ROOT_TREE: u64 = 1;
+    #[cfg(feature = "write")]
+    pub(crate) const EXTENT_TREE: u64 = 2;
     pub(crate) const CHUNK_TREE: u64 = 3;
+    #[cfg(feature = "write")]
+    pub(crate) const DEV_TREE: u64 = 4;
+    #[cfg(feature = "write")]
+    pub(crate) const UUID_TREE: u64 = 9;
+    #[cfg(feature = "write")]
+    pub(crate) const FREE_SPACE_TREE: u64 = 10;
+    #[cfg(feature = "write")]
+    pub(crate) const BLOCK_GROUP_TREE: u64 = 11;
     pub(crate) const FS_TREE: u64 = 5;
     pub(crate) const ROOT_TREE_DIR: u64 = 6;
     pub(crate) const CSUM_TREE: u64 = 7;
+    /// `BTRFS_QUOTA_TREE_OBJECTID`: present once quotas are enabled.
+    #[cfg(feature = "write")]
+    pub(crate) const QUOTA_TREE: u64 = 8;
     pub(crate) const FIRST_FREE: u64 = 256;
     pub(crate) const LAST_FREE: u64 = -256_i64 as u64;
     pub(crate) const FIRST_CHUNK_TREE: u64 = 256;
+    /// `BTRFS_DEV_ITEMS_OBJECTID`: the chunk tree's device items.
+    #[cfg(feature = "write")]
+    pub(crate) const DEV_ITEMS: u64 = 1;
     pub(crate) const EXTENT_CSUM: u64 = -10_i64 as u64;
 }
 
 /// Item types the read path consults.
 pub(crate) mod item_type {
     pub(crate) const INODE_ITEM: u8 = 1;
+    #[cfg(feature = "write")]
+    pub(crate) const INODE_REF: u8 = 12;
+    #[cfg(feature = "write")]
+    pub(crate) const INODE_EXTREF: u8 = 13;
     pub(crate) const XATTR_ITEM: u8 = 24;
     pub(crate) const DIR_ITEM: u8 = 84;
     pub(crate) const DIR_INDEX: u8 = 96;
     pub(crate) const EXTENT_DATA: u8 = 108;
     pub(crate) const EXTENT_CSUM: u8 = 128;
     pub(crate) const ROOT_ITEM: u8 = 132;
+    #[cfg(feature = "write")]
+    pub(crate) const EXTENT_ITEM: u8 = 168;
+    #[cfg(feature = "write")]
+    pub(crate) const METADATA_ITEM: u8 = 169;
+    #[cfg(feature = "write")]
+    pub(crate) const TREE_BLOCK_REF: u8 = 176;
+    #[cfg(feature = "write")]
+    pub(crate) const EXTENT_DATA_REF: u8 = 178;
+    #[cfg(feature = "write")]
+    pub(crate) const SHARED_BLOCK_REF: u8 = 182;
+    #[cfg(feature = "write")]
+    pub(crate) const SHARED_DATA_REF: u8 = 184;
+    #[cfg(feature = "write")]
+    pub(crate) const BLOCK_GROUP_ITEM: u8 = 192;
+    #[cfg(feature = "write")]
+    pub(crate) const FREE_SPACE_INFO: u8 = 198;
+    #[cfg(feature = "write")]
+    pub(crate) const FREE_SPACE_EXTENT: u8 = 199;
+    #[cfg(feature = "write")]
+    pub(crate) const FREE_SPACE_BITMAP: u8 = 200;
+    #[cfg(feature = "write")]
+    pub(crate) const DEV_EXTENT: u8 = 204;
+    #[cfg(feature = "write")]
+    pub(crate) const DEV_ITEM: u8 = 216;
     pub(crate) const CHUNK_ITEM: u8 = 228;
+    #[cfg(feature = "write")]
+    pub(crate) const UUID_SUBVOL: u8 = 251;
+    #[cfg(feature = "write")]
+    pub(crate) const UUID_RECEIVED: u8 = 252;
 }
 
 /// `btrfs_disk_key`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawKey {
     pub(crate) objectid: U64,
@@ -69,7 +117,7 @@ pub(crate) struct RawKey {
 }
 
 /// `btrfs_dev_item`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawDevItem {
     pub(crate) devid: U64,
@@ -89,7 +137,7 @@ pub(crate) struct RawDevItem {
 }
 
 /// The head of `btrfs_super_block`, through the bootstrap chunk array.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawSuperblock {
     pub(crate) csum: [u8; CSUM_FIELD_BYTES],
@@ -129,8 +177,37 @@ pub(crate) struct RawSuperblock {
     pub(crate) sys_chunk_array: [u8; SYS_CHUNK_ARRAY_BYTES],
 }
 
+/// One of the four `btrfs_root_backup` records after the system chunk array.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+pub(crate) struct RawRootBackup {
+    pub(crate) tree: U64,
+    pub(crate) tree_generation: U64,
+    pub(crate) chunk: U64,
+    pub(crate) chunk_generation: U64,
+    pub(crate) extent: U64,
+    pub(crate) extent_generation: U64,
+    pub(crate) fs: U64,
+    pub(crate) fs_generation: U64,
+    pub(crate) device: U64,
+    pub(crate) device_generation: U64,
+    pub(crate) checksum: U64,
+    pub(crate) checksum_generation: U64,
+    pub(crate) total_bytes: U64,
+    pub(crate) bytes_used: U64,
+    pub(crate) devices: U64,
+    pub(crate) unused: [U64; 4],
+    pub(crate) tree_level: u8,
+    pub(crate) chunk_level: u8,
+    pub(crate) extent_level: u8,
+    pub(crate) fs_level: u8,
+    pub(crate) device_level: u8,
+    pub(crate) checksum_level: u8,
+    pub(crate) padding: [u8; 10],
+}
+
 /// `btrfs_header`, the head of every tree block.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawHeader {
     pub(crate) csum: [u8; CSUM_FIELD_BYTES],
@@ -145,7 +222,7 @@ pub(crate) struct RawHeader {
 }
 
 /// `btrfs_item`: a leaf's slot, pointing at its data.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawItem {
     pub(crate) key: RawKey,
@@ -154,7 +231,7 @@ pub(crate) struct RawItem {
 }
 
 /// `btrfs_key_ptr`: an internal node's slot, pointing at a child block.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawKeyPtr {
     pub(crate) key: RawKey,
@@ -163,7 +240,7 @@ pub(crate) struct RawKeyPtr {
 }
 
 /// `btrfs_chunk`, without its trailing stripes.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawChunk {
     pub(crate) length: U64,
@@ -178,7 +255,7 @@ pub(crate) struct RawChunk {
 }
 
 /// `btrfs_stripe`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawStripe {
     pub(crate) devid: U64,
@@ -187,7 +264,7 @@ pub(crate) struct RawStripe {
 }
 
 /// `btrfs_timespec`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawTimespec {
     pub(crate) sec: U64,
@@ -195,7 +272,7 @@ pub(crate) struct RawTimespec {
 }
 
 /// `btrfs_inode_item`.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawInodeItem {
     pub(crate) generation: U64,
@@ -219,7 +296,7 @@ pub(crate) struct RawInodeItem {
 
 /// The head of `btrfs_root_item` every format revision carries; later
 /// revisions append fields the read path does not consult.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawRootItem {
     pub(crate) inode: RawInodeItem,
@@ -236,8 +313,28 @@ pub(crate) struct RawRootItem {
     pub(crate) level: u8,
 }
 
+/// The extension of `btrfs_root_item`, valid when its generation matches the
+/// head. Its layout is fixed by Linux's btrfs_tree.h.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+pub(crate) struct RawRootTail {
+    pub(crate) generation_v2: U64,
+    pub(crate) uuid: [u8; 16],
+    pub(crate) parent_uuid: [u8; 16],
+    pub(crate) received_uuid: [u8; 16],
+    pub(crate) ctransid: U64,
+    pub(crate) otransid: U64,
+    pub(crate) stransid: U64,
+    pub(crate) rtransid: U64,
+    pub(crate) ctime: RawTimespec,
+    pub(crate) otime: RawTimespec,
+    pub(crate) stime: RawTimespec,
+    pub(crate) rtime: RawTimespec,
+    pub(crate) reserved: [U64; 8],
+}
+
 /// `btrfs_dir_item`, without its trailing name and data.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawDirItem {
     pub(crate) location: RawKey,
@@ -247,9 +344,28 @@ pub(crate) struct RawDirItem {
     pub(crate) entry_type: u8,
 }
 
+/// `btrfs_inode_ref`, followed by the name.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+#[cfg(feature = "write")]
+pub(crate) struct RawInodeRef {
+    pub(crate) index: U64,
+    pub(crate) name_len: U16,
+}
+
+/// `btrfs_inode_extref`, followed by the name.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+#[cfg(feature = "write")]
+pub(crate) struct RawInodeExtref {
+    pub(crate) parent: U64,
+    pub(crate) index: U64,
+    pub(crate) name_len: U16,
+}
+
 /// The head of `btrfs_file_extent_item` every extent type carries. An
 /// inline extent's data follows it directly.
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawFileExtentHead {
     pub(crate) generation: U64,
@@ -262,7 +378,7 @@ pub(crate) struct RawFileExtentHead {
 
 /// The tail of `btrfs_file_extent_item` a regular or preallocated extent
 /// carries after [`RawFileExtentHead`].
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
 pub(crate) struct RawFileExtentBody {
     pub(crate) disk_bytenr: U64,
@@ -283,6 +399,7 @@ const _: () = {
     assert!(size_of::<RawKey>() == 17);
     assert!(size_of::<RawDevItem>() == 98);
     assert!(size_of::<RawSuperblock>() == SYS_CHUNK_ARRAY_OFFSET + SYS_CHUNK_ARRAY_BYTES);
+    assert!(size_of::<RawRootBackup>() == 168);
     assert!(size_of::<RawHeader>() == 101);
     assert!(size_of::<RawItem>() == 25);
     assert!(size_of::<RawKeyPtr>() == 33);
@@ -290,6 +407,7 @@ const _: () = {
     assert!(size_of::<RawStripe>() == 32);
     assert!(size_of::<RawInodeItem>() == 160);
     assert!(size_of::<RawRootItem>() == 239);
+    assert!(size_of::<RawRootTail>() == 200);
     assert!(size_of::<RawDirItem>() == 30);
     assert!(size_of::<RawFileExtentHead>() == 21);
     assert!(size_of::<RawFileExtentBody>() == 32);

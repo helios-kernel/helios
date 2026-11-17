@@ -1,3 +1,5 @@
+use helios_unix::FutexTable;
+use helios_unix::{DescriptorId, DescriptorTable, FutexKey, GuestAddress, ProcessMemoryIdentity};
 extern crate alloc;
 
 use alloc::string::{String, ToString};
@@ -12,13 +14,12 @@ use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
 use helios_kernel::SocketReadiness;
 use helios_kernel::{
-    ComponentNetworkService, DescriptorId, DescriptorTable, DnsError, DnsErrorKind, Executor,
-    FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
-    NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
+    ComponentNetworkService, DnsError, DnsErrorKind, Executor, Ipv4Address, Ipv4Cidr, Ipv4Route,
+    MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, NodeRun, Notify, PingError, PingErrorKind, PingReply,
-    ProcessMemoryIdentity, RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind,
-    TcpListener, TcpReadInto, TcpReadProgress, TcpWriteProgress, TryRead, TryWrite, UdpBinding,
-    UdpDatagram, UdpError, UdpErrorKind, UserMemoryPool, byte_channel,
+    RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadInto,
+    TcpReadProgress, TcpWriteProgress, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind, UserMemoryPool, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -838,6 +839,7 @@ impl ComponentNetworkService for BenchNetworkService {
 
 impl Cpu for BenchCpu {
     type Hypervisor = core::convert::Infallible;
+    type Native = core::convert::Infallible;
     const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
 
     fn processor_count(&self) -> usize {

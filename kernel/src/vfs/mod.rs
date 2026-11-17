@@ -40,19 +40,22 @@ mod btrfs;
 mod erofs;
 mod host;
 mod memory;
+mod node;
 mod request;
 mod root;
 mod storage;
 
-pub use btrfs::BtrfsFs;
+use btrfs::WritableMount;
+pub use btrfs::{BtrfsFs, BtrfsMountError, BtrfsService, BtrfsWriteOptions, CommitPolicy};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
 pub use memory::{MemoryFs, MemoryWrite};
+pub use node::{FsDescriptor, FsDescriptorFlags};
 pub use request::{
     AttachedStorage, MountRequestError, MountSource, request_mount, request_unmount,
 };
 pub use root::{RootFs, RootWrite};
-pub use storage::{NoDisks, Storage, UnsupportedStorage};
+pub use storage::{NoDisks, Storage};
 
 use alloc::borrow::{Cow, ToOwned};
 use alloc::boxed::Box;
@@ -71,7 +74,8 @@ use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FilledWrite, FsError, FsPath,
-    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition,
+    WriteProgress,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -181,21 +185,22 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.create_directory(path, now).await,)+ }
             }
 
-            async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.remove_directory(path).await,)+ }
+            async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.remove_directory(path, now).await,)+ }
             }
 
-            async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.unlink(path).await,)+ }
+            async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.unlink(path, now).await,)+ }
             }
 
             async fn rename(
                 &self,
                 source: FsPath<'_>,
                 destination: FsPath<'_>,
+                mode: RenameMode,
                 now: u64,
             ) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.rename(source, destination, now).await,)+ }
+                match self { $(Self::$kind(fs) => fs.rename(source, destination, mode, now).await,)+ }
             }
 
             async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -302,7 +307,7 @@ macro_rules! mount_kinds {
 
 /// Writes `data` at `position` through [`helios_hal::fs::write_with`],
 /// and resolves with the offset it landed at: the filesystem tests'
-/// write.
+/// write. It asserts that every byte landed.
 #[cfg(test)]
 pub(crate) async fn write_bytes<F: FileSystem>(
     fs: &F,
@@ -311,10 +316,13 @@ pub(crate) async fn write_bytes<F: FileSystem>(
     data: &[u8],
     now: u64,
 ) -> FsResult<u64> {
-    helios_hal::fs::write_with(fs, path, position, data.len(), now, |at, destination| {
-        destination.copy_from_slice(&data[at..at + destination.len()]);
-    })
-    .await
+    let landed =
+        helios_hal::fs::write_with(fs, path, position, data.len(), now, |at, destination| {
+            destination.copy_from_slice(&data[at..at + destination.len()]);
+        })
+        .await?;
+    assert_eq!(landed.len, data.len(), "the write landed in full");
+    Ok(landed.offset)
 }
 
 mount_kinds! {
@@ -571,6 +579,10 @@ struct Machine {
     /// Processors that may resolve a path: one pin block each, in every
     /// table.
     processors: usize,
+    /// Every writable btrfs mount whose service has not ended, in whichever
+    /// tree it was made: what the machine commits before it powers off.
+    /// Held only to add, prune and copy the list, never across an await.
+    writable: spin::Mutex<Vec<WritableMount>>,
 }
 
 struct TableInner<S: Storage> {
@@ -702,6 +714,7 @@ impl<S: Storage> MountTable<S> {
             boot,
             next_device: AtomicU64::new(AuthorityDomain::FIRST_MOUNTED.raw()),
             processors,
+            writable: spin::Mutex::new(Vec::new()),
         }))
     }
 
@@ -774,6 +787,13 @@ impl<S: Storage> MountTable<S> {
             }
         }
         let slot = empty.ok_or(MountError::TableFull)?;
+        if let MountedFs::Btrfs(btrfs) = &fs
+            && let Some(writable) = btrfs.writable()
+        {
+            let mut mounts = self.inner.machine.writable.lock();
+            mounts.retain(|mount| !mount.has_ended());
+            mounts.push(writable);
+        }
         // SAFETY: the slot is empty and the writer lock is held: no
         // resolution reads an empty slot's mount and no writer races.
         unsafe {
@@ -839,7 +859,11 @@ impl<S: Storage> MountTable<S> {
         if retiring.held() {
             return Err(busy());
         }
-        drop(retiring.retire());
+        // As Linux's unmount, the call returns once what the filesystem
+        // held is on its device.
+        if let Some(mount) = retiring.retire() {
+            mount.fs.unmount().await;
+        }
         Ok(())
     }
 
@@ -1026,11 +1050,7 @@ pub enum FileContents {
 /// The whole of the regular file at `path` on `fs`.
 pub(crate) async fn read_all<F: FileSystem>(fs: &F, path: FsPath<'_>) -> FsResult<Bytes> {
     let metadata = fs.stat(path).await?;
-    match metadata.kind {
-        NodeKind::File => {}
-        NodeKind::Directory => return Err(FsError::IsDirectory),
-        NodeKind::Symlink => return Err(FsError::Invalid),
-    }
+    metadata.kind.require_regular()?;
     let size = usize::try_from(metadata.size).map_err(|_| FsError::Overflow)?;
     let first = fs.read_at(path, 0, size).await?;
     if first.len() == size {
@@ -1097,7 +1117,36 @@ impl<S: Storage> Clone for Namespace<S> {
     }
 }
 
+impl<S: Storage> MountedFs<S> {
+    /// Ends the filesystem as it leaves the mount table: a writable btrfs
+    /// mount commits and lets its device go first.
+    async fn unmount(&self) {
+        if let Self::Btrfs(btrfs) = self {
+            btrfs.unmount().await;
+        }
+    }
+}
+
 impl<S: Storage> Namespace<S> {
+    /// Makes every writable btrfs mount on the machine durable, in every
+    /// tree and including those still ending after an unmount: what the
+    /// kernel does before it powers off, as Linux syncs and unmounts.
+    pub async fn sync_writable_mounts(&self) {
+        let mounts: Vec<WritableMount> = {
+            let mut mounts = self.own.inner.machine.writable.lock();
+            mounts.retain(|mount| !mount.has_ended());
+            mounts.clone()
+        };
+        // Each mount commits through its own service and device; at most a
+        // table's worth of them wait at once.
+        futures::StreamExt::for_each_concurrent(
+            futures::stream::iter(&mounts),
+            MAX_MOUNTS,
+            WritableMount::settle,
+        )
+        .await;
+    }
+
     /// The root namespace, over `table`: the kernel's own tree, with a
     /// fresh root layer and no ancestors.
     pub fn new(table: MountTable<S>) -> Self {
@@ -1298,18 +1347,27 @@ impl<S: Storage> Namespace<S> {
     /// Removes the empty directory `absolute`. A mount point, or a
     /// directory with a mount point below it, is in use:
     /// [`FsError::Busy`].
-    pub async fn remove_directory(&self, absolute: &str) -> FsResult<()> {
+    pub async fn remove_directory(&self, absolute: &str, now: u64) -> FsResult<()> {
         let resolved = self.resolve(absolute)?;
         if resolved.is_mount_root() || self.holds_mounts(absolute) {
             return Err(FsError::Busy);
         }
-        resolved.writable()?.remove_directory(resolved.path()).await
+        resolved
+            .writable()?
+            .remove_directory(resolved.path(), now)
+            .await
     }
 
     /// Renames within one mount; across two, [`FsError::CrossDevice`]. A
     /// directory with a mount point below it stays where it is:
-    /// [`FsError::Busy`].
-    pub async fn rename(&self, source: &str, destination: &str, now: u64) -> FsResult<()> {
+    /// [`FsError::Busy`]. `mode` is as [`FileSystem::rename`] takes it.
+    pub async fn rename(
+        &self,
+        source: &str,
+        destination: &str,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
         if self.holds_mounts(source) {
             return Err(FsError::Busy);
         }
@@ -1323,7 +1381,7 @@ impl<S: Storage> Namespace<S> {
         }
         source
             .writable()?
-            .rename(source.path(), destination.path(), now)
+            .rename(source.path(), destination.path(), mode, now)
             .await
     }
 
@@ -1363,14 +1421,13 @@ impl<S: Storage> Namespace<S> {
         let parent = crate::parent_path(point);
         // The cap is the authority over where a mount goes, so the parent's
         // links are followed anywhere in the namespace.
-        match self
+        let parent_kind = self
             .stat(parent, Follow::Within("/"))
             .await
             .map_err(refuse)?
-            .kind
-        {
-            NodeKind::Directory => {}
-            NodeKind::File | NodeKind::Symlink => return Err(refuse(FsError::NotDirectory)),
+            .kind;
+        if parent_kind != NodeKind::Directory {
+            return Err(refuse(FsError::NotDirectory));
         }
         match self.stat(point, Follow::No).await {
             Ok(metadata) if metadata.kind != NodeKind::Directory => {

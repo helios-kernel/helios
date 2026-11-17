@@ -20,6 +20,9 @@ where
         /// executable itself is moved through every launch path.
         restore: Box<CoreModuleRestore<Net>>,
     },
+    /// A static Linux executable the native host runs.
+    #[cfg(feature = "linux")]
+    Linux(LinuxExecutable),
 }
 
 pub(super) struct CoreModuleRestore<Net: ComponentHostNetwork> {
@@ -287,6 +290,24 @@ where
                 core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
+                &timeline,
+            )
+            .await
+        }
+        // A Linux process holds the descriptor table it is handed as its
+        // own, and its standard streams lead where the launch routes them.
+        #[cfg(feature = "linux")]
+        ProgramExecutable::Linux(executable) => {
+            run_linux_process(
+                exec_context,
+                argv,
+                env,
+                authority,
+                descriptors,
+                signal_state,
+                launched_instance,
+                output_mode,
+                executable,
                 &timeline,
             )
             .await
@@ -1091,12 +1112,6 @@ where
             instantiate_instance_started,
         );
     }
-    let instance = instance.inspect(|instance| {
-        // Every call that shows a view checks its span against this
-        // instance's linear memory, so the store records the memory's
-        // handle here, the first moment the runtime can name it.
-        crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, instance);
-    });
     let executor = instance.and_then(|instance| {
         let resolve_started = profile_runtime_state
             .profiling_enabled()

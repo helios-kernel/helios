@@ -7,11 +7,11 @@ use triomphe::Arc;
 
 use crate::{
     BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
-    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, FutexKey, FutexTable,
-    FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats,
-    HostShare, InstanceId, InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace,
-    Notify, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter,
-    ProfileScope, ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceLog,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, HEAP_SIZE_CLASS_COUNT,
+    HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId, InstanceRegistry,
+    InstructionSampler, MountTable, MountedFs, Namespace, Notify, PerfMetricFilter,
+    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink,
+    StatsSample, TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
@@ -117,7 +117,6 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// device up. Empty on a machine with no vsock device, where the
     /// runtime adapter answers `unavailable` rather than trapping.
     vsock_service: Once<ComponentHostVsockService>,
-    futex_table: FutexTable,
     /// The user payload the backend handed the kernel — init component,
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
@@ -364,7 +363,6 @@ where
                 compositor: ProviderSlot::new(),
                 audio_service: Once::new(),
                 vsock_service: Once::new(),
-                futex_table: FutexTable::new(),
                 payload,
                 namespace: Namespace::new(MountTable::new(
                     BootFs::new(payload.bootfs(), BOOT_DEVICE),
@@ -1158,18 +1156,6 @@ where
         self.inner.vsock_service.get().cloned()
     }
 
-    pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {
-        self.inner.futex_table.prepare_wait(key)
-    }
-
-    pub fn wake_futex(&self, key: FutexKey, count: usize) -> usize {
-        self.inner.futex_table.wake(key, count)
-    }
-
-    pub fn wake_all_futex(&self, key: FutexKey) -> usize {
-        self.inner.futex_table.wake_all(key)
-    }
-
     /// The system component this payload carries, when this build would
     /// autostart one.
     pub fn system_component(&self) -> Option<EmbeddedComponent> {
@@ -1351,7 +1337,7 @@ mod tests {
 
     #[test]
     fn a_reseed_moves_the_wall_clock_to_the_new_reading() {
-        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
@@ -1365,7 +1351,7 @@ mod tests {
 
         // The machine was stopped and the calendar moved a day.
         rtc.0.set(1_000 + 86_400);
-        let wall = RuntimeState::<(), (), crate::UnsupportedStorage>::read_rtc(&rtc);
+        let wall = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::read_rtc(&rtc);
         state.reseed_wall_clock(6_000_000_000, wall);
         assert_eq!(state.wall_clock_nanos(6_000_000_000), 87_400_000_000_000);
     }
@@ -1373,7 +1359,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "seeded more than once")]
     fn seeding_the_wall_clock_twice_is_a_bring_up_fault() {
-        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
@@ -1387,7 +1373,7 @@ mod tests {
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {
-        let state = RuntimeState::<(), (), crate::UnsupportedStorage>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,

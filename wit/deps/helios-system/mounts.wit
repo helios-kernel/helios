@@ -19,7 +19,7 @@ interface mounts {
     /// The EROFS image on the disk that reported this serial. Always
     /// read-only.
     disk(string),
-    /// The btrfs image on the disk that reported this serial. Always read-only.
+    /// The btrfs image on the disk that reported this serial.
     btrfs(string),
   }
 
@@ -30,6 +30,16 @@ interface mounts {
     path: string,
     /// Attach for reading only.
     read-only: bool,
+    /// The value of Linux's `compress=` mount option, such as `zstd:3`,
+    /// `zlib`, `lzo` or `no`: the compression new data of a writable btrfs
+    /// mount is written with. Absent writes uncompressed. A source other than
+    /// btrfs refuses it.
+    compress: option<string>,
+    /// The value of Linux's `commit=` mount option: the longest, in seconds,
+    /// a change to a writable btrfs mount waits before it is committed when
+    /// nothing syncs it. Absent or zero takes Linux's default of 30. A
+    /// source other than btrfs refuses it.
+    commit: option<u32>,
   }
 
   enum mount-error-kind {
@@ -55,6 +65,9 @@ interface mounts {
     invalid-filesystem,
     /// Reading the source failed.
     io,
+    /// A mount option is malformed, names something the source does not
+    /// take, or asks for a level the kernel cannot encode.
+    invalid-option,
   }
 
   record mount-error {

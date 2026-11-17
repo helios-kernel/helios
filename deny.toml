@@ -26,6 +26,9 @@ deny = [
         "wit-bindgen-core",
         "wit-bindgen-rust",
         "wit-bindgen-rust-macro",
+        # The component composition `helios-cli` plugs libraries with.
+        "wac-graph",
+        "wac-types",
         # The Wasmtime fork's build-time and macro crates.
         "wasmtime-environ",
         "wasmtime-internal-component-macro",

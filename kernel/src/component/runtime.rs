@@ -62,15 +62,24 @@ pub const MAX_CORE_INSTANCES_PER_COMPONENT: u32 = 8;
 /// so it is deliberately tight.
 pub const MAX_MEMORIES_PER_COMPONENT: u32 = 2;
 
-/// The most tables one component may hold.
+/// The tables the pool sets aside for each of [`MAX_CONCURRENT_INSTANCES`].
 ///
-/// Measured at exactly two for every component this tree builds: the
-/// main module's function table and the shim's. There is no headroom
+/// Measured at exactly two for every single component this tree builds:
+/// the main module's function table and the shim's. There is no headroom
 /// here on purpose — the table pool is the one pool the runtime commits
 /// up front rather than reserving, so this number is paid in user pages
 /// per live slot whether or not any component uses it. See
 /// [`MAX_POOLED_USER_MEMORY`].
-pub const MAX_TABLES_PER_COMPONENT: u32 = 2;
+pub const TABLES_PER_INSTANCE: u32 = 2;
+
+/// The most tables one component may hold.
+///
+/// A component the build composed from others holds the sum of theirs: a
+/// program with the WebGPU provider plugged in carries its own two and
+/// the provider's two. The pool is sized by [`TABLES_PER_INSTANCE`], not
+/// by this, so a composed program draws more of the shared pool rather
+/// than growing what every slot commits.
+pub const MAX_TABLES_PER_COMPONENT: u32 = 4;
 
 /// The virtual address space the kernel will let the runtime's instance
 /// pools reserve.
@@ -458,17 +467,11 @@ pub(crate) struct ComponentExecutionContext<FileSystem> {
 
 /// One instance's store data.
 ///
-/// `LinearMemoryImpl` is the runtime's handle on the instance's one
-/// unshared linear memory: the kernel never looks inside it, and the
-/// runtime adapter reads the memory's current extent through it each
-/// time a guest names a span.
-pub struct ComponentStoreData<
-    CpuImpl,
-    RuntimeStateImpl,
-    FileSystem,
-    ResourceTableImpl,
-    LinearMemoryImpl,
-> where
+/// It holds no linear memory: a span a guest names is in the memory of
+/// the call that names it, which the runtime adapter takes from that
+/// call.
+pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
@@ -490,11 +493,6 @@ pub struct ComponentStoreData<
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: crate::SerialReader,
     serial_writer: crate::DebugSerialWriter,
-    /// The runtime's handle on this instance's linear memory, once the
-    /// instance is built. Absent when its component lowers through a
-    /// shared memory, or through more than one: nothing is ever shown
-    /// in such a memory.
-    pub linear_memory: Option<LinearMemoryImpl>,
     /// Every buffer and device region shown in this instance's linear
     /// memory.
     ///
@@ -555,8 +553,8 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
-    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl, LinearMemoryImpl>
+impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -604,7 +602,6 @@ where
             ),
             serial_reader,
             serial_writer,
-            linear_memory: None,
             views: crate::buffer::ViewTable::new(),
             device: crate::device::DeviceOwnership::new(),
             input: crate::input::InputOwnership::new(),

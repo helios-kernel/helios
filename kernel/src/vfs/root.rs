@@ -36,8 +36,8 @@ use core::future::Future;
 
 use bytes::Bytes;
 use helios_hal::fs::{
-    DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeKind, OpenFlags,
-    OwnedFsPath, PreparedWrite, WritePosition, WriteProgress,
+    DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeKind,
+    OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 
 use super::memory::UpperView;
@@ -150,6 +150,12 @@ impl RootFs {
             NodeKind::File => self.lower.file_contents(path)?.to_bytes(),
             NodeKind::Symlink => Bytes::from(self.lower.link_target(path)?),
             NodeKind::Directory => Bytes::new(),
+            // The boot image holds none, and the upper tree cannot hold a
+            // report-only node.
+            NodeKind::CharacterDevice
+            | NodeKind::BlockDevice
+            | NodeKind::Fifo
+            | NodeKind::Socket => return Err(FsError::Unsupported),
         };
         if let Some((parent, _)) = path.split_last() {
             self.copy_up_directories(parent)?;
@@ -244,11 +250,7 @@ impl RootWrite {
         len: usize,
         now: u64,
     ) -> FsResult<Self> {
-        match root.find(path)?.metadata.kind {
-            NodeKind::File => {}
-            NodeKind::Directory => return Err(FsError::IsDirectory),
-            NodeKind::Symlink => return Err(FsError::Invalid),
-        }
+        root.find(path)?.metadata.kind.require_regular()?;
         Ok(Self {
             root: root.clone(),
             path: path.into(),
@@ -258,7 +260,7 @@ impl RootWrite {
         })
     }
 
-    fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<u64> {
+    fn land(self, mut fill: impl FnMut(usize, &mut [u8])) -> FsResult<Landed> {
         self.root.copy_up(self.path.as_path())?;
         self.root.upper.write_now(
             self.path.as_path(),
@@ -384,7 +386,7 @@ impl FileSystem for RootFs {
         self.upper.create_directory(path, now).await
     }
 
-    async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
         let Some((parent, _)) = path.split_last() else {
             return Err(FsError::NotPermitted);
         };
@@ -401,10 +403,10 @@ impl FileSystem for RootFs {
         if whiteout {
             self.copy_up_directories(parent)?;
         }
-        self.upper.remove(path, true, whiteout)
+        self.upper.remove(path, true, whiteout, now)
     }
 
-    async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
         let Some((parent, _)) = path.split_last() else {
             return Err(FsError::IsDirectory);
         };
@@ -416,13 +418,38 @@ impl FileSystem for RootFs {
         if whiteout {
             self.copy_up_directories(parent)?;
         }
-        self.upper.remove(path, false, whiteout)
+        self.upper.remove(path, false, whiteout, now)
     }
 
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
         let found = self.find(source)?;
+        if mode == RenameMode::Exchange {
+            // Both names stay, so the swap needs no whiteout. A directory
+            // merging the boot image's would carry that merge to its new
+            // name, which an overlay without redirects cannot express.
+            let other = self.find(destination)?;
+            for (path, found) in [(source, &found), (destination, &other)] {
+                if found.metadata.kind == NodeKind::Directory && self.merges_boot(path, found) {
+                    return Err(FsError::CrossDevice);
+                }
+            }
+            self.copy_up(source)?;
+            self.copy_up(destination)?;
+            return self
+                .upper
+                .rename_over(source, destination, mode, now, false);
+        }
         if source == destination {
-            return Ok(());
+            return match mode {
+                RenameMode::NoReplace => Err(FsError::Exists),
+                RenameMode::Replace | RenameMode::Exchange => Ok(()),
+            };
         }
         if found.metadata.kind == NodeKind::Directory && self.merges_boot(source, &found) {
             return Err(FsError::CrossDevice);
@@ -430,7 +457,8 @@ impl FileSystem for RootFs {
         self.creatable(destination)?;
         let found = self.copy_up(source)?;
         let whiteout = self.lower_beneath(source, &found);
-        self.upper.rename_over(source, destination, now, whiteout)
+        self.upper
+            .rename_over(source, destination, mode, now, whiteout)
     }
 
     async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -476,7 +504,7 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FsError, FsPath, OpenFlags, WritePosition,
+        DeviceId, DirCookie, FileSystem, FsError, FsPath, OpenFlags, RenameMode, WritePosition,
     };
 
     use super::RootFs;
@@ -596,22 +624,23 @@ mod tests {
     fn removing_a_boot_object_leaves_a_whiteout() {
         let fs = root();
         assert_eq!(
-            block_on(fs.remove_directory(path("bin"))),
+            block_on(fs.remove_directory(path("bin"), 7_000_000_000)),
             Err(FsError::NotEmpty)
         );
-        block_on(fs.unlink(path("bin/tool"))).expect("removes a boot file");
+        block_on(fs.unlink(path("bin/tool"), 7_000_000_000)).expect("removes a boot file");
         assert_eq!(
             block_on(fs.stat(path("bin/tool"))).map(drop),
             Err(FsError::NoEntry)
         );
         assert_eq!(listing(&fs, "bin", 1), ["empty"]);
-        block_on(fs.remove_directory(path("bin/empty"))).expect("removes a boot directory");
-        block_on(fs.remove_directory(path("bin"))).expect("now empty");
+        block_on(fs.remove_directory(path("bin/empty"), 7_000_000_000))
+            .expect("removes a boot directory");
+        block_on(fs.remove_directory(path("bin"), 7_000_000_000)).expect("now empty");
         assert_eq!(listing(&fs, "", 8), ["etc", "init.txt"]);
 
         // A copied-up file removed is hidden too, not uncovered.
         write(&fs, "init.txt", WritePosition::At(0), b"J", 1);
-        block_on(fs.unlink(path("init.txt"))).expect("removes the copy");
+        block_on(fs.unlink(path("init.txt"), 7_000_000_000)).expect("removes the copy");
         assert_eq!(
             block_on(fs.stat(path("init.txt"))).map(drop),
             Err(FsError::NoEntry)
@@ -625,8 +654,8 @@ mod tests {
     #[test]
     fn a_directory_made_over_a_whiteout_shows_nothing_beneath() {
         let fs = root();
-        block_on(fs.unlink(path("etc/motd"))).expect("removes");
-        block_on(fs.remove_directory(path("etc"))).expect("removes");
+        block_on(fs.unlink(path("etc/motd"), 7_000_000_000)).expect("removes");
+        block_on(fs.remove_directory(path("etc"), 7_000_000_000)).expect("removes");
         block_on(fs.create_directory(path("etc"), 1)).expect("makes it again");
         assert_eq!(listing(&fs, "etc", 8), Vec::<String>::new());
         assert_eq!(
@@ -638,28 +667,71 @@ mod tests {
     #[test]
     fn renaming_copies_a_boot_file_up_and_refuses_a_boot_directory() {
         let fs = root();
-        block_on(fs.rename(path("init.txt"), path("moved.txt"), 1)).expect("renames");
+        block_on(fs.rename(path("init.txt"), path("moved.txt"), RenameMode::Replace, 1))
+            .expect("renames");
         assert_eq!(contents(&fs, "moved.txt"), b"hello");
         assert_eq!(
             block_on(fs.stat(path("init.txt"))).map(drop),
             Err(FsError::NoEntry)
         );
         assert_eq!(
-            block_on(fs.rename(path("bin"), path("sbin"), 1)),
+            block_on(fs.rename(path("bin"), path("sbin"), RenameMode::Replace, 1)),
             Err(FsError::CrossDevice)
         );
         // Copied up by the new name, `bin` still merges the image.
         block_on(fs.open(path("bin/new"), OpenFlags::CREATE, 1)).expect("creates");
         assert_eq!(
-            block_on(fs.rename(path("bin"), path("sbin"), 1)),
+            block_on(fs.rename(path("bin"), path("sbin"), RenameMode::Replace, 1)),
             Err(FsError::CrossDevice)
         );
-        block_on(fs.rename(path("bin/tool"), path("bin/empty/tool"), 1)).expect("renames");
+        block_on(fs.rename(
+            path("bin/tool"),
+            path("bin/empty/tool"),
+            RenameMode::Replace,
+            1,
+        ))
+        .expect("renames");
         assert_eq!(listing(&fs, "bin", 8), ["empty", "new"]);
         assert_eq!(contents(&fs, "bin/empty/tool"), b"tool");
 
         block_on(fs.create_directory(path("d"), 1)).expect("creates");
-        block_on(fs.rename(path("d"), path("bin/d"), 1)).expect("an upper directory moves");
+        block_on(fs.rename(path("d"), path("bin/d"), RenameMode::Replace, 1))
+            .expect("an upper directory moves");
+    }
+
+    #[test]
+    fn noreplace_sees_a_boot_destination_and_exchange_copies_boot_files_up() {
+        let fs = root();
+        assert_eq!(
+            block_on(fs.rename(path("init.txt"), path("etc/motd"), RenameMode::NoReplace, 1)),
+            Err(FsError::Exists)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("init.txt"), path("init.txt"), RenameMode::NoReplace, 1)),
+            Err(FsError::Exists)
+        );
+        block_on(fs.rename(path("init.txt"), path("fresh"), RenameMode::NoReplace, 1))
+            .expect("renames");
+        assert_eq!(contents(&fs, "fresh"), b"hello");
+        // Two boot files swap contents between their names.
+        block_on(fs.rename(path("fresh"), path("etc/motd"), RenameMode::Exchange, 2))
+            .expect("exchanges");
+        assert_eq!(contents(&fs, "etc/motd"), b"hello");
+        assert_eq!(contents(&fs, "fresh"), "日本語 한국어 中文".as_bytes());
+        block_on(fs.rename(path("bin/tool"), path("fresh"), RenameMode::Exchange, 3))
+            .expect("exchanges");
+        assert_eq!(contents(&fs, "bin/tool"), "日本語 한국어 中文".as_bytes());
+        assert_eq!(contents(&fs, "fresh"), b"tool");
+        // A directory merging the boot image's cannot change places, as for
+        // any rename of one; a missing name is not found.
+        assert_eq!(
+            block_on(fs.rename(path("bin"), path("fresh"), RenameMode::Exchange, 4)),
+            Err(FsError::CrossDevice)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("fresh"), path("none"), RenameMode::Exchange, 4)),
+            Err(FsError::NoEntry)
+        );
     }
 
     #[test]
@@ -683,7 +755,7 @@ mod tests {
         let first = RootFs::new(MemoryFs::new(DeviceId::new(4)), lower.clone());
         let second = RootFs::new(MemoryFs::new(DeviceId::new(4)), lower);
         block_on(first.open(path("mine"), OpenFlags::CREATE, 1)).expect("creates");
-        block_on(first.unlink(path("bin/tool"))).expect("removes");
+        block_on(first.unlink(path("bin/tool"), 7_000_000_000)).expect("removes");
         assert_eq!(
             block_on(second.stat(path("mine"))).map(drop),
             Err(FsError::NoEntry)

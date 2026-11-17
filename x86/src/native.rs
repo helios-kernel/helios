@@ -1,10 +1,12 @@
-//! Hardware-isolated native execution, independent of any userspace ABI.
+//! The x86-64 implementation of `helios_hal::native`.
 //!
-//! One owner holds both a context and its address space while running. Page
-//! tables are mutated only while inactive. Every entry and exit writes CR3
-//! without PCID or global user mappings, so no CPU retains a usable translation
-//! after an execution slice. The owner may migrate only between slices. Kernel
-//! upper-half tables are shared; userspace owns only its private lower half.
+//! Every slice entry and exit writes CR3 without PCID and no user mapping is
+//! global, so no processor keeps a usable user translation once its slice
+//! ends: a page removed from a space while none of its slices runs needs no
+//! remote invalidation, and one removed while some run goes through the
+//! kernel's TLB shootdown broadcast (`smp::shootdown_tlb_range`). The
+//! kernel's upper half is shared with every space; a space owns only its
+//! private lower half.
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::boxed::Box;
@@ -12,20 +14,27 @@ use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::ptr::NonNull;
 
-use helios_kernel::{allocate_user_frame_zeroed_on, deallocate_user_frame_on};
+use helios_hal::hv::RegisterId;
+use helios_hal::native::{
+    FaultKind, InstructionSet, NativeError, NativeExecution, Stop, UserContext, UserFault,
+};
+use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
+use helios_kernel::{NativeSpace, UserTranslation};
 use x86::msr::{rdmsr, wrmsr};
-use x86_64::registers::control::Cr3;
+use x86_64::registers::control::{Cr2, Cr3};
+use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
 };
-use x86_64::{PhysAddr, VirtAddr};
+use x86_64::{PhysAddr, VirtAddr as X86VirtAddr};
 
 use crate::{exceptions, extended_state, smp};
 
 // GDT: null, kernel code/data, user data/code. RPL is three for user selectors.
 pub(crate) const USER_DATA: u16 = 3 * 8 + 3;
 pub(crate) const USER_CODE: u16 = 4 * 8 + 3;
-const PAGE_BYTES: usize = 4096;
+const PAGE_BYTES: u64 = 4096;
+// The end of the lower canonical half with four-level paging.
 const USER_END: u64 = 1 << 47;
 // AMD64 architectural MSR numbers, also specified by Intel SDM volume 4.
 const EFER: u32 = 0xc000_0080;
@@ -35,23 +44,46 @@ const FMASK: u32 = 0xc000_0084;
 const FS_BASE: u32 = 0xc000_0100;
 const GS_BASE: u32 = 0xc000_0101;
 const KERNEL_GS_BASE: u32 = 0xc000_0102;
+// A software vector number above the IDT's 256, so the exit path can tell a
+// SYSCALL from every hardware vector.
 const SYSCALL_VECTOR: u64 = 256;
+// Page-fault error code bits (Intel SDM vol. 3A, 4.7): P, W/R, I/D.
+const PAGE_FAULT_PRESENT: u64 = 1 << 0;
+const PAGE_FAULT_WRITE: u64 = 1 << 1;
+const PAGE_FAULT_FETCH: u64 = 1 << 4;
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("native address range is outside the user half or overlaps a mapping")]
-    Address,
-    #[error("native user frames exhausted")]
-    OutOfMemory,
-    #[error("native page-table mapping failed")]
-    Mapping,
-}
+/// The x86-64 native execution capability.
+pub struct X86Native;
 
-struct UserPage {
-    address: u64,
-    frame: NonNull<u8>,
-    writable: bool,
-    readable: bool,
+impl NativeExecution for X86Native {
+    type Space = X86Space;
+    type Context = X86Context;
+
+    fn instruction_set(&self) -> InstructionSet {
+        InstructionSet::X86_64
+    }
+
+    fn user_range(&self) -> VirtRange {
+        VirtRange::new(
+            VirtAddr::new(PAGE_BYTES as usize),
+            (USER_END - PAGE_BYTES) as usize,
+        )
+    }
+
+    fn create_space(&self) -> Result<X86Space, NativeError> {
+        let tables = X86Tables {
+            root: Box::new(PageTable::new()),
+            tables: Tables {
+                frames: Vec::new(),
+                offset: smp::current_runtime().physical_memory_offset,
+            },
+        };
+        Ok(NativeSpace::new(tables, PAGE_BYTES, USER_END))
+    }
+
+    fn create_context(&self, entry: VirtAddr, stack: VirtAddr) -> Result<X86Context, NativeError> {
+        X86Context::new(entry.raw() as u64, stack.raw() as u64)
+    }
 }
 
 struct Tables {
@@ -60,7 +92,7 @@ struct Tables {
 }
 
 // SAFETY: each allocation is a fresh aligned, zeroed table retained until the
-// inactive address space is dropped. No frame is allocated twice.
+// space is dropped. No frame is allocated twice.
 unsafe impl FrameAllocator<Size4KiB> for Tables {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
         let table = Box::new(PageTable::new());
@@ -72,252 +104,123 @@ unsafe impl FrameAllocator<Size4KiB> for Tables {
     }
 }
 
-pub struct AddressSpace {
+/// A process's lower-half page tables: a private root whose upper half is
+/// the kernel's, and the tables below it, freed with the space.
+pub struct X86Tables {
     root: Box<PageTable>,
     tables: Tables,
-    pages: Vec<UserPage>,
 }
 
-// SAFETY: all access is through exclusive ownership, with no active CR3 across
-// a move. Frame reclamation uses the allocator's cross-processor free path.
-unsafe impl Send for AddressSpace {}
-// SAFETY: read only copies immutable owned pages; execution requires &mut self.
-unsafe impl Sync for AddressSpace {}
+// SAFETY: owned by one space and written only under its lock.
+unsafe impl Send for X86Tables {}
 
-impl Default for AddressSpace {
-    fn default() -> Self {
-        Self::new()
+/// A user address space.
+pub type X86Space = NativeSpace<X86Tables>;
+
+fn page_table_flags(flags: PageFlags) -> PageTableFlags {
+    let mut table = PageTableFlags::PRESENT;
+    if !flags.is_empty() {
+        table |= PageTableFlags::USER_ACCESSIBLE;
+    }
+    if flags.contains(PageFlags::WRITE) {
+        table |= PageTableFlags::WRITABLE;
+    }
+    if !flags.contains(PageFlags::EXECUTE) {
+        table |= PageTableFlags::NO_EXECUTE;
+    }
+    table
+}
+
+impl X86Tables {
+    fn mapper(&mut self) -> OffsetPageTable<'_> {
+        // SAFETY: the root and every lower-half table are owned by this
+        // space, and the kernel direct map reaches each of them.
+        unsafe { OffsetPageTable::new(&mut self.root, X86VirtAddr::new(self.tables.offset as u64)) }
     }
 }
 
-impl AddressSpace {
-    pub fn new() -> Self {
-        Self {
-            root: Box::new(PageTable::new()),
-            tables: Tables {
-                frames: Vec::new(),
-                offset: smp::current_runtime().physical_memory_offset,
-            },
-            pages: Vec::new(),
+// SAFETY: a user page maps exactly the given frame with the given access;
+// the upper half is copied from the kernel root and never user-accessible.
+unsafe impl UserTranslation for X86Tables {
+    fn install(&mut self, base: u64, physical: u64, flags: PageFlags) -> Result<(), NativeError> {
+        let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(physical))
+            .expect("the user allocator returns page-aligned frames");
+        let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(base))
+            .expect("a page span is page aligned");
+        let offset = X86VirtAddr::new(self.tables.offset as u64);
+        // Every table above a leaf grants user, write and execute access and
+        // the leaf alone limits it, as Linux's `_PAGE_TABLE` does: a page
+        // first mapped with no access must still reach user mode once
+        // `protect` widens its leaf.
+        let parents =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        // SAFETY: the page is not mapped and the frame is fresh; the root and
+        // every lower-half table are owned by this space and reached through
+        // the kernel direct map.
+        let mapped = unsafe {
+            OffsetPageTable::new(&mut self.root, offset).map_to_with_table_flags(
+                page,
+                frame,
+                page_table_flags(flags),
+                parents,
+                &mut self.tables,
+            )
+        };
+        match mapped {
+            // The page was not present, so no processor can cache it.
+            Ok(flush) => {
+                flush.ignore();
+                Ok(())
+            }
+            Err(MapToError::FrameAllocationFailed) => Err(NativeError::OutOfMemory),
+            Err(error) => panic!("mapping unmapped user page {base:#x}: {error:?}"),
         }
     }
 
-    /// Installs private zero-filled pages, then copies the supplied bytes. The
-    /// caller drops the whole inactive space on failure (partial mappings are
-    /// retained and owned until then). W+X is not supported by this prototype.
-    pub fn map(
-        &mut self,
-        address: u64,
-        size: u64,
-        data: &[u8],
-        readable: bool,
-        writable: bool,
-        executable: bool,
-    ) -> Result<(), Error> {
-        let end = address.checked_add(size).ok_or(Error::Address)?;
-        if address < PAGE_BYTES as u64
-            || end > USER_END
-            || data.len() as u64 > size
-            || size == 0
-            || writable && executable
-        {
-            return Err(Error::Address);
-        }
-        let first = address & !(PAGE_BYTES as u64 - 1);
-        let last = (end + PAGE_BYTES as u64 - 1) & !(PAGE_BYTES as u64 - 1);
-        if self
-            .pages
-            .iter()
-            .any(|page| (first..last).contains(&page.address))
-        {
-            return Err(Error::Address);
-        }
-        let mut flags = PageTableFlags::PRESENT;
-        if readable {
-            flags |= PageTableFlags::USER_ACCESSIBLE;
-        }
-        if writable {
-            flags |= PageTableFlags::WRITABLE;
-        }
-        if !executable {
-            flags |= PageTableFlags::NO_EXECUTE;
-        }
-        for base in (first..last).step_by(PAGE_BYTES) {
-            let raw = allocate_user_frame_zeroed_on(smp::current_processor())
-                .map_err(|_| Error::OutOfMemory)?;
-            self.pages.push(UserPage {
-                address: base,
-                frame: raw,
-                writable,
-                readable,
-            });
-            let physical = raw.as_ptr() as usize - self.tables.offset;
-            let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(physical as u64))
-                .expect("user allocator returns aligned frames");
-            let page =
-                Page::<Size4KiB>::from_start_address(VirtAddr::new(base)).expect("page aligned");
-            // SAFETY: the root and all lower-half tables are owned exclusively;
-            // each frame is fresh, and the kernel direct map reaches every table.
-            unsafe {
-                let mut mapper =
-                    OffsetPageTable::new(&mut self.root, VirtAddr::new(self.tables.offset as u64));
-                mapper
-                    .map_to(page, frame, flags, &mut self.tables)
-                    .map_err(|_| Error::Mapping)?
-                    .ignore();
-            }
-            let copy_start = base.max(address);
-            let copy_end = (base + PAGE_BYTES as u64).min(address + data.len() as u64);
-            if copy_start < copy_end {
-                let source = &data[(copy_start - address) as usize..(copy_end - address) as usize];
-                // SAFETY: copy is confined to this freshly allocated page.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        source.as_ptr(),
-                        raw.as_ptr().add((copy_start - base) as usize),
-                        source.len(),
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Finds a free user range and installs an anonymous mapping atomically.
-    /// This space is inactive for the whole allocation and any rollback.
-    pub fn map_anonymous(
-        &mut self,
-        hint: u64,
-        length: u64,
-        readable: bool,
-        writable: bool,
-        executable: bool,
-    ) -> Result<u64, Error> {
-        let candidate = self
-            .free_range(hint, length)
-            .or_else(|| self.free_range(PAGE_BYTES as u64, length))
-            .ok_or(Error::OutOfMemory)?;
-        let previous = self.pages.len();
-        if let Err(error) = self.map(candidate, length, &[], readable, writable, executable) {
-            while self.pages.len() > previous {
-                let page = self.pages.pop().expect("newly allocated page");
-                // SAFETY: the inactive root and all lower tables are exclusively
-                // owned. No CPU can retain translations from this attempted map.
-                let mut mapper = unsafe {
-                    OffsetPageTable::new(&mut self.root, VirtAddr::new(self.tables.offset as u64))
-                };
-                match mapper.unmap(
-                    Page::<Size4KiB>::from_start_address(VirtAddr::new(page.address)).unwrap(),
-                ) {
-                    Ok((_, flush)) => flush.ignore(),
-                    Err(x86_64::structures::paging::mapper::UnmapError::PageNotMapped) => {}
-                    Err(error) => panic!("native mapping rollback: {error:?}"),
-                }
-                deallocate_user_frame_on(smp::current_processor(), page.frame);
-            }
-            return Err(error);
-        }
-        Ok(candidate)
-    }
-
-    fn free_range(&self, start: u64, length: u64) -> Option<u64> {
-        let mut candidate = (start & !(PAGE_BYTES as u64 - 1)).max(PAGE_BYTES as u64);
-        loop {
-            let end = candidate
-                .checked_add(length)
-                .filter(|end| *end <= USER_END)?;
-            match self
-                .pages
-                .iter()
-                .find(|page| (candidate..end).contains(&page.address))
-            {
-                Some(page) => candidate = page.address + PAGE_BYTES as u64,
-                None => return Some(candidate),
-            }
+    fn uninstall(&mut self, base: u64) {
+        let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(base))
+            .expect("an installed page is page aligned");
+        match self.mapper().unmap(page) {
+            // The space's caller invalidates the page wherever a slice may
+            // hold it (`invalidate`).
+            Ok((_, flush)) => flush.ignore(),
+            Err(error) => panic!("removing user page {base:#x}: {error:?}"),
         }
     }
 
-    /// Copies through owned frame aliases, never through unchecked user pointers.
-    pub fn read(&self, address: u64, output: &mut [u8]) -> Result<(), Error> {
-        let end = address
-            .checked_add(output.len() as u64)
-            .ok_or(Error::Address)?;
-        if end > USER_END {
-            return Err(Error::Address);
+    fn protect(&mut self, base: u64, flags: PageFlags) {
+        let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(base))
+            .expect("an installed page is page aligned");
+        // SAFETY: the page maps a frame of this space; only its access
+        // changes, and the caller invalidates a narrowing.
+        match unsafe { self.mapper().update_flags(page, page_table_flags(flags)) } {
+            Ok(flush) => flush.ignore(),
+            Err(error) => panic!("changing the access of user page {base:#x}: {error:?}"),
         }
-        let mut done = 0;
-        while done < output.len() {
-            let cursor = address + done as u64;
-            let base = cursor & !(PAGE_BYTES as u64 - 1);
-            let page = self
-                .pages
-                .iter()
-                .find(|page| page.address == base && page.readable)
-                .ok_or(Error::Address)?;
-            let offset = (cursor - base) as usize;
-            let length = (PAGE_BYTES - offset).min(output.len() - done);
-            // SAFETY: the immutable space owns this entire physical frame and
-            // cannot run or unmap while borrowed for this copy.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    page.frame.as_ptr().add(offset),
-                    output[done..].as_mut_ptr(),
-                    length,
-                );
-            }
-            done += length;
-        }
-        Ok(())
     }
 
-    /// Copies into owned writable pages while this space is inactive.
-    pub fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
-        let end = address
-            .checked_add(bytes.len() as u64)
-            .ok_or(Error::Address)?;
-        if end > USER_END {
-            return Err(Error::Address);
-        }
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        for cursor in (address & !(PAGE_BYTES as u64 - 1)..end).step_by(PAGE_BYTES) {
-            if !self
-                .pages
-                .iter()
-                .any(|page| page.address == cursor && page.writable)
-            {
-                return Err(Error::Address);
-            }
-        }
-        let mut done = 0;
-        while done < bytes.len() {
-            let cursor = address + done as u64;
-            let base = cursor & !(PAGE_BYTES as u64 - 1);
-            let page = self
-                .pages
-                .iter()
-                .find(|page| page.address == base)
-                .expect("validated writable page");
-            let offset = (cursor - base) as usize;
-            let length = (PAGE_BYTES - offset).min(bytes.len() - done);
-            // SAFETY: exclusive inactive ownership and all writable pages were
-            // validated above; the copy stays inside this page's allocation.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes[done..].as_ptr(),
-                    page.frame.as_ptr().add(offset),
-                    length,
-                );
-            }
-            done += length;
-        }
-        Ok(())
+    fn invalidate(&self, first: u64, last: u64) {
+        let (start, byte_len) = (first as usize, (last - first) as usize);
+        // The kernel's CR3 is loaded here, so the local INVLPG reaches no
+        // user translation: the slice exit's CR3 write already dropped
+        // them. A processor running a slice takes the broadcast's IPI from
+        // user mode, and its exit's CR3 write drops the space's
+        // translations before the handler acknowledges.
+        smp::flush_tlb_range_local(start, byte_len);
+        smp::shootdown_tlb_range(start, byte_len);
     }
 
-    fn cr3(&mut self) -> u64 {
+    fn physical(&self, frame: NonNull<u8>) -> u64 {
+        (frame.as_ptr() as usize - self.tables.offset) as u64
+    }
+}
+
+impl X86Tables {
+    /// The physical root for a slice, with the kernel's current upper half.
+    fn root(&mut self) -> u64 {
         let kernel = Cr3::read().0.start_address().as_u64() as usize + self.tables.offset;
-        // SAFETY: the current CR3 is a live kernel root, mapped through HHDM.
+        // SAFETY: the current CR3 is a live kernel root, mapped through the
+        // direct map.
         let kernel = unsafe { &*(kernel as *const PageTable) };
         for index in 256..512 {
             self.root[index] = kernel[index].clone();
@@ -326,42 +229,75 @@ impl AddressSpace {
     }
 }
 
-impl Drop for AddressSpace {
-    fn drop(&mut self) {
-        // No execution slice outlives the exclusive borrow of this space. All
-        // user translations were flushed by the switch back to the kernel CR3.
-        for page in self.pages.drain(..) {
-            deallocate_user_frame_on(smp::current_processor(), page.frame);
-        }
-    }
-}
-
 /// Hardware register order shared with the exception entry stubs.
 #[derive(Default, Debug)]
 #[repr(C)]
-pub struct Registers {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rbp: u64,
-    pub rbx: u64,
-    pub rdx: u64,
-    pub rcx: u64,
-    pub rax: u64,
+struct Registers {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rdi: u64,
+    rsi: u64,
+    rbp: u64,
+    rbx: u64,
+    rdx: u64,
+    rcx: u64,
+    rax: u64,
     vector: u64,
     error: u64,
-    pub rip: u64,
+    rip: u64,
     cs: u64,
     rflags: u64,
-    pub rsp: u64,
+    rsp: u64,
     ss: u64,
+}
+
+impl Registers {
+    /// The word of the frame that holds `register`.
+    fn word(register: RegisterId) -> Result<usize, NativeError> {
+        use core::mem::offset_of;
+        let offset = match register {
+            RegisterId::X86Gpr(0) => offset_of!(Self, rax),
+            RegisterId::X86Gpr(1) => offset_of!(Self, rcx),
+            RegisterId::X86Gpr(2) => offset_of!(Self, rdx),
+            RegisterId::X86Gpr(3) => offset_of!(Self, rbx),
+            RegisterId::X86Gpr(4) => offset_of!(Self, rsp),
+            RegisterId::X86Gpr(5) => offset_of!(Self, rbp),
+            RegisterId::X86Gpr(6) => offset_of!(Self, rsi),
+            RegisterId::X86Gpr(7) => offset_of!(Self, rdi),
+            RegisterId::X86Gpr(8) => offset_of!(Self, r8),
+            RegisterId::X86Gpr(9) => offset_of!(Self, r9),
+            RegisterId::X86Gpr(10) => offset_of!(Self, r10),
+            RegisterId::X86Gpr(11) => offset_of!(Self, r11),
+            RegisterId::X86Gpr(12) => offset_of!(Self, r12),
+            RegisterId::X86Gpr(13) => offset_of!(Self, r13),
+            RegisterId::X86Gpr(14) => offset_of!(Self, r14),
+            RegisterId::X86Gpr(15) => offset_of!(Self, r15),
+            RegisterId::X86Rip => offset_of!(Self, rip),
+            RegisterId::X86Rflags => offset_of!(Self, rflags),
+            _ => return Err(NativeError::Register),
+        };
+        Ok(offset / size_of::<u64>())
+    }
+
+    fn get(&self, register: RegisterId) -> Result<u64, NativeError> {
+        let word = Self::word(register)?;
+        // SAFETY: the frame is `repr(C)` and made of `u64` words only, and
+        // `word` names one of them.
+        Ok(unsafe { (self as *const Self as *const u64).add(word).read() })
+    }
+
+    fn set(&mut self, register: RegisterId, value: u64) -> Result<(), NativeError> {
+        let word = Self::word(register)?;
+        // SAFETY: as in `get`.
+        unsafe { (self as *mut Self as *mut u64).add(word).write(value) };
+        Ok(())
+    }
 }
 
 struct AlignedBytes {
@@ -369,15 +305,17 @@ struct AlignedBytes {
     layout: Layout,
 }
 impl AlignedBytes {
-    fn new(size: usize, align: usize) -> Result<Self, Error> {
+    fn new(size: usize, align: usize) -> Result<Self, NativeError> {
         let layout = Layout::from_size_align(size, align).expect("native allocation layout");
         // SAFETY: layout is nonempty and valid; Drop uses the same layout.
-        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(Error::OutOfMemory)?;
+        let pointer =
+            NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(NativeError::OutOfMemory)?;
         Ok(Self { pointer, layout })
     }
 }
 impl Drop for AlignedBytes {
     fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout.
         unsafe {
             dealloc(self.pointer.as_ptr(), self.layout);
         }
@@ -402,31 +340,19 @@ struct Switch {
     self_pointer: u64,
 }
 
-pub struct Context {
+/// One user thread: its register file, its XSAVE area, and the kernel
+/// stack its system calls and traps enter on.
+pub struct X86Context {
     switch: Switch,
     _user_xstate: AlignedBytes,
     _kernel_xstate: AlignedBytes,
     _entry_stack: AlignedBytes,
 }
 
-#[derive(Debug)]
-pub enum Stop {
-    SystemCall,
-    Interrupted,
-    Preempted,
-    Fault {
-        vector: u64,
-        error: u64,
-        instruction: u64,
-    },
-}
-
-impl Context {
-    pub fn new(entry: u64, stack: u64) -> Result<Self, Error> {
-        if !(PAGE_BYTES as u64..USER_END).contains(&entry)
-            || !(PAGE_BYTES as u64..USER_END).contains(&stack)
-        {
-            return Err(Error::Address);
+impl X86Context {
+    fn new(entry: u64, stack: u64) -> Result<Self, NativeError> {
+        if !(PAGE_BYTES..USER_END).contains(&entry) || !(PAGE_BYTES..USER_END).contains(&stack) {
+            return Err(NativeError::Address);
         }
         let size = extended_state::xsave_sizes().0 as usize;
         let user = AlignedBytes::new(size, 64)?;
@@ -461,34 +387,68 @@ impl Context {
         })
     }
 
-    pub fn registers(&self) -> &Registers {
-        &self.switch.registers
+    fn fault(&self, vector: u64, address: u64) -> UserFault {
+        let error = self.switch.registers.error;
+        let kind = match vector {
+            0 | 16 | 19 => FaultKind::Arithmetic,
+            1 | 3 => FaultKind::Breakpoint,
+            6 | 7 => FaultKind::InvalidInstruction,
+            4 | 5 | 10 | 11 | 12 | 13 | 21 => FaultKind::Protection,
+            14 => FaultKind::Page {
+                address: VirtAddr::new(address as usize),
+                access: if error & PAGE_FAULT_FETCH != 0 {
+                    PageFlags::EXECUTE
+                } else if error & PAGE_FAULT_WRITE != 0 {
+                    PageFlags::WRITE
+                } else {
+                    PageFlags::READ
+                },
+                present: error & PAGE_FAULT_PRESENT != 0,
+            },
+            17 => FaultKind::Alignment,
+            vector => panic!("x86 user mode raised exception vector {vector}, which has no stub"),
+        };
+        UserFault {
+            kind,
+            instruction: VirtAddr::new(self.switch.registers.rip as usize),
+        }
+    }
+}
+
+// SAFETY: `resume` loads `space`'s root only for the slice and restores the
+// kernel's CR3, FS, GS and extended state before returning; the selectors,
+// RFLAGS and canonical RIP/RSP checks keep user code in ring three.
+unsafe impl UserContext for X86Context {
+    type Space = X86Space;
+
+    fn register(&self, register: RegisterId) -> Result<u64, NativeError> {
+        self.switch.registers.get(register)
     }
 
-    /// Selects a canonical userspace TLS base for the next execution slice.
-    pub fn set_thread_pointer(&mut self, address: u64) -> Result<(), Error> {
-        if address >= USER_END {
-            return Err(Error::Address);
+    fn set_register(&mut self, register: RegisterId, value: u64) -> Result<(), NativeError> {
+        self.switch.registers.set(register, value)
+    }
+
+    fn thread_pointer(&self) -> VirtAddr {
+        VirtAddr::new(self.switch.user_fs as usize)
+    }
+
+    fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError> {
+        if address.raw() as u64 >= USER_END {
+            return Err(NativeError::Address);
         }
-        self.switch.user_fs = address;
+        self.switch.user_fs = address.raw() as u64;
         Ok(())
     }
 
-    pub fn return_value(&mut self, value: u64) {
-        self.switch.registers.rax = value;
-    }
-
-    /// Runs until a syscall, fault or external interrupt. The kernel executor
-    /// regains control on every timer tick even if the program never calls out.
-    pub fn resume(&mut self, space: &mut AddressSpace) -> Stop {
+    fn resume(&mut self, space: &X86Space) -> Stop {
         // SYSCALL can save a noncanonical next RIP or stack. Refuse it before
         // IRET, whose fault would otherwise occur at kernel privilege.
         if self.switch.registers.rip >= USER_END || self.switch.registers.rsp >= USER_END {
-            return Stop::Fault {
-                vector: 13,
-                error: 0,
-                instruction: self.switch.registers.rip,
-            };
+            return Stop::Fault(UserFault {
+                kind: FaultKind::Protection,
+                instruction: VirtAddr::new(self.switch.registers.rip as usize),
+            });
         }
         // Preserve user arithmetic/debug flags, RF, AC and ID. NT, VM, IOPL,
         // VIF/VIP and reserved flags cannot be carried into the kernel's IRET.
@@ -504,8 +464,10 @@ impl Context {
             | (1 << 18)
             | (1 << 21);
         self.switch.registers.rflags = (self.switch.registers.rflags & USER_FLAGS) | 0x202;
-        x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-            self.switch.user_cr3 = space.cr3();
+        // Counted until the exit below has written the kernel's CR3 back.
+        let slice = space.begin_slice();
+        self.switch.user_cr3 = slice.with_tables(X86Tables::root);
+        let fault_address = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
             self.switch.self_pointer = core::ptr::from_mut(&mut self.switch) as u64;
             let (kernel_frame, kernel_flags) = Cr3::read_raw();
             self.switch.kernel_cr3 =
@@ -523,17 +485,16 @@ impl Context {
             helios_x86_native_enter(&mut self.switch);
             wrmsr(GS_BASE, self.switch.kernel_gs);
             wrmsr(KERNEL_GS_BASE, old_kernel_gs);
+            // Interrupts stay masked from the user fault to here, so CR2 is
+            // still the user fault's address.
+            Cr2::read_raw()
         });
-        let frame = &self.switch.registers;
-        match frame.vector {
+        drop(slice);
+        match self.switch.registers.vector {
             SYSCALL_VECTOR => Stop::SystemCall,
             vector if vector == exceptions::TIMER_INTERRUPT_VECTOR as u64 => Stop::Preempted,
             32..=255 => Stop::Interrupted,
-            vector => Stop::Fault {
-                vector,
-                error: frame.error,
-                instruction: frame.rip,
-            },
+            vector => Stop::Fault(self.fault(vector, fault_address)),
         }
     }
 }

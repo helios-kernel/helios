@@ -76,6 +76,8 @@ pub use service::{
 /// with a new surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum SurfaceServiceError {
+    #[error("rendering failed before the image was ready")]
+    RenderFailed,
     /// This kernel image ships no compositor plugin, so no window can
     /// exist.
     #[error("this kernel image ships no compositor")]

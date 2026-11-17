@@ -105,8 +105,7 @@ pub use device::{
 };
 pub use display::{
     DisplayClaim, DisplayOwnership, DisplaySender, DisplayService, DisplayServiceError, FrameToken,
-    MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, REQUEST_QUEUE_DEPTH, SequenceSignal,
-    install_display_device,
+    MAX_CLAIMED_SCANOUTS, MAX_PINNED_FRAMES, REQUEST_QUEUE_DEPTH, install_display_device,
 };
 pub use embedded::{BootPayload, EmbeddedComponent, EmbeddedInit};
 pub use exec::{
@@ -121,11 +120,12 @@ pub use exec::{
     PrefixSetError, PressureLevel, ProcessorControl, ProcessorLifecycle, ProfileFilter,
     ProfileHistory, ProfileScope, ProfileSink, ProgressChanged, ProgressMark, ProgressSignal,
     RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock,
-    RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding,
-    Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue,
-    UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter, matches_profile_filter,
-    matches_trace_filter, monotonic_nanos, online_processor_count, parse_console_text,
-    wall_clock_offset_nanos, yield_now,
+    RwLockReadGuard, RwLockWriteGuard, SequenceSignal, SharedTimeline, SignalTimeline, Sleep,
+    Spawner, StatsSample, TaskCapacityError, TaskFunding, Timeline, TimelineError, TimelinePoint,
+    TimelineSource, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceLog,
+    TraceValue, UptimeClock, YieldNow, elapsed_millis, matches_perf_metric_filter,
+    matches_profile_filter, matches_trace_filter, monotonic_nanos, online_processor_count,
+    parse_console_text, wait_timelines, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
@@ -140,7 +140,7 @@ pub use helios_netstack::{
 };
 pub use host_fs::{
     FilledHostFsWrite, HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats,
-    HostFsClient, HostFsTransport, HostFsWrite, UnsupportedHostFileSystem,
+    HostFsClient, HostFsTransport, HostFsWrite, Virtio9pTransport,
 };
 pub use input::{
     DeviceIndex, EVENT_QUEUE_DEPTH, EventBurst, InputClaim, InputDeviceSnapshot, InputEvents,
@@ -186,24 +186,25 @@ pub use memory::{
     IDLE_SWAP_AFTER, INCOMPRESSIBLE_BYTES, InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
     KERNEL_HEAP_RESERVE_FRACTION, LocalMemory, LocalSlice, Locality, MemoryNodeStats, MemoryOwner,
-    NoCryptographicEntropy, NoEntropyDevice, NodeLocalArena, NodeMemory, NodeRun, PerProcessor,
-    ROOT_ENTROPY_MATERIAL_BYTES, RegionShares, ReleasedReservation, ReservationLookup,
-    ReservationTracker, ResidencyVmHooks, RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES,
-    SWAP_TICK, StackFault, SwapDisabled, SwapEntry, SwapFaultError, SwapFaultIn, SwapHandle,
-    SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks, TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES,
-    USER_POOL_MIN_REGION_BYTES, UserHeapStats, UserMemoryOwnerScope, UserMemoryOwners,
-    UserMemoryPool, UserResidency, VaCursor, allocate_user_frame_uninit_on,
-    allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    allocate_user_run_zeroed_on, claim_fiber_stack, configure_user_memory_owner_processors,
-    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on,
-    deallocate_user_run_on, disable_swap, enter_user_memory_owner, fiber_stack_arena_stats,
-    fiber_stack_demand_commits_on, install_entropy_device, install_fiber_stack_arena,
-    install_fiber_stack_hooks, install_memory_balloon, install_residency_hooks, install_swap,
-    install_swap_hooks, install_user_memory_pool, installed_swap_handle, installed_swap_hooks,
-    kernel_reserve_for, largest_servable_user_bytes, page_fault_frame_reserve_bytes,
-    ranges_outside, residency_vm_hooks, resolve_stack_fault, seed_root_entropy, swap_vm_hooks,
-    swapped_token, task_arena_bytes_for, user_frame_node, user_heap_stats,
-    user_mapping_kernel_heap_bytes, user_node_stats, validate_range,
+    NativePage, NativePages, NativeSlice, NativeSpace, NoCryptographicEntropy, NoEntropyDevice,
+    NodeLocalArena, NodeMemory, NodeRun, PerProcessor, ROOT_ENTROPY_MATERIAL_BYTES, RegionShares,
+    ReleasedReservation, ReservationLookup, ReservationTracker, ResidencyVmHooks, RootEntropy,
+    RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, StackFault, SwapDisabled, SwapEntry,
+    SwapFaultError, SwapFaultIn, SwapHandle, SwapLeafFormat, SwapSpace, SwapStats, SwapVmHooks,
+    TASK_ARENA_FRACTION, TASK_ARENA_MIN_BYTES, USER_POOL_MIN_REGION_BYTES, UserHeapStats,
+    UserMemoryOwnerScope, UserMemoryOwners, UserMemoryPool, UserResidency, UserTranslation,
+    VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node,
+    allocate_user_frame_zeroed, allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on,
+    claim_fiber_stack, configure_user_memory_owner_processors, current_user_memory_owner,
+    deallocate_user_frame, deallocate_user_frame_on, deallocate_user_run_on, disable_swap,
+    enter_user_memory_owner, fiber_stack_arena_stats, fiber_stack_demand_commits_on,
+    install_entropy_device, install_fiber_stack_arena, install_fiber_stack_hooks,
+    install_memory_balloon, install_residency_hooks, install_swap, install_swap_hooks,
+    install_user_memory_pool, installed_swap_handle, installed_swap_hooks, kernel_reserve_for,
+    largest_servable_user_bytes, page_fault_frame_reserve_bytes, ranges_outside,
+    residency_vm_hooks, resolve_stack_fault, seed_root_entropy, swap_vm_hooks, swapped_token,
+    task_arena_bytes_for, user_frame_node, user_heap_stats, user_mapping_kernel_heap_bytes,
+    user_node_stats, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -218,20 +219,16 @@ pub use network::{
 };
 pub use process::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, ComponentStdioRefusal,
-    ControlProcessorsCap, DescriptorEntry, DescriptorId, DescriptorLimit, DescriptorTable,
-    DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
+    ControlProcessorsCap, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
     DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap,
-    GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
-    LinkTargetDirectoryCap, MachineAuthorityRights, MountAuthorityRights, MountCap, MulticastCap,
-    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap,
-    ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
-    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
-    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
-    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
-    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
-    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
-    UnbindableStdio, UnmountCap,
+    ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap, JoinAuthority, LinkAuthorityRights,
+    LinkSourceCap, LinkTargetDirectoryCap, LinuxImageRefusal, MachineAuthorityRights,
+    MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
+    NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
+    ProcessAuthorityRights, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind,
+    ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority,
+    SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap,
+    TerminalOutputCap, TtyControlCap, UdpCap, UnbindableStdio, UnmountCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -259,12 +256,12 @@ pub use surface::{
     SurfaceServiceError, SurfaceShared,
 };
 pub use vfs::{
-    AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow, HeldPath,
-    HostShare, HostShareWrite, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError,
-    MountHold, MountRequestError, MountSource, MountTable, MountedFs, MountedWrite, Namespace,
-    NoDisks, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, Storage,
-    UnsupportedStorage, object_identity, request_mount, request_unmount, symlink_target,
-    within_directory,
+    AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow,
+    FsDescriptor, FsDescriptorFlags, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
+    MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError, MountHold, MountRequestError,
+    MountSource, MountTable, MountedFs, MountedWrite, Namespace, NoDisks, ROOT_LAYER_DEVICE,
+    ReaderError, Resolved, RootFs, RootWrite, Storage, object_identity, request_mount,
+    request_unmount, symlink_target, within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
@@ -2038,3 +2035,6 @@ mod tests {
         assert_eq!(stats.requested_live_bytes, 0);
     }
 }
+
+#[cfg(feature = "unix")]
+mod unix;

@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "linux",
-    "aarch64", "acpi", "api", "api-macro", "artifact", "btrfs", "cli", "compiler-abi", "compiler-host", "compiler-plugin", "compiler-support", "firmware", "hal", "i6300esb", "hosted", "kernel", "netstack", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/cpu", "programs/date", "programs/debugger", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/oob-load", "programs/perf", "programs/ping", "programs/procbench", "programs/sched-tasks", "programs/surface-test", "riscv", "tools/branch-hints", "tools/desktop/check-text", "tpm", "venus", "venus-gen", "x86", "inspector", "inspector-protocol", "virtio", "workspace-root",
+    "linux", "unix", "sync",
+    "aarch64", "acpi", "api", "api-macro", "artifact", "btrfs", "cli", "compiler-abi", "compiler-host", "compiler-plugin", "compiler-support", "firmware", "hal", "i6300esb", "hosted", "kernel", "netstack", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/cpu", "programs/date", "programs/debugger", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/oob-load", "programs/perf", "programs/ping", "programs/pride-flag", "programs/procbench", "programs/sched-tasks", "programs/surface-test", "programs/vmm", "programs/webgpu", "riscv", "tools/branch-hints", "tools/desktop/check-text", "tpm", "venus", "venus-gen", "webgpu", "x86", "inspector", "inspector-protocol", "virtio", "workspace-root",
 ]
 resolver = "2"
 
@@ -19,14 +19,22 @@ publish = false
 
 [features]
 default = []
-linux-prototype = ["dep:helios-linux", "helios-linux/runtime", "dep:helios-kernel", "dep:tracing", "helios-x86/native-users"]
+# The Linux process host (`helios-kernel/linux`) and, on a backend that has
+# it, native user execution. A backend without the capability links the
+# host and refuses every Linux launch.
+linux = [
+    "dep:helios-kernel",
+    "helios-kernel/linux",
+    "helios-x86/native-users",
+    "helios-aarch64/native-users",
+]
 
 [dependencies]
-helios-linux = { path = "linux", default-features = false, optional = true }
 helios-kernel = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
 
 [workspace.dependencies]
+helios-sync = { path = "sync", default-features = false }
+helios-unix = { path = "unix", default-features = false }
 helios-hal = { path = "hal" }
 helios-acpi = { path = "acpi" }
 # The fork's `helios` branch carries `Handler::handle_notify`
@@ -163,6 +171,16 @@ inherits = "kernel-release"
 # other's artifacts.
 [profile.profile-use]
 inherits = "kernel-release"
+
+# wit-bindgen refuses `+atomics` in the type guard of every exported
+# resource, and the WebGPU provider is built with atomics for the Venus
+# ring it shares with the host; the fork guards the type under a lock.
+# The generator's crates come from one source, or their types disagree.
+[patch.crates-io]
+wit-bindgen = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
+wit-bindgen-core = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
+wit-bindgen-rust = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
+wit-bindgen-rust-macro = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
 
 [lints]
 workspace = true

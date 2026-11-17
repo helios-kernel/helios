@@ -1,16 +1,32 @@
 #!/usr/bin/env bash
+# Builds a boot root holding the static Linux fixtures of one architecture
+# under /linux beside init's own files, for `helios-inspector vm
+# --bootfs-root`.
+# Usage: build-fixtures.sh <output directory> [x86_64|aarch64]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 out="${1:?bootfs output directory required}"
-mkdir -p "$out/linux-prototype"
+arch="${2:-x86_64}"
+case "$arch" in
+    x86_64) sources=linux/tests ;;
+    aarch64) sources=linux/tests/aarch64 ;;
+    *) echo "unknown fixture architecture: $arch" >&2; exit 1 ;;
+esac
+mkdir -p "$out/linux"
+cp -R programs/init/bootfs/. "$out/"
 for program in hello fault spin; do
-    zig cc -target x86_64-linux-musl -nostdlib -static -no-pie -Wl,--build-id=none \
-        "linux/tests/$program.S" -o "$out/linux-prototype/$program"
+    zig cc -target "$arch-linux-musl" -nostdlib -static -no-pie -Wl,--build-id=none \
+        "$sources/$program.S" -o "$out/linux/$program"
 done
-zig cc -target x86_64-linux-musl -static -no-pie -Wl,--build-id=none \
-    linux/tests/hello-libc.c -o "$out/linux-prototype/hello-libc"
-# The same executable first runs under Linux, establishing its ABI assertions.
-if [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]]; then
-    "$out/linux-prototype/hello"
-    "$out/linux-prototype/hello-libc"
+for program in hello-libc args memory; do
+    zig cc -target "$arch-linux-musl" -static -no-pie -s -O2 -Wl,--build-id=none \
+        "linux/tests/$program.c" -o "$out/linux/$program"
+done
+cp linux/tests/check-memory.sh "$out/linux/check-memory.sh"
+# The same executables first run under Linux, establishing their ABI assertions.
+if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
+    "$out/linux/hello"
+    "$out/linux/hello-libc"
+    HELIOS_PROCESS_ID=1 "$out/linux/args" 0 >/dev/null
+    sh "$out/linux/check-memory.sh" "$out/linux/memory"
 fi
