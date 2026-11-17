@@ -517,9 +517,14 @@ fn linux_authority_survives_unrelated_writes() {
             .await
             .unwrap();
         }
-        tx.rename(at(&root, b"moved"), at(&directory, b"moved"), when)
-            .await
-            .unwrap();
+        tx.rename(
+            at(&root, b"moved"),
+            at(&directory, b"moved"),
+            RenameMode::Replace,
+            when,
+        )
+        .await
+        .unwrap();
         tx.unlink_name(at(&root, b"doomed"), when).await.unwrap();
         tx.commit(|| panic!("mkfs UUIDs are valid"), concurrency)
             .await
