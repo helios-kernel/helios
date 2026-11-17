@@ -2653,7 +2653,7 @@ jobs:
             python3-venv pkg-config flex bison \
             libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev \
             libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev \
-            mesa-vulkan-drivers libegl-mesa0
+            mesa-vulkan-drivers libegl-mesa0 gdb
           # vgem gives a GPU-less runner the render node QEMU's EGL
           # context opens; the azure kernel's own modules package carries
           # it.
@@ -2818,6 +2818,11 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/pride-flag"
           captures="$GITHUB_WORKSPACE/pride-flag-scanout"
           mkdir -p "$runtime" "$captures"
+          # The runner pipes cores to apport, which keeps none for an
+          # unpackaged binary; a crashed QEMU leaves its core here for the
+          # backtrace step below.
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/core.%e.%p"
+          ulimit -c unlimited
           ./target/debug/helios-inspector vm --arch x86-64 --memory 2G \
             --accel kvm --runtime-dir "$runtime" --keep-runtime-dir \
             --renderer virtio-gpu-gl --renderer-hostmem 256M \
@@ -2833,6 +2838,18 @@ jobs:
             grep -Fq "$line" "$runtime/inspector.log"
           done
           file "$captures/pride-flag.png" | grep -Fq 'PNG image data'
+      - name: Print the QEMU crash backtrace
+        if: failure()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          # The kernel truncates %e to 15 bytes of the command name.
+          for core in "$RUNNER_TEMP"/core.qemu-system-x86.*; do
+            echo "::group::backtrace of $core"
+            gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' \
+              "$(command -v qemu-system-x86_64)" "$core"
+            echo "::endgroup::"
+          done
       - name: Upload the pride flag capture
         if: always()
         uses: actions/upload-artifact@v4
