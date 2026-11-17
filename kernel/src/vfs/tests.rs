@@ -3,7 +3,9 @@ use alloc::vec::Vec;
 
 use futures_lite::future::block_on;
 use helios_hal::cpu::ProcessorId;
-use helios_hal::fs::{FileSystem, FileSystemRights, FsError, FsPath, OpenFlags, WritePosition};
+use helios_hal::fs::{
+    FileSystem, FileSystemRights, FsError, FsPath, OpenFlags, RenameMode, WritePosition,
+};
 
 use super::{
     BOOT_DEVICE, Follow, MAX_MOUNTS, MemoryFs, MountError, MountTable, MountedFs, Namespace,
@@ -149,7 +151,7 @@ fn rename_and_link_across_mounts_are_refused_with_exdev() {
     create(&namespace, "/mnt/file", b"payload");
 
     assert_eq!(
-        block_on(namespace.rename("/mnt/file", "/file", 2)),
+        block_on(namespace.rename("/mnt/file", "/file", RenameMode::Replace, 2)),
         Err(FsError::CrossDevice)
     );
     assert_eq!(
@@ -163,7 +165,7 @@ fn rename_and_link_across_mounts_are_refused_with_exdev() {
         Err(FsError::NoEntry)
     );
     // Within the mount, both work.
-    block_on(namespace.rename("/mnt/file", "/mnt/moved", 2)).expect("renames");
+    block_on(namespace.rename("/mnt/file", "/mnt/moved", RenameMode::Replace, 2)).expect("renames");
     block_on(namespace.link("/mnt/moved", "/mnt/linked", 2)).expect("links");
     assert_eq!(read(&namespace, "/mnt/linked"), b"payload");
 }

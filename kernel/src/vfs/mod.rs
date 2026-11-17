@@ -74,7 +74,8 @@ use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FilledWrite, FsError, FsPath,
-    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition,
+    WriteProgress,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -196,9 +197,10 @@ macro_rules! mount_kinds {
                 &self,
                 source: FsPath<'_>,
                 destination: FsPath<'_>,
+                mode: RenameMode,
                 now: u64,
             ) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.rename(source, destination, now).await,)+ }
+                match self { $(Self::$kind(fs) => fs.rename(source, destination, mode, now).await,)+ }
             }
 
             async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -1358,8 +1360,14 @@ impl<S: Storage> Namespace<S> {
 
     /// Renames within one mount; across two, [`FsError::CrossDevice`]. A
     /// directory with a mount point below it stays where it is:
-    /// [`FsError::Busy`].
-    pub async fn rename(&self, source: &str, destination: &str, now: u64) -> FsResult<()> {
+    /// [`FsError::Busy`]. `mode` is as [`FileSystem::rename`] takes it.
+    pub async fn rename(
+        &self,
+        source: &str,
+        destination: &str,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
         if self.holds_mounts(source) {
             return Err(FsError::Busy);
         }
@@ -1373,7 +1381,7 @@ impl<S: Storage> Namespace<S> {
         }
         source
             .writable()?
-            .rename(source.path(), destination.path(), now)
+            .rename(source.path(), destination.path(), mode, now)
             .await
     }
 

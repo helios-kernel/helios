@@ -37,7 +37,7 @@ use core::future::Future;
 use bytes::Bytes;
 use helios_hal::fs::{
     DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeKind,
-    OpenFlags, OwnedFsPath, PreparedWrite, WritePosition, WriteProgress,
+    OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 
 use super::memory::UpperView;
@@ -421,10 +421,35 @@ impl FileSystem for RootFs {
         self.upper.remove(path, false, whiteout, now)
     }
 
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
         let found = self.find(source)?;
+        if mode == RenameMode::Exchange {
+            // Both names stay, so the swap needs no whiteout. A directory
+            // merging the boot image's would carry that merge to its new
+            // name, which an overlay without redirects cannot express.
+            let other = self.find(destination)?;
+            for (path, found) in [(source, &found), (destination, &other)] {
+                if found.metadata.kind == NodeKind::Directory && self.merges_boot(path, found) {
+                    return Err(FsError::CrossDevice);
+                }
+            }
+            self.copy_up(source)?;
+            self.copy_up(destination)?;
+            return self
+                .upper
+                .rename_over(source, destination, mode, now, false);
+        }
         if source == destination {
-            return Ok(());
+            return match mode {
+                RenameMode::NoReplace => Err(FsError::Exists),
+                RenameMode::Replace | RenameMode::Exchange => Ok(()),
+            };
         }
         if found.metadata.kind == NodeKind::Directory && self.merges_boot(source, &found) {
             return Err(FsError::CrossDevice);
@@ -432,7 +457,8 @@ impl FileSystem for RootFs {
         self.creatable(destination)?;
         let found = self.copy_up(source)?;
         let whiteout = self.lower_beneath(source, &found);
-        self.upper.rename_over(source, destination, now, whiteout)
+        self.upper
+            .rename_over(source, destination, mode, now, whiteout)
     }
 
     async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -478,7 +504,7 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FsError, FsPath, OpenFlags, WritePosition,
+        DeviceId, DirCookie, FileSystem, FsError, FsPath, OpenFlags, RenameMode, WritePosition,
     };
 
     use super::RootFs;
@@ -641,28 +667,71 @@ mod tests {
     #[test]
     fn renaming_copies_a_boot_file_up_and_refuses_a_boot_directory() {
         let fs = root();
-        block_on(fs.rename(path("init.txt"), path("moved.txt"), 1)).expect("renames");
+        block_on(fs.rename(path("init.txt"), path("moved.txt"), RenameMode::Replace, 1))
+            .expect("renames");
         assert_eq!(contents(&fs, "moved.txt"), b"hello");
         assert_eq!(
             block_on(fs.stat(path("init.txt"))).map(drop),
             Err(FsError::NoEntry)
         );
         assert_eq!(
-            block_on(fs.rename(path("bin"), path("sbin"), 1)),
+            block_on(fs.rename(path("bin"), path("sbin"), RenameMode::Replace, 1)),
             Err(FsError::CrossDevice)
         );
         // Copied up by the new name, `bin` still merges the image.
         block_on(fs.open(path("bin/new"), OpenFlags::CREATE, 1)).expect("creates");
         assert_eq!(
-            block_on(fs.rename(path("bin"), path("sbin"), 1)),
+            block_on(fs.rename(path("bin"), path("sbin"), RenameMode::Replace, 1)),
             Err(FsError::CrossDevice)
         );
-        block_on(fs.rename(path("bin/tool"), path("bin/empty/tool"), 1)).expect("renames");
+        block_on(fs.rename(
+            path("bin/tool"),
+            path("bin/empty/tool"),
+            RenameMode::Replace,
+            1,
+        ))
+        .expect("renames");
         assert_eq!(listing(&fs, "bin", 8), ["empty", "new"]);
         assert_eq!(contents(&fs, "bin/empty/tool"), b"tool");
 
         block_on(fs.create_directory(path("d"), 1)).expect("creates");
-        block_on(fs.rename(path("d"), path("bin/d"), 1)).expect("an upper directory moves");
+        block_on(fs.rename(path("d"), path("bin/d"), RenameMode::Replace, 1))
+            .expect("an upper directory moves");
+    }
+
+    #[test]
+    fn noreplace_sees_a_boot_destination_and_exchange_copies_boot_files_up() {
+        let fs = root();
+        assert_eq!(
+            block_on(fs.rename(path("init.txt"), path("etc/motd"), RenameMode::NoReplace, 1)),
+            Err(FsError::Exists)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("init.txt"), path("init.txt"), RenameMode::NoReplace, 1)),
+            Err(FsError::Exists)
+        );
+        block_on(fs.rename(path("init.txt"), path("fresh"), RenameMode::NoReplace, 1))
+            .expect("renames");
+        assert_eq!(contents(&fs, "fresh"), b"hello");
+        // Two boot files swap contents between their names.
+        block_on(fs.rename(path("fresh"), path("etc/motd"), RenameMode::Exchange, 2))
+            .expect("exchanges");
+        assert_eq!(contents(&fs, "etc/motd"), b"hello");
+        assert_eq!(contents(&fs, "fresh"), "日本語 한국어 中文".as_bytes());
+        block_on(fs.rename(path("bin/tool"), path("fresh"), RenameMode::Exchange, 3))
+            .expect("exchanges");
+        assert_eq!(contents(&fs, "bin/tool"), "日本語 한국어 中文".as_bytes());
+        assert_eq!(contents(&fs, "fresh"), b"tool");
+        // A directory merging the boot image's cannot change places, as for
+        // any rename of one; a missing name is not found.
+        assert_eq!(
+            block_on(fs.rename(path("bin"), path("fresh"), RenameMode::Exchange, 4)),
+            Err(FsError::CrossDevice)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("fresh"), path("none"), RenameMode::Exchange, 4)),
+            Err(FsError::NoEntry)
+        );
     }
 
     #[test]

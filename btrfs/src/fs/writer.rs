@@ -30,6 +30,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
+use helios_hal::fs::RenameMode;
 
 use super::{Filesystem, Snapshot, find_root};
 use crate::accounting::Allocation;
@@ -665,6 +666,7 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         &mut self,
         source: Name<'_>,
         destination: Name<'_>,
+        mode: RenameMode,
         when: Timestamp,
     ) -> Result<(), WriteError> {
         let across = source.parent.id != destination.parent.id;
@@ -678,7 +680,7 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             .check_writable(destination.tree)?;
         operation
             .inner_mut()
-            .rename(source, destination, when)
+            .rename(source, destination, mode, when)
             .await?;
         operation.accept()
     }

@@ -9,7 +9,7 @@ use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
     BlockSerial, DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind,
-    OpenFlags, PreparedWrite, WritePosition, WriteProgress, write_with,
+    OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress, write_with,
 };
 
 use super::BtrfsFs;
@@ -565,9 +565,14 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                 .prepare_write(path("created"), WritePosition::End, 2, 1_000_000_004)
                 .await
                 .unwrap();
-            fs.rename(path("created"), path("renamed"), 1_000_000_005)
-                .await
-                .expect("rename prepared inode");
+            fs.rename(
+                path("created"),
+                path("renamed"),
+                RenameMode::Replace,
+                1_000_000_005,
+            )
+            .await
+            .expect("rename prepared inode");
             let (first, second) = futures::future::join(
                 first.fill(|_, bytes| bytes.fill(0x41)).submit(),
                 second.fill(|_, bytes| bytes.fill(0x42)).submit(),
@@ -597,9 +602,14 @@ fn writable_service_publishes_namespace_and_survives_remount() {
             fs.link(path("file"), path("dir/link"), 3_000_000_000)
                 .await
                 .expect("link");
-            fs.rename(path("dir/link"), path("dir/moved"), 4_000_000_000)
-                .await
-                .expect("rename");
+            fs.rename(
+                path("dir/link"),
+                path("dir/moved"),
+                RenameMode::Replace,
+                4_000_000_000,
+            )
+            .await
+            .expect("rename");
             fs.set_size(path("dir/moved"), 7, 5_000_000_000)
                 .await
                 .expect("truncate");
@@ -664,6 +674,102 @@ fn writable_service_publishes_namespace_and_survives_remount() {
         assert_eq!(
             reopened.read_link(path("dir/symlink")).await.unwrap(),
             "moved"
+        );
+    });
+}
+
+#[test]
+fn writable_service_renames_with_noreplace_and_exchange_and_survives_remount() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, time)).file(
+        "/中文",
+        b"zhongwen",
+        Metadata::new(0o644, time),
+    );
+    let cache = formatted_writable_image(tree, FormatOptions::new([0x62; 16], time));
+    block_on(async {
+        let (fs, service) =
+            BtrfsFs::mount_writable(cache.disk(0), || DeviceId::new(110), write_options(2, None))
+                .await
+                .expect("writable mount");
+        let client = async move {
+            fs.create_directory(path("日本語"), 1_000_000_000)
+                .await
+                .expect("mkdir");
+            fs.open(path("日本語/한국어"), OpenFlags::CREATE, 1_000_000_001)
+                .await
+                .expect("create");
+            assert_eq!(
+                fs.rename(
+                    path("中文"),
+                    path("日本語/한국어"),
+                    RenameMode::NoReplace,
+                    2_000_000_000
+                )
+                .await,
+                Err(FsError::Exists)
+            );
+            assert_eq!(
+                fs.rename(
+                    path("none"),
+                    path("none2"),
+                    RenameMode::Exchange,
+                    2_000_000_000
+                )
+                .await,
+                Err(FsError::NoEntry)
+            );
+            assert_eq!(
+                fs.rename(
+                    path("中文"),
+                    path("none2"),
+                    RenameMode::Exchange,
+                    2_000_000_000
+                )
+                .await,
+                Err(FsError::NoEntry)
+            );
+            assert_eq!(
+                fs.rename(
+                    path("日本語"),
+                    path("日本語/한국어"),
+                    RenameMode::Exchange,
+                    2_000_000_000
+                )
+                .await,
+                Err(FsError::Invalid)
+            );
+            fs.rename(
+                path("中文"),
+                path("日本語/한국어"),
+                RenameMode::Exchange,
+                3_000_000_000,
+            )
+            .await
+            .expect("exchange a file with a file in another directory");
+            fs.rename(
+                path("日本語"),
+                path("中文"),
+                RenameMode::Exchange,
+                4_000_000_000,
+            )
+            .await
+            .expect("exchange a directory with a file");
+            fs.sync(path("日本語")).await.expect("commit");
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+        let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(111))
+            .await
+            .expect("reopen");
+        // 日本語 holds what 中文 held, and 中文 the directory.
+        assert_eq!(
+            reopened.read_at(path("日本語"), 0, 99).await.unwrap(),
+            &b""[..]
+        );
+        assert_eq!(
+            reopened.read_at(path("中文/한국어"), 0, 99).await.unwrap(),
+            &b"zhongwen"[..]
         );
     });
 }

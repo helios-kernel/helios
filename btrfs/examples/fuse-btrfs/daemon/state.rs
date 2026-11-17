@@ -22,6 +22,7 @@ use helios_btrfs::write::{
 use helios_btrfs::{
     DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
 };
+use helios_hal::fs::RenameMode;
 
 use super::OpenError;
 use super::device::Device;
@@ -482,6 +483,7 @@ impl State {
         name: &OsStr,
         new_parent: INodeNo,
         new_name: &OsStr,
+        mode: RenameMode,
         now: Timestamp,
     ) -> Result<(), Errno> {
         self.writable()?;
@@ -504,6 +506,7 @@ impl State {
                     parent: &new_parent,
                     bytes: new_name,
                 },
+                mode,
                 now,
             )
             .await
