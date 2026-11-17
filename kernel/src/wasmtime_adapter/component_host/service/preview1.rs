@@ -3646,64 +3646,36 @@ where
             }
         }
 
-        let mut ready = Vec::new();
-        let mut earliest: Option<Duration> = None;
-
+        // Descriptor readiness is the only part of a pass that awaits, so
+        // it is resolved here and the pass itself stays a pure function of
+        // the subscriptions, their readiness and the two clocks.
+        let mut readiness = Vec::with_capacity(parsed.len());
         for subscription in &parsed {
-            match subscription {
-                P1Subscription::Failed {
-                    userdata,
-                    event_type,
-                    error,
-                } => ready.push(P1ReadyEvent {
-                    userdata: *userdata,
-                    error: *error,
-                    event_type: *event_type,
-                    nbytes: 0,
-                    fd_flags: 0,
-                }),
-                P1Subscription::Fd {
-                    userdata,
-                    event_type,
-                    fd,
-                } => {
-                    let readiness = p1_descriptor_readiness(caller, *fd, *event_type).await;
-                    if let Some(event) = p1_fd_event(*userdata, *event_type, readiness) {
-                        ready.push(event);
-                    }
+            readiness.push(match subscription {
+                P1Subscription::Fd { fd, event_type, .. } => {
+                    p1_descriptor_readiness(caller, *fd, *event_type).await
                 }
-                P1Subscription::Clock {
-                    userdata,
-                    monotonic,
-                    deadline_nanos,
-                } => {
-                    let now = if *monotonic {
-                        caller.data().now_nanos()
-                    } else {
-                        caller.data().system_time_nanos()
-                    };
-                    match p1_clock_progress(*userdata, *deadline_nanos, now) {
-                        P1ClockProgress::Elapsed(event) => ready.push(event),
-                        P1ClockProgress::Waiting(remaining) => {
-                            earliest = Some(
-                                earliest
-                                    .map_or(remaining, |current: Duration| current.min(remaining)),
-                            );
-                        }
-                    }
+                P1Subscription::Clock { .. } | P1Subscription::Failed { .. } => {
+                    Ok(P1Readiness::Pending)
                 }
-            }
+            });
         }
+        let pass = p1_poll_pass(
+            &parsed,
+            &readiness,
+            caller.data().now_nanos(),
+            caller.data().system_time_nanos(),
+        );
 
-        if !ready.is_empty() {
-            break ready;
+        if !pass.ready.is_empty() {
+            break pass.ready;
         }
 
         // Nothing is ready and no deadline has expired: sleep until one
         // of the armed descriptors makes progress or the earliest
         // deadline arrives.
         let timer = caller.data().timer();
-        p1_wait_step(&timer, &mut wait, earliest).await;
+        p1_wait_step(&timer, &mut wait, pass.earliest).await;
     };
 
     // The wait above awaited, so the guest's pages are checked again here,
@@ -3732,6 +3704,79 @@ where
         .write_u32(GuestAddress::wasm32(nevents), event_count)
         .await?;
     Ok(p1::errno::SUCCESS)
+}
+
+/// What one evaluation of a `poll_oneoff` subscription set found.
+struct P1PollPass {
+    /// The events to hand back to the guest; the call returns once this is
+    /// not empty.
+    ready: Vec<P1ReadyEvent>,
+    /// The time left until the earliest clock deadline that has not elapsed,
+    /// which bounds the next sleep; `None` when no clock is pending.
+    earliest: Option<Duration>,
+}
+
+/// One pass of the `poll_oneoff` wait loop over `subscriptions`.
+///
+/// `readiness` is index-aligned with `subscriptions` and holds the probed
+/// readiness of every `Fd` subscription (the other kinds ignore their
+/// entry); `monotonic_now` and `system_now` are the two clocks a `Clock`
+/// subscription is judged against.
+fn p1_poll_pass(
+    subscriptions: &[P1Subscription],
+    readiness: &[Result<P1Readiness, i32>],
+    monotonic_now: u64,
+    system_now: u64,
+) -> P1PollPass {
+    let mut pass = P1PollPass {
+        ready: Vec::new(),
+        earliest: None,
+    };
+    for (subscription, readiness) in subscriptions.iter().zip(readiness) {
+        match subscription {
+            P1Subscription::Failed {
+                userdata,
+                event_type,
+                error,
+            } => pass.ready.push(P1ReadyEvent {
+                userdata: *userdata,
+                error: *error,
+                event_type: *event_type,
+                nbytes: 0,
+                fd_flags: 0,
+            }),
+            P1Subscription::Fd {
+                userdata,
+                event_type,
+                ..
+            } => {
+                if let Some(event) = p1_fd_event(*userdata, *event_type, *readiness) {
+                    pass.ready.push(event);
+                }
+            }
+            P1Subscription::Clock {
+                userdata,
+                monotonic,
+                deadline_nanos,
+            } => {
+                let now = if *monotonic {
+                    monotonic_now
+                } else {
+                    system_now
+                };
+                match p1_clock_progress(*userdata, *deadline_nanos, now) {
+                    P1ClockProgress::Elapsed(event) => pass.ready.push(event),
+                    P1ClockProgress::Waiting(remaining) => {
+                        pass.earliest = Some(
+                            pass.earliest
+                                .map_or(remaining, |current| current.min(remaining)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    pass
 }
 
 /// Whether a clock subscription's deadline has arrived.
@@ -4869,7 +4914,7 @@ mod tests {
     fn path_open_truncate_without_write_authority_leaves_the_file_untouched() {
         use futures_lite::future::block_on;
 
-        let namespace: crate::Namespace<crate::UnsupportedStorage> =
+        let namespace: crate::Namespace<crate::test_support::UnsupportedStorage> =
             crate::Namespace::new(crate::MountTable::new(
                 crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
                 1,
@@ -4930,7 +4975,7 @@ mod tests {
 
     /// A namespace with one file, `/data`, and the time it was last
     /// modified.
-    fn namespace_with_file() -> crate::Namespace<crate::UnsupportedStorage> {
+    fn namespace_with_file() -> crate::Namespace<crate::test_support::UnsupportedStorage> {
         use futures_lite::future::block_on;
 
         let namespace = crate::Namespace::new(crate::MountTable::new(
@@ -5051,7 +5096,9 @@ mod tests {
         assert_eq!(contents.as_ref(), expected.as_bytes());
     }
 
-    fn modified_nanos(namespace: &crate::Namespace<crate::UnsupportedStorage>) -> u64 {
+    fn modified_nanos(
+        namespace: &crate::Namespace<crate::test_support::UnsupportedStorage>,
+    ) -> u64 {
         futures_lite::future::block_on(wasi_fs::stat_path(namespace, "/data", crate::Follow::No))
             .expect("the file exists")
             .modified_nanos
@@ -5486,42 +5533,62 @@ mod tests {
     /// deadline never arrived.
     #[test]
     fn poll_oneoff_returns_early_when_a_descriptor_becomes_ready() {
-        let mut ready = Vec::new();
-        let mut earliest: Option<Duration> = None;
-
-        if let Some(event) = p1_fd_event(
-            11,
-            P1_EVENTTYPE_FD_READ,
+        let subscriptions = [
+            P1Subscription::Fd {
+                userdata: 11,
+                event_type: P1_EVENTTYPE_FD_READ,
+                fd: 3,
+            },
+            P1Subscription::Clock {
+                userdata: 12,
+                monotonic: true,
+                deadline_nanos: 1_000_000,
+            },
+        ];
+        let readiness = [
             Ok(P1Readiness::Ready { bytes: 4 }),
-        ) {
-            ready.push(event);
-        }
-        match p1_clock_progress(12, 1_000_000, 0) {
-            P1ClockProgress::Elapsed(event) => ready.push(event),
-            P1ClockProgress::Waiting(remaining) => {
-                earliest =
-                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
-            }
-        }
+            Ok(P1Readiness::Pending),
+        ];
 
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].userdata, 11);
-        assert_eq!(ready[0].event_type, P1_EVENTTYPE_FD_READ);
+        let pass = p1_poll_pass(&subscriptions, &readiness, 0, 0);
+
+        assert_eq!(pass.ready.len(), 1);
+        assert_eq!(pass.ready[0].userdata, 11);
+        assert_eq!(pass.ready[0].event_type, P1_EVENTTYPE_FD_READ);
         // The clock only ever bounded the sleep; it never became an event.
-        assert_eq!(earliest, Some(Duration::from_nanos(1_000_000)));
+        assert_eq!(pass.earliest, Some(Duration::from_nanos(1_000_000)));
     }
 
-    /// The sleep is bounded by the earliest of several clock deadlines.
+    /// The sleep is bounded by the earliest of several clock deadlines, each
+    /// judged against its own timebase.
     #[test]
     fn poll_oneoff_sleeps_until_the_earliest_deadline() {
-        let mut earliest: Option<Duration> = None;
-        for deadline in [900u64, 300, 700] {
-            if let P1ClockProgress::Waiting(remaining) = p1_clock_progress(0, deadline, 100) {
-                earliest =
-                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
-            }
-        }
-        assert_eq!(earliest, Some(Duration::from_nanos(200)));
+        let clock = |userdata, monotonic, deadline_nanos| P1Subscription::Clock {
+            userdata,
+            monotonic,
+            deadline_nanos,
+        };
+        let subscriptions = [
+            clock(0, true, 900),
+            clock(1, true, 300),
+            clock(2, true, 700),
+            // On the system clock this one is 150ns away, nearer than any
+            // monotonic deadline above.
+            clock(3, false, 5_150),
+        ];
+        let readiness = [Ok(P1Readiness::Pending); 4];
+
+        let pass = p1_poll_pass(&subscriptions, &readiness, 100, 5_000);
+
+        assert!(pass.ready.is_empty(), "no deadline has arrived");
+        assert_eq!(pass.earliest, Some(Duration::from_nanos(150)));
+
+        // Once the earliest deadline passes, it is reported and the next one
+        // bounds the following sleep.
+        let pass = p1_poll_pass(&subscriptions, &readiness, 100, 5_150);
+        assert_eq!(pass.ready.len(), 1);
+        assert_eq!(pass.ready[0].userdata, 3);
+        assert_eq!(pass.earliest, Some(Duration::from_nanos(200)));
     }
 
     /// Regular files never block, in either direction. They used to fall

@@ -18,7 +18,8 @@ never depends on anything above it.
 | Layer | Crates | Contents |
 | --- | --- | --- |
 | Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
-| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/`, `firmware/`, `btrfs/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; `firmware/` turns the platform description a backend hands it (the device tree's NUMA properties, the ACPI SRAT and SLIT) into `hal/` values; all six depend on `hal/` and none on the kernel. |
+| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/`, `firmware/`, `btrfs/`, `sync/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; `firmware/` turns the platform description a backend hands it (the device tree's NUMA properties, the ACPI SRAT and SLIT) into `hal/` values; `sync/` holds the async primitives the kernel and the compatibility layers share and depends on none of the others; the other six depend on `hal/`, and none depends on the kernel. |
+| Compatibility layers | `unix/`, `linux/` | `#![no_std]` services the non-Preview-3 ABIs share (`unix/`) and the Linux ABI (`linux/`), each behind a kernel feature that is off by default. Both build on `hal/` and `sync/`; neither depends on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
 | Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
@@ -76,6 +77,12 @@ maintainer's decision and the fork's revision moves once, per §1.
   through `Kernel<CpuImpl>`, `RuntimeState<…>` and similar structures.
 - A system capability is a Rust trait first and a WASI/WIT interface second.
   Define the trait, then expose it.
+- The kernel exposes one async-first API, its resources, services and
+  capability checks, and every guest ABI is an adapter over it: WASI
+  Preview 3, WASIX and the Linux subsystem. An adapter translates arguments,
+  layouts and errors; it never re-implements a resource, a wait mechanism or
+  a policy the kernel owns. What WASIX and Linux need beyond Preview 3 lives
+  once, in `unix/`.
 
 ## 3. Code quality
 
@@ -335,6 +342,20 @@ and never comes from CI.
   happen it is for alignment, never for permission to land a degraded
   variant.
 
+### 3.8 Native Linux processes
+
+- A Linux process is bound by the kernel's permission model exactly as a
+  wasm program is: it holds the `ProcessAuthority` its parent grants, every
+  syscall that reaches a resource derives the capability the matching WASI
+  or WASIX operation derives, and a missing right fails with Linux's errno.
+  Linux user, group and capability identities are reported values, never
+  authority.
+- Native execution runs only with the hardware protections its contract
+  states (kernel-mode execute and access protection of user pages, a
+  processor unaffected by rogue data cache load) and refuses to start where
+  one is missing, naming it. It keeps every mitigation Linux applies to user
+  processes on the same hardware.
+
 ## 4. Async-first execution
 
 The kernel runs a cooperative async executor. Anything that pins it blocks
@@ -366,7 +387,7 @@ does.
   bootstrap paths only.
 - No `Arc<Mutex<T>>` behind an async API. Channels, the kernel `Notify`, and
   single-owner `RefCell` within a task come first; when a lock is unavoidable
-  it is the kernel's async `Mutex` or `RwLock` from `kernel/src/exec/sync.rs`,
+  it is the async `Mutex` or `RwLock` from `sync/`,
   and the guard is released before an `.await`.
 - A loop that polls for progress yields on the non-ready path so the executor
   can drive the task that produces the progress.
