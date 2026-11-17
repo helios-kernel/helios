@@ -43,6 +43,7 @@ mod disk;
 mod input;
 mod instruction_profile;
 mod kernel_image;
+mod kernel_image_cache;
 mod kill;
 mod network;
 mod numa;
@@ -57,6 +58,7 @@ mod x86_image_audit;
 
 use disk::{DiskSpecError, VmDiskSpec, validate_disks};
 use input::{InputScript, InputScriptError, InputStatement};
+use kernel_image_cache::{KernelImageBuild, KernelImageCache};
 use kill::KillAfterLines;
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
@@ -258,6 +260,8 @@ pub(crate) enum VmBuildError {
     Tool(#[from] ToolDiscoveryError),
     #[error("{0}")]
     WorkspaceRoot(#[from] WorkspaceRootError),
+    #[error("{0}")]
+    KernelImageCache(#[from] kernel_image_cache::KernelImageCacheError),
     #[error("{0}")]
     RootSecretScan(#[from] root_secret_scan::RootSecretScanError),
     #[error("{0}")]
@@ -1784,9 +1788,10 @@ pub(crate) struct VmCommand {
     /// Sign the boot payload with the Ed25519 secret in this file, and
     /// embed its public half in the kernel, instead of the key a
     /// development build generates in its own build directory. A
-    /// release names the key its workflow installed; the file is read
-    /// in place and never copied into the build directory.
-    #[arg(long, value_name = "PATH")]
+    /// release names the key its workflow installed, and CI's boots name
+    /// its signing key through the environment; the file is read in
+    /// place and never copied into the build directory.
+    #[arg(long, value_name = "PATH", env = "HELIOS_ROOT_SECRET_KEY")]
     root_secret_key: Option<PathBuf>,
 
     #[arg(long)]
@@ -3331,20 +3336,43 @@ fn build_vm(command: &KernelBuildSpec) -> Result<(), VmBuildError> {
         .arg(command.profile.cargo_target)
         .arg("--bin")
         .arg(command.profile.kernel_artifact_name);
-    if command.profile_use.is_some() {
+    let kernel = command.kernel_path()?;
+    // An image an earlier run linked from the same inputs is taken from
+    // the artifact cache instead of linked again (#1023).
+    let cache = KernelImageCache::open(KernelImageBuild {
+        cli: discover_helios_cli(command.kind)?,
+        repo_root: &repo_root,
+        cargo: &kernel_build,
+        profile: command.profile_use.as_ref().map(KernelProfileUse::path),
+        public_key: kernel_prebuild_dir(command)?.join(ROOT_PUBLIC_FILE),
+        image: kernel.clone(),
+        target: command.profile.cargo_target,
+        target_dir: command.target_dir(&repo_root).path().to_path_buf(),
+    })?;
+    let restored = match &cache {
+        Some(cache) => cache.restore()?,
+        None => false,
+    };
+    if restored {
+        eprintln!("{kernel_label}: restored from the artifact cache");
+    } else if command.profile_use.is_some() {
         // A profile-use build emits one warning per function the profile
         // covers nothing about, thousands of them; they are captured to a
         // list beside the kernel and the step log gets the count (#329).
-        let kernel = command.kernel_path()?;
         run_pgo_kernel_step(&kernel_label, &mut kernel_build, command, &kernel)?;
     } else {
         run_step(&kernel_label, &mut kernel_build)?;
     }
     // The image carries the public key alone; the secret this build's
     // prebuild signed with must not be anywhere in it.
-    root_secret_scan::scan_image(&command.kernel_path()?, &command.root_secret_key_path()?)?;
+    root_secret_scan::scan_image(&kernel, &command.root_secret_key_path()?)?;
     if command.profile.arch == VmArch::X86_64 && command.kind.audited_for_legacy_encoding() {
-        x86_image_audit::audit(&command.kernel_path()?)?;
+        x86_image_audit::audit(&kernel)?;
+    }
+    // Stored after the scan and the audit, so the cache holds no image
+    // either refused.
+    if !restored && let Some(cache) = &cache {
+        cache.store()?;
     }
     run_step(
         "building inspector",
