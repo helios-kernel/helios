@@ -2366,7 +2366,7 @@ pub(super) fn map_component_fs_path_error(
 #[cfg(test)]
 mod direct_write_tests {
     use super::*;
-    use crate::UnsupportedStorage;
+    use crate::test_support::UnsupportedStorage;
     use crate::wasmtime_adapter::component_host::service::test_store;
     use crate::wasmtime_adapter::wasi::stream::test_source::{Reads, TrackedBuffer};
     use core::sync::atomic::Ordering;

@@ -4554,10 +4554,11 @@ mod tests {
     /// guest reads `ENOENT`.
     #[test]
     fn wasix_exec_of_a_missing_program_file_is_not_found() {
-        let namespace = Namespace::<crate::UnsupportedStorage>::new(crate::MountTable::new(
-            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
-            1,
-        ));
+        let namespace =
+            Namespace::<crate::test_support::UnsupportedStorage>::new(crate::MountTable::new(
+                crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+                1,
+            ));
         let authority = ProcessAuthority::root();
 
         let error = futures_lite::future::block_on(read_program_source_from(

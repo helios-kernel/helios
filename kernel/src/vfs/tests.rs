@@ -8,9 +8,10 @@ use helios_hal::fs::{FileSystem, FileSystemRights, FsError, FsPath, OpenFlags, W
 use super::{
     BOOT_DEVICE, Follow, MAX_MOUNTS, MemoryFs, MountError, MountTable, MountedFs, Namespace,
 };
+use crate::test_support::UnsupportedStorage;
 use crate::{
     BootFs, ComponentFsPathError, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-    MountCap, ProcessAuthority, UnsupportedStorage, resolve_child_path,
+    MountCap, ProcessAuthority, resolve_child_path,
 };
 
 type TestNamespace = Namespace<UnsupportedStorage>;
