@@ -1044,7 +1044,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1058,6 +1058,10 @@ jobs:
           grep -Fqx 'Hello, World!' linux-smoke.out
           grep -Fqx 'libc:0' linux-smoke.out
           grep -Fqx 'fault:139' linux-smoke.out
+          # The memory fixture (#1026) runs in all its endings against the
+          # results check-memory.sh records from Linux, which build-fixtures.sh
+          # first confirmed on this runner.
+          grep -Fqx 'memory:0' linux-smoke.out
       - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
@@ -1717,7 +1721,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1731,6 +1735,10 @@ jobs:
           grep -Fqx 'Hello, World!' linux-smoke.out
           grep -Fqx 'libc:0' linux-smoke.out
           grep -Fqx 'fault:139' linux-smoke.out
+          # The memory fixture (#1026) runs in all its endings against the
+          # results check-memory.sh records from Linux, which build-fixtures.sh
+          # first confirmed on this runner.
+          grep -Fqx 'memory:0' linux-smoke.out
       - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
