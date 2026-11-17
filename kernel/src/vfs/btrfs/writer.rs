@@ -12,7 +12,9 @@ use helios_btrfs::write::{
     WriteTransaction, Writer,
 };
 use helios_btrfs::{BlockSink, Error, FileKind, Timestamp};
-use helios_hal::fs::{BlockDevice, FsError, FsResult, Landed, OpenFlags, WritePosition};
+use helios_hal::fs::{
+    BlockDevice, FsError, FsResult, Landed, OpenFlags, RenameMode, WritePosition,
+};
 use triomphe::Arc;
 
 use super::{Image, Snapshot};
@@ -50,6 +52,7 @@ pub(super) enum Operation {
     },
     Rename {
         destination: String,
+        mode: RenameMode,
     },
     Link {
         destination: String,
@@ -377,7 +380,7 @@ async fn apply<S: BlockSink>(
             }
             .map_err(fs_error)?;
         }
-        Operation::Rename { destination } => {
+        Operation::Rename { destination, mode } => {
             let (source, source_name) = parent(transaction, path).await?;
             let (destination, destination_name) = parent(transaction, &destination).await?;
             transaction
@@ -390,6 +393,7 @@ async fn apply<S: BlockSink>(
                         parent: &destination,
                         bytes: destination_name,
                     },
+                    mode,
                     when,
                 )
                 .await

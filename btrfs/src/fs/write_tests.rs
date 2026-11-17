@@ -14,6 +14,8 @@ use btrfs_disk::tree::TreeBlock;
 use ferrosys::btrfs::{FormatOptions, format_to};
 use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
+#[cfg(feature = "write")]
+use helios_hal::fs::RenameMode;
 use helios_hal::io::{IoError, IoResult};
 
 use super::Filesystem;
@@ -25,7 +27,7 @@ use crate::tree::write::{MetadataAllocator, Trees, WriteError};
 use crate::tree::{Expected, Node, TreeRoot};
 use crate::{ChecksumType, Key};
 
-struct Disk(File);
+pub(super) struct Disk(pub(super) File);
 
 #[cfg(feature = "write")]
 struct FaultDisk {
@@ -787,6 +789,7 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
             .rename(
                 name(root_number, "中文".as_bytes()),
                 name(child, b"loop"),
+                RenameMode::Replace,
                 when
             )
             .await,
@@ -794,17 +797,28 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
     ));
     // Renaming two links to the same inode leaves both names intact.
     edits
-        .rename(name(first, b"file"), name(second, b"alias"), when)
+        .rename(
+            name(first, b"file"),
+            name(second, b"alias"),
+            RenameMode::Replace,
+            when,
+        )
         .await
         .unwrap();
     edits
-        .rename(name(first, b"file"), name(second, b"target"), when)
+        .rename(
+            name(first, b"file"),
+            name(second, b"target"),
+            RenameMode::Replace,
+            when,
+        )
         .await
         .unwrap();
     edits
         .rename(
             name(root_number, "中文".as_bytes()),
             name(second, b"moved"),
+            RenameMode::Replace,
             when,
         )
         .await
@@ -1788,6 +1802,7 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
             tx.rename(
                 name(&root_handle, label.as_bytes()),
                 name(&root_handle, b"renamed"),
+                RenameMode::Replace,
                 when
             )
         );
@@ -1835,6 +1850,7 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
         tx.rename(
             name(append_dir, b"child"),
             name(&root_handle, b"moved"),
+            RenameMode::Replace,
             when
         )
     );
@@ -2325,7 +2341,10 @@ fn owned_mutations_preserve_readonly_subvolumes() {
         refused!(tx, tx.create_file(name(b"new"), attributes(), when));
         refused!(tx, tx.hard_link(name(b"alias"), &file, when));
         refused!(tx, tx.symlink(name(b"link"), b"data", attributes(), when));
-        refused!(tx, tx.rename(name(b"data"), name(b"renamed"), when));
+        refused!(
+            tx,
+            tx.rename(name(b"data"), name(b"renamed"), RenameMode::Replace, when)
+        );
         refused!(tx, tx.unlink_name(name(b"data"), when));
         refused!(
             tx,
@@ -2617,7 +2636,7 @@ fn owned_mutations_commit_as_one_generation() {
         .await
         .unwrap();
         tx.hard_link(name(b"alias"), &source, when).await.unwrap();
-        tx.rename(name(b"source"), name(b"renamed"), when)
+        tx.rename(name(b"source"), name(b"renamed"), RenameMode::Replace, when)
             .await
             .unwrap();
         let _ = tx
@@ -3062,7 +3081,7 @@ fn extent_cuts_pass_btrfs_check() {
 }
 
 #[cfg(feature = "write")]
-fn assert_btrfs_check(path: &std::path::Path) {
+pub(super) fn assert_btrfs_check(path: &std::path::Path) {
     let output = std::process::Command::new("btrfs")
         .args(["check", "--readonly"])
         .arg(path)
@@ -4464,7 +4483,7 @@ fn filesystem_image_tree(
     filesystem_image_tree_file(separate, free_tree, tree, tempfile::tempfile().unwrap())
 }
 
-fn filesystem_image_tree_file(
+pub(super) fn filesystem_image_tree_file(
     separate: bool,
     free_tree: bool,
     tree: TreeBuilder,
