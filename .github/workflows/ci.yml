@@ -184,6 +184,13 @@ jobs:
               - 'wit/deps/helios-system/gpu.wit'
               - 'wit/deps/helios-system/display.wit'
               - 'programs/gpu-test/**'
+              - 'webgpu/**'
+              - 'venus/**'
+              - 'programs/webgpu/**'
+              - 'programs/pride-flag/**'
+              - 'programs/compositor/**'
+              - 'wit/deps/webgpu/**'
+              - 'wit/deps/helios-webgpu/**'
               - 'inspector/**'
               - '.github/qemu/x86_64-venus-configure.args'
               - '.github/qemu/virglrenderer-meson.args'
@@ -2757,7 +2764,14 @@ jobs:
     name: smoke-x86-64-venus
     needs: [changes, wasm-debug]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-venus')
-    runs-on: ubuntu-24.04
+    # QEMU's display reads the guest's scanout blob through llvmpipe on
+    # vgem, which maps an imported dma-buf only from Mesa 25.3 on
+    # (kms-dri-sw `create_mapped`); 24.04 ships 25.2. The image names the
+    # cached QEMU and virglrenderer builds, which link its libraries.
+    strategy:
+      matrix:
+        image: [ubuntu-26.04]
+    runs-on: ${{ matrix.image }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -2803,18 +2817,21 @@ jobs:
             python3-venv pkg-config flex bison \
             libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev \
             libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev \
-            mesa-vulkan-drivers libegl-mesa0
+            mesa-vulkan-drivers libegl-mesa0 gdb
           # vgem gives a GPU-less runner the render node QEMU's EGL
           # context opens; the azure kernel's own modules package carries
-          # it. No udmabuf: QEMU needs it for blobs only when neither virgl
-          # nor rutabaga backs the device (hw/display/virtio-gpu.c), and
-          # virgl hands guest blobs to virglrenderer as iovecs.
+          # it.
           sudo modprobe vgem
           # Device rules may change the new node's owner and permissions.
           # Complete them before granting the runner access.
           sudo udevadm settle
-          sudo chmod 666 /dev/kvm /dev/dri/renderD*
-          ls -la /dev/kvm /dev/dri
+          # QEMU scans a blob out through an EGL dma-buf import
+          # (ui/egl-helpers.c), and lavapipe exports host-visible memory
+          # as a dma-buf only through /dev/udmabuf (lp_screen.c). Noble
+          # builds udmabuf into the kernel, so the node exists without a
+          # module; chmod fails the step if it does not.
+          sudo chmod 666 /dev/kvm /dev/dri/renderD* /dev/udmabuf
+          ls -la /dev/kvm /dev/dri /dev/udmabuf
           # lavapipe is the only Vulkan driver this runner can enumerate;
           # naming it keeps the loader from probing the hardware ones.
           # Mesa 25's package names the ICD without an architecture suffix.
@@ -2826,7 +2843,7 @@ jobs:
         uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.VIRGL_PREFIX }}
-          key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
+          key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
       - name: Build the pinned virglrenderer
         if: steps.virgl-cache.outputs.cache-hit != 'true'
         run: |
@@ -2847,7 +2864,7 @@ jobs:
           path: ${{ env.QEMU_PREFIX }}
           # QEMU links the virglrenderer above, so its key carries that
           # build's too.
-          key: qemu-venus-${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
+          key: qemu-venus-${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
       - name: Build the pinned QEMU
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         env:
@@ -2950,9 +2967,69 @@ jobs:
           # blobs written and read back, and the second instance.
           for line in 'gpu-test:opened' 'gpu-test:fence ring=0' \
               'gpu-test:host-blob ok' 'gpu-test:guest-blob ok' \
-              'gpu-test:instances=2'; do
+              'gpu-test:instances=2' 'gpu-test:venus ring-reply ok'; do
             grep -Fq "$line" venus-smoke.out
           done
+      # The whole WebGPU path: the provider plugged into `pride-flag`
+      # draws over Venus, the canvas presents to the compositor, and the
+      # capture is what the scanout shows.
+      - name: Draw the pride flag through wasi:webgpu
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/pride-flag"
+          captures="$GITHUB_WORKSPACE/pride-flag-scanout"
+          mkdir -p "$runtime" "$captures"
+          # The runner pipes cores to apport, which keeps none for an
+          # unpackaged binary; a crashed QEMU leaves its core here for the
+          # backtrace step below.
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/core.%e.%p"
+          ulimit -c unlimited
+          ./target/debug/helios-inspector vm --arch x86-64 --memory 2G \
+            --accel kvm --runtime-dir "$runtime" --keep-runtime-dir \
+            --renderer virtio-gpu-gl --renderer-hostmem 256M \
+            --display egl-headless \
+            --boot-program dash --boot-program debugger \
+            --boot-program compositor --boot-program pride-flag \
+            --no-compiler-plugin \
+            screendump --settle-seconds 20 --run /bin/pride-flag \
+              "$captures/pride-flag.png" \
+            2>&1 | tee "$runtime/inspector.log"
+          for line in 'pride-flag:device' 'pride-flag:canvas' \
+              'pride-flag:frame 60' 'pride-flag:done'; do
+            grep -Fq "$line" "$runtime/inspector.log"
+          done
+          file "$captures/pride-flag.png" | grep -Fq 'PNG image data'
+      - name: Print the QEMU crash backtrace
+        if: failure()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          # The kernel logs each segfault with the faulting library and
+          # offset, and udmabuf logs the allocations it refuses.
+          echo "::group::kernel log"
+          sudo dmesg | tail -n 100
+          grep -H . /sys/module/udmabuf/parameters/* || true
+          echo "::endgroup::"
+          # %e is the faulting thread's name (llvmpipe-0, say), not the
+          # binary's, so every core here is QEMU's.
+          for core in "$RUNNER_TEMP"/core.*; do
+            ls -la "$core"
+            echo "::group::backtrace of $core"
+            gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' \
+              "$(command -v qemu-system-x86_64)" "$core"
+            echo "::endgroup::"
+          done
+      - name: Upload the pride flag capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pride-flag-scanout
+          path: pride-flag-scanout/*.png
+          if-no-files-found: warn
+          retention-days: 14
       - name: Upload the inspector runtime directory
         if: failure()
         uses: actions/upload-artifact@v4

@@ -83,23 +83,23 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 }
 
 mod device;
-mod mounts;
-pub(crate) use device::record_linear_memory;
 mod filters;
+mod mounts;
 mod observation;
 mod pending;
 pub(crate) use pending::PendingReply;
 pub mod service;
+mod timeline;
 mod topology;
 mod views;
 mod vsock;
-pub(crate) use views::{guest_memory, view_trap};
+pub(crate) use views::{caller_memory, guest_memory, view_trap};
 
 pub use service::{
-    BlobHandle, ChildExit, ChildHandle, ClientSurfaceHandle, CommandBufferHandle, ContextHandle,
-    DisplayHandle, GpuHandle, InputDeviceHandle, PlaybackHandle, SurfaceHandle, UserProgramService,
-    install_component_host_program_service, install_program_service,
-    run_component_host_processor_forever, run_embedded_component_forever,
+    BlobHandle, ChildExit, ChildHandle, ClientImageSurfaceHandle, ClientSurfaceHandle,
+    CommandBufferHandle, ContextHandle, DisplayHandle, GpuHandle, InputDeviceHandle,
+    PlaybackHandle, SurfaceHandle, UserProgramService, install_component_host_program_service,
+    install_program_service, run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
 pub(crate) use service::{ProgramArgv, ProgramExecContext, ProgramSource};
@@ -124,7 +124,6 @@ pub type StoreData<CpuImpl, Net, StorageImpl> = ComponentStoreData<
     HostRuntimeState<CpuImpl, Net, StorageImpl>,
     crate::Namespace<StorageImpl>,
     ResourceTable,
-    wasmtime::Memory,
 >;
 pub type OutputMode = ComponentOutputMode;
 pub type OutputRoute = ComponentOutputRoute;
@@ -2333,7 +2332,7 @@ where
             })
         },
     )?;
-    Ok(())
+    timeline::add_to_linker(&mut instance)
 }
 
 fn add_stats_to_linker<CpuImpl, Net, StorageImpl>(
@@ -2621,7 +2620,7 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "[method]tcp-stream.close",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
             let socket = caller.data_mut().table.get_mut(&resource)?;
             socket.resource.backend.close();
@@ -2685,7 +2684,7 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "[method]udp-socket.close",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
             let socket = caller.data_mut().table.get_mut(&resource)?;
             socket.resource.backend.close();
@@ -2934,7 +2933,7 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "[method]tcp-stream.close",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiTcpStream<Net>>,)| {
             let socket = caller.data_mut().table.get_mut(&resource)?;
             socket.resource.backend.close();
@@ -2998,7 +2997,7 @@ where
     )?;
     instance.func_wrap_concurrent_immediate(
         "[method]udp-socket.close",
-        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, Net, StorageImpl>>,
+        |mut caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<SbiUdpSocket<Net>>,)| {
             let socket = caller.data_mut().table.get_mut(&resource)?;
             socket.resource.backend.close();

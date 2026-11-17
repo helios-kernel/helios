@@ -84,7 +84,8 @@ clippy-host:
     cargo clippy -p helios-unix --all-targets --features runtime -- -D warnings
     cargo clippy -p helios-linux --all-targets --features runtime -- -D warnings
     cargo clippy \
-        --workspace --all-targets --features helios-btrfs/write \
+        --workspace --all-targets \
+        --features helios-webgpu/runtime --features helios-btrfs/write \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
         --exclude helios-audio-test --exclude helios-compositor --exclude helios-cpu \
@@ -175,9 +176,11 @@ test-libraries:
     cargo nextest run -p helios-btrfs --features write
     # The Venus protocol is generated from pinned venus-protocol inputs that
     # the CLI fetches and hash-verifies; the parity test then compares the
-    # generated encoders with the pinned Mesa generator's output.
+    # generated encoders with the pinned Mesa generator's output. The
+    # driver's entry points and handle-type translation are behind its
+    # `driver` feature.
     {{ cli }} venus-protocol-fetch
-    cargo nextest run -p helios-venus -p helios-venus-gen
+    cargo nextest run -p helios-venus -p helios-venus-gen --features helios-venus/driver
     # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
     # tables the fetch below hash-verifies.
     just acpi-tables-fetch

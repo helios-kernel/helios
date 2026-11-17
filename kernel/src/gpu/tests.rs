@@ -7,10 +7,13 @@
 //! `device::platform`'s test hooks install, so a test can also see when
 //! a buffer's run was taken, shown and given back.
 
+use crate::{SignalTimeline, Timeline, TimelineError, TimelineSource};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::task::{Context as TaskContext, Poll, Waker};
+use std::task::Wake;
 
 use futures::channel::oneshot;
 use futures_lite::future::{block_on, poll_once};
@@ -20,10 +23,11 @@ use helios_hal::display::{
     ContextId, ContextName, FenceId, Gpu3d, Gpu3dError, Gpu3dResult, RingCount, RingIndex,
     Submission,
 };
+use helios_hal::display::{DisplayMode, PixelFormat};
 use helios_hal::io::IoError;
 use helios_hal::iommu::PhysicalRange;
 use helios_hal::vmm::VirtAddr;
-use std::sync::Mutex;
+use std::sync::{Arc as WakeArc, Mutex};
 use triomphe::Arc;
 
 use crate::buffer::{Buffer, GuestMemory, Span, ViewTable, WASM_PAGE_BYTES};
@@ -34,11 +38,12 @@ use crate::test_support::TestCpu;
 
 use super::owner::{gpu3d_channels, serve_control, serve_submit};
 use super::service::{
-    BlobShared, BlobSpec, ContextShared, ControlMessage, Gpu3dRequest, Gpu3dSender, Gpu3dService,
-    Gpu3dShared, InlineCommands, ScanoutHold, SubmitCommands, SubmitMessage, SubmitRequest,
+    BlobShared, BlobSpec, CompletionSignal, ContextShared, ControlMessage, Gpu3dRequest,
+    Gpu3dSender, Gpu3dService, Gpu3dShared, InlineCommands, SubmitCommands, SubmitCompletion,
+    SubmitMessage, SubmitRequest,
 };
 use super::{
-    ContextRecord, Gpu3dOwnership, Gpu3dServiceError, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS,
+    ContextRecord, Gpu3dOwnership, Gpu3dServiceError, GpuImage, MAX_GPU_BLOBS, MAX_GPU_CONTEXTS,
     MAX_GPU_VIEWS, MAX_MACHINE_GPU_BLOBS, MAX_MACHINE_GPU_CONTEXTS,
 };
 
@@ -491,13 +496,24 @@ fn queue_submit(
     fence: Option<u64>,
     commands: SubmitCommands,
 ) -> Result<oneshot::Receiver<Result<(), Gpu3dServiceError>>, Gpu3dServiceError> {
+    queue_submit_with_signals(sender, context, ring, fence, commands, Vec::new())
+}
+
+fn queue_submit_with_signals(
+    sender: &Gpu3dSender,
+    context: &Arc<ContextShared>,
+    ring: u8,
+    fence: Option<u64>,
+    commands: SubmitCommands,
+    signals: Vec<CompletionSignal>,
+) -> Result<oneshot::Receiver<Result<(), Gpu3dServiceError>>, Gpu3dServiceError> {
     let (ring, fence, timeline) = context.admit(ring, fence)?;
     let (reply, answer) = oneshot::channel();
     let queued = sender.try_submit(SubmitRequest {
         context: context.clone(),
         commands,
         ring,
-        fence,
+        completion: fence.map(|fence| SubmitCompletion { fence, signals }),
         reply,
     })?;
     assert!(queued, "no test fills the submit queue");
@@ -1528,7 +1544,7 @@ fn an_ended_session_s_drain_does_not_stall_other_sessions() {
 /// asked for, and its session's end, wait for the scanout to let go,
 /// and only then is the blob destroyed — and its context after it.
 #[test]
-fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
+fn an_exported_image_retains_storage_until_its_last_scanout_retires() {
     test_hooks::install();
     let (shared, control, submit) = gpu3d_channels(true);
     let device = FakeGpu3d::new();
@@ -1547,8 +1563,19 @@ fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
         )
         .await
         .expect("the fake engine agrees");
-        // What a blob surface carries while it is presented.
-        let scanout = ScanoutHold::new(&blob);
+        let image = GpuImage::new(
+            &blob,
+            DisplayMode {
+                width: 4,
+                height: 4,
+            },
+            PixelFormat::Rgba8888,
+            0,
+            16,
+        )
+        .unwrap();
+        let (_, scanout) = image.clone().into_scanout();
+        drop(image);
 
         // The handle goes first.
         queue_destroy(&ownership, blob.id()).await;
@@ -1581,7 +1608,17 @@ fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
         )
         .await
         .expect("the fake engine agrees");
-        let scanout = ScanoutHold::new(&second);
+        let image = GpuImage::new(
+            &second,
+            DisplayMode {
+                width: 4,
+                height: 4,
+            },
+            PixelFormat::Rgba8888,
+            0,
+            16,
+        )
+        .unwrap();
         close(&mut ownership, &mut views);
         settle().await;
         assert!(!device.saw(&Call::DestroyBlob(second.id())));
@@ -1589,6 +1626,12 @@ fn a_scanned_out_blob_is_destroyed_only_once_the_scanout_lets_go() {
             !device.saw(&Call::DestroyContext(context.shared.id())),
             "nor does its context's, which goes after it"
         );
+        // A consumer may turn an exported image into a scanout after
+        // the producer session has ended: the capability owns its storage.
+        let (layout, scanout) = image.into_scanout();
+        assert_eq!(layout.blob, second.id());
+        settle().await;
+        assert!(!device.saw(&Call::DestroyBlob(second.id())));
         drop(scanout);
         settle().await;
         second.id()
@@ -1853,6 +1896,59 @@ mod component_host {
     use crate::wasmtime_adapter::component_host::service::test_store;
     use crate::wasmtime_adapter::component_host::service::{BlobHandle, CommandBufferHandle};
 
+    #[test]
+    fn exported_images_survive_their_source_session_but_stale_blobs_cannot_export() {
+        test_hooks::install();
+        let (shared, _control, _submit) = gpu3d_channels(true);
+        let service = Gpu3dService::from_shared(shared);
+        let mut data = test_store::store_data(&service);
+        let session = data
+            .device
+            .open_gpu(&service, &mut data.views, test_caps::gpu())
+            .expect("the engine renders");
+        let shared = Arc::new(BlobShared::new(
+            BlobId::new(9),
+            4096,
+            Arc::new(crate::exec::Notify::new()),
+        ));
+        let blob = data
+            .table
+            .push(BlobHandle {
+                session,
+                id: shared.id(),
+                shared: shared.clone(),
+                backing: None,
+                mapped: None,
+            })
+            .unwrap();
+        let layout = contract::ImageLayout {
+            width: 8,
+            height: 8,
+            format: contract::PixelFormat::Rgba8888,
+            offset: 32,
+            stride: 64,
+        };
+        let image = contract::HostBlob::image(&mut data, Resource::new_borrow(blob.rep()), layout)
+            .unwrap()
+            .unwrap();
+        assert!(shared.is_retained());
+        reopen(&mut data, &service, session);
+        let actual =
+            contract::Host::describe_image(&mut data, Resource::new_borrow(image.rep())).unwrap();
+        assert_eq!(
+            (actual.width, actual.height, actual.offset, actual.stride),
+            (8, 8, 32, 64)
+        );
+        assert!(matches!(
+            contract::HostBlob::image(&mut data, Resource::new_borrow(blob.rep()), layout).unwrap(),
+            Err(contract::Error::SessionEnded)
+        ));
+        contract::HostBlob::drop(&mut data, blob).unwrap();
+        assert!(shared.is_retained());
+        contract::HostImage::drop(&mut data, image).unwrap();
+        assert!(!shared.is_retained());
+    }
+
     /// Show a fresh 4 KiB buffer at wasm page `page` of the store's
     /// memory, in the open session's set.
     fn shown(data: &mut test_store::TestStoreData, page: u64) -> (Buffer, crate::ViewId) {
@@ -1915,6 +2011,7 @@ mod component_host {
                 id: BlobId::new(9),
                 shared: Arc::new(BlobShared::new(
                     BlobId::new(9),
+                    4096,
                     Arc::new(crate::exec::Notify::new()),
                 )),
                 backing: Some(backing),
@@ -2084,4 +2181,170 @@ mod component_host {
         contract::HostGpu::drop(&mut data, second).expect("the drop is answered");
         assert!(!data.device.gpu().is_open(), "the last handle ends it");
     }
+}
+
+#[test]
+fn waiting_for_a_retired_fence_does_not_need_a_new_event() {
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let ownership = opened(&shared);
+    let sender = sender(&ownership);
+    let context = ContextShared::new(ContextId::new(1), RingCount::new(2).unwrap());
+    let timeline = context.timeline(RingIndex::new(0).unwrap()).unwrap();
+    timeline.record_submitted(FenceId::new(5));
+    timeline.retire(5, 0);
+    assert_eq!(block_on(sender.wait(&context, 0, 3)), Ok(()));
+    assert_eq!(block_on(sender.wait(&context, 0, 0)), Ok(()));
+    assert_eq!(
+        block_on(sender.wait(&context, 0, 6)),
+        Err(Gpu3dServiceError::UnsubmittedFence)
+    );
+    assert_eq!(
+        block_on(sender.wait(&context, 1, 5)),
+        Err(Gpu3dServiceError::UnsubmittedFence)
+    );
+    assert_eq!(
+        block_on(sender.wait(&context, 2, 0)),
+        Err(Gpu3dServiceError::BadRing)
+    );
+}
+
+struct FenceWake(AtomicUsize);
+
+impl Wake for FenceWake {
+    fn wake(self: WakeArc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn a_fence_wait_is_woken_by_retirement_and_not_completed_by_an_earlier_point() {
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let ownership = opened(&shared);
+    let sender = sender(&ownership);
+    let context = ContextShared::new(ContextId::new(1), RingCount::new(1).unwrap());
+    let timeline = context.timeline(RingIndex::new(0).unwrap()).unwrap();
+    timeline.record_submitted(FenceId::new(5));
+    let wakes = WakeArc::new(FenceWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut wait = pin!(sender.wait(&context, 0, 5));
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    timeline.retire(3, 0);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    wakes.0.store(0, Ordering::Relaxed);
+    timeline.retire(5, 0);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+}
+
+#[test]
+fn ending_a_session_wakes_a_fence_wait_whose_submission_never_retired() {
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let ownership = opened(&shared);
+    let sender = sender(&ownership);
+    let context = ContextShared::new(ContextId::new(1), RingCount::new(1).unwrap());
+    context
+        .timeline(RingIndex::new(0).unwrap())
+        .unwrap()
+        .record_submitted(FenceId::new(1));
+    let wakes = WakeArc::new(FenceWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut wait = pin!(sender.wait(&context, 0, 1));
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    drop(ownership);
+    assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        wait.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Gpu3dServiceError::SessionEnded))
+    );
+}
+
+#[test]
+fn faulting_a_context_does_not_report_its_retired_fences_as_successful() {
+    let (shared, _control, _submit) = gpu3d_channels(true);
+    let ownership = opened(&shared);
+    let sender = sender(&ownership);
+    let context = ContextShared::new(ContextId::new(1), RingCount::new(1).unwrap());
+    context
+        .timeline(RingIndex::new(0).unwrap())
+        .unwrap()
+        .record_submitted(FenceId::new(1));
+    block_on(async {
+        let mut wait = pin!(sender.wait(&context, 0, 1));
+        assert!(poll_once(wait.as_mut()).await.is_none());
+        context.fault(0);
+        assert_eq!(wait.await, Err(Gpu3dServiceError::DeviceFault));
+        assert_eq!(
+            sender.wait(&context, 0, 1).await,
+            Err(Gpu3dServiceError::DeviceFault)
+        );
+    });
+}
+
+#[test]
+fn a_submission_keeps_its_signal_source_alive_until_retirement() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let source = TimelineSource::new(0);
+        let reader = source.reader();
+        let (release, hold) = oneshot::channel();
+        *device.submit_hold.lock().unwrap() = Some(hold);
+        let answer = queue_submit_with_signals(
+            &sender(&ownership),
+            &context.shared,
+            0,
+            Some(1),
+            page_commands(),
+            alloc::vec![CompletionSignal {
+                source: source.clone(),
+                value: 7
+            }],
+        )
+        .unwrap();
+        drop(source);
+        assert_eq!(answer.await, Ok(Ok(())));
+        let mut wait = pin!(reader.wait(7));
+        assert!(poll_once(wait.as_mut()).await.is_none());
+        assert_eq!(reader.value(), Ok(0));
+        release.send(()).unwrap();
+        assert_eq!(wait.await, Ok(()));
+        assert_eq!(reader.wait(8).await, Err(TimelineError::Closed));
+    });
+}
+
+#[test]
+fn a_context_fault_fails_signals_while_an_earlier_submission_is_still_pending() {
+    test_hooks::install();
+    let (shared, control, submit) = gpu3d_channels(true);
+    let device = FakeGpu3d::new();
+    let ownership = opened(&shared);
+    with_servers(&device, &shared, &control, &submit, async {
+        let context = create_context(&ownership).await;
+        let source = TimelineSource::new(0);
+        let reader = source.reader();
+        let (release, hold) = oneshot::channel();
+        *device.submit_hold.lock().unwrap() = Some(hold);
+        let answer = queue_submit_with_signals(
+            &sender(&ownership),
+            &context.shared,
+            0,
+            Some(1),
+            page_commands(),
+            alloc::vec![CompletionSignal { source, value: 1 }],
+        )
+        .unwrap();
+        assert_eq!(answer.await, Ok(Ok(())));
+        *device.refuse_context.lock().unwrap() = Some(context.shared.id());
+        assert_eq!(submit_on(&ownership, &context, 0, Some(2)).await, Ok(()));
+        assert_eq!(reader.wait(1).await, Err(TimelineError::Failed));
+        release.send(()).unwrap();
+        settle().await;
+        assert_eq!(reader.value(), Err(TimelineError::Failed));
+    });
 }

@@ -175,6 +175,16 @@ enum PrebuildError {
 /// Why one wasm program could not be built into an artifact.
 #[derive(Debug, thiserror::Error)]
 enum WasmBuildError {
+    #[error("failed to parse wasm build settings in {path}: {source}")]
+    ManifestSettings {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error(transparent)]
+    VenusInputs(#[from] venus_fetch::VenusFetchError),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceRootError),
     #[error("crate manifest {path} is missing")]
     ManifestMissing { path: String },
     #[error("failed to invoke cargo for {path}: {source}")]
@@ -208,6 +218,29 @@ enum WasmBuildError {
     LoadCoreModule { path: String, report: String },
     #[error("failed to encode component {path}: {report}")]
     EncodeComponent { path: String, report: String },
+    /// wac-types reports through `anyhow`; its chain travels as text.
+    #[error("failed to load {name} into the composition graph: {report}")]
+    LoadComposed { name: String, report: String },
+    #[error("failed to register {name} in the composition graph: {source}")]
+    RegisterComposed {
+        name: String,
+        #[source]
+        source: wac_graph::RegisterPackageError,
+    },
+    /// `PlugError` carries an `anyhow` source, so the rendered chain is
+    /// kept beside the variant.
+    #[error("failed to plug {plugs} into {command}: {report}")]
+    Plug {
+        command: String,
+        plugs: String,
+        report: String,
+    },
+    #[error("failed to encode the composition of {command}: {source}")]
+    EncodeComposition {
+        command: String,
+        #[source]
+        source: wac_graph::EncodeError,
+    },
     #[error("failed to run `rustc {query}`: {source}")]
     SpawnRustc {
         query: &'static str,
@@ -256,6 +289,13 @@ enum BootProgramError {
     EmptyEnvSelection,
     #[error("HELIOS_BOOT_PROGRAMS referenced unknown program(s): {missing}")]
     UnknownPrograms { missing: String },
+    #[error(
+        "program {command} plugs {plug}, which is no library component under programs/ \
+         (package.metadata.helios.library)"
+    )]
+    UnknownPlug { command: String, plug: String },
+    #[error("a library component cannot plug others: {command} names {plugs}")]
+    LibraryPlugs { command: String, plugs: String },
     #[error("failed to read {path}: {source}")]
     ReadProgramsRoot {
         path: String,
@@ -1027,6 +1067,21 @@ struct ProgramManifest {
     command: String,
     manifest_path: PathBuf,
     artifact_name: String,
+    role: ProgramRole,
+}
+
+/// What `package.metadata.helios` says a directory under `programs/` is.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ProgramRole {
+    /// A library component: it is plugged into the programs that import
+    /// what it exports and is never installed as a command.
+    #[serde(default)]
+    library: bool,
+    /// The library components, by directory name, whose exports satisfy
+    /// this program's imports.
+    #[serde(default)]
+    plugs: Vec<String>,
 }
 
 /// Every command's failure is a typed error whose message names what was
@@ -1785,22 +1840,29 @@ fn build_boot_program_assets(
     let programs_root = build.workspace_root.join(Path::new("programs"));
     let mut available_programs = BTreeSet::new();
     let mut manifests = Vec::new();
+    let mut libraries = BTreeMap::new();
     let mut external_artifacts = read_external_boot_artifacts(boot_artifacts_manifest)?;
 
     for (command, path) in program_dirs(&programs_root)? {
-        available_programs.insert(command.clone());
         // Init is built once, as the payload's init component; the
         // prebuild publishes that same artifact at `bin/init`.
         if command == INIT_COMMAND {
+            available_programs.insert(command);
             continue;
         }
+        let manifest = read_program_manifest(&command, &path.join("Cargo.toml"))?;
+        if manifest.role.library {
+            libraries.insert(command, manifest);
+            continue;
+        }
+        available_programs.insert(command.clone());
         if selected_programs
             .as_ref()
             .is_some_and(|selected| !selected.contains(&command))
         {
             continue;
         }
-        manifests.push(read_program_manifest(&command, &path.join("Cargo.toml"))?);
+        manifests.push(manifest);
     }
     for artifact in &external_artifacts {
         if !available_programs.insert(artifact.command.clone()) {
@@ -1840,7 +1902,7 @@ fn build_boot_program_assets(
     external_artifacts.sort_by(|left, right| left.command.cmp(&right.command));
     let mut assets = manifests
         .into_iter()
-        .map(|manifest| build_boot_program_asset(build, manifest))
+        .map(|manifest| build_boot_program_asset(build, manifest, &libraries))
         .collect::<Result<Vec<_>, BootfsError>>()?;
     for artifact in external_artifacts {
         assets.extend(build_external_boot_artifact_assets(build, artifact)?);
@@ -1903,13 +1965,22 @@ fn run_wasm_build(
     // worker; every target directory's programs follow.
     let mut programs = program_dirs(&workspace_root.join(Path::new("programs")))?;
     programs.sort();
-    let mut groups = BTreeMap::<&'static str, Vec<(usize, ProgramManifest)>>::new();
+    let mut groups = BTreeMap::<String, Vec<(usize, ProgramManifest)>>::new();
+    let mut venus_protocol = false;
     for (index, (command_name, path)) in programs.into_iter().enumerate() {
         let manifest = read_program_manifest(&command_name, &path.join("Cargo.toml"))?;
+        let requirements = read_wasm_requirements(&manifest.manifest_path)?;
+        venus_protocol |= requirements.venus_protocol;
         groups
-            .entry(component_target_dir(&manifest.manifest_path))
+            .entry(component_target_dir(&requirements))
             .or_default()
             .push((index + 1, manifest));
+    }
+    // Fetched once before the groups start, so that groups building at the
+    // same time only ever find the pinned files in place and never write
+    // the cache directory together.
+    if venus_protocol {
+        venus_fetch::run(workspace_root.path()).map_err(WasmBuildError::from)?;
     }
     let jobs = std::iter::once(WasmJob::CompilerPlugin)
         .chain(groups.into_values().map(WasmJob::Programs))
@@ -2182,11 +2253,32 @@ impl ExternalBootArtifact {
 fn build_boot_program_asset(
     build: &BootBuild<'_>,
     manifest: ProgramManifest,
+    libraries: &BTreeMap<String, ProgramManifest>,
 ) -> Result<BootAsset, BootfsError> {
     let wasm_path = build
         .wasm
         .component(&manifest.manifest_path, &manifest.artifact_name)?;
-    let component_bytes = encode_component(&wasm_path)?;
+    let mut component_bytes = encode_component(&wasm_path)?;
+    if !manifest.role.plugs.is_empty() {
+        let plugs = manifest
+            .role
+            .plugs
+            .iter()
+            .map(|plug| {
+                let library = libraries
+                    .get(plug)
+                    .ok_or_else(|| BootProgramError::UnknownPlug {
+                        command: manifest.command.clone(),
+                        plug: plug.clone(),
+                    })?;
+                let path = build
+                    .wasm
+                    .component(&library.manifest_path, &library.artifact_name)?;
+                Ok((plug.clone(), encode_component(&path)?))
+            })
+            .collect::<Result<Vec<_>, BootfsError>>()?;
+        component_bytes = compose(&manifest.command, component_bytes, plugs)?;
+    }
     let payload = precompile(
         build.precompile,
         &component_bytes,
@@ -2337,11 +2429,90 @@ fn read_program_manifest(
         .ok_or_else(|| BootProgramError::ManifestHasNoName {
             path: manifest_path.display().to_string(),
         })?;
+    let role = manifest
+        .get("package")
+        .and_then(|package| package.get("metadata"))
+        .and_then(|metadata| metadata.get("helios"))
+        .cloned()
+        .map(Value::try_into::<ProgramRole>)
+        .transpose()
+        .map_err(|source| BootProgramError::ParseManifest {
+            path: manifest_path.display().to_string(),
+            source,
+        })?
+        .unwrap_or_default();
+    if role.library && !role.plugs.is_empty() {
+        return Err(BootProgramError::LibraryPlugs {
+            command: command.to_owned(),
+            plugs: role.plugs.join(", "),
+        });
+    }
     Ok(ProgramManifest {
         command: command.to_owned(),
         manifest_path: manifest_path.to_path_buf(),
         artifact_name: format!("{artifact_stem}.wasm"),
+        role,
     })
+}
+
+/// Plugs each library's exports into the imports of `command`'s component
+/// that they satisfy; what the libraries import stays imported by the
+/// result, beside the program's own imports.
+fn compose(
+    command: &str,
+    socket: Vec<u8>,
+    plugs: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<u8>, WasmBuildError> {
+    let mut graph = wac_graph::CompositionGraph::new();
+    let mut register = |name: &str, bytes: Vec<u8>| {
+        // A package name in the graph is a `namespace:name` pair.
+        let package_name = format!("helios:{name}");
+        let package =
+            wac_graph::types::Package::from_bytes(&package_name, None, bytes, graph.types_mut())
+                .map_err(|error| WasmBuildError::LoadComposed {
+                    name: name.to_owned(),
+                    report: format!("{error:#}"),
+                })?;
+        graph
+            .register_package(package)
+            .map_err(|source| WasmBuildError::RegisterComposed {
+                name: name.to_owned(),
+                source,
+            })
+    };
+    let socket = register(command, socket)?;
+    let plug_names = plugs
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plugs = plugs
+        .into_iter()
+        .map(|(name, bytes)| register(&name, bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    wac_graph::plug(&mut graph, plugs, socket).map_err(|error| WasmBuildError::Plug {
+        command: command.to_owned(),
+        plugs: plug_names,
+        report: error_chain(&error),
+    })?;
+    graph
+        .encode(wac_graph::EncodeOptions::default())
+        .map_err(|source| WasmBuildError::EncodeComposition {
+            command: command.to_owned(),
+            source,
+        })
+}
+
+/// An error and every source under it, outermost first.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut report = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        report.push_str(": ");
+        report.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    report
 }
 
 /// The target directory every `wasm32-wasip2` component program builds
@@ -2354,23 +2525,84 @@ const COMPONENT_PROGRAMS_TARGET_DIR: &str = "component-programs-target";
 /// The target the component programs build for.
 const COMPONENT_TRIPLE: &str = "wasm32-wasip2";
 
-/// The target directory, by name, the component program with this manifest
-/// builds into.
+/// The target directory, by name, a component program with these
+/// requirements builds into.
 ///
 /// Programs that name the same directory build one after another, because
 /// cargo locks a target directory; programs that name different ones build
-/// at the same time. Today every program shares one directory. A program
-/// whose wasm flags differ from the others' names its own here, and
-/// nothing else changes.
-fn component_target_dir(_manifest_path: &Path) -> &'static str {
-    COMPONENT_PROGRAMS_TARGET_DIR
+/// at the same time. Programs with extra target features compile every
+/// crate, std included, with other flags, so they get a directory of their
+/// own rather than invalidating the shared one on every switch.
+fn component_target_dir(requirements: &WasmRequirements) -> String {
+    if requirements.target_features.is_empty() {
+        COMPONENT_PROGRAMS_TARGET_DIR.to_owned()
+    } else {
+        format!(
+            "{COMPONENT_PROGRAMS_TARGET_DIR}-{}",
+            requirements.target_features.join("-")
+        )
+    }
+}
+
+/// What `package.metadata.helios` asks of the wasm build of the crate at
+/// `manifest_path`.
+fn read_wasm_requirements(manifest_path: &Path) -> Result<WasmRequirements, WasmBuildError> {
+    if !manifest_path.is_file() {
+        return Err(WasmBuildError::ManifestMissing {
+            path: manifest_path.display().to_string(),
+        });
+    }
+    let manifest_text =
+        fs::read_to_string(manifest_path).map_err(|source| WasmBuildError::Read {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    let settings: WasmBuildSettings =
+        toml::from_str(&manifest_text).map_err(|source| WasmBuildError::ManifestSettings {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    Ok(settings.package.metadata.helios)
+}
+
+#[derive(Default, Deserialize)]
+struct WasmBuildSettings {
+    #[serde(default)]
+    package: WasmPackageSettings,
+}
+
+#[derive(Default, Deserialize)]
+struct WasmPackageSettings {
+    #[serde(default)]
+    metadata: WasmMetadata,
+}
+
+#[derive(Default, Deserialize)]
+struct WasmMetadata {
+    #[serde(default)]
+    helios: WasmRequirements,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct WasmRequirements {
+    #[serde(default)]
+    venus_protocol: bool,
+    #[serde(default)]
+    target_features: Vec<String>,
 }
 
 /// The environment variables a guest build sets, in a fixed order.
 ///
 /// They decide what the build produces, so they are also part of its
-/// cache key.
-fn build_environment(profile: &str, target_triple: &str) -> Vec<(&'static str, String)> {
+/// cache key. The target features are among them, in the rustflags, and
+/// they alone decide whether std is rebuilt with them, so the key covers
+/// that too.
+fn build_environment(
+    profile: &str,
+    target_triple: &str,
+    requirements: &WasmRequirements,
+) -> Vec<(&'static str, String)> {
     let mut environment = Vec::new();
     if profile == "release" {
         if target_triple == COMPILER_PLUGIN_TRIPLE {
@@ -2383,7 +2615,12 @@ fn build_environment(profile: &str, target_triple: &str) -> Vec<(&'static str, S
         environment.push(("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1".to_owned()));
         environment.push(("CARGO_PROFILE_DEV_PANIC", "abort".to_owned()));
     }
-    environment.push(("RUSTFLAGS", wasm_rustflags(target_triple)));
+    // The flags carry link arguments with spaces in them, so they go as
+    // the separator-joined list cargo reads verbatim.
+    environment.push((
+        "CARGO_ENCODED_RUSTFLAGS",
+        wasm_rustflags(target_triple, &requirements.target_features).join("\x1f"),
+    ));
     environment
 }
 
@@ -2395,23 +2632,28 @@ impl WasmBuilder<'_> {
         manifest_path: &Path,
         artifact_name: &str,
     ) -> Result<PathBuf, WasmBuildError> {
+        let requirements = read_wasm_requirements(manifest_path)?;
         self.build(
             manifest_path,
-            component_target_dir(manifest_path),
+            &component_target_dir(&requirements),
             COMPONENT_TRIPLE,
             artifact_name,
+            &requirements,
         )
     }
 
     /// The in-kernel compiler's `wasm32-wasip1-threads` module.
     fn compiler_plugin(&self) -> Result<PathBuf, WasmBuildError> {
+        let manifest_path = self
+            .workspace_root
+            .join(Path::new(COMPILER_PLUGIN_MANIFEST));
+        let requirements = read_wasm_requirements(&manifest_path)?;
         self.build(
-            &self
-                .workspace_root
-                .join(Path::new(COMPILER_PLUGIN_MANIFEST)),
+            &manifest_path,
             COMPILER_PLUGIN_TARGET_DIR,
             COMPILER_PLUGIN_TRIPLE,
             COMPILER_PLUGIN_WASM,
+            &requirements,
         )
     }
 
@@ -2425,18 +2667,14 @@ impl WasmBuilder<'_> {
         target_dir_name: &str,
         target_triple: &str,
         artifact_name: &str,
+        requirements: &WasmRequirements,
     ) -> Result<PathBuf, WasmBuildError> {
-        if !manifest_path.is_file() {
-            return Err(WasmBuildError::ManifestMissing {
-                path: manifest_path.display().to_string(),
-            });
-        }
         let target_dir = self.out_dir.join(target_dir_name);
         let artifact = target_dir
             .join(target_triple)
             .join(profile_dir_name(self.profile))
             .join(artifact_name);
-        let environment = build_environment(self.profile, target_triple);
+        let environment = build_environment(self.profile, target_triple, requirements);
         let cache = match self.cache {
             Some(cache) => Some((
                 cache,
@@ -2464,7 +2702,18 @@ impl WasmBuilder<'_> {
             return resolve();
         }
 
+        // The protocol inputs are pinned by a file in `venus/`, which the
+        // cache key's package closure covers; they are fetched only for a
+        // build that will read them.
+        if requirements.venus_protocol {
+            venus_fetch::run(self.workspace_root.path())?;
+        }
         let mut command = Command::new(self.cargo);
+        if !requirements.target_features.is_empty() {
+            // Wasm atomics change TLS relocations. Every Rust object,
+            // including std, must use the same target features.
+            command.arg("-Zbuild-std=std,panic_abort");
+        }
         command
             .arg("build")
             .arg("--manifest-path")
@@ -2477,7 +2726,7 @@ impl WasmBuilder<'_> {
             command.arg("--release");
         }
         command.envs(environment);
-        command.env_remove("CARGO_ENCODED_RUSTFLAGS");
+        command.env_remove("RUSTFLAGS");
         // C code a program links (ring's, for one) is archived by `cc`, which
         // falls back to the host's `ar` for a wasm target; that archive carries
         // no symbol index wasm-ld can read, and the link then misses every C
@@ -2613,13 +2862,31 @@ fn rustc_print(query: &'static str) -> Result<String, WasmBuildError> {
         .to_owned())
 }
 
-fn wasm_rustflags(target_triple: &str) -> String {
-    match target_triple {
-        "wasm32-wasip1-threads" => format!(
-            "-C debuginfo=0 -C strip=symbols -C link-arg=--no-entry -C link-arg=--export=__tls_base -C link-arg=--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"
-        ),
-        _ => "-C debuginfo=0 -C strip=debuginfo".to_owned(),
+fn wasm_rustflags(target_triple: &str, features: &[String]) -> Vec<String> {
+    let mut flags = vec!["-C".to_owned(), "debuginfo=0".to_owned(), "-C".to_owned()];
+    if target_triple == "wasm32-wasip1-threads" {
+        flags.push("strip=symbols".to_owned());
+        for argument in [
+            "--no-entry".to_owned(),
+            "--export=__tls_base".to_owned(),
+            format!("--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"),
+        ] {
+            flags.extend(["-C".to_owned(), format!("link-arg={argument}")]);
+        }
+    } else {
+        flags.push("strip=debuginfo".to_owned());
     }
+    if !features.is_empty() {
+        let features: Vec<_> = features
+            .iter()
+            .map(|feature| format!("+{feature}"))
+            .collect();
+        flags.extend([
+            "-C".to_owned(),
+            format!("target-feature={}", features.join(",")),
+        ]);
+    }
+    flags
 }
 
 /// Encodes one core module as a component, or passes a component through.
@@ -3177,6 +3444,38 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn gpu_test_requests_protocol_inputs_and_ordinary_programs_do_not() {
+        let gpu: WasmBuildSettings =
+            toml::from_str(include_str!("../../programs/gpu-test/Cargo.toml")).unwrap();
+        assert!(gpu.package.metadata.helios.venus_protocol);
+        assert_eq!(gpu.package.metadata.helios.target_features, ["atomics"]);
+        let init: WasmBuildSettings =
+            toml::from_str(include_str!("../../programs/init/Cargo.toml")).unwrap();
+        assert!(!init.package.metadata.helios.venus_protocol);
+        assert!(init.package.metadata.helios.target_features.is_empty());
+    }
+
+    #[test]
+    fn wasm_target_features_are_explicit_and_do_not_replace_threaded_link_arguments() {
+        let ordinary = wasm_rustflags("wasm32-wasip2", &[]);
+        assert!(
+            !ordinary
+                .iter()
+                .any(|flag| flag.starts_with("target-feature="))
+        );
+        let gpu = wasm_rustflags("wasm32-wasip2", &["atomics".to_owned()]);
+        assert!(gpu.iter().any(|flag| flag == "target-feature=+atomics"));
+        let threaded = wasm_rustflags("wasm32-wasip1-threads", &[]);
+        assert!(
+            threaded
+                .iter()
+                .any(|flag| flag == "link-arg=--export=__tls_base")
+        );
+        assert!(threaded.iter().any(|flag| flag
+            == &format!("link-arg=--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}")));
+    }
 
     #[test]
     fn a_prebuilt_tree_is_read_from_its_profile_directory() {
