@@ -34,7 +34,7 @@ pub(crate) struct CloneRange {
     pub(crate) length: u64,
 }
 
-impl<S: BlockSink> Transaction<'_, S> {
+impl<S: BlockSink> Transaction<S> {
     pub(crate) async fn clone_range(
         &mut self,
         request: CloneRange,
