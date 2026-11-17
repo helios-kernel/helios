@@ -43,6 +43,7 @@ mod disk;
 mod input;
 mod instruction_profile;
 mod kernel_image;
+mod kill;
 mod network;
 mod numa;
 mod qemu;
@@ -56,6 +57,7 @@ mod x86_image_audit;
 
 use disk::{DiskSpecError, VmDiskSpec, validate_disks};
 use input::{InputScript, InputScriptError, InputStatement};
+use kill::KillAfterLines;
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
     VmNetworkError, VmNetworkFile, VmNetworkProfile, VmNetworkSetupError,
@@ -1912,6 +1914,16 @@ pub(crate) struct VmCommand {
     #[arg(long = "enable-target", value_name = "TARGET")]
     enable_targets: Vec<String>,
 
+    /// SIGKILL QEMU once `FILE` holds `COUNT` complete lines.
+    ///
+    /// `FILE` is a file the guest appends a line to after each unit of
+    /// work it finished, normally on a writable `--shared-dir`. The guest
+    /// is ended with no shutdown, so what its disks hold is what a crash
+    /// at that point leaves; the session then fails with the lost
+    /// connection.
+    #[arg(long, value_name = "FILE:COUNT")]
+    kill_after_lines: Option<KillAfterLines>,
+
     /// Extra Cargo feature for the kernel image. Repeat to select several.
     #[arg(long = "kernel-feature")]
     kernel_features: Vec<String>,
@@ -2379,6 +2391,7 @@ struct ResolvedVmCommand {
     qemu_trace_log: Option<PathBuf>,
     qemu_arg: Vec<String>,
     enable_targets: Vec<String>,
+    kill_after_lines: Option<KillAfterLines>,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
     acpi: bool,
@@ -2526,7 +2539,12 @@ pub(crate) fn run(mut command: VmCommand) -> Result<(), VmError> {
         build_vm(&command.build)?;
     }
     let mut runtime = VmRuntime::spawn(&command)?;
+    let kill_watch = command
+        .kill_after_lines
+        .as_ref()
+        .map(|kill| kill.watch(runtime.child.id()));
     let result = connect_and_run(&command, &mut runtime);
+    drop(kill_watch);
     let runtime_dir = runtime.runtime_dir_path().display().to_string();
     // QEMU's own log is the only account of a machine it refused to
     // build or a device backend that never started, and the runtime
@@ -3077,6 +3095,7 @@ fn resolve(mut command: VmCommand) -> Result<ResolvedVmCommand, VmConfigError> {
         qemu_trace_log,
         qemu_arg,
         enable_targets,
+        kill_after_lines: command.kill_after_lines,
         runtime_dir,
         keep_runtime_dir,
         acpi,
@@ -8574,6 +8593,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
@@ -8646,6 +8666,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
@@ -9327,6 +9348,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             kernel_features: Vec::new(),
             boot_programs: Vec::new(),
             no_compiler_plugin: false,
@@ -9374,39 +9396,6 @@ mod tests {
             })?;
         }
         Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires QEMU and a cross-compiled native-users kernel"]
-    fn native_linux_syscalls_x86() -> Result<(), GuestTestFailure> {
-        let root = repo_root()?;
-        let bootfs = root.join("target/native-linux-bootfs");
-        run_step(
-            "building Linux ABI fixtures",
-            Command::new("bash")
-                .current_dir(&root)
-                .arg("linux/tests/build-fixtures.sh")
-                .arg(&bootfs),
-        )?;
-        let mut command = guest_test_command(&X86_64_VM_PROFILE);
-        command.accel =
-            vec![std::env::var("HELIOS_NATIVE_TEST_ACCEL").unwrap_or_else(|_| "kvm".to_owned())];
-        command.cpu = default_cpu(command.profile, &command.accel).map(str::to_owned);
-        command.build.kernel_features = vec!["linux-prototype".to_owned()];
-        command.build.bootfs_root = Some(bootfs);
-        command.runtime_dir = Some(root.join("target/native-linux-runtime"));
-        command.keep_runtime_dir = true;
-        command.debug_serial_log = Some(root.join("target/native-linux-serial.log"));
-        build_self_test_kernel(&command, &[])?;
-        let mut runtime = VmRuntime::spawn(&command)?;
-        let marker = b"native Linux prototype passed:";
-        let result = wait_for_console_matches(
-            runtime.socket_path(),
-            |line| line.windows(marker.len()).any(|window| window == marker),
-            1,
-        );
-        runtime.shutdown();
-        result
     }
 
     /// The aarch64 kernel built with `HELIOS_CFI_SELF_TEST` corrupts a signed
@@ -9559,6 +9548,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,
@@ -9779,6 +9769,7 @@ mod tests {
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
             enable_targets: Vec::new(),
+            kill_after_lines: None,
             runtime_dir: None,
             keep_runtime_dir: false,
             acpi: false,

@@ -81,7 +81,7 @@
     "command": "just test-libraries && just test-btrfs-mkfs",
     "helios-cli": "debug",
     "rust-cache": true,
-    "surfaces": ["x86", "host_tools", "programs"]
+    "surfaces": ["x86", "host_tools", "programs", "btrfs"]
   },
   "test-host-tools": {
     "guest-wasm": "debug",
@@ -125,6 +125,13 @@
     "surfaces": [
       "btrfs",
       "pin"
+    ],
+    "exclusive": true
+  },
+  "test-btrfs-fstests": {
+    "heavy": true,
+    "surfaces": [
+      "btrfs"
     ],
     "exclusive": true
   },

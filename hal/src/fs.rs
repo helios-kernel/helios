@@ -138,18 +138,87 @@ pub enum FsError {
     NameTooLong,
     #[error("operation not supported by this filesystem")]
     Unsupported,
+    /// The filesystem has no free space for what the operation needs.
+    #[error("no space left on device")]
+    NoSpace,
     #[error("input/output error")]
     Io,
 }
 
 pub type FsResult<T> = Result<T, FsError>;
 
+/// How a rename treats a name that already exists at its destination.
+///
+/// The three modes are the combinations Linux's `renameat2` accepts:
+/// `RENAME_NOREPLACE` and `RENAME_EXCHANGE` together are `EINVAL` there, and
+/// here they cannot be written down. `RENAME_WHITEOUT` needs a device node
+/// the contract has no way to create, so a caller refuses it before any
+/// filesystem is asked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RenameMode {
+    /// A name at the destination is replaced by the source: `rename(2)`.
+    #[default]
+    Replace,
+    /// A name at the destination fails the rename with
+    /// [`FsError::Exists`]: `RENAME_NOREPLACE`.
+    NoReplace,
+    /// Source and destination swap places and both must exist, otherwise
+    /// [`FsError::NoEntry`]. Either may be a directory, and a directory
+    /// that is an ancestor of the other name is [`FsError::Invalid`]:
+    /// `RENAME_EXCHANGE`.
+    Exchange,
+}
+
 /// What kind of object a path names.
+///
+/// [`CharacterDevice`](Self::CharacterDevice),
+/// [`BlockDevice`](Self::BlockDevice), [`Fifo`](Self::Fifo) and
+/// [`Socket`](Self::Socket) are report-only: a filesystem names them in
+/// `stat` and directory listings so that a tree holding one stays
+/// readable, and the kernel never opens, creates or reads through them.
+/// Opening a device is refused with [`FsError::NotPermitted`], because
+/// hardware is reached only through device grants; opening a FIFO or a
+/// socket is refused with [`FsError::Unsupported`]. Operations that touch
+/// only the directory entry (unlink, rename, stat) work on them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     Directory,
     File,
     Symlink,
+    CharacterDevice,
+    BlockDevice,
+    Fifo,
+    Socket,
+}
+
+impl NodeKind {
+    /// Succeeds for a regular file and otherwise says why its bytes cannot
+    /// be read or written: a directory is `IsDirectory`, a symbolic link
+    /// `Invalid`, and the report-only kinds fail as
+    /// [`open_refusal`](Self::open_refusal) says.
+    pub const fn require_regular(self) -> FsResult<()> {
+        match self {
+            NodeKind::File => Ok(()),
+            NodeKind::Directory => Err(FsError::IsDirectory),
+            NodeKind::Symlink => Err(FsError::Invalid),
+            NodeKind::CharacterDevice | NodeKind::BlockDevice => Err(FsError::NotPermitted),
+            NodeKind::Fifo | NodeKind::Socket => Err(FsError::Unsupported),
+        }
+    }
+
+    /// Why the kernel never opens an object of this kind, or `None` for
+    /// the kinds a filesystem's `open` answers (files, directories and
+    /// symbolic links, which resolution follows before a filesystem
+    /// opens anything).
+    ///
+    /// Devices are `NotPermitted` and FIFOs and sockets `Unsupported`.
+    pub const fn open_refusal(self) -> Option<FsError> {
+        match self {
+            NodeKind::File | NodeKind::Directory | NodeKind::Symlink => None,
+            NodeKind::CharacterDevice | NodeKind::BlockDevice => Some(FsError::NotPermitted),
+            NodeKind::Fifo | NodeKind::Socket => Some(FsError::Unsupported),
+        }
+    }
 }
 
 /// Names one filesystem instance: what `st_dev` reports.
@@ -232,8 +301,32 @@ pub enum WriteProgress<W> {
     /// The round landed and bytes remain: the next round, staged and
     /// waiting for its own submit.
     More(W),
-    /// Every byte landed; the write began at this offset.
-    Done(u64),
+    /// The write is over: [`Landed`] says where it began and how much of
+    /// it is stored.
+    Done(Landed),
+}
+
+/// Where a finished write began and how many of its bytes landed.
+///
+/// `len` is the prepared length, except when the filesystem ran out of
+/// space after storing a prefix: then `len` is that prefix, nonzero and
+/// shorter than the prepared length, as a POSIX short write. A write that
+/// stores no byte at all fails with [`FsError::NoSpace`] instead, so a
+/// `Landed` with `len == 0` exists only for a prepared length of zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landed {
+    /// The offset the write began at.
+    pub offset: u64,
+    /// The bytes stored, from `offset` on.
+    pub len: usize,
+}
+
+impl Landed {
+    /// The offset just past the stored bytes: where a sequential writer
+    /// continues. `None` when it does not fit a `u64`.
+    pub fn end(self) -> Option<u64> {
+        self.offset.checked_add(self.len as u64)
+    }
 }
 
 /// A write [`FileSystem::prepare_write`] staged.
@@ -246,6 +339,13 @@ pub enum WriteProgress<W> {
 /// never by the write's length, so a write larger than that lands in
 /// several rounds over one prepare. The rounds' lengths sum to the
 /// prepared length, and the rounds land in order at consecutive offsets.
+///
+/// A write that runs out of space ends early: when a round stores only a
+/// prefix of what it staged, the submit resolves with
+/// [`WriteProgress::Done`] carrying the bytes stored so far, and no later
+/// round runs. Only running out of space after at least one byte ends a
+/// write short; when no byte is stored the submit fails with
+/// [`FsError::NoSpace`], and any other failure is its own error.
 ///
 /// Dropping a prepared write before filling releases what it staged
 /// and leaves the file as it was: the bytes of earlier rounds have
@@ -321,9 +421,10 @@ impl FilledWrite for core::convert::Infallible {
     }
 }
 
-/// Writes `len` bytes at `position` and resolves with the offset they
-/// landed at, staging them through [`FileSystem::prepare_write`] and
-/// landing every round.
+/// Writes `len` bytes at `position` and resolves with where they landed
+/// and how many did (fewer than `len` only after running out of space,
+/// see [`Landed`]), staging them through [`FileSystem::prepare_write`]
+/// and landing every round.
 ///
 /// `source` copies the bytes of the write that start at its first
 /// argument into its second, straight into the filesystem's destination,
@@ -337,7 +438,7 @@ pub async fn write_with<F, S>(
     len: usize,
     now: u64,
     mut source: S,
-) -> FsResult<u64>
+) -> FsResult<Landed>
 where
     F: FileSystem,
     S: FnMut(usize, &mut [u8]),
@@ -539,16 +640,29 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     fn remove_directory<'a>(
         &'a self,
         path: FsPath<'a>,
+        now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
     /// Removes a non-directory name.
-    fn unlink<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
+    fn unlink<'a>(
+        &'a self,
+        path: FsPath<'a>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    /// Moves `source` to `destination` within this filesystem.
+    /// Moves `source` to `destination` within this filesystem, treating a
+    /// name already at `destination` as `mode` says. The whole change is
+    /// atomic: no reader sees `source` gone and `destination` not yet
+    /// there, or one name of an exchange moved and not the other.
+    ///
+    /// A filesystem that cannot honour a `mode` other than
+    /// [`RenameMode::Replace`] answers [`FsError::Unsupported`] without
+    /// changing anything.
     fn rename<'a>(
         &'a self,
         source: FsPath<'a>,
         destination: FsPath<'a>,
+        mode: RenameMode,
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 

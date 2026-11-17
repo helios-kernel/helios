@@ -52,6 +52,10 @@ mod wasix_net;
 use wasix_net::*;
 mod wasix_epoll;
 use wasix_epoll::*;
+#[cfg(feature = "linux")]
+mod linux;
+#[cfg(feature = "linux")]
+use linux::*;
 
 use super::*;
 use crate::isa::GuestIsa;
@@ -71,7 +75,7 @@ use crate::wasmtime_adapter::{
 use crate::{
     BootfsBytes, ComponentStdioRefusal, ProgramExecErrorDetail, RuntimeMessage, UnbindableStdio,
 };
-use crate::{FileContents, MemoryFs, Namespace};
+use crate::{FileContents, FsDescriptorFlags, MemoryFs, Namespace};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -92,6 +96,7 @@ use helios_compiler_abi::{
 use helios_hal::fs::WritePosition;
 use helios_hal::measured_boot::{MeasuredBoot, Sha256Digest};
 use helios_hal::watchdog::Watchdog;
+use helios_unix::OpenFile;
 use helios_unix::{DescriptorLimit, GuestAddress};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -398,17 +403,26 @@ pub(crate) enum ProgramSource {
     RawWasm(Bytes),
     SignedArtifact(Bytes),
     BootfsArtifact(BootfsBytes),
+    /// A Linux executable. It runs natively in an address space of its
+    /// own, so no provenance is asked of its bytes.
+    #[cfg(feature = "linux")]
+    LinuxElf(Bytes),
 }
 
 impl ProgramSource {
     /// Classifies a program file by the provenance the filesystem layer
     /// that produced its bytes gave them.
     pub(crate) fn from_file(contents: FileContents) -> Self {
+        // A Wasmtime artifact is an ELF file too, so it is recognised first.
         match contents {
             FileContents::Boot(bytes)
                 if WasmtimePrecompiledKind::detect(bytes.as_slice()).is_some() =>
             {
                 Self::BootfsArtifact(bytes)
+            }
+            #[cfg(feature = "linux")]
+            FileContents::Boot(bytes) if is_linux_elf(bytes.as_slice()) => {
+                Self::LinuxElf(bytes.to_bytes())
             }
             FileContents::Boot(bytes) => Self::RawWasm(bytes.to_bytes()),
             FileContents::Written(bytes) => Self::from_untrusted(bytes),
@@ -418,11 +432,15 @@ impl ProgramSource {
     /// Classifies bytes no boot payload vouches for: a file a guest
     /// wrote, on whichever mount, or one a host shared.
     fn from_untrusted(bytes: Bytes) -> Self {
+        // A Wasmtime artifact is an ELF file too, so it is recognised first.
         if cwasm::is_cwasm(&bytes) {
-            Self::SignedArtifact(bytes)
-        } else {
-            Self::RawWasm(bytes)
+            return Self::SignedArtifact(bytes);
         }
+        #[cfg(feature = "linux")]
+        if is_linux_elf(&bytes) {
+            return Self::LinuxElf(bytes);
+        }
+        Self::RawWasm(bytes)
     }
 
     /// Byte length of the payload the source carries, whichever
@@ -430,6 +448,8 @@ impl ProgramSource {
     pub(crate) fn payload_len(&self) -> usize {
         match self {
             Self::RawWasm(bytes) | Self::SignedArtifact(bytes) => bytes.len(),
+            #[cfg(feature = "linux")]
+            Self::LinuxElf(bytes) => bytes.len(),
             Self::BootfsArtifact(bytes) => bytes.as_slice().len(),
         }
     }
@@ -696,6 +716,7 @@ where
     );
     write_serial.emit_stage_marker("component-host:run-local-begin");
     let stack = system_component_profile_stack(component_name);
+    let namespace = debug_state.root_namespace().clone();
     kernel
         .run_local_future(ProfiledSystemComponentFuture::new(
             run_system_component(
@@ -724,6 +745,9 @@ where
         component = component_name,
         "embedded system component exited cleanly"
     );
+    // As Linux syncs and unmounts before it powers off: what the writable
+    // mounts hold reaches their devices before the machine goes down.
+    kernel.run_local_future(async move { namespace.sync_writable_mounts().await });
     report_fiber_stack_demand_commits(&cpu);
     cpu.shutdown()
 }
@@ -1615,6 +1639,19 @@ where
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadBegin);
         let payload = match source {
+            #[cfg(feature = "linux")]
+            ProgramSource::LinuxElf(image) => {
+                if hint.is_some() {
+                    return Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidHint,
+                        detail: ProgramExecErrorDetail::HintNotAllowedForPrecompiledArtifact,
+                    });
+                }
+                let loaded = LinuxExecutable::load(&exec_context.cpu, image.clone())
+                    .map(ProgramExecutable::Linux);
+                timeline.record(&self.inner.clock_cpu, LaunchPhase::LoadComplete);
+                return loaded;
+            }
             ProgramSource::SignedArtifact(bytes) => {
                 if hint.is_some() {
                     return Err(ProgramExecError {
@@ -2837,14 +2874,14 @@ mod tests {
         let root = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ,
+            flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
         };
         let work = FsDescriptor {
             path: "/work".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ,
+            flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
         };
@@ -2889,17 +2926,13 @@ mod tests {
 
     #[test]
     fn fd_renumber_replaces_stdio_descriptor() {
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/redirected".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::WRITE,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/redirected".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+        }));
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
@@ -2920,8 +2953,8 @@ mod tests {
 
         assert_eq!(table.renumber(3, 1), p1::errno::SUCCESS);
         match table.get(1) {
-            Some(Preview1Descriptor::File { descriptor, .. }) => {
-                assert_eq!(descriptor.path, "/redirected");
+            Some(Preview1Descriptor::File(file)) => {
+                assert_eq!(file.node().path, "/redirected");
             }
             _ => panic!("fd 1 should be redirected to the file descriptor"),
         }
@@ -3113,18 +3146,17 @@ mod tests {
             crate::TryWrite::Closed
         ));
 
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/redirected".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::WRITE,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
-        assert_eq!(table.insert_at(1, file, false), Ok(1));
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/redirected".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+        }));
+        assert_eq!(
+            table.insert_entry_at(1, Preview1DescriptorEntry::new(file, false)),
+            Ok(1)
+        );
         assert_eq!(
             table.component_output_mode(&session).err(),
             Some(ComponentStdioRefusal {
@@ -3174,7 +3206,10 @@ mod tests {
             Err(p1::errno::BADF)
         );
         assert_eq!(
-            snapshot.insert_at(i32::MAX - 1, Preview1Descriptor::NullDevice, false),
+            snapshot.insert_entry_at(
+                i32::MAX - 1,
+                Preview1DescriptorEntry::new(Preview1Descriptor::NullDevice, false)
+            ),
             Err(p1::errno::BADF)
         );
         assert_eq!(snapshot.target_index(i32::MAX - 1), Err(p1::errno::BADF));
@@ -3248,17 +3283,13 @@ mod tests {
 
     #[test]
     fn fd_dup2_replaces_exact_target_descriptor() {
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/redirected".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::WRITE,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/redirected".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+        }));
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
@@ -3279,8 +3310,8 @@ mod tests {
 
         assert_eq!(table.dup_to(3, 1, true), Ok(1));
         match table.get(1) {
-            Some(Preview1Descriptor::File { descriptor, .. }) => {
-                assert_eq!(descriptor.path, "/redirected");
+            Some(Preview1Descriptor::File(file)) => {
+                assert_eq!(file.node().path, "/redirected");
             }
             _ => panic!("fd 1 should be duplicated to the file descriptor"),
         }
@@ -3289,20 +3320,17 @@ mod tests {
 
     #[test]
     fn descriptor_table_preserves_fdflags_across_dup_and_exec_snapshot() {
-        let file: TestDescriptor = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/nonblock".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: P1_FDFLAG_NONBLOCK,
-        };
-        let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![Some(
-            Preview1DescriptorEntry::new(file, false),
-        )]);
+        let file: TestDescriptor = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/nonblock".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+        }));
+        let entry = Preview1DescriptorEntry::new(file, false);
+        entry.set_fdflags(P1_FDFLAG_NONBLOCK);
+        let mut table: TestDescriptorTable =
+            Preview1DescriptorTable::from_entries(vec![Some(entry)]);
 
         assert_eq!(table.fdflags(0), Ok(P1_FDFLAG_NONBLOCK));
         assert_eq!(table.dup(0), Ok(1));
@@ -3396,7 +3424,7 @@ mod tests {
             descriptor: FsDescriptor {
                 path: "/mnt/workspace".into(),
                 kind: FsNodeKind::Directory,
-                flags: fs_types::DescriptorFlags::READ,
+                flags: FsDescriptorFlags::READ,
                 identity: None,
                 mount: None,
             },
@@ -3515,34 +3543,26 @@ mod tests {
             .expect("guest path should resolve inside chroot root");
 
         assert_eq!(source, "/mnt/workspace/app/bin/tool");
-        assert!(flags.contains(fs_types::DescriptorFlags::READ));
-        assert!(flags.contains(fs_types::DescriptorFlags::WRITE));
+        assert!(flags.contains(FsDescriptorFlags::READ));
+        assert!(flags.contains(FsDescriptorFlags::WRITE));
     }
 
     #[test]
     fn exec_descriptor_snapshot_drops_close_on_exec_entries() {
-        let closed = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/closed-on-exec".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
-        let retained = Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/retained".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        };
+        let closed = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/closed-on-exec".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+        }));
+        let retained = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/retained".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+        }));
         let table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Stdin {
@@ -3558,8 +3578,8 @@ mod tests {
 
         assert!(exec_table.get(1).is_none());
         match exec_table.get(2) {
-            Some(Preview1Descriptor::File { descriptor, .. }) => {
-                assert_eq!(descriptor.path, "/retained");
+            Some(Preview1Descriptor::File(file)) => {
+                assert_eq!(file.node().path, "/retained");
             }
             _ => panic!("fd 2 should be retained across exec"),
         }
@@ -3575,7 +3595,7 @@ mod tests {
                         descriptor: FsDescriptor {
                             path: "/mnt/workspace".into(),
                             kind: FsNodeKind::Directory,
-                            flags: fs_types::DescriptorFlags::READ,
+                            flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
                         },
@@ -3604,7 +3624,7 @@ mod tests {
             descriptor: FsDescriptor {
                 path: "/mnt/workspace".into(),
                 kind: FsNodeKind::Directory,
-                flags: fs_types::DescriptorFlags::READ,
+                flags: FsDescriptorFlags::READ,
                 identity: None,
                 mount: None,
             },
@@ -3647,7 +3667,7 @@ mod tests {
                         descriptor: FsDescriptor {
                             path: "/source/root".into(),
                             kind: FsNodeKind::Directory,
-                            flags: fs_types::DescriptorFlags::READ,
+                            flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
                         },
@@ -3661,7 +3681,7 @@ mod tests {
                 descriptor: FsDescriptor {
                     path: "/source/workspace".into(),
                     kind: FsNodeKind::Directory,
-                    flags: fs_types::DescriptorFlags::READ,
+                    flags: FsDescriptorFlags::READ,
                     identity: None,
                     mount: None,
                 },
@@ -3685,7 +3705,7 @@ mod tests {
                         descriptor: FsDescriptor {
                             path: "/source/workspace".into(),
                             kind: FsNodeKind::Directory,
-                            flags: fs_types::DescriptorFlags::READ,
+                            flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
                         },
@@ -4538,10 +4558,11 @@ mod tests {
     /// guest reads `ENOENT`.
     #[test]
     fn wasix_exec_of_a_missing_program_file_is_not_found() {
-        let namespace = Namespace::<crate::UnsupportedStorage>::new(crate::MountTable::new(
-            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
-            1,
-        ));
+        let namespace =
+            Namespace::<crate::test_support::UnsupportedStorage>::new(crate::MountTable::new(
+                crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+                1,
+            ));
         let authority = ProcessAuthority::root();
 
         let error = futures_lite::future::block_on(read_program_source_from(

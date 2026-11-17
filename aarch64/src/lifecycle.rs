@@ -69,8 +69,8 @@ const TABLE_DESCRIPTOR: u64 = 0b11;
 /// `TCR_EL1` fields of the TTBR0 half the identity map uses: a 48-bit
 /// address space, 4 KiB granule, write-back write-allocate inner
 /// shareable table walks, walks enabled.
-const IDMAP_TCR_TTBR0_MASK: u64 = 0xffff;
-const IDMAP_TCR_TTBR0: u64 = 16 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12);
+pub(crate) const IDMAP_TCR_TTBR0_MASK: u64 = 0xffff;
+pub(crate) const IDMAP_TCR_TTBR0: u64 = 16 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12);
 
 const RUNNING: u8 = 0;
 const STOPPING: u8 = 1;

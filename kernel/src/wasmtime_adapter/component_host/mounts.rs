@@ -15,6 +15,7 @@
 use alloc::format;
 use alloc::string::String;
 
+use helios_btrfs::write::CompressionPolicy;
 use helios_hal::cpu::Cpu;
 use helios_hal::fs::BlockSerial;
 use wasmtime::component::{Accessor, HasSelf, Linker};
@@ -25,7 +26,9 @@ use crate::{ComponentHostNetwork, ErofsError, MountError, MountRequestError, Mou
 /// The kind of refusal the guest sees, and the detail it reads.
 fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
     let kind = match error {
-        MountRequestError::Authority(_) => RefusalKind::PermissionDenied,
+        MountRequestError::Authority(_) | MountRequestError::ReadOnlyDisk { .. } => {
+            RefusalKind::PermissionDenied
+        }
         MountRequestError::HostShareUnavailable
         | MountRequestError::InvalidSerial(_)
         | MountRequestError::DiskUnavailable { .. } => RefusalKind::Unavailable,
@@ -38,9 +41,20 @@ fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
             ..
         } => RefusalKind::InvalidFilesystem,
         MountRequestError::Btrfs {
-            error: helios_btrfs::Error::Io { .. },
+            error: crate::vfs::BtrfsMountError::Read(helios_btrfs::Error::Io { .. }),
             ..
         } => RefusalKind::Io,
+        MountRequestError::Btrfs {
+            error: crate::vfs::BtrfsMountError::Busy,
+            ..
+        } => RefusalKind::Busy,
+        MountRequestError::Btrfs {
+            error: crate::vfs::BtrfsMountError::Compression(_),
+            ..
+        }
+        | MountRequestError::CompressionOption(_)
+        | MountRequestError::CompressionUnsupported
+        | MountRequestError::CommitUnsupported => RefusalKind::InvalidOption,
         MountRequestError::Btrfs { .. } => RefusalKind::InvalidFilesystem,
         MountRequestError::Mount(MountError::InvalidPoint(_) | MountError::RootKind) => {
             RefusalKind::InvalidPoint
@@ -65,6 +79,7 @@ enum RefusalKind {
     InvalidPath,
     InvalidFilesystem,
     Io,
+    InvalidOption,
 }
 
 /// The source a request names, or the refusal of a disk serial no disk
@@ -95,6 +110,7 @@ macro_rules! impl_mount_bindings {
                         RefusalKind::InvalidPath => wit::MountErrorKind::InvalidPath,
                         RefusalKind::InvalidFilesystem => wit::MountErrorKind::InvalidFilesystem,
                         RefusalKind::Io => wit::MountErrorKind::Io,
+                        RefusalKind::InvalidOption => wit::MountErrorKind::InvalidOption,
                     },
                     detail,
                 }
@@ -133,12 +149,32 @@ macro_rules! impl_mount_bindings {
                     accessor: &Accessor<U, Self>,
                     request: wit::MountRequest,
                 ) -> wasmtime::Result<Result<(), wit::MountError>> {
-                    let (authority, namespace, attached) = accessor.with(|mut access| {
+                    let compress = match request.compress.as_deref().map(CompressionPolicy::parse) {
+                        None => None,
+                        Some(Ok(policy)) => policy,
+                        Some(Err(error)) => {
+                            let error = MountRequestError::from(error);
+                            tracing::debug!(%error, path = %request.path, "mount refused");
+                            return Ok(Err(mount_error(&error)));
+                        }
+                    };
+                    let (authority, namespace, attached, write, spawner, timer) = accessor.with(|mut access| {
                         let store = access.get();
                         (
                             store.process_authority().clone(),
                             store.filesystem().clone(),
                             store.runtime_state.attached_storage(),
+                            crate::vfs::BtrfsWriteOptions {
+                                entropy: store.runtime_state.root_entropy_handle().clone(),
+                                concurrency: core::num::NonZeroUsize::new(store.cpu.processor_count())
+                                    .expect("a machine has at least one processor"),
+                                compress,
+                                commit: request
+                                    .commit
+                                    .map(crate::vfs::CommitPolicy::from_commit_option),
+                            },
+                            store.spawner().launch_spawner().clone(),
+                            store.timer(),
                         )
                     });
                     let outcome = match mount_source(request.source) {
@@ -150,11 +186,15 @@ macro_rules! impl_mount_bindings {
                                 source,
                                 &request.path,
                                 request.read_only,
+                                write,
                             )
                             .await
                         }
                         Err(error) => Err(error),
                     };
+                    let outcome = outcome.map(|service| {
+                        if let Some(service) = service { spawner.spawn_detached(service.run(timer)); }
+                    });
                     Ok(outcome.map_err(|error| {
                         tracing::debug!(%error, path = %request.path, "mount refused");
                         mount_error(&error)

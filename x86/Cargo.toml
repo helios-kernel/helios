@@ -4,12 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-native-users = ["dep:thiserror"]
+# Native user execution (`helios_hal::native`): ring-three address spaces
+# and contexts, and the exception stubs that route user traps to them.
+native-users = []
 default = ["embedded-debugger"]
 embedded-debugger = ["helios-kernel/embedded-debugger"]
 
 [dependencies]
-thiserror = { version = "2.0.21", default-features = false, optional = true }
 acpi = { workspace = true, features = ["aml"] }
 helios-acpi.workspace = true
 helios-artifact.workspace = true
@@ -28,7 +29,7 @@ libm = { version = "0.2.16", default-features = false, features = ["force-soft-f
 tracing.workspace = true
 limine = "0.5.0"
 pci_types = "0.10.1"
-spin = { version = "0.9.8", default-features = false, features = ["once"] }
+spin = { version = "0.9.8", default-features = false, features = ["once", "mutex", "spin_mutex"] }
 x86 = "0.52.0"
 x86_64 = { version = "0.15.3", default-features = false, features = ["instructions"] }
 

@@ -1,30 +1,29 @@
 //! The mounted filesystem: inodes, directories, file data, symlinks and
 //! extended attributes.
 
+#[cfg(feature = "write")]
+pub(crate) mod writer;
+
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use crate::chunk::ChunkMap;
-use crate::compress::decompress;
 use crate::csum::name_hash;
 use crate::error::{Error, FileKind, ItemDefect};
 use crate::items::{
-    DirRecord, EntryTarget, ExtentData, FileExtent, INODE_NODATASUM, Metadata, RecordKind,
-    RootRecord, dir_index_record, dir_records,
+    DirRecord, EntryTarget, Metadata, RecordKind, RootRecord, dir_index_record, dir_records,
 };
 use crate::key::Key;
-use crate::ondisk::{MAX_COMPRESSED_EXTENT, NAME_MAX, SYMLINK_MAX, item_type, objectid};
+use crate::ondisk::{NAME_MAX, SYMLINK_MAX, item_type, objectid};
 use crate::source::BlockSource;
 use crate::superblock::{self, Superblock};
-use crate::tree::{Cursor, TreeRoot};
-use crate::volume::Volume;
+use crate::tree::{Cursor, Node, TreeRoot};
+use crate::volume::{Mapping, Volume};
 
 /// Most symlinks one path resolution follows, as Linux's `MAXSYMLINKS`.
 pub const MAX_SYMLINK_FOLLOWS: usize = 40;
-
-/// Largest window of file data read and checksummed in one request.
-const DATA_WINDOW: u64 = MAX_COMPRESSED_EXTENT;
 
 /// A btrfs filesystem mounted read-only from one device.
 ///
@@ -40,18 +39,203 @@ const DATA_WINDOW: u64 = MAX_COMPRESSED_EXTENT;
 /// eight, each one node size) and a bounded data window, and frees them
 /// when it finishes.
 ///
-/// An [`Inode`] records the tree root of the commit it was read from, so
-/// operations on it see that commit's state whatever happens afterwards.
+/// An [`Inode`] records the view it was read from — a commit, or with the
+/// `write` feature the running transaction as of an accepted mutation — so
+/// operations on it see that view's state whatever happens afterwards.
+#[derive(Clone)]
 pub struct Filesystem<S> {
+    snapshot: Arc<Snapshot>,
     volume: Volume<S>,
-    root_tree: TreeRoot,
+}
+
+/// Every tree and address translation needed to read one view: a committed
+/// generation, or the running transaction as of an accepted mutation.
+/// Inodes retain this whole view, including its retirement pin.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub(crate) mapping: Arc<Mapping>,
+    pub(crate) root_tree: TreeRoot,
     csum_tree: TreeRoot,
     default_subvolume: RootRecord,
+    /// The running transaction's state this view reads through; `None` for
+    /// a committed generation.
+    #[cfg(feature = "write")]
+    pub(crate) running: Option<Running>,
+}
+
+/// What a view of the running transaction holds beyond a committed
+/// generation's roots. Every collection is persistent, so taking a view is a
+/// handful of reference-count increments, and the writer's later edits copy
+/// only the paths they change.
+#[cfg(feature = "write")]
+pub(crate) struct Running {
+    /// The transaction's private tree blocks, read before the device.
+    trees: crate::tree::write::Trees,
+    /// The subvolume roots as the transaction has moved them. The root tree
+    /// records them only at commit, so a view looks them up here.
+    roots: crate::roots::Roots,
+    /// The private data extents this view reaches. The writer keeps them
+    /// from reuse while the view lives.
+    data: rpds::RedBlackTreeMapSync<u64, u64>,
+    /// The generation the transaction started from: blocks it retired stay
+    /// pinned while this view can still read them.
+    base: Arc<Snapshot>,
+}
+
+#[cfg(feature = "write")]
+impl core::fmt::Debug for Running {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Running")
+            .field("base", &self.base.mapping.superblock.generation())
+            .field("private_data_extents", &self.data.size())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Two views of a running transaction are the same view only when they are
+/// one value: an overlay has no cheaper identity.
+#[cfg(feature = "write")]
+impl PartialEq for Running {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self, other)
+    }
+}
+
+#[cfg(feature = "write")]
+impl Eq for Running {}
+
+#[cfg(feature = "write")]
+impl Snapshot {
+    pub(crate) fn advance(
+        &self,
+        superblock: Superblock,
+        chunks: Arc<ChunkMap>,
+        roots: &crate::roots::Roots,
+    ) -> Result<Arc<Self>, crate::tree::write::WriteError> {
+        Ok(Arc::new(Self {
+            mapping: Mapping::advance(superblock, chunks),
+            root_tree: roots.root,
+            csum_tree: roots.get(objectid::CSUM_TREE)?,
+            default_subvolume: RootRecord {
+                root: roots.get(self.default_subvolume.root.tree)?,
+                root_dirid: self.default_subvolume.root_dirid,
+            },
+            running: None,
+        }))
+    }
+
+    /// A view of the running transaction started from `base`, as its state
+    /// stands now.
+    pub(crate) fn running(
+        base: &Arc<Self>,
+        mapping: Arc<Mapping>,
+        roots: &crate::roots::Roots,
+        checksums: TreeRoot,
+        trees: &crate::tree::write::Trees,
+        data: rpds::RedBlackTreeMapSync<u64, u64>,
+    ) -> Result<Arc<Self>, crate::tree::write::WriteError> {
+        Ok(Arc::new(Self {
+            mapping,
+            root_tree: roots.root,
+            csum_tree: checksums,
+            default_subvolume: RootRecord {
+                root: roots.get(base.default_subvolume.root.tree)?,
+                root_dirid: base.default_subvolume.root_dirid,
+            },
+            running: Some(Running {
+                trees: trees.clone(),
+                roots: roots.clone(),
+                data,
+                base: base.clone(),
+            }),
+        }))
+    }
+
+    /// Whether this view reaches the private data extent at `address`.
+    pub(crate) fn reaches_private_data(&self, address: u64) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|running| running.data.contains_key(&address))
+    }
+}
+
+impl Snapshot {
+    /// The tree blocks this view reads, through its own mapping.
+    fn nodes<'a, S: BlockSource>(&'a self, volume: &'a Volume<S>) -> Nodes<'a, S> {
+        Nodes {
+            volume: volume.view(&self.mapping),
+            #[cfg(feature = "write")]
+            overlay: self.running.as_ref().map(|running| &running.trees),
+        }
+    }
+
+    /// The newest root record of `tree` as this view sees it.
+    async fn find_root<S: BlockSource>(
+        &self,
+        nodes: &Nodes<'_, S>,
+        tree: u64,
+    ) -> Result<RootRecord, Error> {
+        #[cfg(feature = "write")]
+        if let Some(running) = &self.running {
+            return running.roots.record(tree);
+        }
+        find_root(&nodes.volume, self.root_tree, tree).await
+    }
+}
+
+/// Where a view's tree blocks come from: the running transaction's private
+/// blocks first when the view has them, then the device.
+struct Nodes<'a, S> {
+    volume: Volume<&'a S>,
+    #[cfg(feature = "write")]
+    overlay: Option<&'a crate::tree::write::Trees>,
+}
+
+impl<S: BlockSource> crate::tree::NodeSource for Nodes<'_, S> {
+    async fn read_node(
+        &self,
+        logical: u64,
+        expected: crate::tree::Expected,
+    ) -> Result<Node, Error> {
+        #[cfg(feature = "write")]
+        if let Some(trees) = self.overlay {
+            return trees.read(&self.volume, logical, expected).await;
+        }
+        Node::read(&self.volume, logical, expected).await
+    }
+}
+
+/// How a file extent item stores its range.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentKind {
+    /// The bytes are in the item itself.
+    Inline,
+    /// The bytes are in a data extent (a `disk_bytenr` of zero is a hole).
+    Regular,
+    /// Preallocated, never written.
+    Prealloc,
+}
+
+/// One file extent item, as returned by [`Filesystem::file_extents`]: a test
+/// inspection API.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtentInfo {
+    /// File offset of the range the item covers.
+    pub offset: u64,
+    /// Length of that range in bytes.
+    pub len: u64,
+    pub kind: ExtentKind,
+    /// The item's compression type; `None` for stored plain.
+    pub compression: Option<crate::Compression>,
 }
 
 /// An inode, as of the commit it was read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inode {
+    snapshot: Arc<Snapshot>,
     root: TreeRoot,
     number: u64,
     metadata: Metadata,
@@ -86,10 +270,6 @@ impl Inode {
             });
         }
         Ok(())
-    }
-
-    fn is_checksummed(&self) -> bool {
-        self.metadata.flags & INODE_NODATASUM == 0
     }
 }
 
@@ -153,11 +333,22 @@ impl<S: BlockSource> Filesystem<S> {
         let default_tree = default_subvolume(&volume, root_tree).await?;
         let default_subvolume = find_root(&volume, root_tree, default_tree).await?;
         Ok(Self {
+            snapshot: Arc::new(Snapshot {
+                mapping: volume.mapping(),
+                root_tree,
+                csum_tree,
+                default_subvolume,
+                #[cfg(feature = "write")]
+                running: None,
+            }),
             volume,
-            root_tree,
-            csum_tree,
-            default_subvolume,
         })
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn publish(&mut self, committed: crate::transaction::Committed) {
+        self.volume.install(committed.snapshot.mapping.clone());
+        self.snapshot = committed.snapshot;
     }
 
     pub fn superblock(&self) -> &Superblock {
@@ -166,7 +357,7 @@ impl<S: BlockSource> Filesystem<S> {
 
     /// The id of the subvolume a mount lands in.
     pub fn default_subvolume(&self) -> u64 {
-        self.default_subvolume.root.tree
+        self.snapshot.default_subvolume.root.tree
     }
 
     /// Visits each subvolume once, in tree-id order. A mount uses this
@@ -176,7 +367,9 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(u64, u64),
     {
-        let mut cursor = Cursor::ceiling(&self.volume, self.root_tree, Key::new(0, 0, 0)).await?;
+        let nodes = self.snapshot.nodes(&self.volume);
+        let mut cursor =
+            Cursor::ceiling(&nodes, self.snapshot.root_tree, Key::new(0, 0, 0)).await?;
         let mut previous: Option<(u64, u64)> = None;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if key.item_type == item_type::ROOT_ITEM
@@ -185,7 +378,7 @@ impl<S: BlockSource> Filesystem<S> {
             {
                 let record = RootRecord::parse(key, item, self.volume.superblock().sectorsize())
                     .map_err(|defect| Error::Item {
-                        tree: self.root_tree.tree,
+                        tree: self.snapshot.root_tree.tree,
                         key,
                         defect,
                     })?;
@@ -196,7 +389,7 @@ impl<S: BlockSource> Filesystem<S> {
                 }
                 previous = Some((key.objectid, record.root_dirid));
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&nodes).await?;
         }
         if let Some((tree, root_inode)) = previous {
             visit(tree, root_inode);
@@ -207,21 +400,39 @@ impl<S: BlockSource> Filesystem<S> {
     /// The root directory of the default subvolume.
     pub async fn root(&self) -> Result<Inode, Error> {
         self.load_inode(
-            self.default_subvolume.root,
-            self.default_subvolume.root_dirid,
+            self.snapshot.default_subvolume.root,
+            self.snapshot.default_subvolume.root_dirid,
+            &self.snapshot,
         )
         .await
     }
 
     /// The root directory of subvolume `tree`.
     pub async fn subvolume_root(&self, tree: u64) -> Result<Inode, Error> {
-        let record = find_root(&self.volume, self.root_tree, tree).await?;
-        self.load_inode(record.root, record.root_dirid).await
+        let nodes = self.snapshot.nodes(&self.volume);
+        let record = self.snapshot.find_root(&nodes, tree).await?;
+        self.load_inode(record.root, record.root_dirid, &self.snapshot)
+            .await
     }
 
-    async fn load_inode(&self, root: TreeRoot, number: u64) -> Result<Inode, Error> {
+    /// Inode `number` of subvolume `tree`, as of this view. For a caller
+    /// that holds an inode's identity across views and needs its current
+    /// state, such as a network or FUSE server.
+    pub async fn inode(&self, tree: u64, number: u64) -> Result<Inode, Error> {
+        let nodes = self.snapshot.nodes(&self.volume);
+        let record = self.snapshot.find_root(&nodes, tree).await?;
+        self.load_inode(record.root, number, &self.snapshot).await
+    }
+
+    async fn load_inode(
+        &self,
+        root: TreeRoot,
+        number: u64,
+        snapshot: &Arc<Snapshot>,
+    ) -> Result<Inode, Error> {
+        let nodes = snapshot.nodes(&self.volume);
         let key = Key::new(number, item_type::INODE_ITEM, 0);
-        let cursor = Cursor::ceiling(&self.volume, root, key).await?;
+        let cursor = Cursor::ceiling(&nodes, root, key).await?;
         let (Some(found), Some(item)) = (cursor.key(), cursor.item()) else {
             return Err(Error::MissingInode {
                 tree: root.tree,
@@ -240,6 +451,7 @@ impl<S: BlockSource> Filesystem<S> {
             defect,
         })?;
         Ok(Inode {
+            snapshot: snapshot.clone(),
             root,
             number,
             metadata,
@@ -248,8 +460,13 @@ impl<S: BlockSource> Filesystem<S> {
 
     async fn open_target(&self, dir: &Inode, target: EntryTarget) -> Result<Inode, Error> {
         match target {
-            EntryTarget::Inode(number) => self.load_inode(dir.root, number).await,
-            EntryTarget::Subvolume(tree) => self.subvolume_root(tree).await,
+            EntryTarget::Inode(number) => self.load_inode(dir.root, number, &dir.snapshot).await,
+            EntryTarget::Subvolume(tree) => {
+                let nodes = dir.snapshot.nodes(&self.volume);
+                let record = dir.snapshot.find_root(&nodes, tree).await?;
+                self.load_inode(record.root, record.root_dirid, &dir.snapshot)
+                    .await
+            }
         }
     }
 
@@ -261,13 +478,14 @@ impl<S: BlockSource> Filesystem<S> {
     /// Looks `name` up in directory `dir`. `None` when no entry has that
     /// name; `.` and `..` are not stored and are never found.
     pub async fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Option<Inode>, Error> {
+        let nodes = dir.snapshot.nodes(&self.volume);
         dir.expect_kind(FileKind::Directory)?;
         if name.is_empty() || name.len() > NAME_MAX {
             return Ok(None);
         }
         let key = Key::new(dir.number, item_type::DIR_ITEM, name_hash(name));
         let target = {
-            let cursor = Cursor::ceiling(&self.volume, dir.root, key).await?;
+            let cursor = Cursor::ceiling(&nodes, dir.root, key).await?;
             find_record(&cursor, key, name, RecordKind::Entry)?.map(|record| record.target())
         };
         match target {
@@ -291,9 +509,10 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(DirEntry<'_>) -> ControlFlow<()>,
     {
+        let nodes = dir.snapshot.nodes(&self.volume);
         dir.expect_kind(FileKind::Directory)?;
         let start = Key::new(dir.number, item_type::DIR_INDEX, from.0);
-        let mut cursor = Cursor::ceiling(&self.volume, dir.root, start).await?;
+        let mut cursor = Cursor::ceiling(&nodes, dir.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if !key.is(dir.number, item_type::DIR_INDEX) {
                 break;
@@ -312,7 +531,7 @@ impl<S: BlockSource> Filesystem<S> {
             if visit(entry).is_break() {
                 return Ok(Some(DirPosition(key.offset)));
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&nodes).await?;
         }
         Ok(None)
     }
@@ -322,6 +541,23 @@ impl<S: BlockSource> Filesystem<S> {
     pub async fn read(&self, file: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         file.expect_kind(FileKind::Regular)?;
         self.read_range(file, offset, buf).await
+    }
+
+    /// The file extents of `file`, in file-offset order, as stored.
+    ///
+    /// A test inspection API: it exposes the on-disk layout (extent kind and
+    /// compression) that reads deliberately hide.
+    #[cfg(feature = "test-support")]
+    pub async fn file_extents(&self, file: &Inode) -> Result<Vec<ExtentInfo>, Error> {
+        file.expect_kind(FileKind::Regular)?;
+        let nodes = file.snapshot.nodes(&self.volume);
+        crate::data::Reader::new(&nodes.volume, &nodes, file.snapshot.csum_tree)
+            .extents(crate::data::File {
+                root: file.root,
+                number: file.number,
+                metadata: &file.metadata,
+            })
+            .await
     }
 
     /// Reads the target of symlink `link` into `buf`. Returns the target's
@@ -351,11 +587,12 @@ impl<S: BlockSource> Filesystem<S> {
         name: &[u8],
         buf: &mut [u8],
     ) -> Result<Option<usize>, Error> {
+        let nodes = inode.snapshot.nodes(&self.volume);
         if name.is_empty() || name.len() > NAME_MAX {
             return Ok(None);
         }
         let key = Key::new(inode.number, item_type::XATTR_ITEM, name_hash(name));
-        let cursor = Cursor::ceiling(&self.volume, inode.root, key).await?;
+        let cursor = Cursor::ceiling(&nodes, inode.root, key).await?;
         let Some(record) = find_record(&cursor, key, name, RecordKind::Xattr)? else {
             return Ok(None);
         };
@@ -370,8 +607,9 @@ impl<S: BlockSource> Filesystem<S> {
     where
         F: FnMut(&[u8]) -> ControlFlow<()>,
     {
+        let nodes = inode.snapshot.nodes(&self.volume);
         let start = Key::new(inode.number, item_type::XATTR_ITEM, 0);
-        let mut cursor = Cursor::ceiling(&self.volume, inode.root, start).await?;
+        let mut cursor = Cursor::ceiling(&nodes, inode.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
             if !key.is(inode.number, item_type::XATTR_ITEM) {
                 break;
@@ -386,7 +624,7 @@ impl<S: BlockSource> Filesystem<S> {
                     return Ok(());
                 }
             }
-            cursor.advance(&self.volume).await?;
+            cursor.advance(&nodes).await?;
         }
         Ok(())
     }
@@ -461,268 +699,32 @@ impl<S: BlockSource> Filesystem<S> {
         Ok(current)
     }
 
-    /// The file bytes at `offset`, through the inode's extents.
     async fn read_range(&self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        let size = inode.metadata.size;
-        if offset >= size || buf.is_empty() {
-            return Ok(0);
-        }
-        let len = (size - offset).min(buf.len() as u64) as usize;
-        let buf = &mut buf[..len];
-        let end = offset + len as u64;
-        let first_extent = Key::new(inode.number, item_type::EXTENT_DATA, 0);
-        let mut cursor = Cursor::floor(
-            &self.volume,
-            inode.root,
-            Key::new(inode.number, item_type::EXTENT_DATA, offset),
-        )
-        .await?;
-        let mut position = offset;
-        let mut previous_end = 0;
-        while position < end {
-            let (Some(key), Some(item)) = (cursor.key(), cursor.item()) else {
-                break;
-            };
-            if key < first_extent {
-                cursor.advance(&self.volume).await?;
-                continue;
-            }
-            if !key.is(inode.number, item_type::EXTENT_DATA) {
-                break;
-            }
-            let item_error = |defect| Error::Item {
-                tree: inode.root.tree,
-                key,
-                defect,
-            };
-            let extent =
-                FileExtent::parse(key, item, self.superblock().sectorsize()).map_err(item_error)?;
-            if extent.start < previous_end {
-                return Err(item_error(ItemDefect::ExtentOverlap(previous_end)));
-            }
-            previous_end = extent.end;
-            if extent.end > position {
-                if extent.start > position {
-                    // A hole the format leaves implicit.
-                    let gap_end = extent.start.min(end);
-                    buf[(position - offset) as usize..(gap_end - offset) as usize].fill(0);
-                    position = gap_end;
-                }
-                if position < end {
-                    let copy_end = extent.end.min(end);
-                    let out = &mut buf[(position - offset) as usize..(copy_end - offset) as usize];
-                    self.copy_extent(inode, &extent, position - extent.start, out)
-                        .await?;
-                    position = copy_end;
-                }
-            }
-            cursor.advance(&self.volume).await?;
-        }
-        // Past the last extent the file reads as zeroes up to its size.
-        buf[(position - offset) as usize..].fill(0);
-        Ok(len)
-    }
-
-    /// Copies the bytes of `extent` from `from`, relative to its start,
-    /// into `out`.
-    async fn copy_extent(
-        &self,
-        inode: &Inode,
-        extent: &FileExtent<'_>,
-        from: u64,
-        out: &mut [u8],
-    ) -> Result<(), Error> {
-        let sectorsize = self.superblock().sectorsize() as usize;
-        let decompress_error = |algorithm, defect| Error::Decompress {
-            algorithm,
-            tree: inode.root.tree,
-            inode: inode.number,
-            file_offset: extent.start,
-            defect,
-        };
-        match extent.data {
-            ExtentData::Zero => out.fill(0),
-            ExtentData::Inline {
-                data,
-                compression: None,
-            } => {
-                let from = from as usize;
-                out.copy_from_slice(&data[from..from + out.len()]);
-            }
-            ExtentData::Inline {
-                data,
-                compression: Some(algorithm),
-            } => {
-                // `FileExtent::parse` bounded this by the sector size.
-                let mut plain = vec![0_u8; extent.end as usize];
-                decompress(algorithm, data, &mut plain, sectorsize)
-                    .map_err(|defect| decompress_error(algorithm, defect))?;
-                let from = from as usize;
-                out.copy_from_slice(&plain[from..from + out.len()]);
-            }
-            ExtentData::Regular {
-                disk_bytenr,
+        let nodes = inode.snapshot.nodes(&self.volume);
+        crate::data::Reader::new(&nodes.volume, &nodes, inode.snapshot.csum_tree)
+            .read(
+                crate::data::File {
+                    root: inode.root,
+                    number: inode.number,
+                    metadata: &inode.metadata,
+                },
                 offset,
-                compression: None,
-                ..
-            } => {
-                self.read_data(disk_bytenr + offset + from, out, inode.is_checksummed())
-                    .await?;
-            }
-            ExtentData::Regular {
-                disk_bytenr,
-                disk_num_bytes,
-                offset,
-                ram_bytes,
-                compression: Some(algorithm),
-            } => {
-                // Both sizes were bounded by 128 KiB in `FileExtent::parse`.
-                let mut stored = vec![0_u8; disk_num_bytes as usize];
-                self.read_sectors(disk_bytenr, &mut stored, inode.is_checksummed())
-                    .await?;
-                let mut plain = vec![0_u8; ram_bytes as usize];
-                decompress(algorithm, &stored, &mut plain, sectorsize)
-                    .map_err(|defect| decompress_error(algorithm, defect))?;
-                let from = (offset + from) as usize;
-                out.copy_from_slice(&plain[from..from + out.len()]);
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads data bytes at `logical`, which need not be sector aligned, in
-    /// windows of at most [`DATA_WINDOW`] bytes.
-    async fn read_data(
-        &self,
-        logical: u64,
-        out: &mut [u8],
-        checksummed: bool,
-    ) -> Result<(), Error> {
-        let sector = u64::from(self.superblock().sectorsize());
-        let mut window = Vec::new();
-        let mut done = 0;
-        while done < out.len() {
-            let at = logical + done as u64;
-            let window_start = at - at % sector;
-            let wanted_end = at + (out.len() - done) as u64;
-            let window_end = wanted_end
-                .next_multiple_of(sector)
-                .min(window_start + DATA_WINDOW);
-            window.resize((window_end - window_start) as usize, 0);
-            self.read_sectors(window_start, &mut window, checksummed)
-                .await?;
-            let skip = (at - window_start) as usize;
-            let count = (window.len() - skip).min(out.len() - done);
-            out[done..done + count].copy_from_slice(&window[skip..skip + count]);
-            done += count;
-        }
-        Ok(())
-    }
-
-    /// Reads whole sectors at `logical` and, for checksummed data, verifies
-    /// each against the checksum tree, falling back to the other copy of a
-    /// `dup` chunk when one fails.
-    async fn read_sectors(
-        &self,
-        logical: u64,
-        buf: &mut [u8],
-        checksummed: bool,
-    ) -> Result<(), Error> {
-        let sector = self.superblock().sectorsize() as usize;
-        let csum_type = self.superblock().csum_type();
-        let expected = if checksummed {
-            Some(self.lookup_checksums(logical, buf.len()).await?)
-        } else {
-            None
-        };
-        self.volume
-            .read_verified(logical, buf, |data| {
-                let Some(expected) = &expected else {
-                    return Ok(());
-                };
-                let size = csum_type.size();
-                for (index, (sector_data, stored)) in data
-                    .chunks_exact(sector)
-                    .zip(expected.chunks_exact(size))
-                    .enumerate()
-                {
-                    if !csum_type.verifies(sector_data, stored) {
-                        return Err(Error::DataChecksum {
-                            logical: logical + (index * sector) as u64,
-                        });
-                    }
-                }
-                Ok(())
-            })
+                buf,
+            )
             .await
     }
 
-    /// The stored checksum of every sector of `[logical, logical + len)`,
-    /// concatenated.
-    async fn lookup_checksums(&self, logical: u64, len: usize) -> Result<Vec<u8>, Error> {
-        let sector = u64::from(self.superblock().sectorsize());
-        let size = self.superblock().csum_type().size();
-        let sectors = len / sector as usize;
-        let mut sums = vec![0_u8; sectors * size];
-        let mut filled = 0;
-        let first = Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, 0);
-        let mut cursor = Cursor::floor(
-            &self.volume,
-            self.csum_tree,
-            Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, logical),
-        )
-        .await?;
-        while filled < sectors {
-            let (Some(key), Some(item)) = (cursor.key(), cursor.item()) else {
-                break;
-            };
-            if key < first {
-                cursor.advance(&self.volume).await?;
-                continue;
-            }
-            if !key.is(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM) {
-                break;
-            }
-            let item_error = |defect| Error::Item {
-                tree: cursor.tree(),
-                key,
-                defect,
-            };
-            if item.len() % size != 0 {
-                return Err(item_error(ItemDefect::ChecksumItem(item.len())));
-            }
-            if !key.offset.is_multiple_of(sector) {
-                return Err(item_error(ItemDefect::Unaligned {
-                    field: "checksum start",
-                    value: key.offset,
-                }));
-            }
-            let item_sectors = (item.len() / size) as u64;
-            let item_end = key
-                .offset
-                .checked_add(item_sectors * sector)
-                .ok_or(item_error(ItemDefect::ExtentOverflow))?;
-            let wanted = logical + filled as u64 * sector;
-            if item_end <= wanted {
-                cursor.advance(&self.volume).await?;
-                continue;
-            }
-            if key.offset > wanted {
-                break;
-            }
-            let skip = ((wanted - key.offset) / sector) as usize;
-            let count = (item_sectors as usize - skip).min(sectors - filled);
-            sums[filled * size..(filled + count) * size]
-                .copy_from_slice(&item[skip * size..(skip + count) * size]);
-            filled += count;
-            cursor.advance(&self.volume).await?;
-        }
-        if filled < sectors {
-            return Err(Error::MissingDataChecksum {
-                logical: logical + filled as u64 * sector,
-            });
-        }
-        Ok(sums)
+    #[cfg(all(test, feature = "write"))]
+    async fn lookup_checksums(
+        &self,
+        snapshot: &Arc<Snapshot>,
+        logical: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let nodes = snapshot.nodes(&self.volume);
+        crate::data::Reader::new(&nodes.volume, &nodes, snapshot.csum_tree)
+            .lookup_checksums(logical, len)
+            .await
     }
 }
 
@@ -772,7 +774,7 @@ async fn read_chunk_tree<S: BlockSource>(
 }
 
 /// The newest root item of tree `tree`.
-async fn find_root<S: BlockSource>(
+pub(crate) async fn find_root<S: BlockSource>(
     volume: &Volume<S>,
     root_tree: TreeRoot,
     tree: u64,
@@ -824,3 +826,8 @@ async fn default_subvolume<S: BlockSource>(
     }
     Ok(tree)
 }
+
+#[cfg(all(test, feature = "write"))]
+mod rename_tests;
+#[cfg(all(test, feature = "write"))]
+mod write_tests;

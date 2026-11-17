@@ -6,3 +6,6 @@ mod fixture;
 mod mkfs;
 mod read;
 mod walk;
+
+#[cfg(feature = "write")]
+mod writes;

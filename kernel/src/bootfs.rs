@@ -20,7 +20,7 @@ use core::convert::Infallible;
 use bytes::Bytes;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags, WritePosition,
+    NodeKind, OpenFlags, RenameMode, WritePosition,
 };
 use triomphe::Arc;
 
@@ -441,15 +441,15 @@ impl FileSystem for BootFs {
         Err(FsError::ReadOnly)
     }
 
-    async fn remove_directory(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn unlink(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: RenameMode, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
@@ -632,7 +632,7 @@ mod tests {
             Err(FsError::ReadOnly)
         );
         assert_eq!(
-            block_on(fs.unlink(path("etc/config.txt"))),
+            block_on(fs.unlink(path("etc/config.txt"), 7_000_000_000)),
             Err(FsError::ReadOnly)
         );
     }

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# mount(8) helper for `mount -t fuse.helios-btrfs <device> <mountpoint>`.
+# Installed as /sbin/mount.fuse.helios-btrfs. Starts the fuse-btrfs daemon
+# named by HELIOS_FUSE_BTRFS detached, and returns once the mountpoint is
+# mounted or the daemon has failed.
+#
+# Optional environment: HELIOS_FUSE_BTRFS_LOG, a file the daemon appends its
+# diagnostics to; HELIOS_FUSE_BTRFS_RUN_DIR, a directory that receives the
+# daemon's pid as <device basename>.pid.
+set -euo pipefail
+
+# Longest the daemon may take to mount, in seconds.
+readonly mount_deadline=30
+
+fail() {
+    echo "mount.fuse.helios-btrfs: $*" >&2
+    exit 1
+}
+
+: "${HELIOS_FUSE_BTRFS:?set HELIOS_FUSE_BTRFS to the fuse-btrfs binary}"
+
+device=${1:?usage: mount.fuse.helios-btrfs <device> <mountpoint> [-o options]}
+mountpoint=${2:?usage: mount.fuse.helios-btrfs <device> <mountpoint> [-o options]}
+shift 2
+
+# The arguments mount(8) adds to a helper: -o options, and the flags for
+# mtab handling, verbosity and the type, none of which concern the daemon.
+options=()
+while (($#)); do
+    case "$1" in
+        -o) options=(-o "${2:?-o needs its options}"); shift 2 ;;
+        -t) shift 2 ;;
+        -n | -s | -v | -f) shift ;;
+        *) fail "unexpected argument $1" ;;
+    esac
+done
+
+setsid "$HELIOS_FUSE_BTRFS" "$device" "$mountpoint" "${options[@]}" \
+    >>"${HELIOS_FUSE_BTRFS_LOG:-/dev/null}" 2>&1 </dev/null &
+pid=$!
+if [[ -n "${HELIOS_FUSE_BTRFS_RUN_DIR:-}" ]]; then
+    echo "$pid" >"$HELIOS_FUSE_BTRFS_RUN_DIR/$(basename "$device").pid"
+fi
+
+deadline=$((SECONDS + mount_deadline))
+until mountpoint -q "$mountpoint"; do
+    kill -0 "$pid" 2>/dev/null || fail "fuse-btrfs exited before mounting $device on $mountpoint"
+    if ((SECONDS >= deadline)); then
+        kill "$pid"
+        fail "fuse-btrfs did not mount $device on $mountpoint within ${mount_deadline}s"
+    fi
+    sleep 0.1
+done

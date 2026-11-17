@@ -78,7 +78,8 @@ clippy-host:
     cargo clippy -p helios-unix --all-targets --features runtime -- -D warnings
     cargo clippy -p helios-linux --all-targets --features runtime -- -D warnings
     cargo clippy \
-        --workspace --all-targets --features helios-webgpu/runtime \
+        --workspace --all-targets \
+        --features helios-webgpu/runtime --features helios-btrfs/write \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
         --exclude helios-audio-test --exclude helios-compositor --exclude helios-cpu \
@@ -146,10 +147,10 @@ test-libraries:
     # capture check that links it.
     cargo nextest run -p helios-compositor-render -p helios-desktop-text-check
     cargo nextest run -p helios-inspector-protocol --lib
-    # The btrfs reader mounts images two pure-Rust writers build, intact
-    # and damaged. Images from `mkfs.btrfs` need btrfs-progs and run in
+    # Btrfs reader and transaction tests use images two pure-Rust writers build.
+    # Images from `mkfs.btrfs` need btrfs-progs and run in
     # `test-btrfs-mkfs`.
-    cargo nextest run -p helios-btrfs
+    cargo nextest run -p helios-btrfs --features write
     # The Venus protocol is generated from pinned venus-protocol inputs that
     # the CLI fetches and hash-verifies; the parity test then compares the
     # generated encoders with the pinned Mesa generator's output. The
@@ -190,7 +191,7 @@ test-host-tools:
 # Mount the images `mkfs.btrfs --rootdir` builds, one per checksum type and
 # node size. Needs btrfs-progs on PATH; CI's test-libraries lane installs it.
 test-btrfs-mkfs:
-    cargo nextest run -p helios-btrfs --run-ignored ignored-only
+    cargo nextest run -p helios-btrfs --features write --run-ignored ignored-only
 # Fetch the ACPI tables `acpi/tests/qemu-tables.sha256` pins — QEMU's own
 # expected tables for its q35 machine, from its `tests/data/acpi` at the
 # v9.2.0 commit — into `target/acpi-tables` (or `$HELIOS_ACPI_TABLES_DIR`).
@@ -238,7 +239,7 @@ clippy-target target package:
     cargo clippy ${build_std} \
         -p "{{ package }}" --target "{{ target }}" -- -D warnings
     if [[ "{{ package }}" == helios-x86 ]]; then
-        cargo clippy -p helios --features linux-prototype --target "{{ target }}" -- -D warnings
+        cargo clippy -p helios --features linux --target "{{ target }}" -- -D warnings
     fi
 
 # Build the instrumented kernel image of docs/pgo.md for `arch` (aarch64,

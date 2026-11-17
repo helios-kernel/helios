@@ -30,6 +30,7 @@ mod frame_slab;
 mod irq_safe;
 mod locality;
 mod mapping_cost;
+mod native_pages;
 mod owner;
 mod per_processor;
 mod policy;
@@ -63,6 +64,7 @@ pub(crate) use frame_reserve::{
 pub(crate) use irq_safe::IrqSafeMutex;
 pub use locality::{Locality, NodeRun};
 pub use mapping_cost::user_mapping_kernel_heap_bytes;
+pub use native_pages::{NativePage, NativePages, NativeSpace, UserTranslation};
 pub use owner::{
     MemoryOwner, UserMemoryOwnerScope, UserMemoryOwners, configure_user_memory_owner_processors,
     current_user_memory_owner, enter_user_memory_owner,

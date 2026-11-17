@@ -8,10 +8,11 @@ on:
     branches: [dev]
   workflow_dispatch:
     inputs:
-      lanes:
-        description: "Lanes to run, comma-separated names from .github/ci-lanes.json; empty runs every lane"
-        type: string
+      check_lane:
+        description: "Optional lane from ci-lanes.json; empty runs the full suite"
+        required: false
         default: ""
+        type: string
   schedule:
     - cron: "37 3 * * *"
 
@@ -40,7 +41,8 @@ jobs:
   # `exclusive`, which reads only its own surfaces. A skipped lane
   # reports as skipped, which a required check counts as passing; no
   # ruleset on `dev` requires a lane of this workflow. A dispatch and the
-  # nightly schedule run every lane; PR and dev pushes omit heavy suites,
+  # nightly schedule run every lane unless a dispatch names a command lane;
+  # PR and dev pushes omit heavy suites,
   # and Btrfs lanes filter pushes by surface. A draft pull request is not a merge
   # candidate and runs `lint-fmt` alone; marking it ready for review runs
   # the rest.
@@ -182,10 +184,16 @@ jobs:
           DRAFT: ${{ github.event.pull_request.draft == true }}
           EVENT: ${{ github.event_name }}
           HEAVY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-          # A dispatch may name the lanes it wants instead of every lane.
-          REQUESTED: ${{ inputs.lanes || '' }}
+          CHECK_LANE: ${{ github.event_name == 'workflow_dispatch' && inputs.check_lane || '' }}
         run: |
           set -euo pipefail
+          CHECK_LANE="${CHECK_LANE:-}"
+          if [[ -n "$CHECK_LANE" ]]; then
+            jq -e --arg lane "$CHECK_LANE" 'has($lane)' .github/ci-lanes.json > /dev/null || {
+              echo "Unknown lane: $CHECK_LANE" >&2
+              exit 1
+            }
+          fi
           lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --arg event "${EVENT:-}" --argjson heavy "${HEAVY}" '
             to_entries
             | map(select($changed == null
@@ -195,14 +203,8 @@ jobs:
             | map(select($heavy or (.value.heavy != true)))
             | map(.key)
             | if $draft then map(select(. == "lint-fmt")) else . end' .github/ci-lanes.json)"
-          if [ -n "${REQUESTED}" ]; then
-            requested="$(jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))' <<< "${REQUESTED}")"
-            unknown="$(jq -r --argjson requested "${requested}" '$requested - keys | join(", ")' .github/ci-lanes.json)"
-            if [ -n "${unknown}" ]; then
-              echo "::error::lanes input names lanes .github/ci-lanes.json does not define: ${unknown}"
-              exit 1
-            fi
-            lanes="$(jq -c --argjson requested "${requested}" 'map(select(. as $lane | $requested | index($lane)))' <<< "${lanes}")"
+          if [[ -n "$CHECK_LANE" ]]; then
+            lanes="$(jq -cn --arg lane "$CHECK_LANE" '[$lane]')"
           fi
           checks="$(jq -c --argjson lanes "${lanes}" '
             to_entries
@@ -342,7 +344,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs libclang-dev
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs attr libclang-dev
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools,cargo-deny,nextest
@@ -1028,6 +1030,41 @@ jobs:
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      - name: Run static Linux programs through dash
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+        run: |
+          # The aarch64 half of the native Linux check (#1025): the same
+          # programs built for aarch64 run at EL0 under the lane's QEMU.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/linux"
+          mkdir -p "$runtime"
+          bash linux/tests/build-fixtures.sh "$runtime/bootfs" aarch64
+          # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
+          # shellcheck disable=SC2016
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg --kernel-feature linux \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --boot-program dash --boot-program debugger --boot-program cat \
+            --no-compiler-plugin \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"' \
+            2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
+          cat linux-smoke.out
+          grep -Fqx 'arg1=3' linux-smoke.out
+          grep -Fqx 'arg2=中文' linux-smoke.out
+          grep -Fqx 'arg3=日本語' linux-smoke.out
+          grep -Fqx 'arg4=한국어' linux-smoke.out
+          grep -Fqx 'environment:ok' linux-smoke.out
+          grep -Fqx 'status:3' linux-smoke.out
+          grep -Fqx 'native Linux syscall: ok' linux-smoke.out
+          grep -Fqx 'hello:0' linux-smoke.out
+          grep -Fqx 'Hello, World!' linux-smoke.out
+          grep -Fqx 'libc:0' linux-smoke.out
+          grep -Fqx 'fault:139' linux-smoke.out
       - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
@@ -1667,6 +1704,48 @@ jobs:
           grep -Fqx 'suberr:usage: date' coreutils-smoke.out
           grep -Fqx 'usage: date' coreutils-smoke.out
           grep -Fqx after:ok coreutils-smoke.out
+      - name: Run static Linux programs through dash
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          # A kernel built with the `linux` feature starts static musl
+          # programs through the program service (#1025): one's arguments
+          # reach it intact and its stdout pipes into a WASIX program, its
+          # exit status reaches `$?`, and a fault ends it with 128 + SIGSEGV.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/linux"
+          mkdir -p "$runtime"
+          bash linux/tests/build-fixtures.sh "$runtime/bootfs" x86_64
+          # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
+          # shellcheck disable=SC2016
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --kernel-feature linux \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --boot-program dash --boot-program debugger --boot-program cat \
+            --no-compiler-plugin \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"' \
+            2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
+          cat linux-smoke.out
+          grep -Fqx 'arg1=3' linux-smoke.out
+          grep -Fqx 'arg2=中文' linux-smoke.out
+          grep -Fqx 'arg3=日本語' linux-smoke.out
+          grep -Fqx 'arg4=한국어' linux-smoke.out
+          grep -Fqx 'environment:ok' linux-smoke.out
+          grep -Fqx 'status:3' linux-smoke.out
+          grep -Fqx 'native Linux syscall: ok' linux-smoke.out
+          grep -Fqx 'hello:0' linux-smoke.out
+          grep -Fqx 'Hello, World!' linux-smoke.out
+          grep -Fqx 'libc:0' linux-smoke.out
+          grep -Fqx 'fault:139' linux-smoke.out
+      - name: Kill the guest during a btrfs write burst
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          # The kill point is drawn from a seed this step prints; a failure
+          # replays with CRASH_SEED=<seed> bash tools/fs-smoke/crash.sh x86-64 kvm.
+          bash tools/fs-smoke/crash.sh x86-64 kvm
       - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
@@ -2933,6 +3012,41 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  test-btrfs-fstests:
+    name: test-btrfs-fstests
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-fstests')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install fstests, btrfs-progs and FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            acl attr automake bc dbench dump e2fsprogs fio gawk gcc git indent \
+            libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin \
+            liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev \
+            uuid-runtime xfsprogs "linux-headers-$(uname -r)" sqlite3 \
+            libgdbm-compat-dev xfslibs-dev btrfs-progs fuse3 libclang-dev
+      - name: Build the FUSE adapter
+        working-directory: helios
+        run: cargo build --locked -p helios-btrfs --example fuse-btrfs --features test-support,write
+      - name: Run fstests against the FUSE mount
+        working-directory: helios
+        run: sudo env "PATH=$PATH" tools/btrfs/fstests/run.sh
+      - name: Preserve fstests results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-fstests-results
+          path: helios/target/fstests/results
+          if-no-files-found: warn
+          retention-days: 14
+
   test-btrfs-fuzz:
     name: test-btrfs-fuzz (${{ matrix.target }})
     needs: [changes, test-btrfs-upstream]
@@ -2976,7 +3090,7 @@ jobs:
   gate:
     name: CI result
     if: always()
-    needs: [changes, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fuzz]
+    needs: [changes, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fstests, test-btrfs-fuzz]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

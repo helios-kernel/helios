@@ -8,6 +8,7 @@ use helios_hal::cpu::Cpu;
 use helios_hal::fs::WritePosition;
 use helios_netstack::Ipv6Address;
 use thiserror::Error;
+use triomphe::Arc;
 use wasmtime::component::{Access, HasSelf, Linker, Resource};
 use wasmtime::{self, Result};
 use wasmtime_wasi_io::bytes::Bytes;
@@ -22,13 +23,16 @@ use super::bindings::filesystem::types as p3fs;
 use super::fs::{
     PreparedOpenAt, PreparedStat, execute_open, prepare_open, prepare_stat, stat_prepared,
 };
-use super::net::{TcpSocketInputStream, TcpSocketOutputStream};
+use super::net::{
+    AcceptedConnection, ListenAdoption, PendingConnect, PendingListen, TcpConnection,
+    TcpSocketInputStream, TcpSocketOutputStream, spawn_accept, spawn_listen,
+};
 use super::{
     FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network, P2OutgoingDatagramStream,
-    P2ResolveAddressStream, PendingAccept, Preview2GuestExit, TcpSocket, UdpSocket,
-    WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily,
-    WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily, has_wasi_network_rights,
-    output_is_terminal, stdin_is_terminal, wasi_tcp_bind_rights, wasi_udp_bind_rights,
+    P2ResolveAddressStream, Preview2GuestExit, TcpSocket, UdpSocket, WasiAdapterTrap,
+    WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily, WasiUdpSocketAddress,
+    WasiUdpSocketError, WasiUdpSocketFamily, has_wasi_network_rights, output_is_terminal,
+    stdin_is_terminal, wasi_tcp_bind_rights, wasi_udp_bind_rights,
 };
 use crate::wasmtime_adapter::component_host::{
     HostRuntimeState, RuntimeDeadlinePollable, StoreData,
@@ -37,40 +41,45 @@ use crate::wasmtime_adapter::store::{
     ChannelInputStream, ChannelOutputStream, SerialOutputStream, StdioOutputStream,
 };
 use crate::{
-    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, HeldPath, Namespace,
-    NetworkHandle, ProfileScope,
+    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, FsDescriptorFlags,
+    HeldPath, Namespace, NetworkHandle, ProfileScope,
 };
 
-#[cfg(test)]
-pub(crate) const PREVIEW2_LINKED_INTERFACES: &[&str] = &[
-    "wasi:io/error",
-    "wasi:io/poll",
-    "wasi:io/streams",
-    "wasi:cli/environment",
-    "wasi:cli/exit",
-    "wasi:cli/stdin",
-    "wasi:cli/stdout",
-    "wasi:cli/stderr",
-    "wasi:cli/terminal-input",
-    "wasi:cli/terminal-output",
-    "wasi:cli/terminal-stdin",
-    "wasi:cli/terminal-stdout",
-    "wasi:cli/terminal-stderr",
-    "wasi:clocks/monotonic-clock",
-    "wasi:clocks/system-clock",
-    "wasi:filesystem/preopens",
-    "wasi:filesystem/types",
-    "wasi:random/random",
-    "wasi:random/insecure",
-    "wasi:random/insecure-seed",
-    "wasi:sockets/network",
-    "wasi:sockets/instance-network",
-    "wasi:sockets/udp",
-    "wasi:sockets/udp-create-socket",
-    "wasi:sockets/tcp",
-    "wasi:sockets/tcp-create-socket",
-    "wasi:sockets/ip-name-lookup",
-];
+/// Defines [`add_to_linker`] and, for tests, [`PREVIEW2_LINKED_INTERFACES`]
+/// from one table, so the list of interfaces the preview2 linker serves is
+/// the list the code links and cannot drift from it.
+///
+/// `always` names interfaces one call links unconditionally; every other
+/// entry is linked only when the component imports its interface at 0.2.
+/// `$linker` is the name the entries use for the linker they are given.
+macro_rules! preview2_interfaces {
+    (
+        $linker:ident;
+        always [$($always:literal),+] => $always_link:expr;
+        $($name:literal => $link:expr;)+
+    ) => {
+        #[cfg(test)]
+        pub(crate) const PREVIEW2_LINKED_INTERFACES: &[&str] = &[$($always,)+ $($name),+];
+
+        pub(crate) fn add_to_linker<CpuImpl, Net, StorageImpl>(
+            $linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
+            imports: &WasiImportSet,
+        ) -> Result<()>
+        where
+            CpuImpl: Cpu + Clone,
+            Net: ComponentHostNetwork,
+            StorageImpl: crate::Storage,
+        {
+            $always_link?;
+            $(
+                if imports.has($name, "0.2") {
+                    $link?;
+                }
+            )+
+            Ok(())
+        }
+    };
+}
 
 #[cfg(test)]
 pub(crate) const PREVIEW2_WIT_PACKAGES: &[(&str, &str)] = &[
@@ -430,9 +439,20 @@ where
         };
         let now = self.now_nanos();
         match super::write_resolved(&self.file.resolved(), self.mode, &bytes, now).await {
-            Ok(end) => {
+            Ok(landed) => {
                 if let WritePosition::At(offset) = &mut self.mode {
-                    *offset = end;
+                    match landed.end() {
+                        Some(end) => *offset = end,
+                        None => {
+                            self.failure = Some(p2fs::ErrorCode::Overflow);
+                            return;
+                        }
+                    }
+                }
+                // The batch was accepted before it landed; what the
+                // filesystem could not store is lost, and the stream fails.
+                if landed.len != bytes.len() {
+                    self.failure = Some(p2fs::ErrorCode::InsufficientSpace);
                 }
             }
             Err(error) => self.failure = Some(error_code_from_p3(error)),
@@ -509,89 +529,60 @@ where
     }
 }
 
-pub(crate) fn add_to_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-    imports: &WasiImportSet,
-) -> Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    if imports.has("wasi:cli/environment", "0.2") {
-        cli_bindings::cli::environment::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:cli/exit", "0.2") {
-        cli_bindings::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/stdin", "0.2") {
-        cli_bindings::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/stdout", "0.2") {
-        cli_bindings::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/stderr", "0.2") {
-        cli_bindings::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/terminal-input", "0.2") {
-        cli_bindings::cli::terminal_input::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:cli/terminal-output", "0.2") {
-        cli_bindings::cli::terminal_output::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:cli/terminal-stdin", "0.2") {
-        cli_bindings::cli::terminal_stdin::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:cli/terminal-stdout", "0.2") {
-        cli_bindings::cli::terminal_stdout::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:cli/terminal-stderr", "0.2") {
-        cli_bindings::cli::terminal_stderr::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-
-    if imports.has("wasi:clocks/monotonic-clock", "0.2") {
-        clocks_bindings::clocks::monotonic_clock::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:clocks/wall-clock", "0.2") {
-        clocks_bindings::clocks::wall_clock::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:clocks/timezone", "0.2") {
+preview2_interfaces! {
+    linker;
+    // `wasmtime-wasi-io` serves all three of its interfaces in one call.
+    always ["wasi:io/error", "wasi:io/poll", "wasi:io/streams"]
+        => wasmtime_wasi_io::add_to_linker_async(linker);
+    "wasi:cli/environment" => cli_bindings::cli::environment::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:cli/exit" => cli_bindings::cli::exit::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:cli/stdin" => cli_bindings::cli::stdin::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:cli/stdout" => cli_bindings::cli::stdout::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:cli/stderr" => cli_bindings::cli::stderr::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:cli/terminal-input" => cli_bindings::cli::terminal_input::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:cli/terminal-output" => cli_bindings::cli::terminal_output::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:cli/terminal-stdin" => cli_bindings::cli::terminal_stdin::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:cli/terminal-stdout" => cli_bindings::cli::terminal_stdout::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:cli/terminal-stderr" => cli_bindings::cli::terminal_stderr::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:clocks/monotonic-clock" => clocks_bindings::clocks::monotonic_clock::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:clocks/wall-clock" => clocks_bindings::clocks::wall_clock::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:clocks/timezone" => {
         // Every member is gated behind the `clocks-timezone` unstable
         // feature; opt in or the interface links with no functions.
         let mut options = clocks_bindings::clocks::timezone::LinkOptions::default();
@@ -599,83 +590,56 @@ where
         clocks_bindings::clocks::timezone::add_to_linker::<
             _,
             HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, &options, |state| state)?;
-    }
-
-    if imports.has("wasi:filesystem/preopens", "0.2") {
-        filesystem_bindings::filesystem::preopens::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:filesystem/types", "0.2") {
-        filesystem_bindings::filesystem::types::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-
-    if imports.has("wasi:random/random", "0.2") {
-        random_bindings::random::random::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:random/insecure", "0.2") {
-        random_bindings::random::insecure::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:random/insecure-seed", "0.2") {
-        random_bindings::random::insecure_seed::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:sockets/network", "0.2") {
-        sockets_bindings::sockets::network::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, &Default::default(), |state| state)?;
-    }
-    if imports.has("wasi:sockets/instance-network", "0.2") {
-        sockets_bindings::sockets::instance_network::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:sockets/udp", "0.2") {
-        sockets_bindings::sockets::udp::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:sockets/udp-create-socket", "0.2") {
-        sockets_bindings::sockets::udp_create_socket::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:sockets/tcp", "0.2") {
-        sockets_bindings::sockets::tcp::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:sockets/tcp-create-socket", "0.2") {
-        sockets_bindings::sockets::tcp_create_socket::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    if imports.has("wasi:sockets/ip-name-lookup", "0.2") {
-        sockets_bindings::sockets::ip_name_lookup::add_to_linker::<
-            _,
-            HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-        >(linker, |state| state)?;
-    }
-    Ok(())
+        >(linker, &options, |state| state)
+    };
+    "wasi:filesystem/preopens" => filesystem_bindings::filesystem::preopens::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:filesystem/types" => filesystem_bindings::filesystem::types::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:random/random" => random_bindings::random::random::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:random/insecure" => random_bindings::random::insecure::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:random/insecure-seed" => random_bindings::random::insecure_seed::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:sockets/network" => sockets_bindings::sockets::network::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, &Default::default(), |state| state);
+    "wasi:sockets/instance-network" => sockets_bindings::sockets::instance_network::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:sockets/udp" => sockets_bindings::sockets::udp::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:sockets/udp-create-socket" => sockets_bindings::sockets::udp_create_socket::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:sockets/tcp" => sockets_bindings::sockets::tcp::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:sockets/tcp-create-socket" => sockets_bindings::sockets::tcp_create_socket::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
+    "wasi:sockets/ip-name-lookup" => sockets_bindings::sockets::ip_name_lookup::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
+    >(linker, |state| state);
 }
 
 #[wasmtime_wasi_io::async_trait]
@@ -796,24 +760,16 @@ impl Pollable for TcpSocket {
     /// is still waiting for a connection turns that contract into a spin —
     /// the guest retries `accept`, gets `would-block`, and polls again — so
     /// readiness has to cover every in-flight operation, not just connect.
+    ///
+    /// Each operation's task answers through a oneshot the socket keeps,
+    /// and this parks on those receivers directly: a receiver registers
+    /// the waker before it reports the answer missing, so an answer that
+    /// lands between the check and the park still wakes the guest, and
+    /// one that landed before is taken at once. wasi-io gives this
+    /// future the socket exclusively, one per poll however many
+    /// pollables the guest subscribed on it.
     async fn ready(&mut self) {
-        loop {
-            // Armed before the socket state is read: a background
-            // connect/listen/accept broadcasts its result to every
-            // pollable and banks nothing, so a wait created after the
-            // task finished would park until the next operation.
-            let settled = self.ready.notified();
-            {
-                let state = self.inner.lock();
-                let in_flight = state.connect_in_progress
-                    || state.listen_in_progress
-                    || (state.accept_in_progress && state.accept_result.is_none());
-                if !in_flight {
-                    return;
-                }
-            }
-            settled.await;
-        }
+        core::future::poll_fn(|cx| self.poll_settled(cx)).await;
     }
 }
 
@@ -1334,12 +1290,14 @@ where
         path: &str,
     ) -> Result<Self::RemoveDirectoryAtPrepared> {
         let target = store.p2_descriptor(&descriptor);
+        let now = store.now_nanos();
         Ok((|| {
             let (base, namespace) = target?;
             super::PreparedRemoveDirectoryAt::new(
                 namespace,
                 base.grant().map_err(error_code_from_p3)?,
                 path,
+                now,
             )
             .map_err(error_code_from_p3)
         })())
@@ -1431,12 +1389,14 @@ where
         path: &str,
     ) -> Result<Self::UnlinkFileAtPrepared> {
         let target = store.p2_descriptor(&descriptor);
+        let now = store.now_nanos();
         Ok((|| {
             let (base, namespace) = target?;
             super::PreparedUnlinkFileAt::new(
                 namespace,
                 base.grant().map_err(error_code_from_p3)?,
                 path,
+                now,
             )
             .map_err(error_code_from_p3)
         })())
@@ -1466,7 +1426,7 @@ where
             path_flags_to_p3(path_flags),
             path,
             open_flags_to_p3(open_flags),
-            descriptor_flags_to_p3(flags),
+            descriptor_flags_from_p2(flags),
         ))
     }
 
@@ -1594,7 +1554,7 @@ where
     ) -> Result<core::result::Result<p2fs::DescriptorFlags, p2fs::ErrorCode>> {
         Ok(self
             .p2_descriptor(&descriptor)
-            .map(|(descriptor, _)| descriptor_flags_from_p3(descriptor.flags)))
+            .map(|(descriptor, _)| descriptor_flags_to_p2(descriptor.flags)))
     }
 
     fn get_type(
@@ -1930,8 +1890,8 @@ where
             return Ok(Err(p2udp::ErrorCode::AccessDenied));
         }
         let _ = self.table.get(&network)?;
-        let socket = self.table.get(&socket)?.clone();
-        let local_address = match parse_p2_udp_socket_address(local_address, socket.family()) {
+        let family = self.table.get(&socket)?.family();
+        let local_address = match parse_p2_udp_socket_address(local_address, family) {
             Ok(address) => address,
             Err(error) => return Ok(Err(map_p2_udp_error(error))),
         };
@@ -1944,7 +1904,11 @@ where
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(p2udp::ErrorCode::Unknown));
         };
-        Ok(socket
+        // A p2 call holds the store, and the socket with it, until it
+        // returns.
+        Ok(self
+            .table
+            .get_mut(&socket)?
             .start_bind_p2(&service, local_address)
             .await
             .map_err(map_p2_udp_error))
@@ -1954,7 +1918,7 @@ where
         &mut self,
         socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<(), p2udp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.finish_bind_p2().map_err(map_p2_udp_error))
     }
 
@@ -1971,9 +1935,9 @@ where
             p2udp::ErrorCode,
         >,
     > {
-        let socket = self.table.get(&socket_resource)?.clone();
+        let family = self.table.get(&socket_resource)?.family();
         let remote_address = match remote_address {
-            Some(address) => match parse_p2_udp_socket_address(address, socket.family()) {
+            Some(address) => match parse_p2_udp_socket_address(address, family) {
                 Ok(address) => Some(address),
                 Err(error) => return Ok(Err(map_p2_udp_error(error))),
             },
@@ -1982,9 +1946,24 @@ where
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(p2udp::ErrorCode::Unknown));
         };
-        let (incoming, outgoing) = match socket.open_p2_streams(&service, remote_address) {
-            Ok(streams) => streams,
+        let remote_address = match self
+            .table
+            .get_mut(&socket_resource)?
+            .open_p2_streams(&service, remote_address)
+        {
+            Ok(remote_address) => remote_address,
             Err(error) => return Ok(Err(map_p2_udp_error(error))),
+        };
+        // The streams reach their socket through its entry: as its table
+        // children they cannot outlive it.
+        let incoming = P2IncomingDatagramStream {
+            socket: Resource::new_borrow(socket_resource.rep()),
+            remote_address,
+        };
+        let outgoing = P2OutgoingDatagramStream {
+            socket: Resource::new_borrow(socket_resource.rep()),
+            remote_address,
+            check_send_permit_count: 0,
         };
         let incoming = self.table.push_child(incoming, &socket_resource)?;
         let outgoing = self.table.push_child(outgoing, &socket_resource)?;
@@ -1995,7 +1974,7 @@ where
         &mut self,
         socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<p2udp::IpSocketAddress, p2udp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .local_address()
             .map(format_p2_udp_socket_address)
@@ -2006,7 +1985,7 @@ where
         &mut self,
         socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<p2udp::IpSocketAddress, p2udp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .remote_address()
             .map(format_p2_udp_socket_address)
@@ -2014,7 +1993,7 @@ where
     }
 
     fn address_family(&mut self, socket: Resource<UdpSocket>) -> Result<p2udp::IpAddressFamily> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(format_p2_udp_family(socket.family()))
     }
 
@@ -2022,7 +2001,7 @@ where
         &mut self,
         socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<u8, p2udp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.unicast_hop_limit().map_err(map_p2_udp_error))
     }
 
@@ -2034,7 +2013,7 @@ where
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(p2udp::ErrorCode::Unknown));
         };
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .set_unicast_hop_limit(&service, value)
             .map_err(map_p2_udp_error))
@@ -2044,7 +2023,7 @@ where
         &mut self,
         socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<u64, p2udp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.receive_buffer_size().map_err(map_p2_udp_error))
     }
 
@@ -2053,7 +2032,7 @@ where
         socket: Resource<UdpSocket>,
         value: u64,
     ) -> Result<core::result::Result<(), p2udp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .set_receive_buffer_size(value)
             .map_err(map_p2_udp_error))
@@ -2063,7 +2042,7 @@ where
         &mut self,
         socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<u64, p2udp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.send_buffer_size().map_err(map_p2_udp_error))
     }
 
@@ -2072,7 +2051,7 @@ where
         socket: Resource<UdpSocket>,
         value: u64,
     ) -> Result<core::result::Result<(), p2udp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.set_send_buffer_size(value).map_err(map_p2_udp_error))
     }
 
@@ -2102,8 +2081,12 @@ where
         };
         let (socket, remote_address) = {
             let stream = self.table.get(&resource)?;
-            (stream.socket.clone(), stream.remote_address)
+            (
+                Resource::new_borrow(stream.socket.rep()),
+                stream.remote_address,
+            )
         };
+        let socket: &mut UdpSocket = self.table.get_mut(&socket)?;
         let max_results = usize::try_from(max_results).unwrap_or(usize::MAX);
         if max_results == 0 {
             return Ok(Ok(Vec::new()));
@@ -2138,9 +2121,9 @@ where
 
     fn drop(&mut self, resource: Resource<p2udp::IncomingDatagramStream>) -> Result<()> {
         if let Some(service) = self.runtime_state.network_service() {
+            let socket = Resource::new_borrow(self.table.get(&resource)?.socket.rep());
             self.table
-                .get(&resource)?
-                .socket
+                .get_mut::<UdpSocket>(&socket)?
                 .release_stream_handle(&service);
         }
         delete_resource(self, resource)
@@ -2180,8 +2163,12 @@ where
                 return Err(wasmtime::Error::new(WasiAdapterTrap::UdpSendPermitExceeded));
             }
             stream.check_send_permit_count -= datagrams.len() as u64;
-            (stream.socket.clone(), stream.remote_address)
+            (
+                Resource::new_borrow(stream.socket.rep()),
+                stream.remote_address,
+            )
         };
+        let socket: &mut UdpSocket = self.table.get_mut(&socket)?;
 
         let mut sent = 0_u64;
         for datagram in datagrams {
@@ -2230,9 +2217,9 @@ where
 
     fn drop(&mut self, resource: Resource<p2udp::OutgoingDatagramStream>) -> Result<()> {
         if let Some(service) = self.runtime_state.network_service() {
+            let socket = Resource::new_borrow(self.table.get(&resource)?.socket.rep());
             self.table
-                .get(&resource)?
-                .socket
+                .get_mut::<UdpSocket>(&socket)?
                 .release_stream_handle(&service);
         }
         delete_resource(self, resource)
@@ -2536,7 +2523,7 @@ fn p2_record_kernel_profile<CpuImpl, Net, StorageImpl>(
 fn p2_tcp_stream_pair<CpuImpl, Net, StorageImpl>(
     store: &mut StoreData<CpuImpl, Net, StorageImpl>,
     socket_resource: &Resource<TcpSocket>,
-    socket: TcpSocket,
+    connection: Arc<TcpConnection>,
 ) -> Result<(Resource<p2tcp::InputStream>, Resource<p2tcp::OutputStream>)>
 where
     CpuImpl: Cpu + Clone,
@@ -2554,11 +2541,14 @@ where
         }));
     };
     let input = store.table.push_child(
-        Box::new(TcpSocketInputStream::new(socket.clone(), service.clone())) as DynInputStream,
+        Box::new(TcpSocketInputStream::new(
+            connection.clone(),
+            service.clone(),
+        )) as DynInputStream,
         socket_resource,
     )?;
     let output = store.table.push_child(
-        Box::new(TcpSocketOutputStream::new(socket, service)) as DynOutputStream,
+        Box::new(TcpSocketOutputStream::new(connection, service)) as DynOutputStream,
         socket_resource,
     )?;
     p2_record_kernel_profile(&store.runtime_state, &store.cpu, "tcp-stream-pair", started);
@@ -2586,8 +2576,8 @@ where
         local_address: p2tcp::IpSocketAddress,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
         let _ = self.table.get(&network)?;
-        let socket = self.table.get(&socket)?.clone();
-        let local_address = match parse_p2_tcp_socket_address(local_address, socket.family()) {
+        let family = self.table.get(&socket)?.family();
+        let local_address = match parse_p2_tcp_socket_address(local_address, family) {
             Ok(address) => address,
             Err(error) => return Ok(Err(error)),
         };
@@ -2597,7 +2587,9 @@ where
         ) {
             return Ok(Err(p2tcp::ErrorCode::AccessDenied));
         }
-        Ok(socket
+        Ok(self
+            .table
+            .get_mut(&socket)?
             .bind_local(local_address)
             .map_err(map_p2_tcp_socket_error))
     }
@@ -2606,7 +2598,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .local_address()
             .map(drop)
@@ -2623,64 +2615,50 @@ where
             return Ok(Err(p2tcp::ErrorCode::AccessDenied));
         }
         let _ = self.table.get(&network)?;
-        let socket = self.table.get(&socket)?.clone();
-        let remote_address = match parse_p2_tcp_socket_address(remote_address, socket.family()) {
+        let family = self.table.get(&socket)?.family();
+        let remote_address = match parse_p2_tcp_socket_address(remote_address, family) {
             Ok(address) => address,
             Err(error) => return Ok(Err(error)),
         };
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(p2tcp::ErrorCode::Unknown));
         };
-        let (inner, ready, local_port, hop_limit) = {
-            let mut state = socket.inner.lock();
-            if state.stream.is_some() || state.connect_in_progress || state.connect_result.is_some()
+        let (retire, local_port, hop_limit) = {
+            let socket = self.table.get_mut(&socket)?;
+            socket.settle();
+            if socket.connection.is_some()
+                || socket.pending_connect.is_some()
+                || socket.connect_result.is_some()
             {
                 return Ok(Err(p2tcp::ErrorCode::InvalidState));
             }
-            state.connect_in_progress = true;
             (
-                socket.inner.clone(),
-                socket.ready.clone(),
-                state.local_address.map_or(0, |address| address.port),
-                state.hop_limit,
+                socket.retire.clone(),
+                socket.local_address.map_or(0, |address| address.port),
+                socket.hop_limit,
             )
         };
         let profile_cpu = self.cpu.clone();
         let profile_runtime_state = self.runtime_state.clone();
-        let spawned = self.spawner().try_spawn_detached({
-            let inner = inner.clone();
-            async move {
-                let started = profile_cpu.now().ticks();
-                let result = service
-                    .tcp_connect_address(
-                        remote_address.address.network_address(),
-                        remote_address.port,
-                        local_port,
-                        hop_limit,
-                        u64::MAX,
-                    )
-                    .await;
-                p2_record_kernel_profile(
-                    &profile_runtime_state,
-                    &profile_cpu,
-                    "tcp-connect",
-                    started,
-                );
-                let mut state = inner.lock();
-                state.connect_in_progress = false;
-                state.connect_result = Some(match result {
-                    Ok(stream) => {
-                        state.stream = Some(stream.into_raw());
-                        state.remote_address = Some(remote_address);
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                });
-                ready.notify_all();
-            }
+        let (answer, receiver) = futures::channel::oneshot::channel();
+        let spawned = self.spawner().try_spawn_detached(async move {
+            let started = profile_cpu.now().ticks();
+            let result = service
+                .tcp_connect_address(
+                    remote_address.address.network_address(),
+                    remote_address.port,
+                    local_port,
+                    hop_limit,
+                    u64::MAX,
+                )
+                .await
+                .map(|stream| TcpConnection::new(retire, stream.into_raw()));
+            p2_record_kernel_profile(&profile_runtime_state, &profile_cpu, "tcp-connect", started);
+            // A socket that died meanwhile drops the connection, which
+            // retires the stream.
+            let _ = answer.send(result);
         });
         if let Err(error) = spawned {
-            inner.lock().connect_in_progress = false;
             tracing::warn!(
                 target: "helios_kernel::program",
                 %error,
@@ -2688,6 +2666,10 @@ where
             );
             return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
         }
+        self.table.get_mut(&socket)?.pending_connect = Some(PendingConnect {
+            answer: receiver,
+            remote_address,
+        });
         Ok(Ok(()))
     }
 
@@ -2700,45 +2682,33 @@ where
             p2tcp::ErrorCode,
         >,
     > {
-        let socket = self.table.get(&socket_resource)?.clone();
-        {
-            let started = self.cpu.now().ticks();
-            let mut state = socket.inner.lock();
-            if state.connect_in_progress {
-                p2_record_kernel_profile(
-                    &self.runtime_state,
-                    &self.cpu,
-                    "tcp-finish-connect-would-block",
-                    started,
-                );
-                return Ok(Err(p2tcp::ErrorCode::WouldBlock));
-            }
-            let Some(result) = state.connect_result.take() else {
-                p2_record_kernel_profile(
-                    &self.runtime_state,
-                    &self.cpu,
+        let started = self.cpu.now().ticks();
+        let socket = self.table.get_mut(&socket_resource)?;
+        socket.settle();
+        let (phase, outcome) = if socket.pending_connect.is_some() {
+            (
+                "tcp-finish-connect-would-block",
+                Err(p2tcp::ErrorCode::WouldBlock),
+            )
+        } else {
+            match socket.connect_result.take() {
+                None => (
                     "tcp-finish-connect-not-in-progress",
-                    started,
-                );
-                return Ok(Err(p2tcp::ErrorCode::NotInProgress));
-            };
-            if let Err(error) = result {
-                p2_record_kernel_profile(
-                    &self.runtime_state,
-                    &self.cpu,
+                    Err(p2tcp::ErrorCode::NotInProgress),
+                ),
+                Some(Err(error)) => (
                     "tcp-finish-connect-error",
-                    started,
-                );
-                return Ok(Err(map_p2_tcp_core_error(error)));
+                    Err(map_p2_tcp_core_error(error)),
+                ),
+                Some(Ok(connection)) => ("tcp-finish-connect", Ok(connection)),
             }
-            p2_record_kernel_profile(
-                &self.runtime_state,
-                &self.cpu,
-                "tcp-finish-connect",
-                started,
-            );
-        }
-        let (input, output) = p2_tcp_stream_pair(self, &socket_resource, socket)?;
+        };
+        p2_record_kernel_profile(&self.runtime_state, &self.cpu, phase, started);
+        let connection = match outcome {
+            Ok(connection) => connection,
+            Err(error) => return Ok(Err(error)),
+        };
+        let (input, output) = p2_tcp_stream_pair(self, &socket_resource, connection)?;
         Ok(Ok((input, output)))
     }
 
@@ -2746,69 +2716,30 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let _ = self.table.get(&socket)?;
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(p2tcp::ErrorCode::Unknown));
         };
-        let (inner, ready, local_address, listen_backlog, hop_limit) = {
-            let mut state = socket.inner.lock();
-            if state.stream.is_some()
-                || state.listener.is_some()
-                || state.connect_in_progress
-                || state.listen_in_progress
-                || state.listen_result.is_some()
-            {
+        let (request, retire) = {
+            let socket = self.table.get_mut(&socket)?;
+            if !socket.may_listen() {
                 return Ok(Err(p2tcp::ErrorCode::InvalidState));
             }
-            let local_address = state.local_address.unwrap_or(WasiTcpSocketAddress {
-                address: state.family.unspecified_address(),
-                port: 0,
-            });
-            if !has_wasi_network_rights(
-                self.process_authority(),
-                wasi_tcp_bind_rights(local_address.port),
-            ) {
-                return Ok(Err(p2tcp::ErrorCode::AccessDenied));
-            }
-            state.listen_in_progress = true;
-            (
-                socket.inner.clone(),
-                socket.ready.clone(),
-                local_address,
-                state.listen_backlog,
-                state.hop_limit,
-            )
+            (socket.listen_request(), socket.retire.clone())
         };
-        let spawned = self.spawner().try_spawn_detached({
-            let inner = inner.clone();
-            async move {
-                let result = service
-                    .tcp_listen(
-                        local_address.address.network_address(),
-                        local_address.port,
-                        listen_backlog,
-                        hop_limit,
-                    )
-                    .await
-                    .map(|listener| crate::TcpListener {
-                        listener: listener.listener.into_raw(),
-                        local_port: listener.local_port,
-                    });
-                let mut state = inner.lock();
-                state.listen_in_progress = false;
-                state.listen_result = Some(result);
-                ready.notify_all();
-            }
-        });
-        if let Err(error) = spawned {
-            inner.lock().listen_in_progress = false;
-            tracing::warn!(
-                target: "helios_kernel::program",
-                %error,
-                "refused a tcp listen task: the executor's instance share is full"
-            );
-            return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
+        if !has_wasi_network_rights(
+            self.process_authority(),
+            wasi_tcp_bind_rights(request.local_address.port),
+        ) {
+            return Ok(Err(p2tcp::ErrorCode::AccessDenied));
         }
+        let Ok(answer) = spawn_listen(self.spawner(), service, retire, request, None) else {
+            return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
+        };
+        self.table.get_mut(&socket)?.pending_listen = Some(PendingListen {
+            answer,
+            adoption: ListenAdoption::Finish,
+        });
         Ok(Ok(()))
     }
 
@@ -2816,25 +2747,21 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
-        let mut state = socket.inner.lock();
-        if state.listen_in_progress {
+        let socket = self.table.get_mut(&socket)?;
+        socket.settle();
+        if socket.pending_listen.is_some() {
             return Ok(Err(p2tcp::ErrorCode::WouldBlock));
         }
-        let Some(result) = state.listen_result.take() else {
+        let Some(result) = socket.listen_result.take() else {
             return Ok(Err(p2tcp::ErrorCode::NotInProgress));
         };
-        let listener = match result {
-            Ok(listener) => listener,
-            Err(error) => return Ok(Err(map_p2_tcp_core_error(error))),
-        };
-        state.listener = Some(listener.listener);
-        let family = state.family;
-        state.local_address.get_or_insert(WasiTcpSocketAddress {
-            address: family.unspecified_address(),
-            port: listener.local_port,
-        });
-        Ok(Ok(()))
+        match result {
+            Ok(listener) => {
+                socket.adopt_listener(listener);
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(map_p2_tcp_core_error(error))),
+        }
     }
 
     fn accept(
@@ -2853,38 +2780,45 @@ where
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(p2tcp::ErrorCode::Unknown));
         };
-        let socket = self.table.get(&socket_resource)?.clone();
-        let pending = {
-            let mut state = socket.inner.lock();
-            if let Some(result) = state.accept_result.take() {
-                let accepted_socket = match result {
-                    Ok(accepted_socket) => accepted_socket,
-                    Err(error) => return Ok(Err(map_p2_tcp_core_error(error))),
-                };
-                drop(state);
-                let accepted_resource = self.table.push_child(accepted_socket, &socket_resource)?;
-                let accepted_socket = self.table.get(&accepted_resource)?.clone();
-                let (input, output) =
-                    p2_tcp_stream_pair(self, &accepted_resource, accepted_socket)?;
-                return Ok(Ok((accepted_resource, input, output)));
-            }
-            if state.accept_in_progress {
-                return Ok(Err(p2tcp::ErrorCode::WouldBlock));
-            }
-            let Some(listener) = state.listener else {
-                return Ok(Err(p2tcp::ErrorCode::InvalidState));
+        let socket = self.table.get_mut(&socket_resource)?;
+        socket.settle();
+        if let Some(result) = socket.accept_result.take() {
+            let accepted: AcceptedConnection = match result {
+                Ok(accepted) => accepted,
+                Err(error) => return Ok(Err(map_p2_tcp_core_error(error))),
             };
-            let Some(pending) = PendingAccept::start(&socket, &mut state, service, listener) else {
-                return Err(wasmtime::Error::new(crate::ProgramExecError {
-                    kind: crate::ProgramExecErrorKind::Internal,
-                    detail: crate::ProgramExecErrorDetail::InternalInvariant,
-                }));
-            };
-            pending
-        };
-        if pending.spawn(self.spawner()).is_err() {
-            return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
+            let (accepted, connection) =
+                TcpSocket::accepted(socket.retire.clone(), socket.family, accepted);
+            let accepted_resource = self.table.push_child(accepted, &socket_resource)?;
+            let (input, output) = p2_tcp_stream_pair(self, &accepted_resource, connection)?;
+            return Ok(Ok((accepted_resource, input, output)));
         }
+        if socket.pending_accept.is_some() {
+            return Ok(Err(p2tcp::ErrorCode::WouldBlock));
+        }
+        let Some(listener) = socket.listener.clone() else {
+            return Ok(Err(p2tcp::ErrorCode::InvalidState));
+        };
+        // `listener` and `local_address` are set together, and the
+        // accepted socket inherits the listening one's address.
+        let Some(local_address) = socket.local_address else {
+            return Err(wasmtime::Error::new(crate::ProgramExecError {
+                kind: crate::ProgramExecErrorKind::Internal,
+                detail: crate::ProgramExecErrorDetail::InternalInvariant,
+            }));
+        };
+        let (retire, family) = (socket.retire.clone(), socket.family);
+        let Ok(answer) = spawn_accept(
+            self.spawner(),
+            service,
+            retire,
+            listener,
+            family,
+            local_address,
+        ) else {
+            return Ok(Err(p2tcp::ErrorCode::OutOfMemory));
+        };
+        self.table.get_mut(&socket_resource)?.pending_accept = Some(answer);
         Ok(Err(p2tcp::ErrorCode::WouldBlock))
     }
 
@@ -2892,7 +2826,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<p2tcp::IpSocketAddress, p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .local_address()
             .map(format_p2_tcp_socket_address)
@@ -2903,7 +2837,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<p2tcp::IpSocketAddress, p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .remote_address()
             .map(format_p2_tcp_socket_address)
@@ -2911,12 +2845,12 @@ where
     }
 
     fn is_listening(&mut self, socket: Resource<TcpSocket>) -> Result<bool> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.is_listening())
     }
 
     fn address_family(&mut self, socket: Resource<TcpSocket>) -> Result<p2tcp::IpAddressFamily> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(format_p2_tcp_family(socket.family()))
     }
 
@@ -2925,7 +2859,7 @@ where
         socket: Resource<TcpSocket>,
         value: u64,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .set_listen_backlog_size(value)
             .map_err(map_p2_tcp_socket_error))
@@ -2935,7 +2869,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<bool, p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.keep_alive_enabled().map_err(map_p2_tcp_socket_error))
     }
 
@@ -2944,7 +2878,7 @@ where
         socket: Resource<TcpSocket>,
         value: bool,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .set_keep_alive_enabled(value)
             .map_err(map_p2_tcp_socket_error))
@@ -2954,7 +2888,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<p2tcp::Duration, p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .keep_alive_idle_time()
             .map_err(map_p2_tcp_socket_error))
@@ -2965,7 +2899,7 @@ where
         socket: Resource<TcpSocket>,
         value: p2tcp::Duration,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .set_keep_alive_idle_time(value)
             .map_err(map_p2_tcp_socket_error))
@@ -2975,7 +2909,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<p2tcp::Duration, p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .keep_alive_interval()
             .map_err(map_p2_tcp_socket_error))
@@ -2986,7 +2920,7 @@ where
         socket: Resource<TcpSocket>,
         value: p2tcp::Duration,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .set_keep_alive_interval(value)
             .map_err(map_p2_tcp_socket_error))
@@ -2996,7 +2930,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u32, p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.keep_alive_count().map_err(map_p2_tcp_socket_error))
     }
 
@@ -3005,7 +2939,7 @@ where
         socket: Resource<TcpSocket>,
         value: u32,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .set_keep_alive_count(value)
             .map_err(map_p2_tcp_socket_error))
@@ -3015,7 +2949,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u8, p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.hop_limit().map_err(map_p2_tcp_socket_error))
     }
 
@@ -3024,7 +2958,7 @@ where
         socket: Resource<TcpSocket>,
         value: u8,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(p2tcp::ErrorCode::Unknown));
         };
@@ -3037,7 +2971,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u64, p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .receive_buffer_size()
             .map_err(map_p2_tcp_socket_error))
@@ -3048,7 +2982,7 @@ where
         socket: Resource<TcpSocket>,
         value: u64,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .set_receive_buffer_size(value)
             .map_err(map_p2_tcp_socket_error))
@@ -3058,7 +2992,7 @@ where
         &mut self,
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u64, p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket.send_buffer_size().map_err(map_p2_tcp_socket_error))
     }
 
@@ -3067,7 +3001,7 @@ where
         socket: Resource<TcpSocket>,
         value: u64,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        let socket = self.table.get(&socket)?.clone();
+        let socket = self.table.get_mut(&socket)?;
         Ok(socket
             .set_send_buffer_size(value)
             .map_err(map_p2_tcp_socket_error))
@@ -3084,21 +3018,23 @@ where
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
         match shutdown_type {
             p2tcp::ShutdownType::Receive => {
-                let socket = self.table.get(&socket)?.clone();
+                let socket = self.table.get_mut(&socket)?;
                 Ok(socket.shutdown_receive().map_err(map_p2_tcp_socket_error))
             }
             p2tcp::ShutdownType::Send => {
                 let Some(service) = self.runtime_state.network_service() else {
                     return Ok(Err(p2tcp::ErrorCode::Unknown));
                 };
-                let socket = self.table.get(&socket)?.clone();
-                let stream = match socket.shutdown_send_state() {
-                    Ok(value) => value,
+                let socket = self.table.get_mut(&socket)?;
+                let connection = match socket.shutdown_send() {
+                    Ok(connection) => connection,
                     Err(error) => return Ok(Err(map_p2_tcp_socket_error(error))),
                 };
+                // The task holds the connection, so the stream it shuts
+                // stays open until the FIN is queued.
                 if let Err(error) = self.spawner().try_spawn_detached(async move {
                     let _ = service
-                        .tcp_shutdown_send(crate::NetworkHandle::from_raw(stream))
+                        .tcp_shutdown_send(crate::NetworkHandle::from_raw(connection.stream()))
                         .await;
                 }) {
                     tracing::warn!(
@@ -3114,17 +3050,17 @@ where
                 let Some(service) = self.runtime_state.network_service() else {
                     return Ok(Err(p2tcp::ErrorCode::Unknown));
                 };
-                let socket = self.table.get(&socket)?.clone();
+                let socket = self.table.get_mut(&socket)?;
                 if let Err(error) = socket.shutdown_receive() {
                     return Ok(Err(map_p2_tcp_socket_error(error)));
                 }
-                let stream = match socket.shutdown_send_state() {
-                    Ok(value) => value,
+                let connection = match socket.shutdown_send() {
+                    Ok(connection) => connection,
                     Err(error) => return Ok(Err(map_p2_tcp_socket_error(error))),
                 };
                 if let Err(error) = self.spawner().try_spawn_detached(async move {
                     let _ = service
-                        .tcp_shutdown_send(crate::NetworkHandle::from_raw(stream))
+                        .tcp_shutdown_send(crate::NetworkHandle::from_raw(connection.stream()))
                         .await;
                 }) {
                     tracing::warn!(
@@ -3141,8 +3077,8 @@ where
 
     fn drop(&mut self, resource: Resource<TcpSocket>) -> Result<()> {
         // Deleting the handle is the whole of it: the stream is owned by
-        // `TcpSocketState`, which retires it when the last clone of this
-        // socket goes away.
+        // its `TcpConnection`, which retires it when the last stream over
+        // it goes too.
         self.table.delete(resource)?;
         Ok(())
     }
@@ -3193,10 +3129,9 @@ where
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(p2lookup::ErrorCode::TemporaryResolverFailure));
         };
-        let stream = P2ResolveAddressStream::pending();
-        let task_stream = stream.clone();
+        let (stream, completion) = P2ResolveAddressStream::pending();
         if let Err(error) = self.spawner().try_spawn_detached(async move {
-            task_stream.complete(service.dns_resolve(&name, u64::MAX).await);
+            completion.complete(service.dns_resolve(&name, u64::MAX).await);
         }) {
             tracing::warn!(
                 target: "helios_kernel::program",
@@ -3277,6 +3212,10 @@ fn descriptor_type_from_kind(kind: FsNodeKind) -> p2fs::DescriptorType {
         FsNodeKind::Directory => p2fs::DescriptorType::Directory,
         FsNodeKind::File => p2fs::DescriptorType::RegularFile,
         FsNodeKind::Symlink => p2fs::DescriptorType::SymbolicLink,
+        FsNodeKind::CharacterDevice => p2fs::DescriptorType::CharacterDevice,
+        FsNodeKind::BlockDevice => p2fs::DescriptorType::BlockDevice,
+        FsNodeKind::Fifo => p2fs::DescriptorType::Fifo,
+        FsNodeKind::Socket => p2fs::DescriptorType::Socket,
     }
 }
 
@@ -3293,50 +3232,45 @@ fn descriptor_type_from_p3(kind: p3fs::DescriptorType) -> p2fs::DescriptorType {
     }
 }
 
-fn descriptor_flags_from_p3(flags: p3fs::DescriptorFlags) -> p2fs::DescriptorFlags {
-    let mut result = p2fs::DescriptorFlags::empty();
-    if flags.contains(p3fs::DescriptorFlags::READ) {
-        result |= p2fs::DescriptorFlags::READ;
-    }
-    if flags.contains(p3fs::DescriptorFlags::WRITE) {
-        result |= p2fs::DescriptorFlags::WRITE;
-    }
-    if flags.contains(p3fs::DescriptorFlags::FILE_INTEGRITY_SYNC) {
-        result |= p2fs::DescriptorFlags::FILE_INTEGRITY_SYNC;
-    }
-    if flags.contains(p3fs::DescriptorFlags::DATA_INTEGRITY_SYNC) {
-        result |= p2fs::DescriptorFlags::DATA_INTEGRITY_SYNC;
-    }
-    if flags.contains(p3fs::DescriptorFlags::REQUESTED_WRITE_SYNC) {
-        result |= p2fs::DescriptorFlags::REQUESTED_WRITE_SYNC;
-    }
-    if flags.contains(p3fs::DescriptorFlags::MUTATE_DIRECTORY) {
-        result |= p2fs::DescriptorFlags::MUTATE_DIRECTORY;
-    }
-    result
+/// The `wasi:filesystem@0.2` `descriptor-flags` bit that names each
+/// node-handle flag.
+const P2_DESCRIPTOR_FLAGS: [(p2fs::DescriptorFlags, FsDescriptorFlags); 6] = [
+    (p2fs::DescriptorFlags::READ, FsDescriptorFlags::READ),
+    (p2fs::DescriptorFlags::WRITE, FsDescriptorFlags::WRITE),
+    (
+        p2fs::DescriptorFlags::FILE_INTEGRITY_SYNC,
+        FsDescriptorFlags::FILE_INTEGRITY_SYNC,
+    ),
+    (
+        p2fs::DescriptorFlags::DATA_INTEGRITY_SYNC,
+        FsDescriptorFlags::DATA_INTEGRITY_SYNC,
+    ),
+    (
+        p2fs::DescriptorFlags::REQUESTED_WRITE_SYNC,
+        FsDescriptorFlags::REQUESTED_WRITE_SYNC,
+    ),
+    (
+        p2fs::DescriptorFlags::MUTATE_DIRECTORY,
+        FsDescriptorFlags::MUTATE_DIRECTORY,
+    ),
+];
+
+fn descriptor_flags_to_p2(flags: FsDescriptorFlags) -> p2fs::DescriptorFlags {
+    P2_DESCRIPTOR_FLAGS
+        .iter()
+        .filter(|(_, node)| flags.contains(*node))
+        .fold(p2fs::DescriptorFlags::empty(), |result, (p2, _)| {
+            result | *p2
+        })
 }
 
-fn descriptor_flags_to_p3(flags: p2fs::DescriptorFlags) -> p3fs::DescriptorFlags {
-    let mut result = p3fs::DescriptorFlags::empty();
-    if flags.contains(p2fs::DescriptorFlags::READ) {
-        result |= p3fs::DescriptorFlags::READ;
-    }
-    if flags.contains(p2fs::DescriptorFlags::WRITE) {
-        result |= p3fs::DescriptorFlags::WRITE;
-    }
-    if flags.contains(p2fs::DescriptorFlags::FILE_INTEGRITY_SYNC) {
-        result |= p3fs::DescriptorFlags::FILE_INTEGRITY_SYNC;
-    }
-    if flags.contains(p2fs::DescriptorFlags::DATA_INTEGRITY_SYNC) {
-        result |= p3fs::DescriptorFlags::DATA_INTEGRITY_SYNC;
-    }
-    if flags.contains(p2fs::DescriptorFlags::REQUESTED_WRITE_SYNC) {
-        result |= p3fs::DescriptorFlags::REQUESTED_WRITE_SYNC;
-    }
-    if flags.contains(p2fs::DescriptorFlags::MUTATE_DIRECTORY) {
-        result |= p3fs::DescriptorFlags::MUTATE_DIRECTORY;
-    }
-    result
+fn descriptor_flags_from_p2(flags: p2fs::DescriptorFlags) -> FsDescriptorFlags {
+    P2_DESCRIPTOR_FLAGS
+        .iter()
+        .filter(|(p2, _)| flags.contains(*p2))
+        .fold(FsDescriptorFlags::empty(), |result, (_, node)| {
+            result | *node
+        })
 }
 
 fn open_flags_to_p3(flags: p2fs::OpenFlags) -> p3fs::OpenFlags {
@@ -3487,7 +3421,7 @@ mod tests {
         map_p2_tcp_socket_error, p2fs, p2net, p2tcp, p2tcp_create, p2udp,
         parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
     };
-    use super::{FsDescriptor, FsNodeKind, p3fs};
+    use super::{FsDescriptor, FsDescriptorFlags, FsNodeKind, p3fs};
 
     #[test]
     fn p2_empty_stdin_signals_eof_instead_of_starving_blocking_read() {
@@ -3517,9 +3451,9 @@ mod tests {
         let root = FsDescriptor {
             path: String::from("/"),
             kind: FsNodeKind::Directory,
-            flags: p3fs::DescriptorFlags::READ
-                | p3fs::DescriptorFlags::WRITE
-                | p3fs::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -3529,7 +3463,7 @@ mod tests {
             p3fs::PathFlags::empty(),
             "copy",
             p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
-            p3fs::DescriptorFlags::READ | p3fs::DescriptorFlags::WRITE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
         ))
         .expect("creating a file at the root must succeed");
@@ -3594,9 +3528,9 @@ mod tests {
         let root = FsDescriptor {
             path: String::from("/"),
             kind: FsNodeKind::Directory,
-            flags: p3fs::DescriptorFlags::READ
-                | p3fs::DescriptorFlags::WRITE
-                | p3fs::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
         };
@@ -3606,7 +3540,7 @@ mod tests {
             p3fs::PathFlags::empty(),
             "doomed",
             p3fs::OpenFlags::CREATE | p3fs::OpenFlags::TRUNCATE,
-            p3fs::DescriptorFlags::READ | p3fs::DescriptorFlags::WRITE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
         ))
         .expect("creating a file at the root must succeed");

@@ -15,7 +15,7 @@ pub(crate) use http::*;
 
 // The bindgen `with:` mappings re-export these resource types with `pub use`,
 // which requires a fully `pub` path; the globs above are only crate-visible.
-pub use fs::FsDescriptor;
+pub use crate::FsDescriptor;
 pub use host_env::{TerminalInput, TerminalOutput};
 pub use http::{WasiRequest, WasiResponse};
 pub use net::{
@@ -33,12 +33,14 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use crate::{ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, ObjectIdentity};
+use crate::{
+    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, FsDescriptorFlags,
+    ObjectIdentity,
+};
 use bytes::Bytes;
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
 use helios_netstack::Ipv6Address;
-use spin::Mutex;
 use thiserror::Error;
 use triomphe::Arc;
 use wasmtime::component::{
@@ -259,6 +261,10 @@ mod tests {
     use bytes::Bytes;
     use futures_lite::future::block_on;
 
+    use super::net::{
+        AcceptedConnection, ListenAdoption, OwnedTcpListener, PendingListen, TcpConnection,
+        UdpSend, UdpSendBinding, read_socket, write_socket,
+    };
     use super::{
         DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
         DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
@@ -270,6 +276,12 @@ mod tests {
         parse_p3_tcp_socket_address, parse_p3_udp_socket_address, preview3, socket_types,
         stdin_is_terminal, wasi_tcp_bind_rights, wasi_udp_bind_rights,
     };
+    use triomphe::Arc;
+
+    /// A connection on stream `raw`, owned the way a socket owns one.
+    fn connection(retire: crate::SocketRetirementSender, raw: u64) -> Arc<TcpConnection> {
+        Arc::new(TcpConnection::new(retire, raw))
+    }
 
     const fn tcp4(octets: [u8; 4], port: u16) -> WasiTcpSocketAddress {
         WasiTcpSocketAddress {
@@ -535,39 +547,18 @@ mod tests {
         }
     }
 
+    /// The linker serves every interface Wasmtime's preview2 WIT declares
+    /// except `wasi:cli/run`, which a component exports and the kernel calls.
     #[test]
-    fn preview2_linked_interfaces_cover_required_subsystems() {
+    fn preview2_linked_interfaces_cover_the_wasmtime_wit() {
+        let served =
+            wit_interface_names(crate::wasmtime_adapter::wasi::preview2::PREVIEW2_WIT_PACKAGES)
+                .into_iter()
+                .filter(|interface| *interface != "wasi:cli/run")
+                .collect::<alloc::vec::Vec<_>>();
         assert_interface_set_eq(
             crate::wasmtime_adapter::wasi::preview2::PREVIEW2_LINKED_INTERFACES,
-            &[
-                "wasi:cli/environment",
-                "wasi:cli/exit",
-                "wasi:cli/stdin",
-                "wasi:cli/stdout",
-                "wasi:cli/stderr",
-                "wasi:cli/terminal-input",
-                "wasi:cli/terminal-output",
-                "wasi:cli/terminal-stdin",
-                "wasi:cli/terminal-stdout",
-                "wasi:cli/terminal-stderr",
-                "wasi:clocks/monotonic-clock",
-                "wasi:clocks/system-clock",
-                "wasi:filesystem/preopens",
-                "wasi:filesystem/types",
-                "wasi:random/random",
-                "wasi:random/insecure",
-                "wasi:random/insecure-seed",
-                "wasi:io/error",
-                "wasi:io/poll",
-                "wasi:io/streams",
-                "wasi:sockets/network",
-                "wasi:sockets/instance-network",
-                "wasi:sockets/udp",
-                "wasi:sockets/udp-create-socket",
-                "wasi:sockets/tcp",
-                "wasi:sockets/tcp-create-socket",
-                "wasi:sockets/ip-name-lookup",
-            ],
+            &served,
             "Preview2",
         );
     }
@@ -595,8 +586,10 @@ mod tests {
                 "wasi:clocks/monotonic-clock.resolution",
                 "wasi:clocks/monotonic-clock.subscribe-duration",
                 "wasi:clocks/monotonic-clock.subscribe-instant",
-                "wasi:clocks/system-clock.now",
-                "wasi:clocks/system-clock.resolution",
+                "wasi:clocks/timezone.display",
+                "wasi:clocks/timezone.utc-offset",
+                "wasi:clocks/wall-clock.now",
+                "wasi:clocks/wall-clock.resolution",
                 "wasi:filesystem/preopens.get-directories",
                 "wasi:filesystem/types.descriptor.advise",
                 "wasi:filesystem/types.descriptor.append-via-stream",
@@ -880,7 +873,8 @@ mod tests {
             "wasi:clocks" => match name {
                 "types" => "wasi:clocks/types",
                 "monotonic-clock" => "wasi:clocks/monotonic-clock",
-                "system-clock" | "wall-clock" => "wasi:clocks/system-clock",
+                "system-clock" => "wasi:clocks/system-clock",
+                "wall-clock" => "wasi:clocks/wall-clock",
                 "timezone" => "wasi:clocks/timezone",
                 _ => return None,
             },
@@ -1102,13 +1096,13 @@ mod tests {
 
     #[test]
     fn p2_resolve_stream_yields_both_address_families_in_resolver_order() {
-        let mut stream = P2ResolveAddressStream::pending();
+        let (mut stream, completion) = P2ResolveAddressStream::pending();
         let v4 = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([93, 184, 215, 14]));
         let v6 = crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
             0x26, 0x06, 0x28, 0x00, 0x02, 0x1f, 0xcb, 0x07, 0x68, 0x20, 0x80, 0xda, 0x00, 0xaf,
             0x6b, 0x08,
         ]));
-        stream.complete(Ok(vec![v4, v6]));
+        completion.complete(Ok(vec![v4, v6]));
 
         assert_eq!(stream.next_address().unwrap(), Some(v4));
         assert_eq!(stream.next_address().unwrap(), Some(v6));
@@ -1138,7 +1132,7 @@ mod tests {
 
     #[test]
     fn p2_resolve_stream_yields_addresses_after_background_completion() {
-        let mut stream = P2ResolveAddressStream::pending();
+        let (mut stream, completion) = P2ResolveAddressStream::pending();
         assert!(!stream.is_ready());
         assert!(matches!(
             stream
@@ -1151,17 +1145,38 @@ mod tests {
         ));
 
         let address = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 1]));
-        stream.complete(Ok(vec![address]));
+        completion.complete(Ok(vec![address]));
         assert!(stream.is_ready());
         assert_eq!(stream.next_address().unwrap(), Some(address));
         assert_eq!(stream.next_address().unwrap(), None);
+    }
+
+    /// The pollable a guest parks on resolves once the lookup task answers,
+    /// and a lookup that already answered resolves it at once.
+    #[test]
+    fn p2_resolve_stream_wakes_a_waiter_when_the_lookup_answers() {
+        let (mut stream, completion) = P2ResolveAddressStream::pending();
+        let address = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 7]));
+
+        {
+            let mut waiting = core::pin::pin!(stream.wait_ready());
+            let waker = futures::task::noop_waker();
+            let mut context = core::task::Context::from_waker(&waker);
+            assert!(waiting.as_mut().poll(&mut context).is_pending());
+
+            completion.complete(Ok(vec![address]));
+            assert!(waiting.as_mut().poll(&mut context).is_ready());
+        }
+        assert_eq!(stream.next_address().unwrap(), Some(address));
+
+        block_on(stream.wait_ready());
     }
 
     #[test]
     fn udp_socket_send_uses_typed_address_path() {
         let service = TestNetworkService::new();
         let retirement = TestSocketRetirement::new(service.clone());
-        let socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
+        let mut socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
 
         block_on(socket.send_datagram(&service, b"hello", Some(udp4([192, 0, 2, 4], 53)), 0))
             .expect("UDP send should use typed backend address");
@@ -1175,7 +1190,7 @@ mod tests {
     /// program that exited with its socket still open. In #184 that
     /// left connections in their shards — eleven of them on one shard,
     /// each still advertising a receive window — after the programs
-    /// that opened them had gone. Ownership lives on the socket state
+    /// that opened them had gone. Ownership lives on the connection
     /// instead, so whatever ends the resource's life ends the stream's.
     ///
     /// The socket resource holds no service (#219), so its drop queues
@@ -1186,7 +1201,7 @@ mod tests {
     fn a_wasi_tcp_socket_retires_its_stream_when_its_resource_is_dropped() {
         let (service, closed) = crate::test_support::recording_network_service();
         let retirement = TestSocketRetirement::new(service.clone());
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
         block_on(socket.connect(&service, tcp4([127, 0, 0, 1], 80)))
             .expect("the test service always connects");
 
@@ -1226,25 +1241,27 @@ mod tests {
         assert_eq!(closed.count(), 0);
     }
 
-    /// A socket handed to a stream producer outlives the resource
-    /// table, and the stream is retired only once the last holder is
-    /// gone. Retiring on the first drop would close a connection the
-    /// read side is still using, and the slab slot it frees is handed
+    /// A connection handed to a stream outlives the socket resource,
+    /// and the stream is retired only once the last holder is gone.
+    /// Retiring on the socket's drop would close a connection the read
+    /// side is still using, and the slab slot it frees is handed
     /// straight to the next connection.
     #[test]
     fn a_wasi_tcp_socket_retires_its_stream_only_once_every_holder_is_gone() {
         let (service, closed) = crate::test_support::recording_network_service();
         let retirement = TestSocketRetirement::new(service.clone());
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
         block_on(socket.connect(&service, tcp4([127, 0, 0, 1], 80)))
             .expect("the test service always connects");
-        let borrowed = socket.clone();
+        let borrowed = socket
+            .connection()
+            .expect("a connected socket has a connection");
 
         drop(socket);
         assert_eq!(
             retirement.drain(),
             0,
-            "a stream still held by another clone must stay open"
+            "a stream another holder still uses must stay open"
         );
         drop(borrowed);
         assert_eq!(retirement.drain(), 1, "the last holder retires the stream");
@@ -1254,8 +1271,8 @@ mod tests {
     /// The retirement reaches the wire: the last holder of a
     /// `wasi:sockets` socket puts its FIN on it.
     ///
-    /// #184 moved the stream's ownership onto `TcpSocketState`, and the
-    /// tests above prove the drop retires it. What retirement meant
+    /// #184 moved the stream's ownership onto the socket, and the tests
+    /// above prove the drop retires it. What retirement meant
     /// inside the stack was dropping the socket, clearing its timers
     /// and freeing its slot with nothing sent, so a component that
     /// exited holding a connection was invisible to its peer, which
@@ -1267,8 +1284,11 @@ mod tests {
 
         let fixture = EstablishedTcpFixture::new();
         let retirement = crate::SocketRetirementQueue::new();
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.connection = Some(connection(
+            retirement.sender(),
+            crate::NetworkHandle::into_raw(fixture.stream()),
+        ));
 
         assert!(
             fixture.drive().is_empty(),
@@ -1335,11 +1355,13 @@ mod tests {
         let device = crate::test_support::RecordingNetworkInterface::accepting_transmissions(1);
         let fixture = EstablishedTcpFixture::with_interface(device.clone());
         let retirement = crate::SocketRetirementQueue::new();
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
+        let connection = connection(
+            retirement.sender(),
+            crate::NetworkHandle::into_raw(fixture.stream()),
+        );
         let service = fixture.service();
-        let mut input = super::net::TcpSocketInputStream::new(socket.clone(), service.clone());
-        let mut output = super::net::TcpSocketOutputStream::new(socket, service);
+        let mut input = super::net::TcpSocketInputStream::new(connection.clone(), service.clone());
+        let mut output = super::net::TcpSocketOutputStream::new(connection, service);
 
         // `write` is queue, segment, submit and doorbell on this poll —
         // the frame on the device's ring is the proof.
@@ -1386,9 +1408,11 @@ mod tests {
 
         let fixture = EstablishedTcpFixture::new();
         let retirement = crate::SocketRetirementQueue::new();
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
-        let mut input = super::net::TcpSocketInputStream::new(socket, fixture.service());
+        let connection = connection(
+            retirement.sender(),
+            crate::NetworkHandle::into_raw(fixture.stream()),
+        );
+        let mut input = super::net::TcpSocketInputStream::new(connection, fixture.service());
 
         let mut ready = input.ready();
         assert!(
@@ -1423,12 +1447,16 @@ mod tests {
         let fixture = EstablishedTcpFixture::new();
         let service = fixture.service();
         let retirement = crate::SocketRetirementQueue::new();
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
-        let mut output = super::net::TcpSocketOutputStream::new(socket.clone(), service.clone());
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let connection = connection(
+            retirement.sender(),
+            crate::NetworkHandle::into_raw(fixture.stream()),
+        );
+        socket.connection = Some(connection.clone());
+        let mut output = super::net::TcpSocketOutputStream::new(connection, service.clone());
 
         socket
-            .shutdown_send_state()
+            .shutdown_send()
             .expect("a connected socket shuts its send side");
         block_on(service.tcp_shutdown_send(fixture.stream())).expect("the shutdown queues the FIN");
         assert!(
@@ -1468,9 +1496,11 @@ mod tests {
 
         let fixture = EstablishedTcpFixture::new();
         let retirement = crate::SocketRetirementQueue::new();
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
-        let mut output = super::net::TcpSocketOutputStream::new(socket, fixture.service());
+        let connection = connection(
+            retirement.sender(),
+            crate::NetworkHandle::into_raw(fixture.stream()),
+        );
+        let mut output = super::net::TcpSocketOutputStream::new(connection, fixture.service());
 
         fixture.deliver(
             helios_netstack::TcpHeader {
@@ -1519,9 +1549,11 @@ mod tests {
         let fixture = EstablishedTcpFixture::new();
         let service = fixture.service();
         let retirement = crate::SocketRetirementQueue::new();
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().stream = Some(crate::NetworkHandle::into_raw(fixture.stream()));
-        let mut output = super::net::TcpSocketOutputStream::new(socket, service.clone());
+        let connection = connection(
+            retirement.sender(),
+            crate::NetworkHandle::into_raw(fixture.stream()),
+        );
+        let mut output = super::net::TcpSocketOutputStream::new(connection, service.clone());
 
         // The peer advertised a 64 KiB window and never ACKs, so enough
         // queued bytes fill it and then the send queue behind it.
@@ -1620,9 +1652,8 @@ mod tests {
         let service = TestNetworkService::new();
         service.fail_drives();
         let retirement = crate::SocketRetirementQueue::new();
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().stream = Some(7);
-        let mut input = super::net::TcpSocketInputStream::new(socket, service);
+        let mut input =
+            super::net::TcpSocketInputStream::new(connection(retirement.sender(), 7), service);
 
         // `ready` resolves — the pollable must, so the accessor can
         // report what happened — and records the failure it saw.
@@ -1644,9 +1675,10 @@ mod tests {
 
         let service = TestNetworkService::new();
         let retirement = crate::SocketRetirementQueue::new();
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().stream = Some(7);
-        let mut output = super::net::TcpSocketOutputStream::new(socket, service.clone());
+        let mut output = super::net::TcpSocketOutputStream::new(
+            connection(retirement.sender(), 7),
+            service.clone(),
+        );
 
         // With the drive broken the send queue reads as full, so the
         // write parks its batch in `pending`.
@@ -1681,7 +1713,7 @@ mod tests {
     /// A `wasi:sockets` socket's kernel listener dies with the socket.
     ///
     /// Nothing retired it before: the resource destructor deleted the
-    /// table entry, `TcpSocketState`'s `Drop` retired only the stream
+    /// table entry, the socket state's `Drop` retired only the stream
     /// beside it, and the network service offered no
     /// `tcp_listener_close` at all — so every listener a component
     /// opened stayed installed on every shard with its local port bound
@@ -1690,8 +1722,14 @@ mod tests {
     fn a_wasi_tcp_socket_retires_its_listener_when_its_resource_is_dropped() {
         let (service, closed) = crate::test_support::recording_listener_network_service();
         let retirement = TestSocketRetirement::new(service);
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().listener = Some(41);
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.listener = Some(Arc::new(OwnedTcpListener::new(
+            retirement.sender(),
+            crate::TcpListener {
+                listener: 41,
+                local_port: 8080,
+            },
+        )));
 
         assert!(
             !retirement.queued(),
@@ -1709,35 +1747,61 @@ mod tests {
 
     /// A listener that was opened but never adopted is retired too.
     ///
-    /// `tcp_listen` completes on a detached task and parks its answer in
-    /// `listen_result`; the listen stream moves it into `listener` the
-    /// next time it is polled. A socket dropped in that window holds a
-    /// listener in the shards with nothing pointing at it, which is the
-    /// same leak by a narrower door.
+    /// `tcp_listen` completes on a detached task and answers through a
+    /// oneshot the socket keeps; the socket takes the answer in on its
+    /// next accessor. A socket dropped before that holds a listener in
+    /// the shards with nothing pointing at it, which is the same leak by
+    /// a narrower door. Both resting places are covered: the answer
+    /// still in the channel, and the answer settled into
+    /// `listen_result` but never finished.
     #[test]
     fn a_wasi_tcp_socket_retires_a_listener_it_never_adopted() {
         let (service, closed) = crate::test_support::recording_listener_network_service();
         let retirement = TestSocketRetirement::new(service);
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().listen_result = Some(Ok(crate::TcpListener {
-            listener: 42,
-            local_port: 8080,
-        }));
+        let listener = |raw| {
+            Arc::new(OwnedTcpListener::new(
+                retirement.sender(),
+                crate::TcpListener {
+                    listener: raw,
+                    local_port: 8080,
+                },
+            ))
+        };
 
-        drop(socket);
+        let mut unsettled = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let (answer, receiver) = futures::channel::oneshot::channel();
+        unsettled.pending_listen = Some(PendingListen {
+            answer: receiver,
+            adoption: ListenAdoption::Finish,
+        });
+        assert!(answer.send(Ok(listener(42))).is_ok());
+        drop(unsettled);
+        assert_eq!(
+            retirement.drain(),
+            1,
+            "a listener still in the listen task's answer is retired"
+        );
+        assert_eq!(closed.last(), 42);
+
+        let mut settled = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        settled.listen_result = Some(Ok(listener(43)));
+        drop(settled);
         assert_eq!(
             retirement.drain(),
             1,
             "a listener still sitting in the listen result is retired"
         );
-        assert_eq!(closed.count(), 1);
-        assert_eq!(closed.last(), 42);
+        assert_eq!(closed.count(), 2);
+        assert_eq!(closed.last(), 43);
     }
 
-    /// The socket a completed accept parks, as `PendingAccept`'s task
-    /// builds it.
-    fn accepted_connection(retire: crate::SocketRetirementSender, stream: u64) -> TcpSocket {
-        TcpSocket::from_accepted(
+    /// The answer a completed accept parks, as the accept task builds
+    /// it.
+    fn accepted_connection(
+        retire: crate::SocketRetirementSender,
+        stream: u64,
+    ) -> AcceptedConnection {
+        AcceptedConnection::new(
             retire,
             WasiTcpSocketFamily::Ipv4,
             tcp4([127, 0, 0, 1], 8080),
@@ -1757,13 +1821,13 @@ mod tests {
     /// stream id, a socket dropped in the window between the two left a
     /// connected stream in its shard with nothing pointing at it, which
     /// is #184's leak through a narrower door (#225). The parked value
-    /// is the accepted socket itself, so it dies with the listening one.
+    /// owns its stream, so it dies with the listening socket.
     #[test]
     fn a_wasi_tcp_socket_retires_a_connection_it_never_adopted() {
         let (service, closed) = crate::test_support::recording_network_service();
         let retirement = TestSocketRetirement::new(service);
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.inner.lock().accept_result = Some(Ok(accepted_connection(retirement.sender(), 43)));
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        socket.accept_result = Some(Ok(accepted_connection(retirement.sender(), 43)));
 
         drop(socket);
         assert_eq!(
@@ -1777,35 +1841,32 @@ mod tests {
 
     /// A connection accepted after the socket died is retired too.
     ///
-    /// The detached accept task holds the listening socket's state,
-    /// because that is where it parks its answer, so the state outlives
-    /// the guest resource whenever the two race. What the task parks
-    /// owns its stream, and the state's own drop — the moment the task
-    /// lets go of it — retires the connection nobody will ever adopt.
+    /// The detached accept task holds only the sending end of the
+    /// socket's oneshot. When the socket died first, the send fails and
+    /// hands the answer back to the task, and dropping it — it owns its
+    /// stream — retires the connection nobody will ever adopt.
     #[test]
     fn a_wasi_tcp_socket_retires_a_connection_accepted_after_it_died() {
         let (service, closed) = crate::test_support::recording_network_service();
         let retirement = TestSocketRetirement::new(service);
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        let task_state = socket.inner.clone();
-        socket.inner.lock().accept_in_progress = true;
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let (answer, receiver) = futures::channel::oneshot::channel();
+        socket.pending_accept = Some(receiver);
 
         drop(socket);
         assert!(
             !retirement.queued(),
-            "the accept task still holds the listening socket's state"
+            "the accept has not produced a connection yet"
         );
 
-        {
-            let mut state = task_state.lock();
-            state.accept_in_progress = false;
-            state.accept_result = Some(Ok(accepted_connection(retirement.sender(), 43)));
-        }
-        drop(task_state);
+        let undelivered = answer
+            .send(Ok(accepted_connection(retirement.sender(), 43)))
+            .expect_err("a socket that died cannot take the answer");
+        drop(undelivered);
         assert_eq!(
             retirement.drain(),
             1,
-            "the state the accept task released retires the connection it accepted"
+            "the answer the socket could not take retires the connection it carried"
         );
         assert_eq!(closed.count(), 1);
         assert_eq!(closed.last(), 43);
@@ -1815,14 +1876,14 @@ mod tests {
     /// socket.
     ///
     /// Nothing retired it before: the resource destructor deleted the
-    /// table entry and `UdpSocketState` had no `Drop`, so every program
+    /// table entry and the socket state had no `Drop`, so every program
     /// that bound a `udp-socket` left a replica on every shard and a
     /// slot in `udp_slots` behind it (#190).
     #[test]
     fn a_wasi_udp_socket_retires_its_socket_when_its_resource_is_dropped() {
         let (service, closed) = crate::test_support::recording_udp_network_service();
         let retirement = TestSocketRetirement::new(service.clone());
-        let socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
+        let mut socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
         block_on(socket.bind(&service, udp4([0, 0, 0, 0], 5353)))
             .expect("the test service always binds");
 
@@ -1847,7 +1908,7 @@ mod tests {
     fn a_wasi_udp_socket_retires_a_bind_that_never_finished() {
         let (service, closed) = crate::test_support::recording_udp_network_service();
         let retirement = TestSocketRetirement::new(service.clone());
-        let socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
+        let mut socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
         block_on(socket.start_bind_p2(&service, udp4([0, 0, 0, 0], 5353)))
             .expect("the test service always binds");
 
@@ -1862,25 +1923,27 @@ mod tests {
         assert_eq!(closed.last(), 9);
     }
 
-    /// A socket handed to the p2 datagram streams outlives the resource
-    /// table, and the binding is retired only once the last holder is
-    /// gone. Retiring on the first drop would unbind a socket the
-    /// incoming stream is still reading, and the slab slot it frees is
-    /// handed straight to the next bind.
+    /// A binding a p3 send or receive took with the socket released
+    /// outlives the socket, and the kernel socket is retired only once
+    /// the last holder is gone. Retiring on the socket's drop would
+    /// unbind a socket the operation is still using, and the slab slot
+    /// it frees is handed straight to the next bind.
     #[test]
     fn a_wasi_udp_socket_retires_its_socket_only_once_every_holder_is_gone() {
         let (service, closed) = crate::test_support::recording_udp_network_service();
         let retirement = TestSocketRetirement::new(service.clone());
-        let socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
+        let mut socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
         block_on(socket.bind(&service, udp4([0, 0, 0, 0], 5353)))
             .expect("the test service always binds");
-        let borrowed = socket.clone();
+        let borrowed = socket
+            .start_receive(None)
+            .expect("a bound socket admits a receive");
 
         drop(socket);
         assert_eq!(
             retirement.drain(),
             0,
-            "a binding still held by another clone must stay open"
+            "a binding an operation still holds must stay open"
         );
         drop(borrowed);
         assert_eq!(retirement.drain(), 1, "the last holder retires the binding");
@@ -1891,7 +1954,7 @@ mod tests {
     fn p3_tcp_socket_hop_limit_is_descriptor_local_state() {
         let service = TestNetworkService::new();
         let retirement = TestSocketRetirement::new(service.clone());
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
 
         assert_eq!(socket.hop_limit().unwrap(), DEFAULT_WASI_TCP_HOP_LIMIT);
         socket
@@ -1915,7 +1978,7 @@ mod tests {
     #[test]
     fn tcp_socket_rejects_enabling_unsupported_keep_alive() {
         let retirement = TestSocketRetirement::new(TestNetworkService::new());
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
 
         assert!(!socket.keep_alive_enabled().unwrap());
         assert_eq!(
@@ -1974,12 +2037,14 @@ mod tests {
     fn tcp_socket_shutdown_directions_are_idempotent_local_state() {
         let service = TestNetworkService::new();
         let retirement = TestSocketRetirement::new(service.clone());
-        let socket = TcpSocket::accepted(
+        let (mut socket, _) = TcpSocket::accepted(
             retirement.sender(),
             WasiTcpSocketFamily::Ipv4,
-            7,
-            tcp4([127, 0, 0, 1], 8080),
-            tcp4([127, 0, 0, 1], 4040),
+            AcceptedConnection {
+                connection: TcpConnection::new(retirement.sender(), 7),
+                local_address: tcp4([127, 0, 0, 1], 8080),
+                remote_address: tcp4([127, 0, 0, 1], 4040),
+            },
         );
 
         socket
@@ -1989,28 +2054,137 @@ mod tests {
             .shutdown_receive()
             .expect("receive shutdown must be idempotent");
         assert_eq!(
-            block_on(socket.read(&service, 8)).expect("receive shutdown read must succeed"),
+            block_on(read_socket(socket.connection(), service.clone(), 8))
+                .expect("receive shutdown read must succeed"),
             None
         );
 
-        let stream = socket
-            .shutdown_send_state()
+        let connection = socket
+            .shutdown_send()
             .expect("connected send shutdown must be accepted");
-        assert_eq!(stream, 7);
-        let stream = socket
-            .shutdown_send_state()
+        assert_eq!(connection.stream(), 7);
+        let connection = socket
+            .shutdown_send()
             .expect("send shutdown must be idempotent");
-        assert_eq!(stream, 7);
+        assert_eq!(connection.stream(), 7);
         assert!(matches!(
-            block_on(socket.write_all_bytes(&service, Bytes::from_static(b"x"))),
+            block_on(write_socket(
+                socket.connection(),
+                service,
+                Bytes::from_static(b"x")
+            )),
             Err(socket_types::ErrorCode::InvalidState)
         ));
+    }
+
+    /// A second p3 `connect` while one is running answers
+    /// `invalid-state`, the code `wasi:sockets` documents for "The
+    /// socket is already in the `connecting` state. (EALREADY)".
+    ///
+    /// The connect runs with the socket released, so the second call
+    /// used to find nothing marking the first: both connected, and the
+    /// later to finish overwrote the earlier's stream. A cancelled
+    /// connect leaves no mark behind, and a connected socket refuses
+    /// another connect as it always has.
+    #[test]
+    fn p3_tcp_connect_refuses_a_second_connect_while_one_runs() {
+        let (service, closed) = crate::test_support::recording_network_service();
+        let retirement = TestSocketRetirement::new(service.clone());
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let remote = tcp4([127, 0, 0, 1], 80);
+
+        let first = socket
+            .start_p3_connect()
+            .expect("an unconnected socket admits a connect");
+        assert!(matches!(
+            socket.start_p3_connect(),
+            Err(socket_types::ErrorCode::InvalidState)
+        ));
+
+        drop(first);
+        let again = socket
+            .start_p3_connect()
+            .expect("a cancelled connect leaves the socket free");
+        let (guard, outcome) = block_on(again.run(&service, remote));
+        socket
+            .finish_p3_connect(guard, remote, outcome)
+            .expect("the test service always connects");
+        assert_eq!(socket.remote_address().unwrap(), remote);
+        assert!(matches!(
+            socket.start_p3_connect(),
+            Err(socket_types::ErrorCode::InvalidState)
+        ));
+
+        drop(socket);
+        assert_eq!(retirement.drain(), 1, "one connect made one stream");
+        assert_eq!(closed.count(), 1);
+    }
+
+    /// A bind while a p3 `send`'s implicit bind is running answers
+    /// `invalid-state`, the code `wasi:sockets` documents for "The
+    /// socket is already bound. (EINVAL)".
+    ///
+    /// The send binds with the socket released. Before the socket kept
+    /// a mark of it, a second send, a `bind` or a `connect` bound the
+    /// socket again meanwhile, and the later of the two to finish failed
+    /// the assertion "udp bind raced with a concurrent state
+    /// transition". A cancelled implicit bind leaves no mark behind.
+    #[test]
+    fn a_udp_bind_while_an_implicit_bind_runs_is_invalid_state() {
+        let (service, closed) = crate::test_support::recording_udp_network_service();
+        let retirement = TestSocketRetirement::new(service.clone());
+        let mut socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
+        let peer = Some(udp4([192, 0, 2, 4], 53));
+
+        let Ok(UdpSend {
+            binding: UdpSendBinding::Unbound(first),
+            ..
+        }) = socket.start_send(5, peer)
+        else {
+            panic!("a send on an unbound socket binds it first");
+        };
+        assert!(matches!(
+            socket.start_send(5, peer),
+            Err(WasiUdpSocketError::InvalidState)
+        ));
+        assert!(matches!(
+            block_on(socket.bind(&service, udp4([0, 0, 0, 0], 5353))),
+            Err(WasiUdpSocketError::InvalidState)
+        ));
+        assert!(matches!(
+            block_on(socket.connect(&service, udp4([192, 0, 2, 4], 53))),
+            Err(WasiUdpSocketError::InvalidState)
+        ));
+
+        drop(first);
+        let Ok(UdpSend {
+            binding: UdpSendBinding::Unbound(bind),
+            ..
+        }) = socket.start_send(5, peer)
+        else {
+            panic!("a cancelled implicit bind leaves the socket unbound");
+        };
+        let (guard, outcome) = block_on(bind.run(&service));
+        socket
+            .finish_implicit_bind(guard, outcome)
+            .expect("the test service always binds");
+        assert!(matches!(
+            socket.start_send(5, peer),
+            Ok(UdpSend {
+                binding: UdpSendBinding::Bound(_),
+                ..
+            })
+        ));
+
+        drop(socket);
+        assert_eq!(retirement.drain(), 1, "one implicit bind made one socket");
+        assert_eq!(closed.count(), 1);
     }
 
     #[test]
     fn tcp_socket_bind_local_tracks_authorized_local_address() {
         let retirement = TestSocketRetirement::new(TestNetworkService::new());
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
         let local = tcp4([127, 0, 0, 1], 8080);
 
         socket
@@ -2023,7 +2197,7 @@ mod tests {
     #[test]
     fn tcp_socket_listen_backlog_is_descriptor_local_state() {
         let retirement = TestSocketRetirement::new(TestNetworkService::new());
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
 
         assert_eq!(socket.listen_backlog(), DEFAULT_WASI_TCP_LISTEN_BACKLOG);
         socket
@@ -2045,14 +2219,18 @@ mod tests {
     fn p3_tcp_socket_uses_network_backend_without_widening_rights() {
         let service = TestNetworkService::new();
         let retirement = TestSocketRetirement::new(service.clone());
-        let socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
+        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
         let remote = tcp4([203, 0, 113, 10], 443);
 
         block_on(socket.connect(&service, remote)).expect("test TCP backend should connect");
         assert_eq!(socket.remote_address().unwrap(), remote);
-        block_on(socket.write_all_bytes(&service, Bytes::from_static(b"hello")))
-            .expect("test TCP backend should write");
-        let bytes = block_on(socket.read(&service, 16))
+        block_on(write_socket(
+            socket.connection(),
+            service.clone(),
+            Bytes::from_static(b"hello"),
+        ))
+        .expect("test TCP backend should write");
+        let bytes = block_on(read_socket(socket.connection(), service.clone(), 16))
             .unwrap()
             .expect("test TCP backend should read bytes");
         assert_eq!(bytes.as_ref(), [4, 2]);

@@ -8,14 +8,16 @@
 //! `/etc/fstab` holds one mount per line, `#` starting a comment:
 //!
 //! ```text
-//! <source> <mount point> [ro|rw]
+//! <source> <mount point> [<option>[,<option>]...]
 //! ```
 //!
 //! Sources are `memory`, `boot-image`, `host-share`, `disk:<serial>`
 //! for EROFS, and `btrfs:<serial>` for btrfs. Disk sources use the serial
-//! the device reported. The mode defaults to `rw`; the boot image and disks are
-//! read-only whatever it says. A line init cannot parse, or a mount the
-//! kernel refuses, fails init.
+//! the device reported. The options are `ro` or `rw` (default `rw`; the
+//! boot image and EROFS disks remain read-only) and, for btrfs, Linux's
+//! `compress` (zlib) or `compress=<algorithm>[:<level>]` and
+//! `commit=<seconds>`. A line init cannot parse, or a mount the kernel
+//! refuses, fails init.
 
 use std::fs;
 use std::io::{self, ErrorKind, Write};
@@ -34,6 +36,31 @@ struct Mount {
     label: String,
     point: String,
     read_only: bool,
+    /// The value of the `compress=` option, when the line carries one.
+    compress: Option<String>,
+    /// The value of the `commit=` option, in seconds.
+    commit: Option<u32>,
+}
+
+/// A `commit=` value as Linux's `fsparam_u32` reads it: `kstrtouint` with
+/// base 0, so `0x` starts hexadecimal, a leading `0` octal, and anything
+/// else is decimal.
+fn commit_seconds(value: &str) -> Option<u32> {
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let (digits, radix) = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        (hex, 16)
+    } else if value.len() > 1 && value.starts_with('0') {
+        (&value[1..], 8)
+    } else {
+        (value, 10)
+    };
+    if digits.is_empty() || digits.starts_with(['+', '-']) {
+        return None;
+    }
+    u32::from_str_radix(digits, radix).ok()
 }
 
 fn invalid(line: usize, detail: impl std::fmt::Display) -> io::Error {
@@ -49,10 +76,15 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let (label, point, mode) = match fields.as_slice() {
+        let (label, point, options) = match fields.as_slice() {
             [label, point] => (*label, *point, "rw"),
-            [label, point, mode] => (*label, *point, *mode),
-            _ => return Err(invalid(number, "expected `<source> <mount point> [ro|rw]`")),
+            [label, point, options] => (*label, *point, *options),
+            _ => {
+                return Err(invalid(
+                    number,
+                    "expected `<source> <mount point> [<option>[,<option>]...]`",
+                ));
+            }
         };
         let source = match label {
             "memory" => MountSource::Memory,
@@ -70,16 +102,35 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
                 _ => return Err(invalid(number, format!("unknown source `{label}`"))),
             },
         };
-        let read_only = match mode {
-            "ro" => true,
-            "rw" => false,
-            _ => return Err(invalid(number, format!("unknown mode `{mode}`"))),
-        };
+        let mut read_only = false;
+        let mut compress = None;
+        let mut commit = None;
+        for option in options.split(',') {
+            match option {
+                "ro" => read_only = true,
+                "rw" => read_only = false,
+                // Linux's bare `compress` selects zlib at its default level.
+                "compress" => compress = Some("zlib".to_owned()),
+                _ => {
+                    if let Some(value) = option.strip_prefix("compress=") {
+                        compress = Some(value.to_owned());
+                    } else if let Some(value) = option.strip_prefix("commit=") {
+                        commit = Some(commit_seconds(value).ok_or_else(|| {
+                            invalid(number, format!("`{option}` is not a number of seconds"))
+                        })?);
+                    } else {
+                        return Err(invalid(number, format!("unknown option `{option}`")));
+                    }
+                }
+            }
+        }
         mounts.push(Mount {
             source,
             label: label.to_owned(),
             point: point.to_owned(),
             read_only,
+            compress,
+            commit,
         });
     }
     Ok(mounts)
@@ -123,6 +174,7 @@ async fn run_rc() -> io::Result<()> {
         hint: None,
         capability_grants: vec![
             programs::root_directory_grant(),
+            programs::root_link_grant(),
             programs::root_process_grant(),
         ],
     })
@@ -151,14 +203,20 @@ async fn main() -> io::Result<()> {
 
     let mounts = fstab()?;
     for mount in &mounts {
-        mounts::mount(mount.source.clone(), mount.point.as_str(), mount.read_only)
-            .await
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "mounting {} at {}: {:?}: {}",
-                    mount.label, mount.point, error.kind, error.detail
-                ))
-            })?;
+        mounts::mount(
+            mount.source.clone(),
+            mount.point.as_str(),
+            mount.read_only,
+            mount.compress.clone(),
+            mount.commit,
+        )
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "mounting {} at {}: {:?}: {}",
+                mount.label, mount.point, error.kind, error.detail
+            ))
+        })?;
         println!("helios init: mounted {} at {}", mount.label, mount.point);
     }
 
@@ -176,4 +234,37 @@ async fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{commit_seconds, parse_fstab};
+
+    #[test]
+    fn commit_values_read_as_linux_reads_them() {
+        for (value, seconds) in [
+            ("5", 5),
+            ("+5", 5),
+            ("0", 0),
+            ("010", 8),
+            ("0x1e", 30),
+            ("0X1E", 30),
+            ("4294967295", u32::MAX),
+        ] {
+            assert_eq!(commit_seconds(value), Some(seconds), "{value}");
+        }
+        for value in ["", "+", "-1", "0x", "0x+5", "08", "4294967296", "5s", " 5"] {
+            assert_eq!(commit_seconds(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn an_fstab_line_carries_its_commit_interval() {
+        let mounts =
+            parse_fstab("btrfs:数据-データ-데이터 /btrfs rw,compress=zstd:3,commit=120\n").unwrap();
+        assert_eq!(mounts[0].commit, Some(120));
+        assert_eq!(mounts[0].compress.as_deref(), Some("zstd:3"));
+        assert!(parse_fstab("btrfs:disk /btrfs commit=soon\n").is_err());
+        assert_eq!(parse_fstab("memory /tmp\n").unwrap()[0].commit, None);
+    }
 }
