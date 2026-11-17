@@ -1289,6 +1289,10 @@ mod network {
             [2, 0, 0, 0, 0, 1]
         }
 
+        fn owns_ip_address(&self, address: crate::NetworkIpAddress) -> bool {
+            address == crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1]))
+        }
+
         fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
             core::future::ready(())
         }
@@ -1466,6 +1470,16 @@ mod network {
             })
         }
 
+        fn tcp_peek_into<'a>(
+            &'a self,
+            stream: Self::TcpStream,
+            buffer: &'a mut crate::RegisteredTcpReadBuffer<'_>,
+            timeout_nanos: u64,
+        ) -> impl core::future::Future<Output = Result<crate::TcpReadInto, crate::TcpError>> + Send + 'a
+        {
+            self.tcp_read_into(stream, buffer, timeout_nanos)
+        }
+
         fn tcp_send_room(
             &self,
             _: Self::TcpStream,
@@ -1519,6 +1533,7 @@ mod network {
 
         fn udp_bind(
             &self,
+            _: crate::NetworkIpAddress,
             local_port: u16,
         ) -> impl core::future::Future<
             Output = Result<crate::UdpBinding<Self::UdpSocket>, crate::UdpError>,
@@ -1580,6 +1595,18 @@ mod network {
         > + Send
         + '_ {
             core::future::ready(Ok(None))
+        }
+
+        fn udp_peek(
+            &self,
+            socket: Self::UdpSocket,
+            max_bytes: u32,
+            timeout_nanos: u64,
+        ) -> impl core::future::Future<
+            Output = Result<Option<crate::UdpDatagram>, crate::UdpError>,
+        > + Send
+        + '_ {
+            self.udp_receive(socket, max_bytes, timeout_nanos)
         }
 
         fn udp_join_multicast_v4(

@@ -32,6 +32,24 @@ bitflags! {
     }
 }
 
+/// First unprivileged port (IANA well-known ports occupy `1..1024`; port `0`
+/// requests an ephemeral port from the stack).
+const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
+
+impl NetworkAuthorityRights {
+    /// Returns the rights required to bind `local_port` on top of `self`.
+    ///
+    /// Ports `1..1024` require [`Self::PRIVILEGED_BIND`]; port `0` asks the
+    /// stack for an ephemeral port and is exempt.
+    pub const fn bind_rights(self, local_port: u16) -> Self {
+        if local_port != 0 && local_port < FIRST_UNPRIVILEGED_PORT {
+            self.union(Self::PRIVILEGED_BIND)
+        } else {
+            self
+        }
+    }
+}
+
 bitflags! {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct ClockAuthorityRights: u8 {
@@ -1733,5 +1751,29 @@ mod tests {
         assert!(root.derive_input_claim_cap().is_err());
         assert!(root.derive_gpu_open_cap().is_err());
         assert!(root.derive_audio_claim_cap().is_err());
+    }
+
+    #[test]
+    fn bind_rights_exempts_ephemeral_port_zero_and_requires_privilege_below_1024() {
+        assert_eq!(
+            NetworkAuthorityRights::UDP.bind_rights(0),
+            NetworkAuthorityRights::UDP
+        );
+        assert_eq!(
+            NetworkAuthorityRights::TCP.bind_rights(0),
+            NetworkAuthorityRights::TCP
+        );
+        assert_eq!(
+            NetworkAuthorityRights::UDP.bind_rights(1),
+            NetworkAuthorityRights::UDP | NetworkAuthorityRights::PRIVILEGED_BIND
+        );
+        assert_eq!(
+            NetworkAuthorityRights::TCP.bind_rights(1023),
+            NetworkAuthorityRights::TCP | NetworkAuthorityRights::PRIVILEGED_BIND
+        );
+        assert_eq!(
+            NetworkAuthorityRights::UDP.bind_rights(1024),
+            NetworkAuthorityRights::UDP
+        );
     }
 }

@@ -238,10 +238,25 @@ where
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
     }
 
-    pub(super) fn require_privileged_bind_authority(&self) -> i32 {
-        self.authority
-            .derive_privileged_bind_cap()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+    pub(super) fn require_socket_bind_authority(
+        &self,
+        authority: WasixSocketAuthority,
+        local_port: u16,
+    ) -> i32 {
+        let base = match authority {
+            WasixSocketAuthority::LocalOnly => return p1::errno::SUCCESS,
+            WasixSocketAuthority::Tcp => crate::NetworkAuthorityRights::TCP,
+            WasixSocketAuthority::Udp => crate::NetworkAuthorityRights::UDP,
+        };
+        if self
+            .authority
+            .network_rights()
+            .contains(base.bind_rights(local_port))
+        {
+            p1::errno::SUCCESS
+        } else {
+            p1::errno::NOTCAPABLE
+        }
     }
 
     pub(super) fn require_spawn_authority(&self) -> Result<SpawnAuthority, i32> {
@@ -536,15 +551,44 @@ where
         Ok(reader.read_limit(max_bytes).await.unwrap_or_default())
     }
 
-    pub(super) async fn read_socket_pair(
+    pub(super) async fn recv_socket_pair(
         &mut self,
         fd: i32,
         max_bytes: usize,
+        nonblocking: bool,
+        peek: bool,
     ) -> Result<Bytes, i32> {
+        if max_bytes == 0 {
+            return match self.descriptors.get(fd) {
+                Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => Ok(Bytes::new()),
+                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
+                Some(_) => Err(p1::errno::NOTSOCK),
+                None => Err(p1::errno::BADF),
+            };
+        }
+
         let reader = match self.descriptors.get_mut(fd) {
             Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) => {
                 if !carry.is_empty() {
-                    return Ok(take_preview1_carry(carry, max_bytes));
+                    return Ok(if peek {
+                        carry.slice(..carry.len().min(max_bytes))
+                    } else {
+                        take_preview1_carry(carry, max_bytes)
+                    });
+                }
+                if nonblocking {
+                    return match reader.try_read() {
+                        crate::TryRead::Ready(bytes) => {
+                            *carry = bytes;
+                            Ok(if peek {
+                                carry.slice(..carry.len().min(max_bytes))
+                            } else {
+                                take_preview1_carry(carry, max_bytes)
+                            })
+                        }
+                        crate::TryRead::Eof => Ok(Bytes::new()),
+                        crate::TryRead::Pending => Err(p1::errno::AGAIN),
+                    };
                 }
                 reader.clone()
             }
@@ -560,34 +604,11 @@ where
             return Err(p1::errno::BADF);
         };
         *carry = bytes;
-        Ok(take_preview1_carry(carry, max_bytes))
-    }
-
-    pub(super) fn try_read_socket_pair(
-        &mut self,
-        fd: i32,
-        max_bytes: usize,
-    ) -> Result<Option<Bytes>, i32> {
-        let Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) =
-            self.descriptors.get_mut(fd)
-        else {
-            return match self.descriptors.get(fd) {
-                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
-                Some(_) => Err(p1::errno::NOTSOCK),
-                None => Err(p1::errno::BADF),
-            };
-        };
-        if !carry.is_empty() {
-            return Ok(Some(take_preview1_carry(carry, max_bytes)));
-        }
-        match reader.try_read() {
-            crate::TryRead::Ready(bytes) => {
-                *carry = bytes;
-                Ok(Some(take_preview1_carry(carry, max_bytes)))
-            }
-            crate::TryRead::Eof => Ok(Some(Bytes::new())),
-            crate::TryRead::Pending => Ok(None),
-        }
+        Ok(if peek {
+            carry.slice(..carry.len().min(max_bytes))
+        } else {
+            take_preview1_carry(carry, max_bytes)
+        })
     }
 
     pub(super) fn getcwd(&self) -> Result<&str, i32> {
@@ -4120,22 +4141,15 @@ where
         caller.data().descriptors.get(fd),
         Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. }))
     ) {
-        let bytes = if capacity == 0 {
-            Bytes::new()
-        } else if p1_fdflags_nonblocking(fdflags) {
-            match caller
-                .data_mut()
-                .try_read_socket_pair(fd, capacity as usize)?
-            {
-                Some(bytes) => bytes,
-                None => return Ok(p1::errno::AGAIN),
-            }
-        } else {
-            caller
-                .data_mut()
-                .read_socket_pair(fd, capacity as usize)
-                .await?
-        };
+        let bytes = caller
+            .data_mut()
+            .recv_socket_pair(
+                fd,
+                capacity as usize,
+                p1_fdflags_nonblocking(fdflags),
+                false,
+            )
+            .await?;
         return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
     }
     let stream = match caller.data().descriptors.get(fd) {
@@ -4846,6 +4860,9 @@ pub(super) fn p1_errno_from_dns_error(error: crate::DnsError) -> i32 {
 }
 
 pub(super) fn p1_errno_from_tcp_error(error: crate::TcpError) -> i32 {
+    if matches!(error.detail, crate::NetworkErrorDetail::AddressNotAvailable) {
+        return p1::errno::ADDRNOTAVAIL;
+    }
     match error.kind {
         crate::TcpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::TcpErrorKind::Timeout => p1::errno::TIMEDOUT,
@@ -4865,6 +4882,9 @@ pub(super) fn p1_errno_from_tcp_error_for_fdflags(error: crate::TcpError, fdflag
 }
 
 pub(super) fn p1_errno_from_udp_error(error: crate::UdpError) -> i32 {
+    if matches!(error.detail, crate::NetworkErrorDetail::AddressNotAvailable) {
+        return p1::errno::ADDRNOTAVAIL;
+    }
     match error.kind {
         crate::UdpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::UdpErrorKind::Unsupported => p1::errno::NOTSUP,
@@ -5194,6 +5214,7 @@ mod tests {
             Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
                 family: SocketFamily::Ipv4,
                 listener: OwnedTcpListener::new(crate::UnixNetwork::new(service), listener),
+                local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
                 local_port: 8080,
                 options: unix_socket_options::<Net>(),
             })),
@@ -5391,6 +5412,7 @@ mod tests {
             Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
                 family: SocketFamily::Ipv4,
                 socket: OwnedUdpSocket::new(crate::UnixNetwork::new(service), socket),
+                local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
                 local_port: 5353,
                 options: unix_socket_options::<Net>(),
             })),
