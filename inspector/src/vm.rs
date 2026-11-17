@@ -5898,13 +5898,29 @@ impl VmRuntime {
 
     fn shutdown(&mut self) {
         if let Ok(None) = self.child.try_wait() {
-            let _ = self.child.kill();
+            // A QEMU that crashed is still running while the kernel
+            // writes its core, and a kill then cuts the dump short; the
+            // core is the only account of where it crashed.
+            if !qemu_is_dumping_core(self.child.id()) {
+                let _ = self.child.kill();
+            }
             let _ = self.child.wait();
         }
         if let Some(swtpm) = &mut self.swtpm {
             swtpm.shutdown();
         }
     }
+}
+
+/// Whether Linux is writing a core for `pid`, from the `CoreDumping` field
+/// of `/proc/<pid>/status` (proc(5)). A host without that file has no
+/// dump in progress to protect.
+fn qemu_is_dumping_core(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+        status
+            .lines()
+            .any(|line| line.strip_prefix("CoreDumping:").map(str::trim) == Some("1"))
+    })
 }
 
 fn default_persistent_runtime_dir() -> Result<PathBuf, VmRuntimeError> {
