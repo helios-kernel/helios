@@ -2860,7 +2860,7 @@ mod tests {
         let code =
             crate::wasmtime_adapter::wasi::fs_error_code(helios_hal::fs::FsError::NameTooLong);
 
-        // Preview 2 and 3 return the code itself; preview 1 and WASIX
+        // Preview 3 returns the code itself; preview 1 and WASIX
         // answer its errno.
         assert!(matches!(code, fs_types::ErrorCode::NameTooLong));
         assert_eq!(

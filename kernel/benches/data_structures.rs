@@ -18,8 +18,8 @@ use helios_kernel::{
     MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, NodeRun, Notify, PingError, PingErrorKind, PingReply,
     RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadInto,
-    TcpReadProgress, TcpWriteProgress, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError,
-    UdpErrorKind, UserMemoryPool, byte_channel,
+    TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, UserMemoryPool,
+    byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -735,14 +735,6 @@ impl ComponentNetworkService for BenchNetworkService {
         Ok(Some(self.payload.clone()))
     }
 
-    fn tcp_try_read(
-        &self,
-        _stream: Self::TcpStream,
-        _max_bytes: usize,
-    ) -> Result<TcpReadProgress, TcpError> {
-        Ok(TcpReadProgress::Data(self.payload.clone()))
-    }
-
     async fn tcp_read_into<'a>(
         &'a self,
         _stream: Self::TcpStream,
@@ -752,24 +744,6 @@ impl ComponentNetworkService for BenchNetworkService {
         Ok(TcpReadInto::Data(
             helios_netstack::TcpReceiveBuffer::write_from(buffer, &self.payload),
         ))
-    }
-
-    fn tcp_send_room(&self, _stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError> {
-        Ok(TcpWriteProgress::Room(usize::MAX))
-    }
-
-    fn tcp_try_write(
-        &self,
-        _stream: Self::TcpStream,
-        bytes: &mut Bytes,
-    ) -> Result<TcpWriteProgress, TcpError> {
-        let written = bytes.len();
-        bytes.clear();
-        Ok(TcpWriteProgress::Room(written))
-    }
-
-    async fn tcp_write_ready(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {
-        Ok(())
     }
 
     async fn tcp_shutdown_send(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {

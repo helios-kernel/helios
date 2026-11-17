@@ -393,14 +393,6 @@ mod tests {
             core::future::ready(Ok(None))
         }
 
-        fn tcp_try_read(
-            &self,
-            _: Self::TcpStream,
-            _: usize,
-        ) -> Result<crate::TcpReadProgress, TcpError> {
-            Ok(crate::TcpReadProgress::Eof)
-        }
-
         fn tcp_read_into<'a>(
             &'a self,
             _: Self::TcpStream,
@@ -408,27 +400,6 @@ mod tests {
             _: u64,
         ) -> impl Future<Output = Result<crate::TcpReadInto, TcpError>> + Send + 'a {
             core::future::ready(Ok(crate::TcpReadInto::Eof))
-        }
-
-        fn tcp_send_room(&self, _: Self::TcpStream) -> Result<crate::TcpWriteProgress, TcpError> {
-            Ok(crate::TcpWriteProgress::Room(usize::MAX))
-        }
-
-        fn tcp_try_write(
-            &self,
-            _: Self::TcpStream,
-            bytes: &mut Bytes,
-        ) -> Result<crate::TcpWriteProgress, TcpError> {
-            let written = bytes.len();
-            bytes.clear();
-            Ok(crate::TcpWriteProgress::Room(written))
-        }
-
-        fn tcp_write_ready(
-            &self,
-            _: Self::TcpStream,
-        ) -> impl Future<Output = Result<(), TcpError>> + Send + '_ {
-            core::future::ready(Ok(()))
         }
 
         fn tcp_shutdown_send(

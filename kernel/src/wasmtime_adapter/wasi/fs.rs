@@ -5,8 +5,8 @@
 //! directory listing order. They resolve every path through the store's
 //! [`Namespace`], so the mount that owns a path decides which filesystem
 //! answers; no surface knows which filesystems exist. Preview3 below,
-//! preview2 (`preview2.rs`) and preview1 (`component_host::service`) call
-//! them and only translate types.
+//! and preview1 (`component_host::service`) call them and only translate
+//! types.
 
 use helios_hal::fs::{
     FileSystem, FilledWrite, FsError as VfsError, FsResult, Landed, Metadata, NodeKind, OpenFlags,
@@ -597,6 +597,10 @@ where
 /// Writes `bytes` to the file `descriptor` names, and resolves with where
 /// they landed and how many did: fewer than `bytes` only when the
 /// filesystem ran out of space after storing a prefix.
+///
+/// The guests' write paths are streams over [`write_resolved`]; this is
+/// the one-shot form the filesystem tests drive.
+#[cfg(test)]
 pub(crate) async fn write<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     file: Granted<'_, RegularFile, Write>,

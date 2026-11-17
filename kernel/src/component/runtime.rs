@@ -518,17 +518,6 @@ where
     requested_exit: Option<u8>,
 }
 
-pub struct DeadlinePollable<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    cpu: CpuImpl,
-    timer: Timer<CpuImpl>,
-    runtime_state: RuntimeStateImpl,
-    deadline_nanos: u64,
-}
-
 impl<FileSystem> ComponentExecutionContext<FileSystem> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -864,41 +853,6 @@ where
     /// instance's stores makes immediate.
     pub fn pending_kill(&self) -> Option<KillReason> {
         self.execution_context.activity.pending_kill()
-    }
-}
-
-impl<CpuImpl, RuntimeStateImpl> DeadlinePollable<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    pub fn new(
-        cpu: CpuImpl,
-        timer: Timer<CpuImpl>,
-        runtime_state: RuntimeStateImpl,
-        deadline_nanos: u64,
-    ) -> Self {
-        Self {
-            cpu,
-            timer,
-            runtime_state,
-            deadline_nanos,
-        }
-    }
-
-    pub fn uptime_nanos(&self) -> u64 {
-        self.runtime_state.uptime_nanos(self.cpu.now().ticks())
-    }
-
-    pub fn deadline_nanos(&self) -> u64 {
-        self.deadline_nanos
-    }
-
-    pub async fn ready(&mut self) {
-        let timer = self.timer.clone();
-        let cpu = self.cpu.clone();
-        let runtime_state = self.runtime_state.clone();
-        wait_until_runtime_deadline(timer, cpu, runtime_state, self.deadline_nanos).await;
     }
 }
 

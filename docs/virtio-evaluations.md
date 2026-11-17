@@ -409,7 +409,7 @@ a `SetWallClockCap` — WASIX `clock_time_set`
 or the preview1 shim
 (`kernel/src/wasmtime_adapter/component_host/service/preview1.rs:141-145`).
 
-So `wasi:clocks/wall-clock` (`kernel/src/wasmtime_adapter/wasi/preview2.rs:1143-1155`)
+So `wasi:clocks/system-clock` (`kernel/src/wasmtime_adapter/wasi/host_env.rs:75-84`)
 reports uptime-since-boot as if it were the Unix epoch until something
 inside the guest corrects it. Nothing in the boot path seeds it: the
 inspector passes no epoch to the guest, and none of the three machine
