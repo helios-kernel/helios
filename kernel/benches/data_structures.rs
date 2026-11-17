@@ -378,7 +378,7 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
                 registration
                     .as_ref()
                     .expect("futex bench registration should be present")
-                    .notify(),
+                    .is_released(),
             );
         }
         // Dropping a registration completes it.
