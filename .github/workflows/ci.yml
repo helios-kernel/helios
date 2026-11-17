@@ -1667,6 +1667,14 @@ jobs:
         shell: bash
         working-directory: helios
         run: bash tools/fs-smoke/run.sh x86-64 kvm
+      - name: Kill the guest during a btrfs write burst
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          # The kill point is drawn from a seed this step prints; a failure
+          # replays with CRASH_SEED=<seed> bash tools/fs-smoke/crash.sh x86-64 kvm.
+          bash tools/fs-smoke/crash.sh x86-64 kvm
       - name: Run CPython twice and record its launch phases
         timeout-minutes: 5
         shell: bash
