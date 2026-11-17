@@ -14,6 +14,7 @@ use core::arch::{asm, global_asm};
 use core::mem::offset_of;
 use core::ptr::NonNull;
 
+use arm_sysregs::el1::registers::SctlrEl1;
 use helios_hal::hv::RegisterId;
 use helios_hal::native::{
     FaultKind, InstructionSet, NativeError, NativeExecution, Stop, UserContext, UserFault,
@@ -77,6 +78,32 @@ const EXIT_SYNC: u64 = 1;
 const EXIT_IRQ: u64 = 2;
 const EXIT_FIQ: u64 = 3;
 const EXIT_SERROR: u64 = 4;
+
+/// Lets user code synchronise its own instruction stream with the data it
+/// wrote, as Linux's `INIT_SCTLR_EL1_MMU_ON` lets it:
+/// - `SCTLR_EL1.UCT` makes `CTR_EL0` readable at EL0;
+/// - `SCTLR_EL1.UCI` lets EL0 run `DC CVAU`, `DC CVAC`, `DC CIVAC` and
+///   `IC IVAU`.
+///
+/// Code a program writes into a writable executable page runs only after
+/// those, which `__clear_cache` issues. Neither bit changes what EL1 may do.
+/// Each processor sets them once, before it runs any user slice.
+pub(crate) fn enable_user_cache_maintenance() {
+    let bits = (SctlrEl1::UCT | SctlrEl1::UCI).bits();
+    // SAFETY: sets two SCTLR_EL1 bits that govern only EL0 accesses; the
+    // `isb` makes them take effect before any later user slice.
+    unsafe {
+        asm!(
+            "mrs {sctlr}, sctlr_el1",
+            "orr {sctlr}, {sctlr}, {bits}",
+            "msr sctlr_el1, {sctlr}",
+            "isb",
+            sctlr = out(reg) _,
+            bits = in(reg) bits,
+            options(nostack, preserves_flags),
+        );
+    }
+}
 
 /// The AArch64 native execution capability.
 pub struct Aarch64Native;

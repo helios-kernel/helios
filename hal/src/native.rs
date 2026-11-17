@@ -86,6 +86,11 @@
 //!   program: the slice it interrupted is the one it is attributed to.
 //! - `resume` is called from task context with interrupts enabled. It
 //!   occupies its processor for at most one slice and does not suspend.
+//! - A page may be mapped writable and executable at once, and user code
+//!   makes its own stores visible to its instruction fetches by the means
+//!   its ISA gives user mode: x86 keeps the two coherent, and an AArch64
+//!   backend lets EL0 read `CTR_EL0` and run the `DC`/`IC` maintenance
+//!   instructions on every processor before any slice runs there.
 //! - Every register a slice can change, general, flags, vector and every
 //!   extended-state component the processor enables for user mode, is saved
 //!   when the slice ends and restored when the next one starts; the kernel's
@@ -114,8 +119,6 @@ pub enum NativeError {
     Address,
     #[error("range overlaps an existing user mapping")]
     Overlap,
-    #[error("the permission combination is refused (writable and executable)")]
-    Permissions,
     #[error("user memory is exhausted")]
     OutOfMemory,
     #[error("an address in the range is not mapped with the required access")]
@@ -217,8 +220,9 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     /// Installs zero-filled private pages covering `range` with `flags`,
     /// then copies `contents` to `range.start`. `range` need not be page
     /// aligned; every page it touches is installed. Fails, mapping nothing,
-    /// when `contents` is longer than the range, any covered page is
-    /// already mapped, or `flags` asks for write and execute together.
+    /// when `contents` is longer than the range or any covered page is
+    /// already mapped. Any combination of read, write and execute is a
+    /// valid `flags`, write and execute together included.
     fn map(&self, range: VirtRange, contents: &[u8], flags: PageFlags) -> Result<(), NativeError>;
 
     /// Installs `byte_len` bytes (a page multiple) of zero-filled private
@@ -247,9 +251,9 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     fn unmap(&self, range: VirtRange) -> Result<(), NativeError>;
 
     /// Replaces the access of every page of the page-aligned `range` with
-    /// `flags`. Fails, changing nothing, when a page of the range is not
-    /// mapped or `flags` asks for write and execute together. Pages that
-    /// lose an access are shot down before it returns.
+    /// `flags`, any combination of read, write and execute. Fails, changing
+    /// nothing, when a page of the range is not mapped. Pages that lose an
+    /// access are shot down before it returns.
     fn protect(&self, range: VirtRange, flags: PageFlags) -> Result<(), NativeError>;
 
     /// Releases the frame behind every mapped page of the page-aligned

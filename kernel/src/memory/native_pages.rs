@@ -291,14 +291,6 @@ fn page_span(range: VirtRange) -> Result<(u64, u64), NativeError> {
     Ok((first, last))
 }
 
-fn refuse_write_execute(flags: PageFlags) -> Result<(), NativeError> {
-    if flags.contains(PageFlags::WRITE | PageFlags::EXECUTE) {
-        Err(NativeError::Permissions)
-    } else {
-        Ok(())
-    }
-}
-
 // SAFETY: every user page maps a frame this space allocated, with the flags
 // it was mapped with, through a translation that keeps `UserTranslation`'s
 // contract; a frame leaves the space only after `complete` has shot down
@@ -308,7 +300,6 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         if contents.len() > range.byte_len {
             return Err(NativeError::Address);
         }
-        refuse_write_execute(flags)?;
         let start = range.start.raw() as u64;
         let mut state = self.shared.state.lock();
         let (first, last) = state.pages.span(start, range.byte_len as u64)?;
@@ -335,7 +326,6 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         if byte_len == 0 || !(byte_len as u64).is_multiple_of(PAGE) {
             return Err(NativeError::Address);
         }
-        refuse_write_execute(flags)?;
         let mut state = self.shared.state.lock();
         let start = state
             .pages
@@ -387,7 +377,6 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
 
     fn protect(&self, range: VirtRange, flags: PageFlags) -> Result<(), NativeError> {
         let (first, last) = page_span(range)?;
-        refuse_write_execute(flags)?;
         let mut state = self.shared.state.lock();
         state.pages.span(first, last - first)?;
         if !state.pages.covers(first, last) {
