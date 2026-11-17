@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use artifact_cache::{
-    ArtifactCache, CacheError, EntryKind, KeyBuilder, PrecompileCache, PrecompileError,
+    ArtifactCache, CacheError, EntryKind, FeatureSet, KeyBuilder, PrecompileCache, PrecompileError,
     lock_closure_digest, package_directories, package_name, precompile, prune, workspace_inputs,
 };
 use askama::Template;
@@ -39,6 +39,7 @@ use wit_component::ComponentEncoder;
 
 mod artifact_cache;
 mod boot_kernel;
+mod kernel_image;
 mod venus_fetch;
 
 /// Why a `helios-cli` invocation did not do what it was asked.
@@ -50,6 +51,8 @@ mod venus_fetch;
 enum CliError {
     #[error("{0}")]
     ArtifactCachePrune(#[from] CacheError),
+    #[error("{0}")]
+    KernelImage(#[from] kernel_image::KernelImageError),
     #[error("{0}")]
     KernelPrebuild(#[from] PrebuildError),
     #[error("{0}")]
@@ -724,6 +727,8 @@ enum Commands {
         #[arg(long)]
         out_dir: PathBuf,
     },
+    KernelImageRestore(kernel_image::KernelImageRestore),
+    KernelImageStore(kernel_image::KernelImageStore),
     KernelPrebuild(KernelPrebuildCommand),
     LimineUefiImage(LimineUefiImageCommand),
     ProfileFetch(ProfileFetchCommand),
@@ -794,8 +799,8 @@ struct KernelPrebuildCommand {
     ///
     /// The file is read in place and nothing secret is written to
     /// `--out-dir`; a release build names the key its workflow
-    /// installed.
-    #[arg(long, value_name = "PATH")]
+    /// installed, and CI names its signing key through the environment.
+    #[arg(long, value_name = "PATH", env = "HELIOS_ROOT_SECRET_KEY")]
     root_secret_key: Option<PathBuf>,
     #[command(flatten)]
     cache: CacheArgs,
@@ -1114,6 +1119,14 @@ fn run(cli: Cli) -> Result<(), CliError> {
             prepare_root_key(&out_dir, None)?;
             Ok(())
         }
+        Commands::KernelImageRestore(command) => Ok(kernel_image::restore(
+            &command,
+            WorkspaceRoot::resolve(cli.workspace_root.as_deref())?.path(),
+        )?),
+        Commands::KernelImageStore(command) => Ok(kernel_image::store(
+            &command,
+            WorkspaceRoot::resolve(cli.workspace_root.as_deref())?.path(),
+        )?),
         Commands::KernelPrebuild(command) => {
             Ok(run_kernel_prebuild(command, cli.workspace_root.as_deref())?)
         }
@@ -2689,7 +2702,7 @@ impl WasmBuilder<'_> {
             })
         };
         if let Some((cache, key)) = &cache
-            && let Some(wasm) = cache.lookup_wasm(key, self.workspace_root.path())?
+            && let Some(wasm) = cache.lookup_inputs(key, self.workspace_root.path())?
         {
             let write_cached = |source| WasmBuildError::WriteCached {
                 path: artifact.display().to_string(),
@@ -2764,12 +2777,17 @@ impl WasmBuilder<'_> {
                 }
             })?;
             let inputs = workspace_inputs(
-                &artifact.with_extension("d"),
+                &[artifact.with_extension("d")],
                 self.workspace_root.path(),
                 &excluded,
-                &package_directories(self.cargo, manifest_path, target_triple)?,
+                &package_directories(
+                    self.cargo,
+                    manifest_path,
+                    target_triple,
+                    FeatureSet::Default,
+                )?,
             )?;
-            cache.store_wasm(key, self.workspace_root.path(), &inputs, &wasm)?;
+            cache.store_inputs(key, self.workspace_root.path(), &inputs, &wasm)?;
         }
         Ok(resolved)
     }

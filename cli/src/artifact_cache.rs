@@ -168,6 +168,8 @@ pub enum PrecompileError {
 pub enum EntryKind {
     Wasm,
     Cwasm,
+    /// A kernel image cargo linked.
+    Kernel,
 }
 
 impl EntryKind {
@@ -175,6 +177,7 @@ impl EntryKind {
         match self {
             Self::Wasm => "wasm",
             Self::Cwasm => "cwasm",
+            Self::Kernel => "kernel",
         }
     }
 }
@@ -279,7 +282,7 @@ impl ArtifactCache {
     /// The payload stored under `key` when every source file the entry
     /// lists, resolved against `workspace_root`, still exists and hashes
     /// as it did when the entry was stored.
-    pub fn lookup_wasm(
+    pub fn lookup_inputs(
         &self,
         key: &Key,
         workspace_root: &Path,
@@ -308,7 +311,7 @@ impl ArtifactCache {
 
     /// Stores a built wasm under `key` with the workspace-relative source
     /// files it was built from, as [`workspace_inputs`] lists them.
-    pub fn store_wasm(
+    pub fn store_inputs(
         &self,
         key: &Key,
         workspace_root: &Path,
@@ -464,7 +467,7 @@ pub fn prune(dir: &Path, older_than: SystemTime) -> Result<usize, CacheError> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let is_entry = [EntryKind::Wasm, EntryKind::Cwasm]
+        let is_entry = [EntryKind::Wasm, EntryKind::Cwasm, EntryKind::Kernel]
             .iter()
             .any(|kind| name.starts_with(&format!("{}-", kind.prefix())));
         if !is_entry && !name.starts_with(TEMP_PREFIX) {
@@ -485,9 +488,16 @@ pub fn prune(dir: &Path, older_than: SystemTime) -> Result<usize, CacheError> {
     Ok(removed)
 }
 
-/// The files a wasm entry depends on, relative to `workspace_root` and
-/// sorted: the source files cargo's dep-info `dep_info` names, every file of
-/// every package in `package_dirs`, and the root manifest.
+/// The files an entry built by cargo depends on, relative to
+/// `workspace_root` and sorted: the source files cargo's dep-info files
+/// `dep_infos` name, every file of every package in `package_dirs`, and the
+/// root manifest.
+///
+/// The package that is the workspace root itself holds the whole
+/// repository in its directory, so it contributes what a cargo package
+/// there is made of: its manifest, `src/` and the plain files beside the
+/// manifest (linker scripts), and not the documentation, workflows and
+/// tools beside them.
 ///
 /// Files outside the workspace that a registry or git checkout or the
 /// sysroot holds are left out because the lockfile and the toolchain are
@@ -501,33 +511,36 @@ pub fn prune(dir: &Path, older_than: SystemTime) -> Result<usize, CacheError> {
 /// what dep-info does not list but a build reads: manifests, which hold
 /// the features and dependencies, and whatever a build script takes in.
 pub fn workspace_inputs(
-    dep_info: &Path,
+    dep_infos: &[PathBuf],
     workspace_root: &Path,
     excluded: &Path,
     package_dirs: &[PathBuf],
 ) -> Result<Vec<PathBuf>, CacheError> {
-    let text = fs::read_to_string(dep_info).map_err(|source| CacheError::Read {
-        path: dep_info.display().to_string(),
-        source,
-    })?;
     let mut inputs = BTreeSet::from([PathBuf::from(MANIFEST)]);
-    for dependency in parse_dep_info(dep_info, &text)? {
-        let dependency_path = Path::new(&dependency);
-        if !dependency_path.is_absolute() {
-            return Err(CacheError::RelativeDependency {
-                path: dep_info.display().to_string(),
-                dependency,
-            });
-        }
-        let resolved = fs::canonicalize(dependency_path).map_err(|source| CacheError::Resolve {
-            path: dependency.clone(),
+    for dep_info in dep_infos {
+        let text = fs::read_to_string(dep_info).map_err(|source| CacheError::Read {
+            path: dep_info.display().to_string(),
             source,
         })?;
-        if resolved.starts_with(excluded) {
-            continue;
-        }
-        if let Ok(relative) = resolved.strip_prefix(workspace_root) {
-            inputs.insert(relative.to_path_buf());
+        for dependency in parse_dep_info(dep_info, &text)? {
+            let dependency_path = Path::new(&dependency);
+            if !dependency_path.is_absolute() {
+                return Err(CacheError::RelativeDependency {
+                    path: dep_info.display().to_string(),
+                    dependency,
+                });
+            }
+            let resolved =
+                fs::canonicalize(dependency_path).map_err(|source| CacheError::Resolve {
+                    path: dependency.clone(),
+                    source,
+                })?;
+            if resolved.starts_with(excluded) {
+                continue;
+            }
+            if let Ok(relative) = resolved.strip_prefix(workspace_root) {
+                inputs.insert(relative.to_path_buf());
+            }
         }
     }
     for package_dir in package_dirs {
@@ -535,18 +548,30 @@ pub fn workspace_inputs(
             path: package_dir.display().to_string(),
             source,
         })?;
-        let files = WalkDir::new(&resolved).into_iter().filter_entry(|entry| {
-            entry.depth() == 0 || (entry.file_name() != "target" && entry.file_name() != ".git")
-        });
-        for entry in files {
-            let entry = entry.map_err(|source| CacheError::Walk {
-                path: resolved.display().to_string(),
-                source,
-            })?;
-            if entry.file_type().is_file() {
-                inputs.insert(relative_path(workspace_root, entry.path()));
+        let walk_error = |source| CacheError::Walk {
+            path: resolved.display().to_string(),
+            source,
+        };
+        if resolved == workspace_root {
+            for entry in WalkDir::new(&resolved).min_depth(1).max_depth(1) {
+                let entry = entry.map_err(walk_error)?;
+                if entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_none_or(|extension| extension != "md")
+                {
+                    inputs.insert(relative_path(workspace_root, entry.path()));
+                }
             }
+            inputs.extend(package_files(
+                &resolved.join("src"),
+                workspace_root,
+                walk_error,
+            )?);
+            continue;
         }
+        inputs.extend(package_files(&resolved, workspace_root, walk_error)?);
         if !resolved.starts_with(workspace_root) {
             for ancestor in resolved.ancestors().skip(1) {
                 let manifest = ancestor.join(MANIFEST);
@@ -558,6 +583,26 @@ pub fn workspace_inputs(
         }
     }
     Ok(inputs.into_iter().collect())
+}
+
+/// Every file under `directory` except what a `target` or `.git` directory
+/// holds, relative to `workspace_root`.
+fn package_files(
+    directory: &Path,
+    workspace_root: &Path,
+    walk_error: impl Fn(walkdir::Error) -> CacheError,
+) -> Result<Vec<PathBuf>, CacheError> {
+    let files = WalkDir::new(directory).into_iter().filter_entry(|entry| {
+        entry.depth() == 0 || (entry.file_name() != "target" && entry.file_name() != ".git")
+    });
+    let mut paths = Vec::new();
+    for entry in files {
+        let entry = entry.map_err(&walk_error)?;
+        if entry.file_type().is_file() {
+            paths.push(relative_path(workspace_root, entry.path()));
+        }
+    }
+    Ok(paths)
 }
 
 /// Whether the cargo manifest at `path` has a `[workspace]` table.
@@ -721,6 +766,17 @@ struct LockPackage {
 /// The file name of a cargo manifest.
 const MANIFEST: &str = "Cargo.toml";
 
+/// Which optional dependencies a closure includes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeatureSet {
+    /// What the package's default features enable: a program's closure,
+    /// built with exactly those.
+    Default,
+    /// Every optional dependency: a closure that holds every build of the
+    /// package, whichever features it selects.
+    All,
+}
+
 /// The directories of the workspace path packages the program with
 /// `manifest_path` depends on for `target_triple`, itself included.
 ///
@@ -731,13 +787,19 @@ pub fn package_directories(
     cargo: &Path,
     manifest_path: &Path,
     target_triple: &str,
+    features: FeatureSet,
 ) -> Result<Vec<PathBuf>, CacheError> {
     let manifest = manifest_path.display().to_string();
-    let output = Command::new(cargo)
+    let mut metadata = Command::new(cargo);
+    metadata
         .args(["metadata", "--format-version", "1", "--filter-platform"])
         .arg(target_triple)
         .arg("--manifest-path")
-        .arg(manifest_path)
+        .arg(manifest_path);
+    if features == FeatureSet::All {
+        metadata.arg("--all-features");
+    }
+    let output = metadata
         .output()
         .map_err(|source| CacheError::SpawnMetadata {
             manifest: manifest.clone(),
@@ -1009,7 +1071,7 @@ mod tests {
 
         fn inputs(&self) -> Vec<PathBuf> {
             workspace_inputs(
-                &self.dep_info(),
+                &[self.dep_info()],
                 &self.workspace(),
                 &self.workspace().join("target"),
                 &[
@@ -1044,6 +1106,43 @@ mod tests {
     }
 
     #[test]
+    fn the_root_package_contributes_its_manifest_sources_and_linker_scripts_only() {
+        let fixture = Fixture::new();
+        let root = fixture.workspace();
+        for (path, contents) in [
+            ("link.x", "SECTIONS {}\n"),
+            ("README.md", "# readme\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("docs/boot.md", "# boot\n"),
+            (".github/ci.yml", "name: CI\n"),
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+            fs::write(path, contents).expect("a file");
+        }
+        let inputs = workspace_inputs(
+            &[fixture.dep_info()],
+            &root,
+            &root.join("target"),
+            std::slice::from_ref(&root),
+        )
+        .expect("the dep-info is read");
+        assert_eq!(
+            inputs,
+            [
+                "Cargo.toml",
+                "api/src/lib.rs",
+                // The fixture keeps its dep-info file beside the manifest.
+                "date.d",
+                "link.x",
+                "programs/date/src/main.rs",
+                "src/main.rs"
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
     fn a_name_with_a_space_stays_one_word() {
         let words = parse_dep_info(
             Path::new("date.d"),
@@ -1066,7 +1165,7 @@ mod tests {
         let cache = fixture.cache();
         let key = key("rustc 1");
         cache
-            .store_wasm(
+            .store_inputs(
                 &key,
                 &fixture.workspace(),
                 &fixture.inputs(),
@@ -1075,7 +1174,7 @@ mod tests {
             .expect("the store succeeds");
 
         let hit = cache
-            .lookup_wasm(&key, &fixture.workspace())
+            .lookup_inputs(&key, &fixture.workspace())
             .expect("the lookup succeeds");
         assert_eq!(hit.as_deref(), Some(&b"\0asm built"[..]));
         assert_eq!(cache.stats(), CacheStats { hits: 1, misses: 0 });
@@ -1087,7 +1186,7 @@ mod tests {
         let cache = fixture.cache();
         let key = key("rustc 1");
         cache
-            .store_wasm(&key, &fixture.workspace(), &fixture.inputs(), b"built")
+            .store_inputs(&key, &fixture.workspace(), &fixture.inputs(), b"built")
             .expect("the store succeeds");
 
         fs::write(
@@ -1097,7 +1196,7 @@ mod tests {
         .expect("an edit");
         assert_eq!(
             cache
-                .lookup_wasm(&key, &fixture.workspace())
+                .lookup_inputs(&key, &fixture.workspace())
                 .expect("the lookup succeeds"),
             None
         );
@@ -1115,7 +1214,7 @@ mod tests {
         .expect("an edit");
         assert_eq!(
             cache
-                .lookup_wasm(&key, &fixture.workspace())
+                .lookup_inputs(&key, &fixture.workspace())
                 .expect("the lookup succeeds"),
             None
         );
@@ -1128,13 +1227,13 @@ mod tests {
         let cache = fixture.cache();
         let key = key("rustc 1");
         cache
-            .store_wasm(&key, &fixture.workspace(), &fixture.inputs(), b"built")
+            .store_inputs(&key, &fixture.workspace(), &fixture.inputs(), b"built")
             .expect("the store succeeds");
 
         fs::remove_file(fixture.workspace().join("programs/date/src/main.rs")).expect("a removal");
         assert_eq!(
             cache
-                .lookup_wasm(&key, &fixture.workspace())
+                .lookup_inputs(&key, &fixture.workspace())
                 .expect("the lookup succeeds"),
             None
         );
@@ -1145,7 +1244,7 @@ mod tests {
         let fixture = Fixture::new();
         let cache = fixture.cache();
         cache
-            .store_wasm(
+            .store_inputs(
                 &key("rustc 1"),
                 &fixture.workspace(),
                 &fixture.inputs(),
@@ -1155,7 +1254,7 @@ mod tests {
 
         assert_eq!(
             cache
-                .lookup_wasm(&key("rustc 2"), &fixture.workspace())
+                .lookup_inputs(&key("rustc 2"), &fixture.workspace())
                 .expect("the lookup succeeds"),
             None
         );
@@ -1335,6 +1434,7 @@ mod tests {
             Path::new(&cargo),
             &workspace.join("program/Cargo.toml"),
             "wasm32-wasip2",
+            FeatureSet::Default,
         )
         .expect("the closure resolves");
         let directories = directories
@@ -1353,7 +1453,7 @@ mod tests {
         );
 
         let inputs = workspace_inputs(
-            &dep_info,
+            &[dep_info],
             &workspace,
             &workspace.join("target"),
             &directories
@@ -1366,11 +1466,11 @@ mod tests {
         let cache = ArtifactCache::open(cache_dir.path()).expect("the cache opens");
         let key = key("rustc 1");
         cache
-            .store_wasm(&key, &workspace, &inputs, b"built")
+            .store_inputs(&key, &workspace, &inputs, b"built")
             .expect("the store succeeds");
         assert!(
             cache
-                .lookup_wasm(&key, &workspace)
+                .lookup_inputs(&key, &workspace)
                 .expect("the lookup succeeds")
                 .is_some()
         );
@@ -1378,7 +1478,7 @@ mod tests {
         fs::write(workspace.join("generator/protocol.txt"), "protocol 2\n").expect("an edit");
         assert_eq!(
             cache
-                .lookup_wasm(&key, &workspace)
+                .lookup_inputs(&key, &workspace)
                 .expect("the lookup succeeds"),
             None
         );
@@ -1508,7 +1608,7 @@ checksum = "dd"
         let sibling = fs::canonicalize(sibling).expect("the sibling resolves");
         let engine = sibling.join("crates/engine");
         let inputs = workspace_inputs(
-            &fixture.dep_info(),
+            &[fixture.dep_info()],
             &fixture.workspace(),
             &fixture.workspace().join("target"),
             &[fixture.workspace().join("programs/date"), engine],
@@ -1540,11 +1640,11 @@ checksum = "dd"
         let cache = fixture.cache();
         let key = key("rustc 1");
         cache
-            .store_wasm(&key, &fixture.workspace(), &inputs, b"built")
+            .store_inputs(&key, &fixture.workspace(), &inputs, b"built")
             .expect("the store succeeds");
         assert!(
             cache
-                .lookup_wasm(&key, &fixture.workspace())
+                .lookup_inputs(&key, &fixture.workspace())
                 .expect("the lookup succeeds")
                 .is_some()
         );
@@ -1555,7 +1655,7 @@ checksum = "dd"
         .expect("an edit");
         assert_eq!(
             cache
-                .lookup_wasm(&key, &fixture.workspace())
+                .lookup_inputs(&key, &fixture.workspace())
                 .expect("the lookup succeeds"),
             None,
             "an edit to the sibling checkout is a miss"
