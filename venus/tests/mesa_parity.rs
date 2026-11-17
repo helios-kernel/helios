@@ -14,7 +14,7 @@
 //! lays them out. It says nothing about the layout of the generated types on
 //! a 32-bit target; that is closed independently of the host by the layout
 //! assertions the generator emits for both pointer widths (checked when the
-//! crate builds for `wasm32-wasip2`), by `venus-gen`'s tests of the layout
+//! crate builds for `wasm32-wasip3`), by `venus-gen`'s tests of the layout
 //! model against a C compiler targeting wasm32, and by the golden tests of
 //! the `size_t` widening, which run on every host.
 
