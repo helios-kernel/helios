@@ -24,7 +24,9 @@ use super::*;
 use crate::{TerminalInputCap, TerminalOutputCap};
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
-use helios_hal::native::{FaultKind, NativeError, NativeExecution, Stop, UserContext, UserSpace};
+use helios_hal::native::{
+    FaultKind, NativeError, NativeExecution, NativeUnavailable, Stop, UserContext, UserSpace,
+};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_linux::abi::{self, Abi};
@@ -56,22 +58,27 @@ pub(super) struct LinuxExecutable {
 
 impl LinuxExecutable {
     /// Validates `image` for this platform. Refused when the platform has
-    /// no native execution, when no Linux ABI is decoded for its
+    /// no native execution or its processor lacks a protection the
+    /// isolation contract requires, when no Linux ABI is decoded for its
     /// instruction set, or when the image is not one the loader maps.
     pub(super) fn load<CpuImpl: Cpu>(
         cpu: &CpuImpl,
         image: Bytes,
     ) -> Result<Self, ProgramExecError> {
-        let native = cpu.native().ok_or(ProgramExecError {
-            kind: ProgramExecErrorKind::Unavailable,
-            detail: ProgramExecErrorDetail::NativeExecutionUnavailable,
-        })?;
+        let native = cpu.native().map_err(native_unavailable)?;
         let abi = Abi::for_instruction_set(native.instruction_set()).ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::Unavailable,
             detail: ProgramExecErrorDetail::LinuxAbiUnsupported,
         })?;
         Image::parse(&image, abi, user_end(native)).map_err(image_error)?;
         Ok(Self { image, abi })
+    }
+}
+
+fn native_unavailable(reason: NativeUnavailable) -> ProgramExecError {
+    ProgramExecError {
+        kind: ProgramExecErrorKind::Unavailable,
+        detail: ProgramExecErrorDetail::NativeExecutionUnavailable(reason),
     }
 }
 
@@ -393,10 +400,7 @@ where
     timeline.set_instance(instance_id);
     timeline.record(&exec_context.cpu, LaunchPhase::TaskBegin);
     let cpu = exec_context.cpu.clone();
-    let native = cpu.native().ok_or(ProgramExecError {
-        kind: ProgramExecErrorKind::Unavailable,
-        detail: ProgramExecErrorDetail::NativeExecutionUnavailable,
-    })?;
+    let native = cpu.native().map_err(native_unavailable)?;
     let image =
         Image::parse(&executable.image, executable.abi, user_end(native)).map_err(image_error)?;
     let space = native.create_space().map_err(native_error)?;
