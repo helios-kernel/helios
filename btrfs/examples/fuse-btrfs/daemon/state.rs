@@ -68,6 +68,9 @@ pub enum Node<'a> {
 pub struct Owner {
     pub uid: u32,
     pub gid: u32,
+    /// The caller's umask, which the writer applies as `posix_acl_create`
+    /// does.
+    pub umask: u32,
 }
 
 pub struct Statfs {
@@ -428,6 +431,7 @@ impl State {
             permissions,
             uid: owner.uid,
             gid: owner.gid,
+            umask: owner.umask,
         };
         let created = match node {
             Node::File => transaction.create_file(at, attributes, now).await,

@@ -100,12 +100,25 @@ pub enum WriteError {
     XattrExists { tree: u64, inode: u64 },
     #[error("extended attributes need {needed} bytes of buffer, got {provided}")]
     XattrBuffer { needed: usize, provided: usize },
-    /// Writing `security.*`, `trusted.*` or a POSIX ACL (lexoliu/helios#1037),
-    /// or `user.*` on a file that is neither regular nor a directory.
-    #[error("inode {inode} in tree {tree} refuses this extended attribute write")]
+    /// Writing `user.*` on a file that is neither regular nor a directory.
+    #[error("inode {inode} in tree {tree} takes no user.* attributes")]
     XattrNotPermitted { tree: u64, inode: u64 },
     #[error("extended attribute namespace has no handler")]
     XattrNamespace,
+    /// A POSIX ACL value `posix_acl_from_xattr` or `posix_acl_valid` refuses
+    /// (`EINVAL`).
+    #[error("POSIX ACL value is malformed or its entries are invalid")]
+    AclInvalid,
+    /// A POSIX ACL value of a version other than `POSIX_ACL_XATTR_VERSION`
+    /// (`EOPNOTSUPP`).
+    #[error("POSIX ACL version {version} is not supported")]
+    AclVersion { version: u32 },
+    /// A POSIX ACL on a symlink, which has no ACL operations (`EOPNOTSUPP`).
+    #[error("inode {inode} in tree {tree} is a symlink, which takes no POSIX ACL")]
+    AclNotSupported { tree: u64, inode: u64 },
+    /// A default ACL on a non-directory (`EACCES`, `set_posix_acl`).
+    #[error("inode {inode} in tree {tree} is not a directory and takes no default ACL")]
+    AclDefaultNotDirectory { tree: u64, inode: u64 },
 
     #[error("file offset or inode byte accounting overflows")]
     FileOverflow,

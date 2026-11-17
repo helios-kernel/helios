@@ -94,9 +94,15 @@ impl InodeHandle {
 /// by create_file, create_directory or symlink, never by permission bits.
 #[derive(Clone, Copy, Debug)]
 pub struct Attributes {
+    /// The mode bits asked for, before the umask.
     pub permissions: u32,
     pub uid: u32,
     pub gid: u32,
+    /// The creating process's umask. As in Linux's `posix_acl_create`, it
+    /// narrows `permissions` only when the parent directory has no default
+    /// ACL; a default ACL narrows them instead, and the new inode inherits
+    /// it.
+    pub umask: u32,
 }
 
 impl Attributes {
@@ -110,6 +116,7 @@ impl Attributes {
             mode: kind | self.permissions,
             uid: self.uid,
             gid: self.gid,
+            umask: self.umask,
         })
     }
 }
@@ -581,14 +588,15 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     /// Replaces the permission bits (`07777`, with the set-id bits refused on
-    /// a non-directory with [`WriteError::SetId`]) and stamps `changed`.
+    /// a non-directory with [`WriteError::SetId`]) and stamps `changed`. An
+    /// access ACL's base entries follow the new bits.
     pub async fn set_permissions(
         &mut self,
         file: &InodeHandle,
         permissions: u32,
         changed: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self, Units::INODE_UPDATE).await?;
+        let mut operation = Mutation::new(self, Units::MODE).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner_mut().roots.check_writable(file.tree)?;
@@ -651,10 +659,14 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             .await
     }
 
-    /// `setxattr(2)`. Only `user.*` is written, on regular files and
-    /// directories; `security.*`, `trusted.*` and POSIX ACL names are
-    /// [`WriteError::XattrNotPermitted`] and any other namespace
+    /// `setxattr(2)`. Every namespace Linux's btrfs stores is written:
+    /// `user.*` (on regular files and directories only, else
+    /// [`WriteError::XattrNotPermitted`]), `security.*`, `trusted.*` and the
+    /// two POSIX ACL names, which are validated, stored in the encoding
+    /// `posix_acl_to_xattr` produces and, for the access ACL, set the mode's
+    /// permission bits as `btrfs_set_acl` does. Any other namespace is
     /// [`WriteError::XattrNamespace`]. The inode's ctime becomes `changed`.
+    /// Whether the caller may write the namespace is not checked here.
     pub async fn set_xattr(
         &mut self,
         file: &InodeHandle,
@@ -674,7 +686,8 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     /// `removexattr(2)`, under the rules of [`Self::set_xattr`]; an absent
-    /// attribute is [`WriteError::XattrMissing`].
+    /// attribute is [`WriteError::XattrMissing`], except an absent ACL,
+    /// whose removal succeeds as `vfs_remove_acl`'s does.
     pub async fn remove_xattr(
         &mut self,
         file: &InodeHandle,
@@ -715,7 +728,17 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         attributes: RawAttributes,
         when: Timestamp,
     ) -> Result<InodeHandle, WriteError> {
-        let mut operation = Mutation::new(self, Units::CREATE).await?;
+        let parent = self.entry_name(name).await?;
+        let units = if self
+            .inner()
+            .has_default_acl(parent.tree, parent.parent)
+            .await?
+        {
+            Units::CREATE_INHERITING_ACLS
+        } else {
+            Units::CREATE
+        };
+        let mut operation = Mutation::new(self, units).await?;
         let name = operation.entry_name(name).await?;
         operation.inner_mut().roots.check_writable(name.tree)?;
         let inode = operation

@@ -22,9 +22,9 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, LockOwner, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, InitFlags, KernelConfig,
+    LockOwner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use futures_lite::future::block_on;
 use helios_btrfs::Timestamp;
@@ -64,12 +64,29 @@ fn now() -> Timestamp {
     timestamp(SystemTime::now())
 }
 
-/// A new node's permission bits: what the caller asked for, less its umask.
-fn permissions(mode: u32, umask: u32) -> u32 {
-    mode & !umask & 0o7777
+/// A new node's permission bits as the caller asked for them. The kernel
+/// leaves the umask to the filesystem (`FUSE_DONT_MASK`), which applies it
+/// as Linux's `posix_acl_create` does: only when the parent has no default
+/// ACL.
+fn permissions(mode: u32) -> u32 {
+    mode & 0o7777
 }
 
 impl Filesystem for Daemon {
+    /// Asks for `FUSE_POSIX_ACL`, under which the kernel enforces POSIX ACLs
+    /// with `default_permissions` as it does for a local filesystem
+    /// (`process_init_reply` in `fs/fuse/inode.c` sets both), and
+    /// `FUSE_DONT_MASK`, so a creation arrives with its umask unapplied for
+    /// the writer's `posix_acl_create`. A kernel without either fails the
+    /// mount rather than serve ACLs it cannot enforce.
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        config
+            .add_capabilities(InitFlags::FUSE_POSIX_ACL | InitFlags::FUSE_DONT_MASK)
+            .map_err(|missing| {
+                std::io::Error::other(format!("the kernel's FUSE lacks {missing:?}"))
+            })
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.run(|state| block_on(state.lookup(parent, name))) {
             Ok((attr, generation)) => reply.entry(&TTL, &attr, generation),
@@ -148,7 +165,8 @@ impl Filesystem for Daemon {
             parent,
             name,
             Node::File,
-            permissions(mode, umask),
+            permissions(mode),
+            umask,
             reply,
         );
     }
@@ -167,7 +185,8 @@ impl Filesystem for Daemon {
             parent,
             name,
             Node::Directory,
-            permissions(mode, umask),
+            permissions(mode),
+            umask,
             reply,
         );
     }
@@ -186,6 +205,8 @@ impl Filesystem for Daemon {
             link_name,
             Node::Symlink(target_bytes(target)),
             0o777,
+            // `posix_acl_create` leaves a symlink's mode alone.
+            0,
             reply,
         );
     }
@@ -203,8 +224,9 @@ impl Filesystem for Daemon {
         let owner = Owner {
             uid: req.uid(),
             gid: req.gid(),
+            umask,
         };
-        let permissions = permissions(mode, umask);
+        let permissions = permissions(mode);
         match self.run(|state| {
             block_on(state.create(parent, name, Node::File, permissions, owner, now()))
         }) {
@@ -458,11 +480,13 @@ impl Daemon {
         name: &OsStr,
         node: Node<'_>,
         permissions: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         let owner = Owner {
             uid: req.uid(),
             gid: req.gid(),
+            umask,
         };
         match self
             .run(|state| block_on(state.create(parent, name, node, permissions, owner, now())))

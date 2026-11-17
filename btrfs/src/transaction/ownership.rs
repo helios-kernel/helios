@@ -12,6 +12,7 @@ use crate::{FileKind, Timestamp};
 /// The file type bits of an inode's mode.
 pub(crate) const S_IFMT: u32 = 0o170_000;
 pub(crate) const S_IFDIR: u32 = 0o040_000;
+pub(crate) const S_IFLNK: u32 = 0o120_000;
 /// Every bit `chmod` sets: permissions, sticky and the two set-id bits.
 pub(crate) const S_IALLUGO: u32 = 0o7777;
 pub(crate) const S_ISUID: u32 = 0o4000;
@@ -32,7 +33,8 @@ pub(crate) fn refuse_set_id(mode: u32) -> Result<(), WriteError> {
 impl<S: BlockSink> Transaction<S> {
     /// Replaces the permission bits, keeping the file type, as `chmod`
     /// (`chmod_common` in `fs/open.c` stores `(mode & S_IALLUGO) |
-    /// (inode->i_mode & ~S_IALLUGO)`).
+    /// (inode->i_mode & ~S_IALLUGO)`), then sets an access ACL's base
+    /// entries to them as `btrfs_setattr` does with `posix_acl_chmod`.
     pub(crate) async fn set_permissions(
         &mut self,
         tree: u64,
@@ -47,12 +49,15 @@ impl<S: BlockSink> Transaction<S> {
         check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
         let mode = (raw.mode.get() & !S_IALLUGO) | permissions;
         refuse_set_id(mode)?;
+        let changed_at = changed;
         let changed = time(tree, inode, changed)?;
         raw.mode.set(mode);
         raw.ctime = changed;
         raw.transid.set(self.trees.generation());
         raw.sequence.set(raw.sequence.get().wrapping_add(1));
-        self.put_inode(tree, inode, raw).await
+        self.put_inode(tree, inode, raw).await?;
+        // `btrfs_setattr` carries the mode into the access ACL.
+        self.chmod_acl(tree, inode, mode, changed_at).await
     }
 
     /// Sets the owner and/or the group, each left alone when `None` as

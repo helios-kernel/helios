@@ -3,27 +3,36 @@
 //! `btrfs_dir_item` records (name, then value), the layout `fs/btrfs/xattr.c`
 //! and `fs/btrfs/dir-item.c` (`btrfs_insert_xattr_item`) maintain.
 //!
+//! Every namespace Linux's btrfs stores is stored: `user.*`, `security.*`
+//! and `trusted.*` (`btrfs_xattr_handlers` in `fs/btrfs/xattr.c`, each
+//! writing through `btrfs_setxattr_trans`), and the two POSIX ACL names,
+//! which the VFS hands to `btrfs_set_acl` ([`super::acl`]). Whether a caller
+//! may write a namespace is the mount's and the caller's decision
+//! (lexoliu/helios#1037, lexoliu/helios#1084), never this layer's.
+//!
 //! Limits and errors follow Linux's VFS entry points (`fs/xattr.c`:
 //! `setxattr_copy`, `xattr_permission`, `xattr_resolve_name`) and
 //! `btrfs_setxattr` / `btrfs_getxattr` / `btrfs_listxattr`:
 //!
 //! - a name of zero or more than `XATTR_NAME_MAX` bytes is `ERANGE`, a
-//!   handler prefix with nothing after it `EINVAL`;
+//!   handler prefix with nothing after it `EINVAL`, and a name no handler
+//!   takes `EOPNOTSUPP`;
 //! - a value longer than `XATTR_SIZE_MAX` is `E2BIG`;
 //! - name plus value beyond `BTRFS_MAX_XATTR_SIZE` (the leaf's item capacity
 //!   less one `btrfs_dir_item`), or a hash-sharing item that outgrows one
 //!   leaf, is `ENOSPC`;
+//! - an immutable or append-only inode refuses every write with `EPERM`;
 //! - `user.*` on anything but a regular file or directory is `EPERM` to
-//!   write and `ENODATA` to read;
+//!   write and `ENODATA` to read, as `xattr_permission` has it whatever the
+//!   caller;
 //! - removal is a replace with no value: `ENODATA` when absent.
-//!
-//! Only `user.*` is writable. Whatever namespace is on disk reads back.
 
 use alloc::vec::Vec;
 use core::ops::Range;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
+use super::acl::AclKind;
 use super::namespace::{check_flags, time};
 use crate::csum::name_hash;
 use crate::items::{INODE_APPEND, INODE_IMMUTABLE, RecordKind, dir_records};
@@ -42,9 +51,11 @@ const ENTRY_TYPE_XATTR: u8 = 8;
 const CAPABILITY: &[u8] = b"security.capability";
 
 const USER: &[u8] = b"user.";
-/// Handler prefixes of `btrfs_xattr_handlers` (fs/btrfs/xattr.c).
-const PREFIXES: [&[u8]; 4] = [USER, b"security.", b"trusted.", b"btrfs."];
-const POSIX_ACLS: [&[u8]; 2] = [b"system.posix_acl_access", b"system.posix_acl_default"];
+/// The prefixes of the handlers `btrfs_xattr_handlers` stores through
+/// `btrfs_setxattr_trans` (fs/btrfs/xattr.c).
+const STORED: [&[u8]; 3] = [b"security.", b"trusted.", USER];
+/// `XATTR_BTRFS_PREFIX`, whose handler sets btrfs properties.
+const BTRFS: &[u8] = b"btrfs.";
 
 /// How a set treats an attribute that exists or does not: the `flags` of
 /// `setxattr(2)`.
@@ -58,16 +69,15 @@ pub enum XattrMode {
     Replace,
 }
 
-/// The handler a written name resolves to, `xattr_resolve_name` in
-/// `fs/xattr.c`.
+/// Where a written name goes: `is_posix_acl_xattr` in `do_setxattr`, then
+/// `xattr_resolve_name` in `fs/xattr.c`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Namespace {
+    /// `user.*`, which only regular files and directories carry.
     User,
-    /// `security.*`, `trusted.*` and the POSIX ACL names: handlers Linux has
-    /// and this writer refuses (lexoliu/helios#1037).
-    Refused,
-    /// No handler: `EOPNOTSUPP`.
-    Unsupported,
+    /// `security.*` and `trusted.*`.
+    Stored,
+    Acl(AclKind),
 }
 
 fn check_name(name: &[u8]) -> Result<(), WriteError> {
@@ -79,19 +89,21 @@ fn check_name(name: &[u8]) -> Result<(), WriteError> {
 
 fn resolve(name: &[u8]) -> Result<Namespace, WriteError> {
     check_name(name)?;
-    if PREFIXES.contains(&name) {
+    if let Some(kind) = AclKind::of(name) {
+        return Ok(Namespace::Acl(kind));
+    }
+    if STORED.contains(&name) || name == BTRFS {
         return Err(WriteError::XattrName);
     }
-    Ok(if name.starts_with(USER) {
-        Namespace::User
-    } else if name.starts_with(b"security.")
-        || name.starts_with(b"trusted.")
-        || POSIX_ACLS.contains(&name)
-    {
-        Namespace::Refused
+    if name.starts_with(USER) {
+        Ok(Namespace::User)
+    } else if STORED.iter().any(|prefix| name.starts_with(prefix)) {
+        Ok(Namespace::Stored)
     } else {
-        Namespace::Unsupported
-    })
+        // btrfs properties (lexoliu/helios#1041 does not cover them) and
+        // names no handler takes.
+        Err(WriteError::XattrNamespace)
+    }
 }
 
 /// `user.*` exists only on regular files and directories
@@ -156,6 +168,20 @@ impl<S: BlockSink> Transaction<S> {
         self.roots.set(root)
     }
 
+    /// The value stored under `name`, whatever the inode's kind.
+    pub(crate) async fn stored_xattr(
+        &self,
+        tree: u64,
+        inode: u64,
+        name: &[u8],
+    ) -> Result<Option<Vec<u8>>, WriteError> {
+        let (key, item) = self.xattr_item(tree, inode, name).await?;
+        let Some(item) = item else {
+            return Ok(None);
+        };
+        Ok(locate(tree, key, &item, name)?.map(|found| item[found.value].to_vec()))
+    }
+
     /// `getxattr(2)`: the value's length, copied to `buffer` when that is not
     /// empty. A nonempty buffer shorter than the value is `ERANGE`.
     pub(crate) async fn xattr(
@@ -167,18 +193,16 @@ impl<S: BlockSink> Transaction<S> {
     ) -> Result<usize, WriteError> {
         check_name(name)?;
         let missing = WriteError::XattrMissing { tree, inode };
+        if AclKind::of(name).is_some() {
+            self.check_acl_read(tree, inode).await?;
+        }
         let (_, metadata) = self.inode_item(tree, inode).await?;
         if name.starts_with(USER) && !user_applies(metadata.kind) {
             return Err(missing);
         }
-        let (key, item) = self.xattr_item(tree, inode, name).await?;
-        let Some(item) = item else {
+        let Some(value) = self.stored_xattr(tree, inode, name).await? else {
             return Err(missing);
         };
-        let Some(found) = locate(tree, key, &item, name)? else {
-            return Err(missing);
-        };
-        let value = &item[found.value];
         if !buffer.is_empty() {
             if value.len() > buffer.len() {
                 return Err(WriteError::XattrBuffer {
@@ -186,7 +210,7 @@ impl<S: BlockSink> Transaction<S> {
                     provided: buffer.len(),
                 });
             }
-            buffer[..value.len()].copy_from_slice(value);
+            buffer[..value.len()].copy_from_slice(&value);
         }
         Ok(value.len())
     }
@@ -230,9 +254,9 @@ impl<S: BlockSink> Transaction<S> {
         Ok(names.len())
     }
 
-    /// `setxattr(2)` of a `user.*` attribute, `btrfs_setxattr`: `mode` says
-    /// whether it may create or replace; the inode's ctime, transid and
-    /// sequence advance.
+    /// `setxattr(2)`: `btrfs_setxattr_trans` for a stored namespace, where
+    /// `mode` says whether it may create or replace and the inode's ctime,
+    /// transid and sequence advance; `btrfs_set_acl` for an ACL name.
     pub(crate) async fn set_xattr(
         &mut self,
         tree: u64,
@@ -243,13 +267,96 @@ impl<S: BlockSink> Transaction<S> {
         when: Timestamp,
     ) -> Result<(), WriteError> {
         let namespace = resolve(name)?;
+        // `setxattr_copy`, before any handler.
         if value.len() > VALUE_MAX {
             return Err(WriteError::XattrValueTooBig {
                 length: value.len(),
                 maximum: VALUE_MAX,
             });
         }
-        self.check_xattr_write(tree, inode, namespace).await?;
+        if let Namespace::Acl(kind) = namespace {
+            return self.set_acl(tree, inode, kind, value, when).await;
+        }
+        self.check_stored_write(tree, inode, namespace).await?;
+        self.write_xattr(tree, inode, name, value, mode).await?;
+        self.touch(tree, inode, when, None).await
+    }
+
+    /// `removexattr(2)`: `ENODATA` when absent, except for an ACL name,
+    /// which `vfs_remove_acl` removes whether or not it is there.
+    pub(crate) async fn remove_xattr(
+        &mut self,
+        tree: u64,
+        inode: u64,
+        name: &[u8],
+        when: Timestamp,
+    ) -> Result<(), WriteError> {
+        let namespace = resolve(name)?;
+        if let Namespace::Acl(kind) = namespace {
+            return self.remove_acl(tree, inode, kind, when).await;
+        }
+        self.check_stored_write(tree, inode, namespace).await?;
+        if !self.drop_xattr(tree, inode, name).await? {
+            return Err(WriteError::XattrMissing { tree, inode });
+        }
+        self.touch(tree, inode, when, None).await
+    }
+
+    /// `ATTR_KILL_PRIV` on an owner change (`notify_change`, then
+    /// `cap_inode_killpriv` in security/commoncap.c, which removes
+    /// `security.capability` and ignores its absence): drops the file
+    /// capability of a non-directory. Only the item changes; the owner change
+    /// writes the inode, ctime included.
+    pub(crate) async fn kill_privileges(
+        &mut self,
+        tree: u64,
+        inode: u64,
+    ) -> Result<(), WriteError> {
+        let (_, metadata) = self.inode_item(tree, inode).await?;
+        if metadata.kind != FileKind::Directory {
+            self.drop_xattr(tree, inode, CAPABILITY).await?;
+        }
+        Ok(())
+    }
+
+    /// `may_write_xattr` (`fs/xattr.c`): an immutable or append-only inode
+    /// takes no attribute write. Returns the inode's kind.
+    pub(crate) async fn check_xattr_writable(
+        &self,
+        tree: u64,
+        inode: u64,
+    ) -> Result<FileKind, WriteError> {
+        let (_, metadata) = self.inode_item(tree, inode).await?;
+        check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
+        Ok(metadata.kind)
+    }
+
+    /// The checks a stored namespace's write makes before touching the item:
+    /// [`Self::check_xattr_writable`], then `xattr_permission`'s rule that
+    /// `user.*` needs a regular file or a directory.
+    async fn check_stored_write(
+        &self,
+        tree: u64,
+        inode: u64,
+        namespace: Namespace,
+    ) -> Result<(), WriteError> {
+        let kind = self.check_xattr_writable(tree, inode).await?;
+        if namespace == Namespace::User && !user_applies(kind) {
+            return Err(WriteError::XattrNotPermitted { tree, inode });
+        }
+        Ok(())
+    }
+
+    /// `btrfs_setxattr` with a value: inserts or replaces the record of
+    /// `name` under `mode`, without the inode update.
+    pub(crate) async fn write_xattr(
+        &mut self,
+        tree: u64,
+        inode: u64,
+        name: &[u8],
+        value: &[u8],
+        mode: XattrMode,
+    ) -> Result<(), WriteError> {
         let maximum = self.max_item() - size_of::<RawDirItem>();
         if name.len() + value.len() > maximum {
             return Err(WriteError::XattrNoSpace {
@@ -287,64 +394,17 @@ impl<S: BlockSink> Transaction<S> {
                 maximum: self.max_item(),
             });
         }
-        self.put_xattr_item(tree, key, Some(&item)).await?;
-        self.touch(tree, inode, when).await
+        self.put_xattr_item(tree, key, Some(&item)).await
     }
 
-    /// `removexattr(2)` of a `user.*` attribute: `ENODATA` when absent.
-    pub(crate) async fn remove_xattr(
+    /// Removes the record of `name`, and its item when it was the last one.
+    /// Returns whether there was one.
+    pub(crate) async fn drop_xattr(
         &mut self,
         tree: u64,
         inode: u64,
         name: &[u8],
-        when: Timestamp,
-    ) -> Result<(), WriteError> {
-        let namespace = resolve(name)?;
-        self.check_xattr_write(tree, inode, namespace).await?;
-        if !self.drop_xattr(tree, inode, name).await? {
-            return Err(WriteError::XattrMissing { tree, inode });
-        }
-        self.touch(tree, inode, when).await
-    }
-
-    /// `ATTR_KILL_PRIV` on an owner change (`notify_change`, then
-    /// `cap_inode_killpriv` in security/commoncap.c, which removes
-    /// `security.capability` and ignores its absence): drops the file
-    /// capability of a non-directory. Only the item changes; the owner change
-    /// writes the inode, ctime included.
-    pub(crate) async fn kill_privileges(
-        &mut self,
-        tree: u64,
-        inode: u64,
-    ) -> Result<(), WriteError> {
-        let (_, metadata) = self.inode_item(tree, inode).await?;
-        if metadata.kind != FileKind::Directory {
-            self.drop_xattr(tree, inode, CAPABILITY).await?;
-        }
-        Ok(())
-    }
-
-    /// The checks every write makes before touching the item: immutable and
-    /// append-only inodes (`xattr_permission`), then the handler.
-    async fn check_xattr_write(
-        &self,
-        tree: u64,
-        inode: u64,
-        namespace: Namespace,
-    ) -> Result<(), WriteError> {
-        let (_, metadata) = self.inode_item(tree, inode).await?;
-        check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
-        match namespace {
-            Namespace::User if user_applies(metadata.kind) => Ok(()),
-            Namespace::User | Namespace::Refused => {
-                Err(WriteError::XattrNotPermitted { tree, inode })
-            }
-            Namespace::Unsupported => Err(WriteError::XattrNamespace),
-        }
-    }
-
-    /// Removes the record of `name`, and its item when it was the last one.
-    async fn drop_xattr(&mut self, tree: u64, inode: u64, name: &[u8]) -> Result<bool, WriteError> {
+    ) -> Result<bool, WriteError> {
         let (key, item) = self.xattr_item(tree, inode, name).await?;
         let Some(mut item) = item else {
             return Ok(false);
@@ -358,11 +418,21 @@ impl<S: BlockSink> Transaction<S> {
         Ok(true)
     }
 
-    /// An inode change: ctime, transid and sequence, as `btrfs_update_inode`
-    /// after `inode_set_ctime_current` and `inode_inc_iversion`.
-    async fn touch(&mut self, tree: u64, inode: u64, when: Timestamp) -> Result<(), WriteError> {
+    /// The inode update of `btrfs_setxattr_trans`: ctime, transid and
+    /// sequence, as `btrfs_update_inode` after `inode_set_ctime_current` and
+    /// `inode_inc_iversion`, with the mode `btrfs_set_acl` computed.
+    pub(crate) async fn touch(
+        &mut self,
+        tree: u64,
+        inode: u64,
+        when: Timestamp,
+        mode: Option<u32>,
+    ) -> Result<(), WriteError> {
         let changed = time(tree, inode, when)?;
         let (mut raw, _) = self.inode_item(tree, inode).await?;
+        if let Some(mode) = mode {
+            raw.mode.set(mode);
+        }
         raw.ctime = changed;
         raw.transid.set(self.trees.generation());
         raw.sequence.set(raw.sequence.get().wrapping_add(1));

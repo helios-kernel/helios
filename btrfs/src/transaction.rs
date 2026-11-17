@@ -5,6 +5,7 @@
 //! is visible through [`Transaction::view`] at once, and a commit writes them
 //! all durably as one generation.
 
+pub(crate) mod acl;
 pub(crate) mod chunks;
 mod extents;
 pub(crate) mod file;

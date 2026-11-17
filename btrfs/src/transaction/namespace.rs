@@ -28,6 +28,9 @@ pub(crate) struct Attributes {
     pub(crate) mode: u32,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+    /// The creating process's umask, which `posix_acl_create` applies when
+    /// the parent directory has no default ACL.
+    pub(crate) umask: u32,
 }
 
 fn validate_name(name: &[u8]) -> Result<(), WriteError> {
@@ -157,7 +160,12 @@ impl<S: BlockSink> Transaction<S> {
         when: Timestamp,
     ) -> Result<u64, WriteError> {
         validate_name(name.bytes)?;
-        super::ownership::refuse_set_id(attributes.mode)?;
+        // `btrfs_new_inode_prepare` runs `posix_acl_create` first.
+        let mut mode = attributes.mode;
+        let inherited = self
+            .inherit_acls(name.tree, name.parent, &mut mode, attributes.umask)
+            .await?;
+        super::ownership::refuse_set_id(mode)?;
         let tree = name.tree;
         let next = if let Some(last) = self.inode_high_water.get(&tree) {
             last.checked_add(1)
@@ -183,7 +191,7 @@ impl<S: BlockSink> Transaction<S> {
         let mut raw = RawInodeItem::new_zeroed();
         raw.generation.set(self.trees.generation());
         raw.transid.set(self.trees.generation());
-        raw.mode.set(attributes.mode);
+        raw.mode.set(mode);
         raw.uid.set(attributes.uid);
         raw.gid.set(attributes.gid);
         raw.atime = timestamp;
@@ -196,6 +204,7 @@ impl<S: BlockSink> Transaction<S> {
             defect,
         })?;
         self.attach(name, inode, raw, metadata.kind, when).await?;
+        self.store_inherited(tree, inode, inherited).await?;
         Ok(inode)
     }
 

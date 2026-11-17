@@ -86,6 +86,10 @@ impl Units {
     /// its inode ref in the same batch, the dir item and dir index, and the
     /// parent inode update.
     pub(crate) const CREATE: Self = Self::items(4);
+    /// A creation in a directory with a default ACL: `btrfs_new_inode_prepare`
+    /// adds one item for the inherited default ACL and one for the access
+    /// ACL.
+    pub(crate) const CREATE_INHERITING_ACLS: Self = Self::items(Self::CREATE.insert + 2);
     /// `btrfs_symlink`: a creation and its inline extent.
     pub(crate) const SYMLINK: Self = Self::items(5);
     /// `btrfs_link`: the inode and its inode ref, the dir item and dir
@@ -108,6 +112,10 @@ impl Units {
     /// `security_inode_killpriv`, which is a `btrfs_setxattr_trans` of its
     /// own in Linux and is counted as one here.
     pub(crate) const OWNER: Self = Self::items(Self::INODE_UPDATE.insert + Self::XATTR.insert);
+    /// A change of mode: the inode update of `btrfs_setattr`, and the access
+    /// ACL `posix_acl_chmod` sets again through `btrfs_set_acl`, a
+    /// `btrfs_setxattr_trans` of its own in Linux.
+    pub(crate) const MODE: Self = Self::items(Self::INODE_UPDATE.insert + Self::XATTR.insert);
     /// `btrfs_truncate`: the truncate slack space and the inode update.
     pub(crate) const TRUNCATE: Self = Self::items(2);
     /// `btrfs_replace_file_extents` with an extent to put in: the inode, the

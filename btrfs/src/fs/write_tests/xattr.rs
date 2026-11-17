@@ -525,39 +525,130 @@ fn sizes_are_limited_as_linux_limits_them() {
     });
 }
 
+/// The tags and permission bits of `include/uapi/linux/posix_acl.h`.
+const USER_OBJ: u16 = 0x01;
+const USER: u16 = 0x02;
+const GROUP_OBJ: u16 = 0x04;
+const GROUP: u16 = 0x08;
+const MASK: u16 = 0x10;
+const OTHER: u16 = 0x20;
+/// `ACL_UNDEFINED_ID`.
+const NO_ID: u32 = u32::MAX;
+
+/// An ACL in the uapi encoding `setfacl` hands to `setxattr(2)`.
+fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut bytes = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&perm.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    bytes
+}
+
+/// `u::rwx,u:1000:rw-,g::r-x,g:1001:r--,m::rw-,o::r--`.
+fn named_acl() -> Vec<u8> {
+    acl(&[
+        (USER_OBJ, 7, NO_ID),
+        (USER, 6, 1000),
+        (GROUP_OBJ, 5, NO_ID),
+        (GROUP, 4, 1001),
+        (MASK, 6, NO_ID),
+        (OTHER, 4, NO_ID),
+    ])
+}
+
+fn permission_bits(raw: &RawInodeItem) -> u32 {
+    raw.mode.get() & 0o7777
+}
+
+/// `security.*`, `trusted.*` and `user.*` are stored, replaced, listed and
+/// removed alike, with the create and replace flags, and read back through
+/// the reader after a commit; names no handler takes stay `EOPNOTSUPP`.
 #[test]
-fn only_user_attributes_are_written_and_every_namespace_reads() {
+fn every_stored_namespace_is_written_and_reads_back() {
+    const WRITTEN: [(&str, &str); 6] = [
+        ("security.中文", "安全标签"),
+        ("security.日本語", "セキュリティ"),
+        ("trusted.한국어", "신뢰할 수 있는 값"),
+        ("trusted.日本語", "信頼された値"),
+        ("user.中文", "用户的值"),
+        ("security.capability", "能力"),
+    ];
     let (named, mut writer) = image();
     block_on(async {
         let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
-        for name in [
-            &b"security.capability"[..],
-            b"security.selinux",
-            b"trusted.zone",
-            b"trusted.new",
-            ACL,
-            b"system.posix_acl_default",
-        ] {
-            for mode in [XattrMode::Set, XattrMode::Create, XattrMode::Replace] {
-                assert!(
-                    matches!(
-                        tx.set_xattr(&file, name, b"x", mode, when(1)).await,
-                        Err(WriteError::XattrNotPermitted { .. })
-                    ),
-                    "{}",
-                    String::from_utf8_lossy(name)
-                );
-            }
+        let directory = lookup(&tx, "dir").await;
+        for (index, (name, text)) in WRITTEN.iter().enumerate() {
+            let mode = if *name == "security.capability" {
+                XattrMode::Replace
+            } else {
+                XattrMode::Create
+            };
+            tx.set_xattr(
+                &file,
+                name.as_bytes(),
+                text.as_bytes(),
+                mode,
+                when(index as i64),
+            )
+            .await
+            .unwrap();
+            assert_eq!(value(&tx, &file, name.as_bytes()).await, text.as_bytes());
+        }
+        // The flags hold in every namespace.
+        for name in [&b"trusted.zone"[..], b"security.capability"] {
             assert!(
                 matches!(
-                    tx.remove_xattr(&file, name, when(1)).await,
-                    Err(WriteError::XattrNotPermitted { .. })
+                    tx.set_xattr(&file, name, b"x", XattrMode::Create, when(10))
+                        .await,
+                    Err(WriteError::XattrExists { .. })
                 ),
                 "{}",
                 String::from_utf8_lossy(name)
             );
         }
+        assert!(matches!(
+            tx.set_xattr(
+                &file,
+                "trusted.缺席".as_bytes(),
+                b"x",
+                XattrMode::Replace,
+                when(10)
+            )
+            .await,
+            Err(WriteError::XattrMissing { .. })
+        ));
+        tx.set_xattr(
+            &file,
+            b"trusted.zone",
+            "중일한".as_bytes(),
+            XattrMode::Replace,
+            when(11),
+        )
+        .await
+        .unwrap();
+        tx.remove_xattr(&file, "security.日本語".as_bytes(), when(12))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.remove_xattr(&file, "security.日本語".as_bytes(), when(13))
+                .await,
+            Err(WriteError::XattrMissing { .. })
+        ));
+        // A directory takes them too.
+        tx.set_xattr(
+            &directory,
+            "trusted.目录".as_bytes(),
+            "ディレクトリ".as_bytes(),
+            XattrMode::Set,
+            when(14),
+        )
+        .await
+        .unwrap();
+        let after = raw_inode(&mut tx, &file).await;
+        assert_eq!(after.ctime.sec.get(), when(12).seconds as u64);
         // No handler: EOPNOTSUPP.
         for name in [
             &b"system.other"[..],
@@ -575,26 +666,284 @@ fn only_user_attributes_are_written_and_every_namespace_reads() {
                 Err(WriteError::XattrNamespace)
             ));
         }
-        // Existing values are preserved and read back, and so is the inode.
-        assert_eq!(
-            value(&tx, &file, b"trusted.zone").await,
-            "中日韓".as_bytes()
-        );
-        assert_eq!(value(&tx, &file, ACL).await, [2, 0, 0, 0]);
-        assert_eq!(names(&tx, &file).await.len(), 4);
-        assert_eq!(
-            raw_inode(&mut tx, &file).await.ctime.sec.get(),
-            1_700_000_000
-        );
-        // `user.*` beside them is written.
-        tx.set_xattr(&file, b"user.beside", b"ok", XattrMode::Set, when(2))
-            .await
-            .unwrap();
         tx.commit().await.unwrap();
     });
     block_on(async {
         let snapshot = writer.snapshot().unwrap();
-        assert_eq!(read_back(&snapshot, "/file").await.len(), 5);
+        let mut found = read_back(&snapshot, "/file").await;
+        found.sort();
+        let mut expected: Vec<(Vec<u8>, Vec<u8>)> = WRITTEN
+            .iter()
+            .filter(|(name, _)| *name != "security.日本語")
+            .map(|(name, text)| (name.as_bytes().to_vec(), text.as_bytes().to_vec()))
+            .collect();
+        expected.extend([
+            (b"trusted.zone".to_vec(), "중일한".as_bytes().to_vec()),
+            (ACL.to_vec(), vec![2, 0, 0, 0]),
+            (b"user.existing".to_vec(), b"old".to_vec()),
+        ]);
+        expected.sort();
+        assert_eq!(found, expected);
+        assert_eq!(
+            read_back(&snapshot, "/dir").await,
+            vec![(
+                "trusted.目录".as_bytes().to_vec(),
+                "ディレクトリ".as_bytes().to_vec()
+            )]
+        );
+    });
+    drop(named);
+}
+
+/// POSIX ACLs are stored as `btrfs_set_acl` stores them: validated, in the
+/// encoding `posix_acl_to_xattr` produces, with the access ACL setting the
+/// mode's permission bits and not stored when the mode says all it does.
+#[test]
+fn posix_acls_are_stored_as_btrfs_set_acl_stores_them() {
+    const DEFAULT: &[u8] = b"system.posix_acl_default";
+    let (named, mut writer) = image();
+    block_on(async {
+        let mut tx = writer.join().await.unwrap();
+        let file = lookup(&tx, "file").await;
+        let directory = lookup(&tx, "dir").await;
+        let before = raw_inode(&mut tx, &file).await;
+        assert_eq!(permission_bits(&before), 0o644);
+
+        // A base entry's id is written as ACL_UNDEFINED_ID, and the flags do
+        // not apply to an ACL (`do_setxattr` hands it to `do_set_acl`).
+        let mut sent = named_acl();
+        sent[8..12].copy_from_slice(&5u32.to_le_bytes());
+        tx.set_xattr(&file, ACL, &sent, XattrMode::Create, when(1))
+            .await
+            .unwrap();
+        assert_eq!(value(&tx, &file, ACL).await, named_acl());
+        let after = raw_inode(&mut tx, &file).await;
+        // u::rwx, the mask rw-, o::r--.
+        assert_eq!(permission_bits(&after), 0o764);
+        assert_eq!(after.ctime.sec.get(), when(1).seconds as u64);
+        assert_eq!(after.sequence.get(), before.sequence.get().wrapping_add(1));
+
+        // An access ACL the mode represents sets the mode and is not kept.
+        tx.set_xattr(
+            &file,
+            ACL,
+            &acl(&[
+                (USER_OBJ, 6, NO_ID),
+                (GROUP_OBJ, 0, NO_ID),
+                (OTHER, 0, NO_ID),
+            ]),
+            XattrMode::Replace,
+            when(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(permission_bits(&raw_inode(&mut tx, &file).await), 0o600);
+        assert!(matches!(
+            tx.xattr(&file, ACL, &mut []).await,
+            Err(WriteError::XattrMissing { .. })
+        ));
+        // Removing an absent ACL succeeds, as `vfs_remove_acl` does.
+        tx.remove_xattr(&file, ACL, when(3)).await.unwrap();
+
+        // A default ACL belongs to a directory.
+        tx.set_xattr(&directory, DEFAULT, &named_acl(), XattrMode::Set, when(4))
+            .await
+            .unwrap();
+        assert_eq!(value(&tx, &directory, DEFAULT).await, named_acl());
+        assert_eq!(
+            permission_bits(&raw_inode(&mut tx, &directory).await),
+            0o755,
+            "a default ACL leaves the mode alone"
+        );
+        assert!(matches!(
+            tx.set_xattr(&file, DEFAULT, &named_acl(), XattrMode::Set, when(5))
+                .await,
+            Err(WriteError::AclDefaultNotDirectory { .. })
+        ));
+        tx.remove_xattr(&file, DEFAULT, when(5)).await.unwrap();
+
+        // `posix_acl_from_xattr` and `posix_acl_valid` refusals.
+        for (sent, refusal) in [
+            (vec![2, 0], "short"),
+            (
+                acl(&[
+                    (USER_OBJ, 7, NO_ID),
+                    (USER, 6, 1000),
+                    (GROUP_OBJ, 5, NO_ID),
+                    (OTHER, 0, NO_ID),
+                ]),
+                "named entry with no mask",
+            ),
+            (
+                acl(&[
+                    (USER_OBJ, 7, NO_ID),
+                    (USER, 6, NO_ID),
+                    (GROUP_OBJ, 5, NO_ID),
+                    (MASK, 7, NO_ID),
+                    (OTHER, 0, NO_ID),
+                ]),
+                "undefined id",
+            ),
+            (
+                acl(&[
+                    (USER_OBJ, 8, NO_ID),
+                    (GROUP_OBJ, 5, NO_ID),
+                    (OTHER, 0, NO_ID),
+                ]),
+                "permission bit",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    tx.set_xattr(&file, ACL, &sent, XattrMode::Set, when(6))
+                        .await,
+                    Err(WriteError::AclInvalid)
+                ),
+                "{refusal}"
+            );
+        }
+        let mut version = named_acl();
+        version[0] = 1;
+        assert!(matches!(
+            tx.set_xattr(&file, ACL, &version, XattrMode::Set, when(6))
+                .await,
+            Err(WriteError::AclVersion { version: 1 })
+        ));
+        // A FIFO takes an ACL (`btrfs_special_inode_operations`), a symlink
+        // none.
+        let pipe = lookup(&tx, "pipe").await;
+        tx.set_xattr(&pipe, ACL, &named_acl(), XattrMode::Set, when(7))
+            .await
+            .unwrap();
+        let link = lookup(&tx, "link").await;
+        for result in [
+            tx.set_xattr(&link, ACL, &named_acl(), XattrMode::Set, when(7))
+                .await,
+            tx.remove_xattr(&link, ACL, when(7)).await,
+            tx.xattr(&link, ACL, &mut []).await.map(drop),
+        ] {
+            assert!(matches!(result, Err(WriteError::AclNotSupported { .. })));
+        }
+
+        // chmod carries the mode into the access ACL (`posix_acl_chmod`).
+        tx.set_xattr(&file, ACL, &named_acl(), XattrMode::Set, when(8))
+            .await
+            .unwrap();
+        tx.set_permissions(&file, 0o751, when(9)).await.unwrap();
+        assert_eq!(
+            value(&tx, &file, ACL).await,
+            acl(&[
+                (USER_OBJ, 7, NO_ID),
+                (USER, 6, 1000),
+                (GROUP_OBJ, 5, NO_ID),
+                (GROUP, 4, 1001),
+                (MASK, 5, NO_ID),
+                (OTHER, 1, NO_ID),
+            ])
+        );
+        assert_eq!(permission_bits(&raw_inode(&mut tx, &file).await), 0o751);
+        tx.commit().await.unwrap();
+    });
+    block_on(async {
+        let snapshot = writer.snapshot().unwrap();
+        let file = snapshot.resolve(b"/file").await.unwrap();
+        assert_eq!(file.metadata().permissions, 0o751);
+        let mut buffer = [0; 64];
+        let length = snapshot
+            .xattr(&file, ACL, &mut buffer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buffer[..length][4..12], acl(&[(USER_OBJ, 7, NO_ID)])[4..]);
+    });
+    drop(named);
+}
+
+/// A creation under a directory with a default ACL inherits it as
+/// `posix_acl_create` has it: the umask does not apply, the access ACL and
+/// the mode narrow each other, and a directory keeps the default ACL.
+#[test]
+fn creations_inherit_a_default_acl() {
+    const DEFAULT: &[u8] = b"system.posix_acl_default";
+    let (named, mut writer) = image();
+    block_on(async {
+        let mut tx = writer.join().await.unwrap();
+        let directory = lookup(&tx, "dir").await;
+        let root = tx.root().await.unwrap();
+        tx.set_xattr(&directory, DEFAULT, &named_acl(), XattrMode::Set, when(1))
+            .await
+            .unwrap();
+        let attributes = |permissions| Attributes {
+            permissions,
+            uid: 1000,
+            gid: 1000,
+            umask: 0o077,
+        };
+        let file = tx
+            .create_file(
+                Name {
+                    parent: &directory,
+                    bytes: "文件-ファイル-파일".as_bytes(),
+                },
+                attributes(0o666),
+                when(2),
+            )
+            .await
+            .unwrap();
+        // 0666 against u::rwx, m::rw-, o::r--.
+        assert_eq!(permission_bits(&raw_inode(&mut tx, &file).await), 0o664);
+        assert_eq!(
+            value(&tx, &file, ACL).await,
+            acl(&[
+                (USER_OBJ, 6, NO_ID),
+                (USER, 6, 1000),
+                (GROUP_OBJ, 5, NO_ID),
+                (GROUP, 4, 1001),
+                (MASK, 6, NO_ID),
+                (OTHER, 4, NO_ID),
+            ])
+        );
+        assert!(matches!(
+            tx.xattr(&file, DEFAULT, &mut []).await,
+            Err(WriteError::XattrMissing { .. })
+        ));
+        let subdirectory = tx
+            .create_directory(
+                Name {
+                    parent: &directory,
+                    bytes: "目录-ディレクトリ-디렉터리".as_bytes(),
+                },
+                attributes(0o777),
+                when(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            permission_bits(&raw_inode(&mut tx, &subdirectory).await),
+            0o764
+        );
+        assert_eq!(value(&tx, &subdirectory, DEFAULT).await, named_acl());
+        assert_eq!(value(&tx, &subdirectory, ACL).await, named_acl());
+        // Without a default ACL the umask applies and nothing is inherited.
+        let plain = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "普通".as_bytes(),
+                },
+                attributes(0o666),
+                when(4),
+            )
+            .await
+            .unwrap();
+        assert_eq!(permission_bits(&raw_inode(&mut tx, &plain).await), 0o600);
+        assert!(names(&tx, &plain).await.is_empty());
+        tx.commit().await.unwrap();
+    });
+    block_on(async {
+        let snapshot = writer.snapshot().unwrap();
+        let inherited = read_back(&snapshot, "/dir/目录-ディレクトリ-디렉터리").await;
+        assert_eq!(inherited.len(), 2);
     });
     drop(named);
 }
@@ -634,6 +983,7 @@ fn user_attributes_need_a_regular_file_or_directory() {
                     permissions: 0o777,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when(1),
             )
@@ -698,6 +1048,7 @@ fn removing_the_inode_removes_its_attributes() {
             permissions: 0o644,
             uid: 1000,
             gid: 1000,
+            umask: 0,
         };
         let doomed = tx
             .create_file(
