@@ -1,25 +1,51 @@
-//! One task owns transactions. A bounded queue admits requests from all CPUs;
-//! each drained batch publishes once, before replying. Readers clone the last
-//! published snapshot under a short lock and never hold that lock across I/O.
+//! One task owns the mount's writer and its running transaction.
+//!
+//! # Concurrency contract
+//!
+//! - **The running transaction has one owner**, the service task. A bounded
+//!   queue admits requests from every processor; the task drains a batch of
+//!   at most `concurrency` requests and applies them in order, so nothing
+//!   else ever touches the transaction and no lock guards it.
+//! - **A change is visible once its batch is applied.** After the batch the
+//!   task publishes the writer's view of the running transaction under the
+//!   short reader lock, then replies. A reader clones that view and reads
+//!   without the lock and without the task; the view is persistent, so the
+//!   clone is reference-count increments, and it keeps reading what it saw.
+//! - **A sync waits for the commit that covers it.** A sync request's reply
+//!   is held until a commit that starts after the request was applied has
+//!   finished. Every sync drained into one batch shares that batch's one
+//!   commit, and syncs that arrive during a commit share the next.
+//! - **The task commits on its own** when the commit interval has passed
+//!   since the running transaction first changed, when the dirty metadata
+//!   reaches the policy's bound, and when the queue closes at unmount. The
+//!   policy is read afresh on every change an operator makes.
+//! - **A failed commit ends the service.** Its sync waiters, and every later
+//!   request, fail; the device keeps the previous complete generation.
 
 use alloc::string::String;
+use alloc::sync::Arc as SharedArc;
 use alloc::vec::Vec;
+use core::future::pending;
 use core::num::NonZeroUsize;
+use core::pin::pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use futures::channel::oneshot;
+use futures::future::{Either, select};
 use helios_btrfs::write::{
-    Attributes, ChunkError, Compressor, InodeHandle, Name, SpaceError, WriteError,
+    Attributes, ChunkError, Compressor, InodeHandle, Name, RootUuids, SpaceError, WriteError,
     WriteTransaction, Writer,
 };
 use helios_btrfs::{BlockSink, Error, FileKind, Timestamp};
+use helios_hal::cpu::{Cpu, Instant};
 use helios_hal::fs::{
     BlockDevice, FsError, FsResult, Landed, OpenFlags, RenameMode, WritePosition,
 };
 use triomphe::Arc;
 
-use super::{Image, Snapshot};
+use super::{Image, LivePolicy, Snapshot};
 use crate::component::{ProviderReceiver, ProviderSender, provider_channel};
-use crate::{BlockPages, RootEntropyHandle};
+use crate::{BlockPages, ProgressSignal, RootEntropyHandle, Timer};
 
 pub(super) enum Response {
     Done,
@@ -72,6 +98,7 @@ pub(super) struct Request {
 
 pub(super) struct Client {
     sender: ProviderSender<Request>,
+    exit: SharedArc<ServiceExit>,
 }
 
 impl Drop for Client {
@@ -80,7 +107,75 @@ impl Drop for Client {
     }
 }
 
+/// Whether a writable mount's service has ended: its last commit done or
+/// failed, its writer and its hold on the device gone.
+pub(crate) struct ServiceExit {
+    ended: AtomicBool,
+    signal: ProgressSignal,
+}
+
+impl ServiceExit {
+    fn new() -> Self {
+        Self {
+            ended: AtomicBool::new(false),
+            signal: ProgressSignal::new(),
+        }
+    }
+
+    pub(crate) fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the service has ended.
+    pub(crate) async fn ended(&self) {
+        loop {
+            // Armed before the flag is tested, so an end between the two
+            // still wakes this wait.
+            let mark = self.signal.mark();
+            if self.has_ended() {
+                return;
+            }
+            self.signal.changed(mark).await;
+        }
+    }
+}
+
+/// The service's last field: dropped after its writer and receiver, it
+/// reports the end to everyone waiting for it.
+pub(super) struct ExitGuard(SharedArc<ServiceExit>);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.0.ended.store(true, Ordering::Release);
+        self.0.signal.signal();
+    }
+}
+
+/// Root UUIDs from the kernel's entropy, as RFC 9562 version 4.
+pub(super) struct EntropyUuids(pub(super) RootEntropyHandle);
+
+impl RootUuids for EntropyUuids {
+    fn next_uuid(&mut self) -> [u8; 16] {
+        let mut uuid = [0; 16];
+        self.0.fill(&mut uuid);
+        // RFC 9562, version 4 and the RFC variant.
+        uuid[6] = (uuid[6] & 0x0f) | 0x40;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        uuid
+    }
+}
+
 impl Client {
+    /// Ends the mount: no request is taken after this, and it resolves once
+    /// the service has committed what it held and let the device go.
+    pub(super) async fn unmount(&self) {
+        self.sender.close();
+        self.exit.ended().await;
+    }
+
+    pub(super) fn exit(&self) -> &SharedArc<ServiceExit> {
+        &self.exit
+    }
     pub(super) async fn execute(
         &self,
         path: &str,
@@ -101,133 +196,192 @@ impl Client {
     }
 }
 
-pub(super) fn channel(capacity: NonZeroUsize) -> (Client, ProviderReceiver<Request>) {
+pub(super) fn channel(capacity: NonZeroUsize) -> (Client, ProviderReceiver<Request>, ExitGuard) {
     let (sender, receiver) = provider_channel(capacity.get());
-    (Client { sender }, receiver)
+    let exit = SharedArc::new(ServiceExit::new());
+    (
+        Client {
+            sender,
+            exit: exit.clone(),
+        },
+        receiver,
+        ExitGuard(exit),
+    )
 }
 
-/// The kernel task owning one writable mount. Dropping the mount closes its
-/// queue; the task drains already accepted work and then terminates.
+/// The kernel task owning one writable mount. Unmounting, or dropping the
+/// mount, closes its queue; the task drains already accepted work, commits
+/// it, and then terminates.
 pub struct BtrfsService<Device: BlockDevice<Buffer = BlockPages>> {
-    pub(super) writer: Writer<Image<Device>>,
+    pub(super) writer: Writer<Image<Device>, EntropyUuids>,
     pub(super) receiver: ProviderReceiver<Request>,
     pub(super) published: Arc<spin::Mutex<Snapshot<Device>>>,
-    pub(super) entropy: RootEntropyHandle,
     pub(super) concurrency: NonZeroUsize,
     pub(super) compressor: Compressor,
+    pub(super) policy: Arc<LivePolicy>,
+    /// Last, so the end is reported only once everything above has gone.
+    pub(super) _exit: ExitGuard,
+}
+
+/// A sync request's reply, held until a commit covers it.
+type SyncWaiter = oneshot::Sender<FsResult<Response>>;
+
+/// What woke the service.
+enum Wake {
+    Request(Option<Request>),
+    /// The commit deadline passed, or the operator changed the policy.
+    Policy,
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
-    pub async fn run(self) {
-        serve(
-            self.writer,
-            self.receiver,
-            self.published,
-            self.entropy,
-            self.concurrency,
-            self.compressor,
-        )
-        .await;
+    /// Serves the mount until it is unmounted, timing the commit interval
+    /// on `timer`.
+    pub async fn run<CpuImpl: Cpu + Clone>(mut self, timer: Timer<CpuImpl>) {
+        // When the running transaction first changed: the commit interval
+        // runs from here, as Linux's from the transaction's `start_time`.
+        let mut dirty_since: Option<Instant> = None;
+        loop {
+            // Armed before the policy is read, so a change made while the
+            // service decides is not missed.
+            let mark = self.policy.changed.mark();
+            let policy = self.policy.load();
+            let dirty = self.writer.dirty();
+            let deadline = dirty_since.map(|since| {
+                since.saturating_add(timer.cpu().timebase().duration_to_ticks(policy.interval))
+            });
+            if !dirty.is_clean()
+                && (dirty.metadata_bytes >= policy.dirty_metadata_limit
+                    || deadline.is_some_and(|deadline| deadline <= timer.now()))
+            {
+                if !self.commit(Vec::new(), &mut dirty_since).await {
+                    return;
+                }
+                continue;
+            }
+            let wake = {
+                let request = pin!(self.receiver.recv());
+                let due = pin!(async {
+                    match deadline {
+                        Some(deadline) => timer.sleep_until(deadline).await,
+                        None => pending().await,
+                    }
+                });
+                let changed = pin!(self.policy.changed.changed(mark));
+                match select(request, select(due, changed)).await {
+                    Either::Left((request, _)) => Wake::Request(request),
+                    Either::Right(_) => Wake::Policy,
+                }
+            };
+            match wake {
+                Wake::Policy => {}
+                Wake::Request(None) => {
+                    // Unmounted: what the running transaction holds becomes
+                    // durable before the device is let go.
+                    self.commit(Vec::new(), &mut dirty_since).await;
+                    return;
+                }
+                Wake::Request(Some(first)) => {
+                    let Some(syncs) = self.apply_batch(first).await else {
+                        return;
+                    };
+                    if dirty_since.is_none() && !self.writer.dirty().is_clean() {
+                        dirty_since = Some(timer.now());
+                    }
+                    let dirty = self.writer.dirty();
+                    if (!syncs.is_empty()
+                        || dirty.metadata_bytes >= self.policy.load().dirty_metadata_limit)
+                        && !self.commit(syncs, &mut dirty_since).await
+                    {
+                        return;
+                    }
+                }
+            }
+        }
     }
-}
 
-pub(super) async fn serve<Device: BlockDevice<Buffer = BlockPages>>(
-    mut writer: Writer<Image<Device>>,
-    receiver: ProviderReceiver<Request>,
-    published: Arc<spin::Mutex<Snapshot<Device>>>,
-    entropy: RootEntropyHandle,
-    concurrency: NonZeroUsize,
-    mut compressor: Compressor,
-) {
-    while let Some(first) = receiver.recv().await {
+    /// Applies `first` and what else is queued, up to `concurrency`
+    /// requests, publishes the result and replies. Returns the syncs left
+    /// waiting for a commit, or `None` once the writer is poisoned.
+    async fn apply_batch(&mut self, first: Request) -> Option<Vec<SyncWaiter>> {
+        let concurrency = self.concurrency;
         let mut requests = Vec::with_capacity(concurrency.get());
         requests.push(first);
-        // A continuous producer cannot postpone durability indefinitely.
+        // A continuous producer cannot postpone the batch's publication.
         while requests.len() < concurrency.get() {
-            match receiver.try_recv() {
+            match self.receiver.try_recv() {
                 Ok(request) => requests.push(request),
                 Err(_) => break,
             }
         }
-        let mut transaction = match writer.begin().await {
+        let mut transaction = match self.writer.join().await {
             Ok(transaction) => transaction,
             Err(error) => {
                 let error = fs_error(error);
                 for request in requests {
                     let _ = request.reply.send(Err(error));
                 }
-                return;
+                return None;
             }
         };
         let mut replies = Vec::with_capacity(requests.len());
-        let mut dirty = false;
+        let mut syncs = Vec::new();
         for request in requests {
             if request.reply.is_canceled() {
                 continue;
             }
-            let mutates = match &request.operation {
-                Operation::Open { flags } => {
-                    flags.intersects(OpenFlags::CREATE | OpenFlags::TRUNCATE)
-                }
-                Operation::Sync => false,
-                _ => true,
-            };
+            let sync = matches!(request.operation, Operation::Sync);
             let result = apply(
                 &mut transaction,
                 &request.path,
                 request.when,
                 request.operation,
                 concurrency,
-                &mut compressor,
+                &mut self.compressor,
             )
             .await;
-            dirty |= mutates && result.is_ok();
-            replies.push((request.reply, result));
-        }
-        if !dirty {
-            drop(transaction);
-            for (reply, result) in replies {
-                let _ = reply.send(result);
-            }
-            continue;
-        }
-        let committed = transaction
-            .commit(
-                || {
-                    let mut uuid = [0; 16];
-                    entropy.fill(&mut uuid);
-                    // RFC 9562, version 4 and the RFC variant.
-                    uuid[6] = (uuid[6] & 0x0f) | 0x40;
-                    uuid[8] = (uuid[8] & 0x3f) | 0x80;
-                    uuid
-                },
-                concurrency,
-            )
-            .await
-            .map_err(fs_error);
-        if committed.is_ok() {
-            match writer.snapshot() {
-                Ok(snapshot) => *published.lock() = snapshot,
-                Err(error) => {
-                    let error = fs_error(error);
-                    for (reply, _) in replies {
-                        let _ = reply.send(Err(error));
-                    }
-                    return;
-                }
+            match result {
+                Ok(_) if sync => syncs.push(request.reply),
+                result => replies.push((request.reply, result)),
             }
         }
+        *self.published.lock() = self
+            .writer
+            .snapshot()
+            .expect("the writer joined above is not poisoned");
         for (reply, result) in replies {
-            let _ = reply.send(result.and_then(|value| committed.map(|()| value)));
+            let _ = reply.send(result);
         }
-        if committed.is_err() {
-            return;
+        Some(syncs)
+    }
+
+    /// Commits the running transaction and answers `syncs`. Returns false
+    /// once the commit failed, which poisons the writer and ends the
+    /// service.
+    async fn commit(&mut self, syncs: Vec<SyncWaiter>, dirty_since: &mut Option<Instant>) -> bool {
+        let committed = self.writer.commit().await;
+        let outcome = match committed {
+            Ok(()) => {
+                *dirty_since = None;
+                *self.published.lock() = self
+                    .writer
+                    .snapshot()
+                    .expect("a writer that just committed is not poisoned");
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(%error, "btrfs commit failed; the mount takes no more writes");
+                Err(fs_error(error))
+            }
+        };
+        for sync in syncs {
+            let _ = sync.send(outcome.map(|()| Response::Done));
         }
+        outcome.is_ok()
     }
 }
 
-async fn inode<S: BlockSink>(
-    transaction: &WriteTransaction<'_, S>,
+async fn inode<S: BlockSink, U: RootUuids>(
+    transaction: &WriteTransaction<'_, S, U>,
     path: &str,
 ) -> FsResult<InodeHandle> {
     let mut inode = transaction.root().await.map_err(fs_error)?;
@@ -243,8 +397,8 @@ async fn inode<S: BlockSink>(
     Ok(inode)
 }
 
-async fn parent<'a, S: BlockSink>(
-    transaction: &WriteTransaction<'_, S>,
+async fn parent<'a, S: BlockSink, U: RootUuids>(
+    transaction: &WriteTransaction<'_, S, U>,
     path: &'a str,
 ) -> FsResult<(InodeHandle, &'a [u8])> {
     if path.is_empty() {
@@ -261,8 +415,8 @@ fn timestamp(nanos: u64) -> Timestamp {
     }
 }
 
-async fn apply<S: BlockSink>(
-    transaction: &mut WriteTransaction<'_, S>,
+async fn apply<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
     path: &str,
     now: u64,
     operation: Operation,
@@ -464,7 +618,9 @@ pub(super) fn fs_error(error: WriteError) -> FsError {
         WriteError::Exists { .. } => FsError::Exists,
         WriteError::NotEmpty { .. } => FsError::NotEmpty,
         WriteError::ReadOnlySubvolume { .. } => FsError::ReadOnly,
-        WriteError::InodeFlags { .. } | WriteError::DirectoryLink => FsError::NotPermitted,
+        WriteError::InodeFlags { .. } | WriteError::SetId { .. } | WriteError::DirectoryLink => {
+            FsError::NotPermitted
+        }
         WriteError::CrossSubvolume => FsError::CrossDevice,
         WriteError::InvalidName | WriteError::DirectoryCycle | WriteError::SymlinkTarget { .. } => {
             FsError::Invalid

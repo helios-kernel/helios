@@ -31,11 +31,13 @@
 //!
 //! # Writing
 //!
-//! The `write` feature exposes `write::Writer` and transactions with per-operation rollback.
-//! A transaction stages private CoW blocks and publishes a new immutable view
-//! only after its superblocks are durable. Existing readers retain the complete
-//! mapping and checksum roots for their generation; its retired blocks cannot
-//! be reused while any reader still reaches them.
+//! The `write` feature exposes `write::Writer` and its running transaction,
+//! with per-operation rollback. As Linux's btrfs, a change is visible at once
+//! and durable at commit: every accepted mutation publishes a new immutable
+//! view of the transaction's private CoW blocks, and a commit writes them and
+//! then the superblocks. Existing readers retain the complete mapping and
+//! checksum roots of their view; blocks it reaches cannot be reused while any
+//! reader still holds it.
 
 #![no_std]
 

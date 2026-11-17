@@ -1,11 +1,17 @@
 //! A single-owner transaction. Its owner serializes writers and retains the
 //! mounted generation's reader pins; this module never reuses retired extents.
+//!
+//! The transaction runs across many mutations: each one applies to it and
+//! is visible through [`Transaction::view`] at once, and a commit writes them
+//! all durably as one generation.
 
 pub(crate) mod chunks;
 mod extents;
 pub(crate) mod file;
 pub(crate) mod namespace;
+pub(crate) mod ownership;
 pub(crate) mod reflink;
+pub(crate) mod reserve;
 
 use core::num::NonZeroUsize;
 use futures::future;
@@ -37,13 +43,12 @@ pub(crate) struct Committed {
     pub(crate) allocation: Option<Allocation>,
 }
 
-pub(crate) struct Transaction<'a, S> {
+pub(crate) struct Transaction<S> {
     generation: Arc<Snapshot>,
     // Inode generations distinguish reuse across commits. Within one commit,
     // keep allocated numbers monotonic even after an inode is deleted again.
     inode_high_water: BTreeMap<u64, u64>,
-    retirements: &'a mut Retirements,
-    volume: Volume<S>,
+    pub(crate) volume: Volume<S>,
     image: CommitImage,
     pub(crate) roots: Roots,
     /// The chunk tree's root. The superblock, not the root tree, records it.
@@ -71,7 +76,32 @@ pub(crate) struct Checkpoint {
     accounting: Accounting,
 }
 
-impl<'a, S: BlockSink> Transaction<'a, S> {
+impl<S: BlockSink> Transaction<S> {
+    /// The committed generation this transaction started from.
+    pub(crate) fn base(&self) -> &Arc<Snapshot> {
+        &self.generation
+    }
+
+    /// Bytes of private tree blocks this transaction holds in memory, every
+    /// one of which its commit writes.
+    pub(crate) fn dirty_metadata_bytes(&self) -> u64 {
+        self.trees.block_count() as u64 * u64::from(self.volume.superblock().nodesize())
+    }
+
+    /// A reader's view of this transaction as it stands: its private tree
+    /// blocks, its moved roots and the private data they reach. The writer
+    /// keeps that data from reuse while the view lives.
+    pub(crate) fn view(&self) -> Result<Arc<Snapshot>, WriteError> {
+        Snapshot::running(
+            &self.generation,
+            self.volume.mapping(),
+            &self.roots,
+            self.accounting.checksum_root(),
+            &self.trees,
+            self.space.private_data(),
+        )
+    }
+
     pub(crate) fn checkpoint(&mut self) -> Checkpoint {
         let saved = Checkpoint {
             image: self.image.clone(),
@@ -116,10 +146,6 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         })
     }
 
-    pub(crate) fn generation(&self) -> u64 {
-        self.trees.generation()
-    }
-
     /// Read the transaction's current inode and extents, including staged data
     /// and unpublished checksum items from earlier writes in this transaction.
     pub(crate) async fn read_file(
@@ -153,7 +179,7 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
     pub(crate) async fn new(
         volume: Volume<S>,
         pin: Arc<Snapshot>,
-        retirements: &'a mut Retirements,
+        retirements: &mut Retirements,
         committed: &Allocation,
     ) -> Result<Self, WriteError> {
         let root = pin.root_tree;
@@ -184,7 +210,6 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         Ok(Self {
             generation: pin,
             inode_high_water: BTreeMap::new(),
-            retirements,
             volume,
             image,
             roots,
@@ -201,13 +226,22 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
         })
     }
 
+    /// Bytes used once this transaction commits, as the superblock's
+    /// `bytes_used` will record them.
+    pub(crate) fn bytes_used(&self) -> Result<u64, WriteError> {
+        self.accounting.bytes_used(&self.space)
+    }
+
     /// Consume the overlay. Any failure/cancellation prevents in-memory root
     /// publication; BlockSink's commit contract poisons failed durable commits.
+    /// Blocks this transaction retired, and private data it released while a
+    /// view still reached it, are recorded in `retirements` against the
+    /// generation it started from.
     pub(crate) async fn commit(
         mut self,
+        retirements: &mut Retirements,
         mut uuid: impl FnMut() -> [u8; 16],
         concurrency: NonZeroUsize,
-        publishing: impl FnOnce(),
     ) -> Result<Committed, WriteError> {
         // Block groups nothing uses leave first, as the cleaner does after a
         // commit; what they free is out of reach of this commit's chunks.
@@ -254,8 +288,11 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
                 .advance(superblock, self.volume.shared_chunks(), &self.roots)?;
         // Register before the first await that can publish the new generation.
         // Cancellation or a failed mirror write must not lose these pins.
-        self.retirements
-            .record(&self.generation, self.accounting.take_retired());
+        let mut retired = self.accounting.take_retired();
+        for (address, length) in &self.space.take_held() {
+            retired.insert_mut(*address, *length);
+        }
+        retirements.record(&self.generation, retired);
         // Bound the total in-flight I/O by staging one block per concurrent
         // stream item. Volume::stage handles this block's physical copies.
         let mut writes = PendingWrites::new(concurrency);
@@ -271,7 +308,6 @@ impl<'a, S: BlockSink> Transaction<'a, S> {
             }
         }
         writes.finish().await?;
-        publishing();
         self.volume.publish(self.image).await?;
         Ok(Committed {
             snapshot,

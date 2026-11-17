@@ -149,6 +149,10 @@ pub(crate) struct Space {
     data: RedBlackTreeMapSync<u64, u64>,
     protected_data: RedBlackTreeMapSync<u64, u64>,
     deferred_data: RedBlackTreeMapSync<u64, u64>,
+    /// Private data this transaction released while a reader's view of the
+    /// running transaction still reaches it: unallocated in the generation
+    /// being built, but unavailable to this writer until no such view lives.
+    held_data: RedBlackTreeMapSync<u64, u64>,
 }
 
 /// The allocation state a tree-root-independent comparison sees: what a
@@ -163,6 +167,7 @@ impl PartialEq for Space {
             && self.data == other.data
             && self.protected_data == other.protected_data
             && self.deferred_data == other.deferred_data
+            && self.held_data == other.held_data
     }
 }
 
@@ -173,12 +178,48 @@ impl Space {
         self.protected_data = self.data.clone();
     }
 
-    pub(crate) fn accept_operation(&mut self) {
+    /// Ends an operation. Private data it released returns to the free
+    /// ranges unless `viewed` says a reader's view of the running
+    /// transaction still reaches it; data held for such a view earlier
+    /// returns once `viewed` no longer names it.
+    pub(crate) fn accept_operation(&mut self, viewed: impl Fn(u64) -> bool) {
         let deferred = core::mem::take(&mut self.deferred_data);
         self.protected_data = RedBlackTreeMapSync::new_sync();
         for (&address, &length) in &deferred {
+            if viewed(address) {
+                self.held_data.insert_mut(address, length);
+            } else {
+                self.release_private(address..address + length);
+            }
+        }
+        let released: Vec<(u64, u64)> = self
+            .held_data
+            .iter()
+            .filter(|&(&address, _)| !viewed(address))
+            .map(|(&address, &length)| (address, length))
+            .collect();
+        for (address, length) in released {
+            self.held_data.remove_mut(&address);
             self.release_private(address..address + length);
         }
+    }
+
+    /// The private data extents a view of the running transaction taken now
+    /// can reach.
+    pub(crate) fn private_data(&self) -> RedBlackTreeMapSync<u64, u64> {
+        self.data.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_data_bytes(&self) -> u64 {
+        self.held_data.values().sum()
+    }
+
+    /// Takes the data still held for views as the transaction commits: free
+    /// in the committed generation, so the caller keeps it from reuse
+    /// through the reader pins of the generation the views started from.
+    pub(crate) fn take_held(&mut self) -> RedBlackTreeMapSync<u64, u64> {
+        core::mem::take(&mut self.held_data)
     }
 
     /// Reader-pinned storage is free on disk but unavailable to this writer.
@@ -258,6 +299,7 @@ impl Space {
             data: RedBlackTreeMapSync::new_sync(),
             protected_data: RedBlackTreeMapSync::new_sync(),
             deferred_data: RedBlackTreeMapSync::new_sync(),
+            held_data: RedBlackTreeMapSync::new_sync(),
         };
         let mut cursor = Cursor::ceiling(volume, extent_root, Key::new(0, 0, 0)).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
@@ -399,6 +441,7 @@ impl Space {
             data: RedBlackTreeMapSync::new_sync(),
             protected_data: RedBlackTreeMapSync::new_sync(),
             deferred_data: RedBlackTreeMapSync::new_sync(),
+            held_data: RedBlackTreeMapSync::new_sync(),
         })
     }
 
@@ -582,7 +625,8 @@ impl Space {
     }
 
     /// Free-space-tree state after commit. Unlike allocation availability, this
-    /// includes free superblock stripes and extents retired from the old roots.
+    /// includes free superblock stripes, extents retired from the old roots,
+    /// and private data held for a view of the running transaction.
     pub(crate) fn committed_free(
         &self,
         retired: &RedBlackTreeMapSync<u64, u64>,
@@ -595,6 +639,7 @@ impl Space {
                 for returned in group.excluded_free.iter().chain(
                     retired
                         .range(range.clone())
+                        .chain(self.held_data.range(range.clone()))
                         .map(|(&address, &length)| address..address + length),
                 ) {
                     free.release(returned)
@@ -648,6 +693,12 @@ impl Space {
                 Ok((key, used))
             })
             .collect()
+    }
+
+    /// How many tree blocks this transaction has allocated: each is an
+    /// extent item its commit inserts.
+    pub(crate) fn metadata_reservations(&self) -> usize {
+        self.metadata.size()
     }
 
     pub(crate) fn metadata(&self) -> impl Iterator<Item = (u64, MetadataReservation)> + '_ {

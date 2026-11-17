@@ -387,7 +387,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome*
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs libclang-dev
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs attr libclang-dev
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools,cargo-deny,nextest
@@ -1781,6 +1781,14 @@ jobs:
           grep -Fqx 'Hello, World!' linux-smoke.out
           grep -Fqx 'libc:0' linux-smoke.out
           grep -Fqx 'fault:139' linux-smoke.out
+      - name: Kill the guest during a btrfs write burst
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          # The kill point is drawn from a seed this step prints; a failure
+          # replays with CRASH_SEED=<seed> bash tools/fs-smoke/crash.sh x86-64 kvm.
+          bash tools/fs-smoke/crash.sh x86-64 kvm
       - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
