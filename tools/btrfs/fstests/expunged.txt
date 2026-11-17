@@ -14,3 +14,11 @@ generic/687 # #1037: chmod a+rws on a file, setuid is refused
 generic/688 # #1037: setcap on a file, security.capability is refused
 generic/726 # #1037: chmod a+rws on a file, setuid is refused
 generic/727 # #1037: setcap on a file, security.capability is refused
+generic/108 # #1085: overwrites SCRATCH_DEV with LVM pvcreate while FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
+generic/338 # #1085: common/dmerror _dmerror_mount passes -t fuse without FUSE_SUBTYP
+generic/441 # #1085: common/dmerror _dmerror_mount passes -t fuse without FUSE_SUBTYP
+generic/484 # #1085: common/dmerror _dmerror_mount passes -t fuse without FUSE_SUBTYP
+generic/563 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
+generic/620 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
+generic/704 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
+generic/731 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
