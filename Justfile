@@ -9,6 +9,12 @@ cli := env_var_or_default("HELIOS_CLI_BIN", "cargo run -p helios-cli --quiet --"
 # Default profile directory used by `kernel-prebuild --profile`.
 default_profile := "debug"
 
+# The packages whose unit tests `test-kernel` runs with `--lib`, and the host
+# tools `test-host-tools` tests besides the compiler host; each recipe and its
+# `warm-` twin read the one list.
+kernel_unit_packages := "-p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel"
+host_tool_packages := "-p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support"
+
 # The one bare-metal target whose rustflags carry `-Zbranch-protection`, which
 # rustc refuses to mix with a precompiled `core`, `alloc` or
 # `compiler_builtins` (`.cargo/config.toml`). Its builds rebuild them.
@@ -78,7 +84,8 @@ clippy-host:
     cargo clippy -p helios-unix --all-targets --features runtime -- -D warnings
     cargo clippy -p helios-linux --all-targets --features runtime -- -D warnings
     cargo clippy \
-        --workspace --all-targets --features helios-btrfs/write \
+        --workspace --all-targets \
+        --features helios-webgpu/runtime --features helios-btrfs/write \
         --exclude helios \
         --exclude helios-aarch64 --exclude helios-riscv --exclude helios-x86 \
         --exclude helios-audio-test --exclude helios-compositor --exclude helios-cpu \
@@ -120,12 +127,29 @@ test-kernel run_ignored="default":
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel --lib --run-ignored "{{ run_ignored }}"
+    cargo nextest run {{ kernel_unit_packages }} --lib --run-ignored "{{ run_ignored }}"
     cargo nextest run -p helios-kernel --test hal_layering
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and
     # `embedded_debugger_is_provisioned` reads the prebuild payload above.
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run -p helios-hosted
+
+# Compile every test binary `test-kernel` runs and run none of them. The
+# binaries depend on the trusted-root keys and on nothing the prebuild's
+# guest wasm holds, so CI runs this while the guest wasm is still building
+# and `test-kernel` then compiles nothing. The package lists are the
+# recipe's own, so the two build the same units.
+warm-test-kernel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$(rustc -vV | sed -n 's/^host: //p')"
+    out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
+    {{ cli }} kernel-keys --out-dir "${out_dir}"
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
+    cargo nextest run --no-run {{ kernel_unit_packages }} --lib
+    cargo nextest run --no-run -p helios-kernel --test hal_layering
+    HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run --no-run -p helios-hosted
 
 test-libraries:
     #!/usr/bin/env bash
@@ -152,9 +176,11 @@ test-libraries:
     cargo nextest run -p helios-btrfs --features write
     # The Venus protocol is generated from pinned venus-protocol inputs that
     # the CLI fetches and hash-verifies; the parity test then compares the
-    # generated encoders with the pinned Mesa generator's output.
+    # generated encoders with the pinned Mesa generator's output. The
+    # driver's entry points and handle-type translation are behind its
+    # `driver` feature.
     {{ cli }} venus-protocol-fetch
-    cargo nextest run -p helios-venus -p helios-venus-gen
+    cargo nextest run -p helios-venus -p helios-venus-gen --features helios-venus/driver
     # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
     # tables the fetch below hash-verifies.
     just acpi-tables-fetch
@@ -182,8 +208,15 @@ test-host-tools:
         echo "compiler plugin wasm is missing: $plugin" >&2
         exit 1
     fi
-    cargo nextest run -p helios-inspector -p helios-artifact -p helios-profdata -p helios-cli -p helios-compiler-support
+    cargo nextest run {{ host_tool_packages }}
     HELIOS_COMPILER_PLUGIN_WASM="$plugin" cargo nextest run -p helios-compiler-host
+
+# Compile every test binary `test-host-tools` runs and run none of them; CI
+# runs it while the compiler plugin is still building, which only the
+# compiler-host test reads, when it runs.
+warm-test-host-tools:
+    cargo nextest run --no-run {{ host_tool_packages }}
+    cargo nextest run --no-run -p helios-compiler-host
 
 # Mount the images `mkfs.btrfs --rootdir` builds, one per checksum type and
 # node size. Needs btrfs-progs on PATH; CI's test-libraries lane installs it.
@@ -311,6 +344,19 @@ test-embedded-debugger:
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_BOOTFS="${out_dir}/helios-bootfs"
     cargo nextest run -p helios-hosted --no-capture init_program::tests::embedded_debugger_
+
+# Compile the test binary `test-embedded-debugger` runs and run nothing; CI
+# runs it while the guest wasm is still building, which the test reads when
+# it runs and the compile does not.
+warm-test-embedded-debugger:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$(rustc -vV | sed -n 's/^host: //p')"
+    out_dir="{{ repo_root }}/target/kernel-prebuild/${target}/{{ default_profile }}"
+    {{ cli }} kernel-keys --out-dir "${out_dir}"
+    export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
+    export HELIOS_BOOTFS="${out_dir}/helios-bootfs"
+    cargo nextest run --no-run -p helios-hosted
 
 # Unit tests and lint of the benchmark-suite tooling (tools/bench); no benchmark runs.
 check-bench-tools:

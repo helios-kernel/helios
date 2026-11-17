@@ -94,18 +94,29 @@ jobs:
               - '!aarch64/**'
               - '!riscv/**'
               - '!x86/**'
+              - '!kernel/**'
+              - '!virtio/**'
+              - '!netstack/**'
+              - '!linux/**'
+              - '!unix/**'
+              - '!sync/**'
+              - '!btrfs/**'
+              - '!venus/**'
               - '!hosted/**'
               - '!inspector/**'
               - '!inspector-protocol/**'
               - '!cli/**'
+              - '!compiler-host/**'
               - '!compiler-support/**'
               - '!profdata/**'
+              - '!venus-gen/**'
               - '!workspace-root/**'
               - '!programs/**'
               - '!api/**'
               - '!api-macro/**'
               - '!compiler-plugin/**'
               - '!tools/bench/**'
+              - '!tools/btrfs/**'
               - '!docs/**'
               - '!**/*.md'
             pin:
@@ -119,6 +130,28 @@ jobs:
             x86:
               - '!**/*.md'
               - 'x86/**'
+            # The kernel and the libraries only it builds on, the closure
+            # of `helios-kernel` less `hal/`, `artifact/` and
+            # `compiler-abi/`, which every lane reads and `shared` keeps.
+            kernel:
+              - '!**/*.md'
+              - 'kernel/**'
+              - 'virtio/**'
+              - 'netstack/**'
+            # The Linux process host and the libraries beneath it.
+            unix:
+              - '!**/*.md'
+              - 'linux/**'
+              - 'unix/**'
+              - 'sync/**'
+            # The Btrfs library the kernel mounts; `btrfs` below is the
+            # surface of its own test lanes.
+            btrfs_src:
+              - '!**/*.md'
+              - 'btrfs/**'
+            venus:
+              - '!**/*.md'
+              - 'venus/**'
             hosted:
               - '!**/*.md'
               - 'hosted/**'
@@ -127,8 +160,10 @@ jobs:
               - 'inspector/**'
               - 'inspector-protocol/**'
               - 'cli/**'
+              - 'compiler-host/**'
               - 'compiler-support/**'
               - 'profdata/**'
+              - 'venus-gen/**'
               - 'workspace-root/**'
             programs:
               - '!**/*.md'
@@ -154,6 +189,13 @@ jobs:
               - 'wit/deps/helios-system/gpu.wit'
               - 'wit/deps/helios-system/display.wit'
               - 'programs/gpu-test/**'
+              - 'webgpu/**'
+              - 'venus/**'
+              - 'programs/webgpu/**'
+              - 'programs/pride-flag/**'
+              - 'programs/compositor/**'
+              - 'wit/deps/webgpu/**'
+              - 'wit/deps/helios-webgpu/**'
               - 'inspector/**'
               - '.github/qemu/x86_64-venus-configure.args'
               - '.github/qemu/virglrenderer-meson.args'
@@ -233,7 +275,8 @@ jobs:
             | map({name: .key, command: .value.command,
                    "rust-cache": (.value["rust-cache"] // false),
                    "helios-cli": (.value["helios-cli"] // ""),
-                   "guest-wasm": (.value["guest-wasm"] // "")})' .github/ci-lanes.json)"
+                   "guest-wasm": (.value["guest-wasm"] // ""),
+                   "warm": (.value.warm // "")})' .github/ci-lanes.json)"
           # Every consumer declares the profile its prebuild reads.
           wasm_profiles="$(jq -c --argjson lanes "${lanes}" '
             [$lanes[] as $name | .[$name]["guest-wasm"] // empty] | unique' .github/ci-lanes.json)"
@@ -282,11 +325,14 @@ jobs:
   # on the target, so it is built once per run, in each requested profile
   # (`release` for optimised kernels, `debug` for checks, the debug
   # inspector of `smoke-x86-64-venus` and the debug kernel of
-  # `smoke-aarch64-cfi`). Consumers start after their requested producer
-  # finishes and download the
-  # result with the `prebuilt-wasm` action just before its first prebuild,
-  # and reads it through `HELIOS_PREBUILT_WASM`, so a file missing from it
-  # fails the lane's prebuild instead of being built there (#882).
+  # `smoke-aarch64-cfi`). Consumers download the result with the
+  # `prebuilt-wasm` action just before their first prebuild, and read it
+  # through `HELIOS_PREBUILT_WASM`, so a file missing from it fails the
+  # lane's prebuild instead of being built there (#882). The smoke lanes
+  # start after their producer finishes; the `tests` lanes start beside it
+  # and wait in that action. What the producer costs is bounded by the
+  # `helios-cli` build and the programs whose inputs changed: the cache it
+  # restores holds every other program (#1022).
   wasm-debug:
     name: wasm-programs (${{ matrix.profile }})
     needs: changes
@@ -322,22 +368,41 @@ jobs:
           path: ${{ github.workspace }}/wasm-cache
           key: helios-wasm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-${{ github.run_id }}
           restore-keys: helios-wasm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-
+      # The tool that drives the guest build links Wasmtime and Cranelift,
+      # and compiled cold took 3 to 5 minutes of a job that is the first
+      # link of every pull request's critical path; the lanes that restore
+      # a Rust cache build it from that in 1.5 minutes. The step names are
+      # the check lanes', for the reason given there.
+      - name: Make the pinned toolchain the only one rust-cache sees
+        working-directory: helios
+        run: |
+          rustup toolchain install
+          pinned="$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustup default "$pinned"
+          rustup toolchain list --quiet | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+          rustup toolchain list
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
       # The guest programs build in the profile the matrix names; the tool
       # that drives them is the debug one every check lane runs.
       - uses: ./helios/.github/actions/helios-cli
         with:
           profile: debug
+      # Outside `helios/target`, so that no Rust cache saves or restores
+      # the guest build directories or a stale copy of the result.
       - name: Build the guest wasm
         working-directory: helios
         run: >-
           "$HELIOS_CLI_BIN"
-          wasm-build --out-dir target/wasm-programs
+          wasm-build --out-dir ${{ runner.temp }}/wasm-programs
           --profile ${{ matrix.profile }} --cargo cargo
           --cache-dir ${{ github.workspace }}/wasm-cache
       - uses: actions/upload-artifact@v4
         with:
           name: helios-wasm-${{ matrix.profile }}
-          path: helios/target/wasm-programs/${{ matrix.profile }}
+          path: ${{ runner.temp }}/wasm-programs/${{ matrix.profile }}
           if-no-files-found: error
           retention-days: 1
       - name: Prune the guest wasm cache
@@ -441,6 +506,13 @@ jobs:
         if: matrix.helios-cli != ''
         with:
           profile: ${{ matrix.helios-cli }}
+      # What the lane's tests are compiled from reads no guest wasm, so they
+      # compile while the guest wasm is still building and the lane's own
+      # command, which compiles nothing then, starts when it lands.
+      - name: Compile the tests of ${{ matrix.name }}
+        if: matrix.warm != ''
+        working-directory: helios
+        run: ${{ matrix.warm }}
       - uses: ./helios/.github/actions/prebuilt-wasm
         if: matrix.guest-wasm != ''
         with:
@@ -452,9 +524,14 @@ jobs:
           HELIOS_PREBUILT_WASM: ${{ matrix.guest-wasm != '' && format('{0}/helios/target/wasm-programs', github.workspace) || '' }}
         run: ${{ matrix.command }}
 
+  # The lanes that read the guest wasm start with `changes`, not after
+  # `wasm-debug`: their setup, the WASI tooling and the compile of their
+  # tests need none of it, so it runs beside the guest build, and the
+  # `prebuilt-wasm` step waits for the artifact. A `wasm-debug` that fails
+  # fails that step at once.
   tests:
     name: ${{ matrix.name }}
-    needs: [changes, wasm-debug]
+    needs: changes
     if: needs.changes.outputs.tests != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1094,7 +1171,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1108,6 +1185,10 @@ jobs:
           grep -Fqx 'Hello, World!' linux-smoke.out
           grep -Fqx 'libc:0' linux-smoke.out
           grep -Fqx 'fault:139' linux-smoke.out
+          # The memory fixture (#1026) runs in all its endings against the
+          # results check-memory.sh records from Linux, which build-fixtures.sh
+          # first confirmed on this runner.
+          grep -Fqx 'memory:0' linux-smoke.out
       - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
@@ -1767,7 +1848,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1781,6 +1862,10 @@ jobs:
           grep -Fqx 'Hello, World!' linux-smoke.out
           grep -Fqx 'libc:0' linux-smoke.out
           grep -Fqx 'fault:139' linux-smoke.out
+          # The memory fixture (#1026) runs in all its endings against the
+          # results check-memory.sh records from Linux, which build-fixtures.sh
+          # first confirmed on this runner.
+          grep -Fqx 'memory:0' linux-smoke.out
       - name: Kill the guest during a btrfs write burst
         timeout-minutes: 10
         shell: bash
@@ -2729,7 +2814,14 @@ jobs:
     name: smoke-x86-64-venus
     needs: [changes, wasm-debug]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-venus')
-    runs-on: ubuntu-24.04
+    # QEMU's display reads the guest's scanout blob through llvmpipe on
+    # vgem, which maps an imported dma-buf only from Mesa 25.3 on
+    # (kms-dri-sw `create_mapped`); 24.04 ships 25.2. The image names the
+    # cached QEMU and virglrenderer builds, which link its libraries.
+    strategy:
+      matrix:
+        image: [ubuntu-26.04]
+    runs-on: ${{ matrix.image }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -2775,18 +2867,21 @@ jobs:
             python3-venv pkg-config flex bison \
             libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev \
             libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev \
-            mesa-vulkan-drivers libegl-mesa0
+            mesa-vulkan-drivers libegl-mesa0 gdb
           # vgem gives a GPU-less runner the render node QEMU's EGL
           # context opens; the azure kernel's own modules package carries
-          # it. No udmabuf: QEMU needs it for blobs only when neither virgl
-          # nor rutabaga backs the device (hw/display/virtio-gpu.c), and
-          # virgl hands guest blobs to virglrenderer as iovecs.
+          # it.
           sudo modprobe vgem
           # Device rules may change the new node's owner and permissions.
           # Complete them before granting the runner access.
           sudo udevadm settle
-          sudo chmod 666 /dev/kvm /dev/dri/renderD*
-          ls -la /dev/kvm /dev/dri
+          # QEMU scans a blob out through an EGL dma-buf import
+          # (ui/egl-helpers.c), and lavapipe exports host-visible memory
+          # as a dma-buf only through /dev/udmabuf (lp_screen.c). Noble
+          # builds udmabuf into the kernel, so the node exists without a
+          # module; chmod fails the step if it does not.
+          sudo chmod 666 /dev/kvm /dev/dri/renderD* /dev/udmabuf
+          ls -la /dev/kvm /dev/dri /dev/udmabuf
           # lavapipe is the only Vulkan driver this runner can enumerate;
           # naming it keeps the loader from probing the hardware ones.
           # Mesa 25's package names the ICD without an architecture suffix.
@@ -2798,7 +2893,7 @@ jobs:
         uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.VIRGL_PREFIX }}
-          key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
+          key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
       - name: Build the pinned virglrenderer
         if: steps.virgl-cache.outputs.cache-hit != 'true'
         run: |
@@ -2819,7 +2914,7 @@ jobs:
           path: ${{ env.QEMU_PREFIX }}
           # QEMU links the virglrenderer above, so its key carries that
           # build's too.
-          key: qemu-venus-${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
+          key: qemu-venus-${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
       - name: Build the pinned QEMU
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         env:
@@ -2922,9 +3017,69 @@ jobs:
           # blobs written and read back, and the second instance.
           for line in 'gpu-test:opened' 'gpu-test:fence ring=0' \
               'gpu-test:host-blob ok' 'gpu-test:guest-blob ok' \
-              'gpu-test:instances=2'; do
+              'gpu-test:instances=2' 'gpu-test:venus ring-reply ok'; do
             grep -Fq "$line" venus-smoke.out
           done
+      # The whole WebGPU path: the provider plugged into `pride-flag`
+      # draws over Venus, the canvas presents to the compositor, and the
+      # capture is what the scanout shows.
+      - name: Draw the pride flag through wasi:webgpu
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/pride-flag"
+          captures="$GITHUB_WORKSPACE/pride-flag-scanout"
+          mkdir -p "$runtime" "$captures"
+          # The runner pipes cores to apport, which keeps none for an
+          # unpackaged binary; a crashed QEMU leaves its core here for the
+          # backtrace step below.
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/core.%e.%p"
+          ulimit -c unlimited
+          ./target/debug/helios-inspector vm --arch x86-64 --memory 2G \
+            --accel kvm --runtime-dir "$runtime" --keep-runtime-dir \
+            --renderer virtio-gpu-gl --renderer-hostmem 256M \
+            --display egl-headless \
+            --boot-program dash --boot-program debugger \
+            --boot-program compositor --boot-program pride-flag \
+            --no-compiler-plugin \
+            screendump --settle-seconds 20 --run /bin/pride-flag \
+              "$captures/pride-flag.png" \
+            2>&1 | tee "$runtime/inspector.log"
+          for line in 'pride-flag:device' 'pride-flag:canvas' \
+              'pride-flag:frame 60' 'pride-flag:done'; do
+            grep -Fq "$line" "$runtime/inspector.log"
+          done
+          file "$captures/pride-flag.png" | grep -Fq 'PNG image data'
+      - name: Print the QEMU crash backtrace
+        if: failure()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          # The kernel logs each segfault with the faulting library and
+          # offset, and udmabuf logs the allocations it refuses.
+          echo "::group::kernel log"
+          sudo dmesg | tail -n 100
+          grep -H . /sys/module/udmabuf/parameters/* || true
+          echo "::endgroup::"
+          # %e is the faulting thread's name (llvmpipe-0, say), not the
+          # binary's, so every core here is QEMU's.
+          for core in "$RUNNER_TEMP"/core.*; do
+            ls -la "$core"
+            echo "::group::backtrace of $core"
+            gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' \
+              "$(command -v qemu-system-x86_64)" "$core"
+            echo "::endgroup::"
+          done
+      - name: Upload the pride flag capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pride-flag-scanout
+          path: pride-flag-scanout/*.png
+          if-no-files-found: warn
+          retention-days: 14
       - name: Upload the inspector runtime directory
         if: failure()
         uses: actions/upload-artifact@v4

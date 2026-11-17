@@ -867,6 +867,8 @@ extern "C" fn aarch64_kernel_main() -> ! {
         cfi::install_bootstrap_key(&platform_state.instruction_key, &root_entropy);
         cfi::enable_instruction_key_a();
     }
+    #[cfg(feature = "native-users")]
+    native::enable_user_cache_maintenance();
     // The calendar is read once, here, before any component can ask
     // what time it is. The processor's timer carries wall time forward
     // from that reading; only a machine restore re-reads it, which the
@@ -1512,6 +1514,8 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
         );
         cfi::enable_instruction_key_a();
     }
+    #[cfg(feature = "native-users")]
+    native::enable_user_cache_maintenance();
     activate_processor_runtime(&slot.runtime);
     state.gic().attach_current_processor(mp_info.mpidr);
 

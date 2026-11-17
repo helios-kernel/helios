@@ -71,9 +71,14 @@ fn run() -> Result<(), BuildError> {
 
     // The module the parity test compiles; the library never includes it.
     let parity = emit::parity_source(&analysis)?;
+    let entry = emit::entry_source(&analysis)?;
 
     let out_dir = PathBuf::from(var("OUT_DIR")?);
-    for (name, text) in [("protocol.rs", source), ("parity.rs", parity)] {
+    for (name, text) in [
+        ("protocol.rs", source),
+        ("parity.rs", parity),
+        ("entry.rs", entry),
+    ] {
         let out = out_dir.join(name);
         fs::write(&out, text).map_err(|source| BuildError::Io {
             what: format!("failed to write {}", out.display()),

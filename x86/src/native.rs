@@ -3,8 +3,10 @@
 //! Every slice entry and exit writes CR3 without PCID and no user mapping is
 //! global, so no processor keeps a usable user translation once its slice
 //! ends: a page removed from a space while none of its slices runs needs no
-//! remote invalidation. The kernel's upper half is shared with every space;
-//! a space owns only its private lower half.
+//! remote invalidation, and one removed while some run goes through the
+//! kernel's TLB shootdown broadcast (`smp::shootdown_tlb_range`). The
+//! kernel's upper half is shared with every space; a space owns only its
+//! private lower half.
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::boxed::Box;
@@ -146,14 +148,21 @@ unsafe impl UserTranslation for X86Tables {
         let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(base))
             .expect("a page span is page aligned");
         let offset = X86VirtAddr::new(self.tables.offset as u64);
+        // Every table above a leaf grants user, write and execute access and
+        // the leaf alone limits it, as Linux's `_PAGE_TABLE` does: a page
+        // first mapped with no access must still reach user mode once
+        // `protect` widens its leaf.
+        let parents =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         // SAFETY: the page is not mapped and the frame is fresh; the root and
         // every lower-half table are owned by this space and reached through
         // the kernel direct map.
         let mapped = unsafe {
-            OffsetPageTable::new(&mut self.root, offset).map_to(
+            OffsetPageTable::new(&mut self.root, offset).map_to_with_table_flags(
                 page,
                 frame,
                 page_table_flags(flags),
+                parents,
                 &mut self.tables,
             )
         };
@@ -172,10 +181,33 @@ unsafe impl UserTranslation for X86Tables {
         let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(base))
             .expect("an installed page is page aligned");
         match self.mapper().unmap(page) {
-            // No slice ran the page, so no processor caches it.
+            // The space's caller invalidates the page wherever a slice may
+            // hold it (`invalidate`).
             Ok((_, flush)) => flush.ignore(),
-            Err(error) => panic!("native mapping rollback at {base:#x}: {error:?}"),
+            Err(error) => panic!("removing user page {base:#x}: {error:?}"),
         }
+    }
+
+    fn protect(&mut self, base: u64, flags: PageFlags) {
+        let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(base))
+            .expect("an installed page is page aligned");
+        // SAFETY: the page maps a frame of this space; only its access
+        // changes, and the caller invalidates a narrowing.
+        match unsafe { self.mapper().update_flags(page, page_table_flags(flags)) } {
+            Ok(flush) => flush.ignore(),
+            Err(error) => panic!("changing the access of user page {base:#x}: {error:?}"),
+        }
+    }
+
+    fn invalidate(&self, first: u64, last: u64) {
+        let (start, byte_len) = (first as usize, (last - first) as usize);
+        // The kernel's CR3 is loaded here, so the local INVLPG reaches no
+        // user translation: the slice exit's CR3 write already dropped
+        // them. A processor running a slice takes the broadcast's IPI from
+        // user mode, and its exit's CR3 write drops the space's
+        // translations before the handler acknowledges.
+        smp::flush_tlb_range_local(start, byte_len);
+        smp::shootdown_tlb_range(start, byte_len);
     }
 
     fn physical(&self, frame: NonNull<u8>) -> u64 {
@@ -432,7 +464,9 @@ unsafe impl UserContext for X86Context {
             | (1 << 18)
             | (1 << 21);
         self.switch.registers.rflags = (self.switch.registers.rflags & USER_FLAGS) | 0x202;
-        self.switch.user_cr3 = space.with_tables(X86Tables::root);
+        // Counted until the exit below has written the kernel's CR3 back.
+        let slice = space.begin_slice();
+        self.switch.user_cr3 = slice.with_tables(X86Tables::root);
         let fault_address = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
             self.switch.self_pointer = core::ptr::from_mut(&mut self.switch) as u64;
             let (kernel_frame, kernel_flags) = Cr3::read_raw();
@@ -455,6 +489,7 @@ unsafe impl UserContext for X86Context {
             // still the user fault's address.
             Cr2::read_raw()
         });
+        drop(slice);
         match self.switch.registers.vector {
             SYSCALL_VECTOR => Stop::SystemCall,
             vector if vector == exceptions::TIMER_INTERRUPT_VECTOR as u64 => Stop::Preempted,

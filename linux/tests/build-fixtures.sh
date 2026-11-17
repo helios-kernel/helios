@@ -18,13 +18,15 @@ for program in hello fault spin; do
     zig cc -target "$arch-linux-musl" -nostdlib -static -no-pie -Wl,--build-id=none \
         "$sources/$program.S" -o "$out/linux/$program"
 done
-for program in hello-libc args; do
+for program in hello-libc args memory; do
     zig cc -target "$arch-linux-musl" -static -no-pie -s -O2 -Wl,--build-id=none \
         "linux/tests/$program.c" -o "$out/linux/$program"
 done
+cp linux/tests/check-memory.sh "$out/linux/check-memory.sh"
 # The same executables first run under Linux, establishing their ABI assertions.
 if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     "$out/linux/hello"
     "$out/linux/hello-libc"
     HELIOS_PROCESS_ID=1 "$out/linux/args" 0 >/dev/null
+    sh "$out/linux/check-memory.sh" "$out/linux/memory"
 fi

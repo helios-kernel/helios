@@ -169,7 +169,7 @@ impl PoolingBudget {
             component_instances: MAX_CONCURRENT_INSTANCES,
             core_instances: MAX_CONCURRENT_INSTANCES * MAX_CORE_INSTANCES_PER_COMPONENT,
             memories: MAX_CONCURRENT_INSTANCES * MAX_MEMORIES_PER_COMPONENT,
-            tables: MAX_CONCURRENT_INSTANCES * MAX_TABLES_PER_COMPONENT,
+            tables: MAX_CONCURRENT_INSTANCES * TABLES_PER_INSTANCE,
             // One fiber stack and one GC heap per live instance: a guest
             // thread takes a second store over the same instance, and the
             // budget counts instances.
@@ -283,7 +283,7 @@ use super::config::COMPONENT_ASYNC_STACK_SIZE;
 use super::config::{
     MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT, MAX_MEMORIES_PER_COMPONENT,
     MAX_POOLED_ADDRESS_SPACE, MAX_POOLED_USER_MEMORY, MAX_TABLES_PER_COMPONENT,
-    build_component_engine_config,
+    TABLES_PER_INSTANCE, build_component_engine_config,
 };
 
 #[cfg(test)]
@@ -326,9 +326,12 @@ mod tests {
             budget.memories,
             MAX_CONCURRENT_INSTANCES * MAX_MEMORIES_PER_COMPONENT
         );
+        // A composed component may hold more tables than one slot's
+        // share, but the pool every engine commits up front stays sized
+        // by the per-instance share.
         assert_eq!(
             budget.tables,
-            MAX_CONCURRENT_INSTANCES * MAX_TABLES_PER_COMPONENT
+            MAX_CONCURRENT_INSTANCES * TABLES_PER_INSTANCE
         );
     }
 

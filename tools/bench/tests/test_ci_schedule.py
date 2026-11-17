@@ -56,7 +56,9 @@ def changed_surfaces(ci_jobs, paths):
     ]
 
 
-@pytest.mark.parametrize("changed", [[], ["host_tools"], ["shared"], ["aarch64"], ["btrfs"], None])
+@pytest.mark.parametrize(
+    "changed", [[], ["host_tools"], ["shared"], ["aarch64"], ["btrfs"], ["btrfs_src"], None]
+)
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("heavy", [False, True])
 def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
@@ -80,10 +82,16 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
         assert set(lanes) <= {"lint-fmt"}
     if changed == []:
         assert lanes == []
-    if changed == ["btrfs"] and not draft:
+    if changed == ["btrfs_src"] and not draft:
         assert "test-libraries" in lanes
     assert ci_jobs["checks"]["needs"] == "changes"
-    assert ci_jobs["tests"]["needs"] == ["changes", "wasm-debug"]
+    # The payload tests start with `changes` and wait for the guest wasm in
+    # a step, after their tests have compiled and before their command runs.
+    assert ci_jobs["tests"]["needs"] == "changes"
+    steps = [step.get("uses", step.get("name", "")) for step in ci_jobs["tests"]["steps"]]
+    wait = steps.index("./helios/.github/actions/prebuilt-wasm")
+    assert steps.index("Compile the tests of ${{ matrix.name }}") < wait
+    assert steps.index("${{ matrix.name }}") > wait
     for name in lanes:
         if name.startswith("smoke-"):
             assert f"wasm-{catalog[name]['guest-wasm']}" in ci_jobs[name]["needs"]
