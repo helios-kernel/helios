@@ -2849,8 +2849,10 @@ jobs:
           sudo dmesg | tail -n 100
           grep -H . /sys/module/udmabuf/parameters/* || true
           echo "::endgroup::"
-          # The kernel truncates %e to 15 bytes of the command name.
-          for core in "$RUNNER_TEMP"/core.qemu-system-x86.*; do
+          # %e is the faulting thread's name (llvmpipe-0, say), not the
+          # binary's, so every core here is QEMU's.
+          for core in "$RUNNER_TEMP"/core.*; do
+            ls -la "$core"
             echo "::group::backtrace of $core"
             gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' \
               "$(command -v qemu-system-x86_64)" "$core"
