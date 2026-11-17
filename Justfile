@@ -132,6 +132,9 @@ test-kernel run_ignored="default":
     # The Linux process host is behind a feature the run above leaves off.
     cargo nextest run -p helios-kernel --lib --features linux --run-ignored "{{ run_ignored }}"
     cargo nextest run -p helios-kernel --test hal_layering
+    # The x86 user address space's page-table code, the code the x86
+    # kernel runs, over host memory and real threads.
+    cargo nextest run -p helios-x86-vmm
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and
     # `embedded_debugger_is_provisioned` reads the prebuild payload above.
@@ -153,6 +156,7 @@ warm-test-kernel:
     cargo nextest run --no-run {{ kernel_unit_packages }} --lib
     cargo nextest run --no-run -p helios-kernel --lib --features linux
     cargo nextest run --no-run -p helios-kernel --test hal_layering
+    cargo nextest run --no-run -p helios-x86-vmm
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run --no-run -p helios-hosted
 
 test-libraries:
