@@ -330,7 +330,9 @@ fn write_result<M: UserMemory>(memory: &mut M, address: u64, bytes: &[u8]) -> u6
 /// What a `clockid_t` reads, or `None` where Linux has no clock of that
 /// number the kernel can serve (kernel/time/posix-timers.c `posix_clocks`).
 /// The alarm clocks answer `EINVAL` without a wake-capable real-time clock
-/// device, which Helios does not have, and a negative ID names a CPU-time
+/// device, which Helios does not have; the auxiliary clocks (`CLOCK_AUX`,
+/// 16 to 23) answer as on a kernel built without `CONFIG_POSIX_AUX_CLOCKS`,
+/// whose table ends at `CLOCK_TAI`; and a negative ID names a CPU-time
 /// clock of a process or a dynamic POSIX clock, neither of which exists
 /// here.
 enum ClockSource {

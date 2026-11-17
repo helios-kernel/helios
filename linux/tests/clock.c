@@ -74,10 +74,14 @@ int main(int argc, char **argv) {
         CHECK(SYS(SYS_clock_getres, clock, UNMAPPED) == -EFAULT);
     }
 
-    /* No clock has these numbers (posix_clocks[] is NULL there), and -1 is
-     * a malformed CPU-clock ID. The alarm clocks (8 and 9) are left out:
-     * a machine with a wake-capable RTC reads them. */
-    static const int unknown[] = {10, 12, 15, 16, 1000, -1};
+    /* No clock has these numbers (posix_clocks[] is NULL there or ends
+     * before them), and -1 is a malformed CPU-clock ID. The alarm clocks
+     * (8 and 9) are left out: a machine with a wake-capable RTC reads them.
+     * So are the auxiliary clocks CLOCK_AUX..CLOCK_AUX_LAST (16..23, Linux
+     * 6.17): a kernel built with CONFIG_POSIX_AUX_CLOCKS answers ENODEV for
+     * one not enabled, and one built without it answers EINVAL; 24 is the
+     * first number past them. */
+    static const int unknown[] = {10, 12, 15, 24, 1000, -1};
     for (size_t index = 0; index < sizeof unknown / sizeof *unknown; index++) {
         int clock = unknown[index];
         CHECK(get(clock, &first) == -EINVAL);
