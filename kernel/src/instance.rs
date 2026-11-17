@@ -768,6 +768,13 @@ impl InstanceRegistry {
         })
     }
 
+    /// How many instances are registered. Unlike [`Self::snapshot`] it
+    /// leaves the sampling window of the processor-time statistics alone,
+    /// so any caller may ask.
+    pub fn count(&self) -> usize {
+        self.inner.entries.lock().len()
+    }
+
     pub fn snapshot(&self, now_nanos: u64) -> Vec<InstanceSnapshot> {
         let entries = self.inner.entries.lock();
         let mut sampling = self.inner.sampling.lock();
