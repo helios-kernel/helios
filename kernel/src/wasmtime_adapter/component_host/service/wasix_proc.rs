@@ -2981,16 +2981,20 @@ where
 }
 
 /// Initial descriptor, authority and working-directory snapshot for
-/// `proc_spawn2`, starting from the parent's table with `close_on_exec`
-/// entries removed. Both no-action (`fd_ops == 0, fd_ops_len == 0`) and
-/// action-carrying spawns start from this table.
+/// `proc_spawn2`.
+///
+/// Starts from a full clone of the parent's table so `fd_ops` (`dup2`,
+/// `fchdir`, `close`) can act on parent `close_on_exec` descriptors (such as
+/// `O_CLOEXEC` pipes redirected onto stdio); [`wasix_spawn_descriptor_snapshot`]
+/// strips any descriptors that still have `close_on_exec` set once `fd_ops`
+/// finish.
 pub(super) fn wasix_spawn_initial_snapshot<Net: ComponentHostNetwork>(
     descriptors: &Preview1DescriptorTable<Net>,
     authority: &ProcessAuthority,
     cwd: Option<&Preview1Cwd>,
 ) -> WasixSpawnFdSnapshot<Net> {
     WasixSpawnFdSnapshot {
-        descriptors: descriptors.clone_for_exec(),
+        descriptors: descriptors.clone(),
         authority: authority.clone(),
         cwd: cwd.cloned(),
     }
@@ -3020,6 +3024,7 @@ where
         let op = fd_ops.offset(u64::from(index) * u64::from(WASIX_PROC_SPAWN_FD_OP_SIZE));
         wasix_apply_spawn_fd_op(caller, memory, &mut snapshot, op).await?;
     }
+    snapshot.descriptors = snapshot.descriptors.clone_for_exec();
     Ok(snapshot)
 }
 
@@ -4585,6 +4590,95 @@ mod spawn_descriptor_tests {
                 assert!(with_close.descriptors.get(file_fd).is_some());
                 assert!(with_close.descriptors.get(pipe_fd).is_none());
                 assert!(with_close.descriptors.get(cloexec_fd).is_none());
+            })
+        });
+    }
+
+    /// A `proc_spawn2` `DUP2` action runs before `close_on_exec` filtering, so
+    /// a parent holding an `O_CLOEXEC` pipe can redirect it onto stdout (`fd 1`)
+    /// with `close_on_exec == false` while the original `cloexec_pipe_fd` is
+    /// stripped from the child's table.
+    #[test]
+    fn proc_spawn2_dup2_redirects_cloexec_pipe_and_closes_source_fd() {
+        let fixture = std::sync::Arc::new(SpawnFixture::new());
+        let mut parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let (pipe_writer, pipe_reader) = crate::byte_channel();
+        let cloexec_pipe_fd = parent
+            .descriptors
+            .insert_with_close_on_exec(
+                Preview1Descriptor::PipeWrite {
+                    writer: pipe_writer,
+                },
+                true,
+            )
+            .expect("cloexec pipe inserts") as i32;
+
+        let fixture_clone = fixture.clone();
+        fixture.run_with_caller(parent, move |mut caller| {
+            Box::pin(async move {
+                let mut guest = [0_u8; 256];
+                let memory = Preview1AsyncMemory::new(Preview1Memory {
+                    base: guest.as_mut_ptr() as usize,
+                    len: guest.len(),
+                });
+                let op_base = GuestAddress::wasm32(64);
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET)),
+                        &[WASIX_PROC_SPAWN_FD_OP_DUP2],
+                    )
+                    .await
+                    .expect("writes cmd");
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_FD_OFFSET)),
+                        &1_u32.to_le_bytes(),
+                    )
+                    .await
+                    .expect("writes target fd");
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET)),
+                        &(cloexec_pipe_fd as u32).to_le_bytes(),
+                    )
+                    .await
+                    .expect("writes source fd");
+                memory
+                    .write_bytes(
+                        op_base.offset(u64::from(WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET)),
+                        &0_u16.to_le_bytes(),
+                    )
+                    .await
+                    .expect("writes fdflagsext");
+
+                let snapshot = wasix_spawn_descriptor_snapshot(&mut caller, &memory, 64, 1)
+                    .await
+                    .expect("dup2 over cloexec pipe succeeds");
+                let inheritance = wasix_proc_spawn2_inheritance(None, snapshot, Vec::new());
+                let child = fixture_clone.make_store(
+                    "child",
+                    inheritance.authority.expect("child authority"),
+                    inheritance.descriptors,
+                );
+
+                assert!(
+                    child.descriptors.get(cloexec_pipe_fd).is_none(),
+                    "original close_on_exec pipe fd must be closed in child"
+                );
+                assert_eq!(child.descriptors.close_on_exec(1), Ok(false));
+                match child.descriptors.get(1) {
+                    Some(Preview1Descriptor::PipeWrite { writer }) => {
+                        writer
+                            .write(Bytes::from_static(b"cloexec-dup2"))
+                            .await
+                            .expect("child writes redirected stdout pipe");
+                        assert_eq!(
+                            pipe_reader.read_limit(32).await.as_deref(),
+                            Some(&b"cloexec-dup2"[..])
+                        );
+                    }
+                    _ => panic!("child fd 1 must receive the redirected pipe"),
+                }
             })
         });
     }
