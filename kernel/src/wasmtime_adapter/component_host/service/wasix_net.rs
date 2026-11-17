@@ -1049,12 +1049,12 @@ where
     // A bind never names a local address in WASIX, only a port, so the
     // local address is the socket family's wildcard: `0.0.0.0` or `::`.
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
             local_port,
             family,
             ..
         }))) => {
-            let (address, local_port) = (family.unspecified_address(), *local_port);
+            let (address, local_port) = (crate::unix::unspecified_address(*family), *local_port);
             write_wasix_addr_port(
                 caller,
                 memory,
@@ -1063,15 +1063,15 @@ where
                 local_port,
             )
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Bound {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(
+            UnixTcpSocket::Bound {
                 local_port, family, ..
             }
-            | WasixTcpSocket::Listening {
+            | UnixTcpSocket::Listening {
                 local_port, family, ..
             },
         ))) => {
-            let (address, local_port) = (family.unspecified_address(), *local_port);
+            let (address, local_port) = (crate::unix::unspecified_address(*family), *local_port);
             write_wasix_addr_port(
                 caller,
                 memory,
@@ -1102,13 +1102,11 @@ where
         return p1::errno::FAULT;
     };
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected {
-                peer_address,
-                peer_port,
-                ..
-            },
-        ))) => write_wasix_addr_port(
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            peer_address,
+            peer_port,
+            ..
+        }))) => write_wasix_addr_port(
             caller,
             memory,
             GuestAddress::wasm32(ret_addr),
@@ -1149,7 +1147,7 @@ pub(super) fn wasix_validate_socket_pair_request(
     af: i32,
     socktype: i32,
     proto: i32,
-) -> Result<(), i32> {
+) -> Result<SocketKind, i32> {
     match af {
         WASIX_ADDRESS_FAMILY_UNSPEC_I32 | WASIX_ADDRESS_FAMILY_UNIX_I32 => {}
         WASIX_ADDRESS_FAMILY_IP_INET4_I32 | WASIX_ADDRESS_FAMILY_IP_INET6_I32 => {
@@ -1157,10 +1155,26 @@ pub(super) fn wasix_validate_socket_pair_request(
         }
         _ => return Err(p1::errno::INVAL),
     }
+    if proto != 0 {
+        return Err(p1::errno::INVAL);
+    }
+    wasix_socket_kind(socktype)
+}
+
+/// The socket kind a WASIX socket type names.
+fn wasix_socket_kind(socktype: i32) -> Result<SocketKind, i32> {
     match socktype {
-        WASIX_SOCK_TYPE_STREAM | WASIX_SOCK_TYPE_DGRAM if proto == 0 => Ok(()),
-        WASIX_SOCK_TYPE_STREAM | WASIX_SOCK_TYPE_DGRAM => Err(p1::errno::INVAL),
+        WASIX_SOCK_TYPE_STREAM => Ok(SocketKind::Stream),
+        WASIX_SOCK_TYPE_DGRAM => Ok(SocketKind::Datagram),
         _ => Err(p1::errno::INVAL),
+    }
+}
+
+/// The WASIX socket type of a socket kind.
+pub(super) const fn wasix_socket_type(kind: SocketKind) -> i32 {
+    match kind {
+        SocketKind::Stream => WASIX_SOCK_TYPE_STREAM,
+        SocketKind::Datagram => WASIX_SOCK_TYPE_DGRAM,
     }
 }
 
@@ -1182,8 +1196,8 @@ where
     // AF_UNSPEC keeps the historical IPv4 default, matching what a
     // `socket(0, SOCK_STREAM, 0)` caller gets from WASIX today.
     let family = match af {
-        WASIX_ADDRESS_FAMILY_IP_INET6_I32 => WasixSocketFamily::Ipv6,
-        _ => WasixSocketFamily::Ipv4,
+        WASIX_ADDRESS_FAMILY_IP_INET6_I32 => SocketFamily::Ipv6,
+        _ => SocketFamily::Ipv4,
     };
     let status = match socktype {
         WASIX_SOCK_TYPE_STREAM => caller.data().require_tcp_authority(),
@@ -1199,21 +1213,11 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let descriptor = match socktype {
-        WASIX_SOCK_TYPE_STREAM => {
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family,
-                options: WasixSocketOptions::default(),
-            }))
-        }
-        WASIX_SOCK_TYPE_DGRAM => {
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                family,
-                options: WasixSocketOptions::default(),
-            }))
-        }
-        _ => return p1::errno::INVAL,
-    };
+    let descriptor = Preview1Descriptor::Socket(match wasix_socket_kind(socktype) {
+        Ok(SocketKind::Stream) => UnixSocket::<Net>::tcp(family),
+        Ok(SocketKind::Datagram) => UnixSocket::<Net>::udp(family),
+        Err(errno) => return errno,
+    });
     let fd = match caller.data_mut().descriptors.insert(descriptor) {
         Ok(fd) => fd,
         Err(errno) => return errno,
@@ -1234,28 +1238,18 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    if let Err(errno) = wasix_validate_socket_pair_request(af, socktype, proto) {
-        return errno;
-    }
+    let kind = match wasix_validate_socket_pair_request(af, socktype, proto) {
+        Ok(kind) => kind,
+        Err(errno) => return errno,
+    };
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let (left_writer, right_reader) = crate::byte_channel();
-    let (right_writer, left_reader) = crate::byte_channel();
-    let first = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-        reader: left_reader,
-        writer: left_writer,
-        carry: Bytes::new(),
-        options: WasixSocketOptions::default(),
-        socket_type: socktype,
-    });
-    let second = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-        reader: right_reader,
-        writer: right_writer,
-        carry: Bytes::new(),
-        options: WasixSocketOptions::default(),
-        socket_type: socktype,
-    });
+    let (first, second) = UnixSocket::<Net>::pair(kind);
+    let (first, second) = (
+        Preview1Descriptor::Socket(first),
+        Preview1Descriptor::Socket(second),
+    );
     let fd0 = match caller.data_mut().descriptors.insert(first) {
         Ok(fd) => fd,
         Err(errno) => return errno,
@@ -1294,17 +1288,17 @@ pub(super) fn wasix_sock_recv_authority<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Result<WasixSocketAuthority, i32> {
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
-            ..
-        }))) => Ok(WasixSocketAuthority::Udp),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-            ..
-        }))) => Err(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { .. },
-        ))) => Ok(WasixSocketAuthority::Tcp),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => Err(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound { .. }))) => {
+            Ok(WasixSocketAuthority::Udp)
+        }
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound { .. }))) => {
+            Err(p1::errno::INVAL)
+        }
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected { .. }))) => {
+            Ok(WasixSocketAuthority::Tcp)
+        }
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => {
             Ok(WasixSocketAuthority::LocalOnly)
         }
         Some(_) => Err(p1::errno::NOTSOCK),
@@ -1316,14 +1310,12 @@ pub(super) fn wasix_sock_send_authority<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Result<WasixSocketAuthority, i32> {
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => {
-            Ok(WasixSocketAuthority::Udp)
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(_))) => Ok(WasixSocketAuthority::Udp),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected { .. }))) => {
+            Ok(WasixSocketAuthority::Tcp)
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { .. },
-        ))) => Ok(WasixSocketAuthority::Tcp),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => Err(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => {
             Ok(WasixSocketAuthority::LocalOnly)
         }
         Some(_) => Err(p1::errno::NOTSOCK),
@@ -1335,15 +1327,15 @@ pub(super) fn wasix_sock_bind_authority<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Result<WasixSocketAuthority, i32> {
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound { .. }))) => {
+            Ok(WasixSocketAuthority::Udp)
+        }
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
             ..
-        }))) => Ok(WasixSocketAuthority::Udp),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => Ok(WasixSocketAuthority::Tcp),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
-            ..
-        }))) => Err(p1::errno::INVAL),
+        }))) => Ok(WasixSocketAuthority::Tcp),
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound { .. }))) => {
+            Err(p1::errno::INVAL)
+        }
         Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
         Some(_) => Err(p1::errno::NOTSOCK),
         None => Err(p1::errno::BADF),
@@ -1354,9 +1346,7 @@ pub(super) fn wasix_sock_listen_authority<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Result<WasixSocketAuthority, i32> {
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
-            Ok(WasixSocketAuthority::Tcp)
-        }
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Ok(WasixSocketAuthority::Tcp),
         Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
         Some(_) => Err(p1::errno::NOTSOCK),
         None => Err(p1::errno::BADF),
@@ -1386,7 +1376,7 @@ where
             None => p1::errno::BADF,
         };
     };
-    descriptor.options_mut().set_flag(option, flag)
+    wasix_socket_set_flag(descriptor, option, flag)
 }
 
 pub(super) fn wasix_sock_get_opt_flag<CpuImpl, Net, StorageImpl>(
@@ -1406,7 +1396,7 @@ where
             None => p1::errno::BADF,
         };
     };
-    let flag = match descriptor.options().flag(option) {
+    let flag = match wasix_socket_flag(descriptor, option) {
         Ok(flag) => flag,
         Err(errno) => return errno,
     };
@@ -1441,7 +1431,7 @@ where
             None => p1::errno::BADF,
         };
     };
-    descriptor.options_mut().set_time(option, time)
+    wasix_socket_set_time(descriptor, option, time)
 }
 
 pub(super) fn wasix_sock_get_opt_time<CpuImpl, Net, StorageImpl>(
@@ -1461,7 +1451,7 @@ where
             None => p1::errno::BADF,
         };
     };
-    let time = match descriptor.options().time(option) {
+    let time = match wasix_socket_time(descriptor, option) {
         Ok(time) => time,
         Err(errno) => return errno,
     };
@@ -1493,7 +1483,7 @@ where
             None => p1::errno::BADF,
         };
     };
-    let status = descriptor.options_mut().set_size(option, size);
+    let status = wasix_socket_set_size(descriptor, option, size);
     if status != p1::errno::SUCCESS || option != WASIX_SOCK_OPTION_TTL {
         return status;
     }
@@ -1501,49 +1491,21 @@ where
     // one that has not connected, listened, or bound yet gets it applied at
     // that point, so no packet ever leaves with a stale value.
     let hop_limit = descriptor.options().hop_limit();
-    let target = wasix_socket_backend_handle(descriptor);
+    let target = descriptor.handle();
     let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::SUCCESS;
     };
     match target {
-        Some(WasixSocketBackendHandle::TcpStream(stream)) => service
+        Some(UnixSocketHandle::<Net>::TcpStream(stream)) => service
             .tcp_set_hop_limit(stream, hop_limit)
             .map_or_else(p1_errno_from_tcp_error, |()| p1::errno::SUCCESS),
-        Some(WasixSocketBackendHandle::TcpListener(listener)) => service
+        Some(UnixSocketHandle::<Net>::TcpListener(listener)) => service
             .tcp_listener_set_hop_limit(listener, hop_limit)
             .map_or_else(p1_errno_from_tcp_error, |()| p1::errno::SUCCESS),
-        Some(WasixSocketBackendHandle::UdpSocket(socket)) => service
+        Some(UnixSocketHandle::<Net>::UdpSocket(socket)) => service
             .udp_set_hop_limit(socket, hop_limit)
             .map_or_else(p1_errno_from_udp_error, |()| p1::errno::SUCCESS),
         None => p1::errno::SUCCESS,
-    }
-}
-
-/// The netstack handle a WASIX socket descriptor currently owns, if any.
-enum WasixSocketBackendHandle<Net: ComponentHostNetwork> {
-    TcpStream(Net::TcpStream),
-    TcpListener(Net::TcpListener),
-    UdpSocket(Net::UdpSocket),
-}
-
-fn wasix_socket_backend_handle<Net: ComponentHostNetwork>(
-    descriptor: &WasixSocketDescriptor<Net>,
-) -> Option<WasixSocketBackendHandle<Net>> {
-    match descriptor {
-        WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected { stream, .. }) => {
-            Some(WasixSocketBackendHandle::TcpStream(stream.id()))
-        }
-        WasixSocketDescriptor::Tcp(WasixTcpSocket::Listening { listener, .. }) => {
-            Some(WasixSocketBackendHandle::TcpListener(listener.id()))
-        }
-        WasixSocketDescriptor::Udp(WasixUdpSocket::Bound { socket, .. }) => {
-            Some(WasixSocketBackendHandle::UdpSocket(socket.id()))
-        }
-        WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. } | WasixTcpSocket::Bound { .. },
-        )
-        | WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound { .. })
-        | WasixSocketDescriptor::Pair { .. } => None,
     }
 }
 
@@ -1565,9 +1527,11 @@ where
         };
     };
     let size = match option {
-        WASIX_SOCK_OPTION_TYPE => descriptor.socket_type() as u64,
-        WASIX_SOCK_OPTION_PROTO => descriptor.protocol(),
-        _ => match descriptor.options().size(option) {
+        WASIX_SOCK_OPTION_TYPE => wasix_socket_type(descriptor.kind()) as u64,
+        WASIX_SOCK_OPTION_PROTO => descriptor
+            .protocol()
+            .map_or(0, |protocol| u64::from(protocol.number())),
+        _ => match wasix_socket_size(descriptor, option) {
             Ok(size) => size,
             Err(errno) => return errno,
         },
@@ -1660,7 +1624,7 @@ pub(super) fn wasix_udp_socket_descriptor_status<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> i32 {
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => p1::errno::SUCCESS,
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(_))) => p1::errno::SUCCESS,
         Some(Preview1Descriptor::Socket(_)) => p1::errno::INVAL,
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -1710,7 +1674,7 @@ where
         }
     }
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(_))) => {
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
             };
@@ -1718,7 +1682,7 @@ where
                 Ok(binding) => binding,
                 Err(error) => return p1_errno_from_udp_error(error),
             };
-            let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(slot))) =
+            let Some(Preview1Descriptor::Socket(UnixSocket::Udp(slot))) =
                 caller.data_mut().descriptors.get_mut(fd)
             else {
                 return p1::errno::BADF;
@@ -1730,25 +1694,28 @@ where
             if let Err(error) = service.udp_set_hop_limit(binding.socket, options.hop_limit()) {
                 return p1_errno_from_udp_error(error);
             }
-            *slot = WasixUdpSocket::Bound {
+            *slot = UnixUdpSocket::Bound {
                 family,
-                socket: WasixOwnedUdpSocket::new(service.clone(), binding.socket),
+                socket: OwnedUdpSocket::new(
+                    crate::UnixNetwork::new(service.clone()),
+                    binding.socket,
+                ),
                 local_port: binding.local_port,
                 options,
             };
             p1::errno::SUCCESS
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => {
             if caller.data().runtime_state.network_service().is_none() {
                 return p1::errno::NETDOWN;
             }
-            let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(slot))) =
+            let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
                 caller.data_mut().descriptors.get_mut(fd)
             else {
                 return p1::errno::BADF;
             };
             let options = *slot.options();
-            *slot = WasixTcpSocket::Bound {
+            *slot = UnixTcpSocket::Bound {
                 family: slot.family(),
                 local_port: port,
                 options,
@@ -1788,15 +1755,16 @@ where
         Err(_) => return p1::errno::OVERFLOW,
     };
     let (local_port, hop_limit, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { options, family },
-        ))) => (0, options.hop_limit(), *family),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Bound {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+            options,
+            family,
+        }))) => (0, options.hop_limit(), *family),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Bound {
             local_port,
             options,
             family,
         }))) => (*local_port, options.hop_limit(), *family),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => {
             return p1::errno::INVAL;
         }
         Some(_) => return p1::errno::NOTSOCK,
@@ -1804,21 +1772,29 @@ where
     };
     // A wildcard listen means `::` on an AF_INET6 socket, not `0.0.0.0`.
     let listener = match service
-        .tcp_listen(family.unspecified_address(), local_port, backlog, hop_limit)
+        .tcp_listen(
+            crate::unix::unspecified_address(family),
+            local_port,
+            backlog,
+            hop_limit,
+        )
         .await
     {
         Ok(listener) => listener,
         Err(error) => return p1_errno_from_tcp_error(error),
     };
-    let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(slot))) =
+    let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
         caller.data_mut().descriptors.get_mut(fd)
     else {
         return p1::errno::BADF;
     };
     let options = *slot.options();
-    *slot = WasixTcpSocket::Listening {
+    *slot = UnixTcpSocket::Listening {
         family,
-        listener: WasixOwnedTcpListener::new(service.clone(), listener.listener),
+        listener: OwnedTcpListener::new(
+            crate::UnixNetwork::new(service.clone()),
+            listener.listener,
+        ),
         local_port: listener.local_port,
         options,
     };
@@ -1884,15 +1860,17 @@ where
         return Err(status);
     }
     let (listener, accept_timeout, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Listening {
-                listener,
-                options,
-                family,
-                ..
-            },
-        ))) => (listener.id(), options.accept_timeout, *family),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
+            listener,
+            options,
+            family,
+            ..
+        }))) => (
+            listener.id(),
+            options.time(SocketTime::AcceptTimeout),
+            *family,
+        ),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => {
             return Err(p1::errno::INVAL);
         }
         Some(_) => return Err(p1::errno::NOTSOCK),
@@ -1908,14 +1886,13 @@ where
         .await
         .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
     let peer_address = accepted.address;
-    let descriptor =
-        Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-            family,
-            stream: WasixOwnedTcpStream::new(service.clone(), accepted.stream),
-            peer_address,
-            peer_port: accepted.port,
-            options: WasixSocketOptions::default(),
-        }));
+    let descriptor = Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+        family,
+        stream: OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), accepted.stream),
+        peer_address,
+        peer_port: accepted.port,
+        options: unix_socket_options::<Net>(),
+    }));
     let accepted_fd = caller.data_mut().descriptors.insert(descriptor)?;
     Ok((accepted_fd, peer_address, accepted.port))
 }
@@ -1978,32 +1955,38 @@ where
         return status;
     }
     let (local_port, connect_timeout, hop_limit, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { options, family },
-        ))) => (0, options.connect_timeout, options.hop_limit(), *family),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Bound {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+            options,
+            family,
+        }))) => (
+            0,
+            options.time(SocketTime::ConnectTimeout),
+            options.hop_limit(),
+            *family,
+        ),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Bound {
             local_port,
             options,
             family,
         }))) => (
             *local_port,
-            options.connect_timeout,
+            options.time(SocketTime::ConnectTimeout),
             options.hop_limit(),
             *family,
         ),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { .. },
-        ))) => return p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Listening { .. },
-        ))) => return p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected { .. }))) => {
+            return p1::errno::INVAL;
+        }
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening { .. }))) => {
+            return p1::errno::INVAL;
+        }
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(_))) => {
             return p1::errno::NOTSOCK;
         }
         Some(_) => return p1::errno::NOTSOCK,
         None => return p1::errno::BADF,
     };
-    if !family.accepts(address) {
+    if !crate::unix::family_accepts(family, address) {
         return p1::errno::AFNOSUPPORT;
     }
     let Some(service) = caller.data().runtime_state.network_service() else {
@@ -2023,15 +2006,15 @@ where
         Ok(stream) => stream,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
-    let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(slot))) =
+    let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
         caller.data_mut().descriptors.get_mut(fd)
     else {
         return p1::errno::BADF;
     };
     let options = *slot.options();
-    *slot = WasixTcpSocket::Connected {
+    *slot = UnixTcpSocket::Connected {
         family,
-        stream: WasixOwnedTcpStream::new(service.clone(), stream),
+        stream: OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), stream),
         peer_address: address,
         peer_port: port,
         options,
@@ -2113,7 +2096,7 @@ where
         return Ok(status);
     }
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
             socket,
             options,
             ..
@@ -2122,7 +2105,8 @@ where
                 return Ok(p1::errno::NETDOWN);
             };
             let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let timeout = wasix_effective_socket_timeout(options.receive_timeout, fdflags);
+            let timeout =
+                wasix_effective_socket_timeout(options.time(SocketTime::ReceiveTimeout), fdflags);
             let datagram = match service.udp_receive(socket.id(), capacity, timeout).await {
                 Ok(Some(datagram)) => datagram,
                 Ok(None) => return Ok(p1::errno::AGAIN),
@@ -2138,10 +2122,10 @@ where
                 .await?;
             Ok(p1::errno::SUCCESS)
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-            ..
-        }))) => Ok(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound { .. }))) => {
+            Ok(p1::errno::INVAL)
+        }
+        Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => {
             let bytes = caller
                 .data_mut()
                 .read_socket_pair(fd, capacity as usize)
@@ -2153,16 +2137,17 @@ where
             write_wasix_addr_port_async(&memory, ret_addr, None, 0).await?;
             Ok(p1::errno::SUCCESS)
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected {
-                stream, options, ..
-            },
-        ))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            stream,
+            options,
+            ..
+        }))) => {
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return Ok(p1::errno::NETDOWN);
             };
             let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let timeout = wasix_effective_socket_timeout(options.receive_timeout, fdflags);
+            let timeout =
+                wasix_effective_socket_timeout(options.time(SocketTime::ReceiveTimeout), fdflags);
             // The stack copies straight out of its receive queue into the
             // guest's buffers, on this call's own poll, each page checked
             // present in the step that writes it.
@@ -2179,10 +2164,10 @@ where
             memory.write_u16(ret_flags, 0).await?;
             Ok(p1::errno::SUCCESS)
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => Ok(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => Ok(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+            ..
+        }))) => Ok(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Ok(p1::errno::INVAL),
         Some(_) => Ok(p1::errno::NOTSOCK),
         None => Ok(p1::errno::BADF),
     }
@@ -2244,17 +2229,17 @@ where
         return Ok(status);
     }
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(socket))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(socket))) => {
             let (Some(address), port) =
                 wasix_read_addr_port(&memory, GuestAddress::wasm32(addr)).await?
             else {
                 return Ok(p1::errno::INVAL);
             };
             let (socket, send_timeout) = match socket {
-                WasixUdpSocket::Bound {
+                UnixUdpSocket::Bound {
                     socket, options, ..
-                } => (socket.id(), options.send_timeout),
-                WasixUdpSocket::Unbound { options, family } => {
+                } => (socket.id(), options.time(SocketTime::SendTimeout)),
+                UnixUdpSocket::Unbound { options, family } => {
                     let Some(service) = caller.data().runtime_state.network_service() else {
                         return Ok(p1::errno::NETDOWN);
                     };
@@ -2267,26 +2252,29 @@ where
                     {
                         return Ok(p1_errno_from_udp_error(error));
                     }
-                    let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(slot))) =
+                    let Some(Preview1Descriptor::Socket(UnixSocket::Udp(slot))) =
                         caller.data_mut().descriptors.get_mut(fd)
                     else {
                         return Ok(p1::errno::BADF);
                     };
-                    *slot = WasixUdpSocket::Bound {
+                    *slot = UnixUdpSocket::Bound {
                         family,
-                        socket: WasixOwnedUdpSocket::new(service.clone(), binding.socket),
+                        socket: OwnedUdpSocket::new(
+                            crate::UnixNetwork::new(service.clone()),
+                            binding.socket,
+                        ),
                         local_port: binding.local_port,
                         options,
                     };
-                    let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(
-                        WasixUdpSocket::Bound {
-                            socket, options, ..
-                        },
-                    ))) = caller.data().descriptors.get(fd)
+                    let Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
+                        socket,
+                        options,
+                        ..
+                    }))) = caller.data().descriptors.get(fd)
                     else {
                         return Ok(p1::errno::BADF);
                     };
-                    (socket.id(), options.send_timeout)
+                    (socket.id(), options.time(SocketTime::SendTimeout))
                 }
             };
             let Some(service) = caller.data().runtime_state.network_service() else {
@@ -2311,16 +2299,17 @@ where
             memory.write_u32(ret_size, sent).await?;
             Ok(p1::errno::SUCCESS)
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected {
-                stream, options, ..
-            },
-        ))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            stream,
+            options,
+            ..
+        }))) => {
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return Ok(p1::errno::NETDOWN);
             };
             let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
+            let timeout =
+                wasix_effective_socket_timeout(options.time(SocketTime::SendTimeout), fdflags);
             let written = p1_send_gathered(&memory, &mut gather, |chunk| {
                 let (service, stream) = (&service, stream.id());
                 async move {
@@ -2334,11 +2323,11 @@ where
             memory.write_u32(ret_size, written).await?;
             Ok(p1::errno::SUCCESS)
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => Ok(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => Ok(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+            ..
+        }))) => Ok(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Ok(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })) => {
             let fdflags = caller.data().descriptors.fdflags(fd)?;
             let written = p1_send_gathered(&memory, &mut gather, |chunk| {
                 p1_send_to_socketpair(&writer, chunk, fdflags)
@@ -2426,11 +2415,11 @@ where
     let bytes = wasix_read_send_file_range(caller, &file, offset, count).await?;
     let written = u64::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
     match caller.data().descriptors.get(out_fd).cloned() {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected {
-                stream, options, ..
-            },
-        ))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            stream,
+            options,
+            ..
+        }))) => {
             let status = caller
                 .data()
                 .require_socket_authority(WasixSocketAuthority::Tcp);
@@ -2441,14 +2430,15 @@ where
                 return Err(p1::errno::NETDOWN);
             };
             let fdflags = caller.data().descriptors.fdflags(out_fd)?;
-            let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
+            let timeout =
+                wasix_effective_socket_timeout(options.time(SocketTime::SendTimeout), fdflags);
             service
                 .tcp_write_all_bytes(stream.id(), bytes, timeout)
                 .await
                 .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
             Ok(written)
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })) => {
             let fdflags = caller.data().descriptors.fdflags(out_fd)?;
             if p1_fdflags_nonblocking(fdflags) {
                 match writer.try_write(bytes) {
@@ -2657,22 +2647,127 @@ pub(super) async fn wasix_read_optional_timestamp_async(
     }
 }
 
-pub(super) fn wasix_socket_flag_bit(option: i32) -> Result<u32, i32> {
-    match option {
-        WASIX_SOCK_OPTION_REUSE_PORT
-        | WASIX_SOCK_OPTION_REUSE_ADDR
-        | WASIX_SOCK_OPTION_NO_DELAY
-        | WASIX_SOCK_OPTION_DONT_ROUTE
-        | WASIX_SOCK_OPTION_ONLY_V6
-        | WASIX_SOCK_OPTION_BROADCAST
-        | WASIX_SOCK_OPTION_MULTICAST_LOOP_V4
-        | WASIX_SOCK_OPTION_MULTICAST_LOOP_V6
-        | WASIX_SOCK_OPTION_PROMISCUOUS
-        | WASIX_SOCK_OPTION_LISTENING
-        | WASIX_SOCK_OPTION_KEEP_ALIVE
-        | WASIX_SOCK_OPTION_OOB_INLINE => Ok(1_u32 << option),
-        _ => Err(p1::errno::INVAL),
+/// The boolean option a WASIX `sock_option` number names.
+fn wasix_socket_flag_option(option: i32) -> Result<SocketFlag, i32> {
+    Ok(match option {
+        WASIX_SOCK_OPTION_REUSE_PORT => SocketFlag::ReusePort,
+        WASIX_SOCK_OPTION_REUSE_ADDR => SocketFlag::ReuseAddr,
+        WASIX_SOCK_OPTION_NO_DELAY => SocketFlag::NoDelay,
+        WASIX_SOCK_OPTION_DONT_ROUTE => SocketFlag::DontRoute,
+        WASIX_SOCK_OPTION_ONLY_V6 => SocketFlag::OnlyV6,
+        WASIX_SOCK_OPTION_BROADCAST => SocketFlag::Broadcast,
+        WASIX_SOCK_OPTION_MULTICAST_LOOP_V4 => SocketFlag::MulticastLoopV4,
+        WASIX_SOCK_OPTION_MULTICAST_LOOP_V6 => SocketFlag::MulticastLoopV6,
+        WASIX_SOCK_OPTION_PROMISCUOUS => SocketFlag::Promiscuous,
+        WASIX_SOCK_OPTION_LISTENING => SocketFlag::Listening,
+        WASIX_SOCK_OPTION_KEEP_ALIVE => SocketFlag::KeepAlive,
+        WASIX_SOCK_OPTION_OOB_INLINE => SocketFlag::OobInline,
+        _ => return Err(p1::errno::INVAL),
+    })
+}
+
+/// The sized option a WASIX `sock_option` number names. The socket's type
+/// and protocol read back through `sock_get_opt_size` but are not options
+/// a socket records.
+fn wasix_socket_size_option(option: i32) -> Result<SocketSize, i32> {
+    Ok(match option {
+        WASIX_SOCK_OPTION_RECV_BUF_SIZE => SocketSize::ReceiveBuffer,
+        WASIX_SOCK_OPTION_SEND_BUF_SIZE => SocketSize::SendBuffer,
+        WASIX_SOCK_OPTION_RECV_LOWAT => SocketSize::ReceiveLowWater,
+        WASIX_SOCK_OPTION_SEND_LOWAT => SocketSize::SendLowWater,
+        WASIX_SOCK_OPTION_TTL => SocketSize::Ttl,
+        WASIX_SOCK_OPTION_MULTICAST_TTL_V4 => SocketSize::MulticastTtlV4,
+        _ => return Err(p1::errno::INVAL),
+    })
+}
+
+/// The timeout option a WASIX `sock_option` number names.
+fn wasix_socket_time_option(option: i32) -> Result<SocketTime, i32> {
+    Ok(match option {
+        WASIX_SOCK_OPTION_RECV_TIMEOUT => SocketTime::ReceiveTimeout,
+        WASIX_SOCK_OPTION_SEND_TIMEOUT => SocketTime::SendTimeout,
+        WASIX_SOCK_OPTION_CONNECT_TIMEOUT => SocketTime::ConnectTimeout,
+        WASIX_SOCK_OPTION_ACCEPT_TIMEOUT => SocketTime::AcceptTimeout,
+        WASIX_SOCK_OPTION_LINGER => SocketTime::Linger,
+        _ => return Err(p1::errno::INVAL),
+    })
+}
+
+const fn wasix_socket_option_errno(error: SocketOptionError) -> i32 {
+    match error {
+        SocketOptionError::Unsupported => p1::errno::NOTSUP,
+        SocketOptionError::Invalid => p1::errno::INVAL,
     }
+}
+
+const fn wasix_socket_option_status(result: Result<(), SocketOptionError>) -> i32 {
+    match result {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => wasix_socket_option_errno(error),
+    }
+}
+
+/// `sock_set_opt_flag` on a socket, as its errno.
+pub(super) fn wasix_socket_set_flag<Net: ComponentHostNetwork>(
+    socket: &mut UnixSocket<Net>,
+    option: i32,
+    flag: bool,
+) -> i32 {
+    match wasix_socket_flag_option(option) {
+        Ok(option) => wasix_socket_option_status(socket.set_flag(option, flag)),
+        Err(errno) => errno,
+    }
+}
+
+/// `sock_get_opt_flag` on a socket.
+pub(super) fn wasix_socket_flag<Net: ComponentHostNetwork>(
+    socket: &UnixSocket<Net>,
+    option: i32,
+) -> Result<bool, i32> {
+    wasix_socket_flag_option(option).map(|option| socket.options().flag(option))
+}
+
+/// `sock_set_opt_size` on a socket's recorded options, as its errno.
+pub(super) fn wasix_socket_set_size<Net: ComponentHostNetwork>(
+    socket: &mut UnixSocket<Net>,
+    option: i32,
+    size: u64,
+) -> i32 {
+    match wasix_socket_size_option(option) {
+        Ok(option) => wasix_socket_option_status(socket.set_size(option, size)),
+        Err(errno) => errno,
+    }
+}
+
+/// A sized option a socket records.
+pub(super) fn wasix_socket_size<Net: ComponentHostNetwork>(
+    socket: &UnixSocket<Net>,
+    option: i32,
+) -> Result<u64, i32> {
+    wasix_socket_size_option(option).map(|option| socket.options().size(option))
+}
+
+/// `sock_set_opt_time` on a socket, as its errno.
+pub(super) fn wasix_socket_set_time<Net: ComponentHostNetwork>(
+    socket: &mut UnixSocket<Net>,
+    option: i32,
+    time: Option<u64>,
+) -> i32 {
+    match wasix_socket_time_option(option) {
+        Ok(option) => {
+            socket.set_time(option, time);
+            p1::errno::SUCCESS
+        }
+        Err(errno) => errno,
+    }
+}
+
+/// `sock_get_opt_time` on a socket.
+pub(super) fn wasix_socket_time<Net: ComponentHostNetwork>(
+    socket: &UnixSocket<Net>,
+    option: i32,
+) -> Result<Option<u64>, i32> {
+    wasix_socket_time_option(option).map(|option| socket.options().time(option))
 }
 
 pub(super) fn p1_write_wasix_bool<T>(

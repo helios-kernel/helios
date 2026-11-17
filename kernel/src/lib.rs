@@ -2038,3 +2038,5 @@ mod tests {
 
 #[cfg(feature = "unix")]
 mod unix;
+#[cfg(feature = "unix")]
+pub(crate) use unix::UnixNetwork;

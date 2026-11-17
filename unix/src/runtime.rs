@@ -30,3 +30,6 @@ pub use open_file::*;
 
 mod resource;
 pub use resource::*;
+
+mod socket;
+pub use socket::*;
