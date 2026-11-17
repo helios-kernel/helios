@@ -2607,7 +2607,14 @@ jobs:
     name: smoke-x86-64-venus
     needs: [changes, wasm-debug]
     if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-venus')
-    runs-on: ubuntu-24.04
+    # QEMU's display reads the guest's scanout blob through llvmpipe on
+    # vgem, which maps an imported dma-buf only from Mesa 25.3 on
+    # (kms-dri-sw `create_mapped`); 24.04 ships 25.2. The image names the
+    # cached QEMU and virglrenderer builds, which link its libraries.
+    strategy:
+      matrix:
+        image: [ubuntu-26.04]
+    runs-on: ${{ matrix.image }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -2679,7 +2686,7 @@ jobs:
         uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.VIRGL_PREFIX }}
-          key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
+          key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
       - name: Build the pinned virglrenderer
         if: steps.virgl-cache.outputs.cache-hit != 'true'
         run: |
@@ -2700,7 +2707,7 @@ jobs:
           path: ${{ env.QEMU_PREFIX }}
           # QEMU links the virglrenderer above, so its key carries that
           # build's too.
-          key: qemu-venus-${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
+          key: qemu-venus-${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
       - name: Build the pinned QEMU
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         env:
