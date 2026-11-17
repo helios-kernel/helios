@@ -20,7 +20,7 @@ use core::convert::Infallible;
 use bytes::Bytes;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags, WritePosition,
+    NodeKind, OpenFlags, RenameMode, WritePosition,
 };
 use triomphe::Arc;
 
@@ -449,7 +449,7 @@ impl FileSystem for BootFs {
         Err(FsError::ReadOnly)
     }
 
-    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: RenameMode, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 

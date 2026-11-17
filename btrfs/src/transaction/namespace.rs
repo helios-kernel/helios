@@ -3,6 +3,7 @@
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
+use helios_hal::fs::RenameMode;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
@@ -82,7 +83,7 @@ fn entry_type(kind: FileKind) -> u8 {
 }
 
 impl<S: BlockSink> Transaction<'_, S> {
-    pub(super) async fn inode_item(
+    pub(crate) async fn inode_item(
         &self,
         tree: u64,
         inode: u64,
@@ -156,6 +157,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         when: Timestamp,
     ) -> Result<u64, WriteError> {
         validate_name(name.bytes)?;
+        super::ownership::refuse_set_id(attributes.mode)?;
         let tree = name.tree;
         let next = if let Some(last) = self.inode_high_water.get(&tree) {
             last.checked_add(1)
@@ -261,6 +263,7 @@ impl<S: BlockSink> Transaction<'_, S> {
         &mut self,
         source: Name<'_>,
         destination: Name<'_>,
+        mode: RenameMode,
         when: Timestamp,
     ) -> Result<(), WriteError> {
         if source.tree != destination.tree {
@@ -274,6 +277,26 @@ impl<S: BlockSink> Transaction<'_, S> {
                 parent: source.parent,
             })?;
         let existing = self.lookup_entry(destination).await?;
+        match (mode, existing) {
+            (RenameMode::NoReplace, Some(_)) => {
+                return Err(WriteError::Exists {
+                    tree: destination.tree,
+                    parent: destination.parent,
+                });
+            }
+            (RenameMode::Exchange, None) => {
+                return Err(WriteError::NoEntry {
+                    tree: destination.tree,
+                    parent: destination.parent,
+                });
+            }
+            (RenameMode::Exchange, Some(other)) => {
+                return self
+                    .exchange(source, (inode, kind), destination, other, when)
+                    .await;
+            }
+            (RenameMode::Replace | RenameMode::NoReplace, _) => {}
+        }
         if existing.is_some_and(|(other, _)| other == inode) {
             return Ok(());
         }
@@ -296,6 +319,193 @@ impl<S: BlockSink> Transaction<'_, S> {
         let (raw, _) = self.inode_item(source.tree, inode).await?;
         self.attach(destination, inode, raw, kind, when).await?;
         self.detach_name(source, when).await
+    }
+
+    /// Swaps what two existing names refer to. Each name keeps its place in
+    /// its directory, its directory index and its length, so no directory
+    /// grows or shrinks and no link count changes; the entries now point at
+    /// the other inode and the two inodes' back-references trade parents,
+    /// which is all a directory's `..` is in btrfs.
+    async fn exchange(
+        &mut self,
+        first: Name<'_>,
+        (first_inode, first_kind): (u64, FileKind),
+        second: Name<'_>,
+        (second_inode, second_kind): (u64, FileKind),
+        when: Timestamp,
+    ) -> Result<(), WriteError> {
+        if first_inode == second_inode {
+            return Ok(());
+        }
+        let tree = first.tree;
+        // Each directory must land outside itself.
+        if first_kind == FileKind::Directory {
+            self.check_directory_move(tree, first_inode, second.parent)
+                .await?;
+        }
+        if second_kind == FileKind::Directory {
+            self.check_directory_move(tree, second_inode, first.parent)
+                .await?;
+        }
+        for parent in [first.parent, second.parent] {
+            let (_, metadata) = self.inode_item(tree, parent).await?;
+            check_flags(tree, parent, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
+        }
+        for inode in [first_inode, second_inode] {
+            let (_, metadata) = self.inode_item(tree, inode).await?;
+            check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
+        }
+        let (first_key, first_index, first_rest) = self
+            .without_reference(tree, first.parent, first_inode, first.bytes)
+            .await?;
+        self.put_item(
+            tree,
+            first_key,
+            (!first_rest.is_empty()).then_some(&first_rest),
+        )
+        .await?;
+        let (second_key, second_index, second_rest) = self
+            .without_reference(tree, second.parent, second_inode, second.bytes)
+            .await?;
+        self.put_item(
+            tree,
+            second_key,
+            (!second_rest.is_empty()).then_some(&second_rest),
+        )
+        .await?;
+        let (key, bytes) = self
+            .new_reference(tree, second.parent, first_inode, second_index, second.bytes)
+            .await?;
+        self.put_item(tree, key, Some(&bytes)).await?;
+        let (key, bytes) = self
+            .new_reference(tree, first.parent, second_inode, first_index, first.bytes)
+            .await?;
+        self.put_item(tree, key, Some(&bytes)).await?;
+        self.retarget(first, first_index, first_inode, second_inode, second_kind)
+            .await?;
+        self.retarget(second, second_index, second_inode, first_inode, first_kind)
+            .await?;
+        let timestamp = time(tree, first.parent, when)?;
+        let parents = if first.parent == second.parent {
+            &[first.parent][..]
+        } else {
+            &[first.parent, second.parent][..]
+        };
+        for (inode, directory) in parents
+            .iter()
+            .map(|parent| (*parent, true))
+            .chain([(first_inode, false), (second_inode, false)])
+        {
+            let (mut raw, _) = self.inode_item(tree, inode).await?;
+            raw.transid.set(self.trees.generation());
+            raw.sequence.set(raw.sequence.get().wrapping_add(1));
+            raw.ctime = timestamp;
+            if directory {
+                raw.mtime = timestamp;
+            }
+            self.put_inode(tree, inode, raw).await?;
+        }
+        Ok(())
+    }
+
+    async fn put_item(
+        &mut self,
+        tree: u64,
+        key: Key,
+        value: Option<&Vec<u8>>,
+    ) -> Result<(), WriteError> {
+        let root = self.roots.get(tree)?;
+        let root = self
+            .trees
+            .apply(
+                &self.volume,
+                root,
+                key,
+                value.map(Vec::as_slice),
+                &mut self.space,
+            )
+            .await?;
+        self.roots.set(root)
+    }
+
+    /// Makes the existing entry `name`, which sits at directory index
+    /// `index` and refers to `from`, refer to `inode` of `kind` instead.
+    async fn retarget(
+        &mut self,
+        name: Name<'_>,
+        index: u64,
+        from: u64,
+        inode: u64,
+        kind: FileKind,
+    ) -> Result<(), WriteError> {
+        let Name {
+            tree,
+            parent,
+            bytes: name,
+        } = name;
+        let root = self.roots.get(tree)?;
+        let hash_key = Key::new(parent, item_type::DIR_ITEM, name_hash(name));
+        let mismatch = WriteError::NamespaceMismatch {
+            tree,
+            key: hash_key,
+        };
+        let mut names = self
+            .trees
+            .get(&self.volume, root, hash_key)
+            .await?
+            .ok_or(mismatch)?;
+        let mut position = 0;
+        let mut found = None;
+        for record in dir_records(&names, RecordKind::Entry) {
+            let record = record.map_err(|defect| Error::Item {
+                tree,
+                key: hash_key,
+                defect,
+            })?;
+            if record.name == name {
+                found = Some((position, record.location.objectid));
+                break;
+            }
+            position += size_of::<RawDirItem>() + record.name.len();
+        }
+        let (position, current) = found.ok_or(WriteError::NamespaceMismatch {
+            tree,
+            key: hash_key,
+        })?;
+        let index_key = Key::new(parent, item_type::DIR_INDEX, index);
+        let mut indexed = self.trees.get(&self.volume, root, index_key).await?.ok_or(
+            WriteError::NamespaceMismatch {
+                tree,
+                key: index_key,
+            },
+        )?;
+        let record = dir_index_record(&indexed).map_err(|defect| Error::Item {
+            tree,
+            key: index_key,
+            defect,
+        })?;
+        if current != from || record.name != name || record.location.objectid != from {
+            return Err(WriteError::NamespaceMismatch {
+                tree,
+                key: index_key,
+            });
+        }
+        let generation = self.trees.generation();
+        let point = |bytes: &mut [u8]| {
+            let mut head = *view::<RawDirItem>(bytes).expect("validated record");
+            head.location = RawKey {
+                objectid: inode.into(),
+                item_type: item_type::INODE_ITEM,
+                offset: 0.into(),
+            };
+            head.entry_type = entry_type(kind);
+            head.transid.set(generation);
+            bytes[..size_of::<RawDirItem>()].copy_from_slice(head.as_bytes());
+        };
+        point(&mut names[position..]);
+        point(&mut indexed);
+        self.put_item(tree, hash_key, Some(&names)).await?;
+        self.put_item(tree, index_key, Some(&indexed)).await
     }
 
     async fn check_directory_move(

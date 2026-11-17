@@ -694,4 +694,6 @@ async fn default_subvolume<S: BlockSource>(
 }
 
 #[cfg(all(test, feature = "write"))]
+mod rename_tests;
+#[cfg(all(test, feature = "write"))]
 mod write_tests;

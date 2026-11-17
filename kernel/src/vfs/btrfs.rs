@@ -17,7 +17,7 @@ use helios_btrfs::{
 };
 use helios_hal::fs::{
     BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult,
-    Metadata, NodeId, NodeKind, OpenFlags, WritePosition,
+    Metadata, NodeId, NodeKind, OpenFlags, RenameMode, WritePosition,
 };
 use helios_hal::io::{IoError, IoResult};
 use triomphe::Arc;
@@ -485,12 +485,19 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         self.mutate(path, now, Operation::Remove { directory: false })
             .await
     }
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
         self.mutate(
             source,
             now,
             Operation::Rename {
                 destination: String::from(destination.as_str()),
+                mode,
             },
         )
         .await

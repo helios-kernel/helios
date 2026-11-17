@@ -31,7 +31,7 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeId,
-    NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, WritePosition, WriteProgress,
+    NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 use spin::Mutex;
 use triomphe::Arc;
@@ -234,10 +234,15 @@ impl MemoryFs {
 
     /// Renames as [`FileSystem::rename`] does, then records a whiteout at
     /// `source` when `whiteout`, so the layer below stays hidden there.
+    /// An exchange leaves both names in place and so records no whiteout.
+    ///
+    /// The whole change happens under the tree's lock, so it is atomic to
+    /// every reader.
     pub(super) fn rename_over(
         &self,
         source: FsPath<'_>,
         destination: FsPath<'_>,
+        mode: RenameMode,
         now: u64,
         whiteout: bool,
     ) -> FsResult<()> {
@@ -246,8 +251,15 @@ impl MemoryFs {
         }
         let mut state = self.state.lock();
         let (_, inode) = state.inode(source)?;
+        if mode == RenameMode::Exchange {
+            debug_assert!(!whiteout, "an exchange hides nothing");
+            return state.exchange(source, destination, now);
+        }
         if source == destination {
-            return Ok(());
+            return match mode {
+                RenameMode::NoReplace => Err(FsError::Exists),
+                RenameMode::Replace | RenameMode::Exchange => Ok(()),
+            };
         }
         if inode.kind == NodeKind::Directory && destination.starts_with(source) {
             return Err(FsError::NotPermitted);
@@ -262,14 +274,7 @@ impl MemoryFs {
                         .map(|(name, number)| (name.clone(), *number)),
                 )
                 .collect();
-        let renamed = |name: &str| {
-            let mut renamed = String::with_capacity(
-                destination.as_str().len() + name.len() - source.as_str().len(),
-            );
-            renamed.push_str(destination.as_str());
-            renamed.push_str(&name[source.as_str().len()..]);
-            renamed
-        };
+        let renamed = |name: &str| rebase(name, source, destination);
         for (name, number) in moved {
             state.names.remove(&name);
             state.names.insert(renamed(&name), number);
@@ -291,7 +296,82 @@ impl MemoryFs {
     }
 }
 
+/// `name`, which is `from` or lies below it, moved to the same place
+/// below `to`.
+fn rebase(name: &str, from: FsPath<'_>, to: FsPath<'_>) -> String {
+    let mut rebased = String::with_capacity(to.as_str().len() + name.len() - from.as_str().len());
+    rebased.push_str(to.as_str());
+    rebased.push_str(&name[from.as_str().len()..]);
+    rebased
+}
+
 impl MemoryState {
+    /// Swaps the objects at `first` and `second`, each with whatever lies
+    /// below it. Two names of one object stay as they are, and a directory
+    /// with the other name below it is [`FsError::Invalid`].
+    fn exchange(&mut self, first: FsPath<'_>, second: FsPath<'_>, now: u64) -> FsResult<()> {
+        let (first_number, first_kind) = {
+            let (number, inode) = self.inode(first)?;
+            (number, inode.kind)
+        };
+        let (second_number, second_kind) = {
+            let (number, inode) = self.inode(second)?;
+            (number, inode.kind)
+        };
+        if first_number == second_number {
+            return Ok(());
+        }
+        if (first_kind == NodeKind::Directory && second.starts_with(first))
+            || (second_kind == NodeKind::Directory && first.starts_with(second))
+        {
+            return Err(FsError::Invalid);
+        }
+        let subtree = |state: &Self, path: FsPath<'_>, number: u64| -> Vec<(String, u64)> {
+            core::iter::once((path.as_str().to_string(), number))
+                .chain(
+                    state
+                        .descendants(path)
+                        .map(|(name, number)| (name.clone(), *number)),
+                )
+                .collect()
+        };
+        let first_names = subtree(self, first, first_number);
+        let second_names = subtree(self, second, second_number);
+        let first_whiteouts = self.whiteouts_below(first);
+        let second_whiteouts = self.whiteouts_below(second);
+        for (name, _) in first_names.iter().chain(&second_names) {
+            self.names.remove(name);
+        }
+        for name in first_whiteouts.iter().chain(&second_whiteouts) {
+            self.whiteouts.remove(name);
+        }
+        for (name, number) in first_names {
+            self.names.insert(rebase(&name, first, second), number);
+        }
+        for (name, number) in second_names {
+            self.names.insert(rebase(&name, second, first), number);
+        }
+        for name in first_whiteouts {
+            self.whiteouts.insert(rebase(&name, first, second));
+        }
+        for name in second_whiteouts {
+            self.whiteouts.insert(rebase(&name, second, first));
+        }
+        for number in [first_number, second_number] {
+            self.inodes
+                .get_mut(&number)
+                .expect("every name refers to a live inode")
+                .status_nanos = now;
+        }
+        for path in [first, second] {
+            let (parent, _) = path.split_last().expect("the root was rejected");
+            let parent = self.inode_mut(parent)?;
+            parent.modified_nanos = now;
+            parent.status_nanos = now;
+        }
+        Ok(())
+    }
+
     fn inode_of(&self, path: FsPath<'_>) -> FsResult<u64> {
         if path.is_root() {
             return Ok(ROOT_INODE);
@@ -712,8 +792,14 @@ impl FileSystem for MemoryFs {
         self.remove(path, false, false, now)
     }
 
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
-        self.rename_over(source, destination, now, false)
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
+        self.rename_over(source, destination, mode, now, false)
     }
 
     async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -776,7 +862,7 @@ mod tests {
     use futures_lite::future::block_on;
     use helios_hal::fs::{
         DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind, OpenFlags,
-        PreparedWrite, WritePosition, WriteProgress,
+        PreparedWrite, RenameMode, WritePosition, WriteProgress,
     };
 
     use super::MemoryFs;
@@ -981,6 +1067,71 @@ mod tests {
     }
 
     #[test]
+    fn rename_noreplace_refuses_any_destination_and_exchange_needs_both() {
+        let fs = tree();
+        block_on(fs.create_directory(path("d"), 0)).expect("creates");
+        block_on(fs.open(path("f"), OpenFlags::CREATE, 0)).expect("creates");
+        for (source, destination) in [("d", "f"), ("f", "d"), ("f", "f")] {
+            assert_eq!(
+                block_on(fs.rename(path(source), path(destination), RenameMode::NoReplace, 1)),
+                Err(FsError::Exists),
+                "{source} over {destination}"
+            );
+        }
+        assert_eq!(
+            block_on(fs.rename(path("none"), path("f"), RenameMode::NoReplace, 1)),
+            Err(FsError::NoEntry)
+        );
+        block_on(fs.rename(path("f"), path("g"), RenameMode::NoReplace, 1)).expect("renames");
+        assert_eq!(names(&fs, ""), ["d", "g"]);
+        for (source, destination) in [("g", "none"), ("none", "g"), ("none", "never")] {
+            assert_eq!(
+                block_on(fs.rename(path(source), path(destination), RenameMode::Exchange, 1)),
+                Err(FsError::NoEntry),
+                "{source} with {destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_exchange_swaps_subtrees_and_refuses_an_ancestor() {
+        let fs = tree();
+        block_on(fs.create_directory(path("a"), 0)).expect("creates");
+        block_on(fs.open(path("a/inner"), OpenFlags::CREATE, 0)).expect("creates");
+        block_on(fs.create_directory(path("b"), 0)).expect("creates");
+        block_on(fs.create_directory(path("b/deeper"), 0)).expect("creates");
+        block_on(fs.open(path("b/deeper/leaf"), OpenFlags::CREATE, 0)).expect("creates");
+        block_on(fs.open(path("file"), OpenFlags::CREATE, 0)).expect("creates");
+        let identity = |name: &str| block_on(fs.stat(path(name))).expect("stats").id;
+        let (a, b, file) = (identity("a"), identity("b"), identity("file"));
+        assert_eq!(
+            block_on(fs.rename(path("a"), path("a/inner"), RenameMode::Exchange, 1)),
+            Err(FsError::Invalid)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("b/deeper"), path("b"), RenameMode::Exchange, 1)),
+            Err(FsError::Invalid)
+        );
+        block_on(fs.rename(path("a"), path("b"), RenameMode::Exchange, 2)).expect("exchanges");
+        assert_eq!((identity("a"), identity("b")), (b, a));
+        assert_eq!(names(&fs, "a"), ["deeper"]);
+        assert_eq!(names(&fs, "a/deeper"), ["leaf"]);
+        assert_eq!(names(&fs, "b"), ["inner"]);
+        // A file against a directory, and an object against itself.
+        block_on(fs.rename(path("file"), path("a/deeper"), RenameMode::Exchange, 3))
+            .expect("exchanges");
+        assert_eq!(names(&fs, "file"), ["leaf"]);
+        assert_eq!(
+            block_on(fs.stat(path("a/deeper"))).expect("stats").kind,
+            NodeKind::File
+        );
+        assert_eq!(identity("a/deeper"), file);
+        block_on(fs.rename(path("b"), path("b"), RenameMode::Exchange, 4)).expect("a no-op");
+        assert_eq!(names(&fs, "b"), ["inner"]);
+        assert_eq!(names(&fs, ""), ["a", "b", "file"]);
+    }
+
+    #[test]
     fn rename_moves_a_subtree_and_refuses_moving_into_itself() {
         let fs = tree();
         block_on(fs.create_directory(path("d"), 0)).expect("creates");
@@ -989,10 +1140,10 @@ mod tests {
         // Sorts between `d` and `d/f`.
         block_on(fs.open(path("d.x"), OpenFlags::CREATE, 0)).expect("creates");
         assert_eq!(
-            block_on(fs.rename(path("d"), path("d/inner"), 1)),
+            block_on(fs.rename(path("d"), path("d/inner"), RenameMode::Replace, 1)),
             Err(FsError::NotPermitted)
         );
-        block_on(fs.rename(path("d"), path("e"), 1)).expect("renames");
+        block_on(fs.rename(path("d"), path("e"), RenameMode::Replace, 1)).expect("renames");
         assert_eq!(names(&fs, ""), ["d.x", "dx", "e"]);
         assert_eq!(names(&fs, "e"), ["f"]);
         assert_eq!(

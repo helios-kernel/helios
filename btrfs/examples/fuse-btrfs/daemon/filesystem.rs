@@ -7,10 +7,12 @@
 //! Operations the writer has no API for answer the errno of a filesystem that
 //! lacks the feature, and nothing else:
 //!
-//! - `setattr` changing the mode, owner or flags: `EOPNOTSUPP`
+//! - `setattr` changing the file flags: `EOPNOTSUPP`
+//! - `setattr` or a creation giving a non-directory S_ISUID or S_ISGID: `EPERM`
 //! - `mknod` of anything but a regular file: `EPERM`
 //! - `setxattr`, `removexattr`, `fallocate`: `EOPNOTSUPP`
-//! - `rename` with `RENAME_NOREPLACE`, `RENAME_EXCHANGE` or `RENAME_WHITEOUT`: `EINVAL`
+//! - `rename` with `RENAME_WHITEOUT`, or with both `RENAME_NOREPLACE` and
+//!   `RENAME_EXCHANGE`: `EINVAL`
 //!
 //! Left to fuser's default of `ENOSYS`: `access`, `bmap`, `ioctl`, `poll`,
 //! `getlk`, `setlk`, `lseek` and `copy_file_range`.
@@ -26,8 +28,9 @@ use fuser::{
 };
 use futures_lite::future::block_on;
 use helios_btrfs::Timestamp;
+use helios_hal::fs::RenameMode;
 
-use super::state::{Node, Owner, State, target_bytes, timestamp};
+use super::state::{Node, Owner, Setattr, State, target_bytes, timestamp};
 
 /// Attributes and entries are never cached: every change is made through this
 /// daemon, and the kernel revalidating on each use keeps a reply the same as
@@ -103,10 +106,18 @@ impl Filesystem for Daemon {
         flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        if mode.is_some() || uid.is_some() || gid.is_some() || flags.is_some() {
+        if flags.is_some() {
             return reply.error(Errno::EOPNOTSUPP);
         }
-        match self.run(|state| block_on(state.setattr(ino, size, atime, mtime, now()))) {
+        let change = Setattr {
+            mode,
+            uid,
+            gid,
+            size,
+            access: atime,
+            modified: mtime,
+        };
+        match self.run(|state| block_on(state.setattr(ino, change, now()))) {
             Ok(attr) => reply.attr(&TTL, &attr),
             Err(errno) => reply.error(errno),
         }
@@ -242,11 +253,20 @@ impl Filesystem for Daemon {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        if !flags.is_empty() {
+        // Both flags together, `RENAME_WHITEOUT` (a whiteout is a device
+        // node, which the writer cannot create) and unknown bits are `EINVAL`
+        // as on Linux.
+        let mode = if flags.is_empty() {
+            RenameMode::Replace
+        } else if flags == RenameFlags::RENAME_NOREPLACE {
+            RenameMode::NoReplace
+        } else if flags == RenameFlags::RENAME_EXCHANGE {
+            RenameMode::Exchange
+        } else {
             return reply.error(Errno::EINVAL);
-        }
+        };
         finish(
-            self.run(|state| block_on(state.rename(parent, name, newparent, newname, now()))),
+            self.run(|state| block_on(state.rename(parent, name, newparent, newname, mode, now()))),
             reply,
         );
     }

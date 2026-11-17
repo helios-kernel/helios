@@ -6,6 +6,7 @@ use alloc::sync::Arc;
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
+use helios_hal::fs::RenameMode;
 
 use super::{Filesystem, find_root};
 use crate::accounting::Allocation;
@@ -415,6 +416,47 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         Ok(())
     }
 
+    /// Replaces the permission bits (`07777`, with the set-id bits refused on
+    /// a non-directory with [`WriteError::SetId`]) and stamps `changed`.
+    pub async fn set_permissions(
+        &mut self,
+        file: &InodeHandle,
+        permissions: u32,
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self).await?;
+        operation.checked(file).await?;
+        let file = file.id;
+        operation.inner.roots.check_writable(file.tree)?;
+        operation
+            .inner
+            .set_permissions(file.tree, file.inode, permissions, changed)
+            .await?;
+        operation.accept();
+        Ok(())
+    }
+
+    /// Changes the owner and the group, each left as it is when `None`, and
+    /// stamps `changed`. A non-directory loses its set-id bits.
+    pub async fn set_owner(
+        &mut self,
+        file: &InodeHandle,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self).await?;
+        operation.checked(file).await?;
+        let file = file.id;
+        operation.inner.roots.check_writable(file.tree)?;
+        operation
+            .inner
+            .set_owner(file.tree, file.inode, uid, gid, changed)
+            .await?;
+        operation.accept();
+        Ok(())
+    }
+
     pub async fn create_file(
         &mut self,
         name: Name<'_>,
@@ -500,6 +542,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         &mut self,
         source: Name<'_>,
         destination: Name<'_>,
+        mode: RenameMode,
         when: Timestamp,
     ) -> Result<(), WriteError> {
         let mut operation = Mutation::new(self).await?;
@@ -507,7 +550,10 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         let destination = operation.entry_name(destination).await?;
         operation.inner.roots.check_writable(source.tree)?;
         operation.inner.roots.check_writable(destination.tree)?;
-        operation.inner.rename(source, destination, when).await?;
+        operation
+            .inner
+            .rename(source, destination, mode, when)
+            .await?;
         operation.accept();
         Ok(())
     }

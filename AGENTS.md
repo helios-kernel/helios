@@ -21,8 +21,8 @@ never depends on anything above it.
 | Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/`, `firmware/`, `btrfs/`, `sync/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; `firmware/` turns the platform description a backend hands it (the device tree's NUMA properties, the ACPI SRAT and SLIT) into `hal/` values; `sync/` holds the async primitives the kernel and the compatibility layers share and depends on none of the others; the other six depend on `hal/`, and none depends on the kernel. |
 | Compatibility layers | `unix/`, `linux/` | `#![no_std]` services the non-Preview-3 ABIs share (`unix/`) and the Linux ABI (`linux/`), each behind a kernel feature that is off by default. Both build on `hal/` and `sync/`; neither depends on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
-| Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
-| Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
+| Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service, and, behind the `linux` feature, the native Linux process host. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
+| Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport, SMP wiring and native user execution, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
 | Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
 | User space | `api/`, `api-macro/`, `programs/*`, `venus/` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. `venus/` is the Venus wire protocol a program's GPU driver links: the hand-written sinks and the encoders generated at build time. |
 | Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `compiler-host/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `workspace-root/` finds the workspace and holds the root key file format those two share. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. `compiler-host/` runs the compiler plugin under Wasmtime on Linux, the bench's Linux + Wasmtime column of `aot-curl`. |
@@ -77,6 +77,9 @@ maintainer's decision and the fork's revision moves once, per §1.
   through `Kernel<CpuImpl>`, `RuntimeState<…>` and similar structures.
 - A system capability is a Rust trait first and a WASI/WIT interface second.
   Define the trait, then expose it.
+- An optional subsystem is a cargo feature that is off by default, and a
+  build without it compiles none of its code. The Linux subsystem is the
+  `linux` feature.
 - The kernel exposes one async-first API, its resources, services and
   capability checks, and every guest ABI is an adapter over it: WASI
   Preview 3, WASIX and the Linux subsystem. An adapter translates arguments,
@@ -108,8 +111,9 @@ maintainer's decision and the fork's revision moves once, per §1.
 - Kernel memory and user memory are separate ownership domains. The kernel is
   as close to zero-allocation as practical and, when it must allocate, uses
   kernel-owned pools; kernel OOM is fatal and panics. User-mode wasm
-  instances, kernel plugins included, use user-memory allocation and
-  accounting; user OOM kills the instance and reclaims its pool, and never
+  instances, kernel plugins included, and native Linux processes use
+  user-memory allocation and accounting; user OOM kills the instance or
+  process and reclaims its pool, and never
   grows a kernel budget or adds per-plugin policy.
 - A buffer the device handed up belongs to the driver and is on loan for one
   receive pass. Nothing the stack queues (an out-of-order TCP segment, an
@@ -342,14 +346,45 @@ and never comes from CI.
   happen it is for alignment, never for permission to land a degraded
   variant.
 
-### 3.8 Native Linux processes
+### 3.8 Linux subsystem
 
-- A Linux process is bound by the kernel's permission model exactly as a
-  wasm program is: it holds the `ProcessAuthority` its parent grants, every
-  syscall that reaches a resource derives the capability the matching WASI
-  or WASIX operation derives, and a missing right fails with Linux's errno.
-  Linux user, group and capability identities are reported values, never
-  authority.
+- The Linux subsystem runs unmodified Linux programs natively on x86-64 and
+  aarch64, an important optional feature of Helios. Its goal is the Linux
+  UAPI in full, and its support is measured by the conformance suite (§7),
+  never by counting syscalls.
+- Native execution is a `hal/` contract each backend implements. Linux ABI
+  decoding lives in `linux/`, never in a backend or the kernel core. Each
+  implemented behaviour cites the Linux source or manual it follows, and a
+  divergence from Linux is a defect.
+- Every Linux process lives in a container, and its children stay in it. A
+  container is the Linux system its processes see: its root and mounts, its
+  process IDs, its users and groups, its hostname, all constructed by the
+  kernel. It holds the `ProcessAuthority` it was created with, which is the
+  ceiling of everything its processes can reach. Processes in different
+  containers see nothing of each other.
+- Inside a container, Linux's own permission model (users and groups, file
+  modes, capabilities, setuid) applies as Linux defines it and only narrows
+  the container's authority, never widens it: a process running as uid 0
+  holds no more than its container was granted. Every syscall that reaches
+  a resource derives the capability the matching WASI or WASIX operation
+  derives, and a missing right fails with Linux's errno.
+- A filesystem reaches a program only through an explicit mount, and the
+  rights the mount grants are all a WASI or WASIX program holds on it:
+  neither sees ownership, modes or ACLs. A container's mounts are the same
+  explicit mounts, and their rights bound everything the container's
+  processes can do on them. A mount is granted as private or as shared,
+  and that never changes while it exists. A private mount belongs to one
+  container, and within its bound the kernel enforces the ownership,
+  modes, ACLs, setuid bits and file capabilities a Unix filesystem stores,
+  as Linux does. A shared mount may be granted to several containers and
+  to WASI programs at once, and in each container it behaves as it does
+  for WASI: every node appears owned by the identity the container's
+  configuration names, its modes follow the mount's rights, and it is
+  nosuid and nodev with file capabilities ignored. A node a non-Linux
+  program creates, or any program creates on a shared mount, takes its
+  owner and group from its parent directory, and its mode from the
+  parent's, with the execute bits cleared for a regular file; no mount or
+  WASI interface carries a user or group.
 - Native execution runs only with the hardware protections its contract
   states (kernel-mode execute and access protection of user pages, a
   processor unaffected by rogue data cache load) and refuses to start where
@@ -430,6 +465,9 @@ does.
   re-established from the run's artifacts (the console log, the counter
   lines, the QEMU and gdbstub state) before any code changes, and a PR that
   fixes a different mechanism than the issue named says so.
+- `vm --kernel-feature linux --bootfs-root <dir>` boots a kernel with the
+  Linux subsystem and a boot root holding Linux programs;
+  `linux/tests/build-fixtures.sh` builds that root.
 - Inspector and guest communicate through the WIT RPC defined in
   `helios-inspector-protocol`, never through a side channel.
 
@@ -443,6 +481,10 @@ does.
   stub does not return.
 - `docs/wasi-tools.md` describes the reproducible workflow; a change to
   runtime behaviour updates the docs and the paths in the same change.
+- `linux/tests/build-fixtures.sh` builds the static musl Linux fixtures for
+  x86-64 or aarch64 and, on a Linux host of that architecture, runs them
+  there first. A fixture records the Linux behaviour it expects and where
+  that comes from.
 
 ## 7. Checks and CI
 
@@ -474,7 +516,7 @@ just test-units
 `just lint` is `tools/fmt.sh --check`, `cargo deny --workspace check bans`
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
-`just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `firmware`, `kernel`,
+`just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `firmware`, `sync`, `unix`, `linux`, `kernel`,
 `inspector-protocol` and `workspace-root` unit tests, every `btrfs` and `hosted` test,
 and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
@@ -491,10 +533,10 @@ red lane names the surface that broke:
 | `check-host` | `ubuntu-24.04` | The host surfaces compile. |
 | `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
 | `test-kernel`, `test-libraries`, `test-host-tools`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests, the btrfs reader against `mkfs.btrfs` images, and the embedded debugger. |
-| `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot on one node and on two NUMA nodes, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures; under `swtpm`, the kernel's signing key kept across two boots, resealed after a changed payload, and a tampered payload refused. |
+| `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot on one node and on two NUMA nodes, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures; under `swtpm`, the kernel's signing key kept across two boots, resealed after a changed payload, and a tampered payload refused; static Linux programs through dash, checked against the same programs run natively on the runner. |
 | `smoke-x86-64-venus` | `ubuntu-24.04`, `--accel kvm` | `gpu-test` on a Venus `virtio-gpu-gl` device rendered through lavapipe: a virgl context's fence, host and guest blobs, two instances at once. It runs only on changes to the 3D path, against a pinned QEMU and virglrenderer it builds and caches. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, a two-node NUMA boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
-| `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, each on one node and on two NUMA nodes; under `swtpm`, the kernel's signing key kept across two ACPI boots, resealed after a changed payload, changed state detected across device-tree boots, and a tampered payload refused. Runs against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
+| `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, each on one node and on two NUMA nodes; under `swtpm`, the kernel's signing key kept across two ACPI boots, resealed after a changed payload, changed state detected across device-tree boots, and a tampered payload refused; static Linux programs through dash, checked against the same programs run natively on the runner. Runs against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
 | `bench-x86-64-linux` | `ubuntu-24.04`, `--accel kvm`, multi-queue tap | The workload benchmarks of §3.6, with the negotiated virtio-net features reported. |
 
 All smoke suites, the benchmark lanes and kernel-profile collection run
@@ -507,10 +549,13 @@ A pull request runs only non-heavy lanes whose surfaces its change touches
 marked ready for review. Compile, lint and test lanes keep a Rust cache,
 written only by a `dev` push. Other shared caches are written only from
 the default branch. Guest wasm is built once per profile and reused by
-every test and smoke lane that runs a kernel prebuild. Consumers start
-only after their wasm profile is ready; compile and lint remain independent.
+every test and smoke lane that runs a kernel prebuild. A consumer compiles
+its tests while the wasm builds and runs them once its profile is ready.
 The CI result job requires every selected lane to succeed. Every job run by
-a pull request or dev push has a 15-minute timeout.
+a pull request or dev push has a 15-minute timeout. A pull request's run
+finishes within 15 minutes. Linux compatibility is measured by gVisor's
+syscall suite, in a lane that runs only when a change touches the Linux
+subsystem.
 
 Every lane runs on a Linux runner. macOS runners are not used: their queue
 dominates the run and nothing Helios ships targets macOS. Every boot in CI
