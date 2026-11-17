@@ -6,6 +6,7 @@ mod extents;
 pub(crate) mod file;
 pub(crate) mod namespace;
 pub(crate) mod reflink;
+pub(crate) mod xattr;
 
 use core::num::NonZeroUsize;
 use futures::future;
@@ -43,7 +44,7 @@ pub(crate) struct Transaction<'a, S> {
     // keep allocated numbers monotonic even after an inode is deleted again.
     inode_high_water: BTreeMap<u64, u64>,
     retirements: &'a mut Retirements,
-    volume: Volume<S>,
+    pub(crate) volume: Volume<S>,
     image: CommitImage,
     pub(crate) roots: Roots,
     /// The chunk tree's root. The superblock, not the root tree, records it.

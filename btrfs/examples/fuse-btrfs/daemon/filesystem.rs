@@ -9,7 +9,7 @@
 //!
 //! - `setattr` changing the mode, owner or flags: `EOPNOTSUPP`
 //! - `mknod` of anything but a regular file: `EPERM`
-//! - `setxattr`, `removexattr`, `fallocate`: `EOPNOTSUPP`
+//! - `fallocate`: `EOPNOTSUPP`
 //! - `rename` with `RENAME_NOREPLACE`, `RENAME_EXCHANGE` or `RENAME_WHITEOUT`: `EINVAL`
 //!
 //! Left to fuser's default of `ENOSYS`: `access`, `bmap`, `ioctl`, `poll`,
@@ -378,18 +378,25 @@ impl Filesystem for Daemon {
     fn setxattr(
         &self,
         _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        // Only macOS sets a position, in resource forks.
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::EOPNOTSUPP);
+        match self.run(|state| block_on(state.setxattr(ino, name, value, flags, now()))) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
     }
 
-    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::EOPNOTSUPP);
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.run(|state| block_on(state.removexattr(ino, name, now()))) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
     }
 
     fn fallocate(

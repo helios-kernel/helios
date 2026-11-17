@@ -1,5 +1,8 @@
 extern crate std;
 
+#[cfg(feature = "write")]
+mod xattr;
+
 use alloc::collections::BTreeMap;
 #[cfg(feature = "write")]
 use alloc::string::String;

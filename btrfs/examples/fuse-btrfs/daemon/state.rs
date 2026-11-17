@@ -14,7 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, TimeOrNow};
 use futures_lite::future::block_on;
-use helios_btrfs::write::{Attributes, InodeHandle, Name, WriteOptions, WriteTransaction, Writer};
+use helios_btrfs::write::{
+    Attributes, InodeHandle, Name, WriteOptions, WriteTransaction, Writer, XattrMode,
+};
 use helios_btrfs::{
     DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
 };
@@ -536,6 +538,57 @@ impl State {
             .ok_or(Errno::NO_XATTR)?;
         value.truncate(length.min(value.len()));
         Ok((length, value))
+    }
+
+    /// `setxattr(2)`: `flags` is `XATTR_CREATE` or `XATTR_REPLACE` or neither.
+    pub async fn setxattr(
+        &mut self,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        now: Timestamp,
+    ) -> Result<(), Errno> {
+        let mode = match flags {
+            0 => XattrMode::Set,
+            libc::XATTR_CREATE => XattrMode::Create,
+            libc::XATTR_REPLACE => XattrMode::Replace,
+            _ => return Err(Errno::EINVAL),
+        };
+        self.writable()?;
+        let file = self.inodes.handle(ino)?;
+        let concurrency = self.concurrency;
+        let mut transaction = self
+            .writer
+            .begin()
+            .await
+            .map_err(|error| write_errno(&error))?;
+        transaction
+            .set_xattr(&file, name.as_bytes(), value, mode, now)
+            .await
+            .map_err(|error| write_errno(&error))?;
+        Self::commit(transaction, concurrency).await
+    }
+
+    pub async fn removexattr(
+        &mut self,
+        ino: INodeNo,
+        name: &OsStr,
+        now: Timestamp,
+    ) -> Result<(), Errno> {
+        self.writable()?;
+        let file = self.inodes.handle(ino)?;
+        let concurrency = self.concurrency;
+        let mut transaction = self
+            .writer
+            .begin()
+            .await
+            .map_err(|error| write_errno(&error))?;
+        transaction
+            .remove_xattr(&file, name.as_bytes(), now)
+            .await
+            .map_err(|error| write_errno(&error))?;
+        Self::commit(transaction, concurrency).await
     }
 
     /// The names of the extended attributes, each followed by a NUL.

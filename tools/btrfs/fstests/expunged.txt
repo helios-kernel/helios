@@ -1,0 +1,18 @@
+generic/062 # #1037: sets trusted.* xattrs, which the writer refuses
+generic/097 # #1037: sets trusted.* xattrs, which the writer refuses
+generic/403 # #1037: sets trusted.* xattrs, which the writer refuses
+generic/449 # #1037: sets trusted.* xattrs and POSIX ACLs, which the writer refuses
+generic/513 # #1037: sets security.capability with setcap, which the writer refuses
+generic/675 # #1037: sets security.capability with setcap, which the writer refuses
+generic/688 # #1037: sets security.capability with setcap, which the writer refuses
+generic/727 # #1037: sets security.capability with setcap, which the writer refuses
+generic/105 # #1037: sets POSIX ACLs, which the writer refuses
+generic/237 # #1037: sets POSIX ACLs, which the writer refuses
+generic/307 # #1037: sets POSIX ACLs, which the writer refuses
+generic/318 # #1037: sets POSIX ACLs, which the writer refuses
+generic/319 # #1037: sets POSIX ACLs, which the writer refuses
+generic/375 # #1037: sets POSIX ACLs, which the writer refuses
+generic/389 # #1037: sets POSIX ACLs, which the writer refuses
+generic/444 # #1037: sets POSIX ACLs, which the writer refuses
+generic/529 # #1037: sets POSIX ACLs, which the writer refuses
+generic/689 # #1037: sets POSIX ACLs on an idmapped mount, which the writer refuses

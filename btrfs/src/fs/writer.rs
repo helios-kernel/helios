@@ -17,6 +17,7 @@ use crate::source::BlockSink;
 use crate::transaction::file::WriteOptions;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
+use crate::transaction::xattr::XattrMode;
 use crate::transaction::{Checkpoint, Transaction};
 use crate::tree::write::WriteError;
 use crate::{Error, FileKind, Metadata, Timestamp};
@@ -410,6 +411,79 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         operation
             .inner
             .set_times(file.tree, file.inode, access, modified, changed)
+            .await?;
+        operation.accept();
+        Ok(())
+    }
+
+    /// `getxattr(2)`: the length of `name`'s value, which is also copied to
+    /// `output` unless `output` is empty (a size query). A nonempty `output`
+    /// shorter than the value is [`WriteError::XattrBuffer`] (`ERANGE`); an
+    /// absent attribute is [`WriteError::XattrMissing`] (`ENODATA`). Every
+    /// namespace on disk reads back.
+    pub async fn xattr(
+        &self,
+        file: &InodeHandle,
+        name: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, WriteError> {
+        self.checked(file).await?;
+        self.inner
+            .xattr(file.tree(), file.number(), name, output)
+            .await
+    }
+
+    /// `listxattr(2)`: every attribute name of `file`, each followed by a NUL,
+    /// copied to `output` unless it is empty (a size query). Returns the
+    /// bytes the names take.
+    pub async fn list_xattrs(
+        &self,
+        file: &InodeHandle,
+        output: &mut [u8],
+    ) -> Result<usize, WriteError> {
+        self.checked(file).await?;
+        self.inner
+            .list_xattrs(file.tree(), file.number(), output)
+            .await
+    }
+
+    /// `setxattr(2)`. Only `user.*` is written, on regular files and
+    /// directories; `security.*`, `trusted.*` and POSIX ACL names are
+    /// [`WriteError::XattrNotPermitted`] and any other namespace
+    /// [`WriteError::XattrNamespace`]. The inode's ctime becomes `changed`.
+    pub async fn set_xattr(
+        &mut self,
+        file: &InodeHandle,
+        name: &[u8],
+        value: &[u8],
+        mode: XattrMode,
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self).await?;
+        operation.checked(file).await?;
+        operation.inner.roots.check_writable(file.tree())?;
+        operation
+            .inner
+            .set_xattr(file.tree(), file.number(), name, value, mode, changed)
+            .await?;
+        operation.accept();
+        Ok(())
+    }
+
+    /// `removexattr(2)`, under the rules of [`Self::set_xattr`]; an absent
+    /// attribute is [`WriteError::XattrMissing`].
+    pub async fn remove_xattr(
+        &mut self,
+        file: &InodeHandle,
+        name: &[u8],
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self).await?;
+        operation.checked(file).await?;
+        operation.inner.roots.check_writable(file.tree())?;
+        operation
+            .inner
+            .remove_xattr(file.tree(), file.number(), name, changed)
             .await?;
         operation.accept();
         Ok(())

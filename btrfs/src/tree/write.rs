@@ -84,6 +84,27 @@ pub enum WriteError {
     #[error("directory hard links are not permitted")]
     DirectoryLink,
 
+    #[error("extended attribute names are 1..=255 bytes (got {length})")]
+    XattrNameLength { length: usize },
+    #[error("extended attribute name is a namespace prefix with no name after it")]
+    XattrName,
+    #[error("extended attribute value of {length} bytes exceeds {maximum}")]
+    XattrValueTooBig { length: usize, maximum: usize },
+    #[error("extended attribute data of {bytes} bytes exceeds the {maximum} one leaf item holds")]
+    XattrNoSpace { bytes: usize, maximum: usize },
+    #[error("inode {inode} in tree {tree} has no such extended attribute")]
+    XattrMissing { tree: u64, inode: u64 },
+    #[error("inode {inode} in tree {tree} already has this extended attribute")]
+    XattrExists { tree: u64, inode: u64 },
+    #[error("extended attributes need {needed} bytes of buffer, got {provided}")]
+    XattrBuffer { needed: usize, provided: usize },
+    /// Writing `security.*`, `trusted.*` or a POSIX ACL (lexoliu/helios#1037),
+    /// or `user.*` on a file that is neither regular nor a directory.
+    #[error("inode {inode} in tree {tree} refuses this extended attribute write")]
+    XattrNotPermitted { tree: u64, inode: u64 },
+    #[error("extended attribute namespace has no handler")]
+    XattrNamespace,
+
     #[error("file offset or inode byte accounting overflows")]
     FileOverflow,
     #[error("file extent {key} is not a regular or preallocated mapping")]
