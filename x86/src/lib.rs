@@ -301,8 +301,6 @@ fn x86_kernel_main() -> ! {
     vmm::install_user_address_space(physical_memory_offset, cpu.processor_count());
     device::install_hooks();
     exceptions::verify_page_fault_returns();
-    #[cfg(feature = "native-users")]
-    native::verify_user_isolation(user_isolation);
     let pci = pci::PciRoot::new(physical_memory_offset);
     // The translation topology is read before any device is programmed:
     // whether a function is confined decides which addresses its driver
@@ -376,6 +374,10 @@ fn x86_kernel_main() -> ! {
     } else {
         tracing::info!("{measured_boot_discovery}");
     }
+    // Once the logger is up, so the bootstrap processor's result is in the
+    // log beside every secondary's; still before any user code can run.
+    #[cfg(feature = "native-users")]
+    native::verify_user_isolation(user_isolation);
     let (xsave_standard_bytes, xsave_max_bytes) = extended_state::xsave_sizes();
     let supervisor_state = extended_state::supervisor_state_support();
     tracing::info!(
