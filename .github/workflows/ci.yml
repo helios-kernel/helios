@@ -3078,8 +3078,13 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.changes.outputs.linux_suite_build) }}
+    # The suite's build is kept as an image in this repository's container
+    # registry, one per architecture and per pin, build script and image
+    # definition; only a run that is not a pull request publishes one.
+    permissions:
+      contents: read
+      packages: write
     env:
-      GVISOR_BAZEL_CACHE: ${{ github.workspace }}/gvisor-bazel-cache
       SUITE: ${{ github.workspace }}/gvisor-syscalls
     steps:
       - uses: actions/checkout@v4
@@ -3089,21 +3094,42 @@ jobs:
             tools/gvisor-syscalls
             .github
       - uses: astral-sh/setup-uv@v6
-      # A full run warms the cache a listed run then reads; the key is the
-      # pin and the build script, so a new revision starts cold.
-      - name: Restore the gVisor build cache
-        if: needs.changes.outputs.linux_suite_mode == 'full'
-        uses: ./helios/.github/actions/shared-cache
-        with:
-          path: ${{ env.GVISOR_BAZEL_CACHE }}
-          key: gvisor-bazel-${{ matrix.arch }}-${{ hashFiles('helios/tools/gvisor-syscalls/pin.json', 'helios/tools/gvisor-syscalls/build.sh') }}
-      - name: Restore the gVisor build cache a full run wrote
-        if: needs.changes.outputs.linux_suite_mode == 'listed'
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.GVISOR_BAZEL_CACHE }}
-          key: gvisor-bazel-${{ matrix.arch }}-${{ hashFiles('helios/tools/gvisor-syscalls/pin.json', 'helios/tools/gvisor-syscalls/build.sh') }}
+      - name: Log in to the container registry
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      # A registry that answers anything but "manifest unknown" fails the
+      # step: only an image this pin has never had is built.
+      - name: Take this pin's prebuilt suite
+        id: prebuilt
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/helios-gvisor-syscalls:${{ matrix.arch }}-${{ hashFiles('helios/tools/gvisor-syscalls/pin.json', 'helios/tools/gvisor-syscalls/build.sh', 'helios/tools/gvisor-syscalls/image/Dockerfile') }}
+        run: |
+          set -euo pipefail
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          if output="$(docker pull "$IMAGE" 2>&1)"; then
+            # A scratch image has no command; `docker create` needs one
+            # only to exist, never to run.
+            container="$(docker create "$IMAGE" none)"
+            mkdir -p "$SUITE/bin"
+            docker cp "$container:/." "$SUITE/bin"
+            docker rm "$container" > /dev/null
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            cat "$SUITE/bin/BUILT"
+          elif grep -q 'manifest unknown' <<< "$output"; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "no prebuilt suite at $IMAGE"
+          else
+            echo "$output" >&2
+            exit 1
+          fi
+      # A listed run builds only the listed binaries, which make no
+      # complete image; a full run builds them all and, outside a pull
+      # request, publishes them.
       - name: Build the suite's static binaries
+        if: steps.prebuilt.outputs.found == 'false'
         shell: bash
         working-directory: helios
         env:
@@ -3119,6 +3145,15 @@ jobs:
             bash tools/gvisor-syscalls/build.sh "$ARCH" "$SUITE/bin"
           fi
           cat "$SUITE/bin/BUILT"
+      - name: Publish the suite's build
+        if: steps.prebuilt.outputs.found == 'false' && needs.changes.outputs.linux_suite_mode == 'full' && github.event_name != 'pull_request'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.prebuilt.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker build --file helios/tools/gvisor-syscalls/image/Dockerfile --tag "$IMAGE" "$SUITE/bin"
+          docker push "$IMAGE"
       - name: List the cases the binaries hold
         shell: bash
         working-directory: helios

@@ -9,7 +9,6 @@
 #
 # With a binaries file (one `*_test` name per line) only those are built;
 # without one, every binary test/syscalls/BUILD runs as a syscall test.
-# GVISOR_BAZEL_CACHE, when set, holds Bazel's disk and repository caches.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 arch="${1:?architecture required: x86_64 or aarch64}"
@@ -80,14 +79,6 @@ for name in "${names[@]}"; do
     targets+=("//test/syscalls/linux:$name")
 done
 
-cache_flags=()
-if [[ -n "${GVISOR_BAZEL_CACHE:-}" ]]; then
-    mkdir -p "$GVISOR_BAZEL_CACHE/disk" "$GVISOR_BAZEL_CACHE/repository"
-    cache_flags=(
-        "--disk_cache=$GVISOR_BAZEL_CACHE/disk"
-        "--repository_cache=$GVISOR_BAZEL_CACHE/repository"
-    )
-fi
 # The link options are the ones gVisor's own `cc_binary(static = True)`
 # applies (tools/bazeldefs/cc.bzl): a static C++ program that uses
 # threads. `-no-pie` because the Linux host loads ET_EXEC images only.
@@ -97,7 +88,6 @@ bazel_started=true
 (
     cd "$src"
     "$bazel" build \
-        "${cache_flags[@]}" \
         --nostamp \
         --strip=always \
         --skip_incompatible_explicit_targets \
