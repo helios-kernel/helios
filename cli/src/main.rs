@@ -10,7 +10,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use artifact_cache::{
     ArtifactCache, CacheError, EntryKind, KeyBuilder, PrecompileCache, PrecompileError,
-    package_directories, precompile, prune, workspace_inputs,
+    lock_closure_digest, package_directories, package_name, precompile, prune, workspace_inputs,
 };
 use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -233,6 +233,11 @@ enum WasmBuildError {
     Cache(#[from] CacheError),
     #[error("crate manifest {manifest} is outside the workspace {root}, so no cache key names it")]
     ManifestOutsideWorkspace { manifest: String, root: String },
+    #[error("Cargo.lock is not UTF-8: {source}")]
+    LockNotUtf8 {
+        #[source]
+        source: std::str::Utf8Error,
+    },
     #[error("failed to write the cached artifact {path}: {source}")]
     WriteCached {
         path: String,
@@ -2557,10 +2562,18 @@ impl WasmBuilder<'_> {
         for (name, value) in environment {
             key = key.field(name).field(value);
         }
+        // Only the lockfile entries the program resolves through: a line
+        // about the kernel's dependencies must not rebuild every program.
+        let lock = String::from_utf8(read(root.join("Cargo.lock"))?).map_err(|source| {
+            WasmBuildError::LockNotUtf8 {
+                source: source.utf8_error(),
+            }
+        })?;
+        let lock_closure = lock_closure_digest(&lock, &package_name(manifest_path)?)?;
         Ok(key
             .field(rustc_print("-vV")?)
             .field(config)
-            .field(read(root.join("Cargo.lock"))?)
+            .field(lock_closure)
             .finish())
     }
 }
