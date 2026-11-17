@@ -81,7 +81,7 @@ fn entry_type(kind: FileKind) -> u8 {
     }
 }
 
-impl<S: BlockSink> Transaction<'_, S> {
+impl<S: BlockSink> Transaction<S> {
     pub(super) async fn inode_item(
         &self,
         tree: u64,

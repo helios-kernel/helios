@@ -98,7 +98,6 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::Space(SpaceError::Corrupt { .. }) => defect("Space::Corrupt", error),
         WriteError::Space(SpaceError::DataLength { .. }) => defect("Space::DataLength", error),
         WriteError::ForeignHandle => defect("ForeignHandle", error),
-        WriteError::AbortedHandle => defect("AbortedHandle", error),
         WriteError::Encode(_) => defect("Encode", error),
         WriteError::CompressionWithoutChecksums => defect("CompressionWithoutChecksums", error),
         WriteError::NamespaceMismatch { .. } => defect("NamespaceMismatch", error),

@@ -22,8 +22,6 @@ pub enum WriteError {
     InvalidPermissions { permissions: u32 },
     #[error("inode handle belongs to another mount")]
     ForeignHandle,
-    #[error("inode handle was created by an aborted transaction")]
-    AbortedHandle,
     #[error("inode {inode} in tree {tree} no longer has generation {generation}")]
     StaleHandle {
         tree: u64,
@@ -90,7 +88,7 @@ pub enum WriteError {
     NotRegularExtent { key: Key },
     #[error("file range {start}..{end} must be nonempty and aligned to sector size {sector}")]
     FileRange { start: u64, end: u64, sector: u64 },
-    #[error("writer must be reopened after an interrupted durable commit")]
+    #[error("writer must be reopened after a failed or interrupted commit")]
     WriterPoisoned,
     #[error("transaction superblock: {0}")]
     CommitSuperblock(#[from] crate::SuperblockDefect),
@@ -204,7 +202,7 @@ impl Trees {
         }
     }
 
-    async fn read<S: BlockSource>(
+    pub(crate) async fn read<S: BlockSource>(
         &self,
         volume: &Volume<S>,
         address: u64,
@@ -481,6 +479,11 @@ impl Trees {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// How many private tree blocks the overlay holds: what its commit writes.
+    pub(crate) fn block_count(&self) -> usize {
+        self.blocks.size()
     }
 
     pub(crate) fn blocks(&self) -> impl Iterator<Item = (u64, &[u8])> {

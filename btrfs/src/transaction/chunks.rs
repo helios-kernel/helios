@@ -16,10 +16,9 @@
 //!
 //! * METADATA: allocate when `used + 2 MiB >= 80% of total`
 //!   (`should_alloc_chunk` with `CHUNK_ALLOC_NO_FORCE`), so at least a fifth of
-//!   the type stays free unless the device itself is full. When the device is
-//!   full, a mutation additionally refuses to start while less than
-//!   [`Transaction::metadata_reserve`] is free, leaving that much for the commit
-//!   of what is already staged.
+//!   the type stays free unless the device itself is full. A mutation that
+//!   cannot reserve its metadata (`transaction::reserve`) first commits, then
+//!   allocates a chunk whatever this rule says, before it is refused.
 //! * SYSTEM: allocating any other chunk first makes room in the chunk tree the
 //!   way `check_system_chunk` does: a SYSTEM chunk is allocated when its free
 //!   bytes cannot hold one device-item update plus one chunk-item insertion, or
@@ -246,13 +245,19 @@ struct Device {
     chunk_tree_uuid: [u8; 16],
 }
 
-impl<S: BlockSink> Transaction<'_, S> {
-    /// Free metadata bytes below which a mutation refuses to start once the
-    /// device cannot supply another chunk: what a commit may still COW, one
-    /// root-to-leaf path with room to split, in each tree it rewrites
+impl<S: BlockSink> Transaction<S> {
+    /// Free metadata bytes kept for the commit's own work whatever the
+    /// mutations reserved, as Linux's global block reserve: one root-to-leaf
+    /// path with room to split, in each tree a commit rewrites
     /// (`btrfs_calc_insert_metadata_size` per tree).
-    fn metadata_reserve(&self) -> u64 {
+    pub(super) fn metadata_reserve(&self) -> u64 {
         u64::from(self.volume.superblock().nodesize()) * MAX_LEVEL * 2 * COMMITTED_TREES
+    }
+
+    /// Linux's `ALLOC_CHUNK` flush state: a metadata chunk whatever the 80%
+    /// rule says, when the device has room for one.
+    pub(crate) async fn force_metadata_chunk(&mut self) -> Result<(), WriteError> {
+        self.allocate_chunk_if_room(METADATA).await
     }
 
     /// The preparation every mutation and the commit share: a metadata chunk
@@ -267,19 +272,10 @@ impl<S: BlockSink> Transaction<'_, S> {
         self.allocate_chunk_if_room(METADATA).await
     }
 
-    /// Run before every mutation: grow metadata ahead of need and keep the
-    /// commit's reserve.
+    /// Run before every mutation: grow metadata ahead of need. The space the
+    /// mutation itself needs is its reservation's (`transaction::reserve`).
     pub(crate) async fn prepare_mutation(&mut self) -> Result<(), WriteError> {
-        self.grow_metadata().await?;
-        let reserve = self.metadata_reserve();
-        if self.space.totals(METADATA).1 < reserve {
-            return Err(SpaceError::Exhausted {
-                bytes: reserve,
-                flags: METADATA,
-            }
-            .into());
-        }
-        Ok(())
+        self.grow_metadata().await
     }
 
     /// Makes `length` bytes reservable as data, allocating a data chunk when no

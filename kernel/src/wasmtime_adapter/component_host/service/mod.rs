@@ -716,6 +716,7 @@ where
     );
     write_serial.emit_stage_marker("component-host:run-local-begin");
     let stack = system_component_profile_stack(component_name);
+    let namespace = debug_state.root_namespace().clone();
     kernel
         .run_local_future(ProfiledSystemComponentFuture::new(
             run_system_component(
@@ -744,6 +745,9 @@ where
         component = component_name,
         "embedded system component exited cleanly"
     );
+    // As Linux syncs and unmounts before it powers off: what the writable
+    // mounts hold reaches their devices before the machine goes down.
+    kernel.run_local_future(async move { namespace.sync_writable_mounts().await });
     report_fiber_stack_demand_commits(&cpu);
     cpu.shutdown()
 }

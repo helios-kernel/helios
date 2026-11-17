@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use helios_btrfs::write::{Attributes, CloneRange, Name, WriteOptions, Writer, Zstd};
+use helios_btrfs::write::{Attributes, CloneRange, Name, WriteError, WriteOptions, Writer, Zstd};
 use helios_btrfs::{BlockSink, BlockSource, READ_ALIGNMENT, Timestamp};
 use helios_hal::io::IoResult;
 
@@ -37,6 +37,22 @@ impl BlockSink for WritableImage {
 
 fn assert_send<T: Send>(_: &T) {}
 
+/// The images' root records carry valid UUIDs, so no commit asks for one.
+fn no_uuid() -> [u8; 16] {
+    panic!("the image's root records carry valid UUIDs")
+}
+
+type ImageWriter = Writer<WritableImage, fn() -> [u8; 16]>;
+
+async fn mount(image: SparseImage) -> Result<ImageWriter, WriteError> {
+    Writer::mount(
+        WritableImage(Mutex::new(image)),
+        no_uuid as fn() -> [u8; 16],
+        std::thread::available_parallelism().unwrap(),
+    )
+    .await
+}
+
 /// A writer over the image `mkfs.btrfs` produces for the guest smoke (128 MiB,
 /// default features) commits a created file and reads it back.
 #[test]
@@ -46,10 +62,8 @@ fn writer_commits_over_a_mkfs_image() {
     std::fs::write(tree.path().join("hello.txt"), b"hello btrfs\n").unwrap();
     let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &[]);
     block_on(async {
-        let mut writer = Writer::mount(WritableImage(Mutex::new(image)))
-            .await
-            .unwrap();
-        let mut tx = writer.begin().await.unwrap();
+        let mut writer = mount(image).await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         let when = Timestamp {
             seconds: 1_700_000_100,
@@ -79,9 +93,7 @@ fn writer_commits_over_a_mkfs_image() {
         )
         .await
         .unwrap();
-        tx.commit(|| panic!("mkfs UUIDs are valid"), concurrency)
-            .await
-            .unwrap();
+        tx.commit().await.unwrap();
         let snapshot = writer.snapshot().unwrap();
         let written = snapshot.resolve(b"/written").await.unwrap();
         let mut output = [0; 11];
@@ -90,7 +102,7 @@ fn writer_commits_over_a_mkfs_image() {
 
         // The guest smoke's sequence: a directory, a file in it, then a hard
         // link to that file once both are committed.
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         let directory = tx
             .create_directory(
@@ -130,10 +142,8 @@ fn writer_commits_over_a_mkfs_image() {
         )
         .await
         .unwrap();
-        tx.commit(|| panic!("mkfs UUIDs are valid"), concurrency)
-            .await
-            .unwrap();
-        let mut tx = writer.begin().await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         let directory = tx
             .lookup(&root, "目录-ディレクトリ-디렉터리".as_bytes())
@@ -155,9 +165,7 @@ fn writer_commits_over_a_mkfs_image() {
         )
         .await
         .unwrap();
-        tx.commit(|| panic!("mkfs UUIDs are valid"), concurrency)
-            .await
-            .unwrap();
+        tx.commit().await.unwrap();
         assert_eq!(
             writer
                 .snapshot()
@@ -175,13 +183,11 @@ fn writer_commits_over_a_mkfs_image() {
 #[test]
 fn public_writer_preserves_snapshots_and_committed_handles() {
     block_on(async {
-        let mut writer = Writer::mount(WritableImage(Mutex::new(base_image())))
-            .await
-            .unwrap();
+        let mut writer = mount(base_image()).await.unwrap();
         let before = writer.snapshot().unwrap();
-        let begin = writer.begin();
-        assert_send(&begin);
-        let mut tx = begin.await.unwrap();
+        let join = writer.join();
+        assert_send(&join);
+        let mut tx = join.await.unwrap();
         let root = tx.root().await.unwrap();
         let when = Timestamp {
             seconds: 1_700_000_100,
@@ -256,7 +262,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             data.len()
         );
         assert_eq!(output, data);
-        let commit = tx.commit(|| panic!("fixture UUIDs are valid"), concurrency);
+        let commit = tx.commit();
         assert_send(&commit);
         commit.await.unwrap();
         assert!(
@@ -274,7 +280,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             .resolve("/中文-日本語-한국어/source".as_bytes())
             .await
             .unwrap();
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let _ = tx
             .write_file(
                 &source,
@@ -287,9 +293,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
         tx.rename(name(b"clone"), name(b"kept"), when)
             .await
             .unwrap();
-        tx.commit(|| panic!("fixture UUIDs are valid"), concurrency)
-            .await
-            .unwrap();
+        tx.commit().await.unwrap();
         let current = writer.snapshot().unwrap();
         let kept = current
             .resolve("/中文-日本語-한국어/kept".as_bytes())
@@ -316,14 +320,12 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
 #[test]
 #[ignore = "needs mkfs.btrfs from btrfs-progs; the Linux CI lane runs it with --run-ignored"]
 fn writer_refuses_mkfs_images_with_quotas_and_the_reader_mounts_them() {
-    use helios_btrfs::write::WriteError;
-
     let tree = tempfile::tempdir().unwrap();
     std::fs::write(tree.path().join("hello.txt"), b"hello btrfs\n").unwrap();
 
     let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &["-O", "quota"]);
     super::fixture::mount(image.clone()).expect("a read-only mount ignores quotas");
-    let refused = block_on(Writer::mount(WritableImage(Mutex::new(image))));
+    let refused = block_on(mount(image));
     assert!(
         matches!(refused, Err(WriteError::QuotaTreePresent)),
         "-O quota: refused with {:?}",
@@ -342,7 +344,7 @@ fn writer_refuses_mkfs_images_with_quotas_and_the_reader_mounts_them() {
         read.as_ref().is_some_and(squota),
         "-O squota read-only: {read:?}"
     );
-    let write = block_on(Writer::mount(WritableImage(Mutex::new(image)))).err();
+    let write = block_on(mount(image)).err();
     assert!(
         matches!(&write, Some(WriteError::Read(error)) if squota(error)),
         "-O squota writable: {write:?}"

@@ -1,8 +1,10 @@
 //! The writer, the inode map and every operation the daemon serves.
 //!
-//! Reads go through a snapshot of the last committed view. Each mutation runs
-//! in a transaction of its own that is committed before the operation
-//! returns, so a reply to the kernel means the change is durable.
+//! As Linux's btrfs, a change is visible at once and durable at commit. Each
+//! mutation joins the writer's running transaction, and reads go through the
+//! writer's view of it, so the next request sees every reply's change. The
+//! transaction commits on `fsync`, `fsyncdir` and unmount, and when its dirty
+//! metadata reaches Linux's bound.
 
 use std::ffi::OsStr;
 use std::num::NonZeroUsize;
@@ -14,7 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, TimeOrNow};
 use futures_lite::future::block_on;
-use helios_btrfs::write::{Attributes, InodeHandle, Name, WriteOptions, WriteTransaction, Writer};
+use helios_btrfs::write::{
+    Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, WriteOptions, Writer,
+};
 use helios_btrfs::{
     DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
 };
@@ -57,7 +61,7 @@ pub struct Statfs {
 }
 
 pub struct State {
-    writer: Writer<Device>,
+    writer: Writer<Device, RandomUuids>,
     inodes: Inodes,
     concurrency: NonZeroUsize,
     read_only: bool,
@@ -69,11 +73,11 @@ impl State {
         concurrency: NonZeroUsize,
         read_only: bool,
     ) -> Result<Self, OpenError> {
-        let mut writer = block_on(Writer::mount(device))?;
+        let mut writer = block_on(Writer::mount(device, RandomUuids, concurrency))?;
         let snapshot = writer.snapshot()?;
         let root = block_on(snapshot.root())?;
         let handle = {
-            let transaction = block_on(writer.begin())?;
+            let transaction = block_on(writer.join())?;
             block_on(transaction.root())?
         };
         let identity = Identity {
@@ -123,7 +127,7 @@ impl State {
         let parent = self.inodes.handle(parent)?;
         let transaction = self
             .writer
-            .begin()
+            .join()
             .await
             .map_err(|error| write_errno(&error))?;
         transaction
@@ -133,18 +137,26 @@ impl State {
             .ok_or(Errno::ENOENT)
     }
 
-    /// Commits `transaction`; an error leaves the committed view unchanged.
-    async fn commit(
-        transaction: WriteTransaction<'_, Device>,
-        concurrency: NonZeroUsize,
-    ) -> Result<(), Errno> {
-        transaction
-            .commit(new_uuid, concurrency)
+    /// Makes every change so far durable: `fsync`, `fsyncdir` and unmount.
+    /// A failure poisons the writer, and the device keeps the previous
+    /// generation.
+    pub async fn sync(&mut self) -> Result<(), Errno> {
+        self.writer
+            .commit()
             .await
             .map_err(|error| write_errno(&error))
     }
 
-    /// The attributes and generation of `identity` as last committed,
+    /// Ends a mutation: commits once the running transaction's dirty
+    /// metadata reaches Linux's bound.
+    async fn settle(&mut self) -> Result<(), Errno> {
+        if self.writer.dirty().metadata_bytes >= DEFAULT_DIRTY_METADATA_LIMIT {
+            self.sync().await?;
+        }
+        Ok(())
+    }
+
+    /// The attributes and generation of `identity` as the writer sees it,
     /// recorded as one more lookup of it.
     async fn entry_of(
         &mut self,
@@ -218,7 +230,7 @@ impl State {
         let concurrency = self.concurrency;
         let mut transaction = self
             .writer
-            .begin()
+            .join()
             .await
             .map_err(|error| write_errno(&error))?;
         if let Some(size) = size {
@@ -237,7 +249,7 @@ impl State {
                 .await
                 .map_err(|error| write_errno(&error))?;
         }
-        Self::commit(transaction, concurrency).await?;
+        self.settle().await?;
         self.getattr(ino).await
     }
 
@@ -335,14 +347,14 @@ impl State {
         let concurrency = self.concurrency;
         let mut transaction = self
             .writer
-            .begin()
+            .join()
             .await
             .map_err(|error| write_errno(&error))?;
         let written = transaction
             .write_file(&file, offset, data, WriteOptions::plain(now, concurrency))
             .await
             .map_err(|error| write_errno(&error))?;
-        Self::commit(transaction, concurrency).await?;
+        self.settle().await?;
         Ok(u32::try_from(written)
             .expect("a write is never longer than the request that asked for it"))
     }
@@ -359,10 +371,9 @@ impl State {
         self.writable()?;
         let name = entry_name(name)?;
         let parent = self.inodes.handle(parent)?;
-        let concurrency = self.concurrency;
         let mut transaction = self
             .writer
-            .begin()
+            .join()
             .await
             .map_err(|error| write_errno(&error))?;
         let at = Name {
@@ -380,7 +391,7 @@ impl State {
             Node::Symlink(target) => transaction.symlink(at, target, attributes, now).await,
         }
         .map_err(|error| write_errno(&error))?;
-        Self::commit(transaction, concurrency).await?;
+        self.settle().await?;
         let identity = Identity {
             tree: created.tree(),
             number: created.number(),
@@ -400,10 +411,9 @@ impl State {
         let file = self.inodes.handle(ino)?;
         let parent = self.inodes.handle(parent)?;
         let (identity, _) = self.inodes.identity(ino)?;
-        let concurrency = self.concurrency;
         let mut transaction = self
             .writer
-            .begin()
+            .join()
             .await
             .map_err(|error| write_errno(&error))?;
         transaction
@@ -417,7 +427,7 @@ impl State {
             )
             .await
             .map_err(|error| write_errno(&error))?;
-        Self::commit(transaction, concurrency).await?;
+        self.settle().await?;
         self.entry_of(identity, None).await
     }
 
@@ -433,10 +443,9 @@ impl State {
         self.writable()?;
         let name = entry_name(name)?;
         let parent = self.inodes.handle(parent)?;
-        let concurrency = self.concurrency;
         let mut transaction = self
             .writer
-            .begin()
+            .join()
             .await
             .map_err(|error| write_errno(&error))?;
         let child = transaction
@@ -464,7 +473,7 @@ impl State {
             )
             .await
             .map_err(|error| write_errno(&error))?;
-        Self::commit(transaction, concurrency).await
+        self.settle().await
     }
 
     pub async fn rename(
@@ -480,10 +489,9 @@ impl State {
         let new_name = entry_name(new_name)?;
         let parent = self.inodes.handle(parent)?;
         let new_parent = self.inodes.handle(new_parent)?;
-        let concurrency = self.concurrency;
         let mut transaction = self
             .writer
-            .begin()
+            .join()
             .await
             .map_err(|error| write_errno(&error))?;
         transaction
@@ -500,20 +508,18 @@ impl State {
             )
             .await
             .map_err(|error| write_errno(&error))?;
-        Self::commit(transaction, concurrency).await
+        self.settle().await
     }
 
+    /// The space as the running transaction leaves it: a change is counted
+    /// as soon as it is visible, not once it commits.
     pub fn statfs(&self) -> Result<Statfs, Errno> {
-        let snapshot = self.snapshot()?;
-        let superblock = snapshot.superblock();
-        let block_size = superblock.sectorsize();
+        let block_size = self.snapshot()?.superblock().sectorsize();
+        let usage = self.writer.usage().map_err(|error| write_errno(&error))?;
         let size = u64::from(block_size);
         Ok(Statfs {
-            blocks: superblock.total_bytes() / size,
-            free: superblock
-                .total_bytes()
-                .saturating_sub(superblock.bytes_used())
-                / size,
+            blocks: usage.total_bytes / size,
+            free: usage.total_bytes.saturating_sub(usage.used_bytes) / size,
             block_size,
         })
     }
@@ -569,14 +575,18 @@ pub fn target_bytes(target: &Path) -> &[u8] {
     target.as_os_str().as_bytes()
 }
 
-/// A random version 4 UUID for a root record that lacks one.
-fn new_uuid() -> [u8; 16] {
-    let mut uuid = [0; 16];
-    getrandom::fill(&mut uuid).expect("the operating system's random source failed");
-    // RFC 9562: version 4 and the RFC variant.
-    uuid[6] = (uuid[6] & 0x0f) | 0x40;
-    uuid[8] = (uuid[8] & 0x3f) | 0x80;
-    uuid
+/// Random version 4 UUIDs for the root records that lack one.
+struct RandomUuids;
+
+impl RootUuids for RandomUuids {
+    fn next_uuid(&mut self) -> [u8; 16] {
+        let mut uuid = [0; 16];
+        getrandom::fill(&mut uuid).expect("the operating system's random source failed");
+        // RFC 9562: version 4 and the RFC variant.
+        uuid[6] = (uuid[6] & 0x0f) | 0x40;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        uuid
+    }
 }
 
 fn file_type(kind: FileKind) -> FileType {

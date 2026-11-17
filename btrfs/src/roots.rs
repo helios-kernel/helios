@@ -137,6 +137,27 @@ impl Roots {
             .ok_or_else(|| Error::MissingRoot { tree }.into())
     }
 
+    /// Bytes of tree blocks tree `tree` had when this transaction started; 0
+    /// for a tree it does not have.
+    pub(crate) fn committed_used(&self, tree: u64) -> u64 {
+        self.entries
+            .get(&tree)
+            .map_or(0, |entry| entry.initial_used)
+    }
+
+    /// Tree `tree`'s root as this transaction has moved it, with its root
+    /// directory: what the root tree will record for it at commit.
+    pub(crate) fn record(&self, tree: u64) -> Result<RootRecord, Error> {
+        let entry = self.entries.get(&tree).ok_or(Error::MissingRoot { tree })?;
+        Ok(RootRecord {
+            root: entry.root,
+            root_dirid: view::<RawRootItem>(&entry.bytes)
+                .expect("validated root item")
+                .root_dirid
+                .get(),
+        })
+    }
+
     #[cfg(feature = "write")]
     pub(crate) fn root_directory(&self, tree: u64) -> Result<u64, WriteError> {
         let entry = self.entries.get(&tree).ok_or(Error::MissingRoot { tree })?;
