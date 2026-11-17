@@ -64,6 +64,8 @@ pub enum MountRequestError {
     CompressionOption(#[from] helios_btrfs::write::CompressionOptionError),
     #[error("a compression policy applies only to a btrfs mount")]
     CompressionUnsupported,
+    #[error("a commit interval applies only to a btrfs mount")]
+    CommitUnsupported,
     #[error("the btrfs image on disk {serial:?} cannot be mounted: {error}")]
     Btrfs {
         serial: BlockSerial,
@@ -88,6 +90,9 @@ pub async fn request_mount<S: Storage>(
     let cap = authority.derive_mount_cap(point)?;
     if write.compress.is_some() && !matches!(source, MountSource::Btrfs { .. }) {
         return Err(MountRequestError::CompressionUnsupported);
+    }
+    if write.commit.is_some() && !matches!(source, MountSource::Btrfs { .. }) {
+        return Err(MountRequestError::CommitUnsupported);
     }
     let mut service = None;
     let fs = match source {

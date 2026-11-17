@@ -4,14 +4,17 @@
 //! Every slice entry and exit invalidates this processor's non-global
 //! translations of ASID 0, which every user page is, so no processor keeps a
 //! usable user translation once its slice ends; the kernel's own TTBR1
-//! mappings are global and survive. The kernel's TTBR0 and TCR are restored
-//! at every exit.
+//! mappings are global and survive. A page removed or narrowed while a slice
+//! of its space runs is invalidated with the inner-shareable broadcast TLBI
+//! the kernel's own address space uses. The kernel's TTBR0 and TCR are
+//! restored at every exit.
 
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::mem::offset_of;
 use core::ptr::NonNull;
 
+use arm_sysregs::el1::registers::SctlrEl1;
 use helios_hal::hv::RegisterId;
 use helios_hal::native::{
     FaultKind, InstructionSet, NativeError, NativeExecution, Stop, UserContext, UserFault,
@@ -75,6 +78,32 @@ const EXIT_SYNC: u64 = 1;
 const EXIT_IRQ: u64 = 2;
 const EXIT_FIQ: u64 = 3;
 const EXIT_SERROR: u64 = 4;
+
+/// Lets user code synchronise its own instruction stream with the data it
+/// wrote, as Linux's `INIT_SCTLR_EL1_MMU_ON` lets it:
+/// - `SCTLR_EL1.UCT` makes `CTR_EL0` readable at EL0;
+/// - `SCTLR_EL1.UCI` lets EL0 run `DC CVAU`, `DC CVAC`, `DC CIVAC` and
+///   `IC IVAU`.
+///
+/// Code a program writes into a writable executable page runs only after
+/// those, which `__clear_cache` issues. Neither bit changes what EL1 may do.
+/// Each processor sets them once, before it runs any user slice.
+pub(crate) fn enable_user_cache_maintenance() {
+    let bits = (SctlrEl1::UCT | SctlrEl1::UCI).bits();
+    // SAFETY: sets two SCTLR_EL1 bits that govern only EL0 accesses; the
+    // `isb` makes them take effect before any later user slice.
+    unsafe {
+        asm!(
+            "mrs {sctlr}, sctlr_el1",
+            "orr {sctlr}, {sctlr}, {bits}",
+            "msr sctlr_el1, {sctlr}",
+            "isb",
+            sctlr = out(reg) _,
+            bits = in(reg) bits,
+            options(nostack, preserves_flags),
+        );
+    }
+}
 
 /// The AArch64 native execution capability.
 pub struct Aarch64Native;
@@ -174,6 +203,26 @@ impl Aarch64Tables {
     }
 }
 
+/// The last-level descriptor of a user page mapping `physical` with EL0
+/// access `flags`.
+fn page_descriptor(physical: u64, flags: PageFlags) -> u64 {
+    let access = if flags.contains(PageFlags::WRITE) {
+        AP_EL0_RW
+    } else if flags.is_empty() {
+        // No EL0 access at all; EL1 never uses a user address.
+        0
+    } else {
+        AP_EL0_RO
+    };
+    let execute = if flags.contains(PageFlags::EXECUTE) {
+        0
+    } else {
+        UXN
+    };
+    // MAIR index 0 is normal write-back memory (`crate::vmm`).
+    physical | PAGE_DESCRIPTOR | access | SH_INNER | AF | NOT_GLOBAL | PXN | execute
+}
+
 fn publish() {
     // Descriptor writes reach every processor's table walker before any
     // slice that may use them starts.
@@ -186,34 +235,45 @@ fn publish() {
 // TTBR0, which holds no kernel mapping.
 unsafe impl UserTranslation for Aarch64Tables {
     fn install(&mut self, base: u64, physical: u64, flags: PageFlags) -> Result<(), NativeError> {
-        let access = if flags.contains(PageFlags::WRITE) {
-            AP_EL0_RW
-        } else if flags.is_empty() {
-            // No EL0 access at all; EL1 never uses a user address.
-            0
-        } else {
-            AP_EL0_RO
-        };
-        let execute = if flags.contains(PageFlags::EXECUTE) {
-            0
-        } else {
-            UXN
-        };
-        // MAIR index 0 is normal write-back memory (`crate::vmm`).
-        let descriptor =
-            physical | PAGE_DESCRIPTOR | access | SH_INNER | AF | NOT_GLOBAL | PXN | execute;
         let leaf = self.leaf(base)?;
         // SAFETY: the leaf entry of a page that is not mapped.
-        unsafe { leaf.write_volatile(descriptor) };
+        unsafe { leaf.write_volatile(page_descriptor(physical, flags)) };
         publish();
         Ok(())
     }
 
     fn uninstall(&mut self, base: u64) {
         let leaf = self.leaf(base).expect("an installed page has its tables");
-        // SAFETY: as in `install`; no slice ran this page, so no TLB holds it.
+        // SAFETY: as in `install`. The space's caller invalidates the page
+        // wherever a slice may hold it (`invalidate`).
         unsafe { leaf.write_volatile(0) };
         publish();
+    }
+
+    fn protect(&mut self, base: u64, flags: PageFlags) {
+        let leaf = self.leaf(base).expect("an installed page has its tables");
+        // SAFETY: as in `install`. Only the access bits change, which the
+        // Arm ARM's break-before-make rules do not require a break for; the
+        // caller invalidates a narrowing.
+        unsafe {
+            let physical = leaf.read_volatile() & ADDRESS;
+            leaf.write_volatile(page_descriptor(physical, flags));
+        }
+        publish();
+    }
+
+    fn invalidate(&self, first: u64, last: u64) {
+        // SAFETY: TLB maintenance and barriers only. `vale1is` broadcasts
+        // to every processor in the inner-shareable domain, the `dsb ish`
+        // after it waits until each has completed it, and the operand is
+        // VA[55:12] with ASID 0, which every user page is tagged with.
+        unsafe {
+            asm!("dsb ishst", options(nostack, preserves_flags));
+            for base in (first..last).step_by(PAGE as usize) {
+                asm!("tlbi vale1is, {}", in(reg) base >> 12, options(nostack, preserves_flags));
+            }
+            asm!("dsb ish", "isb", options(nostack, preserves_flags));
+        }
     }
 
     fn physical(&self, frame: NonNull<u8>) -> u64 {
@@ -361,8 +421,11 @@ unsafe impl UserContext for Aarch64Context {
 
     fn resume(&mut self, space: &NativeSpace<Aarch64Tables>) -> Stop {
         self.switch.pstate = (self.switch.pstate & SPSR_NZCV) | SPSR_FIQ_MASKED;
-        // ASID 0 in TTBR0[63:48]; every user page is non-global under it.
-        self.switch.user_ttbr0 = space.with_tables(|tables| tables.root_physical());
+        // Counted until the exit below has dropped this processor's
+        // translations of ASID 0. ASID 0 in TTBR0[63:48]; every user page is
+        // non-global under it.
+        let slice = space.begin_slice();
+        self.switch.user_ttbr0 = slice.with_tables(|tables| tables.root_physical());
         let tcr: u64;
         let daif: u64;
         // SAFETY: reads a system register and masks IRQs on this processor.
@@ -375,6 +438,7 @@ unsafe impl UserContext for Aarch64Context {
         // SAFETY: IRQs are masked from here to the exit, which restores
         // every piece of kernel state the entry replaced.
         unsafe { helios_aarch64_native_enter(&mut self.switch) };
+        drop(slice);
         let stop = match self.switch.exit {
             EXIT_IRQ => {
                 if crate::handle_pending_interrupts() {

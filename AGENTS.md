@@ -136,6 +136,13 @@ maintainer's decision and the fork's revision moves once, per §1.
   boot and sealing, and never data I/O.
 - A well-maintained, `no_std`-friendly third-party crate beats a hand-rolled
   implementation.
+- Kernel-mode code is safe Rust above two kinds of boundary: `hal/` and the
+  backends, where `unsafe` touches hardware, and a safe, ergonomic Rust API
+  whose implementation confines the `unsafe` it needs and states each
+  precondition. A component whose work needs `unsafe` throughout (a driver
+  speaking a C ABI, a parser of untrusted formats, a protocol engine over raw
+  memory) runs in user mode, inside the wasm sandbox, as a program or kernel
+  plugin, so that its defects end an instance rather than corrupt the kernel.
 
 ### 3.2 Rust style
 
@@ -372,17 +379,43 @@ and never comes from CI.
   rights the mount grants are all a WASI or WASIX program holds on it:
   neither sees ownership, modes or ACLs. A container's mounts are the same
   explicit mounts, and their rights bound everything the container's
-  processes can do on them. Within that bound, the kernel enforces the
-  ownership, modes, ACLs, setuid bits and file capabilities a Unix
-  filesystem stores, as Linux does. A node a non-Linux program creates on
-  such a filesystem takes its owner and group from its parent directory,
-  and its mode from the parent's, with the execute bits cleared for a
-  regular file; no mount or WASI interface carries a user or group.
+  processes can do on them. A mount is granted as private or as shared,
+  and that never changes while it exists. A private mount belongs to one
+  container, and within its bound the kernel enforces the ownership,
+  modes, ACLs, setuid bits and file capabilities a Unix filesystem stores,
+  as Linux does. A shared mount may be granted to several containers and
+  to WASI programs at once, and in each container it behaves as it does
+  for WASI: every node appears owned by the identity the container's
+  configuration names, its modes follow the mount's rights, and it is
+  nosuid and nodev with file capabilities ignored. A node a non-Linux
+  program creates, or any program creates on a shared mount, takes its
+  owner and group from its parent directory, and its mode from the
+  parent's, with the execute bits cleared for a regular file; no mount or
+  WASI interface carries a user or group.
 - Native execution runs only with the hardware protections its contract
   states (kernel-mode execute and access protection of user pages, a
   processor unaffected by rogue data cache load) and refuses to start where
   one is missing, naming it. It keeps every mitigation Linux applies to user
   processes on the same hardware.
+
+### 3.9 Target environment
+
+Helios runs in production as a guest under hardware-accelerated
+virtualization on a cloud provider's x86-64 Linux KVM host, and a macOS
+development host under HVF is the same class of machine. Design and policy
+decisions assume that machine.
+
+- Guest processor time is cheap and every device access crosses the
+  virtualization boundary, so a mechanism that spends processor work to
+  save device round-trips is usually the right one.
+- The facilities a host offers its guest are part of the machine model,
+  not an edge case.
+- The host's device models are a trust boundary: device input is
+  untrusted, and limiting what a device may access or claim is a
+  legitimate design input.
+- TCG checks correctness on architectures CI cannot virtualize. It is
+  never a design target, and an optimization that wins only under
+  emulation is not an optimization.
 
 ## 4. Async-first execution
 

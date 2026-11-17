@@ -3,12 +3,14 @@
 use core::future::Future;
 use core::ops::ControlFlow;
 use core::task::{Context, Poll, Waker};
+use helios_hal::vmm::PageFlags;
 use helios_linux::abi::Abi;
 use helios_linux::abi::Operation;
 use helios_linux::elf::{Error, Image};
 use helios_linux::syscall::{
-    Call, Credentials, Denied, Ids, MemoryFault, MemoryTotals, NoBacking, Process, Start, Stdio,
-    Stream, System, Thread, UserMemory, WriteError, dispatch as linux_dispatch,
+    Call, Credentials, Denied, Ids, MapError, MemoryFault, MemoryTotals, NoBacking, Process,
+    Region, Start, Stdio, Stream, System, Thread, UserMemory, WriteError,
+    dispatch as linux_dispatch,
 };
 
 // The crate root is not `mod.rs`, so the submodule names its directory.
@@ -22,8 +24,16 @@ fn parse(bytes: &[u8]) -> Result<Image<'_>, Error> {
     Image::parse(bytes, Abi::X86_64, USER_END)
 }
 
+/// Where these tests' processes start their break, past any memory a test
+/// reads.
+const PROGRAM_BREAK: u64 = 0x40_0000;
+
 fn new_process(id: u32) -> Process<NoBacking> {
-    Process::new(Abi::X86_64, core::num::NonZeroU32::new(id).unwrap())
+    Process::new(
+        Abi::X86_64,
+        core::num::NonZeroU32::new(id).unwrap(),
+        PROGRAM_BREAK,
+    )
 }
 
 /// The calling thread's thread pointer, which the sink keeps so a test
@@ -73,18 +83,42 @@ impl UserMemory for Memory {
         Ok(())
     }
 }
+/// The flat memory maps by growing; the calls that change mappings have
+/// their own tests over a page map (`tests/memory.rs`).
 impl helios_linux::syscall::VirtualMemory for Memory {
-    fn map_anonymous(
+    fn lowest_address(&self) -> u64 {
+        4096
+    }
+    fn map_anywhere(
         &mut self,
         hint: u64,
         length: u64,
-        _: bool,
-        _: bool,
-        _: bool,
+        _: PageFlags,
     ) -> Result<u64, helios_linux::syscall::MapError> {
         let base = hint.max((self.0.len() as u64 + 4095) & !4095).max(4096);
         self.0.resize((base + length) as usize, 0);
         Ok(base)
+    }
+    fn map_at(&mut self, _: u64, _: u64, _: PageFlags) -> Result<(), MapError> {
+        unreachable!("the flat test memory maps by growing only")
+    }
+    fn unmap(&mut self, _: u64, _: u64) {
+        unreachable!("the flat test memory maps by growing only")
+    }
+    fn protect(&mut self, _: u64, _: u64, _: PageFlags) -> Result<(), MapError> {
+        unreachable!("the flat test memory maps by growing only")
+    }
+    fn discard(&mut self, _: u64, _: u64) {
+        unreachable!("the flat test memory maps by growing only")
+    }
+    fn remap(&mut self, _: u64, _: u64, _: u64, _: u64) -> Result<(), MapError> {
+        unreachable!("the flat test memory maps by growing only")
+    }
+    fn region(&self, _: u64, _: u64) -> Option<Region> {
+        None
+    }
+    fn free_range(&self, _: u64, _: u64) -> Option<u64> {
+        unreachable!("the flat test memory maps by growing only")
     }
 }
 async fn dispatch(call: Call, memory: &Memory, sink: &mut Sink) -> ControlFlow<u8, u64> {
@@ -301,13 +335,26 @@ fn validates_static_elf_and_retains_bss_extent() {
     assert!(!segment.writable);
 }
 #[test]
-fn refuses_truncated_dynamic_writable_code_and_kernel_addresses() {
+fn a_writable_executable_segment_loads_writable_and_executable() {
+    // fs/binfmt_elf.c `load_elf_binary` maps a PF_R | PF_W | PF_X segment
+    // through `elf_map` with `make_prot(p_flags)`: PROT_READ, PROT_WRITE and
+    // PROT_EXEC together.
+    let mut bytes = image();
+    bytes[68..72].copy_from_slice(&7_u32.to_le_bytes());
+    let parsed = parse(&bytes).expect("an RWX load segment is a valid image");
+    let segment = parsed.segments().next().expect("the image's load segment");
+    assert!(segment.writable && segment.executable);
+}
+
+#[test]
+fn refuses_truncated_dynamic_unknown_flags_and_kernel_addresses() {
     assert!(parse(&image()[..40]).is_err());
     let mut bytes = image();
     bytes[16..18].copy_from_slice(&3_u16.to_le_bytes());
     assert!(matches!(parse(&bytes), Err(Error::UnsupportedImage)));
+    // A p_flags bit beyond PF_R, PF_W and PF_X.
     let mut bytes = image();
-    bytes[68..72].copy_from_slice(&7_u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&0x0d_u32.to_le_bytes());
     assert!(matches!(parse(&bytes), Err(Error::InvalidSegment)));
     let mut bytes = image();
     bytes[80..88].copy_from_slice(&0xffff800000000000_u64.to_le_bytes());
@@ -382,8 +429,11 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
 
 #[test]
 fn aarch64_numbers_reach_the_same_operations_and_legacy_numbers_do_not() {
-    let mut process =
-        Process::<NoBacking>::new(Abi::Aarch64, core::num::NonZeroU32::new(5).unwrap());
+    let mut process = Process::<NoBacking>::new(
+        Abi::Aarch64,
+        core::num::NonZeroU32::new(5).unwrap(),
+        PROGRAM_BREAK,
+    );
     let mut memory = Memory(vec![0; 64]);
     memory.0[..10].copy_from_slice("中文日\n".as_bytes());
     let mut sink = Sink::default();
@@ -695,8 +745,10 @@ fn anonymous_mmap_allocates_zeroed_memory_and_rejects_invalid_requests() {
     assert_eq!(&memory.0[4096..], &[0; 4096]);
     for (arguments, error) in [
         ([0, 0, 3, 0x22, u64::MAX, 0], 22u64),
-        ([0, 4096, 7, 0x22, u64::MAX, 0], 1),
-        ([0, 4096, 3, 0x32, u64::MAX, 0], 95),
+        // MAP_FIXED below the lowest mappable address.
+        ([0, 4096, 3, 0x32, u64::MAX, 0], 1),
+        // MAP_HUGETLB (0x40000), which no mapping here supports.
+        ([0, 4096, 3, 0x22 | 0x40000, u64::MAX, 0], 95),
         ([0, 4096, 3, 0x22, u64::MAX, 1], 22),
         ([0, u64::MAX, 3, 0x22, u64::MAX, 0], 12),
     ] {

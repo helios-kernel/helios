@@ -44,6 +44,7 @@ impl World {
             process: Process::with_descriptors(
                 abi,
                 core::num::NonZeroU32::new(77).unwrap(),
+                PROGRAM_BREAK,
                 helios_linux::syscall::standard_streams::<NoBacking>(),
                 start,
             ),
@@ -749,6 +750,7 @@ fn a_launcher_that_raised_the_descriptor_limit_raises_the_hard_limit_with_it() {
     let process = Process::<NoBacking>::with_descriptors(
         Abi::X86_64,
         core::num::NonZeroU32::new(9).unwrap(),
+        PROGRAM_BREAK,
         table,
         Start::default(),
     );

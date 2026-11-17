@@ -110,7 +110,10 @@ impl<'a> Image<'a> {
                 || bytes.len() as u64 > size
                 || flags & !(PF_R | PF_W | PF_X) != 0
                 || flags & PF_R == 0
-                || flags & (PF_W | PF_X) == PF_W | PF_X
+                // PF_W | PF_X loads writable and executable: fs/binfmt_elf.c
+                // `load_elf_binary` maps each PT_LOAD through `elf_map` with
+                // `make_prot(p_flags)`, which turns PF_W and PF_X into
+                // PROT_WRITE and PROT_EXEC together.
                 || (align > 1
                     && (!align.is_power_of_two()
                         || address % align != header.p_offset(endian) % align))
@@ -166,6 +169,18 @@ impl<'a> Image<'a> {
 
     pub fn entry(&self) -> u64 {
         self.file.entry()
+    }
+
+    /// Where the program break starts: the end of the highest load segment
+    /// rounded up to a page, as fs/binfmt_elf.c's `load_elf_binary` sets
+    /// `mm->start_brk` (`ELF_PAGEALIGN(elf_brk)`) when it does not
+    /// randomise the break.
+    pub fn program_break(&self, page_size: u64) -> u64 {
+        self.segments()
+            .map(|segment| segment.address + segment.memory_size)
+            .max()
+            .expect("a validated image has a load segment")
+            .next_multiple_of(page_size)
     }
 
     pub fn segments(&self) -> impl Iterator<Item = Segment<'a>> + '_ {
