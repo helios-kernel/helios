@@ -566,11 +566,20 @@ mod tests {
         assert_eq!(target, 9);
 
         let original = open_file(&process.descriptors, fd as i32);
-        original.set_offset(7);
+        original
+            .try_lock_position()
+            .expect("the position lock is free")
+            .set(7);
         for copy in [duplicate as i32, 9] {
             let shared = open_file(&process.descriptors, copy);
             assert!(shared.same_description(original));
-            assert_eq!(shared.offset(), 7);
+            assert_eq!(
+                shared
+                    .try_lock_position()
+                    .expect("the position lock is free")
+                    .get(),
+                7
+            );
         }
         // Only close-on-exec belongs to the slot.
         assert!(process.descriptors.get_entry(9).unwrap().close_on_exec);
