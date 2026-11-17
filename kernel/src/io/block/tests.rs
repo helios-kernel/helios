@@ -158,6 +158,20 @@ impl MemoryDisk {
         Self::from(state)
     }
 
+    /// Like [`Self::holding_writable`], but the device refuses every write
+    /// that covers the 512-byte block `failing`.
+    pub(crate) fn holding_writable_failing_at(
+        serial: &'static str,
+        image: &[u8],
+        failing: usize,
+    ) -> Self {
+        let mut disk = Self::holding_image(serial, image, false, false);
+        Arc::get_mut(&mut disk.state)
+            .expect("a disk just built has no other owner")
+            .fail_writes_at = Some(failing);
+        disk
+    }
+
     /// Makes every later read fail, or succeed again.
     pub(crate) fn fail_reads(&self, fail: bool) {
         self.state.fail_reads.store(fail, Ordering::SeqCst);
@@ -218,7 +232,7 @@ impl MemoryDisk {
             .collect()
     }
 
-    fn bytes_at(&self, offset: usize, len: usize) -> Vec<u8> {
+    pub(crate) fn bytes_at(&self, offset: usize, len: usize) -> Vec<u8> {
         self.state.bytes.lock()[offset..offset + len].to_vec()
     }
 

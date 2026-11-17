@@ -29,7 +29,7 @@ pub(crate) fn refuse_set_id(mode: u32) -> Result<(), WriteError> {
     Ok(())
 }
 
-impl<S: BlockSink> Transaction<'_, S> {
+impl<S: BlockSink> Transaction<S> {
     /// Replaces the permission bits, keeping the file type, as `chmod`
     /// (`chmod_common` in `fs/open.c` stores `(mode & S_IALLUGO) |
     /// (inode->i_mode & ~S_IALLUGO)`).

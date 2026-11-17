@@ -11,8 +11,10 @@ use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
 use helios_hal::fs::RenameMode::{Exchange, NoReplace, Replace};
 
-use super::write_tests::{Disk, assert_btrfs_check, filesystem_image_tree_file};
-use super::writer::{WriteTransaction, Writer};
+use super::write_tests::{
+    Disk, FixtureUuids, assert_btrfs_check, filesystem_image_tree_file, mount_writer,
+};
+use super::writer::Writer;
 use crate::source::BlockSink;
 use crate::transaction::Transaction;
 use crate::transaction::file::WriteOptions;
@@ -28,7 +30,7 @@ const WHEN: When = When {
 /// A freshly formatted image with a writer mounted on it.
 struct Image {
     named: tempfile::NamedTempFile,
-    writer: Writer<Disk>,
+    writer: Writer<Disk, FixtureUuids>,
     tree: u64,
     root: u64,
 }
@@ -43,7 +45,7 @@ fn name(tree: u64, parent: u64, bytes: &[u8]) -> Name<'_> {
 
 /// Creates a directory, or a regular file holding `content`.
 async fn create(
-    edits: &mut Transaction<'_, impl BlockSink>,
+    edits: &mut Transaction<impl BlockSink>,
     tree: u64,
     parent: u64,
     entry: &str,
@@ -82,18 +84,14 @@ async fn create(
     inode
 }
 
-/// Commits `tx`, then lets `verify` inspect the image at `path`.
+/// Commits the running transaction, then lets `verify` inspect the image at
+/// `path`.
 async fn commit(
-    tx: WriteTransaction<'_, Disk>,
+    writer: &mut Writer<Disk, FixtureUuids>,
     path: &std::path::Path,
     verify: &mut impl FnMut(&std::path::Path),
 ) {
-    tx.commit(
-        || panic!("valid fixture UUID"),
-        std::thread::available_parallelism().unwrap(),
-    )
-    .await
-    .unwrap();
+    writer.commit().await.unwrap();
     verify(path);
 }
 
@@ -108,7 +106,7 @@ impl Image {
             builder,
             named.reopen().unwrap(),
         ));
-        let writer = Writer::mount(Disk(named.reopen().unwrap())).await.unwrap();
+        let writer = mount_writer(Disk(named.reopen().unwrap())).await.unwrap();
         let root = writer.snapshot().unwrap().root().await.unwrap();
         Self {
             named,
@@ -151,7 +149,7 @@ impl Image {
 async fn exercise_noreplace(mut verify: impl FnMut(&std::path::Path)) {
     let mut image = Image::new().await;
     let (tree, root) = (image.tree, image.root);
-    let mut tx = image.writer.begin().await.unwrap();
+    let mut tx = image.writer.join().await.unwrap();
     let edits = tx.edits();
     let source = create(edits, tree, root, "source", Some(b"moved")).await;
     create(edits, tree, root, "taken", Some(b"kept")).await;
@@ -210,7 +208,7 @@ async fn exercise_noreplace(mut verify: impl FnMut(&std::path::Path)) {
         )
         .await
         .unwrap();
-    commit(tx, image.named.path(), &mut verify).await;
+    commit(&mut image.writer, image.named.path(), &mut verify).await;
     assert!(image.gone("/free").await);
     assert!(image.gone("/source").await);
     let (number, metadata) = image.stat("/taken").await;
@@ -226,18 +224,18 @@ fn rename_noreplace_refuses_an_existing_destination_with_eexist() {
 async fn exercise_exchange_file_and_directory(mut verify: impl FnMut(&std::path::Path)) {
     let mut image = Image::new().await;
     let (tree, root) = (image.tree, image.root);
-    let mut tx = image.writer.begin().await.unwrap();
+    let mut tx = image.writer.join().await.unwrap();
     let edits = tx.edits();
     let first = create(edits, tree, root, "甲", None).await;
     let second = create(edits, tree, root, "乙", None).await;
     let directory = create(edits, tree, first, "目录", None).await;
     create(edits, tree, directory, "内部", Some(b"inside")).await;
     let file = create(edits, tree, second, "文件名更长", Some(&[0x5a; 9000])).await;
-    commit(tx, image.named.path(), &mut verify).await;
+    commit(&mut image.writer, image.named.path(), &mut verify).await;
     let before_first = image.stat("/甲").await.1;
     let before_second = image.stat("/乙").await.1;
 
-    let mut tx = image.writer.begin().await.unwrap();
+    let mut tx = image.writer.join().await.unwrap();
     tx.edits()
         .rename(
             name(tree, first, "目录".as_bytes()),
@@ -247,7 +245,7 @@ async fn exercise_exchange_file_and_directory(mut verify: impl FnMut(&std::path:
         )
         .await
         .unwrap();
-    commit(tx, image.named.path(), &mut verify).await;
+    commit(&mut image.writer, image.named.path(), &mut verify).await;
 
     // Each name now shows the other object, and the objects are intact.
     let (number, metadata) = image.stat("/甲/目录").await;
@@ -271,7 +269,7 @@ async fn exercise_exchange_file_and_directory(mut verify: impl FnMut(&std::path:
     assert_eq!(image.stat("/甲/目录").await.1.ctime, WHEN);
     assert_eq!(image.stat("/乙/文件名更长").await.1.ctime, WHEN);
 
-    let mut tx = image.writer.begin().await.unwrap();
+    let mut tx = image.writer.join().await.unwrap();
     let edits = tx.edits();
     // The moved directory's parent reference follows it: the directory
     // that now holds it cannot go beneath it.
@@ -294,7 +292,7 @@ async fn exercise_exchange_file_and_directory(mut verify: impl FnMut(&std::path:
         )
         .await
         .unwrap();
-    commit(tx, image.named.path(), &mut verify).await;
+    commit(&mut image.writer, image.named.path(), &mut verify).await;
     assert_eq!(image.stat("/甲/目录").await.0, directory);
     assert_eq!(image.stat("/乙/文件名更长").await.0, file);
 }
@@ -307,7 +305,7 @@ fn 交换_文件与目录跨父目录互换且读回一致() {
 async fn exercise_exchange_directories(mut verify: impl FnMut(&std::path::Path)) {
     let mut image = Image::new().await;
     let (tree, root) = (image.tree, image.root);
-    let mut tx = image.writer.begin().await.unwrap();
+    let mut tx = image.writer.join().await.unwrap();
     let edits = tx.edits();
     let left = create(edits, tree, root, "左", None).await;
     let right = create(edits, tree, root, "右", None).await;
@@ -318,10 +316,10 @@ async fn exercise_exchange_directories(mut verify: impl FnMut(&std::path::Path))
     // A pair of different name lengths within one parent.
     let short = create(edits, tree, left, "a", None).await;
     let long = create(edits, tree, left, "bbbbbbbb", Some(b"b")).await;
-    commit(tx, image.named.path(), &mut verify).await;
+    commit(&mut image.writer, image.named.path(), &mut verify).await;
     let before = image.stat("/左").await.1;
 
-    let mut tx = image.writer.begin().await.unwrap();
+    let mut tx = image.writer.join().await.unwrap();
     let edits = tx.edits();
     edits
         .rename(
@@ -341,7 +339,7 @@ async fn exercise_exchange_directories(mut verify: impl FnMut(&std::path::Path))
         )
         .await
         .unwrap();
-    commit(tx, image.named.path(), &mut verify).await;
+    commit(&mut image.writer, image.named.path(), &mut verify).await;
     assert_eq!(image.stat("/左/ディレクトリ").await.0, right_directory);
     assert_eq!(image.stat("/右/디렉터리").await.0, left_directory);
     assert_eq!(image.read("/左/ディレクトリ/오른쪽").await, b"right");
@@ -352,7 +350,7 @@ async fn exercise_exchange_directories(mut verify: impl FnMut(&std::path::Path))
 
     // Both moved directories answer to their new parents: each parent now
     // lies above the directory that came from the other.
-    let mut tx = image.writer.begin().await.unwrap();
+    let mut tx = image.writer.join().await.unwrap();
     let edits = tx.edits();
     for (moved_into, parent_name, held) in
         [(left_directory, "右", right), (right_directory, "左", left)]
@@ -382,7 +380,7 @@ fn 存在しない名前との交換はenoentになりinvalidな交換はeinval�
     block_on(async {
         let mut image = Image::new().await;
         let (tree, root) = (image.tree, image.root);
-        let mut tx = image.writer.begin().await.unwrap();
+        let mut tx = image.writer.join().await.unwrap();
         let edits = tx.edits();
         let outer = create(edits, tree, root, "outer", None).await;
         let inner = create(edits, tree, outer, "inner", None).await;
@@ -436,7 +434,7 @@ fn 存在しない名前との交換はenoentになりinvalidな交換はeinval�
             )
             .await
             .unwrap();
-        commit(tx, image.named.path(), &mut |_| {}).await;
+        commit(&mut image.writer, image.named.path(), &mut |_| {}).await;
         assert_eq!(image.stat("/outer/inner").await.0, inner);
         assert_eq!(image.read("/file").await, b"x");
     });

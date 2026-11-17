@@ -306,8 +306,8 @@ impl Filesystem for Daemon {
         }
     }
 
-    // Every mutating request committed before it was answered, so nothing is
-    // pending for these to push.
+    // Closing a file makes nothing durable on Linux's btrfs either: every
+    // reply's change is already visible, and `fsync` is what commits it.
     fn flush(
         &self,
         _req: &Request,
@@ -319,6 +319,8 @@ impl Filesystem for Daemon {
         reply.ok();
     }
 
+    // The writer's commit is the whole filesystem's, so `fdatasync` commits
+    // what `fsync` does.
     fn fsync(
         &self,
         _req: &Request,
@@ -327,7 +329,7 @@ impl Filesystem for Daemon {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        finish(self.run(|state| block_on(state.sync())), reply);
     }
 
     fn fsyncdir(
@@ -338,7 +340,22 @@ impl Filesystem for Daemon {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        finish(self.run(|state| block_on(state.sync())), reply);
+    }
+
+    /// The unmount: what the running transaction holds becomes durable
+    /// before the daemon lets the device go.
+    fn destroy(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .expect("an earlier request panicked while holding the filesystem");
+        if let Err(errno) = block_on(state.sync()) {
+            tracing::error!(
+                ?errno,
+                "the unmount commit failed; the device keeps the last one"
+            );
+        }
     }
 
     fn readdir(
