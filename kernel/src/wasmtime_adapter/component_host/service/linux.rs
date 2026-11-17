@@ -30,8 +30,8 @@ use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_linux::abi::{self, Abi};
 use helios_linux::elf::{self, Image};
 use helios_linux::syscall::{
-    self, Call, Denied, EpollData, MapError, MemoryFault, Process, Resources, Stdio, Stream,
-    Thread, UserMemory, VirtualMemory, WriteError,
+    self, Call, Denied, EpollData, MapError, MemoryFault, Process, Region, Resources, Stdio,
+    Stream, Thread, UserMemory, VirtualMemory, WriteError,
 };
 
 /// Linux's default `RLIMIT_STACK` soft limit, `_STK_LIM` in
@@ -166,6 +166,9 @@ impl EpollData for EpollUserData {
 /// A process's address space as the system-call decoder sees it.
 struct LinuxMemory<'a, Space> {
     space: &'a Space,
+    /// The platform's user range, whose start is the lowest mappable
+    /// address.
+    user: VirtRange,
 }
 
 impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
@@ -186,30 +189,84 @@ impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
     }
 }
 
+fn page_range(address: u64, length: u64) -> VirtRange {
+    VirtRange::new(VirtAddr::new(address as usize), length as usize)
+}
+
+/// A refusal of a memory-map call the decoder already validated. Only the
+/// address space's own limits reach the process; anything else means the
+/// decoder and the space disagree on a range, a kernel defect.
+fn map_error(error: NativeError) -> MapError {
+    match error {
+        NativeError::OutOfMemory => MapError::OutOfMemory,
+        NativeError::Permissions => MapError::Permission,
+        NativeError::Address => MapError::Address,
+        NativeError::Overlap => MapError::Occupied,
+        error @ (NativeError::NotMapped | NativeError::Register) => {
+            panic!("a validated Linux memory-map call was refused: {error}")
+        }
+    }
+}
+
 impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
-    fn map_anonymous(
-        &mut self,
-        hint: u64,
-        length: u64,
-        readable: bool,
-        writable: bool,
-        executable: bool,
-    ) -> Result<u64, MapError> {
-        let mut flags = PageFlags::empty();
-        flags.set(PageFlags::READ, readable);
-        flags.set(PageFlags::WRITE, writable);
-        flags.set(PageFlags::EXECUTE, executable);
+    fn lowest_address(&self) -> u64 {
+        self.user.start.raw() as u64
+    }
+
+    fn map_anywhere(&mut self, hint: u64, length: u64, access: PageFlags) -> Result<u64, MapError> {
         self.space
-            .map_anywhere(VirtAddr::new(hint as usize), length as usize, flags)
+            .map_anywhere(VirtAddr::new(hint as usize), length as usize, access)
             .map(|range| range.start.raw() as u64)
-            .map_err(|error| match error {
-                NativeError::OutOfMemory => MapError::OutOfMemory,
-                NativeError::Permissions => MapError::Permission,
-                NativeError::Address
-                | NativeError::Overlap
-                | NativeError::NotMapped
-                | NativeError::Register => MapError::Invalid,
+            .map_err(map_error)
+    }
+
+    fn map_at(&mut self, address: u64, length: u64, access: PageFlags) -> Result<(), MapError> {
+        self.space
+            .map(page_range(address, length), &[], access)
+            .map_err(map_error)
+    }
+
+    fn unmap(&mut self, address: u64, length: u64) {
+        self.space
+            .unmap(page_range(address, length))
+            .unwrap_or_else(|error| panic!("unmapping a validated Linux range: {error}"));
+    }
+
+    fn protect(&mut self, address: u64, length: u64, access: PageFlags) -> Result<(), MapError> {
+        self.space
+            .protect(page_range(address, length), access)
+            .map_err(map_error)
+    }
+
+    fn discard(&mut self, address: u64, length: u64) {
+        self.space
+            .discard(page_range(address, length))
+            .unwrap_or_else(|error| panic!("discarding a validated Linux range: {error}"));
+    }
+
+    fn remap(&mut self, from: u64, length: u64, to: u64, new_length: u64) -> Result<(), MapError> {
+        self.space
+            .remap(page_range(from, length), page_range(to, new_length))
+            .map_err(map_error)
+    }
+
+    fn region(&self, start: u64, end: u64) -> Option<Region> {
+        if start >= end {
+            return None;
+        }
+        self.space
+            .mapping(page_range(start, end - start))
+            .map(|mapping| Region {
+                start: mapping.range.start.raw() as u64,
+                end: mapping.range.end().raw() as u64,
+                access: mapping.flags,
             })
+    }
+
+    fn free_range(&self, hint: u64, length: u64) -> Option<u64> {
+        self.space
+            .free_range(VirtAddr::new(hint as usize), length as usize)
+            .map(|start| start.raw() as u64)
     }
 }
 
@@ -421,7 +478,12 @@ where
         Some(table) => table.into_slots(),
         None => syscall::standard_streams::<LinuxResources<Net>>(),
     };
-    let mut process = Process::<LinuxResources<Net>>::with_descriptors(executable.abi, pid, table);
+    let mut process = Process::<LinuxResources<Net>>::with_descriptors(
+        executable.abi,
+        pid,
+        image.program_break(PhysFrame::SIZE as u64),
+        table,
+    );
     let mut stdio = LinuxStdio {
         cpu: cpu.clone(),
         timer: exec_context.timer.clone(),
@@ -467,7 +529,10 @@ where
                 // The call borrows the context for its thread pointer; the
                 // block ends that borrow before its result is written back.
                 let ended = {
-                    let mut memory = LinuxMemory { space: &space };
+                    let mut memory = LinuxMemory {
+                        space: &space,
+                        user,
+                    };
                     let mut thread = ContextThread(&mut context);
                     let mut call = core::pin::pin!(syscall::dispatch(
                         &mut process,
@@ -502,6 +567,24 @@ where
             }
             Stop::Preempted | Stop::Interrupted => crate::yield_now().await,
             Stop::Fault(fault) => match fault.kind {
+                // A discarded page's first touch, or a translation older
+                // than the page's current access: the space answers both,
+                // and the context retries the access.
+                FaultKind::Page {
+                    address, access, ..
+                } if user.contains(address)
+                    && space
+                        .mapping(VirtRange::new(address.page_floor(), PhysFrame::SIZE))
+                        .is_some_and(|page| page.flags.contains(access)) =>
+                {
+                    match space.resolve_fault(address, access) {
+                        Ok(()) => {}
+                        Err(NativeError::OutOfMemory) => {
+                            break Err(native_error(NativeError::OutOfMemory));
+                        }
+                        Err(error) => panic!("resolving a fault on a mapped page: {error}"),
+                    }
+                }
                 FaultKind::Page {
                     address,
                     present: false,

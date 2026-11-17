@@ -31,6 +31,11 @@ pub enum Operation {
     EpollWait,
     EpollPwait,
     Mmap,
+    Munmap,
+    Mprotect,
+    Mremap,
+    Madvise,
+    Brk,
     Ioctl,
     Writev,
     Getpid,
@@ -61,9 +66,14 @@ impl Abi {
                 1 => Operation::Write,
                 3 => Operation::Close,
                 9 => Operation::Mmap,
+                10 => Operation::Mprotect,
+                11 => Operation::Munmap,
+                12 => Operation::Brk,
                 16 => Operation::Ioctl,
                 20 => Operation::Writev,
                 22 => Operation::Pipe,
+                25 => Operation::Mremap,
+                28 => Operation::Madvise,
                 32 => Operation::Dup,
                 33 => Operation::Dup2,
                 39 => Operation::Getpid,
@@ -106,7 +116,12 @@ impl Abi {
                 96 => Operation::SetTidAddress,
                 172 => Operation::Getpid,
                 178 => Operation::Gettid,
+                214 => Operation::Brk,
+                215 => Operation::Munmap,
+                216 => Operation::Mremap,
                 222 => Operation::Mmap,
+                226 => Operation::Mprotect,
+                233 => Operation::Madvise,
                 _ => Operation::Unknown,
             },
         }
@@ -155,6 +170,19 @@ impl Abi {
         match self {
             Self::X86_64 => 4,
             Self::Aarch64 => 8,
+        }
+    }
+
+    /// Linux's `TASK_SIZE` for this ABI's processes: the end of the
+    /// addresses a mapping may reach. x86-64 keeps the last page below the
+    /// canonical hole unmappable (`TASK_SIZE_MAX`, (1 << 47) - PAGE_SIZE in
+    /// arch/x86/include/asm/page_64_types.h); arm64 ends at 1 << VA_BITS
+    /// (`TASK_SIZE_64`, arch/arm64/include/asm/processor.h) with the 48-bit
+    /// user range Helios's TTBR0 provides.
+    pub fn task_size(self) -> u64 {
+        match self {
+            Self::X86_64 => (1 << 47) - 4096,
+            Self::Aarch64 => 1 << 48,
         }
     }
 

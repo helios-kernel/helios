@@ -3,8 +3,10 @@ use core::convert::Infallible;
 use core::future::Future;
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
+use helios_hal::vmm::PageFlags;
 use helios_unix::{DescriptorSlots, FileDescriptor, FileDescriptorEntry, ProcessIdentity};
 mod io;
+mod memory;
 pub use crate::abi::{Abi, Operation};
 pub use io::Clock;
 
@@ -79,27 +81,64 @@ pub trait UserMemory {
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault>;
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MapError {
     #[error("user memory exhausted")]
     OutOfMemory,
     #[error("mapping permissions refused")]
     Permission,
-    #[error("invalid mapping")]
-    Invalid,
+    #[error("the range lies outside the mappable user range")]
+    Address,
+    #[error("the range is already mapped")]
+    Occupied,
 }
 
+/// A run of pages mapped contiguously with one access, `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub start: u64,
+    pub end: u64,
+    pub access: PageFlags,
+}
+
+/// The process's address space as its memory-map system calls change it.
+/// Every range is page aligned, nonempty and below the ABI's `TASK_SIZE`;
+/// the caller has validated it with Linux's errors. The process's task
+/// serialises these calls: each one is atomic, and nothing changes the
+/// space between two of them but the process's own calls.
 pub trait VirtualMemory: UserMemory {
-    /// Installs zero-filled private pages. `hint` is advisory. Failure
-    /// leaves the address space's mappings unchanged.
-    fn map_anonymous(
-        &mut self,
-        hint: u64,
-        length: u64,
-        readable: bool,
-        writable: bool,
-        executable: bool,
-    ) -> Result<u64, MapError>;
+    /// The lowest address the space maps.
+    fn lowest_address(&self) -> u64;
+
+    /// Installs zero-filled private pages at the first free range at or
+    /// above `hint`, else anywhere, and returns where.
+    fn map_anywhere(&mut self, hint: u64, length: u64, access: PageFlags) -> Result<u64, MapError>;
+
+    /// Installs zero-filled private pages at `address`, which must have no
+    /// mapping. Failure leaves the space unchanged.
+    fn map_at(&mut self, address: u64, length: u64, access: PageFlags) -> Result<(), MapError>;
+
+    /// Removes every mapping of the range; unmapped pages are skipped.
+    fn unmap(&mut self, address: u64, length: u64);
+
+    /// Replaces the access of the range, every page of which is mapped.
+    fn protect(&mut self, address: u64, length: u64, access: PageFlags) -> Result<(), MapError>;
+
+    /// Drops the contents of every mapped page of the range, which reads as
+    /// zeros afterwards and holds no memory until it is touched.
+    fn discard(&mut self, address: u64, length: u64);
+
+    /// Moves `[from, from + length)`, one region, to `to`, which has no
+    /// mapping, extending it with zero-filled pages of the same access to
+    /// `new_length`. Failure leaves the space unchanged.
+    fn remap(&mut self, from: u64, length: u64, to: u64, new_length: u64) -> Result<(), MapError>;
+
+    /// The first region of `[start, end)`, clipped to it.
+    fn region(&self, start: u64, end: u64) -> Option<Region>;
+
+    /// The first free range of `length` bytes at or above `hint`, else
+    /// anywhere.
+    fn free_range(&self, hint: u64, length: u64) -> Option<u64>;
 }
 
 /// The calling thread's thread pointer, which x86-64's `arch_prctl` sets
@@ -169,8 +208,6 @@ const ENOTTY: u64 = 25;
 const ENOSYS: u64 = 38;
 const EOPNOTSUPP: u64 = 95;
 const MAX_RW_COUNT: u64 = 0x7fff_f000; // Linux INT_MAX rounded down to a page.
-// x86-64 TASK_SIZE_MAX with four-level paging: the end of the user half.
-const X86_64_USER_END: u64 = 1 << 47;
 
 /// State of a single-threaded Linux process, exclusively owned by its task.
 /// No syscall or user-memory mutation runs concurrently with guest execution.
@@ -180,19 +217,27 @@ pub struct Process<R: Resources> {
     identity: ProcessIdentity,
     descriptors: Descriptors<R>,
     clear_child_tid: u64,
+    program_break: memory::ProgramBreak,
 }
 impl<R: Resources> Process<R> {
-    /// A process holding the standard streams only.
-    pub fn new(abi: Abi, id: NonZeroU32) -> Self {
-        Self::with_descriptors(abi, id, standard_streams::<R>())
+    /// A process holding the standard streams only, whose program break
+    /// starts at `program_break` (`Image::program_break`).
+    pub fn new(abi: Abi, id: NonZeroU32, program_break: u64) -> Self {
+        Self::with_descriptors(abi, id, program_break, standard_streams::<R>())
     }
     /// A process holding the descriptors its parent handed it.
-    pub fn with_descriptors(abi: Abi, id: NonZeroU32, descriptors: Descriptors<R>) -> Self {
+    pub fn with_descriptors(
+        abi: Abi,
+        id: NonZeroU32,
+        program_break: u64,
+        descriptors: Descriptors<R>,
+    ) -> Self {
         Self {
             abi,
             identity: ProcessIdentity::new(id.into()),
             descriptors,
             clear_child_tid: 0,
+            program_break: memory::ProgramBreak::new(program_break),
         }
     }
 }
@@ -260,13 +305,18 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread, O: Stdio + Cloc
             )
             .await
         }
-        Operation::Mmap => mmap(arguments, memory),
+        Operation::Mmap => memory::mmap(process.abi, arguments, memory),
+        Operation::Munmap => memory::munmap(process.abi, arguments, memory),
+        Operation::Mprotect => memory::mprotect(process.abi, arguments, memory),
+        Operation::Mremap => memory::mremap(process.abi, arguments, memory),
+        Operation::Madvise => memory::madvise(arguments, memory),
+        Operation::Brk => process.program_break.set(process.abi, arguments[0], memory),
         Operation::Getpid | Operation::Gettid => process.identity.id().get(),
         Operation::SetTidAddress => {
             process.clear_child_tid = arguments[0];
             process.identity.id().get()
         }
-        Operation::ArchPrctl => arch_prctl(arguments, memory, thread),
+        Operation::ArchPrctl => arch_prctl(process.abi, arguments, memory, thread),
         Operation::Writev => {
             writev::<R, _, _>(&process.descriptors, arguments, memory, output).await
         }
@@ -336,11 +386,18 @@ async fn write<R: Resources, M: UserMemory, O: Stdio>(
     written
 }
 
-fn arch_prctl<M: UserMemory, T: Thread>(args: [u64; 6], memory: &mut M, thread: &mut T) -> u64 {
+fn arch_prctl<M: UserMemory, T: Thread>(
+    abi: Abi,
+    args: [u64; 6],
+    memory: &mut M,
+    thread: &mut T,
+) -> u64 {
     // Linux UAPI asm/prctl.h: ARCH_SET_FS and ARCH_GET_FS.
     match args[0] as u32 {
         0x1002 => {
-            if args[1] >= X86_64_USER_END || thread.set_thread_pointer(args[1]).is_err() {
+            // arch/x86/kernel/process_64.c refuses a base at or above
+            // TASK_SIZE_MAX.
+            if args[1] >= abi.task_size() || thread.set_thread_pointer(args[1]).is_err() {
                 return errno(EPERM);
             }
             0
@@ -419,44 +476,6 @@ async fn writev<R: Resources, M: UserMemory, O: Stdio>(
     done
 }
 
-fn mmap<M: VirtualMemory>(args: [u64; 6], memory: &mut M) -> u64 {
-    // Linux mmap: MAP_PRIVATE | MAP_ANONYMOUS, PROT_{READ,WRITE,EXEC}, whose
-    // values asm-generic/mman-common.h gives both ABIs.
-    if args[1] == 0 || args[2] & !7 != 0 || args[3] & 3 != 2 || args[5] & 4095 != 0 {
-        return errno(EINVAL);
-    }
-    if args[3] & 0x20 == 0 {
-        // Output streams are valid descriptors but cannot back a mapping.
-        return errno(if matches!(args[4] as u32, 1 | 2) {
-            ENODEV
-        } else {
-            EBADF
-        });
-    }
-    if args[3] & !0x22 != 0 {
-        return errno(EOPNOTSUPP);
-    } // Unsupported mapping operations.
-    if args[2] & 6 == 6 {
-        return errno(EPERM);
-    } // Enforce the native W^X policy.
-    let Some(length) = args[1].checked_add(4095).map(|n| n & !4095) else {
-        return errno(ENOMEM);
-    };
-    // Both ISAs permit reads from writable or executable mappings as well.
-    match memory.map_anonymous(
-        args[0] & !4095,
-        length,
-        args[2] != 0,
-        args[2] & 2 != 0,
-        args[2] & 4 != 0,
-    ) {
-        Ok(address) => address,
-        Err(MapError::OutOfMemory) => errno(ENOMEM),
-        Err(MapError::Permission) => errno(EPERM),
-        Err(MapError::Invalid) => errno(EINVAL),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,7 +505,8 @@ mod tests {
 
     #[test]
     fn duplicated_file_descriptors_share_one_open_file_description() {
-        let mut process = Process::<Files>::new(Abi::X86_64, NonZeroU32::new(1).unwrap());
+        let mut process =
+            Process::<Files>::new(Abi::X86_64, NonZeroU32::new(1).unwrap(), 0x40_0000);
         let fd = process
             .descriptors
             .insert_entry(Entry::<Files>::new(
