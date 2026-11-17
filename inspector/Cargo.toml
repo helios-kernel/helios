@@ -44,6 +44,8 @@ object = { version = "0.39", default-features = false, features = ["elf", "read"
 # Decodes executable x86 kernel sections to enforce legacy encodings.
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
 ratatui = "0.30.0"
+# Encodes the frame the VNC capture reads as the `screendump` PNG.
+png = { version = "0.18.1", default-features = false }
 # Names the function each vCPU of a wedged guest was executing.
 rustc-demangle = "0.1.28"
 rustyline = "14.0.0"

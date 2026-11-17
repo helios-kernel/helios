@@ -2573,6 +2573,7 @@ dependencies = [
  "memchr",
  "nu-ansi-term",
  "object",
+ "png",
  "ratatui",
  "rustc-demangle",
  "rustix",
