@@ -27,10 +27,10 @@ tracing.workspace = true
 zerocopy = { version = "0.8.57", default-features = false, features = ["derive"] }
 # The tree's one zstd implementation. `std` and `simd` stay off: both
 # probe the processor at run time, which the kernel does through its `Cpu`.
-zrip-core = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
-zrip-decode = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"] }
+zrip-core = { version = "0.11.1", default-features = false, features = ["alloc"] }
+zrip-decode = { version = "0.8.13", default-features = false, features = ["alloc"] }
 
-zrip-encode = { git = "https://github.com/lexoliu/zrip", branch = "compress-context-alloc", default-features = false, features = ["alloc"], optional = true }
+zrip-encode = { version = "0.9.5", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }

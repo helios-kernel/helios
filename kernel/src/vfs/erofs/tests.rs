@@ -27,10 +27,11 @@ use helios_hal::fs::{
 
 use super::{ErofsError, ErofsFs};
 use crate::io::{MemoryDisk, cache_over};
+use crate::test_support::UnsupportedHostFileSystem;
 use crate::vfs::{AttachedStorage, BOOT_DEVICE, MountSource, MountTable, Namespace, Storage};
 use crate::{
     BlockCacheError, BootFs, EmbeddedBootDirectory, EmbeddedBootFs, MountRequestError,
-    ProcessAuthority, UnsupportedHostFileSystem, request_mount,
+    ProcessAuthority, request_mount,
 };
 
 const SERIAL: &str = "erofs-test";

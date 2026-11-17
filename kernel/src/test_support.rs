@@ -1825,6 +1825,165 @@ pub(crate) fn recording_udp_network_service()
     (service, closed)
 }
 
+/// A [`crate::HostFileSystem`] for a test that needs a host share type
+/// but never reaches one: every operation answers
+/// [`helios_hal::io::IoError::Unsupported`].
+#[derive(Clone)]
+pub(crate) struct UnsupportedHostFileSystem;
+
+fn unsupported_host_fs<T>() -> core::future::Ready<Result<T, crate::HostFsError>> {
+    core::future::ready(Err(crate::HostFsError::Transport(
+        helios_hal::io::IoError::Unsupported,
+    )))
+}
+
+impl crate::HostFileSystem for UnsupportedHostFileSystem {
+    type Write = core::convert::Infallible;
+
+    /// There is no share here, so there is nothing to have cached.
+    fn cache_stats(&self) -> Option<crate::HostFsCacheStats> {
+        None
+    }
+
+    /// No session and no cache, so a restore leaves nothing to drop.
+    fn after_machine_restore(
+        &self,
+        _restore: crate::HostShareRestore,
+    ) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    /// No session, so nothing to release for a snapshot.
+    fn prepare_snapshot(&self) -> impl core::future::Future<Output = ()> + Send + '_ {
+        core::future::ready(())
+    }
+
+    fn snapshot_finished(&self) {}
+
+    fn stat_path(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<crate::HostMetadata, crate::HostFsError>> + Send + '_
+    {
+        unsupported_host_fs()
+    }
+    fn read_dir(
+        &self,
+        _path: &str,
+        _limit: crate::HostDirLimit,
+    ) -> impl core::future::Future<Output = Result<Vec<crate::HostDirEntry>, crate::HostFsError>>
+    + Send
+    + '_ {
+        unsupported_host_fs()
+    }
+    fn read_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn read_file_range(
+        &self,
+        _path: &str,
+        _offset: u64,
+        _max_bytes: u32,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn prepare_write(
+        &self,
+        _path: &str,
+        _position: helios_hal::fs::WritePosition,
+        _len: usize,
+    ) -> impl core::future::Future<Output = Result<Self::Write, crate::HostFsError>> + Send + '_
+    {
+        unsupported_host_fs()
+    }
+    fn sync_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn truncate_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn set_file_size(
+        &self,
+        _path: &str,
+        _size: u64,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn set_times(
+        &self,
+        _path: &str,
+        _access_nanos: Option<u64>,
+        _modified_nanos: Option<u64>,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn create_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn create_directory(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn remove(
+        &self,
+        _path: &str,
+        _directory: bool,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn rename(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn hard_link(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn symlink(
+        &self,
+        _target: &str,
+        _link_path: &str,
+    ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
+        unsupported_host_fs()
+    }
+    fn read_link(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<alloc::string::String, crate::HostFsError>> + Send + '_
+    {
+        unsupported_host_fs()
+    }
+}
+
+/// The storage of a test machine with neither a host share nor a disk.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnsupportedStorage;
+
+impl crate::Storage for UnsupportedStorage {
+    type HostShare = UnsupportedHostFileSystem;
+    type Disk = crate::NoDisks;
+}
+
 #[test]
 fn floor_only_probe_selects_the_floor_level() {
     let levels = helios_artifact::cwasm_target_isa_levels(env!("HELIOS_BUILD_TARGET"));

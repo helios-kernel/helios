@@ -1276,8 +1276,8 @@ pub(crate) mod test_store {
     use crate::component::{ComponentOutputMode, ComponentStoreData};
     use crate::gpu::{ContextShared, Gpu3dService, SessionId};
     use crate::isa::GuestIsa;
-    use crate::test_support::{TestCpu, TestNetworkService};
-    use crate::{Executor, InstanceRegistry, ProcessAuthority, TaskFunding, UnsupportedStorage};
+    use crate::test_support::{TestCpu, TestNetworkService, UnsupportedStorage};
+    use crate::{Executor, InstanceRegistry, ProcessAuthority, TaskFunding};
 
     use crate::wasmtime_adapter::component_host::{HostRuntimeState, StoreData};
 
