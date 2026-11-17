@@ -44,6 +44,8 @@ mod compositor_plugin;
 use compositor_plugin::*;
 mod preview1;
 use preview1::*;
+#[cfg(test)]
+mod path_lookup_tests;
 mod wasix_proc;
 use wasix_proc::*;
 mod wasix_thread;

@@ -719,6 +719,9 @@ where
         Ok((descriptor.clone(), suffix.to_owned()))
     }
 
+    /// The descriptor `wasix-libc` (`<fcntl.h>`) passes for `AT_FDCWD`.
+    pub(super) const WASIX_AT_FDCWD: i32 = -2;
+
     pub(super) fn resolve_wasix_path_base(
         &self,
         fd: i32,
@@ -729,7 +732,8 @@ where
                 crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
             return self.resolve_absolute_guest_base(&guest_name);
         }
-        if let Some(cwd) = self.cwd.as_ref() {
+        if fd == Self::WASIX_AT_FDCWD {
+            let cwd = self.cwd.as_ref().ok_or(p1::errno::BADF)?;
             return Ok((cwd.descriptor.clone(), path.to_owned()));
         }
         let base = match self.descriptors.get(fd) {
@@ -764,6 +768,88 @@ where
         let absolute =
             crate::resolve_child_path(&base.path, &path).map_err(p1_errno_from_component_path)?;
         Ok((base, path, absolute))
+    }
+
+    pub(super) fn resolve_preview1_open_base(
+        &self,
+        fd: i32,
+        path: &str,
+    ) -> Result<(FsDescriptor, String), i32> {
+        if self.wasix_abi {
+            return self.resolve_wasix_path_base(fd, path);
+        }
+        let base = match self.descriptors.get(fd) {
+            None => return Err(p1::errno::BADF),
+            descriptor => p1_directory_descriptor(descriptor)
+                .ok_or(p1::errno::NOTDIR)?
+                .clone(),
+        };
+        Ok((base, path.to_owned()))
+    }
+
+    pub(super) async fn stat_preview1_path(
+        &self,
+        fd: i32,
+        flags: u32,
+        path: &str,
+    ) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32> {
+        let (base, path, absolute) = self.resolve_preview1_path(fd, path)?;
+        if absolute == WASIX_NULL_DEVICE_PATH {
+            return Ok((p1_null_device_identity(), p1_null_device_stat()));
+        }
+        let granted = p1_grant(&base)?;
+        let metadata = wasi_fs::stat_at(&self.filesystem, granted, p1_path_flags(flags), &path)
+            .await
+            .map_err(p1_errno_from_fs)?;
+        Ok((
+            crate::object_identity(&metadata),
+            wasi_fs::descriptor_stat(&metadata),
+        ))
+    }
+
+    pub(super) async fn set_preview1_path_times(
+        &self,
+        fd: i32,
+        path_flags: fs_types::PathFlags,
+        path: &str,
+        atim: u64,
+        mtim: u64,
+        fstflags: u16,
+    ) -> i32 {
+        let (base, path, _) = match self.resolve_preview1_path(fd, path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return errno,
+        };
+        let granted = match p1_grant(&base) {
+            Ok(granted) => granted,
+            Err(errno) => return errno,
+        };
+        let now_nanos = self.system_time_nanos();
+        let access = p1_timestamp_from_fstflags(
+            fstflags,
+            P1_FSTFLAG_ATIM,
+            P1_FSTFLAG_ATIM_NOW,
+            atim,
+            now_nanos,
+        );
+        let modified = p1_timestamp_from_fstflags(
+            fstflags,
+            P1_FSTFLAG_MTIM,
+            P1_FSTFLAG_MTIM_NOW,
+            mtim,
+            now_nanos,
+        );
+        wasi_fs::set_times_at(
+            &self.filesystem,
+            granted,
+            path_flags,
+            &path,
+            access,
+            modified,
+            now_nanos,
+        )
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
     }
 }
 
@@ -2941,20 +3027,9 @@ where
     let path = memory
         .read_path(GuestAddress::wasm32(path), path_len)
         .await?;
-    let (base, path) = if caller.data().wasix_abi {
-        match caller.data().resolve_wasix_path_base(fd, &path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return Ok(errno),
-        }
-    } else {
-        let base = match caller.data().descriptors.get(fd) {
-            None => return Ok(p1::errno::BADF),
-            descriptor => match p1_directory_descriptor(descriptor) {
-                Some(descriptor) => descriptor.clone(),
-                None => return Ok(p1::errno::NOTDIR),
-            },
-        };
-        (base, path)
+    let (base, path) = match caller.data().resolve_preview1_open_base(fd, &path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return Ok(errno),
     };
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
@@ -3156,20 +3231,7 @@ where
     let path = memory
         .read_path(GuestAddress::wasm32(path), path_len)
         .await?;
-    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
-        Ok(resolved) => resolved,
-        Err(errno) => return Ok(errno),
-    };
-    if absolute == WASIX_NULL_DEVICE_PATH {
-        return p1_write_filestat(
-            caller,
-            stat,
-            p1_null_device_identity(),
-            p1_null_device_stat(),
-        )
-        .await;
-    }
-    let (identity, stat_value) = p1_stat_below(caller, &base, p1_path_flags(flags), &path).await?;
+    let (identity, stat_value) = caller.data().stat_preview1_path(fd, flags, &path).await?;
     p1_write_filestat(caller, stat, identity, stat_value).await
 }
 
@@ -3180,7 +3242,7 @@ where
 pub(super) async fn p1_path_filestat_set_times<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
-    _flags: u32,
+    flags: u32,
     path: u32,
     path_len: u32,
     atim: u64,
@@ -3198,12 +3260,22 @@ where
     let path = memory
         .read_path(GuestAddress::wasm32(path), path_len)
         .await?;
-    Ok(p1_path_filestat_set_times_at(caller, fd, &path, atim, mtim, fstflags).await)
+    Ok(p1_path_filestat_set_times_at(
+        caller,
+        fd,
+        p1_path_flags(flags),
+        &path,
+        atim,
+        mtim,
+        fstflags,
+    )
+    .await)
 }
 
 async fn p1_path_filestat_set_times_at<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
+    path_flags: fs_types::PathFlags,
     path: &str,
     atim: u64,
     mtim: u64,
@@ -3214,19 +3286,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, path) {
-        Ok(resolved) => resolved,
-        Err(errno) => return errno,
-    };
-    let granted = match p1_grant(&base) {
-        Ok(granted) => granted,
-        Err(errno) => return errno,
-    };
-    let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
-    let namespace = p1_namespace(caller);
-    wasi_fs::set_times_at(&namespace, granted, &path, access, modified, now_nanos)
+    caller
+        .data()
+        .set_preview1_path_times(fd, path_flags, path, atim, mtim, fstflags)
         .await
-        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 #[expect(
@@ -5159,6 +5222,7 @@ mod tests {
         block_on(wasi_fs::set_times_at(
             &namespace,
             p1_grant(&creator).expect("PATH_CREATE_FILE gives mutate-directory"),
+            fs_types::PathFlags::empty(),
             "data",
             None,
             Some(88),
