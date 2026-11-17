@@ -679,35 +679,29 @@ where
     let timeout =
         wasix_read_optional_timestamp_async(&memory, GuestAddress::wasm32(timeout)).await?;
     let key = caller.data().futex_key(futex);
-    let ((registration, mut wake), current) =
+    let (mut registration, current) =
         wasix_futex_armed_word(&memory, GuestAddress::wasm32(futex), || {
-            let registration = caller.data().threads.futex().prepare_wait(key);
-            let wake = registration.notify().waiter();
-            (registration, wake)
+            caller.data().threads.futex().prepare_wait(key)
         })
         .await?;
     if current != expected {
         return Ok(p1::errno::INVAL);
     }
 
-    let woken = match timeout {
-        Some(0) => false,
+    match timeout {
+        Some(0) => {}
         Some(timeout_nanos) => {
             let sleep = caller.data().sleep_for(Duration::from_nanos(timeout_nanos));
-            let wake =
-                core::future::poll_fn(|cx| registration.notify().poll_notified(cx, &mut wake));
+            let wake = registration.released();
             futures::pin_mut!(wake);
             futures::pin_mut!(sleep);
-            matches!(
-                futures::future::select(wake, sleep).await,
-                futures::future::Either::Left(_)
-            )
+            futures::future::select(wake, sleep).await;
         }
-        None => {
-            core::future::poll_fn(|cx| registration.notify().poll_notified(cx, &mut wake)).await;
-            true
-        }
-    };
+        None => registration.released().await,
+    }
+    // A wake that released this wait counted it, so the wait reports it
+    // even when the timeout ended it first.
+    let woken = registration.is_released();
     drop(registration);
     memory
         .write_u8(GuestAddress::wasm32(ret_woken), u8::from(woken))
@@ -719,14 +713,13 @@ where
 /// waits on, as one synchronous step of the poll that found the word's
 /// page present.
 ///
-/// The wait is armed before the word is compared. `futex_wake` stores a
-/// permit this wait can still claim, but `futex_wake_all` broadcasts to
-/// the waits that already exist and banks nothing, so a wake-all landing
-/// between the comparison and the park is only observed by a wait that
-/// was armed first. Arming only once the page is back keeps the window in
-/// which a wake reaches a wait that may then find the word changed — and
-/// drop the permit it claimed — as narrow as it is with every page
-/// present, however long the page took to come back.
+/// The wait is armed before the word is compared. A futex wake releases
+/// the waits queued on the key when it runs and banks nothing, so a wake
+/// landing between the comparison and the park is only observed by a wait
+/// that was queued first. Arming only once the page is back keeps the
+/// window in which a wake releases a wait that may then find the word
+/// changed as narrow as it is with every page present, however long the
+/// page took to come back.
 pub(super) async fn wasix_futex_armed_word<Armed>(
     memory: &Preview1AsyncMemory,
     futex: GuestAddress,

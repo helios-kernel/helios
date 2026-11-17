@@ -22,9 +22,10 @@
 //! [`ProviderSlot::send`] is lock-free apart from the queue's own
 //! backpressure and may be called concurrently from any processor; producers
 //! park on a [`Notify`] rather than spinning, and the single consumer parks the
-//! same way when the queue is empty. Both notifications are permit-based, so a
-//! wakeup published before the peer starts awaiting is remembered rather than
-//! lost.
+//! same way when the queue is empty. Both notifications are broadcasts that
+//! store nothing, and every waiter arms its wait before it tests the queue:
+//! the queue is the state, a wake only says it may have moved, so no wake
+//! outlives the queue state it was raised for.
 //!
 //! `futures::channel::mpsc` is deliberately not used here: it lives behind
 //! `futures-channel`'s `std` feature, which a `#![no_std]` kernel cannot
@@ -67,9 +68,11 @@ pub enum ProviderError {
 /// Shared state of one provider queue.
 struct ProviderChannel<M> {
     queue: ConcurrentQueue<M>,
-    /// One permit per queued message, for the single consumer.
+    /// Broadcast after every push and on close, for the single consumer,
+    /// which arms before it pops.
     ready: Notify,
-    /// One permit per freed slot, for however many producers are parked.
+    /// Broadcast after every pop and on close, for however many producers
+    /// are parked; each arms before it pushes or tests for room.
     room: Notify,
 }
 
@@ -121,14 +124,14 @@ impl<M> ProviderSender<M> {
     pub async fn send(&self, message: M) -> Result<(), ProviderError> {
         let mut message = message;
         loop {
-            // Armed before the push: the receiver's close broadcast is
-            // not banked, so a receiver dropped between a full push and
-            // the park would otherwise leave this sender asleep with no
-            // further `room` notification ever coming.
+            // Armed before the push: `room` is a broadcast and banks
+            // nothing, so a pop or a close between a full push and the
+            // park would otherwise leave this sender asleep beside a free
+            // slot or a closed queue.
             let room = self.channel.room.notified();
             match self.channel.queue.push(message) {
                 Ok(()) => {
-                    self.channel.ready.notify_one();
+                    self.channel.ready.notify_all();
                     return Ok(());
                 }
                 Err(PushError::Full(returned)) => {
@@ -152,7 +155,7 @@ impl<M> ProviderSender<M> {
     pub fn try_send(&self, message: M) -> Result<(), ProviderError> {
         match self.channel.queue.push(message) {
             Ok(()) => {
-                self.channel.ready.notify_one();
+                self.channel.ready.notify_all();
                 Ok(())
             }
             Err(PushError::Full(_)) => Err(ProviderError::Full),
@@ -168,10 +171,9 @@ impl<M> ProviderSender<M> {
     /// that sends it — a check against state the send itself changes —
     /// and so sends with [`Self::try_send`] and parks here on
     /// [`ProviderError::Full`] rather than parking inside a send with
-    /// the decision already made. Room is one permit per message the
-    /// receiver takes; a producer woken here that then sends nothing
-    /// passes its turn on with [`Self::pass_room`], so a producer parked
-    /// behind it is not left asleep beside a free slot.
+    /// the decision already made. Every pop releases every producer
+    /// parked here to test the queue again, so a producer woken here
+    /// that then sends nothing leaves no other producer asleep.
     pub async fn room(&self) {
         loop {
             // Armed before the queue is tested, for the reason `send`
@@ -183,12 +185,6 @@ impl<M> ProviderSender<M> {
             room.await;
         }
     }
-
-    /// Hand the turn [`Self::room`] gave this producer to the next one
-    /// parked there.
-    pub fn pass_room(&self) {
-        self.channel.room.notify_one();
-    }
 }
 
 impl<M> ProviderSender<M> {
@@ -196,7 +192,7 @@ impl<M> ProviderSender<M> {
     /// remains available to the receiver; blocked producers observe closure.
     pub fn close(&self) {
         self.channel.queue.close();
-        self.channel.ready.notify_one();
+        self.channel.ready.notify_all();
         self.channel.room.notify_all();
     }
 }
@@ -206,7 +202,7 @@ impl<M> ProviderReceiver<M> {
     pub fn try_recv(&self) -> Result<M, ProviderError> {
         match self.channel.queue.pop() {
             Ok(message) => {
-                self.channel.room.notify_one();
+                self.channel.room.notify_all();
                 Ok(message)
             }
             Err(PopError::Empty) => Err(ProviderError::Unavailable),
@@ -216,12 +212,16 @@ impl<M> ProviderReceiver<M> {
     /// Await the next message, or `None` once the queue is closed and drained.
     pub async fn recv(&self) -> Option<M> {
         loop {
+            // Armed before the pop: `ready` is a broadcast and banks
+            // nothing, so a push between an empty pop and the park is
+            // only observed by a wait that already exists.
+            let ready = self.channel.ready.notified();
             match self.channel.queue.pop() {
                 Ok(message) => {
-                    self.channel.room.notify_one();
+                    self.channel.room.notify_all();
                     return Some(message);
                 }
-                Err(PopError::Empty) => self.channel.ready.notified().await,
+                Err(PopError::Empty) => ready.await,
                 Err(PopError::Closed) => return None,
             }
         }
@@ -354,7 +354,7 @@ mod tests {
             sender.send(1).await.expect("first message fits");
             // The queue is full now: this send only completes because the
             // consumer, driven by the same single-threaded executor, frees a
-            // slot and publishes a `room` permit.
+            // slot and broadcasts `room` to the armed producer.
             let produce = async {
                 sender.send(2).await.expect("second message must fit later");
                 sender.send(3).await.expect("third message must fit later");
@@ -366,6 +366,42 @@ mod tests {
             };
             futures::future::join(produce, consume).await;
         });
+    }
+
+    /// Polls a fresh wait on `notify` once, reporting whether it completed.
+    fn completes_at_once(notify: &Notify) -> bool {
+        let mut context = core::task::Context::from_waker(core::task::Waker::noop());
+        core::pin::pin!(notify.notified())
+            .as_mut()
+            .poll(&mut context)
+            .is_ready()
+    }
+
+    /// A burst the consumer takes without ever parking leaves no wake
+    /// behind on either signal: a wait made once the queue is empty, or
+    /// once it is full again, parks instead of completing on a wake that
+    /// described a queue state long gone.
+    #[test]
+    fn a_burst_taken_without_parking_leaves_no_wake_behind() {
+        let (sender, receiver) = provider_channel::<u32>(2);
+        for message in 0..2 {
+            sender.try_send(message).expect("the burst fits");
+        }
+        assert_eq!(receiver.try_recv(), Ok(0));
+        assert_eq!(block_on(receiver.recv()), Some(1));
+
+        assert!(
+            !completes_at_once(&receiver.channel.ready),
+            "an empty queue has nothing for the consumer"
+        );
+
+        for message in 2..4 {
+            sender.try_send(message).expect("the queue has room again");
+        }
+        assert!(
+            !completes_at_once(&sender.channel.room),
+            "a full queue has no room for a producer"
+        );
     }
 
     #[test]
