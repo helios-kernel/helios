@@ -128,6 +128,8 @@ test-kernel run_ignored="default":
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run {{ kernel_unit_packages }} --lib --run-ignored "{{ run_ignored }}"
+    # The Linux process host is behind a feature the run above leaves off.
+    cargo nextest run -p helios-kernel --lib --features linux --run-ignored "{{ run_ignored }}"
     cargo nextest run -p helios-kernel --test hal_layering
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and
@@ -148,6 +150,7 @@ warm-test-kernel:
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run --no-run {{ kernel_unit_packages }} --lib
+    cargo nextest run --no-run -p helios-kernel --lib --features linux
     cargo nextest run --no-run -p helios-kernel --test hal_layering
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run --no-run -p helios-hosted
 
