@@ -713,7 +713,14 @@ fn resolve_lock_dependency(
         .filter(|(_, package)| {
             package.name == name
                 && version.is_none_or(|version| package.version == version)
-                && source.is_none_or(|source| package.source.as_deref() == Some(source))
+                // A dependency entry names a git source without the commit
+                // the package's own `source` ends with after a `#`.
+                && source.is_none_or(|source| {
+                    package
+                        .source
+                        .as_deref()
+                        .is_some_and(|candidate| candidate.split('#').next() == Some(source))
+                })
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
@@ -1547,6 +1554,30 @@ checksum = "dd"
         assert_ne!(
             lock_closure_digest(&moved, "kernel").expect("kernel is in the lockfile"),
             lock_closure_digest(LOCK, "kernel").expect("kernel is in the lockfile"),
+        );
+    }
+
+    #[test]
+    fn a_git_dependency_is_found_by_its_source_without_the_commit() {
+        let lock = r#"
+version = 4
+
+[[package]]
+name = "kernel"
+version = "0.1.0"
+dependencies = ["acpi 6.1.1 (git+https://example.org/acpi?branch=helios)"]
+
+[[package]]
+name = "acpi"
+version = "6.1.1"
+source = "git+https://example.org/acpi?branch=helios#0123abcd"
+"#;
+        let digest = lock_closure_digest(lock, "kernel").expect("the git package resolves");
+        // The commit is part of what the package is.
+        assert_ne!(
+            lock_closure_digest(&lock.replace("0123abcd", "4567ef01"), "kernel")
+                .expect("the git package resolves"),
+            digest
         );
     }
 
