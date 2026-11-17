@@ -368,6 +368,16 @@ and never comes from CI.
   holds no more than its container was granted. Every syscall that reaches
   a resource derives the capability the matching WASI or WASIX operation
   derives, and a missing right fails with Linux's errno.
+- A filesystem reaches a program only through an explicit mount, and the
+  rights the mount grants are all a WASI or WASIX program holds on it:
+  neither sees ownership, modes or ACLs. A container's mounts are the same
+  explicit mounts, and their rights bound everything the container's
+  processes can do on them. Within that bound, the kernel enforces the
+  ownership, modes, ACLs, setuid bits and file capabilities a Unix
+  filesystem stores, as Linux does. A node a non-Linux program creates on
+  such a filesystem takes its owner and group from its parent directory,
+  and its mode from the parent's, with the execute bits cleared for a
+  regular file; no mount or WASI interface carries a user or group.
 - Native execution runs only with the hardware protections its contract
   states (kernel-mode execute and access protection of user pages, a
   processor unaffected by rogue data cache load) and refuses to start where
