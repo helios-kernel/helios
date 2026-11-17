@@ -4,7 +4,9 @@ use core::future::Future;
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 use helios_hal::vmm::PageFlags;
-use helios_unix::{DescriptorSlots, FileDescriptor, FileDescriptorEntry, ProcessIdentity};
+use helios_unix::{
+    DescriptorSlots, FileDescriptor, FileDescriptorEntry, NoNetwork, ProcessIdentity, SocketNetwork,
+};
 mod io;
 mod memory;
 mod system;
@@ -16,13 +18,13 @@ pub use system::{
 };
 
 /// The platform objects a process's descriptors can hold besides the UNIX
-/// objects `helios-unix` owns (pipes, eventfds, epoll sets): the host's
-/// files and sockets, and the user data its epoll interests carry. A
-/// process shares descriptors with programs of another ABI by naming the
-/// same resource set they use.
+/// objects `helios-unix` owns (pipes, eventfds, epoll sets, sockets): the
+/// host's files, the network its sockets live on, and the user data its
+/// epoll interests carry. A process shares descriptors with programs of
+/// another ABI by naming the same resource set they use.
 pub trait Resources: 'static {
     type File: Clone;
-    type Socket: Clone;
+    type Network: SocketNetwork;
     type Data: EpollData;
 }
 
@@ -41,18 +43,19 @@ impl EpollData for u64 {
     }
 }
 
-/// A resource set with no files and no sockets.
+/// A resource set with no files and no network: its only sockets are
+/// socket pairs.
 pub struct NoBacking;
 impl Resources for NoBacking {
     type File = Infallible;
-    type Socket = Infallible;
+    type Network = NoNetwork;
     type Data = u64;
 }
 
 pub type Descriptor<R> =
-    FileDescriptor<<R as Resources>::File, <R as Resources>::Socket, <R as Resources>::Data>;
+    FileDescriptor<<R as Resources>::File, <R as Resources>::Network, <R as Resources>::Data>;
 pub type Entry<R> =
-    FileDescriptorEntry<<R as Resources>::File, <R as Resources>::Socket, <R as Resources>::Data>;
+    FileDescriptorEntry<<R as Resources>::File, <R as Resources>::Network, <R as Resources>::Data>;
 pub type Descriptors<R> = DescriptorSlots<Entry<R>>;
 
 /// The descriptor table a process started by no other process holds:
@@ -528,7 +531,7 @@ mod tests {
     struct Files;
     impl Resources for Files {
         type File = Node;
-        type Socket = Infallible;
+        type Network = NoNetwork;
         type Data = u64;
     }
 

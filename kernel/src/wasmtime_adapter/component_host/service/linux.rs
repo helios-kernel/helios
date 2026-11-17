@@ -149,7 +149,7 @@ pub(super) struct LinuxResources<Net>(core::marker::PhantomData<fn() -> Net>);
 
 impl<Net: ComponentHostNetwork> Resources for LinuxResources<Net> {
     type File = FsDescriptor;
-    type Socket = WasixSocketDescriptor<Net>;
+    type Network = crate::UnixNetwork<Net>;
     type Data = EpollUserData;
 }
 
