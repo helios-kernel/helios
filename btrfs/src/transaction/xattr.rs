@@ -125,7 +125,7 @@ fn locate(tree: u64, key: Key, item: &[u8], name: &[u8]) -> Result<Option<Locate
     Ok(None)
 }
 
-impl<S: BlockSink> Transaction<'_, S> {
+impl<S: BlockSink> Transaction<S> {
     /// `BTRFS_MAX_ITEM_SIZE`: what one item may hold in a leaf.
     fn max_item(&self) -> usize {
         self.volume.superblock().nodesize() as usize - size_of::<RawHeader>() - size_of::<RawItem>()
@@ -312,10 +312,6 @@ impl<S: BlockSink> Transaction<'_, S> {
     /// `security.capability` and ignores its absence): drops the file
     /// capability of a non-directory. Only the item changes; the owner change
     /// writes the inode, ctime included.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the owner change of lexoliu/helios#1066 calls it")
-    )]
     pub(crate) async fn kill_privileges(
         &mut self,
         tree: u64,

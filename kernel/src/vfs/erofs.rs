@@ -34,7 +34,7 @@ use erofs_rs::backend::AsyncImage;
 use erofs_rs::types::{DirentFileType, FeatureCompat, FileType, Inode, SUPER_BLOCK_OFFSET};
 use helios_hal::fs::{
     BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult,
-    Metadata, NodeId, NodeKind, OpenFlags, WritePosition,
+    Metadata, NodeId, NodeKind, OpenFlags, RenameMode, WritePosition,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -440,7 +440,7 @@ where
         Err(FsError::ReadOnly)
     }
 
-    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: RenameMode, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 

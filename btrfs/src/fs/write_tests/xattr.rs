@@ -11,7 +11,7 @@ use ferrosys::{Metadata, Timestamp as ImageTime, TreeBuilder};
 use futures_lite::future::block_on;
 use zerocopy::{FromZeros, IntoBytes};
 
-use super::{Disk, assert_btrfs_check, filesystem_image_tree_file};
+use super::{Disk, FixtureUuids, assert_btrfs_check, filesystem_image_tree_file, mount_writer};
 use crate::csum::name_hash;
 use crate::fs::writer::{Attributes, InodeHandle, Name, WriteTransaction, Writer};
 use crate::ondisk::{RawDirItem, RawInodeItem, RawKey, item_type, view};
@@ -37,11 +37,26 @@ fn when(second: i64) -> Timestamp {
     }
 }
 
-/// An image whose `/file` carries attributes in every namespace, written by
-/// the independent formatter the way Linux stores them.
-fn image() -> (tempfile::NamedTempFile, Writer<Disk>) {
-    let stamp = ImageTime::from_secs(1_700_000_000);
+type DiskWriter = Writer<Disk, FixtureUuids>;
+type Transaction<'a> = WriteTransaction<'a, Disk, FixtureUuids>;
+
+/// A writer over `tree`, formatted by the independent formatter the way
+/// Linux stores it.
+fn mounted(tree: TreeBuilder) -> (tempfile::NamedTempFile, DiskWriter) {
     let named = tempfile::NamedTempFile::new().unwrap();
+    drop(filesystem_image_tree_file(
+        true,
+        true,
+        tree,
+        named.reopen().unwrap(),
+    ));
+    let writer = block_on(mount_writer(Disk(named.reopen().unwrap()))).unwrap();
+    (named, writer)
+}
+
+/// An image whose `/file` carries attributes in every namespace.
+fn image() -> (tempfile::NamedTempFile, DiskWriter) {
+    let stamp = ImageTime::from_secs(1_700_000_000);
     let tree = TreeBuilder::new()
         .root(Metadata::new(0o755, stamp))
         .file("/file", b"data".to_vec(), Metadata::new(0o644, stamp))
@@ -55,22 +70,15 @@ fn image() -> (tempfile::NamedTempFile, Writer<Disk>) {
         .directory("/dir", Metadata::new(0o755, stamp))
         .symlink("/link", "file", Metadata::new(0o777, stamp))
         .fifo("/pipe", Metadata::new(0o644, stamp));
-    drop(filesystem_image_tree_file(
-        true,
-        true,
-        tree,
-        named.reopen().unwrap(),
-    ));
-    let writer = block_on(Writer::mount(Disk(named.reopen().unwrap()))).unwrap();
-    (named, writer)
+    mounted(tree)
 }
 
-async fn lookup(tx: &WriteTransaction<'_, Disk>, name: &str) -> InodeHandle {
+async fn lookup(tx: &Transaction<'_>, name: &str) -> InodeHandle {
     let root = tx.root().await.unwrap();
     tx.lookup(&root, name.as_bytes()).await.unwrap().unwrap()
 }
 
-async fn value(tx: &WriteTransaction<'_, Disk>, file: &InodeHandle, name: &[u8]) -> Vec<u8> {
+async fn value(tx: &Transaction<'_>, file: &InodeHandle, name: &[u8]) -> Vec<u8> {
     let length = tx.xattr(file, name, &mut []).await.unwrap();
     let mut buffer = vec![0; length];
     // A zero-length value has no buffer to ask for.
@@ -80,7 +88,7 @@ async fn value(tx: &WriteTransaction<'_, Disk>, file: &InodeHandle, name: &[u8])
     buffer
 }
 
-async fn names(tx: &WriteTransaction<'_, Disk>, file: &InodeHandle) -> Vec<Vec<u8>> {
+async fn names(tx: &Transaction<'_>, file: &InodeHandle) -> Vec<Vec<u8>> {
     let length = tx.list_xattrs(file, &mut []).await.unwrap();
     let mut buffer = vec![0; length];
     if length > 0 {
@@ -122,12 +130,7 @@ async fn read_back(
 }
 
 /// Writes an attribute of any namespace, as an image written by Linux has it.
-async fn inject(
-    tx: &mut WriteTransaction<'_, Disk>,
-    file: &InodeHandle,
-    name: &[u8],
-    value: &[u8],
-) {
+async fn inject(tx: &mut Transaction<'_>, file: &InodeHandle, name: &[u8], value: &[u8]) {
     let edits = tx.edits();
     let root = edits.roots.get(file.tree()).unwrap();
     let key = Key::new(file.number(), item_type::XATTR_ITEM, name_hash(name));
@@ -155,7 +158,7 @@ async fn inject(
     edits.roots.set(root).unwrap();
 }
 
-async fn raw_inode(tx: &mut WriteTransaction<'_, Disk>, file: &InodeHandle) -> RawInodeItem {
+async fn raw_inode(tx: &mut Transaction<'_>, file: &InodeHandle) -> RawInodeItem {
     let edits = tx.edits();
     let root = edits.roots.get(file.tree()).unwrap();
     let bytes = edits
@@ -172,7 +175,7 @@ async fn raw_inode(tx: &mut WriteTransaction<'_, Disk>, file: &InodeHandle) -> R
 }
 
 /// The `XATTR_ITEM`s stored for `file`: key offset and record count.
-async fn items(tx: &mut WriteTransaction<'_, Disk>, file: &InodeHandle) -> Vec<(u64, usize)> {
+async fn items(tx: &mut Transaction<'_>, file: &InodeHandle) -> Vec<(u64, usize)> {
     let edits = tx.edits();
     let root = edits.roots.get(file.tree()).unwrap();
     let mut found = Vec::new();
@@ -198,9 +201,8 @@ async fn items(tx: &mut WriteTransaction<'_, Disk>, file: &InodeHandle) -> Vec<(
 #[test]
 fn set_get_list_and_remove_round_trip_through_the_reader() {
     let (_named, mut writer) = image();
-    let concurrency = std::thread::available_parallelism().unwrap();
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
         let directory = lookup(&tx, "dir").await;
         let before = raw_inode(&mut tx, &file).await;
@@ -266,7 +268,7 @@ fn set_get_list_and_remove_round_trip_through_the_reader() {
         let after = raw_inode(&mut tx, &file).await;
         assert_eq!(after.ctime.sec.get(), when(21).seconds as u64);
         assert_eq!(after.ctime.nsec.get(), 7);
-        assert_eq!(after.transid.get(), tx.edits().generation());
+        assert_eq!(after.transid.get(), tx.edits().trees.generation());
         assert_eq!(
             after.sequence.get(),
             before.sequence.get().wrapping_add(5),
@@ -282,9 +284,7 @@ fn set_get_list_and_remove_round_trip_through_the_reader() {
             tx.xattr(&file, "user.中文".as_bytes(), &mut []).await,
             Err(WriteError::XattrMissing { .. })
         ));
-        tx.commit(|| panic!("valid fixture UUID"), concurrency)
-            .await
-            .unwrap();
+        tx.commit().await.unwrap();
     });
     block_on(async {
         let snapshot = writer.snapshot().unwrap();
@@ -321,7 +321,7 @@ fn set_get_list_and_remove_round_trip_through_the_reader() {
 fn flags_and_missing_attributes_fail_as_on_linux() {
     let (_named, mut writer) = image();
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
         // XATTR_CREATE over an existing name is EEXIST.
         assert!(matches!(
@@ -400,9 +400,8 @@ fn colliding_names_share_one_item() {
     assert_eq!(name_hash(COLLIDING[0]), 0x4e84_071b);
     assert_ne!(COLLIDING[0], COLLIDING[1]);
     let (named, mut writer) = image();
-    let concurrency = std::thread::available_parallelism().unwrap();
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
         let hash = name_hash(COLLIDING[0]);
         tx.set_xattr(&file, COLLIDING[0], b"first", XattrMode::Create, when(1))
@@ -442,9 +441,7 @@ fn colliding_names_share_one_item() {
         tx.set_xattr(&file, COLLIDING[0], b"again", XattrMode::Create, when(5))
             .await
             .unwrap();
-        tx.commit(|| panic!("valid fixture UUID"), concurrency)
-            .await
-            .unwrap();
+        tx.commit().await.unwrap();
     });
     block_on(async {
         let snapshot = writer.snapshot().unwrap();
@@ -452,7 +449,7 @@ fn colliding_names_share_one_item() {
         for (name, expected) in [(COLLIDING[0], &b"again"[..]), (COLLIDING[1], b"second")] {
             assert!(found.contains(&(name.to_vec(), expected.to_vec())));
         }
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
         for name in COLLIDING {
             tx.remove_xattr(&file, name, when(6)).await.unwrap();
@@ -473,7 +470,7 @@ fn sizes_are_limited_as_linux_limits_them() {
     let (_named, mut writer) = image();
     block_on(async {
         let nodesize = writer.snapshot().unwrap().superblock().nodesize() as usize;
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
         // BTRFS_MAX_XATTR_SIZE: a leaf's item capacity less one dir item.
         let maximum = nodesize
@@ -531,9 +528,8 @@ fn sizes_are_limited_as_linux_limits_them() {
 #[test]
 fn only_user_attributes_are_written_and_every_namespace_reads() {
     let (named, mut writer) = image();
-    let concurrency = std::thread::available_parallelism().unwrap();
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
         for name in [
             &b"security.capability"[..],
@@ -594,9 +590,7 @@ fn only_user_attributes_are_written_and_every_namespace_reads() {
         tx.set_xattr(&file, b"user.beside", b"ok", XattrMode::Set, when(2))
             .await
             .unwrap();
-        tx.commit(|| panic!("valid fixture UUID"), concurrency)
-            .await
-            .unwrap();
+        tx.commit().await.unwrap();
     });
     block_on(async {
         let snapshot = writer.snapshot().unwrap();
@@ -609,7 +603,7 @@ fn only_user_attributes_are_written_and_every_namespace_reads() {
 fn user_attributes_need_a_regular_file_or_directory() {
     let (_named, mut writer) = image();
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         for path in ["link", "pipe"] {
             let node = lookup(&tx, path).await;
@@ -658,7 +652,7 @@ fn immutable_and_append_only_inodes_refuse_changes() {
     use crate::items::{INODE_APPEND, INODE_IMMUTABLE};
     let (_named, mut writer) = image();
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
         tx.set_xattr(&file, b"user.kept", b"v", XattrMode::Set, when(1))
             .await
@@ -697,9 +691,8 @@ fn immutable_and_append_only_inodes_refuse_changes() {
 #[test]
 fn removing_the_inode_removes_its_attributes() {
     let (named, mut writer) = image();
-    let concurrency = std::thread::available_parallelism().unwrap();
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         let attributes = Attributes {
             permissions: 0o644,
@@ -749,10 +742,8 @@ fn removing_the_inode_removes_its_attributes() {
             inject(&mut tx, node, b"trusted.x", b"t").await;
             assert!(!items(&mut tx, node).await.is_empty());
         }
-        tx.commit(|| panic!("valid fixture UUID"), concurrency)
-            .await
-            .unwrap();
-        let mut tx = writer.begin().await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         let doomed = tx.lookup(&root, b"doomed").await.unwrap().unwrap();
         let folder = tx.lookup(&root, b"folder").await.unwrap().unwrap();
@@ -787,9 +778,7 @@ fn removing_the_inode_removes_its_attributes() {
                 "every item of the removed inode is gone"
             );
         }
-        tx.commit(|| panic!("valid fixture UUID"), concurrency)
-            .await
-            .unwrap();
+        tx.commit().await.unwrap();
     });
     drop(named);
 }
@@ -798,7 +787,7 @@ fn removing_the_inode_removes_its_attributes() {
 fn a_hard_linked_inode_keeps_its_attributes_until_the_last_link() {
     let (_named, mut writer) = image();
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         let file = lookup(&tx, "file").await;
         tx.hard_link(
@@ -833,7 +822,7 @@ fn a_hard_linked_inode_keeps_its_attributes_until_the_last_link() {
 fn an_owner_change_kills_the_file_capability_of_a_non_directory() {
     let (_named, mut writer) = image();
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
         let directory = lookup(&tx, "dir").await;
         inject(&mut tx, &directory, b"security.capability", &[1; 12]).await;
@@ -866,14 +855,83 @@ fn an_owner_change_kills_the_file_capability_of_a_non_directory() {
     });
 }
 
+/// `chown` of a file carrying a capability Linux wrote removes the
+/// capability, as `notify_change` does for `ATTR_KILL_PRIV`, whichever of the
+/// owner and the group changes; a directory keeps its own, and every other
+/// attribute stays.
+#[test]
+fn chown_removes_the_capability_linux_wrote() {
+    const FILES: [&str; 3] = ["/中文文件", "/日本語のファイル", "/한국어파일"];
+    const DIRECTORY: &str = "/目录-ディレクトリ-디렉터리";
+    /// A version 2 `security.capability` granting `CAP_NET_RAW` (bit 13).
+    const CAPABILITY: [u8; 20] = [
+        1, 0, 0, 2, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let stamp = ImageTime::from_secs(1_700_000_000);
+    let mut tree = TreeBuilder::new().root(Metadata::new(0o755, stamp));
+    for (path, (name, text)) in FILES.iter().zip(CJK) {
+        tree = tree
+            .file(*path, path.as_bytes().to_vec(), Metadata::new(0o755, stamp))
+            .xattr("security.capability", CAPABILITY.to_vec())
+            .xattr(name, text);
+    }
+    let tree = tree
+        .directory(DIRECTORY, Metadata::new(0o755, stamp))
+        .xattr("security.capability", CAPABILITY.to_vec());
+    let (_named, mut writer) = mounted(tree);
+    let owners = [
+        (Some(1000), None),
+        (None, Some(1000)),
+        (Some(1001), Some(1001)),
+    ];
+    block_on(async {
+        let mut tx = writer.join().await.unwrap();
+        for (path, (uid, gid)) in FILES.iter().zip(owners) {
+            let file = lookup(&tx, &path[1..]).await;
+            assert_eq!(value(&tx, &file, b"security.capability").await, CAPABILITY);
+            tx.set_owner(&file, uid, gid, when(1)).await.unwrap();
+            assert!(matches!(
+                tx.xattr(&file, b"security.capability", &mut []).await,
+                Err(WriteError::XattrMissing { .. })
+            ));
+        }
+        let directory = lookup(&tx, &DIRECTORY[1..]).await;
+        tx.set_owner(&directory, Some(1000), Some(1000), when(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            value(&tx, &directory, b"security.capability").await,
+            CAPABILITY
+        );
+        tx.commit().await.unwrap();
+    });
+    block_on(async {
+        let snapshot = writer.snapshot().unwrap();
+        for ((path, (name, text)), (uid, gid)) in FILES.iter().zip(CJK).zip(owners) {
+            assert_eq!(
+                read_back(&snapshot, path).await,
+                vec![(name.as_bytes().to_vec(), text.as_bytes().to_vec())],
+                "{path}"
+            );
+            let metadata = *snapshot.resolve(path.as_bytes()).await.unwrap().metadata();
+            assert_eq!(metadata.uid, uid.unwrap_or(0), "{path}");
+            assert_eq!(metadata.gid, gid.unwrap_or(0), "{path}");
+            assert_eq!(metadata.ctime, when(1), "{path}");
+        }
+        assert_eq!(
+            read_back(&snapshot, DIRECTORY).await,
+            vec![(b"security.capability".to_vec(), CAPABILITY.to_vec())]
+        );
+    });
+}
+
 #[test]
 #[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
 fn attribute_edits_pass_btrfs_check() {
     let (named, mut writer) = image();
-    let concurrency = std::thread::available_parallelism().unwrap();
     assert_btrfs_check(named.path());
     block_on(async {
-        let mut tx = writer.begin().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
         let file = lookup(&tx, "file").await;
         for (name, text) in CJK {
             tx.set_xattr(
@@ -892,9 +950,7 @@ fn attribute_edits_pass_btrfs_check() {
                 .unwrap();
         }
         tx.remove_xattr(&file, COLLIDING[0], when(3)).await.unwrap();
-        tx.commit(|| panic!("valid fixture UUID"), concurrency)
-            .await
-            .unwrap();
+        tx.commit().await.unwrap();
     });
     assert_btrfs_check(named.path());
 }

@@ -70,7 +70,7 @@ impl Mapping {
     }
 }
 
-impl<S: BlockSink> Transaction<'_, S> {
+impl<S: BlockSink> Transaction<S> {
     /// Cut an aligned range from one regular/preallocated file mapping. Returns
     /// the logical allocated bytes removed for the enclosing inode update.
     /// Inline contents are converted by the file writer before this operation.

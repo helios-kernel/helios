@@ -78,7 +78,7 @@ pub(super) fn aligned_end(end: u64, sector: u64) -> Result<u64, WriteError> {
         * sector)
 }
 
-impl<S: BlockSink> Transaction<'_, S> {
+impl<S: BlockSink> Transaction<S> {
     pub(crate) async fn write_file<E: Encoder>(
         &mut self,
         tree: u64,

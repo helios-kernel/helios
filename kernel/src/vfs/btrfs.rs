@@ -1,14 +1,18 @@
-//! Btrfs over the block cache. Reads pin a published immutable snapshot under
-//! a short lock, released before I/O. A kernel task exclusively owns writable
-//! transactions; queued requests share durable commits. Per-inode write leases
-//! serialize write rounds without blocking unrelated files or the service.
+//! Btrfs over the block cache. Reads pin a published immutable view under a
+//! short lock, released before I/O. A kernel task exclusively owns the
+//! running transaction: a change is visible once its batch is applied and
+//! durable at the next commit, which a sync, the commit interval, the dirty
+//! bound or the unmount triggers. Per-inode write leases serialize write
+//! rounds without blocking unrelated files or the service.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc as SourceArc;
+use alloc::sync::{Arc as SharedArc, Weak as SharedWeak};
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 use core::ops::ControlFlow;
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use helios_btrfs::{
@@ -17,13 +21,17 @@ use helios_btrfs::{
 };
 use helios_hal::fs::{
     BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult,
-    Metadata, NodeId, NodeKind, OpenFlags, WritePosition,
+    Metadata, NodeId, NodeKind, OpenFlags, RenameMode, WritePosition,
 };
 use helios_hal::io::{IoError, IoResult};
 use triomphe::Arc;
 
-use crate::{BlockCacheError, BlockPages, CACHE_BLOCK_BYTES, CachedDisk, RootEntropyHandle};
-use helios_btrfs::write::{CompressionPolicy, Compressor, EncodeError, WriteError, Writer};
+use crate::{
+    BlockCacheError, BlockPages, CACHE_BLOCK_BYTES, CachedDisk, ProgressSignal, RootEntropyHandle,
+};
+use helios_btrfs::write::{
+    CompressionPolicy, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, EncodeError, WriteError, Writer,
+};
 
 mod prepared;
 mod writer;
@@ -40,8 +48,127 @@ pub struct BtrfsWriteOptions {
     /// every compressible inode's new data is written with. `None` writes
     /// every extent uncompressed.
     pub compress: Option<CompressionPolicy>,
+    /// When the mount commits without a sync asking: Linux's defaults when
+    /// `None`, and a request naming it for a source other than btrfs is
+    /// refused. The mount takes it as its starting value;
+    /// [`BtrfsFs::set_commit_policy`] changes it later.
+    pub commit: Option<CommitPolicy>,
 }
-type Snapshot<Device> = Filesystem<SourceArc<Image<Device>>>;
+
+/// What the machine keeps of a writable btrfs mount, whatever its device
+/// type, so that it can commit every one before it powers off. It holds the
+/// mount's queue weakly: an unmounted or dropped mount is not kept alive by
+/// it, and its end is still awaited.
+#[derive(Clone)]
+pub(crate) struct WritableMount {
+    writer: SharedWeak<writer::Client>,
+    exit: SharedArc<writer::ServiceExit>,
+}
+
+impl WritableMount {
+    /// Whether the mount's service has ended, so nothing is left to commit.
+    pub(crate) fn has_ended(&self) -> bool {
+        self.exit.has_ended()
+    }
+
+    /// Makes what the mount holds durable: a sync of a live mount, or the
+    /// end of one that is going away, whose service commits as it ends.
+    pub(crate) async fn settle(&self) {
+        match self.writer.upgrade() {
+            Some(writer) => {
+                if let Err(error) = writer.execute("", 0, Operation::Sync).await {
+                    tracing::error!(?error, "btrfs commit before power-off failed");
+                }
+            }
+            None => self.exit.ended().await,
+        }
+    }
+}
+
+/// When a writable mount commits its running transaction beyond the syncs
+/// that ask for one: operator settings, adjustable at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitPolicy {
+    /// Linux's `commit=` mount option: the longest a change waits after the
+    /// running transaction first changed. Zero commits each batch.
+    pub interval: Duration,
+    /// Dirty metadata the running transaction holds before it commits.
+    pub dirty_metadata_limit: u64,
+}
+
+/// `BTRFS_DEFAULT_COMMIT_INTERVAL`, 30 seconds in `fs/btrfs/fs.h`.
+pub const DEFAULT_COMMIT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// `BTRFS_WARNING_COMMIT_INTERVAL`, 300 seconds in `fs/btrfs/fs.h`: a longer
+/// `commit=` is taken with a warning.
+const WARNING_COMMIT_INTERVAL: u32 = 300;
+
+impl CommitPolicy {
+    /// The policy Linux's `commit=<seconds>` mount option gives, as
+    /// `btrfs_parse_param` reads it: zero is the default interval, and an
+    /// interval past [`WARNING_COMMIT_INTERVAL`] is warned about and kept.
+    pub fn from_commit_option(seconds: u32) -> Self {
+        if seconds > WARNING_COMMIT_INTERVAL {
+            tracing::warn!(seconds, "excessive commit interval, use with care");
+        }
+        Self {
+            interval: match seconds {
+                0 => DEFAULT_COMMIT_INTERVAL,
+                seconds => Duration::from_secs(u64::from(seconds)),
+            },
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for CommitPolicy {
+    /// Linux's defaults.
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_COMMIT_INTERVAL,
+            dirty_metadata_limit: DEFAULT_DIRTY_METADATA_LIMIT,
+        }
+    }
+}
+
+/// A mount's [`CommitPolicy`] as it stands. The operator writes it from any
+/// processor; the mount's service reads it and re-reads it on every change,
+/// which applies the new values to the running transaction at once.
+struct LivePolicy {
+    interval_nanos: AtomicU64,
+    dirty_metadata_limit: AtomicU64,
+    /// Raised after every change, so the service re-arms its deadline.
+    changed: ProgressSignal,
+}
+
+impl LivePolicy {
+    fn new(policy: CommitPolicy) -> Self {
+        let live = Self {
+            interval_nanos: AtomicU64::new(0),
+            dirty_metadata_limit: AtomicU64::new(0),
+            changed: ProgressSignal::new(),
+        };
+        live.store(policy);
+        live
+    }
+
+    fn store(&self, policy: CommitPolicy) {
+        // An interval past u64 nanoseconds, some 584 years, never expires.
+        let nanos = u64::try_from(policy.interval.as_nanos()).unwrap_or(u64::MAX);
+        self.interval_nanos.store(nanos, Ordering::Release);
+        self.dirty_metadata_limit
+            .store(policy.dirty_metadata_limit, Ordering::Release);
+        self.changed.signal();
+    }
+
+    fn load(&self) -> CommitPolicy {
+        CommitPolicy {
+            interval: Duration::from_nanos(self.interval_nanos.load(Ordering::Acquire)),
+            dirty_metadata_limit: self.dirty_metadata_limit.load(Ordering::Acquire),
+        }
+    }
+}
+type Snapshot<Device> = Filesystem<SharedArc<Image<Device>>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BtrfsMountError {
@@ -129,7 +256,11 @@ pub struct BtrfsFs<Device: BlockDevice<Buffer = BlockPages>> {
 
 struct Inner<Device: BlockDevice<Buffer = BlockPages>> {
     reader: Arc<spin::Mutex<Snapshot<Device>>>,
-    writer: Option<writer::Client>,
+    /// A writable mount's service queue, shared with the machine's list of
+    /// writable mounts (`WritableMount`) by a weak reference.
+    writer: Option<SharedArc<writer::Client>>,
+    /// The commit policy a writable mount's service follows.
+    policy: Option<Arc<LivePolicy>>,
     devices: BTreeMap<u64, (DeviceId, u64)>,
     serial: BlockSerial,
     writes: prepared::Leases,
@@ -153,7 +284,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
     ) -> Result<Self, BtrfsMountError> {
         let serial = disk.serial();
         let lease = disk.read_mount().ok_or(BtrfsMountError::Busy)?;
-        let reader = Filesystem::mount(SourceArc::new(Image {
+        let reader = Filesystem::mount(SharedArc::new(Image {
             disk,
             _lease: MountLease::Read { _lease: lease },
         }))
@@ -168,6 +299,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             inner: Arc::new(Inner {
                 reader: Arc::new(spin::Mutex::new(reader)),
                 writer: None,
+                policy: None,
                 devices,
                 serial,
                 writes: Arc::new(spin::Mutex::new(BTreeMap::new())),
@@ -187,14 +319,19 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             entropy,
             concurrency,
             compress,
+            commit,
         } = options;
         let compressor = Compressor::new(compress)?;
         let serial = disk.serial();
         let lease = disk.write_mount().ok_or(BtrfsMountError::Busy)?;
-        let writer = Writer::mount(Image {
-            disk,
-            _lease: MountLease::Write { _lease: lease },
-        })
+        let writer = Writer::mount(
+            Image {
+                disk,
+                _lease: MountLease::Write { _lease: lease },
+            },
+            writer::EntropyUuids(entropy),
+            concurrency,
+        )
         .await?;
         let reader = writer.snapshot()?;
         let mut devices = BTreeMap::new();
@@ -204,20 +341,23 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             })
             .await?;
         let reader = Arc::new(spin::Mutex::new(reader));
-        let (client, receiver) = writer::channel(concurrency);
+        let (client, receiver, exit) = writer::channel(concurrency);
+        let policy = Arc::new(LivePolicy::new(commit.unwrap_or_default()));
         let service = BtrfsService {
             writer,
             receiver,
             published: reader.clone(),
-            entropy,
             concurrency,
             compressor,
+            policy: policy.clone(),
+            _exit: exit,
         };
         Ok((
             Self {
                 inner: Arc::new(Inner {
                     reader,
-                    writer: Some(client),
+                    writer: Some(SharedArc::new(client)),
+                    policy: Some(policy),
                     devices,
                     serial,
                     writes: Arc::new(spin::Mutex::new(BTreeMap::new())),
@@ -226,6 +366,42 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             },
             service,
         ))
+    }
+
+    /// The commit policy of a writable mount; `None` for a read-only one.
+    pub fn commit_policy(&self) -> Option<CommitPolicy> {
+        self.inner.policy.as_ref().map(|policy| policy.load())
+    }
+
+    /// Changes a writable mount's commit policy, as Linux's
+    /// `mount -o remount,commit=`: the running transaction is judged by the
+    /// new values at once. A read-only mount has none to change.
+    pub fn set_commit_policy(&self, policy: CommitPolicy) -> FsResult<()> {
+        self.inner
+            .policy
+            .as_ref()
+            .ok_or(FsError::ReadOnly)?
+            .store(policy);
+        Ok(())
+    }
+
+    /// Ends a writable mount, as Linux's unmount: it resolves once the
+    /// mount's service has committed what it held, or failed to, and let the
+    /// device go; every request after it fails. A read-only mount has
+    /// nothing to end.
+    pub async fn unmount(&self) {
+        if let Some(writer) = &self.inner.writer {
+            writer.unmount().await;
+        }
+    }
+
+    /// The handle the machine keeps on a writable mount, to commit it
+    /// before power-off.
+    pub(crate) fn writable(&self) -> Option<WritableMount> {
+        self.inner.writer.as_ref().map(|writer| WritableMount {
+            writer: SharedArc::downgrade(writer),
+            exit: writer.exit().clone(),
+        })
     }
 
     fn snapshot(&self) -> Snapshot<Device> {
@@ -485,12 +661,19 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         self.mutate(path, now, Operation::Remove { directory: false })
             .await
     }
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, now: u64) -> FsResult<()> {
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
         self.mutate(
             source,
             now,
             Operation::Rename {
                 destination: String::from(destination.as_str()),
+                mode,
             },
         )
         .await

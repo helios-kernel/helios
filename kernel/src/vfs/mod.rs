@@ -45,7 +45,8 @@ mod request;
 mod root;
 mod storage;
 
-pub use btrfs::{BtrfsFs, BtrfsMountError, BtrfsService, BtrfsWriteOptions};
+use btrfs::WritableMount;
+pub use btrfs::{BtrfsFs, BtrfsMountError, BtrfsService, BtrfsWriteOptions, CommitPolicy};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
 pub use memory::{MemoryFs, MemoryWrite};
@@ -73,7 +74,8 @@ use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FilledWrite, FsError, FsPath,
-    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition,
+    WriteProgress,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -195,9 +197,10 @@ macro_rules! mount_kinds {
                 &self,
                 source: FsPath<'_>,
                 destination: FsPath<'_>,
+                mode: RenameMode,
                 now: u64,
             ) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.rename(source, destination, now).await,)+ }
+                match self { $(Self::$kind(fs) => fs.rename(source, destination, mode, now).await,)+ }
             }
 
             async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -576,6 +579,10 @@ struct Machine {
     /// Processors that may resolve a path: one pin block each, in every
     /// table.
     processors: usize,
+    /// Every writable btrfs mount whose service has not ended, in whichever
+    /// tree it was made: what the machine commits before it powers off.
+    /// Held only to add, prune and copy the list, never across an await.
+    writable: spin::Mutex<Vec<WritableMount>>,
 }
 
 struct TableInner<S: Storage> {
@@ -707,6 +714,7 @@ impl<S: Storage> MountTable<S> {
             boot,
             next_device: AtomicU64::new(AuthorityDomain::FIRST_MOUNTED.raw()),
             processors,
+            writable: spin::Mutex::new(Vec::new()),
         }))
     }
 
@@ -779,6 +787,13 @@ impl<S: Storage> MountTable<S> {
             }
         }
         let slot = empty.ok_or(MountError::TableFull)?;
+        if let MountedFs::Btrfs(btrfs) = &fs
+            && let Some(writable) = btrfs.writable()
+        {
+            let mut mounts = self.inner.machine.writable.lock();
+            mounts.retain(|mount| !mount.has_ended());
+            mounts.push(writable);
+        }
         // SAFETY: the slot is empty and the writer lock is held: no
         // resolution reads an empty slot's mount and no writer races.
         unsafe {
@@ -844,7 +859,11 @@ impl<S: Storage> MountTable<S> {
         if retiring.held() {
             return Err(busy());
         }
-        drop(retiring.retire());
+        // As Linux's unmount, the call returns once what the filesystem
+        // held is on its device.
+        if let Some(mount) = retiring.retire() {
+            mount.fs.unmount().await;
+        }
         Ok(())
     }
 
@@ -1098,7 +1117,36 @@ impl<S: Storage> Clone for Namespace<S> {
     }
 }
 
+impl<S: Storage> MountedFs<S> {
+    /// Ends the filesystem as it leaves the mount table: a writable btrfs
+    /// mount commits and lets its device go first.
+    async fn unmount(&self) {
+        if let Self::Btrfs(btrfs) = self {
+            btrfs.unmount().await;
+        }
+    }
+}
+
 impl<S: Storage> Namespace<S> {
+    /// Makes every writable btrfs mount on the machine durable, in every
+    /// tree and including those still ending after an unmount: what the
+    /// kernel does before it powers off, as Linux syncs and unmounts.
+    pub async fn sync_writable_mounts(&self) {
+        let mounts: Vec<WritableMount> = {
+            let mut mounts = self.own.inner.machine.writable.lock();
+            mounts.retain(|mount| !mount.has_ended());
+            mounts.clone()
+        };
+        // Each mount commits through its own service and device; at most a
+        // table's worth of them wait at once.
+        futures::StreamExt::for_each_concurrent(
+            futures::stream::iter(&mounts),
+            MAX_MOUNTS,
+            WritableMount::settle,
+        )
+        .await;
+    }
+
     /// The root namespace, over `table`: the kernel's own tree, with a
     /// fresh root layer and no ancestors.
     pub fn new(table: MountTable<S>) -> Self {
@@ -1312,8 +1360,14 @@ impl<S: Storage> Namespace<S> {
 
     /// Renames within one mount; across two, [`FsError::CrossDevice`]. A
     /// directory with a mount point below it stays where it is:
-    /// [`FsError::Busy`].
-    pub async fn rename(&self, source: &str, destination: &str, now: u64) -> FsResult<()> {
+    /// [`FsError::Busy`]. `mode` is as [`FileSystem::rename`] takes it.
+    pub async fn rename(
+        &self,
+        source: &str,
+        destination: &str,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
         if self.holds_mounts(source) {
             return Err(FsError::Busy);
         }
@@ -1327,7 +1381,7 @@ impl<S: Storage> Namespace<S> {
         }
         source
             .writable()?
-            .rename(source.path(), destination.path(), now)
+            .rename(source.path(), destination.path(), mode, now)
             .await
     }
 

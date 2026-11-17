@@ -3,7 +3,9 @@ use alloc::vec::Vec;
 
 use futures_lite::future::block_on;
 use helios_hal::cpu::ProcessorId;
-use helios_hal::fs::{FileSystem, FileSystemRights, FsError, FsPath, OpenFlags, WritePosition};
+use helios_hal::fs::{
+    FileSystem, FileSystemRights, FsError, FsPath, OpenFlags, RenameMode, WritePosition,
+};
 
 use super::{
     BOOT_DEVICE, Follow, MAX_MOUNTS, MemoryFs, MountError, MountTable, MountedFs, Namespace,
@@ -149,7 +151,7 @@ fn rename_and_link_across_mounts_are_refused_with_exdev() {
     create(&namespace, "/mnt/file", b"payload");
 
     assert_eq!(
-        block_on(namespace.rename("/mnt/file", "/file", 2)),
+        block_on(namespace.rename("/mnt/file", "/file", RenameMode::Replace, 2)),
         Err(FsError::CrossDevice)
     );
     assert_eq!(
@@ -163,7 +165,7 @@ fn rename_and_link_across_mounts_are_refused_with_exdev() {
         Err(FsError::NoEntry)
     );
     // Within the mount, both work.
-    block_on(namespace.rename("/mnt/file", "/mnt/moved", 2)).expect("renames");
+    block_on(namespace.rename("/mnt/file", "/mnt/moved", RenameMode::Replace, 2)).expect("renames");
     block_on(namespace.link("/mnt/moved", "/mnt/linked", 2)).expect("links");
     assert_eq!(read(&namespace, "/mnt/linked"), b"payload");
 }
@@ -480,6 +482,7 @@ fn a_mount_request_without_mount_authority_is_refused() {
                 entropy: crate::test_support::test_root_entropy(),
                 concurrency: core::num::NonZeroUsize::new(1).unwrap(),
                 compress: None,
+                commit: None,
             },
         )),
         Err(crate::MountRequestError::Authority(
@@ -507,6 +510,7 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
             entropy: crate::test_support::test_root_entropy(),
             concurrency: core::num::NonZeroUsize::new(1).unwrap(),
             compress: None,
+            commit: None,
         },
     ))
     .expect("root may mount the boot image");
@@ -532,6 +536,7 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
                 entropy: crate::test_support::test_root_entropy(),
                 concurrency: core::num::NonZeroUsize::new(1).unwrap(),
                 compress: None,
+                commit: None,
             },
         )),
         Err(crate::MountRequestError::HostShareUnavailable)
@@ -549,6 +554,7 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
                 entropy: crate::test_support::test_root_entropy(),
                 concurrency: core::num::NonZeroUsize::new(1).unwrap(),
     compress: None,
+            commit: None,
             },
         )),
             Err(crate::MountRequestError::DiskUnavailable { serial: refused }) if refused == serial

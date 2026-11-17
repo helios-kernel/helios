@@ -53,7 +53,8 @@ fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
             ..
         }
         | MountRequestError::CompressionOption(_)
-        | MountRequestError::CompressionUnsupported => RefusalKind::InvalidOption,
+        | MountRequestError::CompressionUnsupported
+        | MountRequestError::CommitUnsupported => RefusalKind::InvalidOption,
         MountRequestError::Btrfs { .. } => RefusalKind::InvalidFilesystem,
         MountRequestError::Mount(MountError::InvalidPoint(_) | MountError::RootKind) => {
             RefusalKind::InvalidPoint
@@ -157,7 +158,7 @@ macro_rules! impl_mount_bindings {
                             return Ok(Err(mount_error(&error)));
                         }
                     };
-                    let (authority, namespace, attached, write, spawner) = accessor.with(|mut access| {
+                    let (authority, namespace, attached, write, spawner, timer) = accessor.with(|mut access| {
                         let store = access.get();
                         (
                             store.process_authority().clone(),
@@ -168,8 +169,12 @@ macro_rules! impl_mount_bindings {
                                 concurrency: core::num::NonZeroUsize::new(store.cpu.processor_count())
                                     .expect("a machine has at least one processor"),
                                 compress,
+                                commit: request
+                                    .commit
+                                    .map(crate::vfs::CommitPolicy::from_commit_option),
                             },
                             store.spawner().launch_spawner().clone(),
+                            store.timer(),
                         )
                     });
                     let outcome = match mount_source(request.source) {
@@ -188,7 +193,7 @@ macro_rules! impl_mount_bindings {
                         Err(error) => Err(error),
                     };
                     let outcome = outcome.map(|service| {
-                        if let Some(service) = service { spawner.spawn_detached(service.run()); }
+                        if let Some(service) = service { spawner.spawn_detached(service.run(timer)); }
                     });
                     Ok(outcome.map_err(|error| {
                         tracing::debug!(%error, path = %request.path, "mount refused");

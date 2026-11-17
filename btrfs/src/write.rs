@@ -1,16 +1,21 @@
 //! Writable Btrfs mounts and transaction-owned mutations.
 //!
-//! A [`Writer`] exclusively owns the writable mount. Callers serialize access
-//! to it; a transaction holds its mutable borrow until commit or abort. Reads
-//! through a committed [`crate::Filesystem`] snapshot remain concurrent and
-//! retain the generation they opened. No filesystem lock is held across I/O.
+//! A [`Writer`] exclusively owns the writable mount and its running
+//! transaction, following Linux: a change is visible at once and durable at
+//! commit. Callers serialize access to it. Reads through a
+//! [`crate::Filesystem`] view remain concurrent and retain the state they
+//! opened, whether a committed generation or the running transaction as of
+//! an accepted mutation. No filesystem lock is held across I/O.
 //!
-//! Mutations exclusively borrow [`WriteTransaction`]. An error or cancellation
-//! restores that operation's checkpoint and preserves earlier successful edits.
-//! Commit consumes the transaction; dropping it discards the entire batch. [`InodeHandle`] binds an
-//! inode to its mount and creation generation; a handle for an uncommitted inode
-//! survives its transaction only after that transaction successfully commits.
-//! Directory lookup sees staged namespace changes, including subvolume entries.
+//! Mutations exclusively borrow a [`WriteTransaction`] handle on the running
+//! transaction. An error or cancellation restores that operation's checkpoint
+//! and preserves earlier accepted edits; dropping the handle keeps them all.
+//! [`Writer::commit`] makes them durable as one generation; the caller commits
+//! on sync, on its commit interval, when [`Writer::dirty`] reaches its bound
+//! ([`DEFAULT_DIRTY_METADATA_LIMIT`] unless its operator chose another), and
+//! at unmount. [`InodeHandle`] binds an inode
+//! to its mount and generation. Directory lookup sees staged namespace
+//! changes, including subvolume entries.
 //!
 //! Writable support is single-device and excludes pending log replay, verity,
 //! unknown compat-ro features and filesystems with quotas enabled (the writer
@@ -30,7 +35,10 @@ pub use crate::allocation::data::DataDefect;
 pub use crate::compress::policy::{CompressionOptionError, CompressionPolicy, Compressor};
 pub use crate::compress::write::{EncodeError, Encoded, Encoder, Lzo, Plain, Zlib, Zstd};
 pub use crate::free_space::FreeSpaceDefect;
-pub use crate::fs::writer::{Attributes, CloneRange, InodeHandle, Name, WriteTransaction, Writer};
+pub use crate::fs::writer::{
+    Attributes, CloneRange, DEFAULT_DIRTY_METADATA_LIMIT, Dirty, InodeHandle, Name, RootUuids,
+    Usage, WriteTransaction, Writer,
+};
 pub use crate::space::{SpaceDefect, SpaceError};
 pub use crate::transaction::chunks::ChunkError;
 pub use crate::transaction::file::WriteOptions;

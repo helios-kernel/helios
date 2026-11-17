@@ -35,6 +35,11 @@ interface mounts {
     /// mount is written with. Absent writes uncompressed. A source other than
     /// btrfs refuses it.
     compress: option<string>,
+    /// The value of Linux's `commit=` mount option: the longest, in seconds,
+    /// a change to a writable btrfs mount waits before it is committed when
+    /// nothing syncs it. Absent or zero takes Linux's default of 30. A
+    /// source other than btrfs refuses it.
+    commit: option<u32>,
   }
 
   enum mount-error-kind {

@@ -147,6 +147,28 @@ pub enum FsError {
 
 pub type FsResult<T> = Result<T, FsError>;
 
+/// How a rename treats a name that already exists at its destination.
+///
+/// The three modes are the combinations Linux's `renameat2` accepts:
+/// `RENAME_NOREPLACE` and `RENAME_EXCHANGE` together are `EINVAL` there, and
+/// here they cannot be written down. `RENAME_WHITEOUT` needs a device node
+/// the contract has no way to create, so a caller refuses it before any
+/// filesystem is asked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RenameMode {
+    /// A name at the destination is replaced by the source: `rename(2)`.
+    #[default]
+    Replace,
+    /// A name at the destination fails the rename with
+    /// [`FsError::Exists`]: `RENAME_NOREPLACE`.
+    NoReplace,
+    /// Source and destination swap places and both must exist, otherwise
+    /// [`FsError::NoEntry`]. Either may be a directory, and a directory
+    /// that is an ancestor of the other name is [`FsError::Invalid`]:
+    /// `RENAME_EXCHANGE`.
+    Exchange,
+}
+
 /// What kind of object a path names.
 ///
 /// [`CharacterDevice`](Self::CharacterDevice),
@@ -628,11 +650,19 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    /// Moves `source` to `destination` within this filesystem.
+    /// Moves `source` to `destination` within this filesystem, treating a
+    /// name already at `destination` as `mode` says. The whole change is
+    /// atomic: no reader sees `source` gone and `destination` not yet
+    /// there, or one name of an exchange moved and not the other.
+    ///
+    /// A filesystem that cannot honour a `mode` other than
+    /// [`RenameMode::Replace`] answers [`FsError::Unsupported`] without
+    /// changing anything.
     fn rename<'a>(
         &'a self,
         source: FsPath<'a>,
         destination: FsPath<'a>,
+        mode: RenameMode,
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
