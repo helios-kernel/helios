@@ -10,7 +10,7 @@
 
 use helios_hal::fs::{
     FileSystem, FilledWrite, FsError as VfsError, FsResult, Landed, Metadata, NodeKind, OpenFlags,
-    PreparedWrite, WritePosition, WriteProgress,
+    PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 use pin_project_lite::pin_project;
 
@@ -997,7 +997,12 @@ impl<StorageImpl: crate::Storage> PreparedRenameAt<StorageImpl> {
 
     pub(crate) async fn execute(self) -> FsOpResult<()> {
         self.namespace
-            .rename(&self.absolute, &self.destination, self.now)
+            .rename(
+                &self.absolute,
+                &self.destination,
+                RenameMode::Replace,
+                self.now,
+            )
             .await
             .map_err(fs_error_code)
     }

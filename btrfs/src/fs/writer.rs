@@ -6,6 +6,7 @@ use alloc::sync::Arc;
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
+use helios_hal::fs::RenameMode;
 
 use super::{Filesystem, find_root};
 use crate::accounting::Allocation;
@@ -500,6 +501,7 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         &mut self,
         source: Name<'_>,
         destination: Name<'_>,
+        mode: RenameMode,
         when: Timestamp,
     ) -> Result<(), WriteError> {
         let mut operation = Mutation::new(self).await?;
@@ -507,7 +509,10 @@ impl<'a, S: BlockSink> WriteTransaction<'a, S> {
         let destination = operation.entry_name(destination).await?;
         operation.inner.roots.check_writable(source.tree)?;
         operation.inner.roots.check_writable(destination.tree)?;
-        operation.inner.rename(source, destination, when).await?;
+        operation
+            .inner
+            .rename(source, destination, mode, when)
+            .await?;
         operation.accept();
         Ok(())
     }

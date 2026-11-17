@@ -10,7 +10,8 @@
 //! - `setattr` changing the mode, owner or flags: `EOPNOTSUPP`
 //! - `mknod` of anything but a regular file: `EPERM`
 //! - `setxattr`, `removexattr`, `fallocate`: `EOPNOTSUPP`
-//! - `rename` with `RENAME_NOREPLACE`, `RENAME_EXCHANGE` or `RENAME_WHITEOUT`: `EINVAL`
+//! - `rename` with `RENAME_WHITEOUT`, or with both `RENAME_NOREPLACE` and
+//!   `RENAME_EXCHANGE`: `EINVAL`
 //!
 //! Left to fuser's default of `ENOSYS`: `access`, `bmap`, `ioctl`, `poll`,
 //! `getlk`, `setlk`, `lseek` and `copy_file_range`.
@@ -26,6 +27,7 @@ use fuser::{
 };
 use futures_lite::future::block_on;
 use helios_btrfs::Timestamp;
+use helios_hal::fs::RenameMode;
 
 use super::state::{Node, Owner, State, target_bytes, timestamp};
 
@@ -242,11 +244,20 @@ impl Filesystem for Daemon {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        if !flags.is_empty() {
+        // Both flags together, `RENAME_WHITEOUT` (a whiteout is a device
+        // node, which the writer cannot create) and unknown bits are `EINVAL`
+        // as on Linux.
+        let mode = if flags.is_empty() {
+            RenameMode::Replace
+        } else if flags == RenameFlags::RENAME_NOREPLACE {
+            RenameMode::NoReplace
+        } else if flags == RenameFlags::RENAME_EXCHANGE {
+            RenameMode::Exchange
+        } else {
             return reply.error(Errno::EINVAL);
-        }
+        };
         finish(
-            self.run(|state| block_on(state.rename(parent, name, newparent, newname, now()))),
+            self.run(|state| block_on(state.rename(parent, name, newparent, newname, mode, now()))),
             reply,
         );
     }
