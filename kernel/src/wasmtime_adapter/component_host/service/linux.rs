@@ -30,9 +30,8 @@ use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_linux::abi::{self, Abi};
 use helios_linux::elf::{self, Image};
 use helios_linux::syscall::{
-    self, Call, Denied, EpollData, MapError, MemoryFault, MemoryTotals, Process, Region,
-    Resource, Resources, Start, Stdio, Stream, System, Thread, UserMemory, VirtualMemory,
-    WriteError,
+    self, Call, Denied, EpollData, MapError, MemoryFault, MemoryTotals, Process, Region, Resource,
+    Resources, Start, Stdio, Stream, System, Thread, UserMemory, VirtualMemory, WriteError,
 };
 
 /// The ELF identification bytes every ELF file starts with (System V gABI,
