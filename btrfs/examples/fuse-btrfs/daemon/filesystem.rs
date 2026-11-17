@@ -161,12 +161,11 @@ impl Filesystem for Daemon {
             return reply.error(Errno::EPERM);
         }
         self.create_entry(
-            req,
             parent,
             name,
             Node::File,
             permissions(mode),
-            umask,
+            caller(req, umask),
             reply,
         );
     }
@@ -181,12 +180,11 @@ impl Filesystem for Daemon {
         reply: ReplyEntry,
     ) {
         self.create_entry(
-            req,
             parent,
             name,
             Node::Directory,
             permissions(mode),
-            umask,
+            caller(req, umask),
             reply,
         );
     }
@@ -200,13 +198,12 @@ impl Filesystem for Daemon {
         reply: ReplyEntry,
     ) {
         self.create_entry(
-            req,
             parent,
             link_name,
             Node::Symlink(target_bytes(target)),
             0o777,
             // `posix_acl_create` leaves a symlink's mode alone.
-            0,
+            caller(req, 0),
             reply,
         );
     }
@@ -221,11 +218,7 @@ impl Filesystem for Daemon {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let owner = Owner {
-            uid: req.uid(),
-            gid: req.gid(),
-            umask,
-        };
+        let owner = caller(req, umask);
         let permissions = permissions(mode);
         match self.run(|state| {
             block_on(state.create(parent, name, Node::File, permissions, owner, now()))
@@ -475,25 +468,27 @@ impl Filesystem for Daemon {
 impl Daemon {
     fn create_entry(
         &self,
-        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         node: Node<'_>,
         permissions: u32,
-        umask: u32,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
-        let owner = Owner {
-            uid: req.uid(),
-            gid: req.gid(),
-            umask,
-        };
         match self
             .run(|state| block_on(state.create(parent, name, node, permissions, owner, now())))
         {
             Ok((attr, generation)) => reply.entry(&TTL, &attr, generation),
             Err(errno) => reply.error(errno),
         }
+    }
+}
+
+fn caller(req: &Request, umask: u32) -> Owner {
+    Owner {
+        uid: req.uid(),
+        gid: req.gid(),
+        umask,
     }
 }
 
