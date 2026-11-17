@@ -40,7 +40,21 @@ const SUBVOLUME_ROOT_INODE: u64 = 256;
 /// does not store; an entry's cookie is its directory index plus this.
 const DOT_COOKIES: u64 = 2;
 
+/// `S_IALLUGO`: the permission, sticky and set-id bits of a mode.
+const PERMISSION_BITS: u32 = 0o7777;
+
 type Snapshot = Filesystem<Arc<Device>>;
+
+/// The attributes a `setattr` request changes; `None` leaves one alone.
+#[derive(Default)]
+pub struct Setattr {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub size: Option<u64>,
+    pub access: Option<TimeOrNow>,
+    pub modified: Option<TimeOrNow>,
+}
 
 /// What a creation makes.
 pub enum Node<'a> {
@@ -214,16 +228,28 @@ impl State {
         Ok(attr(ino, inode.metadata(), &snapshot))
     }
 
-    /// Applies a size change and time changes in one transaction.
+    /// Applies a mode, owner, size and time change in one transaction.
     pub async fn setattr(
         &mut self,
         ino: INodeNo,
-        size: Option<u64>,
-        access: Option<TimeOrNow>,
-        modified: Option<TimeOrNow>,
+        change: Setattr,
         now: Timestamp,
     ) -> Result<FileAttr, Errno> {
-        if size.is_none() && access.is_none() && modified.is_none() {
+        let Setattr {
+            mode,
+            uid,
+            gid,
+            size,
+            access,
+            modified,
+        } = change;
+        if mode.is_none()
+            && uid.is_none()
+            && gid.is_none()
+            && size.is_none()
+            && access.is_none()
+            && modified.is_none()
+        {
             return self.getattr(ino).await;
         }
         self.writable()?;
@@ -234,6 +260,22 @@ impl State {
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
+        // Linux applies a new owner before a new mode in one `notify_change`,
+        // so a mode sent with it is the one that stays.
+        if uid.is_some() || gid.is_some() {
+            transaction
+                .set_owner(&file, uid, gid, now)
+                .await
+                .map_err(|error| write_errno(&error))?;
+        }
+        if let Some(mode) = mode {
+            // The kernel sends the file type with the mode; `chmod` keeps the
+            // permission, sticky and set-id bits only.
+            transaction
+                .set_permissions(&file, mode & PERMISSION_BITS, now)
+                .await
+                .map_err(|error| write_errno(&error))?;
+        }
         if let Some(size) = size {
             transaction
                 .truncate_file(&file, size, now, concurrency)

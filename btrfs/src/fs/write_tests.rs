@@ -1749,6 +1749,8 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
         );
         refused!(tx, tx.truncate_file(file, 0, when, concurrency));
         refused!(tx, tx.set_times(file, Some(when), None, when));
+        refused!(tx, tx.set_permissions(file, 0o600, when));
+        refused!(tx, tx.set_owner(file, Some(1), Some(2), when));
         refused!(tx, tx.hard_link(name(&root_handle, b"alias"), file, when));
         refused!(
             tx,
@@ -6861,4 +6863,232 @@ fn usage_counts_the_running_transaction() {
         let device = Filesystem::mount(Disk(image)).await.unwrap();
         assert_eq!(device.superblock().bytes_used(), committed.used_bytes);
     });
+}
+
+/// Names in ASCII, Chinese, Japanese and Korean.
+#[cfg(feature = "write")]
+const CJK_NAMES: [&str; 4] = ["plain", "中文文件", "日本語のファイル", "한국어파일"];
+
+#[cfg(feature = "write")]
+#[test]
+fn chmod_and_chown_update_the_inode_and_refuse_set_id_on_files() {
+    block_on(exercise_mode_and_owner(|_| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn mode_and_owner_changes_pass_btrfs_check() {
+    block_on(exercise_mode_and_owner(assert_btrfs_check));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
+    use super::writer::{Attributes, Name};
+    use alloc::format;
+    use zerocopy::IntoBytes;
+    let stamp = Timestamp::from_secs(1_700_000_000);
+    // Owned by root, as `Metadata::new` makes it.
+    let image = |mode: u16| Metadata::new(mode, stamp);
+    // Set-id bits as a Linux-made image carries them: the writer cannot
+    // create these, so ferrosys lays them out.
+    let mut tree = TreeBuilder::new().root(Metadata::new(0o755, stamp));
+    for name in CJK_NAMES {
+        tree = tree
+            .file(format!("/suid-{name}"), "data", image(0o4755))
+            .file(format!("/sgid-{name}"), "data", image(0o6755))
+            .file(format!("/lock-{name}"), "data", image(0o2644))
+            .directory(format!("/dir-{name}"), image(0o2775));
+    }
+    let named = tempfile::NamedTempFile::new().unwrap();
+    drop(filesystem_image_tree_file(
+        true,
+        true,
+        tree,
+        named.reopen().unwrap(),
+    ));
+    verify(named.path());
+    let mut writer = mount_writer(Disk(named.reopen().unwrap())).await.unwrap();
+    let base = writer.snapshot().unwrap();
+    let when = crate::Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 456,
+    };
+    let mut tx = writer.join().await.unwrap();
+    let root = tx.root().await.unwrap();
+    let tree = root.tree();
+    macro_rules! at {
+        ($name:expr) => {
+            Name {
+                parent: &root,
+                bytes: $name.as_bytes(),
+            }
+        };
+    }
+    for name in CJK_NAMES {
+        // An owner change removes the set-id bits of a file, whichever id
+        // changes, and leaves the other id alone.
+        let suid = tx.lookup(&root, format!("suid-{name}").as_bytes()).await;
+        let suid = suid.unwrap().unwrap();
+        let before = tx.edits().inode_item(tree, suid.number()).await.unwrap().0;
+        tx.set_owner(&suid, Some(1001), None, when).await.unwrap();
+        let after = tx.edits().inode_item(tree, suid.number()).await.unwrap().0;
+        let metadata = tx.metadata(&suid).await.unwrap();
+        assert_eq!(metadata.permissions, 0o755, "{name}");
+        assert_eq!((metadata.uid, metadata.gid), (1001, 0), "{name}");
+        assert_eq!(metadata.ctime, when, "{name}");
+        assert_eq!(metadata.mtime, stamp_of(1_700_000_000), "{name}");
+        assert_eq!(after.sequence.get(), before.sequence.get() + 1, "{name}");
+        assert_eq!(after.transid.get(), tx.edits().trees.generation(), "{name}");
+        assert_eq!(after.mode.get() & 0o170_000, 0o100_000, "{name}");
+
+        let sgid = tx.lookup(&root, format!("sgid-{name}").as_bytes()).await;
+        let sgid = sgid.unwrap().unwrap();
+        tx.set_owner(&sgid, None, Some(2002), when).await.unwrap();
+        let metadata = tx.metadata(&sgid).await.unwrap();
+        assert_eq!(metadata.permissions, 0o755, "{name}");
+        assert_eq!((metadata.uid, metadata.gid), (0, 2002), "{name}");
+
+        // Without group execute S_ISGID marks mandatory locking on Linux;
+        // chown still drops it for an unprivileged caller.
+        let lock = tx.lookup(&root, format!("lock-{name}").as_bytes()).await;
+        let lock = lock.unwrap().unwrap();
+        tx.set_owner(&lock, Some(7), Some(8), when).await.unwrap();
+        let metadata = tx.metadata(&lock).await.unwrap();
+        assert_eq!(metadata.permissions, 0o644, "{name}");
+        assert_eq!((metadata.uid, metadata.gid), (7, 8), "{name}");
+
+        // S_ISGID on a directory is legitimate and survives a chown.
+        let dir = tx.lookup(&root, format!("dir-{name}").as_bytes()).await;
+        let dir = dir.unwrap().unwrap();
+        tx.set_owner(&dir, Some(5), Some(6), when).await.unwrap();
+        let metadata = tx.metadata(&dir).await.unwrap();
+        assert_eq!(metadata.permissions, 0o2775, "{name}");
+        assert_eq!((metadata.uid, metadata.gid), (5, 6), "{name}");
+        tx.set_permissions(&dir, 0o3770, when).await.unwrap();
+        assert_eq!(tx.metadata(&dir).await.unwrap().permissions, 0o3770);
+
+        // chmod replaces the permission bits and keeps the file type; the
+        // sticky bit is not a set-id bit.
+        let file = tx
+            .create_file(
+                at!(name),
+                Attributes {
+                    permissions: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                },
+                stamp_of(1_700_000_050),
+            )
+            .await
+            .unwrap();
+        let before = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
+        tx.set_permissions(&file, 0o1750, when).await.unwrap();
+        let after = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
+        let metadata = tx.metadata(&file).await.unwrap();
+        assert_eq!(metadata.kind, crate::FileKind::Regular, "{name}");
+        assert_eq!(metadata.permissions, 0o1750, "{name}");
+        assert_eq!((metadata.uid, metadata.gid), (1000, 1000), "{name}");
+        assert_eq!(metadata.ctime, when, "{name}");
+        assert_eq!(after.sequence.get(), before.sequence.get() + 1, "{name}");
+        assert_eq!(after.transid.get(), tx.edits().trees.generation(), "{name}");
+
+        // Both ids absent still changes the inode, as `fchownat(-1, -1)`.
+        tx.set_permissions(&file, 0o600, stamp_of(1_700_000_060))
+            .await
+            .unwrap();
+        tx.set_owner(&file, None, None, when).await.unwrap();
+        let metadata = tx.metadata(&file).await.unwrap();
+        assert_eq!(metadata.permissions, 0o600, "{name}");
+        assert_eq!((metadata.uid, metadata.gid), (1000, 1000), "{name}");
+        assert_eq!(metadata.ctime, when, "{name}");
+
+        // The refusals leave the inode and the transaction as they were.
+        let settled = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
+        for bits in [0o4755, 0o2755, 0o6755, 0o4000, 0o2000] {
+            assert!(
+                matches!(
+                    tx.set_permissions(&file, bits, when).await,
+                    Err(WriteError::SetId { permissions }) if permissions == bits
+                ),
+                "{name} {bits:#o}"
+            );
+        }
+        assert!(matches!(
+            tx.set_permissions(&file, 0o100_644, when).await,
+            Err(WriteError::InvalidPermissions { .. })
+        ));
+        let unchanged = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
+        assert_eq!(settled.as_bytes(), unchanged.as_bytes(), "{name}");
+        let setuid = |permissions| Attributes {
+            permissions,
+            uid: 0,
+            gid: 0,
+        };
+        assert!(matches!(
+            tx.create_file(at!(format!("new-{name}")), setuid(0o4755), when)
+                .await,
+            Err(WriteError::SetId { .. })
+        ));
+        assert!(matches!(
+            tx.create_file(at!(format!("new-{name}")), setuid(0o2755), when)
+                .await,
+            Err(WriteError::SetId { .. })
+        ));
+        assert!(matches!(
+            tx.symlink(at!(format!("new-{name}")), b"target", setuid(0o2777), when)
+                .await,
+            Err(WriteError::SetId { .. })
+        ));
+        assert!(
+            tx.lookup(&root, format!("new-{name}").as_bytes())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A directory takes S_ISGID, and its S_ISUID means nothing.
+        let directory = tx
+            .create_directory(at!(format!("new-{name}")), setuid(0o2755), when)
+            .await
+            .unwrap();
+        assert_eq!(tx.metadata(&directory).await.unwrap().permissions, 0o2755);
+        tx.set_permissions(&directory, 0o4755, when).await.unwrap();
+        assert_eq!(tx.metadata(&directory).await.unwrap().permissions, 0o4755);
+    }
+    tx.commit().await.unwrap();
+
+    // The reader sees what the transaction stored.
+    let current = writer.snapshot().unwrap();
+    for name in CJK_NAMES {
+        let read = async |path: String| *current.resolve(path.as_bytes()).await.unwrap().metadata();
+        let suid = read(format!("/suid-{name}")).await;
+        assert_eq!((suid.permissions, suid.uid, suid.gid), (0o755, 1001, 0));
+        assert_eq!(suid.ctime, when);
+        let sgid = read(format!("/sgid-{name}")).await;
+        assert_eq!((sgid.permissions, sgid.uid, sgid.gid), (0o755, 0, 2002));
+        let lock = read(format!("/lock-{name}")).await;
+        assert_eq!((lock.permissions, lock.uid, lock.gid), (0o644, 7, 8));
+        let dir = read(format!("/dir-{name}")).await;
+        assert_eq!((dir.permissions, dir.uid, dir.gid), (0o3770, 5, 6));
+        let file = read(format!("/{name}")).await;
+        assert_eq!((file.permissions, file.uid, file.gid), (0o600, 1000, 1000));
+        assert_eq!(file.kind, crate::FileKind::Regular);
+    }
+    // The base view still shows the image as it was made.
+    let original = *base
+        .resolve("/suid-plain".as_bytes())
+        .await
+        .unwrap()
+        .metadata();
+    assert_eq!((original.permissions, original.uid), (0o4755, 0));
+    drop((base, current, writer));
+    verify(named.path());
+}
+
+#[cfg(feature = "write")]
+fn stamp_of(seconds: i64) -> crate::Timestamp {
+    crate::Timestamp {
+        seconds,
+        nanoseconds: 0,
+    }
 }

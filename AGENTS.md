@@ -372,12 +372,19 @@ and never comes from CI.
   rights the mount grants are all a WASI or WASIX program holds on it:
   neither sees ownership, modes or ACLs. A container's mounts are the same
   explicit mounts, and their rights bound everything the container's
-  processes can do on them. Within that bound, the kernel enforces the
-  ownership, modes, ACLs, setuid bits and file capabilities a Unix
-  filesystem stores, as Linux does. A node a non-Linux program creates on
-  such a filesystem takes its owner and group from its parent directory,
-  and its mode from the parent's, with the execute bits cleared for a
-  regular file; no mount or WASI interface carries a user or group.
+  processes can do on them. A mount is granted as private or as shared,
+  and that never changes while it exists. A private mount belongs to one
+  container, and within its bound the kernel enforces the ownership,
+  modes, ACLs, setuid bits and file capabilities a Unix filesystem stores,
+  as Linux does. A shared mount may be granted to several containers and
+  to WASI programs at once, and in each container it behaves as it does
+  for WASI: every node appears owned by the identity the container's
+  configuration names, its modes follow the mount's rights, and it is
+  nosuid and nodev with file capabilities ignored. A node a non-Linux
+  program creates, or any program creates on a shared mount, takes its
+  owner and group from its parent directory, and its mode from the
+  parent's, with the execute bits cleared for a regular file; no mount or
+  WASI interface carries a user or group.
 - Native execution runs only with the hardware protections its contract
   states (kernel-mode execute and access protection of user pages, a
   processor unaffected by rogue data cache load) and refuses to start where

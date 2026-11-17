@@ -579,6 +579,45 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         operation.accept()
     }
 
+    /// Replaces the permission bits (`07777`, with the set-id bits refused on
+    /// a non-directory with [`WriteError::SetId`]) and stamps `changed`.
+    pub async fn set_permissions(
+        &mut self,
+        file: &InodeHandle,
+        permissions: u32,
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self, Units::INODE_UPDATE).await?;
+        operation.checked(file).await?;
+        let file = file.id;
+        operation.inner_mut().roots.check_writable(file.tree)?;
+        operation
+            .inner_mut()
+            .set_permissions(file.tree, file.inode, permissions, changed)
+            .await?;
+        operation.accept()
+    }
+
+    /// Changes the owner and the group, each left as it is when `None`, and
+    /// stamps `changed`. A non-directory loses its set-id bits.
+    pub async fn set_owner(
+        &mut self,
+        file: &InodeHandle,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self, Units::INODE_UPDATE).await?;
+        operation.checked(file).await?;
+        let file = file.id;
+        operation.inner_mut().roots.check_writable(file.tree)?;
+        operation
+            .inner_mut()
+            .set_owner(file.tree, file.inode, uid, gid, changed)
+            .await?;
+        operation.accept()
+    }
+
     pub async fn create_file(
         &mut self,
         name: Name<'_>,

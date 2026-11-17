@@ -618,7 +618,9 @@ pub(super) fn fs_error(error: WriteError) -> FsError {
         WriteError::Exists { .. } => FsError::Exists,
         WriteError::NotEmpty { .. } => FsError::NotEmpty,
         WriteError::ReadOnlySubvolume { .. } => FsError::ReadOnly,
-        WriteError::InodeFlags { .. } | WriteError::DirectoryLink => FsError::NotPermitted,
+        WriteError::InodeFlags { .. } | WriteError::SetId { .. } | WriteError::DirectoryLink => {
+            FsError::NotPermitted
+        }
         WriteError::CrossSubvolume => FsError::CrossDevice,
         WriteError::InvalidName | WriteError::DirectoryCycle | WriteError::SymlinkTarget { .. } => {
             FsError::Invalid

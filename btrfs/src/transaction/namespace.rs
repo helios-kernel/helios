@@ -83,7 +83,7 @@ fn entry_type(kind: FileKind) -> u8 {
 }
 
 impl<S: BlockSink> Transaction<S> {
-    pub(super) async fn inode_item(
+    pub(crate) async fn inode_item(
         &self,
         tree: u64,
         inode: u64,
@@ -157,6 +157,7 @@ impl<S: BlockSink> Transaction<S> {
         when: Timestamp,
     ) -> Result<u64, WriteError> {
         validate_name(name.bytes)?;
+        super::ownership::refuse_set_id(attributes.mode)?;
         let tree = name.tree;
         let next = if let Some(last) = self.inode_high_water.get(&tree) {
             last.checked_add(1)

@@ -55,6 +55,7 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::InvalidPermissions { .. } => Errno::EINVAL,
         WriteError::StaleHandle { .. } => Errno::ESTALE,
         WriteError::InodeFlags { .. } => Errno::EPERM,
+        WriteError::SetId { .. } => Errno::EPERM,
         WriteError::UnsupportedCompatRo { .. } => Errno::EROFS,
         WriteError::QuotaTreePresent => Errno::EROFS,
         WriteError::ReadOnlySubvolume { .. } => Errno::EROFS,
