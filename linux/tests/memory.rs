@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use helios_hal::vmm::PageFlags;
 use helios_linux::abi::Abi;
 use helios_linux::syscall::{
-    Call, Clock, Denied, MapError, MemoryFault, NoBacking, Process, Region, Stdio, Stream, Thread,
-    UserMemory, VirtualMemory, WriteError, dispatch,
+    Call, Clock, Denied, MapError, MemoryFault, MemoryTotals, NoBacking, Process, Region, Stdio,
+    Stream, System, Thread, UserMemory, VirtualMemory, WriteError, dispatch,
 };
 
 const PAGE: u64 = 4096;
@@ -207,6 +207,31 @@ impl Clock for NoOutput {
         0
     }
     async fn sleep_until(&self, _: u64) {}
+}
+/// The memory calls read nothing of the machine; a test that reaches here
+/// made a call it does not mean to.
+impl System for NoOutput {
+    fn realtime_nanos(&self) -> u64 {
+        unreachable!("the memory tests read no clock")
+    }
+    fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+        Err(Denied)
+    }
+    fn cpu_nanos(&self) -> u64 {
+        unreachable!("the memory tests read no CPU time")
+    }
+    fn fill_random(&mut self, _: &mut [u8]) {
+        unreachable!("the memory tests draw no entropy")
+    }
+    fn memory(&self) -> MemoryTotals {
+        unreachable!("the memory tests read no machine memory")
+    }
+    fn process_count(&self) -> u32 {
+        unreachable!("the memory tests count no processes")
+    }
+    fn kernel_version(&self) -> &str {
+        unreachable!("the memory tests read no kernel version")
+    }
 }
 
 struct Linux {
