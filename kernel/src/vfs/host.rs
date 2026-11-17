@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use bytes::Bytes;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FilledWrite, FsError, FsPath, FsResult, Metadata,
-    NodeId, NodeKind, OpenFlags, PreparedWrite, WritePosition, WriteProgress,
+    NodeId, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 
 use crate::{
@@ -292,7 +292,21 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
     }
 
-    async fn rename(&self, source: FsPath<'_>, destination: FsPath<'_>, _now: u64) -> FsResult<()> {
+    /// 9p2000.L's `Trenameat` carries no flags (it is `olddirfid`,
+    /// `oldname`, `newdirfid`, `newname`), and the hosted backend's
+    /// `std::fs::rename` has no atomic no-replace or exchange form, so the
+    /// share can honour only [`RenameMode::Replace`]. Anything else would
+    /// have to be composed from separate calls, which is not atomic.
+    async fn rename(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        mode: RenameMode,
+        _now: u64,
+    ) -> FsResult<()> {
+        if mode != RenameMode::Replace {
+            return Err(FsError::Unsupported);
+        }
         self.client
             .rename(host_path(source), host_path(destination))
             .await

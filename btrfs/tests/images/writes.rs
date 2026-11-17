@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 use helios_btrfs::write::{Attributes, CloneRange, Name, WriteOptions, Writer, Zstd};
 use helios_btrfs::{BlockSink, BlockSource, READ_ALIGNMENT, Timestamp};
+use helios_hal::fs::RenameMode;
 use helios_hal::io::IoResult;
 
 use super::fixture::{SparseImage, base_image, block_on};
@@ -284,7 +285,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             )
             .await
             .unwrap();
-        tx.rename(name(b"clone"), name(b"kept"), when)
+        tx.rename(name(b"clone"), name(b"kept"), RenameMode::Replace, when)
             .await
             .unwrap();
         tx.commit(|| panic!("fixture UUIDs are valid"), concurrency)
