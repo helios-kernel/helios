@@ -111,6 +111,11 @@ jobs:
           # input, or the ref it was dispatched on.
           ref: ${{ inputs.ref || (github.event_name == 'schedule' && 'dev') || github.ref }}
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The boot payload the guest below boots is signed with CI's key
+      # (#1023); the release key is never used here.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Install host dependencies
         run: |
           sudo rm -f /etc/apt/sources.list.d/google-chrome*

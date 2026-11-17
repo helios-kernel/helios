@@ -523,9 +523,18 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # CI signs every boot payload with one key, so every image embeds the
+      # same public key and the cache below can hold the kernel image of
+      # inputs that did not change (#1023).
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       # An entry is addressed by its input, the `helios-cli` that compiled
       # it, the target level and the hint, so a restored cache can only
-      # answer a precompile it is exact for. The key carries the run id so
+      # answer a precompile it is exact for. The same directory holds the
+      # kernel images the job linked, each addressed by what the build is
+      # and checked against every file it read, so a job whose kernel
+      # inputs did not change links none (#1023). The key carries the run id so
       # that each default-branch run saves its own cache, and the prefix
       # restores the newest earlier one. The job's prebuilds each use a
       # subset of the entries and each hit or store sets an entry's
@@ -882,6 +891,10 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
@@ -1492,6 +1505,10 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
@@ -2630,6 +2647,10 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
@@ -2798,6 +2819,10 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
