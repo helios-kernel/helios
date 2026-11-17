@@ -195,6 +195,51 @@ static void remapping(void) {
     munmap(moved, 4 * page);
 }
 
+/* Writes a function returning `value` at `code` and makes the instruction
+ * stream see it, as a JIT does. */
+static int (*emit(char *code, unsigned value))(void) {
+#ifdef __x86_64__
+    /* mov eax, imm32; ret */
+    unsigned char bytes[] = {0xb8, value, value >> 8, value >> 16, value >> 24, 0xc3};
+#else
+    /* movz w0, #imm16; ret */
+    uint32_t words[] = {0x52800000 | (value & 0xffff) << 5, 0xd65f03c0};
+    unsigned char bytes[sizeof(words)];
+    memcpy(bytes, words, sizeof(words));
+#endif
+    memcpy(code, bytes, sizeof(bytes));
+#ifdef __aarch64__
+    /* The Arm ARM's sequence for code written by data stores: clean the
+     * data cache to the point of unification, wait, invalidate the
+     * instruction cache, wait for that too, then resynchronise the fetch.
+     * The code starts a page, so it lies in one cache line. Not
+     * `__builtin___clear_cache`: the toolchain's routine omits the DSB
+     * after IC IVAU and lets a rewritten line run stale. */
+    __asm__ volatile("dc cvau, %0\n dsb ish\n ic ivau, %0\n dsb ish\n isb" :: "r"(code) : "memory");
+#endif
+    /* x86-64 keeps instruction fetch coherent with stores to the same
+     * linear address (Intel SDM vol. 3A, "Self-Modifying Code"). */
+    return (int (*)(void))code;
+}
+
+static void executing(void) {
+    /* A fault while running generated code ends the process: what came
+     * before must already be out. */
+    fflush(stdout);
+    char *rwx = mmap(0, page, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    report("mmap write and execute", rwx == MAP_FAILED ? -1 : 0);
+    if (rwx == MAP_FAILED) return;
+    printf("rwx code returns: %d\n", emit(rwx, 42)());
+    munmap(rwx, page);
+
+    char *memory = map(1);
+    report("mprotect rw to rwx", mprotect(memory, page, PROT_READ | PROT_WRITE | PROT_EXEC));
+    printf("rw to rwx code returns: %d\n", emit(memory, 42)());
+    /* Still writable while executable: the same page rewritten. */
+    printf("rewritten code returns: %d\n", emit(memory, 7)());
+    munmap(memory, page);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 100;
     page = sysconf(_SC_PAGESIZE);
@@ -203,6 +248,7 @@ int main(int argc, char **argv) {
     unmapping();
     discarding();
     remapping();
+    executing();
     if (!strcmp(argv[1], "exit")) {
         printf("end: exit\n");
         return 0;

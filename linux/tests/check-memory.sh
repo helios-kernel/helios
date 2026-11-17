@@ -29,6 +29,14 @@
 #   unmapped address or a range across two mappings ("mappings ... of
 #   different types"); MREMAP_FIXED moves onto the given address.
 # - mmap(2): MAP_FIXED_NOREPLACE fails with EEXIST over a mapping.
+# - mmap(2) and mprotect(2) grant PROT_WRITE with PROT_EXEC on anonymous
+#   private memory: mm/mmap.c `calc_vm_prot_bits` sets VM_WRITE|VM_EXEC,
+#   anonymous mappings carry every VM_MAY* bit so mm/mprotect.c's EACCES
+#   check passes, and only an LSM `execmem` policy or PR_SET_MDWE (neither
+#   set for these runs) refuses the pair. Code written to such a page runs
+#   once the instruction stream is synchronised (on arm64 the EL0
+#   DC CVAU / IC IVAU sequence Linux's SCTLR_EL1.UCI permits), and the page
+#   stays writable while it is executable.
 # - A store to an unmapped or read-only page raises SIGSEGV (signal(7));
 #   the shell reports a process a signal ended as 128 plus its number
 #   (POSIX `wait` status, SIGSEGV is 11 on x86-64 and arm64).
@@ -80,7 +88,12 @@ mremap unmapped: EFAULT
 mprotect half: ok
 mremap across regions: EFAULT
 mremap fixed: ok
-fixed contents: kept'
+fixed contents: kept
+mmap write and execute: ok
+rwx code returns: 42
+mprotect rw to rwx: ok
+rw to rwx code returns: 42
+rewritten code returns: 7'
 failed=0
 
 check() {
