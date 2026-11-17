@@ -5,8 +5,13 @@ use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 use helios_unix::{DescriptorSlots, FileDescriptor, FileDescriptorEntry, ProcessIdentity};
 mod io;
+mod system;
 pub use crate::abi::{Abi, Operation};
 pub use io::Clock;
+pub use system::{
+    Credentials, Ids, MemoryTotals, NR_OPEN_DEFAULT, RELEASE, RLIM_INFINITY, Resource, Rlimit,
+    Start, System,
+};
 
 /// The platform objects a process's descriptors can hold besides the UNIX
 /// objects `helios-unix` owns (pipes, eventfds, epoll sets): the host's
@@ -179,18 +184,26 @@ pub struct Process<R: Resources> {
     abi: Abi,
     identity: ProcessIdentity,
     descriptors: Descriptors<R>,
+    attributes: system::Attributes,
     clear_child_tid: u64,
 }
 impl<R: Resources> Process<R> {
     /// A process holding the standard streams only.
     pub fn new(abi: Abi, id: NonZeroU32) -> Self {
-        Self::with_descriptors(abi, id, standard_streams::<R>())
+        Self::with_descriptors(abi, id, standard_streams::<R>(), Start::default())
     }
-    /// A process holding the descriptors its parent handed it.
-    pub fn with_descriptors(abi: Abi, id: NonZeroU32, descriptors: Descriptors<R>) -> Self {
+    /// A process holding the descriptors its parent handed it, whose
+    /// table's limit is its `RLIMIT_NOFILE`.
+    pub fn with_descriptors(
+        abi: Abi,
+        id: NonZeroU32,
+        descriptors: Descriptors<R>,
+        start: Start,
+    ) -> Self {
         Self {
             abi,
             identity: ProcessIdentity::new(id.into()),
+            attributes: system::Attributes::new(start, descriptors.limit),
             descriptors,
             clear_child_tid: 0,
         }
@@ -203,7 +216,7 @@ fn errno(value: u64) -> u64 {
 
 /// A single-threaded process's initial ABI surface. Exit consumes the execution
 /// loop through `Break`; it is never returned to the guest as a syscall result.
-pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread, O: Stdio + Clock>(
+pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread, O: Stdio + Clock + System>(
     process: &mut Process<R>,
     call: Call,
     memory: &mut M,
@@ -275,6 +288,29 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread, O: Stdio + Cloc
             None => errno(EBADF),
         },
         Operation::Write => write::<R, _, _>(&process.descriptors, arguments, memory, output).await,
+        Operation::ClockGettime => system::clock_gettime(arguments, memory, output),
+        Operation::ClockGetres => system::clock_getres(arguments, memory),
+        Operation::ClockSettime => system::clock_settime(arguments, memory, output),
+        Operation::Gettimeofday => system::gettimeofday(arguments, memory, output),
+        Operation::Time => system::time(arguments, memory, output),
+        Operation::Getrandom => system::getrandom(arguments, memory, output).await,
+        Operation::Uname => system::uname(process.abi, arguments, memory, output),
+        Operation::Sysinfo => system::sysinfo(arguments, memory, output),
+        operation @ (Operation::Getuid
+        | Operation::Geteuid
+        | Operation::Getgid
+        | Operation::Getegid) => process.attributes.credentials.id(operation),
+        Operation::Getgroups => process.attributes.credentials.getgroups(arguments, memory),
+        operation @ (Operation::Getresuid | Operation::Getresgid) => process
+            .attributes
+            .credentials
+            .resolve(operation, arguments, memory),
+        operation @ (Operation::Prlimit64 | Operation::Getrlimit | Operation::Setrlimit) => {
+            process.rlimit(operation, arguments, memory)
+        }
+        Operation::Umask => process.umask(arguments),
+        Operation::Getpriority => process.getpriority(arguments),
+        Operation::Setpriority => process.setpriority(arguments),
         Operation::Unknown => errno(ENOSYS),
     };
     ControlFlow::Continue(result)

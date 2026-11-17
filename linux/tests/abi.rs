@@ -4,11 +4,16 @@ use core::future::Future;
 use core::ops::ControlFlow;
 use core::task::{Context, Poll, Waker};
 use helios_linux::abi::Abi;
+use helios_linux::abi::Operation;
 use helios_linux::elf::{Error, Image};
 use helios_linux::syscall::{
-    Call, Denied, MemoryFault, NoBacking, Process, Stdio, Stream, Thread, UserMemory, WriteError,
-    dispatch as linux_dispatch,
+    Call, Credentials, Denied, Ids, MemoryFault, MemoryTotals, NoBacking, Process, Start, Stdio,
+    Stream, System, Thread, UserMemory, WriteError, dispatch as linux_dispatch,
 };
+
+// The crate root is not `mod.rs`, so the submodule names its directory.
+#[path = "abi/system.rs"]
+mod system;
 
 // x86-64's four-level user half.
 const USER_END: u64 = 1 << 47;
@@ -93,6 +98,45 @@ struct Sink {
     error: Option<WriteError>,
     input: bytes::Bytes,
     thread: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    wall_nanos: u64,
+    may_set_wall_clock: bool,
+    cpu_nanos: u64,
+    entropy: u8,
+    processes: u32,
+}
+impl System for Sink {
+    fn realtime_nanos(&self) -> u64 {
+        self.wall_nanos
+    }
+    fn set_realtime_nanos(&mut self, nanos: u64) -> Result<(), Denied> {
+        if !self.may_set_wall_clock {
+            return Err(Denied);
+        }
+        self.wall_nanos = nanos;
+        Ok(())
+    }
+    fn cpu_nanos(&self) -> u64 {
+        self.cpu_nanos
+    }
+    /// A counting sequence, so a test sees exactly which bytes were drawn.
+    fn fill_random(&mut self, output: &mut [u8]) {
+        for byte in output {
+            *byte = self.entropy;
+            self.entropy = self.entropy.wrapping_add(1);
+        }
+    }
+    fn memory(&self) -> MemoryTotals {
+        MemoryTotals {
+            total_bytes: 8 << 30,
+            free_bytes: 3 << 30,
+        }
+    }
+    fn process_count(&self) -> u32 {
+        self.processes
+    }
+    fn kernel_version(&self) -> &str {
+        "Helios test build"
+    }
 }
 impl Stdio for Sink {
     async fn write(&mut self, _: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
@@ -359,9 +403,9 @@ fn aarch64_numbers_reach_the_same_operations_and_legacy_numbers_do_not() {
         unix_call(&mut process, 172, [0; 6], &mut memory, &mut sink),
         5
     );
-    // x86-64's write (1), dup2 (33) and arch_prctl (158) are no aarch64
-    // calls this decoder serves.
-    for number in [1, 33, 158] {
+    // x86-64's write (1), dup2 (33) and epoll_create (213) are no aarch64
+    // calls this decoder serves (213 is readahead there).
+    for number in [1, 33, 213] {
         assert_eq!(
             unix_call(&mut process, number, [0; 6], &mut memory, &mut sink),
             38u64.wrapping_neg()
