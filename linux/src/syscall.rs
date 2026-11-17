@@ -85,8 +85,6 @@ pub trait UserMemory {
 pub enum MapError {
     #[error("user memory exhausted")]
     OutOfMemory,
-    #[error("mapping permissions refused")]
-    Permission,
     #[error("the range lies outside the mappable user range")]
     Address,
     #[error("the range is already mapped")]

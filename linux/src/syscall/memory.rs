@@ -58,9 +58,6 @@ fn access(prot: u64) -> PageFlags {
 fn map_errno(error: MapError) -> u64 {
     errno(match error {
         MapError::OutOfMemory => ENOMEM,
-        // The native W^X policy, refused as a security module refuses a
-        // mapping.
-        MapError::Permission => EPERM,
         // Below the lowest mappable address: `security_mmap_addr`'s
         // `mmap_min_addr` refusal.
         MapError::Address => EPERM,
@@ -93,7 +90,11 @@ fn unmap_checked<M: VirtualMemory>(abi: Abi, start: u64, length: u64, memory: &m
 }
 
 /// `mmap(addr, length, prot, flags, fd, offset)` for anonymous private
-/// memory (mm/mmap.c `do_mmap`).
+/// memory (mm/mmap.c `do_mmap`). Every protection combination is granted,
+/// PROT_WRITE with PROT_EXEC included, as `calc_vm_prot_bits` and
+/// `protection_map` grant it; on Linux only a security module's `execmem`
+/// policy or `PR_SET_MDWE` refuses that pair, and a Helios process has
+/// neither.
 pub(super) fn mmap<M: VirtualMemory>(abi: Abi, args: [u64; 6], memory: &mut M) -> u64 {
     let [hint, length, prot, flags, fd, offset] = args;
     if length == 0 || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
@@ -112,10 +113,6 @@ pub(super) fn mmap<M: VirtualMemory>(abi: Abi, args: [u64; 6], memory: &mut M) -
     }
     if flags & !(MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
         return errno(EOPNOTSUPP);
-    }
-    // The native W^X policy.
-    if prot & (PROT_WRITE | PROT_EXEC) == PROT_WRITE | PROT_EXEC {
-        return errno(EPERM);
     }
     let length = page_align(length);
     if length == 0 {
@@ -166,7 +163,9 @@ pub(super) fn munmap<M: VirtualMemory>(abi: Abi, args: [u64; 6], memory: &mut M)
 
 /// `mprotect(addr, length, prot)` (mm/mprotect.c `do_mprotect_pkey`).
 /// Regions are changed in address order; a hole after the first ends the
-/// walk with `ENOMEM` and leaves the regions before it changed.
+/// walk with `ENOMEM` and leaves the regions before it changed. Write and
+/// execute together are granted, as for `mmap`: anonymous memory carries
+/// every `VM_MAY*` bit, so `do_mprotect_pkey`'s `EACCES` check never fires.
 pub(super) fn mprotect<M: VirtualMemory>(abi: Abi, args: [u64; 6], memory: &mut M) -> u64 {
     let [start, length, prot, ..] = args;
     let grows = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
@@ -198,9 +197,6 @@ pub(super) fn mprotect<M: VirtualMemory>(abi: Abi, args: [u64; 6], memory: &mut 
     }
     if first.start > start {
         return errno(ENOMEM);
-    }
-    if prot & (PROT_WRITE | PROT_EXEC) == PROT_WRITE | PROT_EXEC {
-        return errno(EPERM);
     }
     let access = access(prot);
     let mut position = start;

@@ -290,13 +290,26 @@ fn validates_static_elf_and_retains_bss_extent() {
     assert!(!segment.writable);
 }
 #[test]
-fn refuses_truncated_dynamic_writable_code_and_kernel_addresses() {
+fn a_writable_executable_segment_loads_writable_and_executable() {
+    // fs/binfmt_elf.c `load_elf_binary` maps a PF_R | PF_W | PF_X segment
+    // through `elf_map` with `make_prot(p_flags)`: PROT_READ, PROT_WRITE and
+    // PROT_EXEC together.
+    let mut bytes = image();
+    bytes[68..72].copy_from_slice(&7_u32.to_le_bytes());
+    let parsed = parse(&bytes).expect("an RWX load segment is a valid image");
+    let segment = parsed.segments().next().expect("the image's load segment");
+    assert!(segment.writable && segment.executable);
+}
+
+#[test]
+fn refuses_truncated_dynamic_unknown_flags_and_kernel_addresses() {
     assert!(parse(&image()[..40]).is_err());
     let mut bytes = image();
     bytes[16..18].copy_from_slice(&3_u16.to_le_bytes());
     assert!(matches!(parse(&bytes), Err(Error::UnsupportedImage)));
+    // A p_flags bit beyond PF_R, PF_W and PF_X.
     let mut bytes = image();
-    bytes[68..72].copy_from_slice(&7_u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&0x0d_u32.to_le_bytes());
     assert!(matches!(parse(&bytes), Err(Error::InvalidSegment)));
     let mut bytes = image();
     bytes[80..88].copy_from_slice(&0xffff800000000000_u64.to_le_bytes());
@@ -687,7 +700,6 @@ fn anonymous_mmap_allocates_zeroed_memory_and_rejects_invalid_requests() {
     assert_eq!(&memory.0[4096..], &[0; 4096]);
     for (arguments, error) in [
         ([0, 0, 3, 0x22, u64::MAX, 0], 22u64),
-        ([0, 4096, 7, 0x22, u64::MAX, 0], 1),
         // MAP_FIXED below the lowest mappable address.
         ([0, 4096, 3, 0x32, u64::MAX, 0], 1),
         // MAP_HUGETLB (0x40000), which no mapping here supports.

@@ -26,13 +26,13 @@ const BRK: u64 = 12;
 const MREMAP: u64 = 25;
 const MADVISE: u64 = 28;
 // Linux errno values.
-const EPERM: u64 = 1;
 const ENOMEM: u64 = 12;
 const EFAULT: u64 = 14;
 const EEXIST: u64 = 17;
 const EINVAL: u64 = 22;
 const RW: PageFlags = PageFlags::READ.union(PageFlags::WRITE);
 const R: PageFlags = PageFlags::READ;
+const RWX: PageFlags = RW.union(PageFlags::EXECUTE);
 
 /// One mapped page: its access and its bytes, `None` once discarded.
 struct Page {
@@ -318,7 +318,23 @@ fn mprotect_changes_regions_in_order_and_stops_at_the_first_hole() {
     // PROT_NONE keeps the pages mapped.
     assert_eq!(linux.call(MPROTECT, [base, 2 * PAGE, 0, 0, 0, 0]), 0);
     assert_eq!(linux.memory.access(base), Some(PageFlags::empty()));
-    assert_eq!(linux.call(MPROTECT, [base, PAGE, 6, 0, 0, 0]), error(EPERM));
+}
+
+#[test]
+fn write_and_execute_together_are_granted_as_on_linux() {
+    // mmap(2) and mprotect(2) grant PROT_WRITE | PROT_EXEC on anonymous
+    // private memory: `calc_vm_prot_bits` sets VM_WRITE | VM_EXEC and
+    // anonymous mappings carry every VM_MAY* bit.
+    let mut linux = Linux::new();
+    let rwx = linux.call(MMAP, [0, PAGE, 7, 0x22, u64::MAX, 0]);
+    assert_eq!(linux.memory.access(rwx), Some(RWX));
+    let base = 0x10_0000;
+    assert_eq!(linux.map(base, 1), base);
+    assert_eq!(linux.call(MPROTECT, [base, PAGE, 7, 0, 0, 0]), 0);
+    assert_eq!(linux.memory.access(base), Some(RWX));
+    // Write and execute without an explicit read: both ISAs read it too.
+    assert_eq!(linux.call(MPROTECT, [base, PAGE, 6, 0, 0, 0]), 0);
+    assert_eq!(linux.memory.access(base), Some(RWX));
 }
 
 #[test]

@@ -110,7 +110,10 @@ impl<'a> Image<'a> {
                 || bytes.len() as u64 > size
                 || flags & !(PF_R | PF_W | PF_X) != 0
                 || flags & PF_R == 0
-                || flags & (PF_W | PF_X) == PF_W | PF_X
+                // PF_W | PF_X loads writable and executable: fs/binfmt_elf.c
+                // `load_elf_binary` maps each PT_LOAD through `elf_map` with
+                // `make_prot(p_flags)`, which turns PF_W and PF_X into
+                // PROT_WRITE and PROT_EXEC together.
                 || (align > 1
                     && (!align.is_power_of_two()
                         || address % align != header.p_offset(endian) % align))

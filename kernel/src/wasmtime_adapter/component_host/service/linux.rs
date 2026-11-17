@@ -199,7 +199,6 @@ fn page_range(address: u64, length: u64) -> VirtRange {
 fn map_error(error: NativeError) -> MapError {
     match error {
         NativeError::OutOfMemory => MapError::OutOfMemory,
-        NativeError::Permissions => MapError::Permission,
         NativeError::Address => MapError::Address,
         NativeError::Overlap => MapError::Occupied,
         error @ (NativeError::NotMapped | NativeError::Register) => {
