@@ -3,18 +3,22 @@
 //! Every slice entry and exit writes CR3 without PCID and no user mapping is
 //! global, so no processor keeps a usable user translation once its slice
 //! ends: a page removed from a space while none of its slices runs needs no
-//! remote invalidation. The kernel's upper half is shared with every space;
-//! a space owns only its private lower half.
+//! remote invalidation, and one removed while some run goes through the
+//! kernel's TLB shootdown broadcast (`smp::shootdown_tlb_range`). The
+//! kernel's upper half is shared with every space; a space owns only its
+//! private lower half.
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::arch::global_asm;
+use core::arch::{asm, global_asm};
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::hv::RegisterId;
 use helios_hal::native::{
-    FaultKind, InstructionSet, NativeError, NativeExecution, Stop, UserContext, UserFault,
+    FaultKind, InstructionSet, NativeError, NativeExecution, Protection, Stop, UserContext,
+    UserFault, UserSpace,
 };
 use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_kernel::{NativeSpace, UserTranslation};
@@ -26,6 +30,7 @@ use x86_64::structures::paging::{
 };
 use x86_64::{PhysAddr, VirtAddr as X86VirtAddr};
 
+use crate::isolation::UserIsolation;
 use crate::{exceptions, extended_state, smp};
 
 // GDT: null, kernel code/data, user data/code. RPL is three for user selectors.
@@ -45,10 +50,13 @@ const KERNEL_GS_BASE: u32 = 0xc000_0102;
 // A software vector number above the IDT's 256, so the exit path can tell a
 // SYSCALL from every hardware vector.
 const SYSCALL_VECTOR: u64 = 256;
-// Page-fault error code bits (Intel SDM vol. 3A, 4.7): P, W/R, I/D.
+// Page-fault error code bits (Intel SDM vol. 3A, 4.7): P, W/R, U/S, I/D.
 const PAGE_FAULT_PRESENT: u64 = 1 << 0;
 const PAGE_FAULT_WRITE: u64 = 1 << 1;
+const PAGE_FAULT_USER: u64 = 1 << 2;
 const PAGE_FAULT_FETCH: u64 = 1 << 4;
+// The `ret` opcode (Intel SDM vol. 2B, RET: C3, near return).
+const RET: u8 = 0xc3;
 
 /// The x86-64 native execution capability.
 pub struct X86Native;
@@ -146,14 +154,21 @@ unsafe impl UserTranslation for X86Tables {
         let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(base))
             .expect("a page span is page aligned");
         let offset = X86VirtAddr::new(self.tables.offset as u64);
+        // Every table above a leaf grants user, write and execute access and
+        // the leaf alone limits it, as Linux's `_PAGE_TABLE` does: a page
+        // first mapped with no access must still reach user mode once
+        // `protect` widens its leaf.
+        let parents =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         // SAFETY: the page is not mapped and the frame is fresh; the root and
         // every lower-half table are owned by this space and reached through
         // the kernel direct map.
         let mapped = unsafe {
-            OffsetPageTable::new(&mut self.root, offset).map_to(
+            OffsetPageTable::new(&mut self.root, offset).map_to_with_table_flags(
                 page,
                 frame,
                 page_table_flags(flags),
+                parents,
                 &mut self.tables,
             )
         };
@@ -172,10 +187,33 @@ unsafe impl UserTranslation for X86Tables {
         let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(base))
             .expect("an installed page is page aligned");
         match self.mapper().unmap(page) {
-            // No slice ran the page, so no processor caches it.
+            // The space's caller invalidates the page wherever a slice may
+            // hold it (`invalidate`).
             Ok((_, flush)) => flush.ignore(),
-            Err(error) => panic!("native mapping rollback at {base:#x}: {error:?}"),
+            Err(error) => panic!("removing user page {base:#x}: {error:?}"),
         }
+    }
+
+    fn protect(&mut self, base: u64, flags: PageFlags) {
+        let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(base))
+            .expect("an installed page is page aligned");
+        // SAFETY: the page maps a frame of this space; only its access
+        // changes, and the caller invalidates a narrowing.
+        match unsafe { self.mapper().update_flags(page, page_table_flags(flags)) } {
+            Ok(flush) => flush.ignore(),
+            Err(error) => panic!("changing the access of user page {base:#x}: {error:?}"),
+        }
+    }
+
+    fn invalidate(&self, first: u64, last: u64) {
+        let (start, byte_len) = (first as usize, (last - first) as usize);
+        // The kernel's CR3 is loaded here, so the local INVLPG reaches no
+        // user translation: the slice exit's CR3 write already dropped
+        // them. A processor running a slice takes the broadcast's IPI from
+        // user mode, and its exit's CR3 write drops the space's
+        // translations before the handler acknowledges.
+        smp::flush_tlb_range_local(start, byte_len);
+        smp::shootdown_tlb_range(start, byte_len);
     }
 
     fn physical(&self, frame: NonNull<u8>) -> u64 {
@@ -432,7 +470,9 @@ unsafe impl UserContext for X86Context {
             | (1 << 18)
             | (1 << 21);
         self.switch.registers.rflags = (self.switch.registers.rflags & USER_FLAGS) | 0x202;
-        self.switch.user_cr3 = space.with_tables(X86Tables::root);
+        // Counted until the exit below has written the kernel's CR3 back.
+        let slice = space.begin_slice();
+        self.switch.user_cr3 = slice.with_tables(X86Tables::root);
         let fault_address = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
             self.switch.self_pointer = core::ptr::from_mut(&mut self.switch) as u64;
             let (kernel_frame, kernel_flags) = Cr3::read_raw();
@@ -455,6 +495,7 @@ unsafe impl UserContext for X86Context {
             // still the user fault's address.
             Cr2::read_raw()
         });
+        drop(slice);
         match self.switch.registers.vector {
             SYSCALL_VECTOR => Stop::SystemCall,
             vector if vector == exceptions::TIMER_INTERRUPT_VECTOR as u64 => Stop::Preempted,
@@ -484,6 +525,177 @@ global_asm!(include_str!("native.S"),
 unsafe extern "C" {
     fn helios_x86_native_enter(state: *mut Switch);
     fn helios_x86_native_syscall();
+    fn helios_x86_isolation_load();
+    fn helios_x86_isolation_store();
+}
+
+/// Marks a recorded error code; no page-fault error code bit reaches 63
+/// (Intel SDM vol. 3A, 4.7; AMD APM vol. 2, 8.4.2).
+const RECORDED: u64 = 1 << 63;
+
+/// One processor's record of [`verify_user_isolation`]: the first of the
+/// two user pages under test while the check runs, and the page-fault
+/// error code of each ring-0 access the processor refused there. Written
+/// by its processor only, from the check and from the page-fault
+/// dispatcher it interrupts.
+pub(crate) struct IsolationProbe {
+    code: AtomicU64,
+    fetch: AtomicU64,
+    load: AtomicU64,
+    store: AtomicU64,
+}
+
+impl IsolationProbe {
+    pub(crate) const fn new() -> Self {
+        Self {
+            code: AtomicU64::new(0),
+            fetch: AtomicU64::new(0),
+            load: AtomicU64::new(0),
+            store: AtomicU64::new(0),
+        }
+    }
+
+    /// Records a ring-0 page fault at `address` with error code `error`
+    /// when it is on the pages under test, and says whether it was.
+    pub(crate) fn claim(&self, address: usize, error: u64) -> bool {
+        let code = self.code.load(Ordering::Relaxed);
+        if code == 0 || !(code..code + 2 * PAGE_BYTES).contains(&(address as u64)) {
+            return false;
+        }
+        let slot = if error & PAGE_FAULT_FETCH != 0 {
+            &self.fetch
+        } else if error & PAGE_FAULT_WRITE != 0 {
+            &self.store
+        } else {
+            &self.load
+        };
+        slot.store(error | RECORDED, Ordering::Relaxed);
+        true
+    }
+}
+
+/// Proves, on the calling processor, that ring 0 can neither fetch from
+/// nor load from nor store to a user page: the SMEP and SMAP half of the
+/// isolation contract, checked against a page this module mapped.
+///
+/// The check maps a user code page holding a `ret` and a user data page in
+/// a fresh space, loads the space's root as a slice entry does, and from
+/// ring 0 calls the code page, then calls the load and store helpers of
+/// `native.S` on the data page. Each access must raise a supervisor
+/// protection fault, which the page-fault dispatcher records through
+/// [`IsolationProbe::claim`] and answers by resuming the call's return.
+/// An access that completes instead (the `ret` comes straight back) is a
+/// boot failure naming the protection that is not in effect.
+///
+/// A processor without the whole contract runs no user code, so there is
+/// nothing to check on it.
+pub(crate) fn verify_user_isolation(isolation: UserIsolation) {
+    let runtime = smp::current_runtime();
+    if let Err(reason) = isolation.require() {
+        tracing::warn!(
+            target: "helios_x86::native",
+            processor = runtime.logical_id(),
+            %reason,
+            "native user execution is unavailable"
+        );
+        return;
+    }
+    let code = X86Native.user_range().start;
+    let data = VirtAddr::new(code.raw() + PAGE_BYTES as usize);
+    let space = X86Native
+        .create_space()
+        .unwrap_or_else(|error| panic!("x86 isolation check could not create a space: {error}"));
+    for (page, contents, flags) in [
+        (code, &[RET][..], PageFlags::READ | PageFlags::EXECUTE),
+        (data, &[][..], PageFlags::READ | PageFlags::WRITE),
+    ] {
+        space
+            .map(VirtRange::new(page, PAGE_BYTES as usize), contents, flags)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "x86 isolation check could not map user page {:#x}: {error}",
+                    page.raw()
+                )
+            });
+    }
+    let probe = &runtime.isolation_probe;
+    let slice = space.begin_slice();
+    let user_cr3 = slice.with_tables(X86Tables::root);
+    probe.code.store(code.raw() as u64, Ordering::Relaxed);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // SAFETY: the user root shares the kernel's upper half, which
+        // holds everything this code, its stack and the dispatcher touch.
+        // The user pages are this space's own, and every access to one
+        // either faults, and resumes at its call's return, or runs the
+        // `ret` and the helpers, which change nothing but RAX, RDI and
+        // the data page. The kernel's CR3 goes back before interrupts
+        // do, and its write drops every translation of the space.
+        unsafe {
+            asm!(
+                "mov {kernel}, cr3",
+                "mov cr3, {user}",
+                "call rdi",
+                "mov rdi, rsi",
+                "call {load}",
+                "call {store}",
+                "mov cr3, {kernel}",
+                user = in(reg) user_cr3,
+                kernel = out(reg) _,
+                load = sym helios_x86_isolation_load,
+                store = sym helios_x86_isolation_store,
+                inout("rdi") code.raw() => _,
+                in("rsi") data.raw(),
+                out("rax") _,
+            );
+        }
+    });
+    probe.code.store(0, Ordering::Relaxed);
+    drop(slice);
+    drop(space);
+    let accesses = [
+        (
+            "fetch from",
+            &probe.fetch,
+            code,
+            PAGE_FAULT_FETCH,
+            Protection::Smep,
+        ),
+        ("load from", &probe.load, data, 0, Protection::Smap),
+        (
+            "store to",
+            &probe.store,
+            data,
+            PAGE_FAULT_WRITE,
+            Protection::Smap,
+        ),
+    ];
+    for (access, slot, page, kind, protection) in accesses {
+        let error = slot.swap(0, Ordering::Relaxed);
+        assert!(
+            error & RECORDED != 0,
+            "x86 processor {} completed a ring-0 {access} user page {:#x}: {protection} is \
+             not in effect",
+            runtime.logical_id(),
+            page.raw()
+        );
+        let expected = PAGE_FAULT_PRESENT | kind;
+        assert!(
+            error & (PAGE_FAULT_PRESENT | PAGE_FAULT_USER | PAGE_FAULT_WRITE | PAGE_FAULT_FETCH)
+                == expected,
+            "x86 processor {}'s ring-0 {access} user page {:#x} faulted with error code \
+             {:#x}, not as the supervisor protection fault {protection} raises",
+            runtime.logical_id(),
+            page.raw(),
+            error & !RECORDED
+        );
+    }
+    tracing::info!(
+        target: "helios_x86::native",
+        processor = runtime.logical_id(),
+        code = code.raw(),
+        data = data.raw(),
+        "ring-0 fetch from, load from and store to user pages fault"
+    );
 }
 
 #[unsafe(no_mangle)]

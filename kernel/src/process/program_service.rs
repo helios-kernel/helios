@@ -2,6 +2,7 @@ use core::fmt::{self, Write};
 
 use arrayvec::ArrayString;
 use helios_hal::fs::FsError;
+use helios_hal::native::NativeUnavailable;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -252,8 +253,8 @@ pub enum ProgramExecErrorDetail {
     InternalInvariant,
     #[error("{0}")]
     ComponentStdioUnbindable(ComponentStdioRefusal),
-    #[error("this platform has no native user execution")]
-    NativeExecutionUnavailable,
+    #[error("{0}")]
+    NativeExecutionUnavailable(NativeUnavailable),
     #[error("no Linux ABI is decoded for this platform's instruction set")]
     LinuxAbiUnsupported,
     #[error("the Linux executable is not a static image this kernel loads: {0}")]
@@ -377,7 +378,9 @@ impl ProgramExecErrorDetail {
             Self::ComponentStdioUnbindable(_) => {
                 "a standard descriptor cannot be a component's standard stream"
             }
-            Self::NativeExecutionUnavailable => "this platform has no native user execution",
+            // What is missing is in the error's `Display`; `as_str` has no
+            // storage to format it into.
+            Self::NativeExecutionUnavailable(_) => "native user execution is unavailable",
             Self::LinuxAbiUnsupported => {
                 "no Linux ABI is decoded for this platform's instruction set"
             }

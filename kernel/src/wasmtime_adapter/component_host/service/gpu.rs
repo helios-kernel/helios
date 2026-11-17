@@ -40,8 +40,8 @@ use core::task::{Context, Poll};
 use futures::channel::oneshot;
 use helios_hal::device::DeviceRegion;
 use helios_hal::display::{
-    BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, MAX_CONTEXT_NAME, RingCount,
-    RingIndex,
+    BlobId, BlobMemory, BlobUsage, CapsetId, ContextId, ContextName, DisplayMode, FenceId,
+    MAX_CONTEXT_NAME, PixelFormat, RingCount, RingIndex,
 };
 use helios_hal::iommu::PhysicalRange;
 use triomphe::Arc;
@@ -54,12 +54,13 @@ use wasmtime::component::{
 use crate::ComponentHostNetwork;
 use crate::buffer::{Buffer, GuestMemory, Span, ViewError, ViewGroup, ViewId, ViewTable};
 use crate::gpu::{
-    BlobShared, BlobSpec, ContextShared, Gpu3dRequest, Gpu3dSender, Gpu3dServiceError,
-    InlineCommands, MAX_EXECUTE_BYTES, SessionId, SubmitCommands, SubmitRequest,
+    BlobShared, BlobSpec, CompletionSignal, ContextShared, Gpu3dRequest, Gpu3dSender,
+    Gpu3dServiceError, GpuImage, InlineCommands, MAX_EXECUTE_BYTES, SessionId, SubmitCommands,
+    SubmitCompletion, SubmitRequest,
 };
 use crate::wasmtime_adapter::bindings::gpu::bindings::helios::system::gpu as gpu_wit;
 
-use super::super::{PendingReply, StoreData, guest_memory, view_trap};
+use super::super::{PendingReply, StoreData, caller_memory, view_trap};
 
 /// Register `helios:system/gpu` in a linker.
 ///
@@ -145,6 +146,7 @@ fn to_wit_error(error: Gpu3dServiceError) -> gpu_wit::Error {
         Gpu3dServiceError::OutOfBounds => gpu_wit::Error::OutOfBounds,
         Gpu3dServiceError::BadRing => gpu_wit::Error::BadRing,
         Gpu3dServiceError::StaleFence => gpu_wit::Error::StaleFence,
+        Gpu3dServiceError::UnsubmittedFence => gpu_wit::Error::UnsubmittedFence,
         Gpu3dServiceError::BadSpan(_) | Gpu3dServiceError::BlobSpanMismatch => {
             gpu_wit::Error::BadSpan
         }
@@ -306,7 +308,7 @@ where
     }
 }
 
-/// The calling instance's linear memory, read through `access`.
+/// The linear memory of the call `access` serves, read through it.
 fn memory_of<U, CpuImpl, Net, StorageImpl>(
     access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
 ) -> Result<GuestMemory, Gpu3dServiceError>
@@ -316,18 +318,17 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let linear_memory = access.get().linear_memory;
-    Ok(guest_memory(linear_memory, &*access)?)
+    Ok(caller_memory(&*access)?)
 }
 
-/// The calling instance's memory in the last step of a call whose early
-/// half already read it.
+/// The call's memory in the last step of a call whose early half already
+/// read it.
 ///
 /// # Panics
 ///
-/// Panics when the store has no unshared memory: the handle is recorded
-/// once, when the instance is built, and the early half of the call
-/// already found it.
+/// Panics when the call has no unshared memory: the memory belongs to
+/// the call, so every step of it answers the same, and the early half
+/// of the call already found it.
 fn checked_memory<U, CpuImpl, Net, StorageImpl>(
     access: &mut Access<'_, U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
 ) -> GuestMemory
@@ -376,6 +377,51 @@ fn spawn_gpu_cleanup<CpuImpl>(
     }
 }
 
+pub(super) const fn from_wit_format(format: gpu_wit::PixelFormat) -> PixelFormat {
+    match format {
+        gpu_wit::PixelFormat::Bgrx8888 => PixelFormat::Bgrx8888,
+        gpu_wit::PixelFormat::Bgra8888 => PixelFormat::Bgra8888,
+        gpu_wit::PixelFormat::Xrgb8888 => PixelFormat::Xrgb8888,
+        gpu_wit::PixelFormat::Argb8888 => PixelFormat::Argb8888,
+        gpu_wit::PixelFormat::Rgbx8888 => PixelFormat::Rgbx8888,
+        gpu_wit::PixelFormat::Rgba8888 => PixelFormat::Rgba8888,
+        gpu_wit::PixelFormat::Xbgr8888 => PixelFormat::Xbgr8888,
+        gpu_wit::PixelFormat::Abgr8888 => PixelFormat::Abgr8888,
+    }
+}
+
+fn image_layout(image: &GpuImage) -> gpu_wit::ImageLayout {
+    let layout = image.layout();
+    gpu_wit::ImageLayout {
+        width: layout.mode.width,
+        height: layout.mode.height,
+        offset: layout.offset,
+        stride: layout.stride,
+        format: match layout.format {
+            PixelFormat::Bgrx8888 => gpu_wit::PixelFormat::Bgrx8888,
+            PixelFormat::Bgra8888 => gpu_wit::PixelFormat::Bgra8888,
+            PixelFormat::Xrgb8888 => gpu_wit::PixelFormat::Xrgb8888,
+            PixelFormat::Argb8888 => gpu_wit::PixelFormat::Argb8888,
+            PixelFormat::Rgbx8888 => gpu_wit::PixelFormat::Rgbx8888,
+            PixelFormat::Rgba8888 => gpu_wit::PixelFormat::Rgba8888,
+            PixelFormat::Xbgr8888 => gpu_wit::PixelFormat::Xbgr8888,
+            PixelFormat::Abgr8888 => gpu_wit::PixelFormat::Abgr8888,
+        },
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl> gpu_wit::HostImage for StoreData<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn drop(&mut self, image: Resource<GpuImage>) -> wasmtime::Result<()> {
+        self.table.delete(image)?;
+        Ok(())
+    }
+}
+
 /// An `UnmapBlob` nobody waits for the answer to.
 fn unmap_request(blob: BlobId) -> Gpu3dRequest {
     let (reply, _) = oneshot::channel();
@@ -388,6 +434,13 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    fn describe_image(
+        &mut self,
+        image: Resource<GpuImage>,
+    ) -> wasmtime::Result<gpu_wit::ImageLayout> {
+        Ok(image_layout(self.table.get(&image)?))
+    }
+
     fn open(&mut self) -> wasmtime::Result<Result<Resource<GpuHandle>, gpu_wit::Error>> {
         let Some(service) = self.runtime_state.gpu3d_service() else {
             return Ok(Err(gpu_wit::Error::Unavailable));
@@ -477,6 +530,28 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    fn image(
+        &mut self,
+        handle: Resource<BlobHandle>,
+        layout: gpu_wit::ImageLayout,
+    ) -> wasmtime::Result<Result<Resource<GpuImage>, gpu_wit::Error>> {
+        let blob = self.table.get(&handle)?;
+        if !self.device.gpu().is_current(blob.session) {
+            return Ok(Err(gpu_wit::Error::SessionEnded));
+        }
+        let image = match GpuImage::new(
+            &blob.shared,
+            DisplayMode::new(layout.width, layout.height),
+            from_wit_format(layout.format),
+            layout.offset,
+            layout.stride,
+        ) {
+            Ok(image) => image,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        Ok(Ok(self.table.push(image)?))
+    }
+
     fn resource_id(&mut self, handle: Resource<BlobHandle>) -> wasmtime::Result<u32> {
         Ok(self.table.get(&handle)?.id.raw())
     }
@@ -600,7 +675,7 @@ async fn queue_submission<U, CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>,
     handle: &Resource<ContextHandle>,
     ring: u8,
-    fence: Option<u64>,
+    completion: Option<gpu_wit::Completion>,
     mut commands: impl FnMut(
         &mut StoreData<CpuImpl, Net, StorageImpl>,
         SessionId,
@@ -612,9 +687,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    // The sender whose room this call was last woken for: a call that
-    // then queues nothing passes its turn on.
-    let mut woken: Option<Gpu3dSender> = None;
+    let fence = completion.as_ref().map(|completion| completion.fence);
     loop {
         let step = accessor.with(|mut access| -> wasmtime::Result<SubmitStep> {
             let data = access.get();
@@ -632,12 +705,31 @@ where
                 Ok(commands) => commands,
                 Err(error) => return Ok(SubmitStep::Refused(error)),
             };
+            let completion = completion
+                .as_ref()
+                .map(|completion| {
+                    let signals = completion
+                        .signals
+                        .iter()
+                        .map(|signal| {
+                            Ok(CompletionSignal {
+                                source: data.table.get(&signal.source)?.clone(),
+                                value: signal.value,
+                            })
+                        })
+                        .collect::<wasmtime::Result<Vec<_>>>()?;
+                    Ok::<_, wasmtime::Error>(SubmitCompletion {
+                        fence: FenceId::new(completion.fence),
+                        signals,
+                    })
+                })
+                .transpose()?;
             let (reply, answer) = oneshot::channel();
             let request = SubmitRequest {
                 context: shared.clone(),
                 commands,
                 ring,
-                fence,
+                completion,
                 reply,
             };
             Ok(match sender.try_submit(request) {
@@ -660,16 +752,8 @@ where
                     .unwrap_or(Err(Gpu3dServiceError::SessionEnded))
                     .map_err(to_wit_error));
             }
-            SubmitStep::Full(sender) => {
-                sender.submit_room().await;
-                woken = Some(sender);
-            }
-            SubmitStep::Refused(error) => {
-                if let Some(sender) = woken {
-                    sender.pass_submit_room();
-                }
-                return Ok(Err(error));
-            }
+            SubmitStep::Full(sender) => sender.submit_room().await,
+            SubmitStep::Refused(error) => return Ok(Err(error)),
         }
     }
 }
@@ -1008,9 +1092,9 @@ where
         offset: u64,
         length: u64,
         ring: u8,
-        fence: Option<u64>,
+        completion: Option<gpu_wit::Completion>,
     ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
-        queue_submission(accessor, &handle, ring, fence, |data, session| {
+        queue_submission(accessor, &handle, ring, completion, |data, session| {
             data.command_range(&commands, offset, length, session)
         })
         .await
@@ -1021,7 +1105,7 @@ where
         handle: Resource<ContextHandle>,
         commands: Vec<u8>,
         ring: u8,
-        fence: Option<u64>,
+        completion: Option<gpu_wit::Completion>,
     ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
         let Ok(inline) = InlineCommands::try_from(commands.as_slice()) else {
             // Longer than the kernel carries inline: such a stream
@@ -1029,10 +1113,34 @@ where
             debug_assert!(commands.len() > MAX_EXECUTE_BYTES);
             return Ok(Err(gpu_wit::Error::OutOfBounds));
         };
-        queue_submission(accessor, &handle, ring, fence, |_, _| {
+        queue_submission(accessor, &handle, ring, completion, |_, _| {
             Ok(Ok(SubmitCommands::Inline(inline.clone())))
         })
         .await
+    }
+
+    async fn wait(
+        accessor: &Accessor<U, Self>,
+        handle: Resource<ContextHandle>,
+        ring: u8,
+        fence: u64,
+    ) -> wasmtime::Result<Result<(), gpu_wit::Error>> {
+        let held = accessor.with(|mut access| {
+            let data = access.get();
+            let context = data.table.get(&handle)?;
+            Ok::<_, wasmtime::Error>(
+                data.gpu_sender(context.session)
+                    .map(|sender| (sender, context.shared.clone())),
+            )
+        })?;
+        let (sender, context) = match held {
+            Ok(held) => held,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        Ok(sender
+            .wait(&context, ring, fence)
+            .await
+            .map_err(to_wit_error))
     }
 
     fn fences(

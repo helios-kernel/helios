@@ -22,7 +22,7 @@ never depends on anything above it.
 | Compatibility layers | `unix/`, `linux/` | `#![no_std]` services the non-Preview-3 ABIs share (`unix/`) and the Linux ABI (`linux/`), each behind a kernel feature that is off by default. Both build on `hal/` and `sync/`; neither depends on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
 | Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service, and, behind the `linux` feature, the native Linux process host. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
-| Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport, SMP wiring and native user execution, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
+| Backends | `aarch64/`, `riscv/`, `x86/`, `x86-vmm/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport, SMP wiring and native user execution, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. `x86-vmm/` is the x86 user address space over a `Machine` the backend supplies, so the host builds and tests the code the kernel runs. |
 | Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
 | User space | `api/`, `api-macro/`, `programs/*`, `venus/` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. `venus/` is the Venus wire protocol a program's GPU driver links: the hand-written sinks and the encoders generated at build time. |
 | Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `compiler-host/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `workspace-root/` finds the workspace and holds the root key file format those two share. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. `compiler-host/` runs the compiler plugin under Wasmtime on Linux, the bench's Linux + Wasmtime column of `aot-curl`. |
@@ -136,6 +136,13 @@ maintainer's decision and the fork's revision moves once, per §1.
   boot and sealing, and never data I/O.
 - A well-maintained, `no_std`-friendly third-party crate beats a hand-rolled
   implementation.
+- Kernel-mode code is safe Rust above two kinds of boundary: `hal/` and the
+  backends, where `unsafe` touches hardware, and a safe, ergonomic Rust API
+  whose implementation confines the `unsafe` it needs and states each
+  precondition. A component whose work needs `unsafe` throughout (a driver
+  speaking a C ABI, a parser of untrusted formats, a protocol engine over raw
+  memory) runs in user mode, inside the wasm sandbox, as a program or kernel
+  plugin, so that its defects end an instance rather than corrupt the kernel.
 
 ### 3.2 Rust style
 
@@ -184,7 +191,7 @@ maintainer's decision and the fork's revision moves once, per §1.
 - The HTTP client is a kernel plugin (`programs/http-client`): the kernel
   implements `wasi:http/types` only and forwards `wasi:http/client.send`
   through a typed provider slot to the plugin's `wasi:http/handler`; HTTP/1.1
-  framing, DNS and, later, TLS run in user memory. The provider slot is the
+  framing, DNS and TLS run in user memory. The provider slot is the
   route for any future interface a plugin serves.
 - Plugins share the user-memory and allocation contract of every program.
   There is no plugin-private allocator policy, memory floor, or oversized
@@ -391,6 +398,25 @@ and never comes from CI.
   one is missing, naming it. It keeps every mitigation Linux applies to user
   processes on the same hardware.
 
+### 3.9 Target environment
+
+Helios runs in production as a guest under hardware-accelerated
+virtualization on a cloud provider's x86-64 Linux KVM host, and a macOS
+development host under HVF is the same class of machine. Design and policy
+decisions assume that machine.
+
+- Guest processor time is cheap and every device access crosses the
+  virtualization boundary, so a mechanism that spends processor work to
+  save device round-trips is usually the right one.
+- The facilities a host offers its guest are part of the machine model,
+  not an edge case.
+- The host's device models are a trust boundary: device input is
+  untrusted, and limiting what a device may access or claim is a
+  legitimate design input.
+- TCG checks correctness on architectures CI cannot virtualize. It is
+  never a design target, and an optimization that wins only under
+  emulation is not an optimization.
+
 ## 4. Async-first execution
 
 The kernel runs a cooperative async executor. Anything that pins it blocks
@@ -516,7 +542,7 @@ just test-units
 `just lint` is `tools/fmt.sh --check`, `cargo deny --workspace check bans`
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
-`just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `firmware`, `sync`, `unix`, `linux`, `kernel`,
+`just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `firmware`, `sync`, `unix`, `linux`, `kernel`, `x86-vmm`,
 `inspector-protocol` and `workspace-root` unit tests, every `btrfs` and `hosted` test,
 and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe

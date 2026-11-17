@@ -233,7 +233,7 @@ pub(crate) fn user_residency() -> UserResidency {
 }
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem> IoView
-    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable, wasmtime::Memory>
+    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,

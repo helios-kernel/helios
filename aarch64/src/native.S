@@ -211,3 +211,20 @@ helios_aarch64_native_exit:
     ldp x19, x20, [sp, #0x10]
     ldp x29, x30, [sp], #0xa0
     ret
+
+// The EL1 load and store of `native::verify_user_isolation`, on the user
+// page in x0. Each faults at its first instruction while PSTATE.PAN
+// holds, and the synchronous exception handler resumes at x30.
+.global helios_aarch64_isolation_load
+.type helios_aarch64_isolation_load, %function
+helios_aarch64_isolation_load:
+    ldr x1, [x0]
+    ret
+.size helios_aarch64_isolation_load, . - helios_aarch64_isolation_load
+
+.global helios_aarch64_isolation_store
+.type helios_aarch64_isolation_store, %function
+helios_aarch64_isolation_store:
+    str x0, [x0, #8]
+    ret
+.size helios_aarch64_isolation_store, . - helios_aarch64_isolation_store

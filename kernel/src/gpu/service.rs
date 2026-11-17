@@ -58,7 +58,7 @@
 //! permit on the same [`Notify`] that has it resume.
 //!
 //! A blob a scanout shows is held by that scanout: the surface carries a
-//! [`ScanoutHold`] on the blob's [`BlobShared`], and the blob is not
+//! [`BlobHold`] on the blob's [`BlobShared`], and the blob is not
 //! destroyed — whether its handle was dropped or its session ended —
 //! until every hold is gone. The display path drops a hold only after it
 //! has blanked the scanout, so the device never scans out a resource
@@ -67,7 +67,9 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::future::poll_fn;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::task::Poll;
 
 use arrayvec::ArrayVec;
 use futures::channel::oneshot;
@@ -81,8 +83,7 @@ use triomphe::Arc;
 
 use crate::buffer::Buffer;
 use crate::component::{ProviderError, ProviderSender};
-use crate::display::SequenceSignal;
-use crate::exec::Notify;
+use crate::exec::{Notify, SequenceSignal, SignalTimeline, TimelineSource};
 use crate::process::GpuOpenCap;
 
 use super::{Gpu3dServiceError, MAX_EXECUTE_BYTES};
@@ -115,6 +116,8 @@ pub(crate) struct SessionState {
     /// Set once, when the session is dropped. A request read after it is
     /// set is dropped unanswered: its instance let the engine go.
     pub(super) ended: AtomicBool,
+    /// Broadcast to operations waiting on a session that has ended.
+    ended_notify: Notify,
     /// Submissions of this session the submit server has popped and the
     /// device has not finished with.
     ///
@@ -143,18 +146,20 @@ impl SessionState {
 /// about one blob.
 pub struct BlobShared {
     id: BlobId,
-    /// Scanouts showing the blob right now.
-    scanouts: AtomicU64,
+    /// Image capabilities and scanouts retaining the blob right now.
+    holds: AtomicU64,
+    size: u64,
     /// The control server's wake-up, banked when the last scanout lets
     /// go, so a release the scanout held back resumes.
     release: Arc<Notify>,
 }
 
 impl BlobShared {
-    pub(crate) fn new(id: BlobId, release: Arc<Notify>) -> Self {
+    pub(crate) fn new(id: BlobId, size: u64, release: Arc<Notify>) -> Self {
         Self {
             id,
-            scanouts: AtomicU64::new(0),
+            holds: AtomicU64::new(0),
+            size,
             release,
         }
     }
@@ -164,25 +169,30 @@ impl BlobShared {
         self.id
     }
 
-    /// Whether a scanout shows the blob.
-    pub fn is_scanned_out(&self) -> bool {
-        self.scanouts.load(Ordering::Acquire) != 0
+    /// The immutable byte length established when the device created the blob.
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Whether an image capability or scanout retains the blob.
+    pub fn is_retained(&self) -> bool {
+        self.holds.load(Ordering::Acquire) != 0
     }
 }
 
-/// One scanout's hold on a blob: the blob is not destroyed while it
-/// exists. Dropped by the display path once the scanout is blanked.
-pub struct ScanoutHold {
+/// An owned hold on a blob. Device destruction waits for every image
+/// capability and scanout to release its hold.
+pub struct BlobHold {
     blob: Arc<BlobShared>,
 }
 
-impl ScanoutHold {
-    /// Hold the blob for one scanout of it.
+impl BlobHold {
+    /// Retain the blob for a consumer independently of its creating handle.
     ///
     /// Taken in the store step that checks the blob's session is open,
     /// so a release that starts afterwards sees the hold.
     pub fn new(blob: &Arc<BlobShared>) -> Self {
-        blob.scanouts.fetch_add(1, Ordering::AcqRel);
+        blob.holds.fetch_add(1, Ordering::AcqRel);
         Self { blob: blob.clone() }
     }
 
@@ -192,9 +202,15 @@ impl ScanoutHold {
     }
 }
 
-impl Drop for ScanoutHold {
+impl Clone for BlobHold {
+    fn clone(&self) -> Self {
+        Self::new(&self.blob)
+    }
+}
+
+impl Drop for BlobHold {
     fn drop(&mut self) {
-        if self.blob.scanouts.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.blob.holds.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.blob.release.notify_one();
         }
     }
@@ -456,13 +472,42 @@ pub(crate) enum SubmitCommands {
     Inline(InlineCommands),
 }
 
+/// A producer retained until a submitted fence completes.
+#[derive(Clone)]
+pub(crate) struct CompletionSignal {
+    pub(crate) source: TimelineSource,
+    pub(crate) value: u64,
+}
+
+/// Signals are structurally tied to a fenced submission.
+pub(crate) struct SubmitCompletion {
+    pub(crate) fence: FenceId,
+    pub(crate) signals: Vec<CompletionSignal>,
+}
+
+impl SubmitCompletion {
+    pub(crate) fn fail(&self) {
+        for signal in &self.signals {
+            signal.source.fail();
+        }
+    }
+
+    pub(crate) fn signal(&self) {
+        for signal in &self.signals {
+            // Another producer may already have failed this timeline.
+            // Failure remains terminal; completion cannot revive it.
+            let _ = signal.source.signal(signal.value);
+        }
+    }
+}
+
 /// Work for the task that posts the command streams.
 pub(crate) struct SubmitRequest {
     /// The context the stream is for, whose ring the fence retires on.
     pub(crate) context: Arc<ContextShared>,
     pub(crate) commands: SubmitCommands,
     pub(crate) ring: RingIndex,
-    pub(crate) fence: Option<FenceId>,
+    pub(crate) completion: Option<SubmitCompletion>,
     /// Answered the moment the command is on the device's ring, or with
     /// the refusal that kept it off.
     pub(crate) reply: oneshot::Sender<Result<(), Gpu3dServiceError>>,
@@ -568,6 +613,7 @@ impl Gpu3dService {
             state: Arc::new(SessionState {
                 id,
                 ended: AtomicBool::new(false),
+                ended_notify: Notify::new(),
                 submits_in_flight: AtomicU64::new(0),
                 release: self.shared.release.clone(),
             }),
@@ -611,6 +657,7 @@ impl Drop for Gpu3dSession {
         // flag is what every request of the session is checked against,
         // and the permit is what has the owner task sweep up after it.
         self.state.ended.store(true, Ordering::Release);
+        self.state.ended_notify.notify_all();
         self.shared.release.notify_one();
     }
 }
@@ -625,6 +672,51 @@ pub struct Gpu3dSender {
 impl Gpu3dSender {
     pub fn session(&self) -> SessionId {
         self.state.id
+    }
+
+    /// Wait for an admitted fence, including one retired before this call.
+    /// Registers both broadcasts before checking progress; cancellation
+    /// drops only the listeners and never cancels the device submission.
+    pub async fn wait(
+        &self,
+        context: &ContextShared,
+        ring: u8,
+        fence: u64,
+    ) -> Result<(), Gpu3dServiceError> {
+        let timeline = RingIndex::new(ring)
+            .and_then(|ring| context.timeline(ring))
+            .ok_or(Gpu3dServiceError::BadRing)?;
+        if fence > timeline.submitted() {
+            return Err(Gpu3dServiceError::UnsubmittedFence);
+        }
+        let signal = timeline.signal();
+        let mut retired = signal.waiter();
+        let mut ended = self.state.ended_notify.waiter();
+        let mut last_seen = 0;
+        poll_fn(|cx| {
+            let _ = self.state.ended_notify.poll_notified(cx, &mut ended);
+            loop {
+                if self.state.has_ended() {
+                    return Poll::Ready(Err(Gpu3dServiceError::SessionEnded));
+                }
+                // Acquire retirement before checking fault: a failed
+                // submission publishes its fault before retiring fences.
+                let reached = signal.sequence() >= fence;
+                if context.is_faulted() {
+                    return Poll::Ready(Err(Gpu3dServiceError::DeviceFault));
+                }
+                if reached {
+                    return Poll::Ready(Ok(()));
+                }
+                if signal
+                    .poll_next(cx, &mut retired, &mut last_seen)
+                    .is_pending()
+                {
+                    return Poll::Pending;
+                }
+            }
+        })
+        .await
     }
 
     fn message(&self, request: Gpu3dRequest) -> ControlMessage {
@@ -687,12 +779,6 @@ impl Gpu3dSender {
     /// Wait until the submit queue has room.
     pub(crate) async fn submit_room(&self) {
         self.shared.submit.room().await;
-    }
-
-    /// Hand a turn [`Self::submit_room`] gave this caller to the next
-    /// producer parked there, when the caller then queued nothing.
-    pub(crate) fn pass_submit_room(&self) {
-        self.shared.submit.pass_room();
     }
 }
 

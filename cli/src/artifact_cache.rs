@@ -7,13 +7,15 @@
 //!
 //! - `wasm-<digest>`: a guest `.wasm` that cargo built. Its lookup key is the
 //!   digest of the build's own description (manifest, profile, target,
-//!   build environment, toolchain, lockfile), the way sccache's direct mode
-//!   keys a compilation. The entry also lists the files the build read,
-//!   each with its digest, because the build description does not say what
-//!   the sources contain: the ones cargo's dep-info named for the artifact,
-//!   and every file of every workspace package the program depends on,
-//!   which also covers what a build script reads. A lookup is a hit only
-//!   when every listed file is still there and still hashes the same.
+//!   build environment, toolchain, the lockfile entries the program
+//!   resolves through), the way sccache's direct mode keys a compilation.
+//!   The entry also lists the files the build read, each with its digest,
+//!   because the build description does not say what the sources contain:
+//!   the ones cargo's dep-info named for the artifact, and every file of
+//!   every path package the program depends on, the sibling Wasmtime
+//!   checkout's included, which also covers what a build script reads. A
+//!   lookup is a hit only when every listed file is still there and still
+//!   hashes the same.
 //! - `cwasm-<digest>`: the bytes `precompile_artifact` returned. Its key
 //!   covers the input component, the running executable (which carries the
 //!   compiler), the target level and the compile hint, so it needs no file
@@ -28,7 +30,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
@@ -138,6 +140,18 @@ pub enum CacheError {
         "`cargo metadata` for {manifest} resolved no root package, or a package it names is missing"
     )]
     MetadataShape { manifest: String },
+    #[error("{path} is not the TOML cargo reads: {source}")]
+    DecodeToml {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("the manifest {path} declares no `[package]` name")]
+    ManifestName { path: String },
+    #[error("Cargo.lock lists no workspace package named {package}")]
+    LockPackageMissing { package: String },
+    #[error("Cargo.lock lists no package for its dependency entry `{dependency}`")]
+    LockDependencyMissing { dependency: String },
 }
 
 /// Why a precompile through the cache did not produce bytes.
@@ -475,13 +489,17 @@ pub fn prune(dir: &Path, older_than: SystemTime) -> Result<usize, CacheError> {
 /// sorted: the source files cargo's dep-info `dep_info` names, every file of
 /// every package in `package_dirs`, and the root manifest.
 ///
-/// Files outside the workspace (registry and git checkouts, the sysroot)
-/// are left out because the lockfile and the toolchain are part of the
-/// entry's key; so is everything under `excluded`, the target directory the
-/// build writes into, and every `target` directory of a package. The
-/// packages add what dep-info does not list but a build reads: manifests,
-/// which hold the features and dependencies, and whatever a build script
-/// takes in.
+/// Files outside the workspace that a registry or git checkout or the
+/// sysroot holds are left out because the lockfile and the toolchain are
+/// part of the entry's key; so is everything under `excluded`, the target
+/// directory the build writes into, and every `target` directory of a
+/// package. A path package outside the workspace (the sibling Wasmtime
+/// checkout) is named by no lockfile content, so its files are listed like
+/// a workspace package's, as paths that leave the workspace with `..`,
+/// together with the manifest of the cargo workspace around it, which
+/// holds the dependency versions and lints it inherits. The packages add
+/// what dep-info does not list but a build reads: manifests, which hold
+/// the features and dependencies, and whatever a build script takes in.
 pub fn workspace_inputs(
     dep_info: &Path,
     workspace_root: &Path,
@@ -517,25 +535,187 @@ pub fn workspace_inputs(
             path: package_dir.display().to_string(),
             source,
         })?;
-        if !resolved.starts_with(workspace_root) {
-            continue;
-        }
-        let files = WalkDir::new(&resolved)
-            .into_iter()
-            .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != "target");
+        let files = WalkDir::new(&resolved).into_iter().filter_entry(|entry| {
+            entry.depth() == 0 || (entry.file_name() != "target" && entry.file_name() != ".git")
+        });
         for entry in files {
             let entry = entry.map_err(|source| CacheError::Walk {
                 path: resolved.display().to_string(),
                 source,
             })?;
-            if entry.file_type().is_file()
-                && let Ok(relative) = entry.path().strip_prefix(workspace_root)
-            {
-                inputs.insert(relative.to_path_buf());
+            if entry.file_type().is_file() {
+                inputs.insert(relative_path(workspace_root, entry.path()));
+            }
+        }
+        if !resolved.starts_with(workspace_root) {
+            for ancestor in resolved.ancestors().skip(1) {
+                let manifest = ancestor.join(MANIFEST);
+                if manifest.is_file() && declares_workspace(&manifest)? {
+                    inputs.insert(relative_path(workspace_root, &manifest));
+                    break;
+                }
             }
         }
     }
     Ok(inputs.into_iter().collect())
+}
+
+/// Whether the cargo manifest at `path` has a `[workspace]` table.
+fn declares_workspace(path: &Path) -> Result<bool, CacheError> {
+    let text = fs::read_to_string(path).map_err(|source| CacheError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let manifest: toml::Table = toml::from_str(&text).map_err(|source| CacheError::DecodeToml {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(manifest.contains_key("workspace"))
+}
+
+/// `path` relative to the directory `base`; both are canonical, so the
+/// walk up from `base` to their common ancestor is the leading `..`s.
+fn relative_path(base: &Path, path: &Path) -> PathBuf {
+    let mut base_parts = base.components().peekable();
+    let mut path_parts = path.components().peekable();
+    while let (Some(base_part), Some(path_part)) = (base_parts.peek(), path_parts.peek())
+        && base_part == path_part
+    {
+        base_parts.next();
+        path_parts.next();
+    }
+    base_parts
+        .map(|_| Component::ParentDir)
+        .chain(path_parts)
+        .collect()
+}
+
+/// A digest of the part of `Cargo.lock` that the build of the workspace
+/// package `root` resolves through: every package reachable from `root`
+/// through the lockfile's dependency lists, each with its version, source,
+/// checksum and dependency list.
+///
+/// A lockfile line about a package outside that closure, which a change to
+/// the kernel's dependencies is, leaves the digest as it was, so the wasm
+/// of a program none of whose dependencies moved is still found. The
+/// closure is the lockfile's, which holds every target and every kind of
+/// dependency, so it only ever holds more than a build reads; `cargo
+/// metadata` would narrow it by platform, at the price of downloading the
+/// crates it reads manifests from.
+pub fn lock_closure_digest(lock: &str, root: &str) -> Result<String, CacheError> {
+    let lockfile: Lockfile = toml::from_str(lock).map_err(|source| CacheError::DecodeToml {
+        path: "Cargo.lock".to_owned(),
+        source,
+    })?;
+    let packages = &lockfile.package;
+    let mut closure = BTreeSet::new();
+    let mut pending = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| package.name == root && package.source.is_none())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Err(CacheError::LockPackageMissing {
+            package: root.to_owned(),
+        });
+    }
+    while let Some(index) = pending.pop() {
+        if !closure.insert(index) {
+            continue;
+        }
+        for dependency in &packages[index].dependencies {
+            pending.extend(resolve_lock_dependency(packages, dependency)?);
+        }
+    }
+    let mut digest = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    };
+    // The lockfile lists packages sorted, so the closure keeps its order.
+    for index in closure {
+        let package = &packages[index];
+        field(package.name.as_bytes());
+        field(package.version.as_bytes());
+        field(package.source.as_deref().unwrap_or_default().as_bytes());
+        field(package.checksum.as_deref().unwrap_or_default().as_bytes());
+        for dependency in &package.dependencies {
+            field(dependency.as_bytes());
+        }
+        // Ends the dependency list, which no dependency string equals.
+        field(b"");
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// The lockfile packages a dependency string names: `name`, `name
+/// version` or `name version (source)`, the form cargo writes by how much
+/// is needed to tell the packages of that name apart.
+fn resolve_lock_dependency(
+    packages: &[LockPackage],
+    dependency: &str,
+) -> Result<Vec<usize>, CacheError> {
+    let mut parts = dependency.splitn(3, ' ');
+    let name = parts.next().unwrap_or_default();
+    let version = parts.next();
+    let source = parts
+        .next()
+        .map(|source| source.trim_start_matches('(').trim_end_matches(')'));
+    let found = packages
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| {
+            package.name == name
+                && version.is_none_or(|version| package.version == version)
+                && source.is_none_or(|source| package.source.as_deref() == Some(source))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if found.is_empty() {
+        return Err(CacheError::LockDependencyMissing {
+            dependency: dependency.to_owned(),
+        });
+    }
+    Ok(found)
+}
+
+/// The name of the package a cargo manifest's `[package]` table declares.
+pub fn package_name(manifest_path: &Path) -> Result<String, CacheError> {
+    let text = fs::read_to_string(manifest_path).map_err(|source| CacheError::Read {
+        path: manifest_path.display().to_string(),
+        source,
+    })?;
+    let manifest: toml::Table = toml::from_str(&text).map_err(|source| CacheError::DecodeToml {
+        path: manifest_path.display().to_string(),
+        source,
+    })?;
+    manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| CacheError::ManifestName {
+            path: manifest_path.display().to_string(),
+        })
+}
+
+/// The parts of `Cargo.lock` the closure needs.
+#[derive(Deserialize)]
+struct Lockfile {
+    #[serde(default)]
+    package: Vec<LockPackage>,
+}
+
+#[derive(Deserialize)]
+struct LockPackage {
+    name: String,
+    version: String,
+    /// Absent for a path package.
+    source: Option<String>,
+    checksum: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
 /// The file name of a cargo manifest.
@@ -1201,6 +1381,196 @@ mod tests {
                 .lookup_wasm(&key, &workspace)
                 .expect("the lookup succeeds"),
             None
+        );
+    }
+    /// A lockfile of two workspace programs that share `serde` and differ in
+    /// one dependency each, with a package that no program reaches.
+    const LOCK: &str = r#"
+version = 4
+
+[[package]]
+name = "date"
+version = "0.1.0"
+dependencies = ["api", "itoa 1.0.0"]
+
+[[package]]
+name = "api"
+version = "0.1.0"
+dependencies = ["serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"]
+
+[[package]]
+name = "kernel"
+version = "0.1.0"
+dependencies = ["api", "zrip"]
+
+[[package]]
+name = "init"
+version = "0.1.0"
+dependencies = ["api", "itoa 2.0.0"]
+
+[[package]]
+name = "itoa"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa"
+
+[[package]]
+name = "itoa"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc"
+
+[[package]]
+name = "zrip"
+version = "0.8.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd"
+"#;
+
+    #[test]
+    fn a_lock_line_outside_the_closure_keeps_the_digest() {
+        let date = lock_closure_digest(LOCK, "date").expect("date is in the lockfile");
+        let moved = LOCK.replace("0.8.16", "0.8.17").replace("\"dd\"", "\"ee\"");
+        assert_ne!(moved, LOCK);
+        assert_eq!(
+            lock_closure_digest(&moved, "date").expect("date is in the lockfile"),
+            date,
+            "zrip is reached by the kernel only"
+        );
+        // The kernel reaches it, so the kernel's digest moves.
+        assert_ne!(
+            lock_closure_digest(&moved, "kernel").expect("kernel is in the lockfile"),
+            lock_closure_digest(LOCK, "kernel").expect("kernel is in the lockfile"),
+        );
+    }
+
+    #[test]
+    fn a_lock_line_inside_the_closure_changes_the_digest() {
+        let date = lock_closure_digest(LOCK, "date").expect("date is in the lockfile");
+        for (from, to) in [
+            // A reached registry package's checksum, then its version.
+            ("\"cc\"", "\"c0\""),
+            ("serde 1.0.0 (registry", "serde 1.0.1 (registry"),
+            // A path package on the way gains a dependency.
+            (
+                "dependencies = [\"serde",
+                "dependencies = [\"itoa 1.0.0\", \"serde",
+            ),
+        ] {
+            let moved = LOCK.replace(from, to);
+            assert_ne!(moved, LOCK, "{from} is in the fixture");
+            // The version edit leaves the entry for 1.0.1 unresolved.
+            if let Ok(digest) = lock_closure_digest(&moved, "date") {
+                assert_ne!(digest, date, "{from} -> {to}");
+            }
+        }
+        // Programs that resolve a different `itoa` differ.
+        assert_ne!(
+            lock_closure_digest(LOCK, "init").expect("init is in the lockfile"),
+            date
+        );
+    }
+
+    #[test]
+    fn a_lock_without_the_program_or_a_dependency_is_an_error() {
+        assert!(matches!(
+            lock_closure_digest(LOCK, "absent"),
+            Err(CacheError::LockPackageMissing { .. })
+        ));
+        let broken = LOCK.replace("\"zrip\"]", "\"missing\"]");
+        assert!(matches!(
+            lock_closure_digest(&broken, "kernel"),
+            Err(CacheError::LockDependencyMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn a_path_package_outside_the_workspace_is_an_input() {
+        let fixture = Fixture::new();
+        let sibling = fixture.outside.path();
+        for (path, contents) in [
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/engine\"]\n"),
+            ("crates/engine/Cargo.toml", "[package]\n"),
+            ("crates/engine/src/lib.rs", "pub fn engine() {}\n"),
+            ("crates/engine/target/ignored.o", "// output\n"),
+            ("crates/engine/.git/config", "// repository\n"),
+        ] {
+            let path = sibling.join(path);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+            fs::write(path, contents).expect("a file");
+        }
+        let sibling = fs::canonicalize(sibling).expect("the sibling resolves");
+        let engine = sibling.join("crates/engine");
+        let inputs = workspace_inputs(
+            &fixture.dep_info(),
+            &fixture.workspace(),
+            &fixture.workspace().join("target"),
+            &[fixture.workspace().join("programs/date"), engine],
+        )
+        .expect("the dep-info is read");
+
+        let outside = inputs
+            .iter()
+            .filter(|input| input.starts_with(".."))
+            .collect::<Vec<_>>();
+        assert_eq!(outside.len(), 3, "{outside:?}");
+        for input in &outside {
+            assert!(
+                fixture.workspace().join(input).is_file(),
+                "{input:?} resolves from the workspace"
+            );
+        }
+        let names = outside
+            .iter()
+            .map(|input| input.file_name().expect("a file name").to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            BTreeSet::from(["Cargo.toml".into(), "lib.rs".into()]),
+            "the package's files and the manifest of the workspace around it, \
+             neither its target directory nor its repository"
+        );
+
+        let cache = fixture.cache();
+        let key = key("rustc 1");
+        cache
+            .store_wasm(&key, &fixture.workspace(), &inputs, b"built")
+            .expect("the store succeeds");
+        assert!(
+            cache
+                .lookup_wasm(&key, &fixture.workspace())
+                .expect("the lookup succeeds")
+                .is_some()
+        );
+        fs::write(
+            sibling.join("crates/engine/src/lib.rs"),
+            "pub fn engine2() {}\n",
+        )
+        .expect("an edit");
+        assert_eq!(
+            cache
+                .lookup_wasm(&key, &fixture.workspace())
+                .expect("the lookup succeeds"),
+            None,
+            "an edit to the sibling checkout is a miss"
+        );
+    }
+
+    #[test]
+    fn a_path_leaves_the_workspace_through_parent_directories() {
+        assert_eq!(
+            relative_path(Path::new("/w/helios"), Path::new("/w/wasmtime/a/b.rs")),
+            PathBuf::from("../wasmtime/a/b.rs")
+        );
+        assert_eq!(
+            relative_path(Path::new("/w/helios"), Path::new("/w/helios/api/lib.rs")),
+            PathBuf::from("api/lib.rs")
         );
     }
 }

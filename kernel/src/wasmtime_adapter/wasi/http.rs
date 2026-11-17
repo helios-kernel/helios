@@ -1174,42 +1174,29 @@ where
     }
 }
 
-/// Link `wasi:http` into a store, for the interfaces the component imports.
-///
-/// `types` is linked whenever either interface is present: `client` is defined
-/// in terms of the `types` resources, so linking it alone would leave those
-/// resource types undefined.
-pub(crate) fn add_to_linker<CpuImpl, Net, StorageImpl>(
-    linker: &mut wasmtime::component::Linker<StoreData<CpuImpl, Net, StorageImpl>>,
-    imports: &WasiImportSet,
-) -> Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let wants_types = imports.has("wasi:http/types", "0.3");
-    let wants_client = imports.has("wasi:http/client", "0.3");
-    if wants_types || wants_client {
+// Link `wasi:http` into a store, for the interfaces the component imports.
+//
+// `wasi:http/handler` is not among them: the kernel calls it as an export on
+// the plugin's store rather than serving it as an import.
+//
+// `wasi:http/client` imports `types` (error-code, fields, request, response,
+// trailers) by reference, so linking `client` alone would leave those
+// resource types undefined; `wasi:http/types` is linked whenever either
+// interface is imported.
+linked_interfaces! {
+    linker, imports;
+    "wasi:http/types"
+        when imports.has("wasi:http/types", "0.3") || imports.has("wasi:http/client", "0.3") =>
         http_types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
-        )?;
-    }
-    if wants_client {
+        );
+    "wasi:http/client" when imports.has("wasi:http/client", "0.3") =>
         http_client::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
             linker,
             |state| state,
-        )?;
-    }
-    Ok(())
+        );
 }
-
-/// Interfaces [`add_to_linker`] serves. `wasi:http/handler` is not among them:
-/// the kernel calls it as an export on the plugin's store rather than serving
-/// it as an import.
-#[cfg(test)]
-pub(crate) const LINKED_INTERFACES: &[&str] = &["wasi:http/types", "wasi:http/client"];
 
 #[cfg(test)]
 mod borrowed_fields_tests {

@@ -129,6 +129,7 @@ const REQUIRED: &[&str] = &[
     "vkCreateDevice",
     "vkDestroyDevice",
     "vkGetDeviceQueue",
+    "vkGetDeviceQueue2",
     "vkQueueSubmit",
     "vkQueueWaitIdle",
     "vkDeviceWaitIdle",

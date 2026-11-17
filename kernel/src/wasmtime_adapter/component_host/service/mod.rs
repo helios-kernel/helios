@@ -21,8 +21,8 @@ mod input;
 pub use input::InputDeviceHandle;
 pub(super) use input::add_input_to_linker;
 mod surface;
-pub use surface::ClientSurfaceHandle;
 pub(super) use surface::add_surface_to_linker;
+pub use surface::{ClientImageSurfaceHandle, ClientSurfaceHandle};
 mod audio;
 pub use audio::PlaybackHandle;
 pub(super) use audio::add_audio_to_linker;
@@ -44,6 +44,8 @@ mod compositor_plugin;
 use compositor_plugin::*;
 mod preview1;
 use preview1::*;
+#[cfg(test)]
+mod path_lookup_tests;
 mod wasix_proc;
 use wasix_proc::*;
 mod wasix_thread;
@@ -115,17 +117,6 @@ const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
 const WASIX_THREAD_START_SIZE: usize = 64;
 const WASIX_MODULE: &str = "wasix_32v1";
 const WASIX_NULL_DEVICE_PATH: &str = "/dev/null";
-const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
-const DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES: u64 = 1;
-const DEFAULT_WASIX_SOCKET_TTL: u64 = helios_netstack::DEFAULT_HOP_LIMIT as u64;
-/// Ceiling for `SO_RCVBUF`: the receive window the netstack really reserves.
-/// A larger request is clamped so a read-back reports the effective size.
-const WASIX_SOCKET_RECEIVE_BUFFER_CEILING: u64 = helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64;
-/// Ceiling for `SO_SNDBUF`: the netstack's per-socket transmit buffer.
-const WASIX_SOCKET_SEND_BUFFER_CEILING: u64 = helios_netstack::TCP_TRANSMIT_BUFFER_BYTES as u64;
-const DEFAULT_WASIX_SOCKET_MULTICAST_TTL: u64 = 1;
-const WASIX_IPPROTO_TCP: u64 = 6;
-const WASIX_IPPROTO_UDP: u64 = 17;
 const WASIX_IPPROTO_TCP_I32: i32 = 6;
 const WASIX_IPPROTO_UDP_I32: i32 = 17;
 const WASIX_STREAM_SECURITY_UNENCRYPTED: u8 = 1 << 0;
@@ -432,12 +423,14 @@ impl ProgramSource {
     /// Classifies bytes no boot payload vouches for: a file a guest
     /// wrote, on whichever mount, or one a host shared.
     fn from_untrusted(bytes: Bytes) -> Self {
-        // A Wasmtime artifact is an ELF file too, so it is recognised first.
         if cwasm::is_cwasm(&bytes) {
             return Self::SignedArtifact(bytes);
         }
+        // A Wasmtime artifact is an ELF file too, so one without a
+        // signature is raw bytes for the wasm validator to refuse, never
+        // a Linux program.
         #[cfg(feature = "linux")]
-        if is_linux_elf(&bytes) {
+        if WasmtimePrecompiledKind::detect(&bytes).is_none() && is_linux_elf(&bytes) {
             return Self::LinuxElf(bytes);
         }
         Self::RawWasm(bytes)
@@ -2772,7 +2765,7 @@ mod tests {
     type TestDescriptor = Preview1Descriptor<TestNet>;
     type TestDescriptorTable = Preview1DescriptorTable<TestNet>;
     type TestSpawnFdSnapshot = WasixSpawnFdSnapshot<TestNet>;
-    type TestSocketDescriptor = WasixSocketDescriptor<TestNet>;
+    type TestSocketDescriptor = UnixSocket<TestNet>;
 
     #[test]
     fn preview1_program_linked_imports_match_manifest() {
@@ -3352,12 +3345,12 @@ mod tests {
     #[test]
     fn socket_descriptor_accepts_only_nonblock_fdflag() {
         let (writer, reader) = crate::byte_channel();
-        let socket = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
+        let socket = Preview1Descriptor::Socket(UnixSocket::Pair {
             reader,
             writer,
             carry: Bytes::new(),
-            options: WasixSocketOptions::default(),
-            socket_type: WASIX_SOCK_TYPE_STREAM,
+            options: unix_socket_options::<TestNet>(),
+            kind: SocketKind::Stream,
         });
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![Some(
             Preview1DescriptorEntry::new(socket, false),
@@ -3774,36 +3767,32 @@ mod tests {
 
     #[test]
     fn wasix_socket_operations_select_network_authority_by_socket_kind() {
-        let tcp =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-                family: WasixSocketFamily::Ipv4,
-                stream: WasixOwnedTcpStream::new(crate::test_support::test_network_service(), 1),
-                peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
-                    127, 0, 0, 1,
-                ])),
-                peer_port: 80,
-                options: WasixSocketOptions::default(),
-            }));
-        let udp_bound =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
-                family: WasixSocketFamily::Ipv4,
-                socket: WasixOwnedUdpSocket::new(crate::test_support::test_network_service(), 2),
-                local_port: 5353,
-                options: WasixSocketOptions::default(),
-            }));
+        let tcp = Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            family: SocketFamily::Ipv4,
+            stream: OwnedTcpStream::new(
+                crate::UnixNetwork::new(crate::test_support::test_network_service()),
+                1,
+            ),
+            peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+            peer_port: 80,
+            options: unix_socket_options::<TestNet>(),
+        }));
+        let udp_bound = Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
+            family: SocketFamily::Ipv4,
+            socket: OwnedUdpSocket::new(
+                crate::UnixNetwork::new(crate::test_support::test_network_service()),
+                2,
+            ),
+            local_port: 5353,
+            options: unix_socket_options::<TestNet>(),
+        }));
         let udp_unbound: TestDescriptor =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
+            Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound {
+                family: SocketFamily::Ipv4,
+                options: unix_socket_options::<TestNet>(),
             }));
-        let (left_writer, right_reader) = crate::byte_channel();
-        let pair: TestDescriptor = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-            reader: right_reader,
-            writer: left_writer,
-            carry: Bytes::new(),
-            options: WasixSocketOptions::default(),
-            socket_type: WASIX_SOCK_TYPE_STREAM,
-        });
+        let pair: TestDescriptor =
+            Preview1Descriptor::Socket(TestSocketDescriptor::pair(SocketKind::Stream).0);
         let nonsocket: TestDescriptor = Preview1Descriptor::Stdout;
 
         assert_eq!(
@@ -3883,14 +3872,14 @@ mod tests {
     #[test]
     fn wasix_multicast_preflight_accepts_udp_sockets_only() {
         let udp: TestDescriptor =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
+            Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound {
+                family: SocketFamily::Ipv4,
+                options: unix_socket_options::<TestNet>(),
             }));
         let tcp: TestDescriptor =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
+            Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+                family: SocketFamily::Ipv4,
+                options: unix_socket_options::<TestNet>(),
             }));
         let file: TestDescriptor = Preview1Descriptor::Stdout;
 
@@ -4016,30 +4005,6 @@ mod tests {
     }
 
     #[test]
-    fn wasix_socket_family_pins_wildcard_address_and_rejects_cross_family_peers() {
-        let v4 = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 1]));
-        let v6 = crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
-            0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
-        ]));
-
-        // A wildcard bind means 0.0.0.0 on AF_INET and :: on AF_INET6.
-        assert_eq!(
-            WasixSocketFamily::Ipv4.unspecified_address(),
-            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0]))
-        );
-        assert_eq!(
-            WasixSocketFamily::Ipv6.unspecified_address(),
-            crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED)
-        );
-
-        // There is no v4-mapped-v6 path: each family accepts only its own.
-        assert!(WasixSocketFamily::Ipv4.accepts(v4));
-        assert!(!WasixSocketFamily::Ipv4.accepts(v6));
-        assert!(WasixSocketFamily::Ipv6.accepts(v6));
-        assert!(!WasixSocketFamily::Ipv6.accepts(v4));
-    }
-
-    #[test]
     fn wasix_socket_creation_validates_family_and_protocol() {
         assert_eq!(
             wasix_validate_network_socket_request(
@@ -4115,7 +4080,7 @@ mod tests {
                 WASIX_SOCK_TYPE_STREAM,
                 0,
             ),
-            Ok(())
+            Ok(SocketKind::Stream)
         );
         assert_eq!(
             wasix_validate_socket_pair_request(
@@ -4197,12 +4162,12 @@ mod tests {
         );
 
         let (pair_writer, pair_reader) = crate::byte_channel();
-        let pair: TestDescriptor = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
+        let pair: TestDescriptor = Preview1Descriptor::Socket(UnixSocket::Pair {
             reader: pair_reader,
             writer: pair_writer.clone(),
             carry: Bytes::new(),
-            options: WasixSocketOptions::default(),
-            socket_type: WASIX_SOCK_TYPE_STREAM,
+            options: unix_socket_options::<TestNet>(),
+            kind: SocketKind::Stream,
         });
         assert_eq!(local_epoll_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         assert_eq!(
@@ -4277,118 +4242,105 @@ mod tests {
 
     #[test]
     fn wasix_socket_size_options_are_descriptor_local_state() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let mut descriptor: TestSocketDescriptor = UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+            family: SocketFamily::Ipv4,
+            options: unix_socket_options::<TestNet>(),
+        });
 
+        // The defaults a WASIX program reads back before setting anything.
         assert_eq!(
-            descriptor.options().receive_buffer_size,
-            DEFAULT_WASIX_SOCKET_BUFFER_BYTES
+            descriptor.options().size(SocketSize::ReceiveBuffer),
+            64 * 1024
+        );
+        assert_eq!(descriptor.options().size(SocketSize::SendBuffer), 64 * 1024);
+        assert_eq!(
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_RECV_LOWAT),
+            Ok(1)
         );
         assert_eq!(
-            descriptor.options().send_buffer_size,
-            DEFAULT_WASIX_SOCKET_BUFFER_BYTES
-        );
-        assert_eq!(
-            descriptor.options().size(WASIX_SOCK_OPTION_RECV_LOWAT),
-            Ok(DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES)
-        );
-        assert_eq!(
-            descriptor.options().size(WASIX_SOCK_OPTION_TTL),
-            Ok(DEFAULT_WASIX_SOCKET_TTL)
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_TTL),
+            Ok(u64::from(helios_netstack::DEFAULT_HOP_LIMIT))
         );
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_RECV_BUF_SIZE, 4096),
+            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE, 4096),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_SEND_BUF_SIZE, 8192),
+            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, 8192),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_RECV_LOWAT, 2),
+            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_RECV_LOWAT, 2),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_TTL, 128),
+            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_TTL, 128),
             p1::errno::SUCCESS
         );
 
-        assert_eq!(descriptor.options().receive_buffer_size, 4096);
-        assert_eq!(descriptor.options().send_buffer_size, 8192);
+        assert_eq!(descriptor.options().size(SocketSize::ReceiveBuffer), 4096);
+        assert_eq!(descriptor.options().size(SocketSize::SendBuffer), 8192);
         assert_eq!(
-            descriptor.options().size(WASIX_SOCK_OPTION_RECV_LOWAT),
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_RECV_LOWAT),
             Ok(2)
         );
-        assert_eq!(descriptor.options().size(WASIX_SOCK_OPTION_TTL), Ok(128));
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_TYPE, WASIX_SOCK_TYPE_STREAM as u64),
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_TTL),
+            Ok(128)
+        );
+        assert_eq!(
+            wasix_socket_set_size(
+                &mut descriptor,
+                WASIX_SOCK_OPTION_TYPE,
+                WASIX_SOCK_TYPE_STREAM as u64
+            ),
             p1::errno::INVAL
         );
         assert_eq!(
-            descriptor.options().size(WASIX_SOCK_OPTION_RECV_TIMEOUT),
+            wasix_socket_size(&descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT),
             Err(p1::errno::INVAL)
         );
     }
 
     #[test]
     fn wasix_socket_flag_options_are_descriptor_local_state() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let mut descriptor: TestSocketDescriptor = UnixSocket::Udp(UnixUdpSocket::Unbound {
+            family: SocketFamily::Ipv4,
+            options: unix_socket_options::<TestNet>(),
+        });
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_BROADCAST, true),
+            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_BROADCAST, true),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_REUSE_ADDR, true),
+            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_REUSE_ADDR, true),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_BROADCAST),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_BROADCAST),
             Ok(true)
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_REUSE_ADDR),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_REUSE_ADDR),
             Ok(true)
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_KEEP_ALIVE),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE),
             Ok(false)
         );
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_BROADCAST, false),
+            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_BROADCAST, false),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_BROADCAST),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_BROADCAST),
             Ok(false)
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_RECV_BUF_SIZE),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE),
             Err(p1::errno::INVAL)
         );
     }
@@ -4401,47 +4353,38 @@ mod tests {
     /// connections are being probed or coalesced when they are not.
     #[test]
     fn wasix_socket_rejects_flags_the_netstack_cannot_honour() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let mut descriptor: TestSocketDescriptor = UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+            family: SocketFamily::Ipv4,
+            options: unix_socket_options::<TestNet>(),
+        });
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_KEEP_ALIVE, true),
+            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE, true),
             p1::errno::NOTSUP
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_KEEP_ALIVE),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE),
             Ok(false)
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_KEEP_ALIVE, false),
+            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE, false),
             p1::errno::SUCCESS
         );
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_NO_DELAY, true),
+            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_NO_DELAY, true),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_NO_DELAY),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_NO_DELAY),
             Ok(true)
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_flag(WASIX_SOCK_OPTION_NO_DELAY, false),
+            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_NO_DELAY, false),
             p1::errno::NOTSUP
         );
         assert_eq!(
-            descriptor.options().flag(WASIX_SOCK_OPTION_NO_DELAY),
+            wasix_socket_flag(&descriptor, WASIX_SOCK_OPTION_NO_DELAY),
             Ok(true)
         );
     }
@@ -4450,49 +4393,42 @@ mod tests {
     /// a TTL outside the IP header's range is rejected instead of truncated.
     #[test]
     fn wasix_socket_size_options_clamp_to_netstack_capacity() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let mut descriptor: TestSocketDescriptor = UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+            family: SocketFamily::Ipv4,
+            options: unix_socket_options::<TestNet>(),
+        });
 
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_RECV_BUF_SIZE, u64::MAX),
+            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE, u64::MAX),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().receive_buffer_size,
-            WASIX_SOCKET_RECEIVE_BUFFER_CEILING
+            descriptor.options().size(SocketSize::ReceiveBuffer),
+            helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_SEND_BUF_SIZE, u64::MAX),
+            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, u64::MAX),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().send_buffer_size,
-            WASIX_SOCKET_SEND_BUFFER_CEILING
+            descriptor.options().size(SocketSize::SendBuffer),
+            helios_netstack::TCP_TRANSMIT_BUFFER_BYTES as u64
         );
 
         assert_eq!(
-            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 0),
+            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_TTL, 0),
             p1::errno::INVAL
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_size(WASIX_SOCK_OPTION_TTL, 256),
+            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_TTL, 256),
             p1::errno::INVAL
         );
         assert_eq!(
             descriptor.options().hop_limit(),
-            DEFAULT_WASIX_SOCKET_TTL as u8
+            helios_netstack::DEFAULT_HOP_LIMIT
         );
         assert_eq!(
-            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 9),
+            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_TTL, 9),
             p1::errno::SUCCESS
         );
         assert_eq!(descriptor.options().hop_limit(), 9);
@@ -4514,40 +4450,33 @@ mod tests {
 
     #[test]
     fn wasix_socket_time_options_are_descriptor_local_state() {
-        let mut descriptor: TestSocketDescriptor =
-            WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
-                options: WasixSocketOptions::default(),
-            });
+        let mut descriptor: TestSocketDescriptor = UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+            family: SocketFamily::Ipv4,
+            options: unix_socket_options::<TestNet>(),
+        });
 
         assert_eq!(
-            descriptor.options().time(WASIX_SOCK_OPTION_RECV_TIMEOUT),
+            wasix_socket_time(&descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT),
             Ok(None)
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_time(WASIX_SOCK_OPTION_RECV_TIMEOUT, Some(1_000)),
+            wasix_socket_set_time(&mut descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT, Some(1_000)),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().time(WASIX_SOCK_OPTION_RECV_TIMEOUT),
+            wasix_socket_time(&descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT),
             Ok(Some(1_000))
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_time(WASIX_SOCK_OPTION_LINGER, Some(2_000)),
+            wasix_socket_set_time(&mut descriptor, WASIX_SOCK_OPTION_LINGER, Some(2_000)),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            descriptor.options().time(WASIX_SOCK_OPTION_LINGER),
+            wasix_socket_time(&descriptor, WASIX_SOCK_OPTION_LINGER),
             Ok(Some(2_000))
         );
         assert_eq!(
-            descriptor
-                .options_mut()
-                .set_time(WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
+            wasix_socket_set_time(&mut descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
             p1::errno::INVAL
         );
     }

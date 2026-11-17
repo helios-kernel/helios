@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "driver", feature(allocator_ext))]
+
 //! The Venus wire protocol: Vulkan commands serialized for a renderer that
 //! runs them on a host GPU.
 //!
@@ -12,7 +14,17 @@
 //! C functions they mirror do, and are `unsafe` on the same terms: the
 //! pointers, array lengths and `pNext` chains describe live memory.
 
+pub mod capset;
+pub mod connection;
+pub mod ring;
 pub mod runtime;
+pub mod transport;
+
+#[cfg(feature = "driver")]
+pub mod driver;
+
+#[cfg(feature = "helios")]
+pub mod helios;
 
 pub use runtime::*;
 

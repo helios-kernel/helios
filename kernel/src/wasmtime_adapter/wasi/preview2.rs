@@ -295,7 +295,10 @@ pub(crate) mod sockets_bindings {
     pub use self::generated::wasi::*;
 }
 
+#[cfg(not(test))]
 use filesystem_bindings::filesystem::types as p2fs;
+#[cfg(test)]
+pub(super) use filesystem_bindings::filesystem::types as p2fs;
 use sockets_bindings::io::error as p2io_error;
 use sockets_bindings::sockets::ip_name_lookup as p2lookup;
 use sockets_bindings::sockets::network as p2net;
@@ -1176,7 +1179,7 @@ where
     fn prepare_set_times_at(
         store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
-        _: p2fs::PathFlags,
+        path_flags: p2fs::PathFlags,
         path: &str,
         data_access_timestamp: p2fs::NewTimestamp,
         data_modification_timestamp: p2fs::NewTimestamp,
@@ -1193,6 +1196,7 @@ where
             super::PreparedSetTimesAt::new(
                 namespace,
                 base.grant().map_err(error_code_from_p3)?,
+                path_flags_to_p3(path_flags),
                 path,
                 access_nanos,
                 modified_nanos,

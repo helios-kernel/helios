@@ -1,4 +1,91 @@
-//! Capability bridge for optional UNIX process bookkeeping.
+//! Capability bridge for optional UNIX process bookkeeping, and the
+//! machine's network as the shared UNIX socket objects see it.
+
+use crate::{ComponentNetworkService, Ipv4Address, NetworkIpAddress};
+use helios_unix::{SocketFamily, SocketLimits, SocketNetwork};
+
+/// The machine's network service as `helios-unix`'s sockets see it: the
+/// network the socket descriptors of every UNIX ABI the kernel hosts live
+/// on. It names the service's handle types and forwards the close calls,
+/// and adds nothing of its own.
+#[derive(Clone)]
+pub(crate) struct UnixNetwork<Service>(Service);
+
+impl<Service: ComponentNetworkService> UnixNetwork<Service> {
+    pub(crate) const fn new(service: Service) -> Self {
+        Self(service)
+    }
+}
+
+impl<Service: ComponentNetworkService> SocketNetwork for UnixNetwork<Service> {
+    type Address = NetworkIpAddress;
+    type TcpStream = Service::TcpStream;
+    type TcpListener = Service::TcpListener;
+    type UdpSocket = Service::UdpSocket;
+
+    /// The netstack's receive window and transmit buffer, and its default
+    /// hop limit.
+    const LIMITS: SocketLimits = SocketLimits {
+        receive_buffer_bytes: helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64,
+        send_buffer_bytes: helios_netstack::TCP_TRANSMIT_BUFFER_BYTES as u64,
+        default_hop_limit: helios_netstack::DEFAULT_HOP_LIMIT,
+    };
+
+    fn tcp_close(&self, stream: Self::TcpStream) {
+        self.0.tcp_close(stream);
+    }
+
+    fn tcp_listener_close(&self, listener: Self::TcpListener) {
+        self.0.tcp_listener_close(listener);
+    }
+
+    fn udp_close(&self, socket: Self::UdpSocket) {
+        self.0.udp_close(socket);
+    }
+}
+
+/// The wildcard local address of `family`: `0.0.0.0` or `::`.
+pub(crate) const fn unspecified_address(family: SocketFamily) -> NetworkIpAddress {
+    match family {
+        SocketFamily::Ipv4 => NetworkIpAddress::Ipv4(Ipv4Address::new([0, 0, 0, 0])),
+        SocketFamily::Ipv6 => NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED),
+    }
+}
+
+/// Whether a socket of `family` may use `address`. There is no
+/// v4-mapped-v6 path: the netstack keeps the two families in separate
+/// socket address spaces, so accepting a v4 address on a v6 socket would
+/// produce a socket that cannot be described back to its program.
+pub(crate) const fn family_accepts(family: SocketFamily, address: NetworkIpAddress) -> bool {
+    matches!(
+        (family, address),
+        (SocketFamily::Ipv4, NetworkIpAddress::Ipv4(_))
+            | (SocketFamily::Ipv6, NetworkIpAddress::Ipv6(_))
+    )
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::{family_accepts, unspecified_address};
+    use crate::{Ipv4Address, NetworkIpAddress};
+    use helios_unix::SocketFamily;
+
+    #[test]
+    fn each_family_has_its_own_wildcard_and_accepts_only_its_addresses() {
+        let v4 = NetworkIpAddress::Ipv4(Ipv4Address::new([10, 0, 2, 2]));
+        let v6 = NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED);
+        assert_eq!(
+            unspecified_address(SocketFamily::Ipv4),
+            NetworkIpAddress::Ipv4(Ipv4Address::new([0, 0, 0, 0]))
+        );
+        assert_eq!(unspecified_address(SocketFamily::Ipv6), v6);
+        assert!(family_accepts(SocketFamily::Ipv4, v4));
+        assert!(!family_accepts(SocketFamily::Ipv4, v6));
+        assert!(family_accepts(SocketFamily::Ipv6, v6));
+        assert!(!family_accepts(SocketFamily::Ipv6, v4));
+    }
+}
+
 #[cfg(test)]
 mod process_tests {
     use crate::{

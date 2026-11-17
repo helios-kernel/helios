@@ -53,6 +53,7 @@ use crate::exceptions::{
 use crate::extended_state::Xcr0;
 use crate::hotplug::SciEvents;
 use crate::ioapic::IoApics;
+use crate::isolation::UserIsolation;
 use crate::mtrr::Mtrrs;
 use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
@@ -214,6 +215,11 @@ pub(crate) struct ProcessorRuntime {
     /// to map at `probe_fault`, as its direct-map address; zero when
     /// none is staged. Written by this processor only.
     pub(crate) probe_frame: AtomicUsize,
+    /// The record of this processor's boot-time check that ring 0 can
+    /// neither fetch from nor access a user page
+    /// (`native::verify_user_isolation`).
+    #[cfg(feature = "native-users")]
+    pub(crate) isolation_probe: crate::native::IsolationProbe,
     watchdog: X86Watchdog,
     timer: Once<Timer<crate::X86Cpu>>,
     program_service: Once<debug_state::ProgramService>,
@@ -321,6 +327,9 @@ pub(crate) struct BootContext {
 }
 
 pub(crate) struct X86PlatformState {
+    /// The bootstrap processor's kernel isolation, which every other
+    /// processor matches (`isolation`). Immutable.
+    user_isolation: UserIsolation,
     tsc_base: u64,
     timebase: Timebase,
     physical_memory_offset: usize,
@@ -417,6 +426,7 @@ pub(crate) fn build_boot_context(
     wakeup_page: Option<Range<usize>>,
     debug_state: debug_state::RuntimeState,
     xcr0: Xcr0,
+    user_isolation: UserIsolation,
     pool: &UserMemoryPool,
 ) -> &'static BootContext {
     let tsc_hz = handler.timebase.frequency();
@@ -484,6 +494,8 @@ pub(crate) fn build_boot_context(
                 interrupt_in_progress: AtomicBool::new(false),
                 probe_fault: AtomicUsize::new(0),
                 probe_frame: AtomicUsize::new(0),
+                #[cfg(feature = "native-users")]
+                isolation_probe: crate::native::IsolationProbe::new(),
                 watchdog: watchdog.clone(),
                 timer: Once::new(),
                 program_service: Once::new(),
@@ -518,6 +530,7 @@ pub(crate) fn build_boot_context(
     };
     publish_anchor_identities(&processors);
     let platform = Arc::new(X86PlatformState {
+        user_isolation,
         tsc_base: handler.tsc_base,
         timebase: handler.timebase,
         physical_memory_offset: handler.physical_memory_offset,
@@ -718,6 +731,7 @@ pub(crate) extern "C" fn resume_current_rust(
     let boot = unsafe { &*boot };
     let runtime = unsafe { &*runtime };
     crate::extended_state::enable_on_secondary_processor(boot.xcr0());
+    boot.user_isolation().enable_on_secondary_processor();
     // INIT keeps the page-attribute table, but a vCPU firmware ejected
     // and added again starts from RESET, whose table maps no type
     // write-combined; this is the table a first start programs.
@@ -1048,6 +1062,12 @@ impl BootContext {
         self.isa_answers
     }
 
+    /// The bootstrap processor's kernel isolation; see
+    /// [`UserIsolation::enable_on_secondary_processor`].
+    pub(crate) fn user_isolation(&self) -> UserIsolation {
+        self.platform.user_isolation
+    }
+
     /// The bootstrap processor's MTRRs; see [`Mtrrs::apply`].
     pub(crate) fn mtrrs(&self) -> &Mtrrs {
         &self.mtrrs
@@ -1065,6 +1085,12 @@ impl BootContext {
 impl X86PlatformState {
     pub(crate) fn tsc_base(&self) -> u64 {
         self.tsc_base
+    }
+
+    /// The kernel isolation every processor of the machine runs with.
+    #[cfg(feature = "native-users")]
+    pub(crate) fn user_isolation(&self) -> UserIsolation {
+        self.user_isolation
     }
 
     pub(crate) fn timebase(&self) -> Timebase {

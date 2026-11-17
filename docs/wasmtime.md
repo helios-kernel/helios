@@ -5,13 +5,43 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/register-component-hosts`):
+The local checkout must be at (branch `helios/caller-memory`):
 
 ```text
-e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e
+5048e15b9626f0382e9a5df653668a0d44b017ed
 ```
 
-This revision combines the register trampoline implementation with
+`helios/caller-memory` is `helios/register-component-hosts` at
+`e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e` plus one additive commit, which
+tells a host function the linear memory of the call it is serving:
+
+- `Access::caller_memory()` returns the memory named by the `canon lower`
+  options the guest called through: the calling subcomponent's own memory.
+  It is `None` when those options name no memory or a shared one, and for an
+  `Access` that serves no guest call (`Access::new`, a spawned task).
+- The answer belongs to the call. The runtime captures the calling instance
+  and its options index when the host call is entered, on the array, register
+  and async-lowered paths alike, and carries them in that call's `Access`, or
+  in the `Accessor` its host future owns. A concurrent host that suspends
+  answers with its own call's memory after any number of other calls ran.
+- `LinkerInstance::func_wrap_access` is `func_wrap` with the store handed over
+  as an `Access`; `bindgen!` registers synchronous `store` imports through it.
+  `func_wrap_concurrent_immediate` hands its closure an `Access` as well, and
+  `Access` gains `data()` beside `data_mut()`.
+- Each component instance records the `Memory` handle of every core memory
+  its canonical options extract, as instantiation extracts it, so the lookup
+  is an index; `get_default_memory` reads the same record.
+
+Helios needs it because every span a guest passes to `gpu`, `surface`,
+`display` or `device` names "this instance's linear memory", and a component
+composed from several subcomponents has several. `get_default_memory`
+returns `None` for those, so the kernel's one recorded memory per store
+refused every span the WebGPU provider's Venus driver sent from inside
+`pride-flag` (`bad-span`). The kernel now resolves each span against the
+calling call's memory and keeps no memory in its store data.
+
+The revision it replaces is `helios/register-component-hosts` at
+`e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e`, which combines the register trampoline implementation with
 `helios/borrowed-sync-wit-inputs` at `6e4440eff80a35670c7622d4be28d422ab624461`.
 Typed synchronous scalar and resource-handle imports select precompiled native
 register trampolines; other imports retain the array ABI. Canonical validation,

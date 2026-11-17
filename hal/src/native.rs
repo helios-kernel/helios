@@ -12,11 +12,16 @@
 //!
 //! The kernel's Linux process host is the first: it maps an ELF image,
 //! builds the initial stack, resumes a context until it stops, and answers
-//! each system call. The shape also carries what comes next on the same
-//! surface: removing and narrowing mappings with a cross-processor
-//! shootdown, several threads of one process running on several processors
-//! in one space, signal delivery that saves and restores the complete
-//! register and extended state, and copy-on-write duplication of a space.
+//! each system call, `brk`, `munmap`, `mprotect`, `mremap` and `madvise`
+//! among them through the space's removal, protection, move and discard
+//! operations. The shape also carries what comes next on the same surface:
+//! several threads of one process running on several processors in one
+//! space, whose concurrent removals the slice count and shootdown below
+//! already cover; signal delivery that saves and restores the complete
+//! register and extended state; and copy-on-write duplication of a space,
+//! which narrows every page with [`UserSpace::protect`]'s shootdown and
+//! answers the write faults that follow through
+//! [`UserSpace::resolve_fault`].
 //!
 //! # Concurrency contract
 //!
@@ -31,6 +36,34 @@
 //!   or narrows its permissions must invalidate it on every processor that
 //!   has run a slice of the space since the translation was installed, and
 //!   free nothing it removed until each of them has acknowledged.
+//! - Every backend's slice exit leaves no translation of the space usable
+//!   on its processor, so the processors that can hold one are exactly
+//!   those running a slice of the space at that moment. A space counts its
+//!   running slices: a slice is counted before it loads the space's root
+//!   and uncounted after its exit has dropped the translations, and a
+//!   removal reads the count after its table writes are visible. A
+//!   removal that finds no slice running needs no remote invalidation; one
+//!   that finds any runs the backend's own shootdown (an IPI broadcast and
+//!   its acknowledgements, or a broadcast TLB maintenance instruction and
+//!   the barrier that completes it) before it returns.
+//! - [`UserSpace::unmap`], [`UserSpace::discard`], a narrowing
+//!   [`UserSpace::protect`] and [`UserSpace::remap`] remove or narrow
+//!   translations. Each holds the space's lock from its first table write
+//!   through the shootdown, then frees the frames it removed; the lock is
+//!   never taken with interrupts masked, so a processor spinning on it
+//!   still acknowledges the shootdown. When one returns, no processor can
+//!   reach a removed frame or use a removed access through a stale
+//!   translation, and a moved page is reachable only at its new address.
+//! - A widening [`UserSpace::protect`] and [`UserSpace::resolve_fault`]
+//!   only add access, so they send no shootdown. A slice elsewhere that
+//!   still holds the narrower translation faults on it; the fault is
+//!   spurious, and [`UserSpace::resolve_fault`] answers it as resolved, so
+//!   the owner resumes the context and the processor walks the tables
+//!   again.
+//! - Each operation is atomic with respect to every other operation and
+//!   to every slice. A caller that composes several (a query, then a
+//!   mapping it decided on) serialises its own compositions; the contract
+//!   orders nothing across calls.
 //! - [`UserSpace::read`] and [`UserSpace::write`] copy through the kernel's
 //!   own mapping of the backing frames, never through a user address. They
 //!   may run while slices of the same space run elsewhere; user code sees
@@ -53,10 +86,38 @@
 //!   program: the slice it interrupted is the one it is attributed to.
 //! - `resume` is called from task context with interrupts enabled. It
 //!   occupies its processor for at most one slice and does not suspend.
+//! - A page may be mapped writable and executable at once, and user code
+//!   makes its own stores visible to its instruction fetches by the means
+//!   its ISA gives user mode: x86 keeps the two coherent, and an AArch64
+//!   backend lets EL0 read `CTR_EL0` and run the `DC`/`IC` maintenance
+//!   instructions on every processor before any slice runs there.
 //! - Every register a slice can change, general, flags, vector and every
 //!   extended-state component the processor enables for user mode, is saved
 //!   when the slice ends and restored when the next one starts; the kernel's
 //!   own state is saved and restored around the slice the same way.
+//!
+//! # Isolation contract
+//!
+//! A space keeps the kernel's half mapped while user code runs, so the
+//! processor's privilege checks are all that separate the two, in both
+//! directions. A backend publishes the capability only when every one of
+//! its processors provides each of these, and otherwise refuses it with
+//! [`NativeUnavailable::MissingProtection`] naming the first one missing:
+//!
+//! - Kernel mode cannot fetch an instruction from a page user mode can
+//!   reach: x86 `CR4.SMEP` on every processor, AArch64 `PXN` on every
+//!   EL0 mapping and on every table above one.
+//! - Kernel mode cannot load from or store to such a page: x86 `CR4.SMAP`
+//!   and AArch64 `PSTATE.PAN` (set on every exception entry by a clear
+//!   `SCTLR_EL1.SPAN`) on every processor. The kernel never needs to lift
+//!   either, because [`UserSpace::read`] and [`UserSpace::write`] reach
+//!   user memory through the kernel's own mapping of its frames.
+//! - User mode cannot read kernel memory through a speculative load the
+//!   privilege check refuses only at retirement: the processor declares
+//!   itself unaffected by rogue data cache load, x86
+//!   `IA32_ARCH_CAPABILITIES.RDCL_NO` and AArch64 `ID_AA64PFR0_EL1.CSV3`.
+//!   No processor that lacks it runs user code, because the kernel's half
+//!   stays mapped and no page-table isolation separates it.
 
 use core::convert::Infallible;
 
@@ -73,6 +134,39 @@ pub enum InstructionSet {
     Riscv64,
 }
 
+/// A hardware protection the isolation contract requires, by its
+/// architectural name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum Protection {
+    /// x86 supervisor-mode execution prevention,
+    /// `CPUID.(EAX=07H,ECX=0):EBX[7]`.
+    #[error("SMEP (supervisor-mode execution prevention)")]
+    Smep,
+    /// x86 supervisor-mode access prevention,
+    /// `CPUID.(EAX=07H,ECX=0):EBX[20]`.
+    #[error("SMAP (supervisor-mode access prevention)")]
+    Smap,
+    /// x86 `IA32_ARCH_CAPABILITIES.RDCL_NO`, bit 0 of an MSR that
+    /// `CPUID.(EAX=07H,ECX=0):EDX[29]` declares.
+    #[error("RDCL_NO (not affected by rogue data cache load)")]
+    RdclNo,
+    /// AArch64 FEAT_PAN, `ID_AA64MMFR1_EL1.PAN` nonzero.
+    #[error("FEAT_PAN (privileged access never)")]
+    Pan,
+    /// AArch64 FEAT_CSV3, `ID_AA64PFR0_EL1.CSV3` nonzero.
+    #[error("FEAT_CSV3 (not affected by rogue data cache load)")]
+    Csv3,
+}
+
+/// Why a platform offers no native user execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum NativeUnavailable {
+    #[error("this platform has no native user execution")]
+    Unsupported,
+    #[error("native user execution requires {0}, which this processor lacks")]
+    MissingProtection(Protection),
+}
+
 /// Why a native operation was refused. Every refusal leaves the space or
 /// context it was asked of unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -81,8 +175,6 @@ pub enum NativeError {
     Address,
     #[error("range overlaps an existing user mapping")]
     Overlap,
-    #[error("the permission combination is refused (writable and executable)")]
-    Permissions,
     #[error("user memory is exhausted")]
     OutOfMemory,
     #[error("an address in the range is not mapped with the required access")]
@@ -184,8 +276,9 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     /// Installs zero-filled private pages covering `range` with `flags`,
     /// then copies `contents` to `range.start`. `range` need not be page
     /// aligned; every page it touches is installed. Fails, mapping nothing,
-    /// when `contents` is longer than the range, any covered page is
-    /// already mapped, or `flags` asks for write and execute together.
+    /// when `contents` is longer than the range or any covered page is
+    /// already mapped. Any combination of read, write and execute is a
+    /// valid `flags`, write and execute together included.
     fn map(&self, range: VirtRange, contents: &[u8], flags: PageFlags) -> Result<(), NativeError>;
 
     /// Installs `byte_len` bytes (a page multiple) of zero-filled private
@@ -207,6 +300,63 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     /// Copies `bytes` to `address`, which must be mapped writable over the
     /// whole length; nothing is written otherwise.
     fn write(&self, address: VirtAddr, bytes: &[u8]) -> Result<(), NativeError>;
+
+    /// Removes every mapped page of `range`, a page-aligned range inside
+    /// the user range, and frees its frame once the shootdown completes.
+    /// Pages of the range that are not mapped are skipped.
+    fn unmap(&self, range: VirtRange) -> Result<(), NativeError>;
+
+    /// Replaces the access of every page of the page-aligned `range` with
+    /// `flags`, any combination of read, write and execute. Fails, changing
+    /// nothing, when a page of the range is not mapped. Pages that lose an
+    /// access are shot down before it returns.
+    fn protect(&self, range: VirtRange, flags: PageFlags) -> Result<(), NativeError>;
+
+    /// Releases the frame behind every mapped page of the page-aligned
+    /// `range` once the shootdown completes, keeping the page mapped with
+    /// its access: its next access reads zeros, and commits a zero-filled
+    /// frame through [`Self::resolve_fault`] or a copy. Pages of the range
+    /// that are not mapped are skipped.
+    fn discard(&self, range: VirtRange) -> Result<(), NativeError>;
+
+    /// Moves the pages of `from` to the start of `to`, each keeping its
+    /// frame (or its discarded state) and its access, and installs
+    /// zero-filled pages with the same access over the rest of `to`. Both
+    /// ranges are page aligned and disjoint, `to` is at least as long as
+    /// `from` and has no mapping, and every page of `from` is mapped with
+    /// one access; anything else fails with nothing changed. When it
+    /// returns, `from` has no mapping and no processor holds a translation
+    /// of it.
+    fn remap(&self, from: VirtRange, to: VirtRange) -> Result<(), NativeError>;
+
+    /// Answers a page fault a slice reported at `address` for `access`
+    /// (one of read, write or execute). Succeeds, and the context may
+    /// resume, when the page is mapped with that access: a discarded page
+    /// gets its zero-filled frame here, and a page that already has one
+    /// faulted on a translation an earlier, narrower state left on that
+    /// processor. Fails with [`NativeError::NotMapped`] when the page is
+    /// not mapped with `access`, so the fault is the program's.
+    fn resolve_fault(&self, address: VirtAddr, access: PageFlags) -> Result<(), NativeError>;
+
+    /// The first run of the page-aligned `range` mapped contiguously with
+    /// one access, clipped to `range`: the lowest mapped page of the range
+    /// starts it, and the first unmapped page or change of access ends it.
+    /// `None` when no page of the range is mapped.
+    fn mapping(&self, range: VirtRange) -> Option<Mapping>;
+
+    /// The first page-aligned free range of `byte_len` bytes, a nonzero
+    /// page multiple, at or above `hint`, else in the whole user range:
+    /// the placement [`Self::map_anywhere`] chooses. `None` when none is
+    /// free.
+    fn free_range(&self, hint: VirtAddr, byte_len: usize) -> Option<VirtAddr>;
+}
+
+/// A run of pages mapped with one access, as [`UserSpace::mapping`]
+/// reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mapping {
+    pub range: VirtRange,
+    pub flags: PageFlags,
 }
 
 /// One thread of user execution. See the module docs for its concurrency
@@ -270,6 +420,27 @@ unsafe impl UserSpace for Infallible {
         match *self {}
     }
     fn write(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn unmap(&self, _: VirtRange) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn protect(&self, _: VirtRange, _: PageFlags) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn discard(&self, _: VirtRange) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn remap(&self, _: VirtRange, _: VirtRange) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn resolve_fault(&self, _: VirtAddr, _: PageFlags) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn mapping(&self, _: VirtRange) -> Option<Mapping> {
+        match *self {}
+    }
+    fn free_range(&self, _: VirtAddr, _: usize) -> Option<VirtAddr> {
         match *self {}
     }
 }

@@ -542,9 +542,7 @@ where
         max_bytes: usize,
     ) -> Result<Bytes, i32> {
         let reader = match self.descriptors.get_mut(fd) {
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-                reader, carry, ..
-            })) => {
+            Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) => {
                 if !carry.is_empty() {
                     return Ok(take_preview1_carry(carry, max_bytes));
                 }
@@ -556,7 +554,7 @@ where
         };
 
         let bytes = reader.read().await.unwrap_or_default();
-        let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { carry, .. })) =
+        let Some(Preview1Descriptor::Socket(UnixSocket::Pair { carry, .. })) =
             self.descriptors.get_mut(fd)
         else {
             return Err(p1::errno::BADF);
@@ -570,7 +568,7 @@ where
         fd: i32,
         max_bytes: usize,
     ) -> Result<Option<Bytes>, i32> {
-        let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })) =
+        let Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) =
             self.descriptors.get_mut(fd)
         else {
             return match self.descriptors.get(fd) {
@@ -721,6 +719,9 @@ where
         Ok((descriptor.clone(), suffix.to_owned()))
     }
 
+    /// The descriptor `wasix-libc` (`<fcntl.h>`) passes for `AT_FDCWD`.
+    pub(super) const WASIX_AT_FDCWD: i32 = -2;
+
     pub(super) fn resolve_wasix_path_base(
         &self,
         fd: i32,
@@ -731,7 +732,8 @@ where
                 crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
             return self.resolve_absolute_guest_base(&guest_name);
         }
-        if let Some(cwd) = self.cwd.as_ref() {
+        if fd == Self::WASIX_AT_FDCWD {
+            let cwd = self.cwd.as_ref().ok_or(p1::errno::BADF)?;
             return Ok((cwd.descriptor.clone(), path.to_owned()));
         }
         let base = match self.descriptors.get(fd) {
@@ -766,6 +768,88 @@ where
         let absolute =
             crate::resolve_child_path(&base.path, &path).map_err(p1_errno_from_component_path)?;
         Ok((base, path, absolute))
+    }
+
+    pub(super) fn resolve_preview1_open_base(
+        &self,
+        fd: i32,
+        path: &str,
+    ) -> Result<(FsDescriptor, String), i32> {
+        if self.wasix_abi {
+            return self.resolve_wasix_path_base(fd, path);
+        }
+        let base = match self.descriptors.get(fd) {
+            None => return Err(p1::errno::BADF),
+            descriptor => p1_directory_descriptor(descriptor)
+                .ok_or(p1::errno::NOTDIR)?
+                .clone(),
+        };
+        Ok((base, path.to_owned()))
+    }
+
+    pub(super) async fn stat_preview1_path(
+        &self,
+        fd: i32,
+        flags: u32,
+        path: &str,
+    ) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32> {
+        let (base, path, absolute) = self.resolve_preview1_path(fd, path)?;
+        if absolute == WASIX_NULL_DEVICE_PATH {
+            return Ok((p1_null_device_identity(), p1_null_device_stat()));
+        }
+        let granted = p1_grant(&base)?;
+        let metadata = wasi_fs::stat_at(&self.filesystem, granted, p1_path_flags(flags), &path)
+            .await
+            .map_err(p1_errno_from_fs)?;
+        Ok((
+            crate::object_identity(&metadata),
+            wasi_fs::descriptor_stat(&metadata),
+        ))
+    }
+
+    pub(super) async fn set_preview1_path_times(
+        &self,
+        fd: i32,
+        path_flags: fs_types::PathFlags,
+        path: &str,
+        atim: u64,
+        mtim: u64,
+        fstflags: u16,
+    ) -> i32 {
+        let (base, path, _) = match self.resolve_preview1_path(fd, path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return errno,
+        };
+        let granted = match p1_grant(&base) {
+            Ok(granted) => granted,
+            Err(errno) => return errno,
+        };
+        let now_nanos = self.system_time_nanos();
+        let access = p1_timestamp_from_fstflags(
+            fstflags,
+            P1_FSTFLAG_ATIM,
+            P1_FSTFLAG_ATIM_NOW,
+            atim,
+            now_nanos,
+        );
+        let modified = p1_timestamp_from_fstflags(
+            fstflags,
+            P1_FSTFLAG_MTIM,
+            P1_FSTFLAG_MTIM_NOW,
+            mtim,
+            now_nanos,
+        );
+        wasi_fs::set_times_at(
+            &self.filesystem,
+            granted,
+            path_flags,
+            &path,
+            access,
+            modified,
+            now_nanos,
+        )
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
     }
 }
 
@@ -2943,20 +3027,9 @@ where
     let path = memory
         .read_path(GuestAddress::wasm32(path), path_len)
         .await?;
-    let (base, path) = if caller.data().wasix_abi {
-        match caller.data().resolve_wasix_path_base(fd, &path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return Ok(errno),
-        }
-    } else {
-        let base = match caller.data().descriptors.get(fd) {
-            None => return Ok(p1::errno::BADF),
-            descriptor => match p1_directory_descriptor(descriptor) {
-                Some(descriptor) => descriptor.clone(),
-                None => return Ok(p1::errno::NOTDIR),
-            },
-        };
-        (base, path)
+    let (base, path) = match caller.data().resolve_preview1_open_base(fd, &path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return Ok(errno),
     };
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
@@ -3158,20 +3231,7 @@ where
     let path = memory
         .read_path(GuestAddress::wasm32(path), path_len)
         .await?;
-    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
-        Ok(resolved) => resolved,
-        Err(errno) => return Ok(errno),
-    };
-    if absolute == WASIX_NULL_DEVICE_PATH {
-        return p1_write_filestat(
-            caller,
-            stat,
-            p1_null_device_identity(),
-            p1_null_device_stat(),
-        )
-        .await;
-    }
-    let (identity, stat_value) = p1_stat_below(caller, &base, p1_path_flags(flags), &path).await?;
+    let (identity, stat_value) = caller.data().stat_preview1_path(fd, flags, &path).await?;
     p1_write_filestat(caller, stat, identity, stat_value).await
 }
 
@@ -3182,7 +3242,7 @@ where
 pub(super) async fn p1_path_filestat_set_times<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
-    _flags: u32,
+    flags: u32,
     path: u32,
     path_len: u32,
     atim: u64,
@@ -3200,12 +3260,22 @@ where
     let path = memory
         .read_path(GuestAddress::wasm32(path), path_len)
         .await?;
-    Ok(p1_path_filestat_set_times_at(caller, fd, &path, atim, mtim, fstflags).await)
+    Ok(p1_path_filestat_set_times_at(
+        caller,
+        fd,
+        p1_path_flags(flags),
+        &path,
+        atim,
+        mtim,
+        fstflags,
+    )
+    .await)
 }
 
 async fn p1_path_filestat_set_times_at<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
+    path_flags: fs_types::PathFlags,
     path: &str,
     atim: u64,
     mtim: u64,
@@ -3216,19 +3286,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, path) {
-        Ok(resolved) => resolved,
-        Err(errno) => return errno,
-    };
-    let granted = match p1_grant(&base) {
-        Ok(granted) => granted,
-        Err(errno) => return errno,
-    };
-    let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
-    let namespace = p1_namespace(caller);
-    wasi_fs::set_times_at(&namespace, granted, &path, access, modified, now_nanos)
+    caller
+        .data()
+        .set_preview1_path_times(fd, path_flags, path, atim, mtim, fstflags)
         .await
-        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 #[expect(
@@ -4002,11 +4063,11 @@ where
         return Err(status);
     }
     let (listener, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Listening {
-                listener, family, ..
-            },
-        ))) => (listener.id(), *family),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
+            listener,
+            family,
+            ..
+        }))) => (listener.id(), *family),
         Some(Preview1Descriptor::Socket(_)) => return Err(p1::errno::INVAL),
         Some(_) => return Err(p1::errno::NOTSOCK),
         None => return Err(p1::errno::BADF),
@@ -4023,14 +4084,13 @@ where
         .tcp_accept(listener, timeout)
         .await
         .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
-    let descriptor =
-        Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-            family,
-            stream: WasixOwnedTcpStream::new(service.clone(), accepted.stream),
-            peer_address: accepted.address,
-            peer_port: accepted.port,
-            options: WasixSocketOptions::default(),
-        }));
+    let descriptor = Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+        family,
+        stream: OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), accepted.stream),
+        peer_address: accepted.address,
+        peer_port: accepted.port,
+        options: unix_socket_options::<Net>(),
+    }));
     caller
         .data_mut()
         .descriptors
@@ -4047,9 +4107,10 @@ where
     StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { stream, .. },
-        ))) => Ok(stream.id()),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            stream,
+            ..
+        }))) => Ok(stream.id()),
         Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
         Some(_) => Err(p1::errno::NOTSOCK),
         None => Err(p1::errno::BADF),
@@ -4120,9 +4181,7 @@ where
     let fdflags = caller.data().descriptors.fdflags(fd)?;
     if matches!(
         caller.data().descriptors.get(fd),
-        Some(Preview1Descriptor::Socket(
-            WasixSocketDescriptor::Pair { .. }
-        ))
+        Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. }))
     ) {
         let bytes = if capacity == 0 {
             Bytes::new()
@@ -4143,9 +4202,10 @@ where
         return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
     }
     let stream = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { stream, .. },
-        ))) => stream.id(),
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            stream,
+            ..
+        }))) => stream.id(),
         Some(Preview1Descriptor::Socket(_)) => return Ok(p1::errno::INVAL),
         Some(_) => return Ok(p1::errno::NOTSOCK),
         None => return Ok(p1::errno::BADF),
@@ -4263,8 +4323,7 @@ where
     let layout = p1_read_iovs_with_byte_len(&memory, si_data, si_data_len).await?;
     let mut gather = Preview1Gather::new(&memory, &layout)?;
     let descriptor = caller.data().descriptors.get(fd).cloned();
-    if let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) = descriptor
-    {
+    if let Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })) = descriptor {
         let fdflags = caller.data().descriptors.fdflags(fd)?;
         let written = p1_send_gathered(&memory, &mut gather, |chunk| {
             p1_send_to_socketpair(&writer, chunk, fdflags)
@@ -4273,9 +4332,8 @@ where
         memory.write_u32(so_datalen, written).await?;
         return Ok(p1::errno::SUCCESS);
     }
-    let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-        stream,
-        ..
+    let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+        stream, ..
     }))) = &descriptor
     else {
         return Ok(p1_connected_tcp_stream(caller, fd)
@@ -4324,9 +4382,7 @@ where
     }
     let descriptor = caller.data().descriptors.get(fd).cloned();
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { .. },
-        ))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected { .. }))) => {
             let status = caller.data().require_tcp_authority();
             if status != p1::errno::SUCCESS {
                 return status;
@@ -4334,7 +4390,7 @@ where
             if caller.data().runtime_state.network_service().is_none() {
                 return p1::errno::NETDOWN;
             }
-            let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(slot))) =
+            let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
                 caller.data_mut().descriptors.get_mut(fd)
             else {
                 return p1::errno::BADF;
@@ -4342,19 +4398,17 @@ where
             // Replacing the slot drops this descriptor's handle, and the
             // stream is retired once the last one is gone.
             let options = *slot.options();
-            *slot = WasixTcpSocket::Unconnected {
+            *slot = UnixTcpSocket::Unconnected {
                 family: slot.family(),
                 options,
             };
             p1::errno::SUCCESS
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
             ..
-        }))) => {
+        }))) => p1::errno::INVAL,
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => p1::errno::INVAL,
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound { .. }))) => {
             let status = caller.data().require_udp_authority();
             if status != p1::errno::SUCCESS {
                 return status;
@@ -4362,7 +4416,7 @@ where
             if caller.data().runtime_state.network_service().is_none() {
                 return p1::errno::NETDOWN;
             }
-            let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(slot))) =
+            let Some(Preview1Descriptor::Socket(UnixSocket::Udp(slot))) =
                 caller.data_mut().descriptors.get_mut(fd)
             else {
                 return p1::errno::BADF;
@@ -4370,18 +4424,16 @@ where
             // Replacing the slot drops this descriptor's handle, and the
             // socket is retired once the last one is gone.
             let options = *slot.options();
-            *slot = WasixUdpSocket::Unbound {
+            *slot = UnixUdpSocket::Unbound {
                 family: slot.family(),
                 options,
             };
             p1::errno::SUCCESS
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-            ..
-        }))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-            reader, writer, ..
-        })) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound { .. }))) => {
+            p1::errno::INVAL
+        }
+        Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, writer, .. })) => {
             if how & P1_SDFLAGS_RD != 0 {
                 reader.close();
             }
@@ -5170,6 +5222,7 @@ mod tests {
         block_on(wasi_fs::set_times_at(
             &namespace,
             p1_grant(&creator).expect("PATH_CREATE_FILE gives mutate-directory"),
+            fs_types::PathFlags::empty(),
             "data",
             None,
             Some(88),
@@ -5184,14 +5237,14 @@ mod tests {
         stream: Net::TcpStream,
     ) -> Preview1DescriptorEntry<Net> {
         Preview1DescriptorEntry::new(
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-                family: WasixSocketFamily::Ipv4,
-                stream: WasixOwnedTcpStream::new(service, stream),
+            Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+                family: SocketFamily::Ipv4,
+                stream: OwnedTcpStream::new(crate::UnixNetwork::new(service), stream),
                 peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
                     127, 0, 0, 1,
                 ])),
                 peer_port: 80,
-                options: WasixSocketOptions::default(),
+                options: unix_socket_options::<Net>(),
             })),
             false,
         )
@@ -5202,11 +5255,11 @@ mod tests {
         listener: Net::TcpListener,
     ) -> Preview1DescriptorEntry<Net> {
         Preview1DescriptorEntry::new(
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Listening {
-                family: WasixSocketFamily::Ipv4,
-                listener: WasixOwnedTcpListener::new(service, listener),
+            Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
+                family: SocketFamily::Ipv4,
+                listener: OwnedTcpListener::new(crate::UnixNetwork::new(service), listener),
                 local_port: 8080,
-                options: WasixSocketOptions::default(),
+                options: unix_socket_options::<Net>(),
             })),
             false,
         )
@@ -5338,7 +5391,7 @@ mod tests {
     ///
     /// #224 put the segment on the outbound queue and #232 kicked the
     /// packet pump from the retirement drain, but a preview1 descriptor
-    /// closes its stream straight from `WasixOwnedTcpStream::drop` and
+    /// closes its stream straight from `OwnedTcpStream::drop` and
     /// never went through that drain. Its FIN therefore sat in the
     /// queue until the pump's park expired, which on a guest with
     /// nothing else to send is `CONFIGURATION_POLL_NANOS` — a second of
@@ -5399,11 +5452,11 @@ mod tests {
         socket: Net::UdpSocket,
     ) -> Preview1DescriptorEntry<Net> {
         Preview1DescriptorEntry::new(
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
-                family: WasixSocketFamily::Ipv4,
-                socket: WasixOwnedUdpSocket::new(service, socket),
+            Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
+                family: SocketFamily::Ipv4,
+                socket: OwnedUdpSocket::new(crate::UnixNetwork::new(service), socket),
                 local_port: 5353,
-                options: WasixSocketOptions::default(),
+                options: unix_socket_options::<Net>(),
             })),
             false,
         )
@@ -5455,12 +5508,15 @@ mod tests {
     }
 
     fn connected_socket() -> Preview1Descriptor<crate::test_support::TestNetworkService> {
-        Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-            family: WasixSocketFamily::Ipv4,
-            stream: WasixOwnedTcpStream::new(crate::test_support::test_network_service(), 9),
+        Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            family: SocketFamily::Ipv4,
+            stream: OwnedTcpStream::new(
+                crate::UnixNetwork::new(crate::test_support::test_network_service()),
+                9,
+            ),
             peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
             peer_port: 80,
-            options: WasixSocketOptions::default(),
+            options: unix_socket_options::<crate::test_support::TestNetworkService>(),
         }))
     }
 
@@ -5615,11 +5671,11 @@ mod tests {
         let socket = connected_socket();
         assert!(matches!(
             p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_READ),
-            Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
+            Ok(P1Probe::Network(helios_unix::SocketHandle::TcpStream(9)))
         ));
         assert!(matches!(
             p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_WRITE),
-            Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
+            Ok(P1Probe::Network(helios_unix::SocketHandle::TcpStream(9)))
         ));
     }
 

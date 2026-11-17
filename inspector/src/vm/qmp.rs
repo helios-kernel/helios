@@ -84,8 +84,6 @@ pub(crate) enum QmpError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("the screendump path must be valid UTF-8, and {path:?} is not")]
-    ScreendumpPathNotUtf8 { path: String },
     #[error("the human monitor answered {command:?} with {value} instead of its text output")]
     DecodeHumanMonitor { command: String, value: Value },
 }
@@ -209,20 +207,6 @@ pub(crate) enum InputEvent {
     },
 }
 
-/// The arguments of one `screendump`.
-///
-/// `format` is named on every capture: QEMU's default is PPM, and a
-/// lane that uploaded a PPM under a `.png` name would produce an
-/// artifact nothing opens.
-#[derive(Debug, Serialize)]
-struct ScreendumpArguments<'a> {
-    filename: &'a str,
-    format: &'a str,
-}
-
-/// The image format every capture asks for.
-const SCREENDUMP_FORMAT: &str = "png";
-
 /// The arguments of one `input-send-event`.
 ///
 /// QEMU delivers the whole list to the guest as one input batch ended
@@ -310,29 +294,6 @@ impl QmpClient {
     /// guest to keep, in bytes.
     pub(crate) fn set_balloon(&mut self, bytes: u64) -> Result<(), QmpError> {
         self.execute("balloon", json!({ "value": bytes }))?;
-        Ok(())
-    }
-
-    /// Writes the machine's current scanout to `path` as a PNG.
-    ///
-    /// The capture is QEMU's own view of the display device's surface,
-    /// so it is taken with no host display backend at all: a headless
-    /// lane sees exactly what a window would have shown.
-    pub(crate) fn screendump(&mut self, path: &Path) -> Result<(), QmpError> {
-        // QMP is JSON, and JSON strings are Unicode: a path that is not
-        // UTF-8 cannot be named to QEMU at all, and lossy-encoding one
-        // would write the capture somewhere the caller did not ask for.
-        let filename = path
-            .to_str()
-            .ok_or_else(|| QmpError::ScreendumpPathNotUtf8 {
-                path: path.display().to_string(),
-            })?;
-        let arguments = serde_json::to_value(ScreendumpArguments {
-            filename,
-            format: SCREENDUMP_FORMAT,
-        })
-        .map_err(|source| QmpError::Encode { source })?;
-        self.execute("screendump", arguments)?;
         Ok(())
     }
 
@@ -542,8 +503,7 @@ mod tests {
 
     use super::{
         ABS_AXIS_MAX, AbsCoordinate, HumanMonitorCommandArguments, InputEvent,
-        InputSendEventArguments, KeyValue, PointerAxis, PointerButton, QKeyCode,
-        ScreendumpArguments, parse_size,
+        InputSendEventArguments, KeyValue, PointerAxis, PointerButton, QKeyCode, parse_size,
     };
 
     #[test]
@@ -618,19 +578,6 @@ mod tests {
         assert_eq!(
             on_one,
             json!({ "command-line": "info lapic", "cpu-index": 3 })
-        );
-    }
-
-    #[test]
-    fn a_capture_names_the_format_it_wants() {
-        let arguments = serde_json::to_value(ScreendumpArguments {
-            filename: "/tmp/desktop.png",
-            format: super::SCREENDUMP_FORMAT,
-        })
-        .expect("the screendump arguments serialise");
-        assert_eq!(
-            arguments,
-            json!({ "filename": "/tmp/desktop.png", "format": "png" })
         );
     }
 

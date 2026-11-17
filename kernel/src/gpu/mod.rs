@@ -49,6 +49,7 @@
 //! renderer has stopped reading it, on whichever processor drops the
 //! last reference.
 
+mod image;
 mod instance;
 mod owner;
 mod service;
@@ -97,13 +98,17 @@ pub const MAX_MACHINE_GPU_BLOBS: usize = 4 * MAX_GPU_BLOBS;
 /// a command buffer.
 pub const MAX_EXECUTE_BYTES: usize = 256;
 
+pub use image::GpuImage;
 pub use instance::Gpu3dOwnership;
 pub use owner::install_gpu3d_device;
 pub use service::{
-    BlobShared, ContextRecord, ContextShared, Gpu3dSender, Gpu3dService, Gpu3dSession,
-    RingTimeline, ScanoutHold, SessionId,
+    BlobHold, BlobShared, ContextRecord, ContextShared, Gpu3dSender, Gpu3dService, Gpu3dSession,
+    RingTimeline, SessionId,
 };
-pub(crate) use service::{BlobSpec, Gpu3dRequest, InlineCommands, SubmitCommands, SubmitRequest};
+pub(crate) use service::{
+    BlobSpec, CompletionSignal, Gpu3dRequest, InlineCommands, SubmitCommands, SubmitCompletion,
+    SubmitRequest,
+};
 
 /// Why a 3D request was refused.
 ///
@@ -171,6 +176,9 @@ pub enum Gpu3dServiceError {
     /// not come after the last one this context submitted on its ring.
     #[error("a fence must come after every fence already submitted on its ring")]
     StaleFence,
+    /// The requested wait is beyond every fence admitted on this ring.
+    #[error("the fence has not been submitted on this ring")]
+    UnsubmittedFence,
     /// The span is not whole pages inside the instance's memory, is not
     /// the length the request needs, or overlaps something already
     /// shown.

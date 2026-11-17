@@ -23,6 +23,9 @@ pub mod display;
 mod error;
 #[cfg(feature = "fs")]
 pub mod fs;
+#[cfg(any(feature = "display", feature = "gpu", feature = "surface"))]
+pub mod image;
+
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(feature = "http")]
@@ -64,6 +67,8 @@ pub mod task;
 pub mod tracing;
 #[cfg(feature = "vsock")]
 pub mod vsock;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
 
 #[cfg(any(feature = "fs", feature = "io"))]
 pub use error::Result;

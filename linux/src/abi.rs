@@ -31,6 +31,11 @@ pub enum Operation {
     EpollWait,
     EpollPwait,
     Mmap,
+    Munmap,
+    Mprotect,
+    Mremap,
+    Madvise,
+    Brk,
     Ioctl,
     Writev,
     Getpid,
@@ -39,6 +44,28 @@ pub enum Operation {
     ArchPrctl,
     Exit,
     ExitGroup,
+    ClockGettime,
+    ClockGetres,
+    ClockSettime,
+    Gettimeofday,
+    /// x86-64 only: aarch64's asm-generic table has no `time`.
+    Time,
+    Getrandom,
+    Uname,
+    Sysinfo,
+    Getuid,
+    Geteuid,
+    Getgid,
+    Getegid,
+    Getgroups,
+    Getresuid,
+    Getresgid,
+    Prlimit64,
+    Getrlimit,
+    Setrlimit,
+    Umask,
+    Getpriority,
+    Setpriority,
     Unknown,
 }
 
@@ -55,24 +82,48 @@ impl Abi {
     /// The operation system call `number` names.
     pub fn operation(self, number: u64) -> Operation {
         match self {
-            // arch/x86/entry/syscalls/syscall_64.tbl
+            // arch/x86/entry/syscalls/syscall_64.tbl, Linux v6.12.
             Self::X86_64 => match number {
                 0 => Operation::Read,
                 1 => Operation::Write,
                 3 => Operation::Close,
                 9 => Operation::Mmap,
+                10 => Operation::Mprotect,
+                11 => Operation::Munmap,
+                12 => Operation::Brk,
                 16 => Operation::Ioctl,
                 20 => Operation::Writev,
                 22 => Operation::Pipe,
+                25 => Operation::Mremap,
+                28 => Operation::Madvise,
                 32 => Operation::Dup,
                 33 => Operation::Dup2,
                 39 => Operation::Getpid,
                 60 => Operation::Exit,
+                63 => Operation::Uname,
                 72 => Operation::Fcntl,
+                95 => Operation::Umask,
+                96 => Operation::Gettimeofday,
+                97 => Operation::Getrlimit,
+                99 => Operation::Sysinfo,
+                102 => Operation::Getuid,
+                104 => Operation::Getgid,
+                107 => Operation::Geteuid,
+                108 => Operation::Getegid,
+                115 => Operation::Getgroups,
+                118 => Operation::Getresuid,
+                120 => Operation::Getresgid,
+                140 => Operation::Getpriority,
+                141 => Operation::Setpriority,
                 158 => Operation::ArchPrctl,
+                160 => Operation::Setrlimit,
                 186 => Operation::Gettid,
+                201 => Operation::Time,
                 213 => Operation::EpollCreate,
                 218 => Operation::SetTidAddress,
+                227 => Operation::ClockSettime,
+                228 => Operation::ClockGettime,
+                229 => Operation::ClockGetres,
                 231 => Operation::ExitGroup,
                 232 => Operation::EpollWait,
                 233 => Operation::EpollCtl,
@@ -82,11 +133,13 @@ impl Abi {
                 291 => Operation::EpollCreate1,
                 292 => Operation::Dup3,
                 293 => Operation::Pipe2,
+                302 => Operation::Prlimit64,
+                318 => Operation::Getrandom,
                 _ => Operation::Unknown,
             },
             // include/uapi/asm-generic/unistd.h, which has none of the
-            // legacy calls (pipe, dup2, epoll_create, epoll_wait, eventfd)
-            // and no arch_prctl: user code writes TPIDR_EL0 itself.
+            // legacy calls (pipe, dup2, epoll_create, epoll_wait, eventfd,
+            // time) and no arch_prctl: user code writes TPIDR_EL0 itself.
             Self::Aarch64 => match number {
                 19 => Operation::Eventfd2,
                 20 => Operation::EpollCreate1,
@@ -104,9 +157,34 @@ impl Abi {
                 93 => Operation::Exit,
                 94 => Operation::ExitGroup,
                 96 => Operation::SetTidAddress,
+                112 => Operation::ClockSettime,
+                113 => Operation::ClockGettime,
+                114 => Operation::ClockGetres,
+                140 => Operation::Setpriority,
+                141 => Operation::Getpriority,
+                148 => Operation::Getresuid,
+                150 => Operation::Getresgid,
+                158 => Operation::Getgroups,
+                160 => Operation::Uname,
+                163 => Operation::Getrlimit,
+                164 => Operation::Setrlimit,
+                166 => Operation::Umask,
+                169 => Operation::Gettimeofday,
                 172 => Operation::Getpid,
+                174 => Operation::Getuid,
+                175 => Operation::Geteuid,
+                176 => Operation::Getgid,
+                177 => Operation::Getegid,
                 178 => Operation::Gettid,
+                179 => Operation::Sysinfo,
+                214 => Operation::Brk,
+                215 => Operation::Munmap,
+                216 => Operation::Mremap,
                 222 => Operation::Mmap,
+                226 => Operation::Mprotect,
+                233 => Operation::Madvise,
+                261 => Operation::Prlimit64,
+                278 => Operation::Getrandom,
                 _ => Operation::Unknown,
             },
         }
@@ -155,6 +233,19 @@ impl Abi {
         match self {
             Self::X86_64 => 4,
             Self::Aarch64 => 8,
+        }
+    }
+
+    /// Linux's `TASK_SIZE` for this ABI's processes: the end of the
+    /// addresses a mapping may reach. x86-64 keeps the last page below the
+    /// canonical hole unmappable (`TASK_SIZE_MAX`, (1 << 47) - PAGE_SIZE in
+    /// arch/x86/include/asm/page_64_types.h); arm64 ends at 1 << VA_BITS
+    /// (`TASK_SIZE_64`, arch/arm64/include/asm/processor.h) with the 48-bit
+    /// user range Helios's TTBR0 provides.
+    pub fn task_size(self) -> u64 {
+        match self {
+            Self::X86_64 => (1 << 47) - 4096,
+            Self::Aarch64 => 1 << 48,
         }
     }
 
