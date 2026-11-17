@@ -21,7 +21,7 @@
 //! a system call that suspends is dropped when either arrives.
 
 use super::*;
-use crate::{TerminalInputCap, TerminalOutputCap};
+use crate::{SetWallClockCap, TerminalInputCap, TerminalOutputCap};
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 use helios_hal::native::{
@@ -32,14 +32,9 @@ use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_linux::abi::{self, Abi};
 use helios_linux::elf::{self, Image};
 use helios_linux::syscall::{
-    self, Call, Denied, EpollData, MapError, MemoryFault, Process, Region, Resources, Stdio,
-    Stream, Thread, UserMemory, VirtualMemory, WriteError,
+    self, Call, Denied, EpollData, MapError, MemoryFault, MemoryTotals, Process, Region, Resource,
+    Resources, Start, Stdio, Stream, System, Thread, UserMemory, VirtualMemory, WriteError,
 };
-
-/// Linux's default `RLIMIT_STACK` soft limit, `_STK_LIM` in
-/// include/uapi/linux/resource.h: how far below its top the main thread's
-/// stack grows on demand.
-const STACK_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 /// The ELF identification bytes every ELF file starts with (System V gABI,
 /// `e_ident[EI_MAG0..EI_MAG3]`).
@@ -105,9 +100,12 @@ impl<Context: UserContext> Thread for ContextThread<'_, Context> {
 /// resource a later system call reaches (files, sockets, clocks,
 /// processes, devices) derives its capability here the way the matching
 /// WASIX import does, and a missing one is refused with Linux's errno.
+/// User and group IDs are values a process reports and take no part here.
 struct LinuxGrants {
     terminal_input: Option<TerminalInputCap>,
     terminal_output: Option<TerminalOutputCap>,
+    /// What WASIX's `clock_time_set` derives, for `clock_settime`.
+    set_wall_clock: Option<SetWallClockCap>,
 }
 
 impl LinuxGrants {
@@ -115,6 +113,7 @@ impl LinuxGrants {
         Self {
             terminal_input: authority.derive_terminal_input_cap().ok(),
             terminal_output: authority.derive_terminal_output_cap().ok(),
+            set_wall_clock: authority.derive_set_wall_clock_cap().ok(),
         }
     }
 }
@@ -276,9 +275,11 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
     }
 }
 
-/// The standard streams and clock of a Linux process, routed as the
-/// launching program's output mode routes a wasm child's.
-struct LinuxStdio<CpuImpl, Net, StorageImpl>
+/// What a Linux process's system calls reach beyond its own state: the
+/// standard streams, routed as the launching program's output mode routes
+/// a wasm child's, and the kernel's clocks, entropy and machine totals,
+/// read from the services a WASIX program's imports read.
+struct LinuxPlatform<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -293,9 +294,17 @@ where
     output_mode: OutputMode,
     instance: crate::InstanceId,
     grants: LinuxGrants,
+    /// The process's view of wall time, which `clock_settime` moves as
+    /// WASIX's `clock_time_set` moves a program's.
+    clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>,
+    entropy: crate::EntropyPool,
+    instances: crate::InstanceRegistry,
+    /// Timer ticks the thread's user context has run, summed over its
+    /// slices.
+    cpu_ticks: u64,
 }
 
-impl<CpuImpl, Net, StorageImpl> Stdio for LinuxStdio<CpuImpl, Net, StorageImpl>
+impl<CpuImpl, Net, StorageImpl> Stdio for LinuxPlatform<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -354,18 +363,62 @@ where
     }
 }
 
-impl<CpuImpl, Net, StorageImpl> syscall::Clock for LinuxStdio<CpuImpl, Net, StorageImpl>
+impl<CpuImpl, Net, StorageImpl> syscall::Clock for LinuxPlatform<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    /// The uptime clock, the one WASIX's `clock_time_get` reads.
     fn now_nanos(&self) -> u64 {
-        self.cpu.timebase().ticks_to_nanos(self.cpu.now().ticks())
+        self.clock.monotonic_nanos()
     }
     async fn sleep_until(&self, deadline: u64) {
         let remaining = deadline.saturating_sub(self.now_nanos());
         self.timer.sleep_for(Duration::from_nanos(remaining)).await;
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl> System for LinuxPlatform<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn realtime_nanos(&self) -> u64 {
+        self.clock.system_time_nanos()
+    }
+
+    fn set_realtime_nanos(&mut self, nanos: u64) -> Result<(), Denied> {
+        // The right WASIX's `clock_time_set` derives.
+        let cap = self.grants.set_wall_clock.as_ref().ok_or(Denied)?;
+        self.clock.set_system_time_nanos(cap, nanos);
+        Ok(())
+    }
+
+    fn cpu_nanos(&self) -> u64 {
+        self.cpu.timebase().ticks_to_nanos(self.cpu_ticks)
+    }
+
+    fn fill_random(&mut self, output: &mut [u8]) {
+        self.entropy
+            .fill_secure(self.runtime_state.root_entropy(), output);
+    }
+
+    fn memory(&self) -> MemoryTotals {
+        let machine = crate::machine_memory();
+        MemoryTotals {
+            total_bytes: machine.usable_bytes as u64,
+            free_bytes: machine.free_bytes as u64,
+        }
+    }
+
+    fn process_count(&self) -> u32 {
+        u32::try_from(self.instances.count()).unwrap_or(u32::MAX)
+    }
+
+    fn kernel_version(&self) -> &str {
+        concat!("#1 Helios ", env!("CARGO_PKG_VERSION"))
     }
 }
 
@@ -404,6 +457,10 @@ where
     let image =
         Image::parse(&executable.image, executable.abi, user_end(native)).map_err(image_error)?;
     let space = native.create_space().map_err(native_error)?;
+    // The end of the highest segment: the stack never grows down past it,
+    // whatever its limit, so a wild pointer into the unmapped space below
+    // the stack stays a fault.
+    let mut image_end = 0;
     for segment in image.segments() {
         let mut flags = PageFlags::READ;
         flags.set(PageFlags::WRITE, segment.writable);
@@ -412,6 +469,7 @@ where
             VirtAddr::new(segment.address as usize),
             segment.memory_size as usize,
         );
+        image_end = image_end.max(range.end().raw().next_multiple_of(PhysFrame::SIZE));
         space
             .map(range, segment.bytes, flags)
             .map_err(native_error)?;
@@ -460,12 +518,16 @@ where
             PageFlags::READ | PageFlags::WRITE,
         )
         .map_err(native_error)?;
-    // An argument vector larger than the limit leaves the stack no room
-    // to grow.
-    let growth = VirtRange::new(
-        VirtAddr::new(top as usize - STACK_LIMIT_BYTES),
-        STACK_LIMIT_BYTES.saturating_sub(stack.bytes.len()),
-    );
+    // Where the stack may grow into: from its initial pages down as far as
+    // the process's current `RLIMIT_STACK` allows. An argument vector
+    // larger than the limit leaves it no room.
+    let growth = |limit: u64| {
+        let lowest = (top.saturating_sub(limit) as usize).max(image_end);
+        VirtRange::new(
+            VirtAddr::new(lowest),
+            (stack.base as usize).saturating_sub(lowest),
+        )
+    };
     let mut context = native
         .create_context(
             VirtAddr::new(image.entry() as usize),
@@ -481,13 +543,19 @@ where
         Some(table) => table.into_slots(),
         None => syscall::standard_streams::<LinuxResources<Net>>(),
     };
+    // The launch hands a process no user or group IDs, so it reports zero
+    // ones; the machine's memory sizes the limits Linux derives from it.
     let mut process = Process::<LinuxResources<Net>>::with_descriptors(
         executable.abi,
         pid,
         image.program_break(PhysFrame::SIZE as u64),
         table,
+        Start {
+            memory_bytes: crate::machine_memory().usable_bytes as u64,
+            ..Start::default()
+        },
     );
-    let mut stdio = LinuxStdio {
+    let mut stdio = LinuxPlatform {
         cpu: cpu.clone(),
         timer: exec_context.timer.clone(),
         runtime_state: exec_context.runtime_state.clone(),
@@ -497,6 +565,13 @@ where
         output_mode,
         instance: instance_id,
         grants: LinuxGrants::derive(&authority),
+        clock: crate::KernelClock::new(cpu.clone(), exec_context.runtime_state.clone()),
+        entropy: crate::EntropyPool::derive(
+            exec_context.runtime_state.root_entropy(),
+            instance_id.raw(),
+        ),
+        instances: exec_context.instance_registry.clone(),
+        cpu_ticks: 0,
     };
     let registers = executable.abi.system_call_registers();
     let exit = |exit_code: u32| ChildExit {
@@ -514,7 +589,10 @@ where
         if let Some(signal) = signal_state.take_pending() {
             break Ok(exit(abi::signal_exit_status(signal)));
         }
-        match context.resume(&space) {
+        let slice_began = cpu.now().ticks();
+        let stop = context.resume(&space);
+        stdio.cpu_ticks += cpu.now().ticks().saturating_sub(slice_began);
+        match stop {
             Stop::SystemCall => {
                 let read = |register| {
                     context
@@ -592,7 +670,7 @@ where
                     address,
                     present: false,
                     ..
-                } if growth.contains(address) => {
+                } if growth(process.limit(Resource::Stack).current).contains(address) => {
                     let page = VirtRange::new(address.page_floor(), PhysFrame::SIZE);
                     match space.map(page, &[], PageFlags::READ | PageFlags::WRITE) {
                         Ok(()) => {}
