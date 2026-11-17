@@ -93,8 +93,9 @@ clippy-host:
         --exclude helios-gpu-test --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
         --exclude helios-oob-load --exclude helios-perf \
-        --exclude helios-ping --exclude helios-procbench \
+        --exclude helios-ping --exclude helios-pride-flag --exclude helios-procbench \
         --exclude helios-sched-tasks --exclude helios-surface-test \
+        --exclude helios-webgpu-provider \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
@@ -106,8 +107,8 @@ clippy-programs:
     # them would unify those features and fail to build.
     for package in helios-audio-test helios-compositor helios-cpu helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
-        helios-init helios-input-test helios-oob-load helios-perf helios-ping \
-        helios-procbench helios-sched-tasks helios-surface-test; do
+        helios-init helios-input-test helios-oob-load helios-perf helios-ping helios-pride-flag \
+        helios-procbench helios-sched-tasks helios-surface-test helios-webgpu-provider; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -128,6 +129,8 @@ test-kernel run_ignored="default":
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run {{ kernel_unit_packages }} --lib --run-ignored "{{ run_ignored }}"
+    # The Linux process host is behind a feature the run above leaves off.
+    cargo nextest run -p helios-kernel --lib --features linux --run-ignored "{{ run_ignored }}"
     cargo nextest run -p helios-kernel --test hal_layering
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and
@@ -148,6 +151,7 @@ warm-test-kernel:
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run --no-run {{ kernel_unit_packages }} --lib
+    cargo nextest run --no-run -p helios-kernel --lib --features linux
     cargo nextest run --no-run -p helios-kernel --test hal_layering
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run --no-run -p helios-hosted
 

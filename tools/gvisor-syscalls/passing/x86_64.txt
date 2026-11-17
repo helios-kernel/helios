@@ -1,0 +1,3 @@
+# gVisor syscall cases that pass on Helios (x86_64), at gVisor 7a675ac66a1e2357abdaa6cccedabcd3cce9aa5c.
+# A run fails when one of them stops passing; extend the list when a change makes more pass.
+# A full run publishes this file as passing-x86_64.txt in its report artifact.
