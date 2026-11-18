@@ -82,8 +82,15 @@ mod tests {
         else {
             unreachable!("both slots hold the file");
         };
-        copy.set_offset(5);
-        assert_eq!(file.offset(), 5);
+        copy.try_lock_position()
+            .expect("the position lock is free")
+            .set(5);
+        assert_eq!(
+            file.try_lock_position()
+                .expect("the position lock is free")
+                .get(),
+            5
+        );
         assert!(file.same_description(copy));
     }
 
