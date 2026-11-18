@@ -1528,10 +1528,9 @@ where
     };
     let signal = signal as u32;
     if pid == current {
-        caller
-            .data_mut()
-            .request_exit(128u32.saturating_add(signal));
-        return Err(wasmtime::Error::new(Preview1Exit));
+        return Err(wasmtime::Error::new(Preview1SignalExit {
+            signal: signal as u8,
+        }));
     }
     let Some(index) = caller.data().find_child_index(Some(pid)) else {
         return Ok(p1::errno::SRCH);
@@ -2606,9 +2605,9 @@ where
     };
     if flags & WASIX_JOIN_FLAG_NON_BLOCKING != 0 {
         match caller.data_mut().poll_child_exit(index) {
-            Ok(Some(code)) => {
+            Ok(Some(termination)) => {
                 let child = caller.data_mut().children.swap_remove(index);
-                wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
+                wasix_write_join_exit(&memory, pid, ret_status, child.pid, termination).await?;
             }
             Ok(None) => {
                 crate::yield_now().await;
@@ -2619,9 +2618,9 @@ where
     } else {
         let child_pid = caller.data().children[index].pid;
         match caller.data_mut().poll_child_exit(index) {
-            Ok(Some(code)) => {
+            Ok(Some(termination)) => {
                 let child = caller.data_mut().children.swap_remove(index);
-                wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
+                wasix_write_join_exit(&memory, pid, ret_status, child.pid, termination).await?;
                 return Ok(p1::errno::SUCCESS);
             }
             Ok(None) => {}
@@ -2631,26 +2630,31 @@ where
             wasix_write_join_nothing(&memory, ret_status).await?;
             return Ok(p1::errno::SUCCESS);
         };
-        let (code, filesystem) = wasix_child_exit_result(exit.await);
-        if let Some(filesystem) = filesystem {
-            caller.data_mut().filesystem.adopt_root_layer(filesystem);
-        }
+        let outcome = wasix_child_exit_result(exit.await);
         let Some(index) = caller.data().find_child_index(Some(child_pid)) else {
             wasix_write_join_nothing(&memory, ret_status).await?;
             return Ok(p1::errno::SUCCESS);
         };
         let child = caller.data_mut().children.swap_remove(index);
-        wasix_write_join_exit(&memory, pid, ret_status, child.pid, code).await?;
+        let (termination, filesystem) = match outcome {
+            Ok(exit) => exit,
+            Err(errno) => return Ok(errno),
+        };
+        if let Some(filesystem) = filesystem {
+            caller.data_mut().filesystem.adopt_root_layer(filesystem);
+        }
+        wasix_write_join_exit(&memory, pid, ret_status, child.pid, termination).await?;
     }
     Ok(p1::errno::SUCCESS)
 }
 
 pub(super) fn wasix_child_exit_result(
     result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
-) -> (u32, Option<MemoryFs>) {
+) -> Result<(helios_unix::ChildTermination, Option<MemoryFs>), i32> {
     match result {
-        Ok(Ok(exit)) => (exit.exit_code, exit.filesystem),
-        Ok(Err(_)) | Err(_) => (u32::from(p1::errno::IO as u16), None),
+        Ok(Ok(exit)) => Ok((exit.termination, exit.filesystem)),
+        Ok(Err(error)) => Err(p1_errno_from_program_exec_error(&error)),
+        Err(_) => Err(p1::errno::IO),
     }
 }
 
@@ -3687,9 +3691,8 @@ pub(super) async fn wasix_write_join_exit(
     pid_ptr: GuestAddress,
     ret_status: GuestAddress,
     pid: u32,
-    code: u32,
+    termination: helios_unix::ChildTermination,
 ) -> Result<(), GuestAccessError> {
-    let errno = u16::try_from(code).unwrap_or(u16::MAX);
     memory.write_u8(pid_ptr, WASIX_OPTION_SOME).await?;
     memory
         .write_u32(
@@ -3697,13 +3700,53 @@ pub(super) async fn wasix_write_join_exit(
             pid,
         )
         .await?;
+    match termination {
+        helios_unix::ChildTermination::Exited(code) => {
+            let errno = u16::try_from(code).unwrap_or(u16::MAX);
+            memory
+                .write_u8(ret_status, WASIX_JOIN_STATUS_EXIT_NORMAL)
+                .await?;
+            memory
+                .write_u16(
+                    ret_status.offset(u64::from(WASIX_JOIN_STATUS_UNION_OFFSET)),
+                    errno,
+                )
+                .await
+        }
+        helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+            signal,
+            core_dumped,
+        }) => {
+            let encoded = (signal & 0x7f) | (u8::from(core_dumped) << 7);
+            wasix_write_join_signal(memory, ret_status, encoded).await
+        }
+        helios_unix::ChildTermination::Trapped => {
+            wasix_write_join_signal(memory, ret_status, WASIX_SIGABRT).await
+        }
+        helios_unix::ChildTermination::Killed => {
+            wasix_write_join_signal(memory, ret_status, WASIX_SIGKILL).await
+        }
+    }
+}
+
+async fn wasix_write_join_signal(
+    memory: &Preview1AsyncMemory,
+    ret_status: GuestAddress,
+    signal: u8,
+) -> Result<(), GuestAccessError> {
     memory
-        .write_u8(ret_status, WASIX_JOIN_STATUS_EXIT_NORMAL)
+        .write_u8(ret_status, WASIX_JOIN_STATUS_EXIT_SIGNAL)
         .await?;
     memory
         .write_u16(
             ret_status.offset(u64::from(WASIX_JOIN_STATUS_UNION_OFFSET)),
-            errno,
+            0,
+        )
+        .await?;
+    memory
+        .write_u8(
+            ret_status.offset(u64::from(WASIX_ERRNO_SIGNAL_SIGNAL_OFFSET)),
+            signal,
         )
         .await
 }
@@ -4023,21 +4066,60 @@ mod tests {
         );
     }
 
-    /// A join that reaped a child reports it as the guest's record has
-    /// it, and one that found nothing reports so.
+    /// A join that reaped a child encodes each termination kind into the
+    /// guest's `__wasi_join_status_t`, and one that found nothing reports so.
     #[test]
     fn a_join_reports_an_exit_and_the_absence_of_one() {
-        let mut guest = vec![0xee_u8; 64];
+        let mut guest = vec![0xee_u8; 128];
         let memory = memory_over(&mut guest);
         run(wasix_write_join_exit(
             &memory,
             GuestAddress::wasm32(0),
             GuestAddress::wasm32(16),
             9,
-            3,
+            helios_unix::ChildTermination::Exited(3),
         ))
         .expect("the records fit");
         run(wasix_write_join_nothing(&memory, GuestAddress::wasm32(32))).expect("fits");
+        run(wasix_write_join_exit(
+            &memory,
+            GuestAddress::wasm32(40),
+            GuestAddress::wasm32(48),
+            10,
+            helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+                signal: 15,
+                core_dumped: false,
+            }),
+        ))
+        .expect("fits");
+        run(wasix_write_join_exit(
+            &memory,
+            GuestAddress::wasm32(56),
+            GuestAddress::wasm32(64),
+            11,
+            helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+                signal: 11,
+                core_dumped: true,
+            }),
+        ))
+        .expect("fits");
+        run(wasix_write_join_exit(
+            &memory,
+            GuestAddress::wasm32(72),
+            GuestAddress::wasm32(80),
+            12,
+            helios_unix::ChildTermination::Trapped,
+        ))
+        .expect("fits");
+        run(wasix_write_join_exit(
+            &memory,
+            GuestAddress::wasm32(88),
+            GuestAddress::wasm32(96),
+            13,
+            helios_unix::ChildTermination::Killed,
+        ))
+        .expect("fits");
+
         assert_eq!(guest[0], WASIX_OPTION_SOME);
         assert_eq!(guest[4..8], 9_u32.to_le_bytes());
         assert_eq!(guest[16], WASIX_JOIN_STATUS_EXIT_NORMAL);
@@ -4050,6 +4132,23 @@ mod tests {
             guest[32 + WASIX_JOIN_STATUS_UNION_OFFSET as usize..][..2],
             0_u16.to_le_bytes()
         );
+
+        let check_signal = |at: usize, expected_signal: u8| {
+            assert_eq!(guest[at], WASIX_JOIN_STATUS_EXIT_SIGNAL);
+            assert_eq!(
+                guest[at + WASIX_JOIN_STATUS_UNION_OFFSET as usize..][..2],
+                0_u16.to_le_bytes(),
+                "exit_signal.exit_code must stay zero so musl WIFSIGNALED holds"
+            );
+            assert_eq!(
+                guest[at + WASIX_ERRNO_SIGNAL_SIGNAL_OFFSET as usize],
+                expected_signal
+            );
+        };
+        check_signal(48, 15);
+        check_signal(64, 11 | 0x80);
+        check_signal(80, WASIX_SIGABRT);
+        check_signal(96, WASIX_SIGKILL);
     }
 
     /// Signal dispositions are decoded one record at a time; an unknown

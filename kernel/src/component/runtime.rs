@@ -627,11 +627,21 @@ where
     pub fn guest_turns(
         &self,
     ) -> super::GuestTurns<CpuImpl, RuntimeStateImpl, super::SocketRetirementQueue> {
+        self.guest_turns_with_epilogue(self.retirement.turn_queue())
+    }
+
+    pub(crate) fn guest_turns_with_epilogue<Epilogue>(
+        &self,
+        epilogue: Epilogue,
+    ) -> super::GuestTurns<CpuImpl, RuntimeStateImpl, Epilogue>
+    where
+        Epilogue: super::StopWake,
+    {
         super::GuestTurns::new(
             self.execution_context.activity.turns(),
             self.cpu.clone(),
             self.runtime_state.clone(),
-            self.retirement.turn_queue(),
+            epilogue,
         )
     }
 

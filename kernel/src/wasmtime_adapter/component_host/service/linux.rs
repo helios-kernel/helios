@@ -574,20 +574,30 @@ where
         cpu_ticks: 0,
     };
     let registers = executable.abi.system_call_registers();
-    let exit = |exit_code: u32| ChildExit {
+    let exit = |termination: helios_unix::ChildTermination| ChildExit {
         instance_id,
-        exit_code,
+        termination,
         filesystem: None,
     };
     timeline.record(&cpu, LaunchPhase::GuestBegin);
     let end = loop {
         if let Some(reason) = launched_instance.pending_kill() {
-            break Err(map_program_runtime_error(wasmtime::Error::from(
-                crate::InstanceKilled { reason },
-            )));
+            break match reason {
+                crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                    Ok(exit(helios_unix::ChildTermination::Killed))
+                }
+                _ => Err(map_program_runtime_error(wasmtime::Error::from(
+                    crate::InstanceKilled { reason },
+                ))),
+            };
         }
         if let Some(signal) = signal_state.take_pending() {
-            break Ok(exit(abi::signal_exit_status(signal)));
+            break Ok(exit(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: u8::try_from(signal).unwrap_or(u8::MAX),
+                    core_dumped: false,
+                },
+            )));
         }
         let slice_began = cpu.now().ticks();
         let stop = context.resume(&space);
@@ -642,7 +652,11 @@ where
                     CallEnd::Done(ControlFlow::Continue(result)) => context
                         .set_register(registers.result, result)
                         .expect("the ABI names registers of this instruction set"),
-                    CallEnd::Done(ControlFlow::Break(status)) => break Ok(exit(u32::from(status))),
+                    CallEnd::Done(ControlFlow::Break(status)) => {
+                        break Ok(exit(helios_unix::ChildTermination::Exited(u32::from(
+                            status,
+                        ))));
+                    }
                     CallEnd::Stopped => {}
                 }
             }
@@ -687,9 +701,12 @@ where
                         ?fault,
                         "Linux process faulted"
                     );
-                    break Ok(exit(abi::signal_exit_status(u32::from(abi::fault_signal(
-                        kind,
-                    )))));
+                    break Ok(exit(helios_unix::ChildTermination::Signaled(
+                        helios_unix::SignalTermination {
+                            signal: abi::fault_signal(kind),
+                            core_dumped: false,
+                        },
+                    )));
                 }
             },
         }

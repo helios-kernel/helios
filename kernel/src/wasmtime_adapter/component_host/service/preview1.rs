@@ -299,7 +299,7 @@ where
     pub(super) fn take_process_end(
         &mut self,
         error: wasmtime::Error,
-    ) -> Result<u32, ProgramExecError> {
+    ) -> Result<helios_unix::ChildTermination, ProgramExecError> {
         preview1_process_end(error, self.requested_exit.take())
     }
 
@@ -410,9 +410,12 @@ where
         });
     }
 
-    pub(super) fn poll_child_exit(&mut self, index: usize) -> Result<Option<u32>, i32> {
-        if let Some(code) = self.children[index].completed {
-            return Ok(Some(code));
+    pub(super) fn poll_child_exit(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<helios_unix::ChildTermination>, i32> {
+        if let Some(termination) = self.children[index].completed {
+            return Ok(Some(termination));
         }
         let Some(exit) = self.children[index].exit.as_mut() else {
             return Ok(self.children[index].completed);
@@ -422,19 +425,21 @@ where
         match Pin::new(exit).poll(&mut context) {
             Poll::Pending => Ok(None),
             Poll::Ready(Ok(Ok(exit))) => {
-                let code = exit.exit_code;
+                let termination = exit.termination;
                 if let Some(filesystem) = exit.filesystem {
                     self.filesystem.adopt_root_layer(filesystem);
                 }
-                self.children[index].completed = Some(code);
+                self.children[index].completed = Some(termination);
                 self.children[index].exit = None;
-                Ok(Some(code))
+                Ok(Some(termination))
             }
-            Poll::Ready(Ok(Err(_))) | Poll::Ready(Err(_)) => {
-                let code = u32::from(p1::errno::IO as u16);
-                self.children[index].completed = Some(code);
-                self.children[index].exit = None;
-                Ok(Some(code))
+            Poll::Ready(Ok(Err(error))) => {
+                self.children.swap_remove(index);
+                Err(p1_errno_from_program_exec_error(&error))
+            }
+            Poll::Ready(Err(_)) => {
+                self.children.swap_remove(index);
+                Err(p1::errno::IO)
             }
         }
     }
@@ -3913,7 +3918,7 @@ async fn p1_read_subscriptions(
 }
 
 pub(super) fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     signal: u32,
 ) -> wasmtime::Result<i32>
 where
@@ -3921,10 +3926,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    caller
-        .data_mut()
-        .request_exit(128u32.saturating_add(signal));
-    Err(wasmtime::Error::new(Preview1Exit))
+    let Ok(signal) = u8::try_from(signal) else {
+        return Ok(p1::errno::INVAL);
+    };
+    Err(wasmtime::Error::new(Preview1SignalExit { signal }))
 }
 
 pub(super) fn p1_errno_from_wasmtime_error(error: &wasmtime::Error) -> i32 {
@@ -5670,7 +5675,15 @@ mod tests {
 
         let error =
             drive_wasix_call(&activity, &signal_state, call).expect_err("the signal ends the call");
-        assert_eq!(preview1_exit_status(&error, Some(0)), Some(143));
+        assert_eq!(
+            preview1_exit_status(&error, Some(0)),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 15,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(
             signal_state.take_pending(),
             None,
@@ -5729,7 +5742,15 @@ mod tests {
         let core::task::Poll::Ready(Err(error)) = driven.as_mut().poll(&mut cx) else {
             panic!("the signal ends the suspended call");
         };
-        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 9,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(signal_state.take_pending(), None, "delivered once");
     }
 
@@ -5787,7 +5808,15 @@ mod tests {
         let core::task::Poll::Ready(Err(error)) = target_call.as_mut().poll(&mut target_cx) else {
             panic!("the signal ends the target thread's suspended call");
         };
-        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 9,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(target_thread.take_pending(), None, "delivered once");
         assert_eq!(
             process.take_pending(),
@@ -5861,7 +5890,15 @@ mod tests {
         let error =
             drive_wasix_call(&activity, &signal_state, call).expect_err("the call is stopped");
         assert!(error.downcast_ref::<crate::InstanceKilled>().is_none());
-        assert_eq!(preview1_exit_status(&error, None), Some(130));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 2,
+                    core_dumped: false,
+                }
+            ))
+        );
     }
 
     fn memory_of(bytes: &[u8]) -> Preview1Memory {
