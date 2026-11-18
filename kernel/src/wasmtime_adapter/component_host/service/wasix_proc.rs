@@ -2798,10 +2798,13 @@ where
         return Err(p1::errno::INVAL);
     }
 
-    let (stdin_writer, stdin_reader) = crate::byte_channel();
-    let stdin_writer = match io.stdin {
-        WasixStdioMode::Piped => Some(stdin_writer),
-        WasixStdioMode::Inherit | WasixStdioMode::Null | WasixStdioMode::Log => None,
+    let (stdin, stdin_writer) = match io.stdin {
+        WasixStdioMode::Piped => {
+            let (writer, reader) = crate::byte_channel();
+            (crate::ComponentInputRoute::Child(reader), Some(writer))
+        }
+        WasixStdioMode::Inherit => (store.stdin_route(), None),
+        WasixStdioMode::Null | WasixStdioMode::Log => (crate::ComponentInputRoute::Closed, None),
         WasixStdioMode::Invalid => unreachable!("invalid stdio mode already rejected"),
     };
     let (stdout, stdout_reader) = wasix_prepare_child_output_route(
@@ -2816,7 +2819,7 @@ where
     )?;
     Ok(WasixSpawnPreparedIo {
         output_mode: OutputMode::RoutedChild {
-            stdin_rx: stdin_reader,
+            stdin,
             stdout,
             stderr,
         },

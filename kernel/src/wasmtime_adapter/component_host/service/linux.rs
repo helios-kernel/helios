@@ -342,9 +342,11 @@ where
     }
 
     async fn read_input(&mut self, limit: usize) -> Result<Bytes, Denied> {
-        Ok(match &self.output_mode {
-            OutputMode::Serial if self.grants.terminal_input.is_none() => return Err(Denied),
-            OutputMode::Serial => loop {
+        Ok(match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.grants.terminal_input.is_none() => {
+                return Err(Denied);
+            }
+            crate::ComponentInputRoute::Serial => loop {
                 let wait = self.write_serial.wait_for_debug_serial_input();
                 (self.read_serial)(
                     &mut self.serial_input,
@@ -355,9 +357,9 @@ where
                 }
                 wait.await;
             },
-            OutputMode::Trace => Bytes::new(),
-            OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                stdin_rx.read().await.unwrap_or_default()
+            crate::ComponentInputRoute::Closed => Bytes::new(),
+            crate::ComponentInputRoute::Child(stdin_rx) => {
+                stdin_rx.read_limit(limit).await.unwrap_or_default()
             }
         })
     }

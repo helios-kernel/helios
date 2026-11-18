@@ -291,23 +291,25 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
         Some(Preview1Descriptor::Stdin { carry })
             if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
         {
-            match &store.output_mode {
+            match store.output_mode.stdin_route() {
                 // A child's stdin is a byte channel, so it can wake us.
-                OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
+                crate::ComponentInputRoute::Child(stdin_rx) => {
                     wait.notified.push(EpollWaitTarget::ByteReader {
-                        reader: stdin_rx.clone(),
                         wait: stdin_rx.wait_state(),
+                        reader: stdin_rx,
                     });
                 }
                 // The serial console's receive signal is the wakeup
                 // source, parked on the same way a channel's is.
-                OutputMode::Serial => wait.notified.push(EpollWaitTarget::SerialInput {
-                    serial: store.write_serial,
-                    wait: store.write_serial.debug_serial_input_waiter(),
-                }),
-                // Trace output never delivers input; the probe reports it as
-                // an immediate hangup, so there is nothing to wait for.
-                OutputMode::Trace => {}
+                crate::ComponentInputRoute::Serial => {
+                    wait.notified.push(EpollWaitTarget::SerialInput {
+                        serial: store.write_serial,
+                        wait: store.write_serial.debug_serial_input_waiter(),
+                    })
+                }
+                // Trace or closed input never delivers input; the probe reports
+                // it as an immediate hangup, so there is nothing to wait for.
+                crate::ComponentInputRoute::Closed => {}
             }
         }
         Some(Preview1Descriptor::Socket(
@@ -875,7 +877,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
             return Ok(inherited.clone());
         }
         Ok(OutputMode::RoutedChild {
-            stdin_rx: self.component_stdin(inherited)?,
+            stdin: self.component_stdin(inherited)?,
             stdout: self.component_output(1, inherited)?,
             stderr: self.component_output(2, inherited)?,
         })
@@ -884,14 +886,15 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     fn component_stdin(
         &self,
         inherited: &OutputMode,
-    ) -> Result<crate::ByteReader, ComponentStdioRefusal> {
-        let closed = || crate::byte_channel().1;
+    ) -> Result<crate::ComponentInputRoute, ComponentStdioRefusal> {
         match self.get(0) {
-            None | Some(Preview1Descriptor::NullDevice) => Ok(closed()),
+            None | Some(Preview1Descriptor::NullDevice) => Ok(crate::ComponentInputRoute::Closed),
             Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty() => {
-                Ok(inherited.child_stdin().cloned().unwrap_or_else(closed))
+                Ok(inherited.stdin_route())
             }
-            Some(Preview1Descriptor::PipeRead { reader }) => Ok(reader.clone()),
+            Some(Preview1Descriptor::PipeRead { reader }) => {
+                Ok(crate::ComponentInputRoute::Child(reader.clone()))
+            }
             Some(descriptor) => Err(ComponentStdioRefusal {
                 fd: 0,
                 held: unbindable_stdio(descriptor),
