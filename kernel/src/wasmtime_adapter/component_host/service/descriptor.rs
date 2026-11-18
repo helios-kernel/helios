@@ -16,12 +16,150 @@ pub(super) type WasixProcessEnd<Image> = helios_unix::ProcessEnd<Image, ProgramE
 pub(super) type WasixThreadExit = helios_unix::ThreadExit;
 pub(super) type EventFd = helios_unix::EventFd;
 
-pub(super) struct WasixChildProcess {
+/// The exit report a child's launch task sends its parent.
+pub(super) type WasixChildExit =
+    futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>;
+
+/// A process's children, in spawn order, until each one is joined.
+///
+/// # Concurrency contract
+///
+/// The table is the parent store's own and is touched only by the task
+/// driving that store. A child's exit arrives from its launch task, on
+/// whichever processor that runs, through the child's oneshot; a join
+/// that polls the table registers its waker with every child it waits
+/// on, so the first of them to exit wakes it.
+pub(super) struct WasixChildren {
+    children: Vec<WasixChildProcess>,
+}
+
+struct WasixChildProcess {
+    pid: u32,
+    signal_state: WasixSignalState,
+    state: WasixChildState,
+}
+
+enum WasixChildState {
+    Running(WasixChildExit),
+    /// Completed and not joined yet: either how the child ended or the
+    /// errno its failed launch or lost report gives the joiner.
+    Completed(Result<helios_unix::ChildTermination, i32>),
+}
+
+/// The child a join took off the table, and what came of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WasixJoinedChild {
     pub(super) pid: u32,
-    pub(super) signal_state: WasixSignalState,
-    pub(super) exit:
-        Option<futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>>,
-    pub(super) completed: Option<helios_unix::ChildTermination>,
+    pub(super) outcome: Result<helios_unix::ChildTermination, i32>,
+}
+
+impl WasixChildren {
+    pub(super) const fn new() -> Self {
+        Self {
+            children: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.children.is_empty()
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        pid: u32,
+        signal_state: WasixSignalState,
+        exit: WasixChildExit,
+    ) {
+        self.children.push(WasixChildProcess {
+            pid,
+            signal_state,
+            state: WasixChildState::Running(exit),
+        });
+    }
+
+    /// The signal mailbox of child `pid` while it can still take a
+    /// signal: `None` for a pid that names no child and for a child
+    /// whose completion has been seen.
+    pub(super) fn signal_target(&self, pid: u32) -> Option<&WasixSignalState> {
+        self.children
+            .iter()
+            .find(|child| child.pid == pid)
+            .filter(|child| matches!(child.state, WasixChildState::Running(_)))
+            .map(|child| &child.signal_state)
+    }
+
+    /// Joins the child `pid` names, or any child for `None`.
+    ///
+    /// Every running child the join names is polled, so each completion
+    /// that has arrived is recorded and `cx` is registered with every
+    /// child still running: an any-child join takes the oldest child
+    /// that has completed, never waits on one child while another has
+    /// already completed, and is woken by whichever completes first. A
+    /// shell reaps each foreground command this way while its background
+    /// jobs, older children, keep running.
+    ///
+    /// `Ready(None)` when `pid` names no child, `Ready(Some)` with the
+    /// child taken off the table once one it names has completed, and
+    /// `Pending` while every child it names is still running. `adopt`
+    /// receives the filesystem layer each exit observed here hands back
+    /// to the parent.
+    pub(super) fn poll_join(
+        &mut self,
+        pid: Option<u32>,
+        cx: &mut Context<'_>,
+        mut adopt: impl FnMut(MemoryFs),
+    ) -> Poll<Option<WasixJoinedChild>> {
+        let mut named = false;
+        let mut completed = None;
+        for (index, child) in self.children.iter_mut().enumerate() {
+            if pid.is_some_and(|pid| child.pid != pid) {
+                continue;
+            }
+            named = true;
+            if let WasixChildState::Running(exit) = &mut child.state
+                && let Poll::Ready(result) = Pin::new(exit).poll(cx)
+            {
+                child.state = WasixChildState::Completed(child_exit_outcome(result, &mut adopt));
+            }
+            if completed.is_none() && matches!(child.state, WasixChildState::Completed(_)) {
+                completed = Some(index);
+            }
+        }
+        let Some(index) = completed else {
+            return if named {
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            };
+        };
+        let child = self.children.remove(index);
+        let WasixChildState::Completed(outcome) = child.state else {
+            unreachable!("a joined child was just seen to have completed");
+        };
+        Poll::Ready(Some(WasixJoinedChild {
+            pid: child.pid,
+            outcome,
+        }))
+    }
+}
+
+/// What a child's exit report gives its parent: the child's termination,
+/// or the errno for a launch failure or dropped exit channel.
+fn child_exit_outcome(
+    result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
+    adopt: &mut impl FnMut(MemoryFs),
+) -> Result<helios_unix::ChildTermination, i32> {
+    match result {
+        Ok(Ok(exit)) => {
+            if let Some(filesystem) = exit.filesystem {
+                adopt(filesystem);
+            }
+            Ok(exit.termination)
+        }
+        Ok(Err(error)) => Err(p1_errno_from_program_exec_error(&error)),
+        Err(_) => Err(p1::errno::IO),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
