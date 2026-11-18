@@ -4,20 +4,21 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::num::NonZeroUsize;
+use zerocopy::FromBytes;
 
 use super::Transaction;
 use super::extents::Mapping;
-use super::file::{WriteOptions, aligned_end};
+use super::file::{WriteOptions, aligned_end, check_encoder, inline_ram_bytes};
 use super::namespace::{check_flags, time};
 use crate::accounting::DataChange;
 use crate::allocation::data::DataReference;
+use crate::compress::write::Encoder;
 use crate::items::{ExtentData, FileExtent, INODE_APPEND, INODE_IMMUTABLE, INODE_NODATASUM};
-use crate::ondisk::{MAX_COMPRESSED_EXTENT, item_type};
+use crate::ondisk::{MAX_COMPRESSED_EXTENT, RawFileExtentHead, item_type};
 use crate::source::BlockSink;
 use crate::tree::Cursor;
 use crate::tree::write::WriteError;
-use crate::{Error, ItemDefect, Key, Timestamp};
+use crate::{Error, ItemDefect, Key};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FileId {
@@ -35,12 +36,15 @@ pub(crate) struct CloneRange {
 }
 
 impl<S: BlockSink> Transaction<S> {
-    pub(crate) async fn clone_range(
+    /// Clones `request`; `options` writes what cannot be shared: an inline
+    /// source, and the destination's own inline data when shared extents
+    /// replace it.
+    pub(crate) async fn clone_range<E: Encoder>(
         &mut self,
         request: CloneRange,
-        when: Timestamp,
-        concurrency: NonZeroUsize,
+        mut options: WriteOptions<E>,
     ) -> Result<(), WriteError> {
+        let when = options.when;
         let CloneRange {
             source,
             destination,
@@ -70,6 +74,7 @@ impl<S: BlockSink> Transaction<S> {
         if (source_metadata.flags ^ destination_metadata.flags) & INODE_NODATASUM != 0 {
             return Err(WriteError::CloneChecksumPolicy);
         }
+        check_encoder::<E>(destination_metadata.flags)?;
         let sector = u64::from(self.volume.superblock().sectorsize());
         if !source_offset.is_multiple_of(sector)
             || !destination_offset.is_multiple_of(sector)
@@ -126,9 +131,9 @@ impl<S: BlockSink> Transaction<S> {
             previous_end = extent.end;
             if extent.end > source_offset {
                 if matches!(extent.data, ExtentData::Inline { .. }) {
-                    // An inline item has no separate allocation to share. Copy
-                    // bounded windows through the normal destination writer.
-                    return self.clone_inline_range(request, when, concurrency).await;
+                    // An inline item has no separate allocation to share.
+                    let item = bytes.to_vec();
+                    return self.clone_inline_range(request, item, options).await;
                 }
                 let mapping = Mapping::parse(source.tree, key, bytes, sector as u32)?
                     .slice(extent.start.max(source_offset)..extent.end.min(source_rounded));
@@ -168,7 +173,6 @@ impl<S: BlockSink> Transaction<S> {
                     .await?;
             }
         }
-        let mut options = WriteOptions::plain(when, concurrency);
         let root = self.roots.get(destination.tree)?;
         let first_key = Key::new(destination.inode, item_type::EXTENT_DATA, 0);
         let first = self.trees.get(&self.volume, root, first_key).await?;
@@ -256,16 +260,90 @@ impl<S: BlockSink> Transaction<S> {
             .await
     }
 
-    async fn clone_inline_range(
+    /// Clones a range whose source is the inline item `item`, as Linux's
+    /// `clone_copy_inline_extent` (`fs/btrfs/reflink.c`): the item itself
+    /// when it lands at offset 0 of a destination that holds no more than it
+    /// (inline or nothing at all), and otherwise its data, written into the
+    /// destination as a write is.
+    async fn clone_inline_range<E: Encoder>(
         &mut self,
         request: CloneRange,
-        when: Timestamp,
-        concurrency: NonZeroUsize,
+        mut item: Vec<u8>,
+        mut options: WriteOptions<E>,
     ) -> Result<(), WriteError> {
+        let CloneRange {
+            destination,
+            destination_offset,
+            length,
+            ..
+        } = request;
+        let sector = u64::from(self.volume.superblock().sectorsize());
+        let datal = inline_ram_bytes(&item).expect("the caller found an inline item");
+        let (mut raw, metadata) = self.file_inode(destination.tree, destination.inode).await?;
+        let root = self.roots.get(destination.tree)?;
+        let first = self
+            .trees
+            .ceiling(
+                &self.volume,
+                root,
+                Key::new(destination.inode, item_type::EXTENT_DATA, 0),
+            )
+            .await?
+            .filter(|(key, _)| key.is(destination.inode, item_type::EXTENT_DATA));
+        let replaced = match &first {
+            None => Some(None),
+            Some((key, bytes)) if key.offset == 0 => {
+                FileExtent::parse(*key, bytes, sector as u32).map_err(|defect| Error::Item {
+                    tree: destination.tree,
+                    key: *key,
+                    defect,
+                })?;
+                inline_ram_bytes(bytes).map(Some)
+            }
+            Some(_) => None,
+        };
+        let stored = (item.len() - size_of::<RawFileExtentHead>()) as u64;
+        if destination_offset == 0
+            && metadata.size <= datal
+            && length == datal
+            && self.may_inline(datal, stored, options.max_inline)
+            && let Some(replaced) = replaced
+        {
+            if let Some(inline_bytes) = replaced {
+                self.remove_first_item(destination.tree, destination.inode, inline_bytes, &mut raw)
+                    .await?;
+            }
+            let (head, _) =
+                RawFileExtentHead::mut_from_prefix(&mut item).expect("validated extent");
+            head.generation.set(self.trees.generation());
+            let root = self.roots.get(destination.tree)?;
+            let root = self
+                .trees
+                .apply(
+                    &self.volume,
+                    root,
+                    Key::new(destination.inode, item_type::EXTENT_DATA, 0),
+                    Some(&item),
+                    &mut self.space,
+                )
+                .await?;
+            self.roots.set(root)?;
+            raw.nbytes.set(
+                raw.nbytes
+                    .get()
+                    .checked_add(datal)
+                    .ok_or(WriteError::FileOverflow)?,
+            );
+            raw.size.set(metadata.size.max(destination_offset + length));
+            let when = time(destination.tree, destination.inode, options.when)?;
+            return self
+                .store_file_inode(destination.tree, destination.inode, raw, when)
+                .await;
+        }
         let mut position = 0;
-        while position < request.length {
-            let length = (request.length - position).min(MAX_COMPRESSED_EXTENT) as usize;
-            let mut bytes = vec![0; length];
+        while position < length {
+            let window = (length - position).min(MAX_COMPRESSED_EXTENT) as usize;
+            let mut bytes = vec![0; window];
             self.read_file(
                 request.source.tree,
                 request.source.inode,
@@ -274,14 +352,19 @@ impl<S: BlockSink> Transaction<S> {
             )
             .await?;
             self.write_file(
-                request.destination.tree,
-                request.destination.inode,
-                request.destination_offset + position,
+                destination.tree,
+                destination.inode,
+                destination_offset + position,
                 &bytes,
-                WriteOptions::plain(when, concurrency),
+                WriteOptions {
+                    when: options.when,
+                    concurrency: options.concurrency,
+                    encoder: &mut options.encoder,
+                    max_inline: options.max_inline,
+                },
             )
             .await?;
-            position += length as u64;
+            position += window as u64;
         }
         Ok(())
     }

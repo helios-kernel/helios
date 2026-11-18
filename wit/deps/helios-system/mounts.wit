@@ -59,6 +59,11 @@ interface mounts {
     /// nothing syncs it. Absent or zero takes Linux's default of 30. A
     /// source other than btrfs refuses it.
     commit: option<u32>,
+    /// The value of Linux's `max_inline=` mount option, in bytes: the most
+    /// a file's data, as stored, may keep inline in the metadata of a
+    /// writable btrfs mount. Absent takes Linux's default of 2048; zero
+    /// stores nothing inline. A source other than btrfs refuses it.
+    max-inline: option<u64>,
   }
 
   enum mount-error-kind {

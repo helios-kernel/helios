@@ -119,7 +119,7 @@ where
 }
 
 /// RAII guard keeping a shard's in-flight request count elevated until the
-/// dispatched `AccessorTask` completes, traps, or drops.
+/// dispatched plugin task completes, traps, or drops.
 pub(super) struct PluginInFlight {
     count: AllocArc<CachePadded<AtomicUsize>>,
 }

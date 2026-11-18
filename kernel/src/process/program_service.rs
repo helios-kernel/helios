@@ -171,6 +171,10 @@ pub enum ProgramExecErrorDetail {
     ChildExitChannelDropped,
     #[error("child exit result was already consumed")]
     ChildExitAlreadyConsumed,
+    #[error("the child program trapped")]
+    ChildTrapped,
+    #[error("the child program was killed")]
+    ChildKilled,
     #[error("compile hint is not allowed for precompiled artifacts")]
     HintNotAllowedForPrecompiledArtifact,
     #[error("the fast AOT hint is not supported")]
@@ -311,6 +315,8 @@ impl ProgramExecErrorDetail {
         match self {
             Self::ChildExitChannelDropped => "child exit channel closed before completion",
             Self::ChildExitAlreadyConsumed => "child exit result was already consumed",
+            Self::ChildTrapped => "the child program trapped",
+            Self::ChildKilled => "the child program was killed",
             Self::HintNotAllowedForPrecompiledArtifact => {
                 "compile hint is not allowed for precompiled artifacts"
             }

@@ -280,7 +280,7 @@ impl State {
         }
         if let Some(size) = size {
             transaction
-                .truncate_file(&file, size, now, concurrency)
+                .truncate_file(&file, size, WriteOptions::plain(now, concurrency))
                 .await
                 .map_err(|error| write_errno(&error))?;
         }

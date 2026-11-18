@@ -269,8 +269,10 @@ pub struct SystemCallRegisters {
 // Linux uapi/asm-generic/signal.h numbers, shared by x86-64.
 pub const SIGILL: u8 = 4;
 pub const SIGTRAP: u8 = 5;
+pub const SIGABRT: u8 = 6;
 pub const SIGBUS: u8 = 7;
 pub const SIGFPE: u8 = 8;
+pub const SIGKILL: u8 = 9;
 pub const SIGSEGV: u8 = 11;
 
 /// The signal Linux raises for a user fault of `kind`
@@ -286,8 +288,47 @@ pub fn fault_signal(kind: FaultKind) -> u8 {
     }
 }
 
-/// The exit status a parent reads for a process a signal ended, as a POSIX
-/// shell reports it: 128 plus the signal number.
-pub fn signal_exit_status(signal: u32) -> u32 {
-    128 + signal
+/// Encodes `termination` into the 16-bit status word `wait4(2)` writes
+/// (`kernel/exit.c` `wait_task_zombie`, `include/uapi/linux/wait.h`):
+/// `(code & 0xff) << 8` on exit, `(signal & 0x7f) | (core_dumped << 7)`
+/// on signal death, `SIGABRT` on a trap, and `SIGKILL` on an owner kill.
+pub fn wait_status(termination: helios_unix::ChildTermination) -> i32 {
+    match termination {
+        helios_unix::ChildTermination::Exited(code) => ((code & 0xff) as i32) << 8,
+        helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+            signal,
+            core_dumped,
+        }) => i32::from(signal & 0x7f) | (i32::from(core_dumped) << 7),
+        helios_unix::ChildTermination::Trapped => i32::from(SIGABRT),
+        helios_unix::ChildTermination::Killed => i32::from(SIGKILL),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_unix::{ChildTermination, SignalTermination};
+
+    #[test]
+    fn wait_status_encodes_each_termination_kind() {
+        assert_eq!(wait_status(ChildTermination::Exited(0)), 0);
+        assert_eq!(wait_status(ChildTermination::Exited(42)), 42 << 8);
+        assert_eq!(wait_status(ChildTermination::Exited(0x1ff)), 0xff << 8);
+        assert_eq!(
+            wait_status(ChildTermination::Signaled(SignalTermination {
+                signal: SIGSEGV,
+                core_dumped: false,
+            })),
+            i32::from(SIGSEGV),
+        );
+        assert_eq!(
+            wait_status(ChildTermination::Signaled(SignalTermination {
+                signal: SIGSEGV,
+                core_dumped: true,
+            })),
+            i32::from(SIGSEGV) | 0x80,
+        );
+        assert_eq!(wait_status(ChildTermination::Trapped), i32::from(SIGABRT));
+        assert_eq!(wait_status(ChildTermination::Killed), i32::from(SIGKILL));
+    }
 }

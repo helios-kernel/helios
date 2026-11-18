@@ -19,14 +19,15 @@
 //! shared one may be seen by many, each of which sees it as WASI does. The
 //! other options are `ro` or `rw` (default `rw`; the boot image and EROFS
 //! disks remain read-only) and, for btrfs, Linux's `compress` (zlib) or
-//! `compress=<algorithm>[:<level>]` and `commit=<seconds>`. A line init
-//! cannot parse, or a mount the kernel refuses, fails init.
+//! `compress=<algorithm>[:<level>]`, `commit=<seconds>` and
+//! `max_inline=<bytes>[K|M|G]`. A line init cannot parse, or a mount the
+//! kernel refuses, fails init.
 
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
 
-use helios_api::mounts::{self, MountSharing, MountSource};
+use helios_api::mounts::{self, MountRequest, MountSharing, MountSource};
 use helios_api::programs::{self, ExecRequest};
 
 const FSTAB: &str = "/etc/fstab";
@@ -44,6 +45,56 @@ struct Mount {
     compress: Option<String>,
     /// The value of the `commit=` option, in seconds.
     commit: Option<u32>,
+    /// The value of the `max_inline=` option, in bytes.
+    max_inline: Option<u64>,
+}
+
+/// An unsigned number as the kernel's `kstrtouint` and `simple_strtoull`
+/// read it with base 0: `0x` starts hexadecimal, a leading `0` octal, and
+/// anything else is decimal. Returns the value and the rest of `value`.
+fn number_base_0(value: &str) -> Option<(&str, u32, &str)> {
+    let (digits, radix) = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        (hex, 16)
+    } else if value
+        .strip_prefix('0')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        (&value[1..], 8)
+    } else {
+        (value, 10)
+    };
+    let end = digits
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&digits[..end], radix, &digits[end..]))
+}
+
+/// A `max_inline=` value as Linux's `memparse` reads it: a base-0 number
+/// and an optional `K`, `M`, `G`, `T`, `P` or `E` suffix, in either case,
+/// each a further factor of 1024. Linux takes what precedes anything else
+/// and ignores the rest; init refuses the line instead, and refuses a value
+/// past 64 bits, which Linux wraps.
+fn max_inline_bytes(value: &str) -> Option<u64> {
+    let (digits, radix, rest) = number_base_0(value)?;
+    let number = u64::from_str_radix(digits, radix).ok()?;
+    let shift = match rest {
+        "" => 0,
+        "k" | "K" => 10,
+        "m" | "M" => 20,
+        "g" | "G" => 30,
+        "t" | "T" => 40,
+        "p" | "P" => 50,
+        "e" | "E" => 60,
+        _ => return None,
+    };
+    let scaled = number.checked_shl(shift)?;
+    (scaled >> shift == number).then_some(scaled)
 }
 
 /// A `commit=` value as Linux's `fsparam_u32` reads it: `kstrtouint` with
@@ -51,20 +102,10 @@ struct Mount {
 /// else is decimal.
 fn commit_seconds(value: &str) -> Option<u32> {
     let value = value.strip_prefix('+').unwrap_or(value);
-    let (digits, radix) = if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        (hex, 16)
-    } else if value.len() > 1 && value.starts_with('0') {
-        (&value[1..], 8)
-    } else {
-        (value, 10)
-    };
-    if digits.is_empty() || digits.starts_with(['+', '-']) {
-        return None;
+    match number_base_0(value)? {
+        (digits, radix, "") => u32::from_str_radix(digits, radix).ok(),
+        _ => None,
     }
-    u32::from_str_radix(digits, radix).ok()
 }
 
 fn invalid(line: usize, detail: impl std::fmt::Display) -> io::Error {
@@ -107,6 +148,7 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
         let mut sharing = None;
         let mut compress = None;
         let mut commit = None;
+        let mut max_inline = None;
         for option in options.split(',') {
             match option {
                 "ro" => read_only = true,
@@ -134,6 +176,10 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
                         commit = Some(commit_seconds(value).ok_or_else(|| {
                             invalid(number, format!("`{option}` is not a number of seconds"))
                         })?);
+                    } else if let Some(value) = option.strip_prefix("max_inline=") {
+                        max_inline = Some(max_inline_bytes(value).ok_or_else(|| {
+                            invalid(number, format!("`{option}` is not a size in bytes"))
+                        })?);
                     } else {
                         return Err(invalid(number, format!("unknown option `{option}`")));
                     }
@@ -154,6 +200,7 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
             sharing,
             compress,
             commit,
+            max_inline,
         });
     }
     Ok(mounts)
@@ -226,14 +273,15 @@ async fn main() -> io::Result<()> {
 
     let mounts = fstab()?;
     for mount in &mounts {
-        mounts::mount(
-            mount.source.clone(),
-            mount.point.as_str(),
-            mount.read_only,
-            mount.sharing,
-            mount.compress.clone(),
-            mount.commit,
-        )
+        mounts::mount(MountRequest {
+            source: mount.source.clone(),
+            path: mount.point.clone(),
+            read_only: mount.read_only,
+            sharing: mount.sharing,
+            compress: mount.compress.clone(),
+            commit: mount.commit,
+            max_inline: mount.max_inline,
+        })
         .await
         .map_err(|error| {
             io::Error::other(format!(
@@ -264,7 +312,57 @@ async fn main() -> io::Result<()> {
 mod tests {
     use helios_api::mounts::MountSharing;
 
-    use super::{commit_seconds, parse_fstab};
+    use super::{commit_seconds, max_inline_bytes, parse_fstab};
+
+    #[test]
+    fn max_inline_values_read_as_linux_memparse_reads_them() {
+        for (value, bytes) in [
+            ("2048", 2048),
+            ("0", 0),
+            ("0k", 0),
+            ("04000", 2048),
+            ("0x800", 2048),
+            ("2k", 2048),
+            ("2K", 2048),
+            ("1M", 1 << 20),
+            ("1g", 1 << 30),
+            ("1T", 1 << 40),
+            ("1p", 1 << 50),
+            ("1E", 1 << 60),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            assert_eq!(max_inline_bytes(value), Some(bytes), "{value}");
+        }
+        for value in [
+            "",
+            "k",
+            "+2048",
+            "-1",
+            "0x",
+            "08",
+            "2KB",
+            "2 K",
+            "16E",
+            "18446744073709551616",
+        ] {
+            assert_eq!(max_inline_bytes(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn an_fstab_line_carries_its_inline_limit() {
+        let mounts = parse_fstab(
+            "btrfs:数据-データ-데이터 /btrfs rw,shared,compress=zstd:3,max_inline=4k\n",
+        )
+        .unwrap();
+        assert_eq!(mounts[0].max_inline, Some(4096));
+        assert_eq!(mounts[0].compress.as_deref(), Some("zstd:3"));
+        assert!(parse_fstab("btrfs:disk /btrfs shared,max_inline=big\n").is_err());
+        assert_eq!(
+            parse_fstab("memory /tmp shared\n").unwrap()[0].max_inline,
+            None
+        );
+    }
 
     #[test]
     fn commit_values_read_as_linux_reads_them() {

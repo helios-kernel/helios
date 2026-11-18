@@ -41,6 +41,7 @@ fn request(source: crate::MountSource, read_only: bool) -> crate::MountRequest<'
             concurrency: core::num::NonZeroUsize::new(1).unwrap(),
             compress: None,
             commit: None,
+            max_inline: None,
         },
     }
 }

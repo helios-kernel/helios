@@ -112,6 +112,7 @@ fn write_options(
         concurrency: core::num::NonZeroUsize::new(concurrency).unwrap(),
         compress,
         commit: None,
+        max_inline: None,
     }
 }
 
@@ -1478,5 +1479,90 @@ fn the_commit_option_of_a_mount_request_sets_its_interval() {
             ),
         )),
         Err(crate::MountRequestError::CommitUnsupported)
+    ));
+}
+
+/// A mount's `max_inline` decides which small files its writes keep inline,
+/// and its operator changes it on the running mount, as Linux's
+/// `remount,max_inline=`. A source other than btrfs refuses the option.
+#[test]
+fn the_max_inline_option_bounds_inline_files_and_follows_its_operator() {
+    use helios_btrfs::ExtentKind;
+
+    let disk = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    // Between the two limits the test sets: 45 lines of 33 bytes.
+    let contents = "内联 インライン 인라인\n".repeat(45);
+    assert_eq!(contents.len(), 1485);
+    const BEFORE: &str = "之前-前-이전";
+    const AFTER: &str = "之后-後-이후";
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache_over(&disk, 256, 1).disk(0),
+            || DeviceId::new(100),
+            crate::vfs::BtrfsWriteOptions {
+                max_inline: Some(1024),
+                ..write_options(1, None)
+            },
+        )
+        .await
+        .expect("writable mount");
+        let contents = contents.as_bytes();
+        let client = async move {
+            assert_eq!(fs.max_inline(), Some(1024));
+            for (name, max_inline) in [(BEFORE, 1024), (AFTER, 2048)] {
+                fs.set_max_inline(max_inline).expect("writable mount");
+                fs.open(path(name), OpenFlags::CREATE, 1_000_000_000)
+                    .await
+                    .expect("create");
+                write_with(
+                    &fs,
+                    path(name),
+                    WritePosition::At(0),
+                    contents.len(),
+                    1_000_000_001,
+                    |offset, bytes| bytes.copy_from_slice(&contents[offset..offset + bytes.len()]),
+                )
+                .await
+                .expect("write");
+            }
+            assert_eq!(fs.max_inline(), Some(2048));
+            fs.sync(path(AFTER)).await.expect("sync");
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+    });
+    let reopened = mount(&cache_over(&disk, 256, 1));
+    let snapshot = reopened.inner.reader.lock().clone();
+    for (name, kind) in [(BEFORE, ExtentKind::Regular), (AFTER, ExtentKind::Inline)] {
+        assert_eq!(
+            block_on(reopened.read_at(path(name), 0, contents.len())).unwrap(),
+            contents.as_bytes()
+        );
+        let inode = block_on(snapshot.resolve(alloc::format!("/{name}").as_bytes())).unwrap();
+        let extents = block_on(snapshot.file_extents(&inode)).unwrap();
+        assert_eq!(extents.len(), 1, "{name}: {extents:?}");
+        assert_eq!(extents[0].kind, kind, "{name}: {extents:?}");
+    }
+    assert_eq!(reopened.max_inline(), None, "a read-only mount has none");
+
+    let namespace = mount_point_namespace();
+    assert!(matches!(
+        block_on(request_mount(
+            &ProcessAuthority::root(),
+            &namespace,
+            AttachedStorage {
+                host_share: None,
+                disks: None,
+            },
+            mount_request(
+                MountSource::Memory,
+                false,
+                crate::vfs::BtrfsWriteOptions {
+                    max_inline: Some(2048),
+                    ..write_options(1, None)
+                },
+            ),
+        )),
+        Err(crate::MountRequestError::MaxInlineUnsupported)
     ));
 }

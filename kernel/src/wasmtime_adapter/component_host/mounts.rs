@@ -56,7 +56,8 @@ fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
         }
         | MountRequestError::CompressionOption(_)
         | MountRequestError::CompressionUnsupported
-        | MountRequestError::CommitUnsupported => RefusalKind::InvalidOption,
+        | MountRequestError::CommitUnsupported
+        | MountRequestError::MaxInlineUnsupported => RefusalKind::InvalidOption,
         MountRequestError::Btrfs { .. } => RefusalKind::InvalidFilesystem,
         MountRequestError::Mount(MountError::InvalidPoint(_) | MountError::RootKind) => {
             RefusalKind::InvalidPoint
@@ -174,6 +175,7 @@ macro_rules! impl_mount_bindings {
                                 commit: request
                                     .commit
                                     .map(crate::vfs::CommitPolicy::from_commit_option),
+                                max_inline: request.max_inline,
                             },
                             store.spawner().launch_spawner().clone(),
                             store.timer(),
