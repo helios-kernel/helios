@@ -30,8 +30,8 @@ mod hv;
 pub(super) use hv::add_hv_to_linker;
 mod processors;
 pub(super) use processors::add_processors_to_linker;
-mod compile_session;
-use compile_session::*;
+mod shared_memory_plugin;
+use shared_memory_plugin::*;
 mod compiler;
 use compiler::*;
 mod exec;
@@ -85,7 +85,7 @@ use alloc::vec;
 use bytes::Bytes;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+use core::sync::atomic::Ordering as AtomicOrdering;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use hashbrown::HashMap;
@@ -125,8 +125,8 @@ const WASIX_STREAM_SECURITY_CLASSIC_ENCRYPTION: u8 = 1 << 2;
 const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
-type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
-type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
+type CompilerThreadTasks = SmallVec<[crate::JoinHandle<SharedMemoryThreadReport>; 8]>;
+type CompilerThreadReports = SmallVec<[SharedMemoryThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, StorageImpl> =
     Arc<CompilerPluginRuntime<CpuImpl, Net, StorageImpl>>;
 
@@ -139,9 +139,10 @@ struct CompileJob {
     profile: bool,
 }
 
-/// How a compile's body ended, with the phase timestamps it filled in.
+/// How a compile's body ended, with the phase timestamps and live worker count.
 struct CompileEnd {
     result: Result<(Vec<u8>, CompilerThreadReports), ProgramExecError>,
+    worker_threads: u32,
     phases: CompilerPhaseTimestamps,
 }
 
@@ -149,9 +150,9 @@ struct CompileEnd {
 pub(crate) struct AotArtifact {
     /// The signed `cwasm` artifact.
     pub(crate) signed: Vec<u8>,
-    /// The worker count the compiler plugin was told to compile with
-    /// (`compiler_plugin_worker_threads`), reported so a caller comparing
-    /// this compile with another can hold the count fixed.
+    /// The live worker count the compiler plugin was told to compile with,
+    /// reported so a caller comparing this compile with another can hold the
+    /// count fixed.
     pub(crate) worker_threads: u32,
 }
 
@@ -357,7 +358,7 @@ where
     /// buffers. The slot is held only on the kernel side; the rayon
     /// worker pool inside the plugin still parallelises a single
     /// compile across all cores.
-    compile_slot: CompilerCompileSlot,
+    compile_slot: SharedMemorySessionSlot,
     /// Every wasm image this service loaded, by address, for the
     /// instruction sampler to name.
     code_map: CodeMap,
@@ -629,7 +630,7 @@ where
             cwasm_signing_key,
             guest_isa,
             compiler_plugin: Mutex::new(None),
-            compile_slot: CompilerCompileSlot::new(),
+            compile_slot: SharedMemorySessionSlot::new(),
             code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
             _marker: core::marker::PhantomData,
@@ -1610,13 +1611,8 @@ where
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<AotArtifact, ProgramExecError> {
-        let signed = self
-            .compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
-            .await?;
-        Ok(AotArtifact {
-            signed,
-            worker_threads: compiler_plugin_worker_threads(&exec_context.cpu),
-        })
+        self.compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
+            .await
     }
 
     async fn load_executable(
@@ -1667,7 +1663,7 @@ where
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
                     .map_err(map_artifact_profile_error)?;
                 let hint = hint.unwrap_or(AotCompileHint::Performance);
-                let signed = self
+                let compiled = self
                     .compile_raw_component_to_signed_artifact(
                         compile,
                         exec_context,
@@ -1676,7 +1672,7 @@ where
                         false,
                     )
                     .await?;
-                let signed = Bytes::from(signed);
+                let signed = Bytes::from(compiled.signed);
                 trusted_signed_payload(&signed, &self.inner.cwasm_signing_key)?
             }
         };
@@ -1896,7 +1892,7 @@ where
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<Vec<u8>, ProgramExecError> {
+    ) -> Result<AotArtifact, ProgramExecError> {
         let phases = CompilerPhaseTimestamps {
             processor: if profile {
                 helios_hal::cpu::current_processor().id()
@@ -1920,7 +1916,7 @@ where
         // The compile runs in a task of its own, whichever route asked for
         // it, and this call holds only the receiving half of its reply: the
         // compile outlives a requester that stops waiting, and stops itself
-        // when that happens (`run_compile_session`).
+        // when that happens (`run_shared_memory_session`).
         let (reply, artifact) = futures::channel::oneshot::channel();
         exec_context.spawner.spawn_detached({
             let service = self.clone();
@@ -1940,18 +1936,18 @@ where
         }
     }
 
-    /// The compile session task: waits for the compile slot, runs the compile
-    /// with the slot held until every worker is joined, condemns the compile
+    /// The compile session task: waits for the session slot, runs the compile
+    /// with core affinity until every worker is joined, condemns the compile
     /// if its requester leaves, and replies with the signed artifact.
     async fn compile_session(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         job: CompileJob,
         phases: CompilerPhaseTimestamps,
-        reply: futures::channel::oneshot::Sender<Result<Vec<u8>, ProgramExecError>>,
+        reply: futures::channel::oneshot::Sender<Result<AotArtifact, ProgramExecError>>,
     ) {
         let profile = job.profile;
-        run_compile_session(
+        run_shared_memory_session(
             &self.inner.compile_slot,
             reply,
             || {
@@ -1970,7 +1966,7 @@ where
                     let runtime_state = exec_context.runtime_state.clone();
                     let id = instance.id();
                     move || {
-                        condemn_compile(
+                        condemn_session(
                             &registry,
                             &interrupts,
                             id,
@@ -1996,8 +1992,12 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         profile: bool,
         end: CompileEnd,
-    ) -> Result<Vec<u8>, ProgramExecError> {
-        let CompileEnd { result, mut phases } = end;
+    ) -> Result<AotArtifact, ProgramExecError> {
+        let CompileEnd {
+            result,
+            worker_threads,
+            mut phases,
+        } = end;
         let (payload, thread_reports) = result?;
         let signed = cwasm::sign_artifact_payload(&payload, &self.inner.cwasm_signing_key)
             .map_err(map_artifact_trust_error)?;
@@ -2021,12 +2021,15 @@ where
                 signed.len(),
             );
         }
-        Ok(signed)
+        Ok(AotArtifact {
+            signed,
+            worker_threads,
+        })
     }
 
     /// The compile proper, run with the compile slot held: the plugin's call,
-    /// then the join of every worker task the plugin spawned, so the slot is
-    /// never released while one still runs on the plugin's memory.
+    /// then the join of every core-pinned worker task the plugin spawned, so the
+    /// slot is never released while one still runs on the plugin's memory.
     async fn run_compile(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
@@ -2045,17 +2048,24 @@ where
         } else {
             0
         };
+        let affinity_plan = CoreAffinityPlan::capture(
+            &exec_context.cpu,
+            exec_context.spawner.processor_control().online_set(),
+            helios_hal::cpu::current_processor(),
+        );
+        let worker_threads = affinity_plan.worker_count();
         let result = self
             .invoke_compiler_inner(
                 exec_context,
                 &compiler_payload,
                 instance,
                 CompileRequest {
-                    wasm: &wasm,
+                    wasm,
                     guest_isa: self.inner.guest_isa,
                     hint,
                     profile,
                 },
+                affinity_plan,
                 &mut phases,
             )
             .await;
@@ -2086,6 +2096,7 @@ where
         }
         CompileEnd {
             result: result.map(|payload| (payload, thread_reports)),
+            worker_threads,
             phases,
         }
     }
@@ -2122,13 +2133,15 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         compiler_payload: &Bytes,
         compiler_instance: crate::RegisteredInstance,
-        request: CompileRequest<'_>,
+        request: CompileRequest,
+        affinity_plan: CoreAffinityPlan,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let profile = request.profile;
         let (plugin, plugin_cached) = self
-            .ensure_compiler_plugin(exec_context, compiler_payload)
+            .ensure_compiler_plugin(exec_context, compiler_payload, affinity_plan.worker_count())
             .await?;
+        plugin.shared.begin_session(&affinity_plan);
         phases.plugin_cached = plugin_cached;
         phases.plugin_ready_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
@@ -2142,14 +2155,34 @@ where
             instance: compiler_instance,
             registry: exec_context.instance_registry.clone(),
             shared: plugin.shared.clone(),
+            affinity_plan: affinity_plan.clone(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         };
-        // The main thread's part ends here, before the workers are joined, so
-        // a failure condemns the compile while they can still be ended.
-        let result = self
-            .run_main_thread(exec_context, &plugin, context.clone(), request, phases)
+        // Pin the compile's main store to `affinity_plan.main()` so main and all
+        // workers execute deterministically across the live `Kernel` cores.
+        let main_core = affinity_plan.main();
+        let (result, updated_phases) = affinity_plan
+            .spawn_pinned(&exec_context.spawner, main_core, {
+                let service = self.clone();
+                let exec_context = exec_context.clone();
+                let context = context.clone();
+                let mut local_phases = *phases;
+                async move {
+                    let result = service
+                        .run_main_thread(
+                            &exec_context,
+                            &plugin,
+                            context,
+                            request,
+                            &mut local_phases,
+                        )
+                        .await;
+                    (result, local_phases)
+                }
+            })
             .await;
+        *phases = updated_phases;
         context.end_main_part(result)
     }
 
@@ -2160,7 +2193,7 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         plugin: &CompilerPluginHandle<CpuImpl, Net, StorageImpl>,
         context: CompilerCompileContext<CpuImpl, Net, StorageImpl>,
-        request: CompileRequest<'_>,
+        request: CompileRequest,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let profile = request.profile;
@@ -2252,7 +2285,7 @@ where
         store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         exports: &CompilerExports,
         allocations: &mut CompilerAllocations,
-        request: CompileRequest<'_>,
+        request: CompileRequest,
         phases: &mut CompilerPhaseTimestamps,
     ) -> CompilerCallOutcome {
         let CompileRequest {
@@ -2307,7 +2340,7 @@ where
         let memory = Preview1AsyncMemory::of_shared(store.data().memory());
         let written = in_guest_turn(store.data().guest_turns(), async {
             memory
-                .write_bytes(GuestAddress::wasm32(wasm_ptr), wasm)
+                .write_bytes(GuestAddress::wasm32(wasm_ptr), &wasm)
                 .await?;
             memory
                 .write_bytes(GuestAddress::wasm32(target_ptr), target)
@@ -2378,6 +2411,7 @@ where
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         compiler_payload: &Bytes,
+        worker_threads: u32,
     ) -> Result<(CompilerPluginHandle<CpuImpl, Net, StorageImpl>, bool), ProgramExecError> {
         let cached = self.inner.compiler_plugin.lock().clone();
         if let Some(plugin) = cached {
@@ -2396,7 +2430,6 @@ where
             });
         }
 
-        let worker_threads = compiler_plugin_worker_threads(&exec_context.cpu);
         tracing::info!(
             worker_threads,
             "building cached compiler plugin runtime (one-time per kernel boot)"
@@ -2410,17 +2443,12 @@ where
             .code_map
             .register_module(COMPILER_PLUGIN_PATH, &module);
         let shared_memory = compiler_shared_memory(engine, &module)?;
-        let shared = Arc::new(CompilerCoreShared {
-            memory: shared_memory.clone(),
-            entropy: Mutex::new(crate::EntropyPool::derive(
-                exec_context.runtime_state.root_entropy(),
-                0,
-            )),
-            instance_pre: spin::Once::new(),
-            next_thread_id: AtomicI32::new(0),
-            thread_tasks: Mutex::new(Vec::new()),
-            interrupts: self.inner.engine.interrupts().clone(),
-        });
+        let shared = Arc::new(SharedMemoryCoreShared::new(
+            shared_memory.clone(),
+            crate::EntropyPool::derive(exec_context.runtime_state.root_entropy(), 0),
+            self.inner.engine.interrupts().clone(),
+            worker_threads,
+        ));
         let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, Net, StorageImpl>> =
             CoreLinker::new(engine);
         add_compiler_core_imports(&mut linker, shared_memory.clone())?;
@@ -2445,6 +2473,7 @@ where
             instance: scratch_instance,
             registry: exec_context.instance_registry.clone(),
             shared: shared.clone(),
+            affinity_plan: CoreAffinityPlan::single(exec_context.cpu.bootstrap_processor()),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         });

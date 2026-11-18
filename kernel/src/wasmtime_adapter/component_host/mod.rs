@@ -103,8 +103,7 @@ pub use service::{
 };
 pub(crate) use service::{ProgramArgv, ProgramExecContext, ProgramSource};
 pub use topology::{
-    ComponentHostProcessorRole, component_host_kernel_processor_count,
-    component_host_processor_role, component_host_processors_to_start,
+    ComponentHostProcessorRole, component_host_processor_role, component_host_processors_to_start,
     component_host_system_processor, component_host_worker_count, system_component_should_run_on,
 };
 
