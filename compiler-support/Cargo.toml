@@ -8,7 +8,7 @@ cranelift-codegen = { path = "../../wasmtime/cranelift/codegen", features = ["ti
 helios-artifact.workspace = true
 rayon = "1.12.0"
 thiserror = "2.0.20"
-wasmparser = "0.245.0"
+wasmparser = { version = "0.263.0", default-features = false, features = ["std"] }
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async-compile", "cranelift", "gc-null", "parallel-compilation", "std", "threads"] }
 
 [dev-dependencies]

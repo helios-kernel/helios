@@ -33,8 +33,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use futures::channel::oneshot;
 use futures::future::{Either, select};
 use helios_btrfs::write::{
-    Attributes, ChunkError, Compressor, InodeHandle, Name, RootUuids, SpaceError, WriteError,
-    WriteTransaction, Writer,
+    Attributes, ChunkError, Compressor, InodeHandle, MountPolicy, Name, RootUuids, SpaceError,
+    WriteError, WriteTransaction, Writer,
 };
 use helios_btrfs::{BlockSink, Error, FileKind, Timestamp};
 use helios_hal::cpu::{Cpu, Instant};
@@ -325,6 +325,8 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
         };
         let mut replies = Vec::with_capacity(requests.len());
         let mut syncs = Vec::new();
+        // An operator's change applies from the next batch.
+        let max_inline = self.policy.max_inline();
         for request in requests {
             if request.reply.is_canceled() {
                 continue;
@@ -337,6 +339,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                 request.operation,
                 concurrency,
                 &mut self.compressor,
+                max_inline,
             )
             .await;
             match result {
@@ -422,8 +425,15 @@ async fn apply<S: BlockSink, U: RootUuids>(
     operation: Operation,
     concurrency: NonZeroUsize,
     compressor: &mut Compressor,
+    max_inline: u64,
 ) -> FsResult<Response> {
     let when = timestamp(now);
+    let policy = |compressor| MountPolicy {
+        when,
+        concurrency,
+        compressor,
+        max_inline,
+    };
     match operation {
         Operation::Write {
             inode,
@@ -439,7 +449,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .checked_add(bytes.len() as u64)
                 .ok_or(FsError::Overflow)?;
             let written = transaction
-                .write_file_with_policy(&inode, offset, &bytes, when, concurrency, compressor)
+                .write_file_with_policy(&inode, offset, &bytes, policy(&mut *compressor))
                 .await
                 .map_err(fs_error)?;
             // A device with no more free sectors stores a prefix, which the
@@ -493,7 +503,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
             }
             if flags.contains(OpenFlags::TRUNCATE) {
                 transaction
-                    .truncate_file(&file, 0, when, concurrency)
+                    .truncate_file_with_policy(&file, 0, policy(&mut *compressor))
                     .await
                     .map_err(fs_error)?;
             }
@@ -592,7 +602,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
         Operation::Truncate { size } => {
             let file = inode(transaction, path).await?;
             transaction
-                .truncate_file(&file, size, when, concurrency)
+                .truncate_file_with_policy(&file, size, policy(&mut *compressor))
                 .await
                 .map_err(fs_error)?;
         }

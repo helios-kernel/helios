@@ -28,8 +28,8 @@ toml = "0.8.23"
 # import what they export.
 wac-graph = { version = "0.12.0", default-features = false }
 walkdir = "2.5.0"
-wasmparser = "0.245.0"
-wit-component = "0.245.0"
+wasmparser = { version = "0.263.0", default-features = false, features = ["component-model", "features", "simd", "std", "validate"] }
+wit-component = { version = "0.263.0", default-features = false }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [lints]

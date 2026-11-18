@@ -2,6 +2,7 @@
 //! reads resolve against this transaction's inode, extent and checksum roots.
 
 use alloc::vec;
+use alloc::vec::Vec;
 use core::{num::NonZeroUsize, ops::Range};
 use zerocopy::{FromZeros, IntoBytes};
 
@@ -10,7 +11,9 @@ use super::namespace::{check_flags, time};
 use crate::accounting::DataWrite;
 use crate::allocation::data::DataReference;
 use crate::compress::write::{Encoder, Plain};
-use crate::items::{FileExtent, INODE_APPEND, INODE_IMMUTABLE, INODE_NODATASUM, Metadata};
+use crate::items::{
+    ExtentData, FileExtent, INODE_APPEND, INODE_IMMUTABLE, INODE_NODATASUM, Metadata,
+};
 use crate::ondisk::{
     MAX_COMPRESSED_EXTENT, RawFileExtentBody, RawFileExtentHead, RawHeader, RawInodeItem, RawItem,
     RawTimespec, item_type, view,
@@ -23,20 +26,41 @@ use crate::{Compression, Error, FileKind, Key, Timestamp};
 const HEAD_BYTES: usize = size_of::<RawFileExtentHead>();
 const REGULAR_BYTES: usize = HEAD_BYTES + size_of::<RawFileExtentBody>();
 
+/// `BTRFS_DEFAULT_MAX_INLINE`, 2048 bytes in `fs/btrfs/fs.h`: the default of
+/// Linux's `max_inline` mount option.
+pub const DEFAULT_MAX_INLINE: u64 = 2048;
+
+/// What a data mutation is written with: the caller's time, I/O concurrency,
+/// encoder and inline limit.
 pub struct WriteOptions<E> {
     pub when: Timestamp,
     pub concurrency: NonZeroUsize,
     pub encoder: E,
+    /// Linux's `max_inline` mount option: the most bytes a file's data, as
+    /// stored (compressed when it compresses), may keep inline in its
+    /// metadata item. Zero stores nothing inline.
+    pub max_inline: u64,
 }
 
 impl WriteOptions<Plain> {
+    /// Uncompressed, under Linux's default inline limit.
     pub fn plain(when: Timestamp, concurrency: NonZeroUsize) -> Self {
         Self {
             when,
             concurrency,
             encoder: Plain,
+            max_inline: DEFAULT_MAX_INLINE,
         }
     }
+}
+
+/// Refuses an encoder that compresses for an inode without checksums: Linux
+/// never compresses a `NODATASUM` inode's data.
+pub(super) fn check_encoder<E: Encoder>(flags: u64) -> Result<(), WriteError> {
+    if flags & INODE_NODATASUM != 0 && E::ALGORITHM.is_some() {
+        return Err(WriteError::CompressionWithoutChecksums);
+    }
+    Ok(())
 }
 
 fn compression_code(algorithm: Option<Compression>) -> u8 {
@@ -70,6 +94,25 @@ fn regular(
     bytes
 }
 
+/// An inline file extent item: its head, then `data`, which holds `size`
+/// bytes of the file, compressed with `algorithm`.
+fn inline_item(generation: u64, size: u64, algorithm: Option<Compression>, data: &[u8]) -> Vec<u8> {
+    let mut head = RawFileExtentHead::new_zeroed();
+    head.generation.set(generation);
+    head.ram_bytes.set(size);
+    head.compression = compression_code(algorithm);
+    let mut item = Vec::with_capacity(HEAD_BYTES + data.len());
+    item.extend_from_slice(head.as_bytes());
+    item.extend_from_slice(data);
+    item
+}
+
+/// The ram size of a validated file extent item that is inline.
+pub(super) fn inline_ram_bytes(item: &[u8]) -> Option<u64> {
+    let head = view::<RawFileExtentHead>(item).expect("validated extent");
+    (head.extent_type == 0).then_some(head.ram_bytes.get())
+}
+
 pub(super) fn aligned_end(end: u64, sector: u64) -> Result<u64, WriteError> {
     Ok(end
         .checked_add(sector - 1)
@@ -100,9 +143,7 @@ impl<S: BlockSink> Transaction<S> {
                 },
         )?;
         let when = time(tree, inode, options.when)?;
-        if metadata.flags & INODE_NODATASUM != 0 && E::ALGORITHM.is_some() {
-            return Err(WriteError::CompressionWithoutChecksums);
-        }
+        check_encoder::<E>(metadata.flags)?;
         let root = self.roots.get(tree)?;
         if data.is_empty() {
             return Ok(0);
@@ -122,52 +163,19 @@ impl<S: BlockSink> Transaction<S> {
                 key: *key,
                 defect,
             })?;
-            let head = view::<RawFileExtentHead>(bytes).expect("validated extent");
-            (head.extent_type == 0).then_some(head.ram_bytes.get())
+            inline_ram_bytes(bytes)
         } else {
             None
         };
-        let inline_limit = sector.min(
-            u64::from(self.volume.superblock().nodesize())
-                - (size_of::<RawHeader>() + size_of::<RawItem>() + HEAD_BYTES) as u64,
-        );
-        if (inline.is_some() || first.is_none()) && size <= inline_limit {
-            let mut payload = vec![0; HEAD_BYTES + size as usize];
-            self.read_file(tree, inode, 0, &mut payload[HEAD_BYTES..])
+        // A file whose every byte lies in its first sector, held inline or
+        // not yet stored at all, is written as that one sector, as Linux's
+        // writeback of block 0 is (`btrfs_run_delalloc_range`).
+        if (inline.is_some() || first.is_none()) && size <= sector {
+            let mut content = vec![0; size as usize];
+            self.read_file(tree, inode, 0, &mut content).await?;
+            content[offset as usize..end as usize].copy_from_slice(data);
+            self.store_first_sector(tree, inode, content, inline, &mut raw, &mut options)
                 .await?;
-            payload[HEAD_BYTES + offset as usize..HEAD_BYTES + end as usize].copy_from_slice(data);
-            let mut head = RawFileExtentHead::new_zeroed();
-            head.generation.set(self.trees.generation());
-            head.ram_bytes.set(size);
-            if let Some(encoded) = options
-                .encoder
-                .encode(&payload[HEAD_BYTES..], sector as usize)?
-                && encoded.bytes.len() < size as usize
-            {
-                head.compression = compression_code(Some(encoded.algorithm));
-                self.image.enable_compression(encoded.algorithm);
-                payload.truncate(HEAD_BYTES);
-                payload.extend_from_slice(encoded.bytes);
-            }
-            payload[..HEAD_BYTES].copy_from_slice(head.as_bytes());
-            let root = self
-                .trees
-                .apply(
-                    &self.volume,
-                    root,
-                    first_key,
-                    Some(&payload),
-                    &mut self.space,
-                )
-                .await?;
-            self.roots.set(root)?;
-            raw.nbytes.set(
-                raw.nbytes
-                    .get()
-                    .checked_sub(inline.unwrap_or(0))
-                    .and_then(|bytes| bytes.checked_add(size))
-                    .ok_or(WriteError::FileOverflow)?,
-            );
         } else {
             if let Some(inline_bytes) = inline {
                 self.promote_inline(
@@ -232,77 +240,99 @@ impl<S: BlockSink> Transaction<S> {
         Ok((end - offset) as usize)
     }
 
-    pub(crate) async fn truncate_file(
+    pub(crate) async fn truncate_file<E: Encoder>(
         &mut self,
         tree: u64,
         inode: u64,
         size: u64,
-        when: Timestamp,
-        concurrency: NonZeroUsize,
+        mut options: WriteOptions<E>,
     ) -> Result<(), WriteError> {
         let (mut raw, metadata) = self.file_inode(tree, inode).await?;
         check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
-        let mut options = WriteOptions::plain(when, concurrency);
-        let when = time(tree, inode, when)?;
+        check_encoder::<E>(metadata.flags)?;
+        let when = time(tree, inode, options.when)?;
         let sector = u64::from(self.volume.superblock().sectorsize());
         let end = aligned_end(size, sector)?;
         let root = self.roots.get(tree)?;
         let key = Key::new(inode, item_type::EXTENT_DATA, 0);
         let first = self.trees.get(&self.volume, root, key).await?;
         let inline = if let Some(bytes) = &first {
-            FileExtent::parse(key, bytes, sector as u32).map_err(|defect| Error::Item {
-                tree,
-                key,
-                defect,
-            })?;
-            let head = view::<RawFileExtentHead>(bytes).expect("validated extent");
-            (head.extent_type == 0).then_some(head.ram_bytes.get())
+            let extent = FileExtent::parse(key, bytes, sector as u32)
+                .map_err(|defect| Error::Item { tree, key, defect })?;
+            inline_ram_bytes(bytes).map(|ram_bytes| {
+                let compressed = matches!(
+                    extent.data,
+                    ExtentData::Inline {
+                        compression: Some(_),
+                        ..
+                    }
+                );
+                (ram_bytes, compressed)
+            })
         } else {
             None
         };
-        if let Some(inline_bytes) = inline {
+        if let Some((inline_bytes, compressed)) = inline
+            && size != metadata.size
+        {
             let retained = size.min(metadata.size);
-            let mut payload = vec![0; retained as usize];
-            self.read_file(tree, inode, 0, &mut payload).await?;
-            let root = self
-                .trees
-                .apply(&self.volume, root, key, None, &mut self.space)
-                .await?;
-            self.roots.set(root)?;
-            raw.nbytes.set(
-                raw.nbytes
-                    .get()
-                    .checked_sub(inline_bytes)
-                    .ok_or(WriteError::FileOverflow)?,
-            );
-            let inline_limit = sector.min(
-                u64::from(self.volume.superblock().nodesize())
-                    - (size_of::<RawHeader>() + size_of::<RawItem>() + HEAD_BYTES) as u64,
-            );
-            if size != 0 && size <= inline_limit {
-                let mut bytes = vec![0; HEAD_BYTES + size as usize];
+            if size == 0 {
+                self.remove_first_item(tree, inode, inline_bytes, &mut raw)
+                    .await?;
+            } else if size < metadata.size && !compressed {
+                // `btrfs_truncate_inode_items` shrinks an uncompressed inline
+                // item in place.
+                let mut item = vec![0; HEAD_BYTES + size as usize];
+                self.read_file(tree, inode, 0, &mut item[HEAD_BYTES..])
+                    .await?;
                 let mut head = RawFileExtentHead::new_zeroed();
                 head.generation.set(self.trees.generation());
                 head.ram_bytes.set(size);
-                bytes[..HEAD_BYTES].copy_from_slice(head.as_bytes());
-                bytes[HEAD_BYTES..HEAD_BYTES + payload.len()].copy_from_slice(&payload);
+                item[..HEAD_BYTES].copy_from_slice(head.as_bytes());
                 let root = self
                     .trees
-                    .apply(&self.volume, root, key, Some(&bytes), &mut self.space)
+                    .apply(&self.volume, root, key, Some(&item), &mut self.space)
                     .await?;
                 self.roots.set(root)?;
                 raw.nbytes.set(
                     raw.nbytes
                         .get()
-                        .checked_add(size)
+                        .checked_sub(inline_bytes)
+                        .and_then(|bytes| bytes.checked_add(size))
                         .ok_or(WriteError::FileOverflow)?,
                 );
-            } else if !payload.is_empty() {
-                payload.resize(aligned_end(retained, sector)? as usize, 0);
-                self.replace_chunk(tree, inode, 0, &payload, &mut raw, &mut options)
+            } else {
+                // A compressed item cannot be cut (`BTRFS_NEED_TRUNCATE_BLOCK`),
+                // and growth zeroes the old tail (`btrfs_cont_expand`): either
+                // way Linux dirties the first sector, and its writeback stores
+                // the file's first `size` bytes afresh.
+                let stored = if size <= sector {
+                    size
+                } else {
+                    aligned_end(retained, sector)?
+                };
+                let mut content = vec![0; stored as usize];
+                self.read_file(tree, inode, 0, &mut content[..retained as usize])
                     .await?;
+                if size <= sector {
+                    self.store_first_sector(
+                        tree,
+                        inode,
+                        content,
+                        Some(inline_bytes),
+                        &mut raw,
+                        &mut options,
+                    )
+                    .await?;
+                } else {
+                    self.remove_first_item(tree, inode, inline_bytes, &mut raw)
+                        .await?;
+                    self.replace_chunk(tree, inode, 0, &content, &mut raw, &mut options)
+                        .await?;
+                }
             }
-        } else if size != metadata.size && size.min(metadata.size) % sector != 0 {
+        } else if inline.is_none() && size != metadata.size && size.min(metadata.size) % sector != 0
+        {
             self.zero_tail(tree, inode, size.min(metadata.size), &mut raw, &mut options)
                 .await?;
         }
@@ -398,6 +428,23 @@ impl<S: BlockSink> Transaction<S> {
         if !preserved.is_empty() {
             self.read_file(tree, inode, 0, &mut preserved).await?;
         }
+        self.remove_first_item(tree, inode, inline_bytes, raw)
+            .await?;
+        if !preserved.is_empty() {
+            self.replace_chunk(tree, inode, 0, &preserved, raw, options)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Removes the inline item holding the file's `inline_bytes` bytes.
+    pub(super) async fn remove_first_item(
+        &mut self,
+        tree: u64,
+        inode: u64,
+        inline_bytes: u64,
+        raw: &mut RawInodeItem,
+    ) -> Result<(), WriteError> {
         let root = self.roots.get(tree)?;
         let root = self
             .trees
@@ -416,8 +463,86 @@ impl<S: BlockSink> Transaction<S> {
                 .checked_sub(inline_bytes)
                 .ok_or(WriteError::FileOverflow)?,
         );
-        if !preserved.is_empty() {
-            self.replace_chunk(tree, inode, 0, &preserved, raw, options)
+        Ok(())
+    }
+
+    /// `can_cow_file_range_inline` in Linux's `fs/btrfs/inode.c`: whether a
+    /// file of `size` bytes, all of them, may be one inline item that stores
+    /// `stored` bytes (their compressed length, or `size` uncompressed) under
+    /// `BTRFS_MAX_INLINE_DATA_SIZE` (`fs/btrfs/ctree.h`) and the `max_inline`
+    /// mount option. Linux's `PAGE_SIZE` bound is its page cache's, which this
+    /// writer does not have.
+    pub(super) fn may_inline(&self, size: u64, stored: u64, max_inline: u64) -> bool {
+        let superblock = self.volume.superblock();
+        let sector = u64::from(superblock.sectorsize());
+        // `BTRFS_MAX_INLINE_DATA_SIZE`: a leaf's largest item, less the
+        // file extent head the data follows.
+        let max_data = u64::from(superblock.nodesize())
+            - (size_of::<RawHeader>() + size_of::<RawItem>() + HEAD_BYTES) as u64;
+        size <= sector && stored < sector && stored <= max_data && stored <= max_inline
+    }
+
+    /// Stores `content`, every byte of a file that ends within its first
+    /// sector, as Linux's writeback of that sector does
+    /// (`run_delalloc_inline`): compressed when the encoder saves space, inline
+    /// when [`Self::may_inline`] allows the stored length, and otherwise as a
+    /// one-sector regular extent. `inline` is the ram size of the inline item
+    /// it replaces.
+    async fn store_first_sector<E: Encoder>(
+        &mut self,
+        tree: u64,
+        inode: u64,
+        mut content: Vec<u8>,
+        inline: Option<u64>,
+        raw: &mut RawInodeItem,
+        options: &mut WriteOptions<E>,
+    ) -> Result<(), WriteError> {
+        let size = content.len() as u64;
+        let sector = u64::from(self.volume.superblock().sectorsize());
+        let generation = self.trees.generation();
+        let max_inline = options.max_inline;
+        // Compression that saves space decides alone: a compressed length
+        // too large to inline sends the sector to a regular extent, never to
+        // an uncompressed inline item.
+        let item = if let Some(encoded) = options.encoder.encode(&content, sector as usize)?
+            && (encoded.bytes.len() as u64) < size
+        {
+            self.may_inline(size, encoded.bytes.len() as u64, max_inline)
+                .then(|| {
+                    self.image.enable_compression(encoded.algorithm);
+                    inline_item(generation, size, Some(encoded.algorithm), encoded.bytes)
+                })
+        } else {
+            self.may_inline(size, size, max_inline)
+                .then(|| inline_item(generation, size, None, &content))
+        };
+        if let Some(item) = item {
+            let root = self.roots.get(tree)?;
+            let root = self
+                .trees
+                .apply(
+                    &self.volume,
+                    root,
+                    Key::new(inode, item_type::EXTENT_DATA, 0),
+                    Some(&item),
+                    &mut self.space,
+                )
+                .await?;
+            self.roots.set(root)?;
+            raw.nbytes.set(
+                raw.nbytes
+                    .get()
+                    .checked_sub(inline.unwrap_or(0))
+                    .and_then(|bytes| bytes.checked_add(size))
+                    .ok_or(WriteError::FileOverflow)?,
+            );
+        } else {
+            if let Some(inline_bytes) = inline {
+                self.remove_first_item(tree, inode, inline_bytes, raw)
+                    .await?;
+            }
+            content.resize(sector as usize, 0);
+            self.replace_chunk(tree, inode, 0, &content, raw, options)
                 .await?;
         }
         Ok(())

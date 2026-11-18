@@ -213,8 +213,11 @@ impl WasixJoinHarness {
         config.wasm_threads(true);
         config.shared_memory(true);
         let engine = wasmtime::Engine::new(&config).expect("shared-memory engine initializes");
-        let memory = SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1))
-            .expect("shared memory allocates");
+        let memory = SharedMemory::new(
+            &engine,
+            wasmtime::MemoryType::shared(1, 1).expect("1..=1 is a valid shared memory type"),
+        )
+        .expect("shared memory allocates");
 
         let cpu = TestCpu::with_entropy(0x5a);
         let runtime_state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
