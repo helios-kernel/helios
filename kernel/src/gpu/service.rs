@@ -780,12 +780,6 @@ impl Gpu3dSender {
     pub(crate) async fn submit_room(&self) {
         self.shared.submit.room().await;
     }
-
-    /// Hand a turn [`Self::submit_room`] gave this caller to the next
-    /// producer parked there, when the caller then queued nothing.
-    pub(crate) fn pass_submit_room(&self) {
-        self.shared.submit.pass_room();
-    }
 }
 
 const fn closed(error: ProviderError) -> Gpu3dServiceError {

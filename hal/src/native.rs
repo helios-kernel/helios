@@ -95,6 +95,29 @@
 //!   extended-state component the processor enables for user mode, is saved
 //!   when the slice ends and restored when the next one starts; the kernel's
 //!   own state is saved and restored around the slice the same way.
+//!
+//! # Isolation contract
+//!
+//! A space keeps the kernel's half mapped while user code runs, so the
+//! processor's privilege checks are all that separate the two, in both
+//! directions. A backend publishes the capability only when every one of
+//! its processors provides each of these, and otherwise refuses it with
+//! [`NativeUnavailable::MissingProtection`] naming the first one missing:
+//!
+//! - Kernel mode cannot fetch an instruction from a page user mode can
+//!   reach: x86 `CR4.SMEP` on every processor, AArch64 `PXN` on every
+//!   EL0 mapping and on every table above one.
+//! - Kernel mode cannot load from or store to such a page: x86 `CR4.SMAP`
+//!   and AArch64 `PSTATE.PAN` (set on every exception entry by a clear
+//!   `SCTLR_EL1.SPAN`) on every processor. The kernel never needs to lift
+//!   either, because [`UserSpace::read`] and [`UserSpace::write`] reach
+//!   user memory through the kernel's own mapping of its frames.
+//! - User mode cannot read kernel memory through a speculative load the
+//!   privilege check refuses only at retirement: the processor declares
+//!   itself unaffected by rogue data cache load, x86
+//!   `IA32_ARCH_CAPABILITIES.RDCL_NO` and AArch64 `ID_AA64PFR0_EL1.CSV3`.
+//!   No processor that lacks it runs user code, because the kernel's half
+//!   stays mapped and no page-table isolation separates it.
 
 use core::convert::Infallible;
 
@@ -109,6 +132,39 @@ pub enum InstructionSet {
     X86_64,
     Aarch64,
     Riscv64,
+}
+
+/// A hardware protection the isolation contract requires, by its
+/// architectural name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum Protection {
+    /// x86 supervisor-mode execution prevention,
+    /// `CPUID.(EAX=07H,ECX=0):EBX[7]`.
+    #[error("SMEP (supervisor-mode execution prevention)")]
+    Smep,
+    /// x86 supervisor-mode access prevention,
+    /// `CPUID.(EAX=07H,ECX=0):EBX[20]`.
+    #[error("SMAP (supervisor-mode access prevention)")]
+    Smap,
+    /// x86 `IA32_ARCH_CAPABILITIES.RDCL_NO`, bit 0 of an MSR that
+    /// `CPUID.(EAX=07H,ECX=0):EDX[29]` declares.
+    #[error("RDCL_NO (not affected by rogue data cache load)")]
+    RdclNo,
+    /// AArch64 FEAT_PAN, `ID_AA64MMFR1_EL1.PAN` nonzero.
+    #[error("FEAT_PAN (privileged access never)")]
+    Pan,
+    /// AArch64 FEAT_CSV3, `ID_AA64PFR0_EL1.CSV3` nonzero.
+    #[error("FEAT_CSV3 (not affected by rogue data cache load)")]
+    Csv3,
+}
+
+/// Why a platform offers no native user execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum NativeUnavailable {
+    #[error("this platform has no native user execution")]
+    Unsupported,
+    #[error("native user execution requires {0}, which this processor lacks")]
+    MissingProtection(Protection),
 }
 
 /// Why a native operation was refused. Every refusal leaves the space or

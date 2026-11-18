@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/google/gvisor",
+  "tag": "release-20261102.0",
+  "revision": "7a675ac66a1e2357abdaa6cccedabcd3cce9aa5c",
+  "url": "https://github.com/google/gvisor/archive/7a675ac66a1e2357abdaa6cccedabcd3cce9aa5c.tar.gz",
+  "sha256": "c80f43adf09f132019c943fdac1391a99b696744880aafbbeb1414146a566896",
+  "bazel": {
+    "version": "8.8.1",
+    "x86_64": {
+      "url": "https://github.com/bazelbuild/bazel/releases/download/8.8.1/bazel-8.8.1-linux-x86_64",
+      "sha256": "5b5bab2095065817d3416ca9a0678bd39c10c9ede432dbe8187bfe74de285160"
+    },
+    "aarch64": {
+      "url": "https://github.com/bazelbuild/bazel/releases/download/8.8.1/bazel-8.8.1-linux-arm64",
+      "sha256": "41ad5f9e833fcaee7398111343570cb155ca14985abb084b1f0ad2d29eaaec6d"
+    }
+  }
+}

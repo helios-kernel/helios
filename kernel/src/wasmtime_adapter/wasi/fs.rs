@@ -270,6 +270,12 @@ where
             {
                 return Err(fs_types::ErrorCode::Exist);
             }
+            if existing.kind == NodeKind::Symlink {
+                return Err(fs_types::ErrorCode::Loop);
+            }
+            if let Some(refusal) = existing.kind.open_refusal() {
+                return Err(fs_error_code(refusal));
+            }
             let directory = existing.kind == NodeKind::Directory;
             if open_flags.contains(fs_types::OpenFlags::DIRECTORY) && !directory {
                 return Err(fs_types::ErrorCode::NotDirectory);
@@ -294,7 +300,7 @@ where
                 return Err(fs_types::ErrorCode::NoEntry);
             };
             if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
-                return Err(fs_types::ErrorCode::Unsupported);
+                return Err(fs_types::ErrorCode::Invalid);
             }
             let flags = effective_open_descriptor_flags(base.flags, requested, FsNodeKind::File)?;
             (create_file(&resolved, mutate, now).await?, flags)
@@ -417,14 +423,20 @@ where
         .map_err(fs_error_code)
 }
 
-/// How a path below `base` follows a final symbolic link: when the guest
-/// asks it to, and then never out of `base`.
-pub(crate) fn follow_within(base: &FsDescriptor, path_flags: fs_types::PathFlags) -> Follow<'_> {
+/// How a path below `floor` follows a final symbolic link: when the guest
+/// asks it to, and then never out of `floor`.
+pub(crate) fn follow_within_path(floor: &str, path_flags: fs_types::PathFlags) -> Follow<'_> {
     if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
-        Follow::Within(&base.path)
+        Follow::Within(floor)
     } else {
         Follow::No
     }
+}
+
+/// How a path below `base` follows a final symbolic link: when the guest
+/// asks it to, and then never out of `base`.
+pub(crate) fn follow_within(base: &FsDescriptor, path_flags: fs_types::PathFlags) -> Follow<'_> {
+    follow_within_path(&base.path, path_flags)
 }
 
 /// Describes the object `absolute` names, following a final symbolic link
@@ -726,6 +738,7 @@ where
     set_times_of(
         namespace,
         &target.descriptor().path,
+        Follow::No,
         access_nanos,
         modified_nanos,
         now,
@@ -737,6 +750,8 @@ where
 /// alone.
 pub struct PreparedSetTimesAt<StorageImpl: crate::Storage> {
     namespace: Namespace<StorageImpl>,
+    floor: String,
+    path_flags: fs_types::PathFlags,
     absolute: String,
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
@@ -747,14 +762,18 @@ impl<StorageImpl: crate::Storage> PreparedSetTimesAt<StorageImpl> {
     pub(crate) fn new(
         namespace: Namespace<StorageImpl>,
         base: Granted<'_, Directory, Retime>,
+        path_flags: fs_types::PathFlags,
         path: &str,
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         now: u64,
     ) -> FsOpResult<Self> {
+        let floor = base.descriptor().path.clone();
         let absolute = child_path(base.descriptor(), path)?;
         Ok(Self {
             namespace,
+            floor,
+            path_flags,
             absolute,
             access_nanos,
             modified_nanos,
@@ -766,6 +785,7 @@ impl<StorageImpl: crate::Storage> PreparedSetTimesAt<StorageImpl> {
         set_times_of(
             &self.namespace,
             &self.absolute,
+            follow_within_path(&self.floor, self.path_flags),
             self.access_nanos,
             self.modified_nanos,
             self.now,
@@ -777,6 +797,7 @@ impl<StorageImpl: crate::Storage> PreparedSetTimesAt<StorageImpl> {
 pub(crate) async fn set_times_at<StorageImpl: crate::Storage>(
     namespace: &Namespace<StorageImpl>,
     base: Granted<'_, Directory, Retime>,
+    path_flags: fs_types::PathFlags,
     path: &str,
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
@@ -785,6 +806,7 @@ pub(crate) async fn set_times_at<StorageImpl: crate::Storage>(
     PreparedSetTimesAt::new(
         namespace.clone(),
         base,
+        path_flags,
         path,
         access_nanos,
         modified_nanos,
@@ -797,6 +819,7 @@ pub(crate) async fn set_times_at<StorageImpl: crate::Storage>(
 async fn set_times_of<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     absolute: &str,
+    follow: Follow<'_>,
     access_nanos: Option<u64>,
     modified_nanos: Option<u64>,
     now: u64,
@@ -804,7 +827,10 @@ async fn set_times_of<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    let resolved = resolve(namespace, absolute)?;
+    let resolved = namespace
+        .resolve_following(absolute, follow)
+        .await
+        .map_err(fs_error_code)?;
     resolved
         .writable()
         .map_err(fs_error_code)?
@@ -2018,7 +2044,7 @@ where
     fn prepare_set_times_at(
         store: &mut &mut StoreData<CpuImpl, Net, StorageImpl>,
         descriptor: Resource<FsDescriptor>,
-        _: fs_types::PathFlags,
+        path_flags: fs_types::PathFlags,
         path: &str,
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
@@ -2034,6 +2060,7 @@ where
             PreparedSetTimesAt::new(
                 namespace,
                 base.grant()?,
+                path_flags,
                 path,
                 access_nanos,
                 modified_nanos,
@@ -2674,6 +2701,7 @@ mod borrowed_request_tests {
         let times = PreparedSetTimesAt::new(
             namespace.clone(),
             root.grant().unwrap(),
+            fs_types::PathFlags::empty(),
             "中文-日本語-한국어/renamed",
             Some(5),
             Some(6),

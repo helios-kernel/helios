@@ -9,6 +9,47 @@ mod stream;
 pub(crate) use stream::*;
 mod host_env;
 pub(crate) use host_env::*;
+
+/// Defines `add_to_linker` and, for tests, `LINKED_INTERFACES` from one
+/// table, so the list of interfaces the linker serves is the list the code
+/// links and cannot drift from it.
+///
+/// By default each entry is linked only when `imports.has(name, "0.3")`;
+/// `when <cond>` overrides that predicate (for example when `wasi:http/client`
+/// also requires `wasi:http/types`).
+macro_rules! linked_interfaces {
+    (
+        $linker:ident, $imports:ident;
+        $($name:literal $(when $cond:expr)? => $link:expr;)+
+    ) => {
+        #[cfg(test)]
+        pub(crate) const LINKED_INTERFACES: &[&str] = &[$($name),+];
+
+        pub(crate) fn add_to_linker<CpuImpl, Net, StorageImpl>(
+            $linker: &mut wasmtime::component::Linker<StoreData<CpuImpl, Net, StorageImpl>>,
+            $imports: &WasiImportSet,
+        ) -> Result<()>
+        where
+            CpuImpl: Cpu + Clone,
+            Net: ComponentHostNetwork,
+            StorageImpl: crate::Storage,
+        {
+            $(
+                if linked_interfaces!(@cond $imports, $name $(, $cond)?) {
+                    $link?;
+                }
+            )+
+            Ok(())
+        }
+    };
+    (@cond $imports:ident, $name:literal) => {
+        $imports.has($name, "0.3")
+    };
+    (@cond $imports:ident, $name:literal, $cond:expr) => {
+        $cond
+    };
+}
+
 pub(crate) mod http;
 pub(crate) use http::*;
 

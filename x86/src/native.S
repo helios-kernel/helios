@@ -73,6 +73,9 @@ helios_x86_native_syscall:
 .global helios_x86_native_trap_exit
 helios_x86_native_trap_exit:
     swapgs
+    // An exception keeps the user's RFLAGS.AC, which would lift SMAP for
+    // the kernel; SYSCALL clears it through FMASK.
+    clac
 helios_x86_native_exit:
     // Registers already have the same layout as the ordinary exception frame.
     cld
@@ -119,4 +122,18 @@ helios_x86_native_exit:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+// The ring-0 load and store of `native::verify_user_isolation`, on the
+// user page in RDI. Each faults at its first instruction while SMAP
+// holds, and the page-fault dispatcher resumes at the return address the
+// caller's `call` pushed.
+.global helios_x86_isolation_load
+helios_x86_isolation_load:
+    mov rax, [rdi]
+    ret
+
+.global helios_x86_isolation_store
+helios_x86_isolation_store:
+    mov [rdi + 8], rdi
     ret

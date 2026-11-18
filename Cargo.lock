@@ -3157,6 +3157,7 @@ dependencies = [
  "helios-kernel",
  "helios-tpm",
  "helios-virtio",
+ "helios-x86-vmm",
  "i6300esb",
  "libm",
  "limine 0.5.0",
@@ -3164,6 +3165,16 @@ dependencies = [
  "spin 0.9.9",
  "tracing",
  "x86",
+ "x86_64",
+]
+
+[[package]]
+name = "helios-x86-vmm"
+version = "0.1.0"
+dependencies = [
+ "helios-hal",
+ "helios-kernel",
+ "spin 0.9.9",
  "x86_64",
 ]
 

@@ -163,6 +163,17 @@
     ],
     "exclusive": true
   },
+  "linux-syscalls": {
+    "surfaces": ["linux_abi"],
+    "exclusive": true,
+    "guest-wasm": "release"
+  },
+  "linux-syscalls-full": {
+    "heavy": true,
+    "surfaces": ["linux_abi"],
+    "exclusive": true,
+    "guest-wasm": "release"
+  },
   "test-btrfs-fuzz": {
     "surfaces": [
       "btrfs",

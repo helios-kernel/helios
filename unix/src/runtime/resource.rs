@@ -1,25 +1,28 @@
-use crate::{Epoll, EventFd, OpenFile};
+use crate::{Epoll, EventFd, OpenFile, Socket, SocketNetwork};
 use alloc::string::String;
 use alloc::sync::Arc;
 use bytes::Bytes;
 use core::sync::atomic::{AtomicU16, Ordering};
 use helios_sync::{ByteReader, ByteWriter};
-/// ABI-independent descriptor resources. File and socket adapters provide the
-/// platform's backing objects; UNIX object ownership is common to every ABI.
+/// ABI-independent descriptor resources. The file adapter provides the
+/// platform's backing file object and `Net` the network its sockets live
+/// on; UNIX object ownership, sockets included, is common to every ABI.
 ///
 /// One entry is one descriptor slot. Cloning it is POSIX duplication: the
 /// clone shares the open description, its status flags and, for a file, the
 /// [`OpenFile`] that holds the node and the offset, and only `close_on_exec`
-/// belongs to the slot.
+/// belongs to the slot. A socket's endpoint is shared the same way, but
+/// its state (which endpoint it holds, its options) is copied into the
+/// clone.
 #[derive(Clone)]
-pub struct FileDescriptorEntry<File: Clone, Socket: Clone, Data: Clone> {
-    pub descriptor: FileDescriptor<File, Socket, Data>,
+pub struct FileDescriptorEntry<File: Clone, Net: SocketNetwork, Data: Clone> {
+    pub descriptor: FileDescriptor<File, Net, Data>,
     pub close_on_exec: bool,
     fdflags: Arc<AtomicU16>,
 }
 
 #[derive(Clone)]
-pub enum FileDescriptor<File: Clone, Socket: Clone, Data: Clone> {
+pub enum FileDescriptor<File: Clone, Net: SocketNetwork, Data: Clone> {
     Stdin {
         carry: Bytes,
     },
@@ -38,13 +41,13 @@ pub enum FileDescriptor<File: Clone, Socket: Clone, Data: Clone> {
     },
     File(OpenFile<File>),
     NullDevice,
-    Socket(Socket),
+    Socket(Socket<Net>),
     Epoll(Epoll<Data>),
 }
 
-impl<File: Clone, Socket: Clone, Data: Clone> FileDescriptorEntry<File, Socket, Data> {
+impl<File: Clone, Net: SocketNetwork, Data: Clone> FileDescriptorEntry<File, Net, Data> {
     /// A slot for a new open description, with no status flags set.
-    pub fn new(descriptor: FileDescriptor<File, Socket, Data>, close_on_exec: bool) -> Self {
+    pub fn new(descriptor: FileDescriptor<File, Net, Data>, close_on_exec: bool) -> Self {
         Self {
             descriptor,
             close_on_exec,
@@ -64,12 +67,12 @@ impl<File: Clone, Socket: Clone, Data: Clone> FileDescriptorEntry<File, Socket, 
 #[cfg(test)]
 mod tests {
     use super::{FileDescriptor, FileDescriptorEntry};
-    use crate::OpenFile;
+    use crate::{NoNetwork, OpenFile};
     use core::convert::Infallible;
 
     #[test]
     fn duplicate_shares_the_file_offset() {
-        let entry = FileDescriptorEntry::<&str, Infallible, u64>::new(
+        let entry = FileDescriptorEntry::<&str, NoNetwork, u64>::new(
             FileDescriptor::File(OpenFile::new("node")),
             false,
         );
@@ -86,7 +89,7 @@ mod tests {
 
     #[test]
     fn duplicate_shares_status_flags_but_not_close_on_exec() {
-        let entry = FileDescriptorEntry::<Infallible, Infallible, u64>::new(
+        let entry = FileDescriptorEntry::<Infallible, NoNetwork, u64>::new(
             FileDescriptor::NullDevice,
             false,
         );

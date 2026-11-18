@@ -13,16 +13,20 @@ use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::mem::offset_of;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use arm_sysregs::el1::registers::SctlrEl1;
 use helios_hal::hv::RegisterId;
 use helios_hal::native::{
     FaultKind, InstructionSet, NativeError, NativeExecution, Stop, UserContext, UserFault,
+    UserSpace,
 };
 use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_kernel::{
     NativeSpace, UserTranslation, allocate_user_frame_zeroed_on, deallocate_user_frame_on,
 };
+
+use crate::isolation::UserIsolation;
 
 const PAGE: u64 = 4096;
 /// The end of a 48-bit TTBR0 range (`TCR_EL1.T0SZ` = 16).
@@ -39,6 +43,10 @@ const AF: u64 = 1 << 10;
 const NOT_GLOBAL: u64 = 1 << 11;
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
+// Table descriptor PXNTable: nothing below the table is executable at
+// EL1, as Linux's `PUD_TABLE_PXN` and `PMD_TABLE_PXN` make every table
+// of a user address space.
+const PXN_TABLE: u64 = 1 << 59;
 const ADDRESS: u64 = 0x0000_ffff_ffff_f000;
 
 // SPSR_EL1: the NZCV flags user code keeps; M = 0 is EL0t (AArch64, so
@@ -192,7 +200,7 @@ impl Aarch64Tables {
                 // before the descriptor that names it (`dsb` in `publish`).
                 unsafe {
                     asm!("dsb ishst", options(nostack, preserves_flags));
-                    entry.write_volatile(physical | TABLE);
+                    entry.write_volatile(physical | TABLE | PXN_TABLE);
                 }
                 physical
             };
@@ -496,4 +504,187 @@ const _: () = {
 
 unsafe extern "C" {
     fn helios_aarch64_native_enter(switch: *mut Switch);
+    fn helios_aarch64_isolation_load();
+    fn helios_aarch64_isolation_store();
+}
+
+// `ESR_EL1.EC` classes taken without a change of exception level.
+const EC_INSTRUCTION_ABORT_SAME: u64 = 0x21;
+const EC_DATA_ABORT_SAME: u64 = 0x25;
+// `RET` (Arm ARM C6.2, RET with x30), little-endian.
+const RET: [u8; 4] = 0xd65f_03c0_u32.to_le_bytes();
+/// Marks a recorded syndrome; `ESR_EL1` bit 63 is RES0.
+const RECORDED: u64 = 1 << 63;
+
+/// One processor's record of [`verify_user_isolation`]: the first of the
+/// two user pages under test while the check runs, and the syndrome of
+/// each EL1 access the processor refused there. Written by its processor
+/// only, from the check and from the synchronous exception handler it
+/// raises.
+pub(crate) struct IsolationProbe {
+    code: AtomicU64,
+    fetch: AtomicU64,
+    load: AtomicU64,
+    store: AtomicU64,
+}
+
+impl IsolationProbe {
+    pub(crate) const fn new() -> Self {
+        Self {
+            code: AtomicU64::new(0),
+            fetch: AtomicU64::new(0),
+            load: AtomicU64::new(0),
+            store: AtomicU64::new(0),
+        }
+    }
+
+    /// Records an EL1 abort with syndrome `esr` at `far` when it is on the
+    /// pages under test, and says whether it was.
+    pub(crate) fn claim(&self, esr: usize, far: usize) -> bool {
+        let code = self.code.load(Ordering::Relaxed);
+        if code == 0 || !(code..code + 2 * PAGE).contains(&(far as u64)) {
+            return false;
+        }
+        let esr = esr as u64;
+        let slot = match esr >> 26 {
+            EC_INSTRUCTION_ABORT_SAME => &self.fetch,
+            EC_DATA_ABORT_SAME if esr & ISS_WNR != 0 => &self.store,
+            EC_DATA_ABORT_SAME => &self.load,
+            _ => return false,
+        };
+        slot.store(esr | RECORDED, Ordering::Relaxed);
+        true
+    }
+}
+
+/// Proves, on the calling processor, that EL1 can neither fetch from nor
+/// load from nor store to a user page: the PXN and PAN half of the
+/// isolation contract, checked against a page this module mapped.
+///
+/// The check maps a user code page and a user data page in a fresh space,
+/// loads the space's TTBR0 and TCR as a slice entry does, and from EL1
+/// branches with link to the code page, then to the load and store
+/// helpers of `native.S` on the data page. Each access must raise a
+/// permission fault, which the synchronous exception handler records
+/// through [`IsolationProbe::claim`] and answers by resuming at the
+/// branch's return address. An access that completes instead is a boot
+/// failure naming the protection that is not in effect.
+///
+/// A processor without the whole contract runs no user code, so there is
+/// nothing to check on it.
+pub(crate) fn verify_user_isolation(isolation: UserIsolation) {
+    let processor = helios_hal::cpu::current_processor();
+    if let Err(reason) = isolation.require() {
+        tracing::warn!(
+            target: "helios_aarch64::native",
+            processor = processor.id(),
+            %reason,
+            "native user execution is unavailable"
+        );
+        return;
+    }
+    // An executable page that EL0 cannot write, so that PXN alone refuses
+    // the fetch (EL1 never executes an EL0-writable page whatever its
+    // PXN), and a writable page above it for the load and the store.
+    let code = Aarch64Native.user_range().start;
+    let data = VirtAddr::new(code.raw() + PAGE as usize);
+    let space = Aarch64Native.create_space().unwrap_or_else(|error| {
+        panic!("AArch64 isolation check could not create a space: {error}")
+    });
+    for (page, contents, flags) in [
+        (code, &RET[..], PageFlags::READ | PageFlags::EXECUTE),
+        (data, &[][..], PageFlags::READ | PageFlags::WRITE),
+    ] {
+        space
+            .map(VirtRange::new(page, PAGE as usize), contents, flags)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "AArch64 isolation check could not map user page {:#x}: {error}",
+                    page.raw()
+                )
+            });
+    }
+    let probe = &crate::current_processor_runtime().isolation_probe;
+    let slice = space.begin_slice();
+    let user_ttbr0 = slice.with_tables(|tables| tables.root_physical());
+    let tcr: u64;
+    // SAFETY: reads a system register.
+    unsafe { asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack, preserves_flags)) };
+    let user_tcr =
+        (tcr & !crate::lifecycle::IDMAP_TCR_TTBR0_MASK) | crate::lifecycle::IDMAP_TCR_TTBR0;
+    probe.code.store(code.raw() as u64, Ordering::Relaxed);
+    let daif = crate::read_daif();
+    crate::mask_irq();
+    // SAFETY: IRQs are masked from here to the restore below. TTBR0 holds
+    // no kernel mapping this code, its stack or the exception handler
+    // reach, so swapping it for the space's changes nothing they use, and
+    // the TLBI after each swap leaves no translation of the other behind.
+    // Every access to a user page either faults, and resumes at its
+    // branch's return address, or runs the `ret` and the helpers, which
+    // change nothing but x0, x1 and the data page.
+    unsafe {
+        asm!(
+            "mrs {kernel_ttbr0}, ttbr0_el1",
+            "msr tcr_el1, {user_tcr}",
+            "msr ttbr0_el1, {user_ttbr0}",
+            "isb",
+            "tlbi aside1, xzr",
+            "dsb nsh",
+            "isb",
+            "blr x0",
+            "mov x0, x2",
+            "bl {load}",
+            "bl {store}",
+            "msr tcr_el1, {kernel_tcr}",
+            "msr ttbr0_el1, {kernel_ttbr0}",
+            "isb",
+            "tlbi aside1, xzr",
+            "dsb nsh",
+            "isb",
+            kernel_ttbr0 = out(reg) _,
+            user_tcr = in(reg) user_tcr,
+            user_ttbr0 = in(reg) user_ttbr0,
+            kernel_tcr = in(reg) tcr,
+            load = sym helios_aarch64_isolation_load,
+            store = sym helios_aarch64_isolation_store,
+            inout("x0") code.raw() => _,
+            out("x1") _,
+            in("x2") data.raw(),
+            out("x30") _,
+        );
+        crate::write_daif(daif);
+    }
+    probe.code.store(0, Ordering::Relaxed);
+    drop(slice);
+    drop(space);
+    let accesses = [
+        ("fetch from", &probe.fetch, code, "PXN"),
+        ("load from", &probe.load, data, "PSTATE.PAN"),
+        ("store to", &probe.store, data, "PSTATE.PAN"),
+    ];
+    for (access, slot, page, protection) in accesses {
+        let syndrome = slot.swap(0, Ordering::Relaxed);
+        assert!(
+            syndrome & RECORDED != 0,
+            "AArch64 processor {} completed an EL1 {access} user page {:#x}: {protection} is \
+             not in effect",
+            processor.id(),
+            page.raw()
+        );
+        let syndrome = syndrome & !RECORDED;
+        assert!(
+            (syndrome & 0x3f) >> 2 == FSC_PERMISSION,
+            "AArch64 processor {}'s EL1 {access} user page {:#x} faulted with syndrome \
+             {syndrome:#x}, not as the permission fault {protection} raises",
+            processor.id(),
+            page.raw()
+        );
+    }
+    tracing::info!(
+        target: "helios_aarch64::native",
+        processor = processor.id(),
+        code = code.raw(),
+        data = data.raw(),
+        "EL1 fetch from, load from and store to user pages fault"
+    );
 }

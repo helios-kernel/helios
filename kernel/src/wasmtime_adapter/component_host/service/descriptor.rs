@@ -81,9 +81,24 @@ fn descriptor_errno(error: helios_unix::DescriptorTableError) -> i32 {
     }
 }
 pub(super) type Preview1DescriptorEntry<Net> =
-    helios_unix::FileDescriptorEntry<FsDescriptor, WasixSocketDescriptor<Net>, EpollUserData>;
+    helios_unix::FileDescriptorEntry<FsDescriptor, crate::UnixNetwork<Net>, EpollUserData>;
 pub(super) type Preview1Descriptor<Net> =
-    helios_unix::FileDescriptor<FsDescriptor, WasixSocketDescriptor<Net>, EpollUserData>;
+    helios_unix::FileDescriptor<FsDescriptor, crate::UnixNetwork<Net>, EpollUserData>;
+
+/// The shared UNIX socket objects on the machine's network, as every
+/// descriptor table in this host (WASIX's and the Linux host's) holds them.
+pub(super) type UnixSocket<Net> = helios_unix::Socket<crate::UnixNetwork<Net>>;
+pub(super) type UnixTcpSocket<Net> = helios_unix::TcpSocket<crate::UnixNetwork<Net>>;
+pub(super) type UnixUdpSocket<Net> = helios_unix::UdpSocket<crate::UnixNetwork<Net>>;
+pub(super) type UnixSocketHandle<Net> = helios_unix::SocketHandle<crate::UnixNetwork<Net>>;
+/// The options a new socket on the machine's network starts with.
+pub(super) const fn unix_socket_options<Net: ComponentHostNetwork>() -> SocketOptions {
+    SocketOptions::for_network::<crate::UnixNetwork<Net>>()
+}
+pub(super) use helios_unix::{
+    OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, SocketFamily, SocketFlag, SocketKind,
+    SocketOptionError, SocketOptions, SocketSize, SocketTime,
+};
 
 pub(super) type EpollDescriptor = helios_unix::Epoll<EpollUserData>;
 pub(super) type EpollInterest = helios_unix::Interest<EpollUserData>;
@@ -248,7 +263,7 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
                 wait: reader.wait_state(),
             });
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. }))
+        Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. }))
             if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
         {
             wait.notified.push(EpollWaitTarget::ByteReader {
@@ -257,7 +272,7 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
             });
         }
         Some(Preview1Descriptor::PipeWrite { writer })
-        | Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. }))
+        | Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. }))
             if event_type == P1_EVENTTYPE_FD_WRITE && !writer.is_writable() =>
         {
             wait.notified.push(EpollWaitTarget::ByteWriter {
@@ -296,10 +311,8 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
             }
         }
         Some(Preview1Descriptor::Socket(
-            WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Connected { .. } | WasixTcpSocket::Listening { .. },
-            )
-            | WasixSocketDescriptor::Udp(WasixUdpSocket::Bound { .. }),
+            UnixSocket::Tcp(UnixTcpSocket::Connected { .. } | UnixTcpSocket::Listening { .. })
+            | UnixSocket::Udp(UnixUdpSocket::Bound { .. }),
         )) => wait.repoll = true,
         _ => {}
     }
@@ -333,15 +346,15 @@ where
         return Err(p1::errno::NETDOWN);
     };
     let readiness = match probe {
-        P1NetworkProbe::TcpStream(stream) => service
+        UnixSocketHandle::<Net>::TcpStream(stream) => service
             .tcp_readiness(stream)
             .await
             .map_err(p1_errno_from_tcp_error)?,
-        P1NetworkProbe::TcpListener(listener) => service
+        UnixSocketHandle::<Net>::TcpListener(listener) => service
             .tcp_listener_readiness(listener)
             .await
             .map_err(p1_errno_from_tcp_error)?,
-        P1NetworkProbe::UdpSocket(socket) => service
+        UnixSocketHandle::<Net>::UdpSocket(socket) => service
             .udp_readiness(socket)
             .await
             .map_err(p1_errno_from_udp_error)?,
@@ -368,414 +381,6 @@ pub(super) fn p1_readiness_from_socket(
     // send is window-limited rather than byte-counted; report one byte so
     // callers see a non-zero count and read what is actually there.
     P1Readiness::Ready { bytes: 1 }
-}
-
-#[derive(Clone)]
-pub(super) enum WasixSocketDescriptor<Net: ComponentHostNetwork> {
-    Tcp(WasixTcpSocket<Net>),
-    Udp(WasixUdpSocket<Net>),
-    Pair {
-        reader: crate::ByteReader,
-        writer: crate::ByteWriter,
-        carry: Bytes,
-        options: WasixSocketOptions,
-        socket_type: i32,
-    },
-}
-
-/// Address family a WASIX socket was opened with.
-///
-/// `socket(AF_INET6, ...)` and `socket(AF_INET, ...)` produce sockets
-/// that differ in what a wildcard bind means and in which peer
-/// addresses they accept, so the family is descriptor identity and
-/// travels with the socket through every state transition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WasixSocketFamily {
-    Ipv4,
-    Ipv6,
-}
-
-impl WasixSocketFamily {
-    /// The wildcard local address for this family: `0.0.0.0` or `::`.
-    pub(super) const fn unspecified_address(self) -> crate::NetworkIpAddress {
-        match self {
-            Self::Ipv4 => crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
-            Self::Ipv6 => crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED),
-        }
-    }
-
-    /// Whether an address supplied by the guest may be used on a socket
-    /// of this family. There is no v4-mapped-v6 path here: the netstack
-    /// keeps the two families in separate socket address spaces, so
-    /// accepting a v4 address on an v6 socket would silently produce a
-    /// socket that cannot be described back to the guest.
-    pub(super) const fn accepts(self, address: crate::NetworkIpAddress) -> bool {
-        matches!(
-            (self, address),
-            (Self::Ipv4, crate::NetworkIpAddress::Ipv4(_))
-                | (Self::Ipv6, crate::NetworkIpAddress::Ipv6(_))
-        )
-    }
-}
-
-/// A netstack TCP stream a preview1 descriptor owns.
-///
-/// The stream is retired when the last descriptor holding it goes away.
-/// That is the whole lifetime rule, and it covers every way a preview1
-/// socket can end: `fd_close` drops the table entry, `sock_shutdown`
-/// replaces it, an `exec` inherits a duplicate of it, and a program
-/// that simply exits takes its descriptor table with it. Retiring the
-/// stream from `fd_close` alone left the stream behind in that last
-/// case, which is how eleven connections outlived the programs that
-/// opened them in #184.
-pub(super) struct WasixOwnedTcpStream<Net: ComponentHostNetwork> {
-    service: Net,
-    stream: Net::TcpStream,
-}
-
-impl<Net: ComponentHostNetwork> WasixOwnedTcpStream<Net> {
-    pub(super) fn new(service: Net, stream: Net::TcpStream) -> Arc<Self> {
-        Arc::new(Self { service, stream })
-    }
-
-    pub(super) fn id(&self) -> Net::TcpStream {
-        self.stream
-    }
-}
-
-impl<Net: ComponentHostNetwork> Drop for WasixOwnedTcpStream<Net> {
-    fn drop(&mut self) {
-        self.service.tcp_close(self.stream);
-    }
-}
-
-/// A netstack TCP listener a preview1 descriptor owns.
-///
-/// The same rule as [`WasixOwnedTcpStream`], for the same reason: the
-/// listener is retired when the last descriptor holding it goes away,
-/// which covers `fd_close`, the duplicate an `exec` inherits, and the
-/// table a program takes with it when it exits. Nothing on any of those
-/// paths touched the listener before — the network service had no
-/// `tcp_listener_close` at all — so every listener a program opened
-/// stayed in its shard for the rest of the boot, holding the local port
-/// that `is_tcp_local_port_free` consults (#191).
-pub(super) struct WasixOwnedTcpListener<Net: ComponentHostNetwork> {
-    service: Net,
-    listener: Net::TcpListener,
-}
-
-impl<Net: ComponentHostNetwork> WasixOwnedTcpListener<Net> {
-    pub(super) fn new(service: Net, listener: Net::TcpListener) -> Arc<Self> {
-        Arc::new(Self { service, listener })
-    }
-
-    pub(super) fn id(&self) -> Net::TcpListener {
-        self.listener
-    }
-}
-
-impl<Net: ComponentHostNetwork> Drop for WasixOwnedTcpListener<Net> {
-    fn drop(&mut self) {
-        self.service.tcp_listener_close(self.listener);
-    }
-}
-
-#[derive(Clone)]
-pub(super) enum WasixTcpSocket<Net: ComponentHostNetwork> {
-    Unconnected {
-        family: WasixSocketFamily,
-        options: WasixSocketOptions,
-    },
-    Bound {
-        family: WasixSocketFamily,
-        local_port: u16,
-        options: WasixSocketOptions,
-    },
-    Listening {
-        family: WasixSocketFamily,
-        listener: Arc<WasixOwnedTcpListener<Net>>,
-        local_port: u16,
-        options: WasixSocketOptions,
-    },
-    Connected {
-        family: WasixSocketFamily,
-        stream: Arc<WasixOwnedTcpStream<Net>>,
-        peer_address: crate::NetworkIpAddress,
-        peer_port: u16,
-        options: WasixSocketOptions,
-    },
-}
-
-/// A netstack datagram socket a preview1 descriptor owns.
-///
-/// The same rule as [`WasixOwnedTcpStream`], for the same reason: the
-/// socket is retired when the last descriptor holding it goes away,
-/// which covers `fd_close`, the `sock_shutdown` that unbinds it, the
-/// duplicate an `exec` inherits, and the table a program takes with it
-/// when it exits. Nothing on any of those paths touched the netstack
-/// socket before, so a datagram socket stayed installed on every shard
-/// with its slot in `udp_slots` held (#190).
-pub(super) struct WasixOwnedUdpSocket<Net: ComponentHostNetwork> {
-    service: Net,
-    socket: Net::UdpSocket,
-}
-
-impl<Net: ComponentHostNetwork> WasixOwnedUdpSocket<Net> {
-    pub(super) fn new(service: Net, socket: Net::UdpSocket) -> Arc<Self> {
-        Arc::new(Self { service, socket })
-    }
-
-    pub(super) fn id(&self) -> Net::UdpSocket {
-        self.socket
-    }
-}
-
-impl<Net: ComponentHostNetwork> Drop for WasixOwnedUdpSocket<Net> {
-    fn drop(&mut self) {
-        self.service.udp_close(self.socket);
-    }
-}
-
-#[derive(Clone)]
-pub(super) enum WasixUdpSocket<Net: ComponentHostNetwork> {
-    Unbound {
-        family: WasixSocketFamily,
-        options: WasixSocketOptions,
-    },
-    Bound {
-        family: WasixSocketFamily,
-        socket: Arc<WasixOwnedUdpSocket<Net>>,
-        local_port: u16,
-        options: WasixSocketOptions,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct WasixSocketOptions {
-    pub(super) flag_bits: u32,
-    pub(super) receive_buffer_size: u64,
-    pub(super) send_buffer_size: u64,
-    pub(super) receive_low_water: u64,
-    pub(super) send_low_water: u64,
-    pub(super) ttl: u64,
-    pub(super) multicast_ttl_v4: u64,
-    pub(super) receive_timeout: Option<u64>,
-    pub(super) send_timeout: Option<u64>,
-    pub(super) connect_timeout: Option<u64>,
-    pub(super) accept_timeout: Option<u64>,
-    pub(super) linger: Option<u64>,
-}
-
-impl Default for WasixSocketOptions {
-    fn default() -> Self {
-        Self {
-            flag_bits: 0,
-            receive_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
-            send_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
-            receive_low_water: DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES,
-            send_low_water: DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES,
-            ttl: DEFAULT_WASIX_SOCKET_TTL,
-            multicast_ttl_v4: DEFAULT_WASIX_SOCKET_MULTICAST_TTL,
-            receive_timeout: None,
-            send_timeout: None,
-            connect_timeout: None,
-            accept_timeout: None,
-            linger: None,
-        }
-    }
-}
-
-impl WasixSocketOptions {
-    /// Records a boolean socket option, refusing the ones the netstack has no
-    /// mechanism for.
-    ///
-    /// `SO_KEEPALIVE` has no keepalive timer behind it, and `TCP_NODELAY`
-    /// cleared is a request for Nagle's algorithm, which the stack does not
-    /// implement — it transmits as soon as the window allows. Accepting either
-    /// would report a behaviour change that never happens, so both are
-    /// answered with `ENOTSUP`; clearing keepalive and setting nodelay
-    /// describe what the stack already does and succeed.
-    pub(super) fn set_flag(&mut self, option: i32, flag: bool) -> i32 {
-        let bit = match wasix_socket_flag_bit(option) {
-            Ok(bit) => bit,
-            Err(errno) => return errno,
-        };
-        match (option, flag) {
-            (WASIX_SOCK_OPTION_KEEP_ALIVE, true) | (WASIX_SOCK_OPTION_NO_DELAY, false) => {
-                return p1::errno::NOTSUP;
-            }
-            _ => {}
-        }
-        if flag {
-            self.flag_bits |= bit;
-        } else {
-            self.flag_bits &= !bit;
-        }
-        p1::errno::SUCCESS
-    }
-
-    /// Records a sized socket option.
-    ///
-    /// Buffer sizes clamp to what the netstack actually reserves per socket so
-    /// a read-back reports the effective value; `IP_TTL` is range-checked here
-    /// and pushed to the live socket by the syscall wrapper.
-    pub(super) fn set_size(&mut self, option: i32, size: u64) -> i32 {
-        match option {
-            WASIX_SOCK_OPTION_RECV_BUF_SIZE => {
-                self.receive_buffer_size = size.min(WASIX_SOCKET_RECEIVE_BUFFER_CEILING);
-            }
-            WASIX_SOCK_OPTION_SEND_BUF_SIZE => {
-                self.send_buffer_size = size.min(WASIX_SOCKET_SEND_BUFFER_CEILING);
-            }
-            WASIX_SOCK_OPTION_RECV_LOWAT => self.receive_low_water = size,
-            WASIX_SOCK_OPTION_SEND_LOWAT => self.send_low_water = size,
-            WASIX_SOCK_OPTION_TTL => {
-                if size == 0 || size > u64::from(u8::MAX) {
-                    return p1::errno::INVAL;
-                }
-                self.ttl = size;
-            }
-            WASIX_SOCK_OPTION_MULTICAST_TTL_V4 => self.multicast_ttl_v4 = size,
-            WASIX_SOCK_OPTION_TYPE | WASIX_SOCK_OPTION_PROTO => return p1::errno::INVAL,
-            _ => return p1::errno::INVAL,
-        }
-        p1::errno::SUCCESS
-    }
-
-    /// TTL to stamp on this socket's packets, as a netstack hop limit.
-    pub(super) fn hop_limit(self) -> u8 {
-        u8::try_from(self.ttl).unwrap_or(helios_netstack::DEFAULT_HOP_LIMIT)
-    }
-
-    pub(super) fn size(self, option: i32) -> Result<u64, i32> {
-        match option {
-            WASIX_SOCK_OPTION_RECV_BUF_SIZE => Ok(self.receive_buffer_size),
-            WASIX_SOCK_OPTION_SEND_BUF_SIZE => Ok(self.send_buffer_size),
-            WASIX_SOCK_OPTION_RECV_LOWAT => Ok(self.receive_low_water),
-            WASIX_SOCK_OPTION_SEND_LOWAT => Ok(self.send_low_water),
-            WASIX_SOCK_OPTION_TTL => Ok(self.ttl),
-            WASIX_SOCK_OPTION_MULTICAST_TTL_V4 => Ok(self.multicast_ttl_v4),
-            WASIX_SOCK_OPTION_TYPE | WASIX_SOCK_OPTION_PROTO => Err(p1::errno::INVAL),
-            _ => Err(p1::errno::INVAL),
-        }
-    }
-
-    pub(super) fn flag(self, option: i32) -> Result<bool, i32> {
-        let bit = wasix_socket_flag_bit(option)?;
-        Ok(self.flag_bits & bit != 0)
-    }
-
-    pub(super) fn set_time(&mut self, option: i32, time: Option<u64>) -> i32 {
-        match option {
-            WASIX_SOCK_OPTION_RECV_TIMEOUT => self.receive_timeout = time,
-            WASIX_SOCK_OPTION_SEND_TIMEOUT => self.send_timeout = time,
-            WASIX_SOCK_OPTION_CONNECT_TIMEOUT => self.connect_timeout = time,
-            WASIX_SOCK_OPTION_ACCEPT_TIMEOUT => self.accept_timeout = time,
-            WASIX_SOCK_OPTION_LINGER => self.linger = time,
-            _ => return p1::errno::INVAL,
-        }
-        p1::errno::SUCCESS
-    }
-
-    pub(super) fn time(self, option: i32) -> Result<Option<u64>, i32> {
-        match option {
-            WASIX_SOCK_OPTION_RECV_TIMEOUT => Ok(self.receive_timeout),
-            WASIX_SOCK_OPTION_SEND_TIMEOUT => Ok(self.send_timeout),
-            WASIX_SOCK_OPTION_CONNECT_TIMEOUT => Ok(self.connect_timeout),
-            WASIX_SOCK_OPTION_ACCEPT_TIMEOUT => Ok(self.accept_timeout),
-            WASIX_SOCK_OPTION_LINGER => Ok(self.linger),
-            _ => Err(p1::errno::INVAL),
-        }
-    }
-}
-
-impl<Net: ComponentHostNetwork> WasixSocketDescriptor<Net> {
-    pub(super) fn options(&self) -> &WasixSocketOptions {
-        match self {
-            WasixSocketDescriptor::Tcp(socket) => socket.options(),
-            WasixSocketDescriptor::Udp(socket) => socket.options(),
-            WasixSocketDescriptor::Pair { options, .. } => options,
-        }
-    }
-
-    pub(super) fn options_mut(&mut self) -> &mut WasixSocketOptions {
-        match self {
-            WasixSocketDescriptor::Tcp(socket) => socket.options_mut(),
-            WasixSocketDescriptor::Udp(socket) => socket.options_mut(),
-            WasixSocketDescriptor::Pair { options, .. } => options,
-        }
-    }
-
-    pub(super) fn socket_type(&self) -> i32 {
-        match self {
-            WasixSocketDescriptor::Tcp(_) => WASIX_SOCK_TYPE_STREAM,
-            WasixSocketDescriptor::Udp(_) => WASIX_SOCK_TYPE_DGRAM,
-            WasixSocketDescriptor::Pair { socket_type, .. } => *socket_type,
-        }
-    }
-
-    pub(super) fn protocol(&self) -> u64 {
-        match self {
-            WasixSocketDescriptor::Tcp(_) => WASIX_IPPROTO_TCP,
-            WasixSocketDescriptor::Udp(_) => WASIX_IPPROTO_UDP,
-            WasixSocketDescriptor::Pair { .. } => 0,
-        }
-    }
-}
-
-impl<Net: ComponentHostNetwork> WasixTcpSocket<Net> {
-    pub(super) fn options(&self) -> &WasixSocketOptions {
-        match self {
-            WasixTcpSocket::Unconnected { options, .. }
-            | WasixTcpSocket::Bound { options, .. }
-            | WasixTcpSocket::Listening { options, .. }
-            | WasixTcpSocket::Connected { options, .. } => options,
-        }
-    }
-
-    pub(super) fn options_mut(&mut self) -> &mut WasixSocketOptions {
-        match self {
-            WasixTcpSocket::Unconnected { options, .. }
-            | WasixTcpSocket::Bound { options, .. }
-            | WasixTcpSocket::Listening { options, .. }
-            | WasixTcpSocket::Connected { options, .. } => options,
-        }
-    }
-
-    pub(super) fn family(&self) -> WasixSocketFamily {
-        match self {
-            WasixTcpSocket::Unconnected { family, .. }
-            | WasixTcpSocket::Bound { family, .. }
-            | WasixTcpSocket::Listening { family, .. }
-            | WasixTcpSocket::Connected { family, .. } => *family,
-        }
-    }
-}
-
-impl<Net: ComponentHostNetwork> WasixUdpSocket<Net> {
-    pub(super) fn options(&self) -> &WasixSocketOptions {
-        match self {
-            WasixUdpSocket::Unbound { options, .. } | WasixUdpSocket::Bound { options, .. } => {
-                options
-            }
-        }
-    }
-
-    pub(super) fn options_mut(&mut self) -> &mut WasixSocketOptions {
-        match self {
-            WasixUdpSocket::Unbound { options, .. } | WasixUdpSocket::Bound { options, .. } => {
-                options
-            }
-        }
-    }
-
-    pub(super) fn family(&self) -> WasixSocketFamily {
-        match self {
-            WasixUdpSocket::Unbound { family, .. } | WasixUdpSocket::Bound { family, .. } => {
-                *family
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1577,14 +1182,7 @@ impl P1Readiness {
 /// socket as "not ready" when it simply never asked the network.
 pub(super) enum P1Probe<Net: ComponentHostNetwork> {
     Local(P1Readiness),
-    Network(P1NetworkProbe<Net>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum P1NetworkProbe<Net: ComponentHostNetwork> {
-    TcpStream(Net::TcpStream),
-    TcpListener(Net::TcpListener),
-    UdpSocket(Net::UdpSocket),
+    Network(UnixSocketHandle<Net>),
 }
 
 /// Probe every descriptor whose readiness is answerable from local state.
@@ -1615,7 +1213,7 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
             })
         }
         (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })),
+            Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })),
             P1_EVENTTYPE_FD_READ,
         ) => {
             if !carry.is_empty() {
@@ -1659,7 +1257,7 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // write itself reports the error.
         (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE)
         | (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })),
+            Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })),
             P1_EVENTTYPE_FD_WRITE,
         ) => {
             if writer.is_writable() {
@@ -1682,39 +1280,19 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
                 bytes: usize::MAX as u64,
             })
         }
+        // A network socket's readiness is the network's answer for the
+        // endpoint it owns. One with no endpoint yet can never make
+        // progress; it is not an error to poll it, it simply never becomes
+        // ready.
         (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Connected { stream, .. },
-            ))),
+            Some(Preview1Descriptor::Socket(
+                socket @ (UnixSocket::<Net>::Tcp(_) | UnixSocket::<Net>::Udp(_)),
+            )),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpStream(stream.id()))),
-        (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Listening { listener, .. },
-            ))),
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpListener(listener.id()))),
-        (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
-                socket,
-                ..
-            }))),
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(P1Probe::Network(P1NetworkProbe::UdpSocket(socket.id()))),
-        // A socket with no endpoint yet can never make progress; it is not
-        // an error to poll it, it simply never becomes ready.
-        (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Unconnected { .. } | WasixTcpSocket::Bound { .. },
-            ))),
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        )
-        | (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                ..
-            }))),
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => local(P1Readiness::Pending),
+        ) => match socket.handle() {
+            Some(handle) => Ok(P1Probe::Network(handle)),
+            None => local(P1Readiness::Pending),
+        },
         (Some(_), _) => Err(p1::errno::INVAL),
         (None, _) => Err(p1::errno::BADF),
     }
