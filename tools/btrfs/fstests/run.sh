@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Runs the unmodified upstream fstests `generic/quick` group against Helios's
-# btrfs writer, mounted through FUSE by the `fuse-btrfs` example, then checks
-# both test devices with `btrfs check`, runs the crash-consistency replay of
-# crash.sh, and replays the pending-log images of log-replay.sh against
-# Linux's own replay. Needs root (losetup, mount, dmsetup) and the build
-# dependencies of fstests, btrfs-progs and fuse3.
+# Replays the pending-log images of log-replay.sh against Linux's own replay,
+# runs the unmodified upstream fstests `generic/quick` group against Helios's
+# btrfs writer mounted through FUSE by the `fuse-btrfs` example, then checks
+# both test devices with `btrfs check` and runs the crash-consistency replay of
+# crash.sh. Needs root (losetup, mount, dmsetup) and the build dependencies of
+# fstests, btrfs-progs and fuse3.
 #
 # fstests has no mkfs or fsck for FSTYP=fuse, so this formats the devices with
 # mkfs.btrfs and checks them with `btrfs check --readonly` itself.
@@ -144,6 +144,17 @@ done
 
 failed=()
 
+# Linux's btrfs, not the FUSE mount, makes these: images with a log pending,
+# which the unprivileged log replay tests read from $work/log-replay and hold
+# to Linux's own replay and `btrfs check`.
+echo "== log replay"
+if "$here/log-replay.sh" "$work/log-replay"; then
+    chmod a+rx "$work"
+    run_log_replay_tests "$work/log-replay" || failed+=("log_replay comparison failed")
+else
+    failed+=("log-replay.sh failed")
+fi
+
 echo "== fstests generic/quick"
 check_status=0
 (cd "$fstests" && ./check -g generic/quick -E "$here/expunged.txt") || check_status=$?
@@ -158,17 +169,6 @@ done
 
 echo "== crash consistency"
 "$here/crash.sh" || failed+=("crash.sh failed")
-
-# Linux's btrfs, not the FUSE mount, makes these: images with a log pending,
-# which the unprivileged log replay tests read from $work/log-replay and hold
-# to Linux's own replay and `btrfs check`.
-echo "== log replay"
-if "$here/log-replay.sh" "$work/log-replay"; then
-    chmod a+rx "$work"
-    run_log_replay_tests "$work/log-replay" || failed+=("log_replay comparison failed")
-else
-    failed+=("log-replay.sh failed")
-fi
 
 if ((${#failed[@]})); then
     printf 'fstests: %s\n' "${failed[@]}" >&2
