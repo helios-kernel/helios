@@ -11,7 +11,7 @@
 # Every entry of expunged.txt is `<test> # <one-line reason>`.
 #
 # Environment: HELIOS_FUSE_BTRFS (the fuse-btrfs binary, default
-# target/debug/examples/fuse-btrfs), HELIOS_FSTESTS_WORK (default target/fstests),
+# target/release/examples/fuse-btrfs), HELIOS_FSTESTS_WORK (default target/fstests),
 # HELIOS_FSTESTS_DEVICE_SIZE (default 10G), HELIOS_CRASH_SECONDS (see crash.sh).
 set -euo pipefail
 
@@ -22,8 +22,8 @@ root=$(cd "$here/../../.." && pwd)
 
 [[ $EUID -eq 0 ]] || die "run as root: it sets up loop devices, mounts and device-mapper targets"
 
-HELIOS_FUSE_BTRFS=${HELIOS_FUSE_BTRFS:-$root/target/debug/examples/fuse-btrfs}
-[[ -x "$HELIOS_FUSE_BTRFS" ]] || die "$HELIOS_FUSE_BTRFS is not an executable; build the fuse-btrfs example first"
+HELIOS_FUSE_BTRFS=${HELIOS_FUSE_BTRFS:-$root/target/release/examples/fuse-btrfs}
+[[ -x "$HELIOS_FUSE_BTRFS" ]] || die "$HELIOS_FUSE_BTRFS is not an executable; build the fuse-btrfs example with --release first"
 work=${HELIOS_FSTESTS_WORK:-$root/target/fstests}
 device_size=${HELIOS_FSTESTS_DEVICE_SIZE:-10G}
 # The log device records every write the crash workload makes.

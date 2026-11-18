@@ -3175,7 +3175,7 @@ jobs:
             libgdbm-compat-dev xfslibs-dev btrfs-progs fuse3 libclang-dev
       - name: Build the FUSE adapter
         working-directory: helios
-        run: cargo build --locked -p helios-btrfs --example fuse-btrfs --features test-support,write
+        run: cargo build --locked --release -p helios-btrfs --example fuse-btrfs --features test-support,write
       - name: Run fstests against the FUSE mount
         working-directory: helios
         run: sudo env "PATH=$PATH" tools/btrfs/fstests/run.sh
