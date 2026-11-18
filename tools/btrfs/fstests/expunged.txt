@@ -13,6 +13,7 @@ generic/484 # #1085: common/dmerror _dmerror_mount passes -t fuse without FUSE_S
 generic/563 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
 generic/604 # #1085: races mount against background umount while O_EXCL holds the device until unmount finishes
 generic/620 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
+generic/633 # #1037: vfstest setattr_truncate creates a file with S_ISUID; writer refuses setuid on non-directory creation
 generic/673 # #1037: chmod a+rws on a file, setuid is refused
 generic/674 # #1037: chmod a+rws on a file, setuid is refused
 generic/683 # #1037: chmod a+rws on a file, setuid is refused
@@ -20,6 +21,7 @@ generic/684 # #1037: chmod a+rws on a file, setuid is refused
 generic/685 # #1037: chmod a+rws on a file, setuid is refused
 generic/686 # #1037: chmod a+rws on a file, setuid is refused
 generic/687 # #1037: chmod a+rws on a file, setuid is refused
+generic/697 # fuse-btrfs mknod returns EPERM for non-regular files; vfstest setgid_create_acl calls mknodat for device nodes
 generic/704 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
 generic/726 # #1037: chmod a+rws on a file, setuid is refused
 generic/731 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
