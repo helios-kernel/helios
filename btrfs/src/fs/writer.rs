@@ -97,6 +97,8 @@ pub struct Attributes {
     /// The mode bits asked for, before the umask.
     pub permissions: u32,
     pub uid: u32,
+    /// The creating process's group; overridden by the parent directory's
+    /// when the parent carries `S_ISGID`, as `inode_init_owner` does.
     pub gid: u32,
     /// The creating process's umask. As in Linux's `posix_acl_create`, it
     /// narrows `permissions` only when the parent directory has no default
@@ -630,9 +632,10 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
 
     /// `getxattr(2)`: the length of `name`'s value, which is also copied to
     /// `output` unless `output` is empty (a size query). A nonempty `output`
-    /// shorter than the value is [`WriteError::XattrBuffer`] (`ERANGE`); an
-    /// absent attribute is [`WriteError::XattrMissing`] (`ENODATA`). Every
-    /// namespace on disk reads back.
+    /// shorter than the value is [`WriteError::XattrBuffer`] (`ERANGE`), a
+    /// bare handler prefix is [`WriteError::XattrName`] (`EINVAL`), an
+    /// unhandled namespace is [`WriteError::XattrNamespace`] (`EOPNOTSUPP`),
+    /// and an absent attribute is [`WriteError::XattrMissing`] (`ENODATA`).
     pub async fn xattr(
         &self,
         file: &InodeHandle,
@@ -660,7 +663,7 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     /// `setxattr(2)`. Every namespace Linux's btrfs stores is written:
-    /// `user.*` (on regular files and directories only, else
+    /// `user.*` (on regular files, directories and sockets only, else
     /// [`WriteError::XattrNotPermitted`]), `security.*`, `trusted.*` and the
     /// two POSIX ACL names, which are validated, stored in the encoding
     /// `posix_acl_to_xattr` produces and, for the access ACL, set the mode's

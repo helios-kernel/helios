@@ -412,7 +412,6 @@ impl Filesystem for Daemon {
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         match self.run(|state| block_on(state.getxattr(ino, name, size))) {
             Ok((length, _)) if size == 0 => reply.size(length as u32),
-            Ok((length, _)) if length > size as usize => reply.error(Errno::ERANGE),
             Ok((_, value)) => reply.data(&value),
             Err(errno) => reply.error(errno),
         }

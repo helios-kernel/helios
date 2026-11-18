@@ -574,22 +574,28 @@ impl State {
         })
     }
 
-    /// The value of extended attribute `name`; its full length even when
-    /// `size` is too small to hold it, and nothing when `size` is zero.
+    /// `getxattr(2)`: the attribute's length when `size` is zero, or its
+    /// bytes when `size` holds them (`ERANGE` when `size` is too small).
     pub async fn getxattr(
-        &self,
+        &mut self,
         ino: INodeNo,
         name: &OsStr,
         size: u32,
     ) -> Result<(usize, Vec<u8>), Errno> {
-        let snapshot = self.snapshot()?;
-        let inode = self.open_inode(&snapshot, ino).await?;
-        let mut value = vec![0; size as usize];
-        let length = snapshot
-            .xattr(&inode, name.as_bytes(), &mut value)
+        // Linux's FUSE client (`fs/fuse/xattr.c` in torvalds/linux) uses a
+        // catch-all `.prefix = ""` handler, so non-ACL `getxattr` requests
+        // reach the daemon for namespace and bare-prefix validation.
+        let file = self.inodes.handle(ino)?;
+        let transaction = self
+            .writer
+            .join()
             .await
-            .map_err(|error| read_errno(&error))?
-            .ok_or(Errno::NO_XATTR)?;
+            .map_err(|error| write_errno(&error))?;
+        let mut value = vec![0; size as usize];
+        let length = transaction
+            .xattr(&file, name.as_bytes(), &mut value)
+            .await
+            .map_err(|error| write_errno(&error))?;
         value.truncate(length.min(value.len()));
         Ok((length, value))
     }

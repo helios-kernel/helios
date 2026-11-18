@@ -377,15 +377,29 @@ fn flags_and_missing_attributes_fail_as_on_linux() {
                 Err(WriteError::XattrNameLength { .. })
             ));
             assert!(matches!(
+                tx.remove_xattr(&file, name, when(5)).await,
+                Err(WriteError::XattrNameLength { .. })
+            ));
+            assert!(matches!(
                 tx.xattr(&file, name, &mut []).await,
                 Err(WriteError::XattrNameLength { .. })
             ));
         }
-        assert!(matches!(
-            tx.set_xattr(&file, b"user.", b"v", XattrMode::Set, when(5))
-                .await,
-            Err(WriteError::XattrName)
-        ));
+        for prefix in [&b"user."[..], b"security.", b"trusted.", b"btrfs."] {
+            assert!(matches!(
+                tx.set_xattr(&file, prefix, b"v", XattrMode::Set, when(5))
+                    .await,
+                Err(WriteError::XattrName)
+            ));
+            assert!(matches!(
+                tx.remove_xattr(&file, prefix, when(5)).await,
+                Err(WriteError::XattrName)
+            ));
+            assert!(matches!(
+                tx.xattr(&file, prefix, &mut []).await,
+                Err(WriteError::XattrName)
+            ));
+        }
         let longest = [b"user.".as_slice(), &[b'n'; 250]].concat();
         tx.set_xattr(&file, &longest, b"v", XattrMode::Set, when(5))
             .await
@@ -663,6 +677,10 @@ fn every_stored_namespace_is_written_and_reads_back() {
             ));
             assert!(matches!(
                 tx.remove_xattr(&file, name, when(1)).await,
+                Err(WriteError::XattrNamespace)
+            ));
+            assert!(matches!(
+                tx.xattr(&file, name, &mut []).await,
                 Err(WriteError::XattrNamespace)
             ));
         }
@@ -948,27 +966,226 @@ fn creations_inherit_a_default_acl() {
     drop(named);
 }
 
+/// Under a directory with `S_ISGID`, creations inherit the parent's group and
+/// subdirectories inherit `S_ISGID` (`inode_init_owner` in `fs/inode.c`), both
+/// under umask narrowing and under a default ACL (`posix_acl_create`).
 #[test]
-fn user_attributes_need_a_regular_file_or_directory() {
-    let (_named, mut writer) = image();
+fn creations_under_setgid_directory_inherit_group_and_directory_setgid() {
+    const DEFAULT: &[u8] = b"system.posix_acl_default";
+    let (named, mut writer) = image();
+    block_on(async {
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let sgid = tx
+            .create_directory(
+                Name {
+                    parent: &root,
+                    bytes: b"sgid",
+                },
+                Attributes {
+                    permissions: 0o755,
+                    uid: 100,
+                    gid: 200,
+                    umask: 0,
+                },
+                when(1),
+            )
+            .await
+            .unwrap();
+        tx.set_permissions(&sgid, 0o2755, when(2)).await.unwrap();
+
+        let file = tx
+            .create_file(
+                Name {
+                    parent: &sgid,
+                    bytes: "文件-ファイル-파일".as_bytes(),
+                },
+                Attributes {
+                    permissions: 0o666,
+                    uid: 100,
+                    gid: 300,
+                    umask: 0o022,
+                },
+                when(3),
+            )
+            .await
+            .unwrap();
+        let file_meta = tx.metadata(&file).await.unwrap();
+        assert_eq!(file_meta.uid, 100);
+        assert_eq!(file_meta.gid, 200);
+        assert_eq!(file_meta.permissions, 0o644);
+
+        let subdir = tx
+            .create_directory(
+                Name {
+                    parent: &sgid,
+                    bytes: "目录-ディレクトリ-디렉터리".as_bytes(),
+                },
+                Attributes {
+                    permissions: 0o777,
+                    uid: 100,
+                    gid: 300,
+                    umask: 0o022,
+                },
+                when(4),
+            )
+            .await
+            .unwrap();
+        let subdir_meta = tx.metadata(&subdir).await.unwrap();
+        assert_eq!(subdir_meta.uid, 100);
+        assert_eq!(subdir_meta.gid, 200);
+        assert_eq!(subdir_meta.permissions, 0o2755);
+
+        // `inode_init_owner` sets `S_ISGID` after `posix_acl_create` applies
+        // the umask, and the inherited `S_ISGID` propagates to grandchildren.
+        let nested = tx
+            .create_directory(
+                Name {
+                    parent: &subdir,
+                    bytes: b"nested",
+                },
+                Attributes {
+                    permissions: 0o777,
+                    uid: 101,
+                    gid: 400,
+                    umask: 0o2027,
+                },
+                when(5),
+            )
+            .await
+            .unwrap();
+        let nested_meta = tx.metadata(&nested).await.unwrap();
+        assert_eq!(nested_meta.uid, 101);
+        assert_eq!(nested_meta.gid, 200);
+        assert_eq!(nested_meta.permissions, 0o2750);
+
+        let link = tx
+            .symlink(
+                Name {
+                    parent: &sgid,
+                    bytes: "链接-リンク-링크".as_bytes(),
+                },
+                b"nested",
+                Attributes {
+                    permissions: 0o777,
+                    uid: 100,
+                    gid: 300,
+                    umask: 0,
+                },
+                when(6),
+            )
+            .await
+            .unwrap();
+        let link_meta = tx.metadata(&link).await.unwrap();
+        assert_eq!(link_meta.gid, 200);
+        assert_eq!(link_meta.permissions, 0o777);
+
+        // With a default ACL (`u::rwx,u:101:rwx,g::r-x,m::rwx,o::r-x`, as in
+        // fstests generic/444), subdirectories keep `S_ISGID` (`0o2775`).
+        let default_acl = acl(&[
+            (USER_OBJ, 7, NO_ID),
+            (USER, 7, 101),
+            (GROUP_OBJ, 5, NO_ID),
+            (MASK, 7, NO_ID),
+            (OTHER, 5, NO_ID),
+        ]);
+        tx.set_xattr(&sgid, DEFAULT, &default_acl, XattrMode::Set, when(7))
+            .await
+            .unwrap();
+        let acl_subdir = tx
+            .create_directory(
+                Name {
+                    parent: &sgid,
+                    bytes: b"acl-sub",
+                },
+                Attributes {
+                    permissions: 0o777,
+                    uid: 100,
+                    gid: 101,
+                    umask: 0o022,
+                },
+                when(8),
+            )
+            .await
+            .unwrap();
+        let acl_subdir_meta = tx.metadata(&acl_subdir).await.unwrap();
+        assert_eq!(acl_subdir_meta.gid, 200);
+        assert_eq!(acl_subdir_meta.permissions, 0o2775);
+        assert_eq!(value(&tx, &acl_subdir, DEFAULT).await, default_acl);
+        assert_eq!(value(&tx, &acl_subdir, ACL).await, default_acl);
+
+        let acl_file = tx
+            .create_file(
+                Name {
+                    parent: &sgid,
+                    bytes: b"acl-file",
+                },
+                Attributes {
+                    permissions: 0o666,
+                    uid: 100,
+                    gid: 101,
+                    umask: 0o022,
+                },
+                when(9),
+            )
+            .await
+            .unwrap();
+        let acl_file_meta = tx.metadata(&acl_file).await.unwrap();
+        assert_eq!(acl_file_meta.gid, 200);
+        assert_eq!(acl_file_meta.permissions, 0o664);
+
+        tx.commit().await.unwrap();
+    });
+    block_on(async {
+        let snapshot = writer.snapshot().unwrap();
+        let subdir = snapshot.resolve(b"/sgid/acl-sub").await.unwrap();
+        assert_eq!(subdir.metadata().gid, 200);
+        assert_eq!(subdir.metadata().permissions, 0o2775);
+        let file = snapshot
+            .resolve("/sgid/文件-ファイル-파일".as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(file.metadata().gid, 200);
+        assert_eq!(file.metadata().permissions, 0o644);
+    });
+    drop(named);
+}
+
+#[test]
+fn user_attributes_apply_to_regular_files_directories_and_sockets() {
+    use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
+    let (named, mut writer) = image();
     block_on(async {
         let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         for path in ["link", "pipe"] {
             let node = lookup(&tx, path).await;
-            // Writing is EPERM, reading ENODATA (`xattr_permission`).
+            // Writing is EPERM, reading ENODATA (`xattr_permission` runs
+            // before `xattr_resolve_name`, bare `"user."` included).
+            for user_name in [&b"user.x"[..], b"user."] {
+                assert!(matches!(
+                    tx.set_xattr(&node, user_name, b"v", XattrMode::Set, when(1))
+                        .await,
+                    Err(WriteError::XattrNotPermitted { .. })
+                ));
+                assert!(matches!(
+                    tx.remove_xattr(&node, user_name, when(1)).await,
+                    Err(WriteError::XattrNotPermitted { .. })
+                ));
+                assert!(matches!(
+                    tx.xattr(&node, user_name, &mut []).await,
+                    Err(WriteError::XattrMissing { .. })
+                ));
+            }
+            for prefix in [&b"security."[..], b"trusted.", b"btrfs."] {
+                assert!(matches!(
+                    tx.xattr(&node, prefix, &mut []).await,
+                    Err(WriteError::XattrName)
+                ));
+            }
             assert!(matches!(
-                tx.set_xattr(&node, b"user.x", b"v", XattrMode::Set, when(1))
-                    .await,
-                Err(WriteError::XattrNotPermitted { .. })
-            ));
-            assert!(matches!(
-                tx.remove_xattr(&node, b"user.x", when(1)).await,
-                Err(WriteError::XattrNotPermitted { .. })
-            ));
-            assert!(matches!(
-                tx.xattr(&node, b"user.x", &mut []).await,
-                Err(WriteError::XattrMissing { .. })
+                tx.xattr(&node, b"os2.x", &mut []).await,
+                Err(WriteError::XattrNamespace)
             ));
         }
         // A symlink created by the writer is the same.
@@ -976,7 +1193,7 @@ fn user_attributes_need_a_regular_file_or_directory() {
             .symlink(
                 Name {
                     parent: &root,
-                    bytes: "链接".as_bytes(),
+                    bytes: "链接-リンク-링크".as_bytes(),
                 },
                 b"file",
                 Attributes {
@@ -994,7 +1211,71 @@ fn user_attributes_need_a_regular_file_or_directory() {
                 .await,
             Err(WriteError::XattrNotPermitted { .. })
         ));
+
+        // Sockets (`S_IFSOCK`, `fs/xattr.c:159-175`) accept `user.*`.
+        tx.edits()
+            .create_node(
+                RawName {
+                    tree: root.tree(),
+                    parent: root.number(),
+                    bytes: "套接字-ソケット-소켓".as_bytes(),
+                },
+                RawAttributes {
+                    mode: 0o140_755,
+                    uid: 1000,
+                    gid: 1000,
+                    umask: 0,
+                },
+                when(3),
+            )
+            .await
+            .unwrap();
+        let socket = tx
+            .lookup(&root, "套接字-ソケット-소켓".as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tx.metadata(&socket).await.unwrap().kind,
+            crate::FileKind::Socket
+        );
+        assert!(matches!(
+            tx.xattr(&socket, b"user.", &mut []).await,
+            Err(WriteError::XattrName)
+        ));
+        for (index, (name, text)) in CJK.iter().enumerate() {
+            tx.set_xattr(
+                &socket,
+                name.as_bytes(),
+                text.as_bytes(),
+                XattrMode::Create,
+                when(4 + index as i64),
+            )
+            .await
+            .unwrap();
+            assert_eq!(value(&tx, &socket, name.as_bytes()).await, text.as_bytes());
+        }
+        tx.remove_xattr(&socket, CJK[0].0.as_bytes(), when(10))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tx.xattr(&socket, CJK[0].0.as_bytes(), &mut []).await,
+            Err(WriteError::XattrMissing { .. })
+        ));
+        tx.commit().await.unwrap();
     });
+    block_on(async {
+        let snapshot = writer.snapshot().unwrap();
+        let mut found = read_back(&snapshot, "/套接字-ソケット-소켓").await;
+        found.sort();
+        let mut expected: Vec<(Vec<u8>, Vec<u8>)> = CJK[1..]
+            .iter()
+            .map(|(name, text)| (name.as_bytes().to_vec(), text.as_bytes().to_vec()))
+            .collect();
+        expected.sort();
+        assert_eq!(found, expected);
+    });
+    drop(named);
 }
 
 #[test]

@@ -1,3 +1,4 @@
+generic/020 # _attr_get_maxval_size hardcodes a 65536-byte xattr value for FSTYP=fuse, exceeding BTRFS_MAX_XATTR_SIZE
 generic/128 # #1037: chmod 4755 on a file, setuid is refused
 generic/193 # #1037: chmod ug+s on files and the set-id bits chown clears, setuid is refused
 generic/355 # #1037: chmod ug+s on a file, setuid is refused

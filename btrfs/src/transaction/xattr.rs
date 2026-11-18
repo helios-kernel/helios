@@ -22,8 +22,8 @@
 //!   less one `btrfs_dir_item`), or a hash-sharing item that outgrows one
 //!   leaf, is `ENOSPC`;
 //! - an immutable or append-only inode refuses every write with `EPERM`;
-//! - `user.*` on anything but a regular file or directory is `EPERM` to
-//!   write and `ENODATA` to read, as `xattr_permission` has it whatever the
+//! - `user.*` on anything but a regular file, directory or socket is `EPERM`
+//!   to write and `ENODATA` to read, as `xattr_permission` has it whatever the
 //!   caller;
 //! - removal is a replace with no value: `ENODATA` when absent.
 
@@ -69,17 +69,6 @@ pub enum XattrMode {
     Replace,
 }
 
-/// Where a written name goes: `is_posix_acl_xattr` in `do_setxattr`, then
-/// `xattr_resolve_name` in `fs/xattr.c`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Namespace {
-    /// `user.*`, which only regular files and directories carry.
-    User,
-    /// `security.*` and `trusted.*`.
-    Stored,
-    Acl(AclKind),
-}
-
 fn check_name(name: &[u8]) -> Result<(), WriteError> {
     if name.is_empty() || name.len() > NAME_MAX {
         return Err(WriteError::XattrNameLength { length: name.len() });
@@ -87,29 +76,29 @@ fn check_name(name: &[u8]) -> Result<(), WriteError> {
     Ok(())
 }
 
-fn resolve(name: &[u8]) -> Result<Namespace, WriteError> {
-    check_name(name)?;
-    if let Some(kind) = AclKind::of(name) {
-        return Ok(Namespace::Acl(kind));
-    }
+/// `xattr_resolve_name` (`fs/xattr.c` in torvalds/linux) against
+/// `btrfs_xattr_handlers` (`fs/btrfs/xattr.c`): a bare handler prefix is
+/// `EINVAL`, and any prefix outside `security.`, `trusted.` and `user.` (btrfs
+/// properties included, which lexoliu/helios#1041 does not cover) is
+/// `EOPNOTSUPP`.
+fn resolve_handler(name: &[u8]) -> Result<(), WriteError> {
     if STORED.contains(&name) || name == BTRFS {
         return Err(WriteError::XattrName);
     }
-    if name.starts_with(USER) {
-        Ok(Namespace::User)
-    } else if STORED.iter().any(|prefix| name.starts_with(prefix)) {
-        Ok(Namespace::Stored)
+    if STORED.iter().any(|prefix| name.starts_with(prefix)) {
+        Ok(())
     } else {
-        // btrfs properties (lexoliu/helios#1041 does not cover them) and
-        // names no handler takes.
         Err(WriteError::XattrNamespace)
     }
 }
 
-/// `user.*` exists only on regular files and directories
-/// (`xattr_permission`).
+/// `user.*` exists only on regular files, directories and sockets
+/// (`xattr_permission` in `fs/xattr.c:159-175` of torvalds/linux).
 fn user_applies(kind: FileKind) -> bool {
-    matches!(kind, FileKind::Regular | FileKind::Directory)
+    matches!(
+        kind,
+        FileKind::Regular | FileKind::Directory | FileKind::Socket
+    )
 }
 
 /// Where one record sits in an xattr item.
@@ -182,8 +171,10 @@ impl<S: BlockSink> Transaction<S> {
         Ok(locate(tree, key, &item, name)?.map(|found| item[found.value].to_vec()))
     }
 
-    /// `getxattr(2)`: the value's length, copied to `buffer` when that is not
-    /// empty. A nonempty buffer shorter than the value is `ERANGE`.
+    /// `getxattr(2)`: `import_xattr_name`, `do_get_acl` or `vfs_getxattr`
+    /// (`xattr_permission` then `xattr_resolve_name` in `fs/xattr.c` of
+    /// torvalds/linux), and the value's length, copied to `buffer` when that
+    /// is not empty. A nonempty buffer shorter than the value is `ERANGE`.
     pub(crate) async fn xattr(
         &self,
         tree: u64,
@@ -195,10 +186,15 @@ impl<S: BlockSink> Transaction<S> {
         let missing = WriteError::XattrMissing { tree, inode };
         if AclKind::of(name).is_some() {
             self.check_acl_read(tree, inode).await?;
-        }
-        let (_, metadata) = self.inode_item(tree, inode).await?;
-        if name.starts_with(USER) && !user_applies(metadata.kind) {
-            return Err(missing);
+        } else {
+            let (_, metadata) = self.inode_item(tree, inode).await?;
+            // `xattr_permission` runs before `__vfs_getxattr` and
+            // `xattr_resolve_name`, so `user.*` (bare `"user."` included) on
+            // an ineligible file kind is `ENODATA`.
+            if name.starts_with(USER) && !user_applies(metadata.kind) {
+                return Err(missing);
+            }
+            resolve_handler(name)?;
         }
         let Some(value) = self.stored_xattr(tree, inode, name).await? else {
             return Err(missing);
@@ -254,9 +250,10 @@ impl<S: BlockSink> Transaction<S> {
         Ok(names.len())
     }
 
-    /// `setxattr(2)`: `btrfs_setxattr_trans` for a stored namespace, where
-    /// `mode` says whether it may create or replace and the inode's ctime,
-    /// transid and sequence advance; `btrfs_set_acl` for an ACL name.
+    /// `setxattr(2)`: `setxattr_copy` and `do_setxattr` (`fs/xattr.c`), then
+    /// `btrfs_setxattr_trans` for a stored namespace (where `mode` says
+    /// whether it may create or replace and the inode's ctime, transid and
+    /// sequence advance) or `btrfs_set_acl` for an ACL name.
     pub(crate) async fn set_xattr(
         &mut self,
         tree: u64,
@@ -266,7 +263,7 @@ impl<S: BlockSink> Transaction<S> {
         mode: XattrMode,
         when: Timestamp,
     ) -> Result<(), WriteError> {
-        let namespace = resolve(name)?;
+        check_name(name)?;
         // `setxattr_copy`, before any handler.
         if value.len() > VALUE_MAX {
             return Err(WriteError::XattrValueTooBig {
@@ -274,16 +271,18 @@ impl<S: BlockSink> Transaction<S> {
                 maximum: VALUE_MAX,
             });
         }
-        if let Namespace::Acl(kind) = namespace {
+        if let Some(kind) = AclKind::of(name) {
             return self.set_acl(tree, inode, kind, value, when).await;
         }
-        self.check_stored_write(tree, inode, namespace).await?;
+        self.check_stored_write(tree, inode, name).await?;
+        resolve_handler(name)?;
         self.write_xattr(tree, inode, name, value, mode).await?;
         self.touch(tree, inode, when, None).await
     }
 
-    /// `removexattr(2)`: `ENODATA` when absent, except for an ACL name,
-    /// which `vfs_remove_acl` removes whether or not it is there.
+    /// `removexattr(2)`: `vfs_removexattr` (`fs/xattr.c`), `ENODATA` when
+    /// absent, except for an ACL name, which `vfs_remove_acl` removes whether
+    /// or not it is there.
     pub(crate) async fn remove_xattr(
         &mut self,
         tree: u64,
@@ -291,11 +290,12 @@ impl<S: BlockSink> Transaction<S> {
         name: &[u8],
         when: Timestamp,
     ) -> Result<(), WriteError> {
-        let namespace = resolve(name)?;
-        if let Namespace::Acl(kind) = namespace {
+        check_name(name)?;
+        if let Some(kind) = AclKind::of(name) {
             return self.remove_acl(tree, inode, kind, when).await;
         }
-        self.check_stored_write(tree, inode, namespace).await?;
+        self.check_stored_write(tree, inode, name).await?;
+        resolve_handler(name)?;
         if !self.drop_xattr(tree, inode, name).await? {
             return Err(WriteError::XattrMissing { tree, inode });
         }
@@ -331,17 +331,17 @@ impl<S: BlockSink> Transaction<S> {
         Ok(metadata.kind)
     }
 
-    /// The checks a stored namespace's write makes before touching the item:
-    /// [`Self::check_xattr_writable`], then `xattr_permission`'s rule that
-    /// `user.*` needs a regular file or a directory.
+    /// `xattr_permission` (`fs/xattr.c`, `MAY_WRITE`):
+    /// [`Self::check_xattr_writable`], then `user.*` only on a regular file, a
+    /// directory or a socket.
     async fn check_stored_write(
         &self,
         tree: u64,
         inode: u64,
-        namespace: Namespace,
+        name: &[u8],
     ) -> Result<(), WriteError> {
         let kind = self.check_xattr_writable(tree, inode).await?;
-        if namespace == Namespace::User && !user_applies(kind) {
+        if name.starts_with(USER) && !user_applies(kind) {
             return Err(WriteError::XattrNotPermitted { tree, inode });
         }
         Ok(())

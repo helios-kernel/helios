@@ -7,6 +7,7 @@ use helios_hal::fs::RenameMode;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
+use super::ownership::{S_IFDIR, S_IFMT, S_ISGID, refuse_set_id};
 use crate::csum::{inode_ref_hash, name_hash};
 use crate::items::{INODE_APPEND, INODE_IMMUTABLE, RecordKind, dir_index_record, dir_records};
 use crate::ondisk::{
@@ -124,7 +125,7 @@ impl<S: BlockSink> Transaction<S> {
             )
             .await?;
         self.roots.set(root)?;
-        if raw.mode.get() & 0o170_000 == 0o040_000 {
+        if raw.mode.get() & S_IFMT == S_IFDIR {
             self.roots.directory_size(tree, inode, raw.size.get())?;
         }
         Ok(())
@@ -160,12 +161,34 @@ impl<S: BlockSink> Transaction<S> {
         when: Timestamp,
     ) -> Result<u64, WriteError> {
         validate_name(name.bytes)?;
-        // `btrfs_new_inode_prepare` runs `posix_acl_create` first.
+        let (_, parent) = self.inode_item(name.tree, name.parent).await?;
+        if parent.kind != FileKind::Directory {
+            return Err(Error::WrongKind {
+                tree: name.tree,
+                inode: name.parent,
+                expected: FileKind::Directory,
+                found: parent.kind,
+            }
+            .into());
+        }
+        // `btrfs_new_inode_prepare` (`fs/btrfs/inode.c` in torvalds/linux) runs
+        // `posix_acl_create` first, then `btrfs_create_new_inode` calls
+        // `inode_init_owner` (`fs/inode.c`): under a directory with `S_ISGID`,
+        // the new inode takes the directory's group, and a directory inherits
+        // `S_ISGID` as well.
         let mut mode = attributes.mode;
         let inherited = self
             .inherit_acls(name.tree, name.parent, &mut mode, attributes.umask)
             .await?;
-        super::ownership::refuse_set_id(mode)?;
+        let gid = if parent.permissions & S_ISGID != 0 {
+            if mode & S_IFMT == S_IFDIR {
+                mode |= S_ISGID;
+            }
+            parent.gid
+        } else {
+            attributes.gid
+        };
+        refuse_set_id(mode)?;
         let tree = name.tree;
         let next = if let Some(last) = self.inode_high_water.get(&tree) {
             last.checked_add(1)
@@ -193,7 +216,7 @@ impl<S: BlockSink> Transaction<S> {
         raw.transid.set(self.trees.generation());
         raw.mode.set(mode);
         raw.uid.set(attributes.uid);
-        raw.gid.set(attributes.gid);
+        raw.gid.set(gid);
         raw.atime = timestamp;
         raw.ctime = timestamp;
         raw.mtime = timestamp;

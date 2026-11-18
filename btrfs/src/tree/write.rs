@@ -100,7 +100,7 @@ pub enum WriteError {
     XattrExists { tree: u64, inode: u64 },
     #[error("extended attributes need {needed} bytes of buffer, got {provided}")]
     XattrBuffer { needed: usize, provided: usize },
-    /// Writing `user.*` on a file that is neither regular nor a directory.
+    /// Writing `user.*` on a file that is not regular, a directory or a socket.
     #[error("inode {inode} in tree {tree} takes no user.* attributes")]
     XattrNotPermitted { tree: u64, inode: u64 },
     #[error("extended attribute namespace has no handler")]
