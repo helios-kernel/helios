@@ -521,6 +521,7 @@ fn request(
             concurrency: core::num::NonZeroUsize::new(1).unwrap(),
             compress: None,
             commit: None,
+            max_inline: None,
             now: 1_700_000_000_000_000_000,
         },
     ))

@@ -48,6 +48,49 @@ use crate::transaction::{Checkpoint, Transaction};
 use crate::tree::write::WriteError;
 use crate::{Error, FileKind, Metadata, Timestamp};
 
+/// What a mount's options give each of its data mutations: Linux's
+/// `compress=` and `max_inline=`, with the caller's time and concurrency.
+/// The encoder is chosen per inode: one that Linux does not compress
+/// (`NODATASUM`, `NODATACOW` or `NOCOMPRESS`) is written uncompressed, where
+/// the [`WriteOptions`] forms refuse a compressing encoder for it.
+pub struct MountPolicy<'a> {
+    pub when: Timestamp,
+    pub concurrency: NonZeroUsize,
+    pub compressor: &'a mut Compressor,
+    /// Linux's `max_inline` mount option; see [`WriteOptions::max_inline`].
+    pub max_inline: u64,
+}
+
+/// Evaluates `$body` with `$options`, the [`WriteOptions`] `$policy` gives an
+/// inode that compresses when `$compresses`.
+macro_rules! with_policy {
+    ($policy:expr, $compresses:expr, |$options:ident| $body:expr) => {{
+        let MountPolicy {
+            when,
+            concurrency,
+            compressor,
+            max_inline,
+        } = $policy;
+        macro_rules! run {
+            ($encoder:expr) => {{
+                let $options = WriteOptions {
+                    when,
+                    concurrency,
+                    encoder: $encoder,
+                    max_inline,
+                };
+                $body
+            }};
+        }
+        match compressor {
+            Compressor::Zlib(encoder) if $compresses => run!(encoder),
+            Compressor::Lzo(encoder) if $compresses => run!(encoder),
+            Compressor::Zstd(encoder) if $compresses => run!(&mut **encoder),
+            _ => run!(Plain),
+        }
+    }};
+}
+
 /// The dirty metadata a running transaction holds before it is committed,
 /// unless the mount's operator chose another bound: Linux's
 /// `BTRFS_DIRTY_METADATA_THRESH`, `SZ_32M` in `fs/btrfs/fs.h`, past which
@@ -529,48 +572,28 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         Ok(written)
     }
 
-    /// [`Self::write_file`] with the mount's compression policy. An inode that
-    /// Linux does not compress (`NODATASUM`, `NODATACOW` or `NOCOMPRESS`) is
-    /// written uncompressed, where `write_file` with an encoder refuses it.
+    /// [`Self::write_file`] under the mount's policy.
     pub async fn write_file_with_policy(
         &mut self,
         file: &InodeHandle,
         offset: u64,
         data: &[u8],
-        when: Timestamp,
-        concurrency: NonZeroUsize,
-        compressor: &mut Compressor,
+        policy: MountPolicy<'_>,
     ) -> Result<usize, WriteError> {
         let compresses = inode_compresses(self.metadata(file).await?.flags);
-        macro_rules! write {
-            ($encoder:expr) => {
-                self.write_file(
-                    file,
-                    offset,
-                    data,
-                    WriteOptions {
-                        when,
-                        concurrency,
-                        encoder: $encoder,
-                    },
-                )
-                .await
-            };
-        }
-        match compressor {
-            Compressor::Zlib(encoder) if compresses => write!(encoder),
-            Compressor::Lzo(encoder) if compresses => write!(encoder),
-            Compressor::Zstd(encoder) if compresses => write!(&mut **encoder),
-            _ => write!(Plain),
-        }
+        with_policy!(policy, compresses, |options| self
+            .write_file(file, offset, data, options)
+            .await)
     }
 
-    pub async fn truncate_file(
+    /// Sets the size of `file`, as `truncate(2)`. `options` stores the data
+    /// left in the first sector when Linux would write it back: a grown or
+    /// compressed inline file.
+    pub async fn truncate_file<E: Encoder>(
         &mut self,
         file: &InodeHandle,
         size: u64,
-        when: Timestamp,
-        concurrency: NonZeroUsize,
+        options: WriteOptions<E>,
     ) -> Result<(), WriteError> {
         let mut operation = Mutation::new(self, Units::TRUNCATE).await?;
         operation.checked(file).await?;
@@ -578,16 +601,44 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         operation.inner_mut().roots.check_writable(file.tree)?;
         operation
             .inner_mut()
-            .truncate_file(file.tree, file.inode, size, when, concurrency)
+            .truncate_file(file.tree, file.inode, size, options)
             .await?;
         operation.accept()
     }
 
-    pub async fn clone_range(
+    /// [`Self::truncate_file`] under the mount's policy.
+    pub async fn truncate_file_with_policy(
+        &mut self,
+        file: &InodeHandle,
+        size: u64,
+        policy: MountPolicy<'_>,
+    ) -> Result<(), WriteError> {
+        let compresses = inode_compresses(self.metadata(file).await?.flags);
+        with_policy!(policy, compresses, |options| self
+            .truncate_file(file, size, options)
+            .await)
+    }
+
+    /// [`Self::clone_range`] under the mount's policy, which the destination's
+    /// flags select the encoder of.
+    pub async fn clone_range_with_policy(
         &mut self,
         range: CloneRange<'_>,
-        when: Timestamp,
-        concurrency: NonZeroUsize,
+        policy: MountPolicy<'_>,
+    ) -> Result<(), WriteError> {
+        let compresses = inode_compresses(self.metadata(range.destination).await?.flags);
+        with_policy!(policy, compresses, |options| self
+            .clone_range(range, options)
+            .await)
+    }
+
+    /// Shares `range` of one file's extents into another, as `FICLONERANGE`.
+    /// `options` writes what cannot be shared: an inline source, and inline
+    /// destination data the shared extents replace.
+    pub async fn clone_range<E: Encoder>(
+        &mut self,
+        range: CloneRange<'_>,
+        options: WriteOptions<E>,
     ) -> Result<(), WriteError> {
         let mut operation = Mutation::new(self, Units::CLONE).await?;
         operation.checked(range.source).await?;
@@ -603,10 +654,7 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             .inner_mut()
             .roots
             .check_writable(range.destination.tree)?;
-        operation
-            .inner_mut()
-            .clone_range(range, when, concurrency)
-            .await?;
+        operation.inner_mut().clone_range(range, options).await?;
         operation.accept()
     }
 

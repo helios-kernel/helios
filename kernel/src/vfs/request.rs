@@ -66,6 +66,8 @@ pub enum MountRequestError {
     CompressionUnsupported,
     #[error("a commit interval applies only to a btrfs mount")]
     CommitUnsupported,
+    #[error("an inline data limit applies only to a btrfs mount")]
+    MaxInlineUnsupported,
     #[error("the btrfs image on disk {serial:?} cannot be mounted: {error}")]
     Btrfs {
         serial: BlockSerial,
@@ -93,6 +95,9 @@ pub async fn request_mount<S: Storage>(
     }
     if write.commit.is_some() && !matches!(source, MountSource::Btrfs { .. }) {
         return Err(MountRequestError::CommitUnsupported);
+    }
+    if write.max_inline.is_some() && !matches!(source, MountSource::Btrfs { .. }) {
+        return Err(MountRequestError::MaxInlineUnsupported);
     }
     let mut service = None;
     let fs = match source {

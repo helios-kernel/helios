@@ -483,6 +483,7 @@ fn a_mount_request_without_mount_authority_is_refused() {
                 concurrency: core::num::NonZeroUsize::new(1).unwrap(),
                 compress: None,
                 commit: None,
+                max_inline: None,
                 now: 1_700_000_000_000_000_000,
             },
         )),
@@ -512,6 +513,7 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
             concurrency: core::num::NonZeroUsize::new(1).unwrap(),
             compress: None,
             commit: None,
+            max_inline: None,
             now: 1_700_000_000_000_000_000,
         },
     ))
@@ -539,6 +541,7 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
                 concurrency: core::num::NonZeroUsize::new(1).unwrap(),
                 compress: None,
                 commit: None,
+                max_inline: None,
                 now: 1_700_000_000_000_000_000,
             },
         )),
@@ -546,23 +549,24 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
     ));
     let serial = helios_hal::fs::BlockSerial::new(b"absent").expect("serial fits");
     assert!(matches!(
-            block_on(crate::request_mount(
-                &authority,
-                &namespace,
-                nothing_attached(),
-                crate::MountSource::Disk { serial },
-                "/mnt",
-                true,
+        block_on(crate::request_mount(
+            &authority,
+            &namespace,
+            nothing_attached(),
+            crate::MountSource::Disk { serial },
+            "/mnt",
+            true,
             crate::vfs::BtrfsWriteOptions {
                 entropy: crate::test_support::test_root_entropy(),
                 concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-    compress: None,
-            commit: None,
-            now: 1_700_000_000_000_000_000,
+                compress: None,
+                commit: None,
+                max_inline: None,
+                now: 1_700_000_000_000_000_000,
             },
-        )),
-            Err(crate::MountRequestError::DiskUnavailable { serial: refused }) if refused == serial
-        ));
+    )),
+        Err(crate::MountRequestError::DiskUnavailable { serial: refused }) if refused == serial
+    ));
 
     block_on(crate::request_unmount(&authority, &namespace, "/mnt")).expect("unmounts");
     assert_eq!(owner(&namespace, "/mnt/bin/tool").0, "/");
