@@ -535,6 +535,25 @@ impl NetworkControlPlane {
             .map(map_ipv4_cidr)
             .collect()
     }
+
+    fn owns_ip_address(&self, address: NetworkIpAddress) -> bool {
+        match address {
+            NetworkIpAddress::Ipv4(address) => {
+                let target = map_kernel_ipv4_address(address);
+                self.ipv4_addresses
+                    .load_full()
+                    .entries
+                    .iter()
+                    .any(|cidr| cidr.address() == target)
+            }
+            NetworkIpAddress::Ipv6(address) => self
+                .ipv6_addresses
+                .load_full()
+                .entries
+                .iter()
+                .any(|entry| entry.cidr().address() == address),
+        }
+    }
 }
 
 impl<T> SnapshotCell<T> {
@@ -1552,6 +1571,11 @@ where
         self.inner.device.mac_address()
     }
 
+    /// Whether the stack currently owns `address` as a configured local address.
+    pub fn owns_ip_address(&self, address: NetworkIpAddress) -> bool {
+        self.inner.control.owns_ip_address(address)
+    }
+
     pub async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
         self.inner.control.list_ipv4_addresses().into_iter().next()
     }
@@ -1892,6 +1916,47 @@ pub(crate) mod fixture {
             segments
         }
     }
+
+    impl<C, I> NetworkService<C, I>
+    where
+        C: Cpu + Clone,
+        I: helios_netstack::NetworkInterface,
+    {
+        /// Installs static test IPv4/IPv6 interface addresses and an optional
+        /// reachable neighbor entry, then publishes and syncs them across shards.
+        pub(crate) fn configure_test_addresses(
+            &self,
+            ipv4: &[helios_netstack::Ipv4Cidr],
+            ipv6: &[helios_netstack::Ipv6Cidr],
+            neighbor: Option<(helios_netstack::IpAddress, [u8; 6])>,
+        ) {
+            {
+                let mut shard = self.inner.state.shard_at(DEFAULT_SHARD_IDX).lock();
+                for &cidr in ipv4 {
+                    shard
+                        .stack
+                        .add_ipv4_address(cidr)
+                        .expect("test IPv4 address should be accepted");
+                }
+                for &cidr in ipv6 {
+                    shard
+                        .stack
+                        .add_ipv6_address(cidr)
+                        .expect("test IPv6 address should be accepted");
+                }
+                if let Some((ip, mac)) = neighbor {
+                    shard.stack.learn_neighbor(helios_netstack::NeighborEntry {
+                        ip,
+                        mac,
+                        state: helios_netstack::NeighborState::Reachable,
+                        updated_at: StackInstant::from_nanos(0),
+                    });
+                }
+                self.inner.control.publish_from_shard(&shard);
+            }
+            self.synchronize_control_plane();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2182,7 +2247,11 @@ mod tests {
     /// for the whole set.
     fn bind_udp(shard: &mut NetworkShard, slot: usize, local_port: u16) -> UdpSocketId {
         shard
-            .install_udp_bind(slot, local_port)
+            .install_udp_bind(
+                slot,
+                NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                local_port,
+            )
             .expect("test UDP socket should bind");
         UdpSocketId(ReplicaHandle::new(slot).get())
     }
@@ -3513,7 +3582,11 @@ mod tests {
                         .stack
                         .add_ipv4_address(Ipv4Cidr::new(local, 24))
                         .expect("test address should be accepted");
-                    shard.install_udp_bind(slot, 49_153)
+                    shard.install_udp_bind(
+                        slot,
+                        NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                        49_153,
+                    )
                 },
                 NetworkShard::remove_udp_replica,
             )
@@ -6479,7 +6552,11 @@ mod tests {
                         state: NeighborState::Reachable,
                         updated_at: StackInstant::from_nanos(0),
                     });
-                    shard.install_udp_bind(slot, 49_153)
+                    shard.install_udp_bind(
+                        slot,
+                        NetworkIpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+                        49_153,
+                    )
                 },
                 NetworkShard::remove_udp_replica,
             )

@@ -22,7 +22,7 @@ never depends on anything above it.
 | Compatibility layers | `unix/`, `linux/` | `#![no_std]` services the non-Preview-3 ABIs share (`unix/`) and the Linux ABI (`linux/`), each behind a kernel feature that is off by default. Both build on `hal/` and `sync/`; neither depends on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
 | Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service, and, behind the `linux` feature, the native Linux process host. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
-| Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport, SMP wiring and native user execution, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
+| Backends | `aarch64/`, `riscv/`, `x86/`, `x86-vmm/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport, SMP wiring and native user execution, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. `x86-vmm/` is the x86 user address space over a `Machine` the backend supplies, so the host builds and tests the code the kernel runs. |
 | Kernel image | the root crate `helios` (`src/`) | The binary that links whichever backend the target selects, and runs `hosted` on the host. |
 | User space | `api/`, `api-macro/`, `programs/*`, `venus/` | The userland SDK and the wasm programs, kernel plugins included: `init`, `debugger`, `http-client`, `date`, `ping`, `perf`, `oob-load`. `compiler-plugin/` is the in-kernel compiler, a kernel plugin built by the host tools. `venus/` is the Venus wire protocol a program's GPU driver links: the hand-written sinks and the encoders generated at build time. |
 | Host tools | `inspector/`, `inspector-protocol/`, `cli/`, `compiler-support/`, `compiler-host/`, `profdata/`, `venus-gen/`, `workspace-root/` | `std` crates that boot, build and observe a guest. `inspector-protocol/` is the WIT RPC contract between the inspector and the guest debugger. `profdata/` is the kernel profile's header check and fetched-profile store, shared by `cli/` and `inspector/`. `workspace-root/` finds the workspace and holds the root key file format those two share. `venus-gen/` generates `venus/`'s encoders from the pinned venus-protocol registry. `compiler-host/` runs the compiler plugin under Wasmtime on Linux, the bench's Linux + Wasmtime column of `aot-curl`. |
@@ -191,7 +191,7 @@ maintainer's decision and the fork's revision moves once, per §1.
 - The HTTP client is a kernel plugin (`programs/http-client`): the kernel
   implements `wasi:http/types` only and forwards `wasi:http/client.send`
   through a typed provider slot to the plugin's `wasi:http/handler`; HTTP/1.1
-  framing, DNS and, later, TLS run in user memory. The provider slot is the
+  framing, DNS and TLS run in user memory. The provider slot is the
   route for any future interface a plugin serves.
 - Plugins share the user-memory and allocation contract of every program.
   There is no plugin-private allocator policy, memory floor, or oversized
@@ -499,6 +499,10 @@ does.
 
 ## 6. WASI tooling
 
+- WASI 0.3 is the kernel's first-class ABI. Programs, tools and host
+  interfaces use 0.3 wherever it covers the need. Preview 1 and WASIX
+  are supported for programs built against them; Preview 2 is not a
+  supported ABI.
 - `tools/wasi-apps/build.sh` is the single entry point that stages the WASI
   shared-fs tooling: it downloads the official CPython WASI build into
   `artifacts/python3-root/` (`python3.wasm` plus the standard library) and
@@ -542,7 +546,7 @@ just test-units
 `just lint` is `tools/fmt.sh --check`, `cargo deny --workspace check bans`
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
-`just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `firmware`, `sync`, `unix`, `linux`, `kernel`,
+`just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `firmware`, `sync`, `unix`, `linux`, `kernel`, `x86-vmm`,
 `inspector-protocol` and `workspace-root` unit tests, every `btrfs` and `hosted` test,
 and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe

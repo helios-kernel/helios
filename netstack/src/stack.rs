@@ -4260,6 +4260,20 @@ where
         panic!("UDP receive socket count had no matching queued datagram");
     }
 
+    /// Returns a reference to the next queued datagram for `socket` without
+    /// removing it from the receive queue.
+    pub fn peek_udp(&self, socket: UdpSocketId) -> Result<Option<&UdpReceive>, StackError> {
+        self.udp_socket(socket)?;
+        if self.udp_rx_counts[udp_socket_index(socket)] == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .udp_rx
+            .iter()
+            .find(|queued| queued.socket == socket)
+            .map(|queued| &queued.datagram))
+    }
+
     pub fn take_udp_error(
         &mut self,
         socket: UdpSocketId,
@@ -4968,6 +4982,32 @@ where
         self.schedule_tcp_timer(index);
         self.update_tcp_receive_backpressure(index);
         Ok(state)
+    }
+
+    /// Copies queued receive bytes for `socket` into `sink` without consuming
+    /// them or advancing the receive window.
+    pub fn tcp_peek_into<S>(
+        &self,
+        socket: SocketId,
+        skip_bytes: usize,
+        sink: &mut S,
+    ) -> Result<TcpReadIntoState, StackError>
+    where
+        S: TcpReceiveBuffer,
+    {
+        let socket = self.tcp_socket(socket)?;
+        Ok(match socket.peek_into(skip_bytes, sink) {
+            Some(bytes) => TcpReadIntoState::Data(bytes),
+            None => match tcp_read_termination(socket) {
+                Some(kind) => TcpReadIntoState::Closed(kind),
+                None => TcpReadIntoState::Pending,
+            },
+        })
+    }
+
+    /// Returns the number of contiguous in-order bytes currently queued for `socket`.
+    pub fn tcp_receive_queued_bytes(&self, socket: SocketId) -> Result<usize, StackError> {
+        Ok(self.tcp_socket(socket)?.receive_queued_bytes())
     }
 
     pub fn send_udp(
@@ -7809,7 +7849,7 @@ where
         self.owns_ip_address(IpAddress::Ipv6(destination)) || destination.is_multicast()
     }
 
-    fn owns_ip_address(&self, address: IpAddress) -> bool {
+    pub fn owns_ip_address(&self, address: IpAddress) -> bool {
         match address {
             IpAddress::Ipv4(address) => self
                 .ipv4_addresses

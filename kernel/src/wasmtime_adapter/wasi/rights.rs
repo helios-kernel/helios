@@ -263,6 +263,9 @@ impl<D: core::borrow::Borrow<FsDescriptor>> OpenGrant<D> {
         } else {
             None
         };
+        if flags.contains(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::DIRECTORY) {
+            return Err(fs_types::ErrorCode::Invalid);
+        }
         Ok(Self {
             descriptor,
             create,

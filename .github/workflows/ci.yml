@@ -186,6 +186,7 @@ jobs:
               - 'kernel/src/wasmtime_adapter/component_host/service/gpu.rs'
               - 'kernel/src/wasmtime_adapter/component_host/service/display.rs'
               - 'x86/src/memory_type.rs'
+              - 'x86-vmm/src/memory_type.rs'
               - 'wit/deps/helios-system/gpu.wit'
               - 'wit/deps/helios-system/display.wit'
               - 'programs/gpu-test/**'

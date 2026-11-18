@@ -321,6 +321,10 @@ where
         NetworkService::hardware_address(self)
     }
 
+    fn owns_ip_address(&self, address: NetworkIpAddress) -> bool {
+        NetworkService::owns_ip_address(self, address)
+    }
+
     async fn revalidate_lease(&self) {
         NetworkService::revalidate_lease(self).await;
     }
@@ -453,30 +457,6 @@ where
         NetworkService::tcp_read(self, stream, max_bytes, timeout_nanos).await
     }
 
-    fn tcp_try_read(
-        &self,
-        stream: Self::TcpStream,
-        max_bytes: usize,
-    ) -> Result<crate::TcpReadProgress, TcpError> {
-        NetworkService::tcp_try_read(self, stream, max_bytes)
-    }
-
-    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<crate::TcpWriteProgress, TcpError> {
-        NetworkService::tcp_send_room(self, stream)
-    }
-
-    fn tcp_try_write(
-        &self,
-        stream: Self::TcpStream,
-        bytes: &mut Bytes,
-    ) -> Result<crate::TcpWriteProgress, TcpError> {
-        NetworkService::tcp_try_write(self, stream, bytes)
-    }
-
-    async fn tcp_write_ready(&self, stream: Self::TcpStream) -> Result<(), TcpError> {
-        NetworkService::tcp_write_ready(self, stream).await
-    }
-
     async fn tcp_read_into<'a>(
         &'a self,
         stream: Self::TcpStream,
@@ -484,6 +464,15 @@ where
         timeout_nanos: u64,
     ) -> Result<crate::TcpReadInto, TcpError> {
         NetworkService::tcp_read_into(self, stream, buffer, timeout_nanos).await
+    }
+
+    async fn tcp_peek_into<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> Result<crate::TcpReadInto, TcpError> {
+        NetworkService::tcp_peek_into(self, stream, buffer, timeout_nanos).await
     }
 
     async fn tcp_shutdown_send(&self, stream: Self::TcpStream) -> Result<(), TcpError> {
@@ -498,8 +487,12 @@ where
         NetworkService::tcp_listener_close(self, listener);
     }
 
-    async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
-        NetworkService::udp_bind(self, local_port).await
+    async fn udp_bind(
+        &self,
+        local_address: NetworkIpAddress,
+        local_port: u16,
+    ) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
+        NetworkService::udp_bind(self, local_address, local_port).await
     }
 
     fn udp_connect(
@@ -549,6 +542,15 @@ where
         timeout_nanos: u64,
     ) -> Result<Option<UdpDatagram>, UdpError> {
         NetworkService::udp_receive(self, socket, max_bytes, timeout_nanos).await
+    }
+
+    async fn udp_peek(
+        &self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        NetworkService::udp_peek(self, socket, max_bytes, timeout_nanos).await
     }
 
     async fn udp_join_multicast_v4(

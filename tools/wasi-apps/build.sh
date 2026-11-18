@@ -3,10 +3,9 @@
 # Build helios's WASI side tooling.
 #
 # - Downloads the official (unofficial-but-canonical) CPython WASI build
-#   from `brettcannon/cpython-wasi-build`, runs it through the wasi
-#   preview1→p2 adapter shipped alongside wasmtime, compiles the stdlib
-#   to bytecode with the interpreter itself, and stashes the component
-#   + stdlib under `$out_dir/../python3-root`.
+#   from `brettcannon/cpython-wasi-build`, compiles the stdlib to
+#   bytecode with the interpreter itself, and stashes the preview1 core
+#   module + stdlib under `$out_dir/../python3-root`.
 # - Builds our Rust `curl-wasi`, the TCP throughput tools, and the
 #   benchmark-suite workload programs from source.
 # - Stages standard Wasmer WASIX shell/coreutils artifacts, derives the
@@ -58,7 +57,7 @@ coreutils_root="$artifacts_root/wasix/coreutils"
 mkdir -p "$out_dir" "$python_root" "$dash_root" "$bash_root" "$quickjs_root" "$coreutils_root"
 
 cpython_version="${CPYTHON_VERSION:-3.14.4}"
-wasmtime_version="${WASMTIME_ADAPTER_VERSION:-43.0.1}"
+wasmtime_version="${WASMTIME_CLI_VERSION:-43.0.1}"
 dash_package="${WASIX_DASH_PACKAGE:-sharrattj/dash}"
 dash_version="${WASIX_DASH_VERSION:-1.0.19}"
 dash_webc_url="${WASIX_DASH_WEBC_URL:-https://cdn.wasmer.io/webcimages/05e14719a38cc0cc84823ecabec48ca2b76f82187a7c4833bee82e5dbcbf4c30.webc}"
@@ -143,8 +142,7 @@ require_tool() {
 
 # The wasmtime CLI of the pinned release, for running a staged
 # interpreter on the host: `WASMTIME_BIN` when the caller has one,
-# otherwise the release asset for this machine, fetched next to the
-# preview1 adapter that comes from the same release.
+# otherwise the release asset for this machine.
 stage_wasmtime_cli() {
   if [[ -n "${WASMTIME_BIN:-}" ]]; then
     printf '%s\n' "$WASMTIME_BIN"
@@ -243,23 +241,14 @@ if [[ -z "$zip_path" ]]; then
     "https://github.com/brettcannon/cpython-wasi-build/releases/download/v${cpython_version}/python-${cpython_version}-wasi_sdk-24.zip"
 fi
 
-adapter_path="$staging/wasi_snapshot_preview1.command.wasm"
-echo "Downloading wasmtime $wasmtime_version preview1 adapter..."
-download "$adapter_path" \
-  "https://github.com/bytecodealliance/wasmtime/releases/download/v${wasmtime_version}/wasi_snapshot_preview1.command.wasm"
-
 echo "Extracting CPython..."
 rm -rf "$python_root/lib" "$python_root/python3.wasm"
 mkdir -p "$python_root"
 unzip -q "$zip_path" -d "$staging/cpython"
 
-echo "Converting python.wasm to a WASI P2 component..."
-python_component_raw="$staging/python3.component.wasm"
-wasm-tools component new \
-  "$staging/cpython/python.wasm" \
-  --adapt "$adapter_path" \
-  -o "$python_component_raw"
-wasm-tools strip "$python_component_raw" -o "$python_root/python3.wasm"
+# CPython is a WASI Preview 1 core module, which the kernel runs as it is.
+echo "Staging python.wasm..."
+wasm-tools strip "$staging/cpython/python.wasm" -o "$python_root/python3.wasm"
 apply_branch_hints python3 "$python_root/python3.wasm"
 
 # CPython compiles every stdlib module it imports from source unless a
@@ -385,20 +374,20 @@ build_wasi_tool() {
   apply_branch_hints "$name" "$out_dir/$name-stripped.wasm"
 }
 
-build_wasi_tool curl helios_curl_wasi wasm32-wasip2 curl
-build_wasi_tool tcp-throughput helios_tcp_throughput_wasi wasm32-wasip2 tcp-throughput
-build_wasi_tool wasi-tcp-throughput helios_wasi_tcp_throughput wasm32-wasip2 wasi-tcp-throughput
+build_wasi_tool curl helios_curl_wasi wasm32-wasip3 curl
+build_wasi_tool tcp-throughput helios_tcp_throughput_wasi wasm32-wasip3 tcp-throughput
+build_wasi_tool wasi-tcp-throughput helios_wasi_tcp_throughput wasm32-wasip3 wasi-tcp-throughput
 build_wasi_tool wasix-tcp-throughput wasix-tcp-throughput wasm32-wasip1 wasix-tcp-throughput
 # The Helios curl imports helios:system/programs and wasi:http@0.3.0,
 # which upstream Wasmtime cannot instantiate; the Linux + Wasmtime side
 # runs this plain-WASI HTTP/1.1 client instead.
-build_wasi_tool wasi-curl helios_wasi_curl wasm32-wasip2 wasi-curl
+build_wasi_tool wasi-curl helios_wasi_curl wasm32-wasip3 wasi-curl
 # Benchmark-suite workloads that run unchanged on Helios and under Wasmtime
 # on Linux; docs/benchmarks.md lists what each one measures.
-build_wasi_tool hello helios_hello_wasi wasm32-wasip2 hello
-build_wasi_tool pipe-echo helios_pipe_echo_wasi wasm32-wasip2 pipe-echo
-build_wasi_tool hostcall-loop helios_hostcall_loop_wasi wasm32-wasip2 hostcall-loop
-build_wasi_tool tcp-latency helios_tcp_latency_wasi wasm32-wasip2 tcp-latency
+build_wasi_tool hello helios_hello_wasi wasm32-wasip3 hello
+build_wasi_tool pipe-echo helios_pipe_echo_wasi wasm32-wasip3 pipe-echo
+build_wasi_tool hostcall-loop helios_hostcall_loop_wasi wasm32-wasip3 hostcall-loop
+build_wasi_tool tcp-latency helios_tcp_latency_wasi wasm32-wasip3 tcp-latency
 
 echo "wasi artifacts written to: $out_dir and $python_root"
 ls -lh "$out_dir"/{curl,tcp-throughput,wasi-tcp-throughput,wasix-tcp-throughput,wasi-curl,hello,pipe-echo,hostcall-loop,tcp-latency}*.wasm

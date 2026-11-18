@@ -14,10 +14,11 @@ The local checkout must be at (branch `helios/sync-main-52`):
 `helios/sync-main-52` replays the 32 surviving Helios fork commits from
 `helios/caller-memory` (`5048e15b9626f0382e9a5df653668a0d44b017ed`) onto
 upstream `bytecodealliance/wasmtime` `main` at
-`591684039699641a3ec725fbc86fc8c9f7681211` (Wasmtime 52.0.0-dev, #1099),
-dropping patches and hunks superseded upstream (`a34ece0e5a` via #14524,
-`18b428e6be` via #14193, and the `custom/vm.rs` `decommit_pages` and
-`decommit_queue.rs` `std::io` hunks via #14774 and #14874).
+`591684039699641a3ec725fbc86fc8c9f7681211` (Wasmtime 52.0.0-dev, #1099, which
+already includes bytecodealliance/wasmtime#13949 / `fb8c7616d6` from
+`helios/realloc-task-context`), dropping patches and hunks superseded upstream
+(`a34ece0e5a` via #14524, `18b428e6be` via #14193, and the `custom/vm.rs`
+`decommit_pages` and `decommit_queue.rs` `std::io` hunks via #14774 and #14874).
 
 Its tip commit tells a host function the linear memory of the call it is serving:
 

@@ -23,12 +23,11 @@ use crate::{
 };
 use crate::{
     ComponentCache, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
-    ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, HostFileSystem,
-    InstanceId, KillOutcome, KillReason, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock,
-    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource,
-    elapsed_millis, largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats,
-    user_node_stats,
+    ComponentStoreData, EmbeddedComponent, ExecResult, HostFileSystem, InstanceId, KillOutcome,
+    KillReason, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
+    RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
+    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
+    largest_servable_user_bytes, machine_memory, monotonic_nanos, user_heap_stats, user_node_stats,
 };
 use helios_hal::cpu::Cpu;
 use spin::Mutex;
@@ -128,8 +127,6 @@ pub type StoreData<CpuImpl, Net, StorageImpl> = ComponentStoreData<
 pub type OutputMode = ComponentOutputMode;
 pub type OutputRoute = ComponentOutputRoute;
 pub type OutputStreamKind = ComponentOutputStreamKind;
-pub type RuntimeDeadlinePollable<CpuImpl, Net, StorageImpl> =
-    DeadlinePollable<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>;
 
 /// A long-running bring-up phase the heartbeat reports on.
 ///
@@ -1868,7 +1865,6 @@ where
     let wasi_imports =
         crate::wasmtime_adapter::wasi::WasiImportSet::from_component(engine, component);
     linker.allow_shadowing(true);
-    crate::wasmtime_adapter::wasi::preview2::add_to_linker(&mut linker, &wasi_imports)?;
     crate::wasmtime_adapter::wasi::preview3::add_to_linker(&mut linker, &wasi_imports)?;
     crate::wasmtime_adapter::wasi::http::add_to_linker(&mut linker, &wasi_imports)?;
     add_serial_to_linker(&mut linker)?;
@@ -2392,11 +2388,7 @@ fn tcp_connect_network_rights() -> NetworkAuthorityRights {
 }
 
 fn udp_bind_network_rights(local_port: u16) -> NetworkAuthorityRights {
-    if local_port != 0 && local_port < 1024 {
-        NetworkAuthorityRights::UDP | NetworkAuthorityRights::PRIVILEGED_BIND
-    } else {
-        NetworkAuthorityRights::UDP
-    }
+    NetworkAuthorityRights::UDP.bind_rights(local_port)
 }
 
 fn add_net_to_linker<CpuImpl, Net, StorageImpl>(
@@ -2533,7 +2525,12 @@ where
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(unavailable_udp_error()),));
                 };
-                let bound = service.udp_bind(local_port).await;
+                let bound = service
+                    .udp_bind(
+                        crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                        local_port,
+                    )
+                    .await;
                 let response =
                     match bound {
                         Ok(binding) => {
@@ -2832,7 +2829,12 @@ where
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(unavailable_program_udp_error()),));
                 };
-                let bound = service.udp_bind(local_port).await;
+                let bound = service
+                    .udp_bind(
+                        crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                        local_port,
+                    )
+                    .await;
                 let response =
                     match bound {
                         Ok(binding) => {

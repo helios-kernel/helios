@@ -23,7 +23,6 @@ pub enum ArtifactProfile {
     CorePreview1,
     CorePreview1Threads,
     CoreWasix,
-    ComponentPreview2,
     ComponentPreview3,
 }
 
@@ -207,7 +206,7 @@ fn classify_component(imports: Vec<String>) -> Result<ArtifactProfileReport, Art
 
     Ok(ArtifactProfileReport {
         kind: ArtifactKind::Component,
-        profile: component_profile(&imports),
+        profile: ArtifactProfile::ComponentPreview3,
         imports: imports
             .into_iter()
             .map(|name| ArtifactImport {
@@ -218,22 +217,11 @@ fn classify_component(imports: Vec<String>) -> Result<ArtifactProfileReport, Art
     })
 }
 
-fn component_profile(imports: &[String]) -> ArtifactProfile {
-    if imports
-        .iter()
-        .any(|import| is_wasi_import_version(import, "0.3"))
-    {
-        ArtifactProfile::ComponentPreview3
-    } else {
-        ArtifactProfile::ComponentPreview2
-    }
-}
-
-fn is_wasi_import_version(name: &str, version_prefix: &str) -> bool {
-    name.starts_with("wasi:")
-        && name
-            .split_once('@')
-            .is_some_and(|(_, version)| version.starts_with(version_prefix))
+/// Whether `name` is a `wasi:` interface at a 0.3 version, the only WASI
+/// version a component may import.
+fn is_wasi_preview3_import(name: &str) -> bool {
+    name.split_once('@')
+        .is_some_and(|(_, version)| version.starts_with("0.3"))
 }
 
 pub fn validate_component_import_name(name: &str) -> Result<(), ArtifactProfileError> {
@@ -247,13 +235,13 @@ pub fn validate_component_import_name(name: &str) -> Result<(), ArtifactProfileE
 }
 
 fn is_supported_component_import(name: &str) -> bool {
-    name.starts_with("wasi:cli/")
+    let is_wasi = name.starts_with("wasi:cli/")
         || name.starts_with("wasi:clocks/")
         || name.starts_with("wasi:filesystem/")
         || name.starts_with("wasi:http/")
-        || name.starts_with("wasi:io/")
         || name.starts_with("wasi:random/")
-        || name.starts_with("wasi:sockets/")
+        || name.starts_with("wasi:sockets/");
+    (is_wasi && is_wasi_preview3_import(name))
         || name.starts_with("helios:system/")
         || name == "helios:hv/virtualization@0.1.0"
         || name.starts_with("import-func-")
@@ -270,6 +258,7 @@ mod tests {
 
     use super::{
         ArtifactKind, ArtifactProfile, ArtifactProfileError, classify_component, classify_raw_wasm,
+        validate_component_import_name,
     };
 
     #[test]
@@ -371,15 +360,21 @@ mod tests {
     }
 
     #[test]
-    fn component_imports_with_preview2_version_are_preview2() {
-        let report = classify_component(alloc::vec![
+    fn component_imports_with_preview2_version_are_refused() {
+        let error = classify_component(alloc::vec![
             "wasi:cli/environment@0.2.12".to_string(),
             "wasi:filesystem/types@0.2.12".to_string(),
-            "import-func-run".to_string(),
         ])
-        .expect("Preview2 imports must classify");
+        .expect_err("Preview2 is not a supported ABI");
 
-        assert_eq!(report.profile, ArtifactProfile::ComponentPreview2);
+        assert!(matches!(
+            error,
+            ArtifactProfileError::UnknownComponentImport { name } if name == "wasi:cli/environment@0.2.12"
+        ));
+        assert!(matches!(
+            validate_component_import_name("wasi:io/streams@0.2.12"),
+            Err(ArtifactProfileError::UnknownComponentImport { .. })
+        ));
     }
 
     #[test]

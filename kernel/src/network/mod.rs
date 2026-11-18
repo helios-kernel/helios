@@ -3,14 +3,12 @@
 //! `service` hosts the `NetworkService` that wraps `helios-netstack`
 //! for component-host TCP/UDP/DNS access. `control` exposes the
 //! capability-checked admin API used by privileged components.
-//! `socket_stack` provides per-task socket lifecycle bookkeeping.
 //! `http` holds the transport-neutral HTTP value types that cross the
 //! boundary between a program and the `http-client` kernel plugin.
 
 mod control;
 mod http;
 mod service;
-mod socket_stack;
 
 pub use control::{
     Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
@@ -27,7 +25,6 @@ pub use http::{
 pub use service::{
     NetworkQueueStats, NetworkService, NetworkStats, TcpListenerId, TcpStreamId, UdpSocketId,
 };
-pub use socket_stack::SocketStack;
 
 /// The established-connection fixture the retirement tests in
 /// `wasmtime_adapter` need. Its wiring is private to `network::service`
