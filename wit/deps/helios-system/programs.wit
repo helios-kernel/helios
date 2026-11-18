@@ -249,9 +249,21 @@ interface programs {
     launch-nanos: u64,
   }
 
+  record signal-termination {
+    signal: u8,
+    core-dumped: bool,
+  }
+
+  variant child-termination {
+    exited(u32),
+    signaled(signal-termination),
+    trapped,
+    killed,
+  }
+
   record exit-status {
     instance-id: instance-id,
-    code: u32,
+    termination: child-termination,
   }
 
   enum spawn-error-kind {
