@@ -94,6 +94,26 @@ pub struct TaskCapacityError {
 // wake on one processor's counter can never invalidate another's.
 const _: () = assert!(align_of::<CachePadded<AtomicUsize>>() >= 64);
 
+/// A core-pinned spawn could not be placed because the target processor was
+/// offline (or outside the platform's possible processors).
+///
+/// Carries the rejected future back to the caller so it can re-route onto
+/// another online processor without re-allocating or reconstructing state.
+#[derive(thiserror::Error)]
+#[error("processor {} is offline and cannot accept core-pinned tasks", .processor.id())]
+pub struct PinnedSpawnError<Fut> {
+    pub processor: ProcessorId,
+    pub future: Fut,
+}
+
+impl<Fut> core::fmt::Debug for PinnedSpawnError<Fut> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PinnedSpawnError")
+            .field("processor", &self.processor)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The queues and counters every processor's executor shares.
 ///
 /// The ready queues are intrusive lists linked through the tasks'
@@ -180,11 +200,12 @@ pub(crate) struct ExecutorGroup {
 /// the wake handshake it serves is in `idle`'s module docs. The arena's
 /// header is the one shared allocation every future placed in it keeps
 /// a reference to; its bytes are in the owner's node's memory.
-/// `local_live` counts the local tasks whose future is still alive. It
-/// is written by the owner only — a local task is spawned, run and
-/// dropped on its owner — and read by the owner's offline step, which
-/// refuses to stop a processor that still has work pinned to it; being
-/// owner-only, it shares the arena pointer's line.
+/// `local_live` counts the local and core-pinned tasks whose future is still
+/// alive on this processor. It is incremented by the owner (`spawn_local`) or
+/// by a caller pinning work to this processor (`try_spawn_on`, participating
+/// in the `SeqCst` handshake with `OnlineSet`), decremented on `Drop`, and read
+/// by the owner's offline step, which refuses to stop a processor that still
+/// has work pinned to it; it shares the arena pointer's line.
 struct ProcessorQueues {
     shared: CachePadded<ReadyShared>,
     idle: CachePadded<ProcessorIdle>,
@@ -1196,8 +1217,20 @@ impl Executor {
                 None => break,
             }
         }
-        let live = queues.local_live.load(Ordering::Acquire);
+        // Fast check before leaving `online`.
+        let live = queues.local_live.load(Ordering::SeqCst);
         if live != 0 {
+            return Err(PinnedTasks { processor, live });
+        }
+        // Dekker handshake with cross-processor `Spawner::try_spawn_on`: remove
+        // from `online` (`SeqCst`) then re-test `local_live` (`SeqCst`). Any
+        // concurrent `try_spawn_on` either incremented `local_live` before
+        // seeing `!online` (caught here, rolling back `online`), or saw
+        // `!online` and dropped its count without pushing anything.
+        self.group.online.remove(processor);
+        let live = queues.local_live.load(Ordering::SeqCst);
+        if live != 0 {
+            self.group.online.insert(processor);
             return Err(PinnedTasks { processor, live });
         }
         assert!(
@@ -1205,7 +1238,6 @@ impl Executor {
             "processor {} has local work queued with no local task alive",
             processor.id()
         );
-        self.group.online.remove(processor);
         if self.group.any_node_ready() && self.group.needs_wake(successor) {
             cpu.wake_processor(successor);
         }
@@ -1391,10 +1423,14 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
     }
 
     fn local_scheduler(&self) -> LocalScheduler<CpuImpl> {
+        self.scheduler_for(self.owner_processor)
+    }
+
+    fn scheduler_for(&self, processor: ProcessorId) -> LocalScheduler<CpuImpl> {
         LocalScheduler {
             group: self.group,
             cpu: self.cpu.clone(),
-            owner_processor: self.owner_processor,
+            owner_processor: processor,
             progress: self.progress_signal(),
         }
     }
@@ -1441,6 +1477,51 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut::Output: Send + 'static,
     {
         self.spawn(future).detach();
+    }
+
+    /// Spawns a kernel task pinned to `target`'s local queue rather than any
+    /// `NodeQueue`: every poll, time-slice yield, and wake runs exclusively on
+    /// `target` with zero cross-core stealing.
+    ///
+    /// Returns [`PinnedSpawnError`] carrying `future` back when `target` is
+    /// offline (or outside the platform's possible processors).
+    pub fn try_spawn_on<Fut>(
+        &self,
+        target: ProcessorId,
+        future: Fut,
+    ) -> Result<JoinHandle<Fut::Output>, PinnedSpawnError<Fut>>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        if usize::from(target.id()) >= self.group.possible_processors()
+            || !self.group.online.contains(target)
+        {
+            return Err(PinnedSpawnError {
+                processor: target,
+                future,
+            });
+        }
+        let target_queues = self.group.queues(target);
+        target_queues.local_live.fetch_add(1, Ordering::SeqCst);
+        if !self.group.online.contains(target) {
+            target_queues.local_live.fetch_sub(1, Ordering::SeqCst);
+            return Err(PinnedSpawnError {
+                processor: target,
+                future,
+            });
+        }
+        let future = TaskArena::allocate_kernel(
+            self.task_arena(current_processor()),
+            LocalTask::from_precounted(future, &target_queues.local_live),
+        );
+        let scheduler = self.scheduler_for(target);
+        let schedule = move |runnable| scheduler.schedule(runnable);
+        let (runnable, task) = Builder::new()
+            .metadata(ReadyLink::new())
+            .spawn(move |_| future, schedule);
+        runnable.schedule();
+        Ok(task)
     }
 
     pub fn spawn_local<Fut>(&self, future: Fut) -> LocalJoinHandle<Fut::Output>
@@ -1812,7 +1893,13 @@ struct LocalTask<Fut> {
 
 impl<Fut> LocalTask<Fut> {
     fn new(future: Fut, live: &'static AtomicUsize) -> Self {
-        live.fetch_add(1, Ordering::Release);
+        live.fetch_add(1, Ordering::SeqCst);
+        Self { future, live }
+    }
+
+    /// Adopts a `local_live` count already incremented by the caller's
+    /// online-check handshake (`Spawner::try_spawn_on`).
+    fn from_precounted(future: Fut, live: &'static AtomicUsize) -> Self {
         Self { future, live }
     }
 }
@@ -1829,7 +1916,7 @@ impl<Fut: Future> Future for LocalTask<Fut> {
 
 impl<Fut> Drop for LocalTask<Fut> {
     fn drop(&mut self) {
-        let previous = self.live.fetch_sub(1, Ordering::Release);
+        let previous = self.live.fetch_sub(1, Ordering::SeqCst);
         assert!(previous != 0, "local task live count underflowed");
     }
 }
@@ -3029,7 +3116,10 @@ mod tests {
 
     /// Runs passes until one finds nothing to run, and returns how many
     /// local and global tasks ran in all.
-    fn run_to_stall(executor: &Executor, timer: &Timer<TestCpu>) -> (usize, usize) {
+    fn run_to_stall<CpuImpl: Cpu + Clone>(
+        executor: &Executor,
+        timer: &Timer<CpuImpl>,
+    ) -> (usize, usize) {
         let (mut local, mut global) = (0, 0);
         loop {
             let stats = executor.run_until_stalled_with_stats(timer);
@@ -3207,5 +3297,116 @@ mod tests {
         assert_eq!(local_ready(&executor, 0), LEFT_OVER);
         assert_eq!(run_to_stall(&executor, &timer), (LEFT_OVER, 0));
         assert_eq!(ran.load(Ordering::Relaxed), READY_BATCH_TASKS + LEFT_OVER);
+    }
+
+    /// `try_spawn_on` refuses an offline or out-of-range processor without
+    /// altering its live task count or ready queue.
+    #[test]
+    fn try_spawn_on_refuses_offline_and_out_of_range_processors() {
+        let executor0 = executor_on(two_nodes(), ProcessorId::new(0));
+        let cpu = RecordingSmpCpu::new(0, 2);
+        let spawner0 = executor0.spawner(cpu.clone());
+        executor0.group.online.remove(ProcessorId::new(1));
+
+        let Err(refused) = spawner0.try_spawn_on(ProcessorId::new(1), async { 7usize }) else {
+            panic!("offline processor cannot accept pinned tasks");
+        };
+        assert_eq!(refused.processor, ProcessorId::new(1));
+        assert_eq!(
+            executor0
+                .group
+                .queues(ProcessorId::new(1))
+                .local_live
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(local_ready(&executor0, 1), 0);
+
+        let Err(out_of_range) = spawner0.try_spawn_on(ProcessorId::new(9), async { 11usize })
+        else {
+            panic!("out-of-range processor is refused");
+        };
+        assert_eq!(out_of_range.processor, ProcessorId::new(9));
+    }
+
+    /// A task placed via `try_spawn_on` runs only on its pinned target across
+    /// yields, wakes the target when parked, cannot be stolen by another
+    /// processor, and blocks `take_offline` until it completes.
+    #[test]
+    fn try_spawn_on_pins_to_target_and_blocks_offline_until_done() {
+        let executor0 = executor_on(two_nodes(), ProcessorId::new(0));
+        let cpu0 = RecordingSmpCpu::new(0, 2);
+        let cpu1 = RecordingSmpCpu::new(1, 2);
+        let executor1 = executor0.sibling(ProgressCounter::new(), ProcessorId::new(1));
+        executor0.group.publish_parked(ProcessorId::new(1));
+        test_processor_identity::set(ProcessorId::new(0));
+
+        let gate = Arc::new(std::sync::Mutex::new(Gate {
+            open: false,
+            wakers: Vec::new(),
+        }));
+        let observed = Arc::new(spin::Mutex::new(Vec::new()));
+        let spawner0 = executor0.spawner(cpu0.clone());
+        let handle = spawner0
+            .try_spawn_on(ProcessorId::new(1), {
+                let gate = gate.clone();
+                let observed = observed.clone();
+                async move {
+                    observed
+                        .lock()
+                        .push(helios_hal::cpu::current_processor().id());
+                    WaitForGate(gate).await;
+                    observed
+                        .lock()
+                        .push(helios_hal::cpu::current_processor().id());
+                }
+            })
+            .expect("online target accepts core-pinned task");
+
+        assert_eq!(local_ready(&executor0, 1), 1);
+        assert_eq!(cpu0.woken(), [ProcessorId::new(1)]);
+
+        // Processor 0 cannot steal processor 1's core-pinned task.
+        test_processor_identity::set(ProcessorId::new(0));
+        let timer0 = executor0.timer(cpu0.clone());
+        assert_eq!(run_to_stall(&executor0, &timer0), (0, 0));
+        assert!(observed.lock().is_empty());
+
+        // Processor 1 runs the first poll and yields at the gate.
+        test_processor_identity::set(ProcessorId::new(1));
+        let timer1 = executor1.timer(cpu1.clone());
+        assert_eq!(run_to_stall(&executor1, &timer1), (1, 0));
+        assert_eq!(*observed.lock(), [1]);
+
+        // While the pinned task is still alive on processor 1, offline refuses.
+        assert_eq!(
+            executor1.take_offline(&cpu1, ProcessorId::new(0)),
+            Err(super::PinnedTasks {
+                processor: ProcessorId::new(1),
+                live: 1,
+            })
+        );
+        assert!(executor0.group.online.contains(ProcessorId::new(1)));
+
+        // Wake from processor 0: the resume goes back to processor 1 only.
+        test_processor_identity::set(ProcessorId::new(0));
+        let wakers = {
+            let mut gate = gate.lock().expect("the gate lock is never poisoned");
+            gate.open = true;
+            core::mem::take(&mut gate.wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+        assert_eq!(run_to_stall(&executor0, &timer0), (0, 0));
+        assert_eq!(local_ready(&executor0, 1), 1);
+
+        test_processor_identity::set(ProcessorId::new(1));
+        assert_eq!(run_to_stall(&executor1, &timer1), (1, 0));
+        assert_eq!(*observed.lock(), [1, 1]);
+        drop(handle);
+
+        assert_eq!(executor1.take_offline(&cpu1, ProcessorId::new(0)), Ok(()));
+        assert!(!executor0.group.online.contains(ProcessorId::new(1)));
     }
 }

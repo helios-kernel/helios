@@ -970,7 +970,7 @@ where
              count: i32,
              size: i32|
              -> i32 {
-                let thread_count = compiler_plugin_worker_threads(&caller.data().context.cpu);
+                let thread_count = caller.data().context.shared.worker_threads();
                 let env_len = compiler_rayon_env_len(thread_count);
                 let memory = caller.data().memory();
                 let first = write_u32(memory, GuestAddress::wasm32(count as u32), 1);
@@ -1045,6 +1045,11 @@ where
                     return -1;
                 };
                 let thread_id = previous + 1;
+                let worker_slot = context
+                    .shared
+                    .session_worker_cursor
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                let preferred = context.affinity_plan.worker(worker_slot);
                 let instance_pre = context
                     .shared
                     .instance_pre
@@ -1052,9 +1057,10 @@ where
                     .unwrap_or_else(|| panic!("compiler thread-spawn called before instance pre"))
                     .clone();
                 let spawner = context.spawner.clone();
+                let affinity_plan = context.affinity_plan.clone();
                 let shared = context.shared.clone();
                 let spawned_ns = crate::monotonic_nanos(&context.cpu);
-                let task = spawner.spawn(async move {
+                let task = affinity_plan.spawn_pinned(&spawner, preferred, async move {
                     let started_ns = crate::monotonic_nanos(&context.cpu);
                     let processor = helios_hal::cpu::current_processor().id();
                     // The worker's own store, accounted and driven like the
@@ -1092,7 +1098,7 @@ where
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
                         store.data().context.condemn_for_store_end(error)
                     });
-                    CompilerThreadReport {
+                    SharedMemoryThreadReport {
                         trap,
                         thread_id,
                         processor,

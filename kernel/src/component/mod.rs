@@ -32,8 +32,8 @@ pub use fs_path::{
     resolve_absolute_path, resolve_child_path, resolve_guest_path, strip_directory_prefix,
 };
 pub use provider::{
-    ProviderAlreadyInstalled, ProviderError, ProviderReceiver, ProviderSender, ProviderSlot,
-    provider_channel,
+    PerProcessorProvider, ProviderAlreadyInstalled, ProviderError, ProviderReceiver,
+    ProviderSender, ProviderSlot, provider_channel,
 };
 pub use resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
