@@ -44,6 +44,7 @@ use crate::compress::policy::Compressor;
 use crate::ondisk::objectid;
 use crate::retirement::Retirements;
 use crate::source::BlockSink;
+use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
 use crate::transaction::reserve::Units;
@@ -163,6 +164,9 @@ pub struct Writer<S, U> {
     uuids: U,
     /// The mount's compression, which writeback encodes new extents with.
     compressor: Compressor,
+    /// Linux's `max_inline` mount option: the most stored bytes an inline
+    /// extent holds.
+    max_inline: u64,
     concurrency: NonZeroUsize,
 }
 
@@ -232,8 +236,35 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             mount: Arc::new(MountIdentity),
             uuids,
             compressor,
+            max_inline: DEFAULT_MAX_INLINE,
             concurrency,
         })
+    }
+
+    /// The mount's `max_inline` limit, in bytes.
+    pub fn max_inline(&self) -> u64 {
+        self.max_inline
+    }
+
+    /// Changes the mount's `max_inline`, as Linux's
+    /// `mount -o remount,max_inline=`: subsequent mutations store inline data
+    /// under the new limit, and what is already stored stays as it is.
+    pub fn set_max_inline(&mut self, max_inline: u64) {
+        self.max_inline = max_inline;
+    }
+
+    /// Changes the mount's compression policy, as Linux's
+    /// `mount -o remount,compress=`: writes back dirty data queued under the
+    /// previous policy first so its reserved extent count stays exact, then
+    /// applies `compressor` to subsequent writes.
+    pub async fn set_compressor(&mut self, compressor: Compressor) -> Result<(), WriteError> {
+        self.writeback().await?;
+        let compresses = compressor.algorithm().is_some();
+        self.compressor = compressor;
+        if let Some(running) = &mut self.running {
+            running.inner.delalloc.set_compresses(compresses);
+        }
+        Ok(())
     }
 
     /// The space the filesystem has, and what it uses once the running
@@ -297,7 +328,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         let mut transaction = self.join().await?;
         let mut operation = Mutation::checkpointed(&mut transaction, Units::default());
         operation.inner_mut().prepare_mutation().await?;
-        let (inner, compressor, concurrency) = operation.split();
+        let (inner, compressor, concurrency, _) = operation.split();
         inner.writeback_all(compressor, concurrency).await?;
         // The reservations the data took when it was written pay for this:
         // there is nothing left to refuse it for.
@@ -401,9 +432,11 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         &mut self.running_mut().inner
     }
 
-    /// The running transaction beside the mount's compressor and I/O
-    /// concurrency, for the operations that write data back.
-    pub(crate) fn split(&mut self) -> (&mut Transaction<Arc<S>>, &mut Compressor, NonZeroUsize) {
+    /// The running transaction beside the mount's compressor, I/O concurrency
+    /// and `max_inline` limit, for the operations that encode or write data.
+    pub(crate) fn split(
+        &mut self,
+    ) -> (&mut Transaction<Arc<S>>, &mut Compressor, NonZeroUsize, u64) {
         let writer = &mut *self.writer;
         let running = writer
             .running
@@ -413,7 +446,23 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             &mut running.inner,
             &mut writer.compressor,
             writer.concurrency,
+            writer.max_inline,
         )
+    }
+
+    /// The mount's `max_inline` limit, in bytes.
+    pub fn max_inline(&self) -> u64 {
+        self.writer.max_inline()
+    }
+
+    /// Changes the mount's `max_inline`, as [`Writer::set_max_inline`].
+    pub fn set_max_inline(&mut self, max_inline: u64) {
+        self.writer.set_max_inline(max_inline);
+    }
+
+    /// Changes the mount's compression policy, as [`Writer::set_compressor`].
+    pub async fn set_compressor(&mut self, compressor: Compressor) -> Result<(), WriteError> {
+        self.writer.set_compressor(compressor).await
     }
 
     #[cfg(test)]
@@ -541,33 +590,38 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         self.checked(file).await?;
         let id = file.id;
         self.inner().roots.check_writable(id.tree)?;
+        let max_inline = self.writer.max_inline;
         let reservation = self
             .inner()
-            .write_reservation(id, offset, data.len() as u64)
+            .write_reservation(id, offset, data.len() as u64, max_inline)
             .await?;
         self.reserve_data(reservation).await?;
         let mut units = self
             .inner()
-            .write_units(id, offset, data.len() as u64)
+            .write_units(id, offset, data.len() as u64, max_inline)
             .await?;
         if !self.inner().reserves(units) && !self.writer.dirty().is_clean() {
             self.writer.commit().await?;
             self.writer.start().await?;
             units = self
                 .inner()
-                .write_units(id, offset, data.len() as u64)
+                .write_units(id, offset, data.len() as u64, max_inline)
                 .await?;
         }
         let mut operation = Mutation::new(self, units).await?;
         operation.checked(file).await?;
-        let (inner, compressor, _) = operation.split();
+        let (inner, compressor, _, max_inline) = operation.split();
         let written = inner
-            .write_file(id.tree, id.inode, offset, data, when, compressor)
+            .write_file(
+                id.tree, id.inode, offset, data, when, compressor, max_inline,
+            )
             .await?;
         operation.accept()?;
         Ok(written)
     }
 
+    /// Sets the size of `file`, as `truncate(2)`. A grown or compressed inline
+    /// file re-stores its first sector under the mount's policy.
     pub async fn truncate_file(
         &mut self,
         file: &InodeHandle,
@@ -575,21 +629,35 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         when: Timestamp,
     ) -> Result<(), WriteError> {
         self.checked(file).await?;
-        let reservation = self.inner().truncate_reservation(file.id, size).await?;
+        let max_inline = self.writer.max_inline;
+        let reservation = self
+            .inner()
+            .truncate_reservation(file.id, size, max_inline)
+            .await?;
         self.reserve_data(reservation).await?;
-        let mut operation = Mutation::new(self, Units::TRUNCATE).await?;
+        let units = if reservation == 0 {
+            Units::TRUNCATE
+        } else {
+            Units {
+                insert: 4,
+                update: 1,
+                frees: false,
+            }
+        };
+        let mut operation = Mutation::new(self, units).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner_mut().roots.check_writable(file.tree)?;
-        operation
-            .inner_mut()
-            .truncate_file(file.tree, file.inode, size, when)
+        let (inner, compressor, _, max_inline) = operation.split();
+        inner
+            .truncate_file(file.tree, file.inode, size, when, compressor, max_inline)
             .await?;
         operation.accept()
     }
 
-    /// Clones the range, writing back the dirty data of both its ends
-    /// first: only an extent can be shared.
+    /// Shares `range` of one file's extents into another, as `FICLONERANGE`,
+    /// writing back dirty data in the source range first so its extents can be
+    /// shared.
     pub async fn clone_range(
         &mut self,
         range: CloneRange<'_>,
@@ -621,9 +689,9 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             .inner_mut()
             .roots
             .check_writable(range.destination.tree)?;
-        let (inner, compressor, concurrency) = operation.split();
+        let (inner, compressor, concurrency, max_inline) = operation.split();
         inner
-            .clone_range(range, when, compressor, concurrency)
+            .clone_range(range, when, compressor, concurrency, max_inline)
             .await?;
         operation.accept()
     }

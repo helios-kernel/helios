@@ -341,6 +341,8 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
         };
         let mut replies = Vec::with_capacity(requests.len());
         let mut syncs = Vec::new();
+        // An operator's change applies from the next batch.
+        transaction.set_max_inline(self.policy.max_inline());
         for request in requests {
             if request.reply.is_canceled() {
                 continue;

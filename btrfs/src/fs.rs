@@ -237,6 +237,9 @@ pub struct ExtentInfo {
     pub kind: ExtentKind,
     /// The item's compression type; `None` for stored plain.
     pub compression: Option<crate::Compression>,
+    /// The bytes the range occupies as stored: an inline item's data, or a
+    /// regular or preallocated extent's `disk_num_bytes` (zero for a hole).
+    pub stored: u64,
 }
 
 /// An inode, as of the commit it was read from.
@@ -852,6 +855,8 @@ async fn default_subvolume<S: BlockSource>(
     Ok(tree)
 }
 
+#[cfg(all(test, feature = "write"))]
+mod inline_tests;
 #[cfg(all(test, feature = "write"))]
 mod rename_tests;
 #[cfg(all(test, feature = "write"))]

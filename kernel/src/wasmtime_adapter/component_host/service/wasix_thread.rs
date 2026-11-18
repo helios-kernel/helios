@@ -199,7 +199,14 @@ where
             // Nobody joins a thread of an ended process; the status is
             // only ever seen by the process's own end.
             let code = match &end {
-                WasixProcessEnd::Exit(code) => *code,
+                WasixProcessEnd::Exit(termination) => match termination {
+                    helios_unix::ChildTermination::Exited(code) => *code,
+                    helios_unix::ChildTermination::Signaled(sig) => {
+                        128u32.saturating_add(u32::from(sig.signal))
+                    }
+                    helios_unix::ChildTermination::Trapped
+                    | helios_unix::ChildTermination::Killed => WasixThreadEnded::EXIT_CODE,
+                },
                 WasixProcessEnd::Exec(_) => WasixThreadEnded::EXIT_CODE,
                 WasixProcessEnd::Fail(failure) => {
                     tracing::error!(tid, %failure, "wasix thread failed; its process fails with it");
@@ -328,7 +335,7 @@ pub(super) fn wasix_thread_call_end<Image>(
         return WasixThreadCallEnd::Process(WasixProcessEnd::Exec(image));
     }
     WasixThreadCallEnd::Process(match preview1_process_end(error, requested_exit) {
-        Ok(code) => WasixProcessEnd::Exit(code),
+        Ok(termination) => WasixProcessEnd::Exit(termination),
         Err(failure) => WasixProcessEnd::Fail(failure),
     })
 }
@@ -393,19 +400,16 @@ where
     if !(0..=31).contains(&signal) {
         return Ok(p1::errno::INVAL);
     };
-    let signal = signal as u32;
+    let signal = signal as u8;
     // A signal to the calling thread itself ends that thread alone, as
     // one raised on its mailbox would.
     if u32::try_from(tid).ok() == Some(caller.data().thread_id) {
         return Err(wasmtime::Error::new(WasixThreadSignalExit { signal }));
     }
     // A spawned thread signalling main: main's end is its process's, so
-    // the process ends with the signal's status.
+    // the process ends with the signal.
     if tid == 0 {
-        caller
-            .data_mut()
-            .request_exit(128u32.saturating_add(signal));
-        return Err(wasmtime::Error::new(Preview1Exit));
+        return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
     }
     let Ok(tid) = u32::try_from(tid) else {
         return Ok(p1::errno::INVAL);
@@ -413,7 +417,7 @@ where
     let Some(mailbox) = caller.data().threads.live_mailbox(tid) else {
         return Ok(p1::errno::SRCH);
     };
-    mailbox.raise(signal);
+    mailbox.raise(u32::from(signal));
     Ok(p1::errno::SUCCESS)
 }
 
@@ -1068,7 +1072,10 @@ mod tests {
             Box::pin(main_turns.drive(parked.call_async(&mut main_store, &[], &mut [])));
         assert!(main_call.as_mut().poll(&mut main_cx).is_pending());
 
-        threads.end_from_thread(exiting_tid, WasixProcessEnd::Exit(7));
+        threads.end_from_thread(
+            exiting_tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(7)),
+        );
         assert!(
             threads.main_mailbox().thread_ended(),
             "the exit ends main's image"
@@ -1089,7 +1096,10 @@ mod tests {
             Some(helios_unix::ThreadAdmissionError::Ended),
             "an exiting process admits no thread"
         );
-        threads.end_from_thread(other_tid, WasixProcessEnd::Exit(3));
+        threads.end_from_thread(
+            other_tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(3)),
+        );
 
         match main_call.as_mut().poll(&mut main_cx) {
             Poll::Ready(Err(error)) => assert!(
@@ -1106,7 +1116,9 @@ mod tests {
         drop(main_store);
         assert_eq!(
             threads.take_process_end(),
-            Some(WasixProcessEnd::Exit(7)),
+            Some(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Exited(7)
+            )),
             "main takes the first exit's status"
         );
         assert_eq!(threads.take_process_end(), None, "and takes it once");
@@ -1151,7 +1163,10 @@ mod tests {
         assert!(threads.main_mailbox().thread_ended(), "main's image ends");
         assert!(other_mailbox.thread_ended(), "every other thread ends");
         assert!(!exec_mailbox.thread_ended());
-        threads.end_from_thread(exec_tid, WasixProcessEnd::Exit(1));
+        threads.end_from_thread(
+            exec_tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(1)),
+        );
         assert_eq!(
             threads.take_process_end(),
             Some(WasixProcessEnd::Exec("next")),
@@ -1184,7 +1199,10 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(end.as_mut().poll(&mut cx).is_pending());
 
-        threads.end_from_thread(tid, WasixProcessEnd::Exit(7));
+        threads.end_from_thread(
+            tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(7)),
+        );
         assert!(
             !threads.main_mailbox().thread_ended(),
             "main has already ended on its own"
@@ -1223,7 +1241,9 @@ mod tests {
         );
         assert_eq!(
             end(Err(wasmtime::Error::new(Preview1Exit)), Some(7)),
-            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(7)),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Exited(7)
+            )),
             "proc_exit ends the process"
         );
         assert_eq!(
@@ -1231,8 +1251,13 @@ mod tests {
                 Err(wasmtime::Error::new(Preview1SignalExit { signal: 15 })),
                 Some(7)
             ),
-            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(128 + 15)),
-            "a fatal signal ends the process with its status"
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+                    signal: 15,
+                    core_dumped: false,
+                })
+            )),
+            "a fatal signal ends the process with its signal"
         );
         assert_eq!(
             wasix_thread_call_end(Err(wasmtime::Error::new(Preview1Exit)), None, Some("next")),
@@ -1241,29 +1266,47 @@ mod tests {
         );
     }
 
-    /// A trap on a spawned thread ends the whole process with the
-    /// failure the same trap on main reports: main's completion maps its
-    /// call's error through `preview1_process_end`, and the thread's end
-    /// carries exactly that, kind and detail alike. An exec the thread
-    /// asked for before it trapped still replaces the process, as on
-    /// main.
+    /// A trap or owner kill on a spawned thread ends the whole process
+    /// with the termination the same event on main reports, while an OOM
+    /// failure fails the process as on main. An exec the thread asked for
+    /// before it trapped still replaces the process, as on main.
     #[test]
     fn a_trap_on_a_thread_fails_the_process_as_a_trap_on_main_does() {
         let trap = || wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached);
-        let mains = preview1_process_end(trap(), None)
-            .expect_err("a trap on main is the process's failure");
-        assert_eq!(mains.kind, ProgramExecErrorKind::Internal);
+        assert_eq!(
+            preview1_process_end(trap(), None),
+            Ok(helios_unix::ChildTermination::Trapped),
+            "a trap on main reports Trapped"
+        );
         assert_eq!(
             wasix_thread_call_end::<()>(Err(trap()), None, None),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Trapped
+            )),
+            "a trap on a thread ends its process as Trapped"
+        );
+
+        let oom = || {
+            wasmtime::Error::from(crate::InstanceKilled {
+                reason: crate::KillReason::OutOfMemory,
+            })
+        };
+        let mains = preview1_process_end(oom(), None)
+            .expect_err("an OOM kill on main is the process's failure");
+        assert_eq!(mains.kind, ProgramExecErrorKind::OutOfMemory);
+        assert_eq!(
+            wasix_thread_call_end::<()>(Err(oom()), None, None),
             WasixThreadCallEnd::Process(WasixProcessEnd::Fail(mains)),
-            "a trap on a thread fails its process"
+            "an OOM kill on a thread fails its process"
         );
 
         // A trap after the guest asked to exit ends the process with the
         // status it asked for, as on main.
         assert_eq!(
             wasix_thread_call_end::<()>(Err(trap()), Some(4), None),
-            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(4))
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Exited(4)
+            ))
         );
         // An exec comes first, as main's completion takes it first.
         assert_eq!(
@@ -1281,10 +1324,12 @@ mod tests {
     fn a_threads_failure_ends_main_with_the_failure() {
         let failure = || {
             preview1_process_end(
-                wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached),
+                wasmtime::Error::from(crate::InstanceKilled {
+                    reason: crate::KillReason::OutOfMemory,
+                }),
                 None,
             )
-            .expect_err("a trap is a failure")
+            .expect_err("an OOM kill is a failure")
         };
 
         let threads = WasixProcessThreads::<&'static str>::new();
@@ -1296,7 +1341,10 @@ mod tests {
             .admit(other_mailbox.clone(), Arc::new(WasixThreadExit::new()))
             .expect("a live process admits a thread");
         threads.end_from_thread(failing_tid, WasixProcessEnd::Fail(failure()));
-        threads.end_from_thread(other_tid, WasixProcessEnd::Exit(3));
+        threads.end_from_thread(
+            other_tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(3)),
+        );
         threads.end_from_thread(other_tid, WasixProcessEnd::Exec("next"));
         assert!(threads.main_mailbox().thread_ended(), "main is ended");
         assert!(other_mailbox.thread_ended(), "every other thread is ended");

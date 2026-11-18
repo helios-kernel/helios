@@ -3227,8 +3227,11 @@ mod tests {
             &crate::test_support::TestCpu::without_entropy(),
         )
         .expect("component engine builds on test platform");
-        let memory = wasmtime::SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1))
-            .expect("shared guest test memory builds");
+        let memory = wasmtime::SharedMemory::new(
+            &engine,
+            wasmtime::MemoryType::shared(1, 1).expect("1..=1 is a valid shared memory type"),
+        )
+        .expect("shared guest test memory builds");
         let runtime_state: HostRuntimeState<
             crate::test_support::ManualClockCpu,
             TestNetService,

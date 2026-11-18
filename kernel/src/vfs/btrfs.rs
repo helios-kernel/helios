@@ -47,8 +47,8 @@ use crate::{
     BlockCacheError, BlockPages, CACHE_BLOCK_BYTES, CachedDisk, ProgressSignal, RootEntropyHandle,
 };
 use helios_btrfs::write::{
-    CompressionPolicy, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, EncodeError, WriteError, Writer,
-    default_dirty_data_limit,
+    CompressionPolicy, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, DEFAULT_MAX_INLINE, EncodeError,
+    WriteError, Writer, default_dirty_data_limit,
 };
 
 mod prepared;
@@ -72,6 +72,12 @@ pub struct BtrfsWriteOptions {
     /// it for a source other than btrfs is refused. The mount takes it as its
     /// starting value; [`BtrfsFs::set_commit_policy`] changes it later.
     pub commit: Option<CommitPolicy>,
+    /// Linux's `max_inline=` mount option, in bytes: the most a file's
+    /// stored data may keep inline in its metadata item. `None` takes
+    /// Linux's default ([`DEFAULT_MAX_INLINE`]), and a request naming it for
+    /// a source other than btrfs is refused. [`BtrfsFs::set_max_inline`]
+    /// changes it later.
+    pub max_inline: Option<u64>,
 }
 
 /// What the machine keeps of a writable btrfs mount, whatever its device
@@ -161,27 +167,36 @@ impl CommitPolicy {
     }
 }
 
-/// A mount's [`CommitPolicy`] as it stands. The operator writes it from any
-/// processor; the mount's service reads it and re-reads it on every change,
-/// which applies the new values to the running transaction at once.
+/// A mount's operator settings as they stand: its [`CommitPolicy`] and its
+/// `max_inline`. The operator writes them from any processor. The mount's
+/// service re-reads the commit policy on every change, which applies the new
+/// values to the running transaction at once, and reads `max_inline` for
+/// every batch of mutations.
 struct LivePolicy {
     interval_nanos: AtomicU64,
     dirty_metadata_limit: AtomicU64,
     dirty_data_limit: AtomicU64,
-    /// Raised after every change, so the service re-arms its deadline.
+    max_inline: AtomicU64,
+    /// Raised after every commit policy change, so the service re-arms its
+    /// deadline.
     changed: ProgressSignal,
 }
 
 impl LivePolicy {
-    fn new(policy: CommitPolicy) -> Self {
+    fn new(policy: CommitPolicy, max_inline: u64) -> Self {
         let live = Self {
             interval_nanos: AtomicU64::new(0),
             dirty_metadata_limit: AtomicU64::new(0),
             dirty_data_limit: AtomicU64::new(0),
+            max_inline: AtomicU64::new(max_inline),
             changed: ProgressSignal::new(),
         };
         live.store(policy);
         live
+    }
+
+    fn max_inline(&self) -> u64 {
+        self.max_inline.load(Ordering::Acquire)
     }
 
     fn store(&self, policy: CommitPolicy) {
@@ -355,11 +370,13 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             concurrency,
             compress,
             commit,
+            max_inline,
         } = options;
         let compressor = Compressor::new(compress)?;
         let serial = disk.serial();
         let lease = disk.write_mount().ok_or(BtrfsMountError::Busy)?;
-        let writer = Writer::mount(
+        let max_inline = max_inline.unwrap_or(DEFAULT_MAX_INLINE);
+        let mut writer = Writer::mount(
             Image {
                 disk,
                 _lease: MountLease::Write { _lease: lease },
@@ -369,6 +386,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             compressor,
         )
         .await?;
+        writer.set_max_inline(max_inline);
         let reader = writer.snapshot()?;
         let mut devices = BTreeMap::new();
         reader
@@ -380,6 +398,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
         let (client, receiver, exit) = writer::channel(concurrency);
         let policy = Arc::new(LivePolicy::new(
             commit.unwrap_or_else(CommitPolicy::machine_default),
+            max_inline,
         ));
         let service = BtrfsService {
             writer,
@@ -419,6 +438,25 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             .as_ref()
             .ok_or(FsError::ReadOnly)?
             .store(policy);
+        Ok(())
+    }
+
+    /// The `max_inline` of a writable mount; `None` for a read-only one.
+    pub fn max_inline(&self) -> Option<u64> {
+        self.inner.policy.as_ref().map(|policy| policy.max_inline())
+    }
+
+    /// Changes a writable mount's `max_inline`, as Linux's
+    /// `mount -o remount,max_inline=`: the next mutation stores inline data
+    /// under the new limit, and what is already stored stays as it is. A
+    /// read-only mount has none to change.
+    pub fn set_max_inline(&self, bytes: u64) -> FsResult<()> {
+        self.inner
+            .policy
+            .as_ref()
+            .ok_or(FsError::ReadOnly)?
+            .max_inline
+            .store(bytes, Ordering::Release);
         Ok(())
     }
 

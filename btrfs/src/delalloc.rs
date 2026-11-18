@@ -211,6 +211,13 @@ impl Delalloc {
         self.compresses && inode_compresses(flags)
     }
 
+    /// Updates whether the mount compresses, once any dirty data queued under
+    /// the previous policy has been written back.
+    pub(crate) fn set_compresses(&mut self, compresses: bool) {
+        debug_assert!(self.files.is_empty(), "writeback drains dirty files first");
+        self.compresses = compresses;
+    }
+
     /// The longest extent writeback forms for an inode with `flags`.
     pub(crate) fn extent_limit(&self, flags: u64) -> u64 {
         DirtyFile::new(self.compresses(flags), true).extent_limit()

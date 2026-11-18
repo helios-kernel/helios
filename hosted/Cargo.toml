@@ -26,7 +26,7 @@ helios-inspector-protocol.workspace = true
 tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 tokio-util = { version = "0.7.16", features = ["compat"] }
 tempfile.workspace = true
-wasm-encoder = "0.245.0"
+wasm-encoder = { version = "0.263.0", default-features = false }
 
 [lints]
 workspace = true

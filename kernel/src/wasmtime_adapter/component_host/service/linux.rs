@@ -342,9 +342,11 @@ where
     }
 
     async fn read_input(&mut self, limit: usize) -> Result<Bytes, Denied> {
-        Ok(match &self.output_mode {
-            OutputMode::Serial if self.grants.terminal_input.is_none() => return Err(Denied),
-            OutputMode::Serial => loop {
+        Ok(match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.grants.terminal_input.is_none() => {
+                return Err(Denied);
+            }
+            crate::ComponentInputRoute::Serial => loop {
                 let wait = self.write_serial.wait_for_debug_serial_input();
                 (self.read_serial)(
                     &mut self.serial_input,
@@ -355,9 +357,9 @@ where
                 }
                 wait.await;
             },
-            OutputMode::Trace => Bytes::new(),
-            OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                stdin_rx.read().await.unwrap_or_default()
+            crate::ComponentInputRoute::Closed => Bytes::new(),
+            crate::ComponentInputRoute::Child(stdin_rx) => {
+                stdin_rx.read_limit(limit).await.unwrap_or_default()
             }
         })
     }
@@ -574,20 +576,30 @@ where
         cpu_ticks: 0,
     };
     let registers = executable.abi.system_call_registers();
-    let exit = |exit_code: u32| ChildExit {
+    let exit = |termination: helios_unix::ChildTermination| ChildExit {
         instance_id,
-        exit_code,
+        termination,
         filesystem: None,
     };
     timeline.record(&cpu, LaunchPhase::GuestBegin);
     let end = loop {
         if let Some(reason) = launched_instance.pending_kill() {
-            break Err(map_program_runtime_error(wasmtime::Error::from(
-                crate::InstanceKilled { reason },
-            )));
+            break match reason {
+                crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                    Ok(exit(helios_unix::ChildTermination::Killed))
+                }
+                _ => Err(map_program_runtime_error(wasmtime::Error::from(
+                    crate::InstanceKilled { reason },
+                ))),
+            };
         }
         if let Some(signal) = signal_state.take_pending() {
-            break Ok(exit(abi::signal_exit_status(signal)));
+            break Ok(exit(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: u8::try_from(signal).unwrap_or(u8::MAX),
+                    core_dumped: false,
+                },
+            )));
         }
         let slice_began = cpu.now().ticks();
         let stop = context.resume(&space);
@@ -642,7 +654,11 @@ where
                     CallEnd::Done(ControlFlow::Continue(result)) => context
                         .set_register(registers.result, result)
                         .expect("the ABI names registers of this instruction set"),
-                    CallEnd::Done(ControlFlow::Break(status)) => break Ok(exit(u32::from(status))),
+                    CallEnd::Done(ControlFlow::Break(status)) => {
+                        break Ok(exit(helios_unix::ChildTermination::Exited(u32::from(
+                            status,
+                        ))));
+                    }
                     CallEnd::Stopped => {}
                 }
             }
@@ -687,9 +703,12 @@ where
                         ?fault,
                         "Linux process faulted"
                     );
-                    break Ok(exit(abi::signal_exit_status(u32::from(abi::fault_signal(
-                        kind,
-                    )))));
+                    break Ok(exit(helios_unix::ChildTermination::Signaled(
+                        helios_unix::SignalTermination {
+                            signal: abi::fault_signal(kind),
+                            core_dumped: false,
+                        },
+                    )));
                 }
             },
         }

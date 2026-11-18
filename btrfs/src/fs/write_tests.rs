@@ -22,6 +22,8 @@ use super::Filesystem;
 #[cfg(feature = "write")]
 use crate::compress::policy::Compressor;
 use crate::source::BlockSource;
+#[cfg(feature = "write")]
+use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::tree::edit::{Header, Leaf};
 use crate::tree::write::{MetadataAllocator, Trees, WriteError};
 use crate::tree::{Expected, Node, TreeRoot};
@@ -497,15 +499,16 @@ async fn exercise_reflink(
             continue;
         }
         let id = ids[name];
-        let (edits, compressor, _) = tx.split();
+        let (edits, compressor, _, max_inline) = tx.split();
         edits
-            .write_file(id.tree, id.inode, 0, bytes, when, compressor)
+            .write_file(id.tree, id.inode, 0, bytes, when, compressor, max_inline)
             .await
             .unwrap();
     }
     let tail = ids["tail"];
-    tx.edits()
-        .truncate_file(tail.tree, tail.inode, 17, when)
+    let (edits, compressor, _, max_inline) = tx.split();
+    edits
+        .truncate_file(tail.tree, tail.inode, 17, when, compressor, max_inline)
         .await
         .unwrap();
     expected.get_mut("tail").unwrap().truncate(17);
@@ -519,7 +522,7 @@ async fn exercise_reflink(
     let old_tail = initial.resolve(b"/tail").await.unwrap();
     let tail_allocation = disk_allocation(&initial, &old_tail, 0).await;
     let mut tx = writer.join().await.unwrap();
-    let (edits, compressor, concurrency) = tx.split();
+    let (edits, compressor, concurrency, max_inline) = tx.split();
     for (source_offset, destination_offset, length, expected_error) in [
         (0, 4096, 8192, WriteError::CloneOverlap),
         (1, 65536, 4096, WriteError::CloneAlignment),
@@ -539,6 +542,7 @@ async fn exercise_reflink(
                 when,
                 compressor,
                 concurrency,
+                max_inline,
             )
             .await
             .unwrap_err();
@@ -574,6 +578,7 @@ async fn exercise_reflink(
                 when,
                 compressor,
                 concurrency,
+                max_inline,
             )
             .await
             .unwrap();
@@ -611,9 +616,17 @@ async fn exercise_reflink(
         ("clone", 1, vec![0x31; 31]),
     ] {
         let id = ids[name];
-        let (edits, compressor, _) = tx.split();
+        let (edits, compressor, _, max_inline) = tx.split();
         edits
-            .write_file(id.tree, id.inode, offset as u64, &bytes, when, compressor)
+            .write_file(
+                id.tree,
+                id.inode,
+                offset as u64,
+                &bytes,
+                when,
+                compressor,
+                max_inline,
+            )
             .await
             .unwrap();
         expected.get_mut(name).unwrap()[offset..offset + bytes.len()].copy_from_slice(&bytes);
@@ -736,11 +749,27 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
         .unwrap();
     let content = vec![0x37; 12307];
     edits
-        .write_file(tree, file, 0, &content, when, &mut Compressor::Plain)
+        .write_file(
+            tree,
+            file,
+            0,
+            &content,
+            when,
+            &mut Compressor::Plain,
+            DEFAULT_MAX_INLINE,
+        )
         .await
         .unwrap();
     edits
-        .write_file(tree, target, 0, b"replaced", when, &mut Compressor::Plain)
+        .write_file(
+            tree,
+            target,
+            0,
+            b"replaced",
+            when,
+            &mut Compressor::Plain,
+            DEFAULT_MAX_INLINE,
+        )
         .await
         .unwrap();
     edits
@@ -904,7 +933,15 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
         .unwrap();
     let content: Vec<_> = (0..12307).map(|index| (index % 251) as u8).collect();
     edits
-        .write_file(tree, inode, 0, &content, when, &mut Compressor::Plain)
+        .write_file(
+            tree,
+            inode,
+            0,
+            &content,
+            when,
+            &mut Compressor::Plain,
+            DEFAULT_MAX_INLINE,
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -1241,7 +1278,7 @@ async fn exercise_file_writes(
             (0, vec![0x71; 13]),
             (262144, incompressible.clone()),
         ] {
-            let (edits, compressor, _) = transaction.split();
+            let (edits, compressor, _, max_inline) = transaction.split();
             assert_eq!(
                 edits
                     .write_file(
@@ -1251,6 +1288,7 @@ async fn exercise_file_writes(
                         &bytes,
                         when,
                         compressor,
+                        max_inline,
                     )
                     .await
                     .unwrap(),
@@ -1348,9 +1386,16 @@ async fn exercise_file_writes(
         let inode = previous.resolve(b"/data.bin").await.unwrap();
         let old = expected.clone();
         let mut transaction = writer.join().await.unwrap();
-        let edits = transaction.edits();
+        let (edits, compressor, _, max_inline) = transaction.split();
         edits
-            .truncate_file(inode.tree(), inode.number(), size as u64, when)
+            .truncate_file(
+                inode.tree(),
+                inode.number(),
+                size as u64,
+                when,
+                compressor,
+                max_inline,
+            )
             .await
             .unwrap();
         expected.resize(size, 0);
@@ -6961,10 +7006,11 @@ fn a_full_device_refuses_mutations_and_the_writer_keeps_committing() {
         }
         tx.commit().await.unwrap();
 
-        // Small files go inline, into metadata, until it has no room left.
+        // Small files go inline, into metadata, until it has no room left:
+        // 62 copies of 33 bytes stay within Linux's default `max_inline`.
         let contents = |index: usize| {
             alloc::format!("{index:05} 文件 ファイル 파일 ")
-                .repeat(64)
+                .repeat(62)
                 .into_bytes()
         };
         let name = |index: usize| alloc::format!("小-小さい-작은-{index:05}");

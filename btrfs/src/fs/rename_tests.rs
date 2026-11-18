@@ -18,6 +18,7 @@ use super::writer::Writer;
 use crate::compress::policy::Compressor;
 use crate::source::BlockSink;
 use crate::transaction::Transaction;
+use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes, Name};
 use crate::tree::write::WriteError;
 use crate::{FileKind, Timestamp as When};
@@ -70,7 +71,15 @@ async fn create(
         .unwrap();
     if let Some(content) = content {
         edits
-            .write_file(tree, inode, 0, content, WHEN, &mut Compressor::Plain)
+            .write_file(
+                tree,
+                inode,
+                0,
+                content,
+                WHEN,
+                &mut Compressor::Plain,
+                DEFAULT_MAX_INLINE,
+            )
             .await
             .unwrap();
     }

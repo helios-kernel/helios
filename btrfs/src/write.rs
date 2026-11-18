@@ -33,9 +33,9 @@
 //! never runs out of tree blocks. A write that finds the data space short
 //! stores the prefix that fits, and only one that cannot store a sector
 //! reports out of space; writeback uses the smaller free ranges that remain
-//! for the space reserved. The caller supplies time, compression policy, I/O
-//! concurrency and a UUID generator for root records that lack a valid UUID
-//! extension.
+//! for the space reserved. The caller supplies time, compression policy, the
+//! inline data limit (Linux's `max_inline`), I/O concurrency and a UUID
+//! generator for root records that lack a valid UUID extension.
 
 pub use crate::allocation::AllocationDefect;
 pub use crate::allocation::data::DataDefect;
@@ -48,6 +48,7 @@ pub use crate::fs::writer::{
 };
 pub use crate::space::{SpaceDefect, SpaceError};
 pub use crate::transaction::chunks::ChunkError;
+pub use crate::transaction::file::DEFAULT_MAX_INLINE;
 pub use crate::tree::edit::EditError;
 pub use crate::tree::write::WriteError;
 pub use crate::uuid_tree::UuidDefect;

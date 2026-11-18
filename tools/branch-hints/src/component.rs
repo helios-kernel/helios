@@ -112,7 +112,7 @@ fn top_level_core_modules(bytes: &[u8]) -> Result<Vec<Range<usize>>, Error> {
                 unchecked_range, ..
             } => {
                 if depth == 0 {
-                    modules.push(unchecked_range);
+                    modules.push(wasm::usize_range(unchecked_range));
                 }
                 depth += 1;
             }
