@@ -1,9 +1,26 @@
-//! Btrfs over the block cache. Reads pin a published immutable view under a
-//! short lock, released before I/O. A kernel task exclusively owns the
-//! running transaction: a change is visible once its batch is applied and
-//! durable at the next commit, which a sync, the commit interval, the dirty
-//! bound or the unmount triggers. Per-inode write leases serialize write
-//! rounds without blocking unrelated files or the service.
+//! Btrfs over the block cache.
+//!
+//! # Concurrency contract
+//!
+//! - **Snapshot reads (`stat`, `read_at`, `read_dir`, `read_link`)** clone a
+//!   published immutable [`Filesystem`] view under a short `spin::Mutex` (held
+//!   only for the `Arc` reference-count bump, never across `.await` or I/O)
+//!   and execute lock-free on any processor against that view's persistent
+//!   tree and dirty-page overlay.
+//! - **Mutations and writeback** are owned exclusively by one [`BtrfsService`]
+//!   task per writable mount, reached from any processor through a bounded
+//!   async channel. Written file data accumulates as dirty pages in the
+//!   running transaction until `CommitPolicy::dirty_data_limit` or a commit
+//!   writes it back into extents at Linux's sizes (`128 KiB` compressed
+//!   windows, up to `128 MiB` uncompressed).
+//! - **Prepared writes ([`BtrfsWrite`])** fill each `write_round` buffer
+//!   synchronously on the caller and acquire a per-inode async `RawMutex`
+//!   across rounds so multi-round and append writes stay contiguous and
+//!   preserve their starting offset without blocking unrelated inodes or the
+//!   mount service.
+//! - **Policy updates ([`LivePolicy`])** store and load `CommitPolicy` knobs
+//!   with release/acquire atomics and wake the service through
+//!   [`ProgressSignal`] armed before the policy is sampled.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -31,6 +48,7 @@ use crate::{
 };
 use helios_btrfs::write::{
     CompressionPolicy, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, EncodeError, WriteError, Writer,
+    default_dirty_data_limit,
 };
 
 mod prepared;
@@ -48,10 +66,11 @@ pub struct BtrfsWriteOptions {
     /// every compressible inode's new data is written with. `None` writes
     /// every extent uncompressed.
     pub compress: Option<CompressionPolicy>,
-    /// When the mount commits without a sync asking: Linux's defaults when
-    /// `None`, and a request naming it for a source other than btrfs is
-    /// refused. The mount takes it as its starting value;
-    /// [`BtrfsFs::set_commit_policy`] changes it later.
+    /// When the mount commits, or writes dirty data back, without a sync
+    /// asking: Linux's defaults on this machine
+    /// ([`CommitPolicy::machine_default`]) when `None`, and a request naming
+    /// it for a source other than btrfs is refused. The mount takes it as its
+    /// starting value; [`BtrfsFs::set_commit_policy`] changes it later.
     pub commit: Option<CommitPolicy>,
 }
 
@@ -85,8 +104,9 @@ impl WritableMount {
     }
 }
 
-/// When a writable mount commits its running transaction beyond the syncs
-/// that ask for one: operator settings, adjustable at runtime.
+/// When a writable mount commits its running transaction, or writes its
+/// dirty data back, beyond the syncs that ask for a commit: operator
+/// settings, adjustable at runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitPolicy {
     /// Linux's `commit=` mount option: the longest a change waits after the
@@ -94,6 +114,10 @@ pub struct CommitPolicy {
     pub interval: Duration,
     /// Dirty metadata the running transaction holds before it commits.
     pub dirty_metadata_limit: u64,
+    /// Dirty file data the running transaction holds before the mount
+    /// writes it back into extents, as Linux's `vm.dirty_background_bytes`.
+    /// Zero writes each batch back.
+    pub dirty_data_limit: u64,
 }
 
 /// `BTRFS_DEFAULT_COMMIT_INTERVAL`, 30 seconds in `fs/btrfs/fs.h`.
@@ -104,10 +128,26 @@ pub const DEFAULT_COMMIT_INTERVAL: Duration = Duration::from_secs(30);
 const WARNING_COMMIT_INTERVAL: u32 = 300;
 
 impl CommitPolicy {
-    /// The policy Linux's `commit=<seconds>` mount option gives, as
-    /// `btrfs_parse_param` reads it: zero is the default interval, and an
-    /// interval past [`WARNING_COMMIT_INTERVAL`] is warned about and kept.
-    pub fn from_commit_option(seconds: u32) -> Self {
+    /// Linux's defaults on a machine of `memory_bytes`, the memory that
+    /// holds the dirty data: [`default_dirty_data_limit`] of it.
+    pub fn for_machine(memory_bytes: usize) -> Self {
+        Self {
+            interval: DEFAULT_COMMIT_INTERVAL,
+            dirty_metadata_limit: DEFAULT_DIRTY_METADATA_LIMIT,
+            dirty_data_limit: default_dirty_data_limit(memory_bytes as u64),
+        }
+    }
+
+    /// Linux's defaults on this machine.
+    pub fn machine_default() -> Self {
+        Self::for_machine(crate::machine_memory().usable_bytes)
+    }
+
+    /// This policy with the interval Linux's `commit=<seconds>` mount option
+    /// gives, as `btrfs_parse_param` reads it: zero is the default interval,
+    /// and an interval past [`WARNING_COMMIT_INTERVAL`] is warned about and
+    /// kept.
+    pub fn with_commit_option(self, seconds: u32) -> Self {
         if seconds > WARNING_COMMIT_INTERVAL {
             tracing::warn!(seconds, "excessive commit interval, use with care");
         }
@@ -116,17 +156,7 @@ impl CommitPolicy {
                 0 => DEFAULT_COMMIT_INTERVAL,
                 seconds => Duration::from_secs(u64::from(seconds)),
             },
-            ..Self::default()
-        }
-    }
-}
-
-impl Default for CommitPolicy {
-    /// Linux's defaults.
-    fn default() -> Self {
-        Self {
-            interval: DEFAULT_COMMIT_INTERVAL,
-            dirty_metadata_limit: DEFAULT_DIRTY_METADATA_LIMIT,
+            ..self
         }
     }
 }
@@ -137,6 +167,7 @@ impl Default for CommitPolicy {
 struct LivePolicy {
     interval_nanos: AtomicU64,
     dirty_metadata_limit: AtomicU64,
+    dirty_data_limit: AtomicU64,
     /// Raised after every change, so the service re-arms its deadline.
     changed: ProgressSignal,
 }
@@ -146,6 +177,7 @@ impl LivePolicy {
         let live = Self {
             interval_nanos: AtomicU64::new(0),
             dirty_metadata_limit: AtomicU64::new(0),
+            dirty_data_limit: AtomicU64::new(0),
             changed: ProgressSignal::new(),
         };
         live.store(policy);
@@ -158,6 +190,8 @@ impl LivePolicy {
         self.interval_nanos.store(nanos, Ordering::Release);
         self.dirty_metadata_limit
             .store(policy.dirty_metadata_limit, Ordering::Release);
+        self.dirty_data_limit
+            .store(policy.dirty_data_limit, Ordering::Release);
         self.changed.signal();
     }
 
@@ -165,6 +199,7 @@ impl LivePolicy {
         CommitPolicy {
             interval: Duration::from_nanos(self.interval_nanos.load(Ordering::Acquire)),
             dirty_metadata_limit: self.dirty_metadata_limit.load(Ordering::Acquire),
+            dirty_data_limit: self.dirty_data_limit.load(Ordering::Acquire),
         }
     }
 }
@@ -331,6 +366,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             },
             writer::EntropyUuids(entropy),
             concurrency,
+            compressor,
         )
         .await?;
         let reader = writer.snapshot()?;
@@ -342,13 +378,14 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             .await?;
         let reader = Arc::new(spin::Mutex::new(reader));
         let (client, receiver, exit) = writer::channel(concurrency);
-        let policy = Arc::new(LivePolicy::new(commit.unwrap_or_default()));
+        let policy = Arc::new(LivePolicy::new(
+            commit.unwrap_or_else(CommitPolicy::machine_default),
+        ));
         let service = BtrfsService {
             writer,
             receiver,
             published: reader.clone(),
             concurrency,
-            compressor,
             policy: policy.clone(),
             _exit: exit,
         };

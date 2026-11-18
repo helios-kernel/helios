@@ -15,9 +15,9 @@ use super::write_tests::{
     Disk, FixtureUuids, assert_btrfs_check, filesystem_image_tree_file, mount_writer,
 };
 use super::writer::Writer;
+use crate::compress::policy::Compressor;
 use crate::source::BlockSink;
 use crate::transaction::Transaction;
-use crate::transaction::file::WriteOptions;
 use crate::transaction::namespace::{Attributes, Name};
 use crate::tree::write::WriteError;
 use crate::{FileKind, Timestamp as When};
@@ -69,15 +69,8 @@ async fn create(
         .await
         .unwrap();
     if let Some(content) = content {
-        let concurrency = std::thread::available_parallelism().unwrap();
         edits
-            .write_file(
-                tree,
-                inode,
-                0,
-                content,
-                WriteOptions::plain(WHEN, concurrency),
-            )
+            .write_file(tree, inode, 0, content, WHEN, &mut Compressor::Plain)
             .await
             .unwrap();
     }

@@ -11,6 +11,8 @@ use core::ops::ControlFlow;
 
 use crate::chunk::ChunkMap;
 use crate::csum::name_hash;
+#[cfg(feature = "write")]
+use crate::delalloc::Delalloc;
 use crate::error::{Error, FileKind, ItemDefect};
 use crate::items::{
     DirRecord, EntryTarget, Metadata, RecordKind, RootRecord, dir_index_record, dir_records,
@@ -77,6 +79,8 @@ pub(crate) struct Running {
     /// The private data extents this view reaches. The writer keeps them
     /// from reuse while the view lives.
     data: rpds::RedBlackTreeMapSync<u64, u64>,
+    /// The dirty file data not yet written back, which reads see first.
+    dirty: Delalloc,
     /// The generation the transaction started from: blocks it retired stay
     /// pinned while this view can still read them.
     base: Arc<Snapshot>,
@@ -89,6 +93,7 @@ impl core::fmt::Debug for Running {
             .debug_struct("Running")
             .field("base", &self.base.mapping.superblock.generation())
             .field("private_data_extents", &self.data.size())
+            .field("dirty_bytes", &self.dirty.bytes())
             .finish_non_exhaustive()
     }
 }
@@ -134,6 +139,7 @@ impl Snapshot {
         checksums: TreeRoot,
         trees: &crate::tree::write::Trees,
         data: rpds::RedBlackTreeMapSync<u64, u64>,
+        dirty: &Delalloc,
     ) -> Result<Arc<Self>, crate::tree::write::WriteError> {
         Ok(Arc::new(Self {
             mapping,
@@ -147,6 +153,7 @@ impl Snapshot {
                 trees: trees.clone(),
                 roots: roots.clone(),
                 data,
+                dirty: dirty.clone(),
                 base: base.clone(),
             }),
         }))
@@ -207,7 +214,7 @@ impl<S: BlockSource> crate::tree::NodeSource for Nodes<'_, S> {
 }
 
 /// How a file extent item stores its range.
-#[cfg(feature = "test-support")]
+#[cfg(any(all(test, feature = "write"), feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtentKind {
     /// The bytes are in the item itself.
@@ -220,7 +227,7 @@ pub enum ExtentKind {
 
 /// One file extent item, as returned by [`Filesystem::file_extents`]: a test
 /// inspection API.
-#[cfg(feature = "test-support")]
+#[cfg(any(all(test, feature = "write"), feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExtentInfo {
     /// File offset of the range the item covers.
@@ -445,11 +452,21 @@ impl<S: BlockSource> Filesystem<S> {
                 inode: number,
             });
         }
-        let metadata = Metadata::parse(item).map_err(|defect| Error::Item {
+        #[cfg_attr(
+            not(feature = "write"),
+            expect(unused_mut, reason = "only writable views hold delalloc bytes")
+        )]
+        let mut metadata = Metadata::parse(item).map_err(|defect| Error::Item {
             tree: root.tree,
             key,
             defect,
         })?;
+        #[cfg(feature = "write")]
+        if let Some(running) = &snapshot.running {
+            metadata.nbytes = metadata
+                .nbytes
+                .saturating_add(running.dirty.file_bytes(root.tree, number));
+        }
         Ok(Inode {
             snapshot: snapshot.clone(),
             root,
@@ -547,7 +564,7 @@ impl<S: BlockSource> Filesystem<S> {
     ///
     /// A test inspection API: it exposes the on-disk layout (extent kind and
     /// compression) that reads deliberately hide.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(all(test, feature = "write"), feature = "test-support"))]
     pub async fn file_extents(&self, file: &Inode) -> Result<Vec<ExtentInfo>, Error> {
         file.expect_kind(FileKind::Regular)?;
         let nodes = file.snapshot.nodes(&self.volume);
@@ -556,6 +573,8 @@ impl<S: BlockSource> Filesystem<S> {
                 root: file.root,
                 number: file.number,
                 metadata: &file.metadata,
+                #[cfg(feature = "write")]
+                dirty: None,
             })
             .await
     }
@@ -707,6 +726,12 @@ impl<S: BlockSource> Filesystem<S> {
                     root: inode.root,
                     number: inode.number,
                     metadata: &inode.metadata,
+                    #[cfg(feature = "write")]
+                    dirty: inode
+                        .snapshot
+                        .running
+                        .as_ref()
+                        .and_then(|running| running.dirty.file(inode.root.tree, inode.number)),
                 },
                 offset,
                 buf,

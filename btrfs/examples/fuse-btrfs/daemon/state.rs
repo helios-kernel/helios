@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, TimeOrNow};
 use futures_lite::future::block_on;
 use helios_btrfs::write::{
-    Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, WriteOptions, Writer,
+    Attributes, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, Writer,
+    default_dirty_data_limit,
 };
 use helios_btrfs::{
     DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
@@ -78,8 +79,20 @@ pub struct Statfs {
 pub struct State {
     writer: Writer<Device, RandomUuids>,
     inodes: Inodes,
-    concurrency: NonZeroUsize,
+    /// The dirty data the writer holds before it writes it back.
+    dirty_data_limit: u64,
     read_only: bool,
+}
+
+/// The host's memory, which holds the writer's dirty data.
+fn host_memory_bytes() -> u64 {
+    // SAFETY: `sysinfo` writes only the struct it is given.
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, writable `struct sysinfo`.
+    let status = unsafe { libc::sysinfo(&mut info) };
+    assert_eq!(status, 0, "sysinfo(2) cannot fail with a valid buffer");
+    let bytes = u128::from(info.totalram) * u128::from(info.mem_unit);
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 impl State {
@@ -88,7 +101,12 @@ impl State {
         concurrency: NonZeroUsize,
         read_only: bool,
     ) -> Result<Self, OpenError> {
-        let mut writer = block_on(Writer::mount(device, RandomUuids, concurrency))?;
+        let mut writer = block_on(Writer::mount(
+            device,
+            RandomUuids,
+            concurrency,
+            Compressor::Plain,
+        ))?;
         let snapshot = writer.snapshot()?;
         let root = block_on(snapshot.root())?;
         let handle = {
@@ -102,7 +120,7 @@ impl State {
         Ok(Self {
             writer,
             inodes: Inodes::new(identity, root.metadata().generation, handle),
-            concurrency,
+            dirty_data_limit: default_dirty_data_limit(host_memory_bytes()),
             read_only,
         })
     }
@@ -165,6 +183,12 @@ impl State {
     /// Ends a mutation: commits once the running transaction's dirty
     /// metadata reaches Linux's bound.
     async fn settle(&mut self) -> Result<(), Errno> {
+        if self.writer.dirty().data_bytes >= self.dirty_data_limit {
+            self.writer
+                .writeback()
+                .await
+                .map_err(|error| write_errno(&error))?;
+        }
         if self.writer.dirty().metadata_bytes >= DEFAULT_DIRTY_METADATA_LIMIT {
             self.sync().await?;
         }
@@ -254,7 +278,6 @@ impl State {
         }
         self.writable()?;
         let file = self.inodes.handle(ino)?;
-        let concurrency = self.concurrency;
         let mut transaction = self
             .writer
             .join()
@@ -278,7 +301,7 @@ impl State {
         }
         if let Some(size) = size {
             transaction
-                .truncate_file(&file, size, now, concurrency)
+                .truncate_file(&file, size, now)
                 .await
                 .map_err(|error| write_errno(&error))?;
         }
@@ -387,14 +410,13 @@ impl State {
     ) -> Result<u32, Errno> {
         self.writable()?;
         let file = self.inodes.handle(ino)?;
-        let concurrency = self.concurrency;
         let mut transaction = self
             .writer
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
         let written = transaction
-            .write_file(&file, offset, data, WriteOptions::plain(now, concurrency))
+            .write_file(&file, offset, data, now)
             .await
             .map_err(|error| write_errno(&error))?;
         self.settle().await?;

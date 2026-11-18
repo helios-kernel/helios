@@ -8,10 +8,11 @@ use core::num::NonZeroUsize;
 
 use super::Transaction;
 use super::extents::Mapping;
-use super::file::{WriteOptions, aligned_end};
+use super::file::aligned_end;
 use super::namespace::{check_flags, time};
 use crate::accounting::DataChange;
 use crate::allocation::data::DataReference;
+use crate::compress::policy::Compressor;
 use crate::items::{ExtentData, FileExtent, INODE_APPEND, INODE_IMMUTABLE, INODE_NODATASUM};
 use crate::ondisk::{MAX_COMPRESSED_EXTENT, item_type};
 use crate::source::BlockSink;
@@ -39,6 +40,7 @@ impl<S: BlockSink> Transaction<S> {
         &mut self,
         request: CloneRange,
         when: Timestamp,
+        compressor: &mut Compressor,
         concurrency: NonZeroUsize,
     ) -> Result<(), WriteError> {
         let CloneRange {
@@ -49,7 +51,7 @@ impl<S: BlockSink> Transaction<S> {
             length,
         } = request;
         let (_, source_metadata) = self.file_inode(source.tree, source.inode).await?;
-        let (mut raw, destination_metadata) =
+        let (_, destination_metadata) =
             self.file_inode(destination.tree, destination.inode).await?;
         check_flags(
             destination.tree,
@@ -90,6 +92,19 @@ impl<S: BlockSink> Transaction<S> {
         }
         let source_rounded = aligned_end(source_end, sector)?;
         let destination_rounded = aligned_end(destination_end, sector)?;
+        // The source range is written back before its extents are read, as
+        // `btrfs_remap_file_range_prep` waits for its ordered extents
+        // (`fs/btrfs/reflink.c`): dirty data has no extent to share yet.
+        // Overwritten dirty pages in the destination range are dropped below
+        // without allocating extents that the clone immediately replaces.
+        self.writeback_range(
+            source.tree,
+            source.inode,
+            source_offset..source_rounded,
+            compressor,
+            concurrency,
+        )
+        .await?;
         let root = self.roots.get(source.tree)?;
         let nodes = self.trees.reader(&self.volume);
         let first = Key::new(source.inode, item_type::EXTENT_DATA, 0);
@@ -128,7 +143,7 @@ impl<S: BlockSink> Transaction<S> {
                 if matches!(extent.data, ExtentData::Inline { .. }) {
                     // An inline item has no separate allocation to share. Copy
                     // bounded windows through the normal destination writer.
-                    return self.clone_inline_range(request, when, concurrency).await;
+                    return self.clone_inline_range(request, when, compressor).await;
                 }
                 let mapping = Mapping::parse(source.tree, key, bytes, sector as u32)?
                     .slice(extent.start.max(source_offset)..extent.end.min(source_rounded));
@@ -168,7 +183,11 @@ impl<S: BlockSink> Transaction<S> {
                     .await?;
             }
         }
-        let mut options = WriteOptions::plain(when, concurrency);
+        // Reload the destination inode after source writeback: a same-inode
+        // clone updates `nbytes` on the shared inode item when writing the
+        // source range back.
+        let (mut raw, destination_metadata) =
+            self.file_inode(destination.tree, destination.inode).await?;
         let root = self.roots.get(destination.tree)?;
         let first_key = Key::new(destination.inode, item_type::EXTENT_DATA, 0);
         let first = self.trees.get(&self.volume, root, first_key).await?;
@@ -191,19 +210,19 @@ impl<S: BlockSink> Transaction<S> {
                 inline_bytes,
                 destination_offset..destination_end,
                 &mut raw,
-                &mut options,
             )
             .await?;
         } else if destination_offset > raw.size.get() {
-            self.zero_tail(
-                destination.tree,
-                destination.inode,
-                raw.size.get(),
-                &mut raw,
-                &mut options,
-            )
-            .await?;
+            self.zero_tail(destination.tree, destination.inode, raw.size.get(), &raw)
+                .await?;
         }
+        // The cloned extents replace whatever pages the destination range
+        // holds, as the page cache is invalidated after the clone.
+        self.delalloc.remove_range(
+            destination.tree,
+            destination.inode,
+            destination_offset..destination_rounded,
+        );
         let removed = self
             .remove_regular_range(
                 destination.tree,
@@ -260,7 +279,7 @@ impl<S: BlockSink> Transaction<S> {
         &mut self,
         request: CloneRange,
         when: Timestamp,
-        concurrency: NonZeroUsize,
+        compressor: &mut Compressor,
     ) -> Result<(), WriteError> {
         let mut position = 0;
         while position < request.length {
@@ -278,7 +297,8 @@ impl<S: BlockSink> Transaction<S> {
                 request.destination.inode,
                 request.destination_offset + position,
                 &bytes,
-                WriteOptions::plain(when, concurrency),
+                when,
+                compressor,
             )
             .await?;
             position += length as u64;

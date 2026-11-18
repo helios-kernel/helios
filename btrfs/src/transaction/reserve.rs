@@ -18,6 +18,15 @@
 //! a transaction added), which here is one extent item per tree block the
 //! transaction allocated and one per committed block it retired.
 //!
+//! It also holds what writing its dirty data back needs, as each Linux
+//! inode's delalloc `block_rsv` does (`btrfs_calculate_inode_block_rsv_size`
+//! in `fs/btrfs/delalloc-space.c`): an inserted item per outstanding extent
+//! and per checksum leaf of the dirty sectors, one inode update per dirty
+//! inode, and the delayed refs of all of them. Dirty data reserves its data
+//! space when it is written, as `btrfs_check_data_free_space` does: the
+//! dirty bytes never exceed the free data space ([`Transaction::data_budget`]),
+//! so writeback, and the commit that runs it, never runs out of data space.
+//!
 //! A mutation fits when its own bytes, the commit hold it may grow to, and
 //! the commit's own reserve ([`Transaction::metadata_reserve`], Linux's
 //! global block reserve) fit in the free metadata space. One that does not
@@ -31,15 +40,20 @@
 use super::Transaction;
 use crate::ondisk::{RawHeader, RawItem, objectid};
 use crate::source::BlockSink;
-use crate::space::{METADATA, SpaceError};
+use crate::space::{DATA, METADATA, SpaceError};
+use crate::superblock::Superblock;
 use crate::tree::write::WriteError;
 
 /// `BTRFS_MAX_LEVEL`.
 const MAX_LEVEL: u64 = 8;
 
-/// `BTRFS_MAX_EXTENT_SIZE`, `SZ_128M` in `fs/btrfs/fs.h`: the longest data
-/// extent, so a write of more than this takes another extent item.
-const MAX_EXTENT_SIZE: u64 = 128 << 20;
+/// Checksums one leaf item holds: `csums_per_leaf` in
+/// `btrfs_csum_bytes_to_leaves`, `BTRFS_MAX_ITEM_SIZE / csum_size`.
+pub(crate) fn csums_per_leaf(superblock: &Superblock) -> u64 {
+    let item_space =
+        u64::from(superblock.nodesize()) - (size_of::<RawHeader>() + size_of::<RawItem>()) as u64;
+    item_space / superblock.csum_type().size() as u64
+}
 
 /// `BTRFS_UNLINK_METADATA_UNITS` in `fs/btrfs/fs.h`.
 const UNLINK_ITEMS: u64 = 6;
@@ -102,8 +116,9 @@ impl Units {
     /// `btrfs_truncate`: the truncate slack space and the inode update.
     pub(crate) const TRUNCATE: Self = Self::items(2);
     /// `btrfs_replace_file_extents` with an extent to put in: the inode, the
-    /// extents dropped and the extent added.
-    pub(crate) const CLONE: Self = Self::items(3);
+    /// extents dropped, the extent added, and any delalloc runs split at the
+    /// source and destination boundaries.
+    pub(crate) const CLONE: Self = Self::items(6);
 
     /// `btrfs_rename`: the old parent, the inode and its two refs, four dir
     /// entries, the new parent when it differs, and the five items of a
@@ -139,32 +154,39 @@ impl<S: BlockSink> Transaction<S> {
         }
     }
 
-    /// The units of a data write of `length` bytes, as Linux's
-    /// `calc_inode_reservations`: one extent item per `BTRFS_MAX_EXTENT_SIZE`
-    /// (`count_max_extents`), the checksum leaves of checksummed data
-    /// (`btrfs_csum_bytes_to_leaves`, with `csums_per_leaf` as
-    /// `BTRFS_MAX_ITEM_SIZE / csum_size`), and one inode update.
-    pub(crate) fn write_units(&self, length: u64, checksummed: bool) -> Units {
-        let extents = length.div_ceil(MAX_EXTENT_SIZE);
-        let csum_leaves = if checksummed {
-            let item_space =
-                self.nodesize() - (size_of::<RawHeader>() + size_of::<RawItem>()) as u64;
-            let csums_per_leaf = item_space / self.volume.superblock().csum_type().size() as u64;
-            let sectors = length.div_ceil(u64::from(self.volume.superblock().sectorsize()));
-            sectors.div_ceil(csums_per_leaf)
+    /// The refs this transaction's commit still has to run, those writing
+    /// its dirty data back will add included.
+    fn outstanding_refs(&self) -> u64 {
+        (self.space.metadata_reservations() + self.trees.retired().len()) as u64
+            + self.delalloc.items()
+            + self.delalloc.inode_updates()
+    }
+
+    /// What writing the dirty data back may COW: its items' paths, as the
+    /// inodes' delalloc reservations count them.
+    fn writeback_bytes(&self) -> u64 {
+        self.insert_size(self.delalloc.items()) + self.update_size(self.delalloc.inode_updates())
+    }
+
+    /// Whether data and metadata share block groups (`MIXED_GROUPS`), so
+    /// each kind's free space is the other's too.
+    pub(super) fn mixed(&self) -> bool {
+        self.space
+            .latest_flags(DATA)
+            .is_some_and(|flags| flags & METADATA != 0)
+    }
+
+    /// The data space a write may still dirty: the free data space less what
+    /// the dirty data already reserved, and in mixed groups less what the
+    /// metadata holds.
+    pub(crate) fn data_budget(&self) -> u64 {
+        let free = self.space.totals(DATA).1;
+        let held = if self.mixed() {
+            self.held(Units::default())
         } else {
             0
         };
-        Units {
-            insert: extents + csum_leaves,
-            update: 1,
-            frees: false,
-        }
-    }
-
-    /// The refs this transaction's commit still has to run.
-    fn outstanding_refs(&self) -> u64 {
-        (self.space.metadata_reservations() + self.trees.retired().len()) as u64
+        free.saturating_sub(self.delalloc.bytes() + held)
     }
 
     /// What running `refs` at commit may allocate: Linux's delayed-ref size,
@@ -218,22 +240,33 @@ impl<S: BlockSink> Transaction<S> {
     }
 
     /// The free metadata a mutation of `units` needs before it starts.
-    fn needed(&self, units: Units) -> u64 {
+    pub(super) fn needed(&self, units: Units) -> u64 {
         let items = units.insert + units.update;
         self.insert_size(units.insert)
             + self.update_size(units.update)
+            + self.writeback_bytes()
             + self.commit_bytes(self.outstanding_refs() + items)
             + self.global_reserve(units)
     }
 
-    /// The free metadata the commit needs for the work already applied,
-    /// with what a mutation of `units` leaves of the global reserve.
+    /// The free metadata the commit needs for the work already applied, the
+    /// writeback of the dirty data included, with what a mutation of `units`
+    /// leaves of the global reserve.
     fn held(&self, units: Units) -> u64 {
-        self.commit_bytes(self.outstanding_refs()) + self.global_reserve(units)
+        self.writeback_bytes()
+            + self.commit_bytes(self.outstanding_refs())
+            + self.global_reserve(units)
     }
 
+    /// Free metadata space; in mixed groups, less the data space the dirty
+    /// data reserved.
     fn free_metadata(&self) -> u64 {
-        self.space.totals(METADATA).1
+        let free = self.space.totals(METADATA).1;
+        if self.mixed() {
+            free.saturating_sub(self.delalloc.bytes())
+        } else {
+            free
+        }
     }
 
     /// Whether a mutation of `units` fits.
@@ -251,13 +284,21 @@ impl<S: BlockSink> Transaction<S> {
     }
 
     /// Refuses an applied mutation of `units` that left the commit less than
-    /// it needs for everything the transaction now holds.
+    /// it needs for everything the transaction now holds: the metadata of
+    /// its work, or the data space of its dirty data.
     pub(crate) fn check_commit_hold(&self, units: Units) -> Result<(), WriteError> {
         let held = self.held(units);
         if held > self.free_metadata() {
             return Err(SpaceError::Exhausted {
                 bytes: held,
                 flags: METADATA,
+            }
+            .into());
+        }
+        if self.delalloc.bytes() > self.space.totals(DATA).1 {
+            return Err(SpaceError::Exhausted {
+                bytes: self.delalloc.bytes(),
+                flags: DATA,
             }
             .into());
         }

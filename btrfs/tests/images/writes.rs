@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use helios_btrfs::write::{Attributes, CloneRange, Name, WriteError, WriteOptions, Writer, Zstd};
+use helios_btrfs::write::{Attributes, CloneRange, Compressor, Name, WriteError, Writer, Zstd};
 use helios_btrfs::{BlockSink, BlockSource, READ_ALIGNMENT, Timestamp};
 use helios_hal::fs::RenameMode;
 use helios_hal::io::IoResult;
@@ -46,10 +46,18 @@ fn no_uuid() -> [u8; 16] {
 type ImageWriter = Writer<WritableImage, fn() -> [u8; 16]>;
 
 async fn mount(image: SparseImage) -> Result<ImageWriter, WriteError> {
+    mount_compressing(image, Compressor::Plain).await
+}
+
+async fn mount_compressing(
+    image: SparseImage,
+    compressor: Compressor,
+) -> Result<ImageWriter, WriteError> {
     Writer::mount(
         WritableImage(Mutex::new(image)),
         no_uuid as fn() -> [u8; 16],
         std::thread::available_parallelism().unwrap(),
+        compressor,
     )
     .await
 }
@@ -70,7 +78,6 @@ fn writer_commits_over_a_mkfs_image() {
             seconds: 1_700_000_100,
             nanoseconds: 0,
         };
-        let concurrency = std::thread::available_parallelism().unwrap();
         let file = tx
             .create_file(
                 Name {
@@ -86,14 +93,7 @@ fn writer_commits_over_a_mkfs_image() {
             )
             .await
             .unwrap();
-        tx.write_file(
-            &file,
-            0,
-            b"guest bytes",
-            WriteOptions::plain(when, concurrency),
-        )
-        .await
-        .unwrap();
+        tx.write_file(&file, 0, b"guest bytes", when).await.unwrap();
         tx.commit().await.unwrap();
         let snapshot = writer.snapshot().unwrap();
         let written = snapshot.resolve(b"/written").await.unwrap();
@@ -135,14 +135,9 @@ fn writer_commits_over_a_mkfs_image() {
             )
             .await
             .unwrap();
-        tx.write_file(
-            &original,
-            0,
-            &[0x47; 8192],
-            WriteOptions::plain(when, concurrency),
-        )
-        .await
-        .unwrap();
+        tx.write_file(&original, 0, &[0x47; 8192], when)
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
         let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
@@ -184,7 +179,8 @@ fn writer_commits_over_a_mkfs_image() {
 #[test]
 fn public_writer_preserves_snapshots_and_committed_handles() {
     block_on(async {
-        let mut writer = mount(base_image()).await.unwrap();
+        let compressor = Compressor::Zstd(Box::new(Zstd::new(3).unwrap()));
+        let mut writer = mount_compressing(base_image(), compressor).await.unwrap();
         let before = writer.snapshot().unwrap();
         let join = writer.join();
         assert_send(&join);
@@ -194,7 +190,6 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             seconds: 1_700_000_100,
             nanoseconds: 123,
         };
-        let concurrency = std::thread::available_parallelism().unwrap();
         let attributes = |permissions| Attributes {
             permissions,
             uid: 1000,
@@ -220,17 +215,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             .await
             .unwrap();
         let data = vec![0x53; 32768];
-        let mut encoder = Zstd::new(3).unwrap();
-        let write = tx.write_file(
-            &source,
-            0,
-            &data,
-            WriteOptions {
-                when,
-                concurrency,
-                encoder: &mut encoder,
-            },
-        );
+        let write = tx.write_file(&source, 0, &data, when);
         assert_send(&write);
         let count = write.await.unwrap();
         assert_eq!(count, data.len());
@@ -247,7 +232,6 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
                 length: data.len() as u64,
             },
             when,
-            concurrency,
         )
         .await
         .unwrap();
@@ -282,15 +266,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             .await
             .unwrap();
         let mut tx = writer.join().await.unwrap();
-        let _ = tx
-            .write_file(
-                &source,
-                0,
-                b"changed",
-                WriteOptions::plain(when, concurrency),
-            )
-            .await
-            .unwrap();
+        let _ = tx.write_file(&source, 0, b"changed", when).await.unwrap();
         tx.rename(name(b"clone"), name(b"kept"), RenameMode::Replace, when)
             .await
             .unwrap();
@@ -447,6 +423,7 @@ fn linux_authority_survives_unrelated_writes() {
             SharedImage(shared.clone()),
             no_uuid as fn() -> [u8; 16],
             std::thread::available_parallelism().unwrap(),
+            Compressor::Plain,
         )
         .await
         .unwrap();
@@ -487,7 +464,6 @@ fn linux_authority_survives_unrelated_writes() {
             seconds: 1_800_000_000,
             nanoseconds: 0,
         };
-        let concurrency = std::thread::available_parallelism().unwrap();
         let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         let at = |parent, bytes| Name { parent, bytes };
@@ -516,14 +492,9 @@ fn linux_authority_survives_unrelated_writes() {
                 )
                 .await
                 .unwrap();
-            tx.write_file(
-                &file,
-                0,
-                name.as_bytes(),
-                WriteOptions::plain(when, concurrency),
-            )
-            .await
-            .unwrap();
+            tx.write_file(&file, 0, name.as_bytes(), when)
+                .await
+                .unwrap();
         }
         let (source, destination) = (at(&root, b"moved"), at(&directory, b"moved"));
         tx.rename(source, destination, RenameMode::Replace, when)
@@ -559,4 +530,112 @@ fn linux_authority_survives_unrelated_writes() {
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
+}
+
+/// 4 KiB chunked writes (as issued by WASI preview1's component adapter for
+/// CPython) over a `mkfs.btrfs` image form 128 KiB zstd extents under
+/// `compress=zstd:3` and a single extent when uncompressed, and pass
+/// `btrfs check` and `btrfs inspect-internal dump-tree` (#1052, #1060).
+#[test]
+#[ignore = "needs mkfs.btrfs and btrfs check from btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn chunked_writes_form_zstd_and_plain_extents_over_mkfs_image() {
+    const CHUNK: usize = 4096;
+    let payload = "compressible line of text, 中文 日本語 한국어\n"
+        .repeat(8000)
+        .into_bytes();
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("hello.txt"), b"hello btrfs\n").unwrap();
+
+    for (zstd, compressor) in [
+        (true, Compressor::Zstd(Box::new(Zstd::new(3).unwrap()))),
+        (false, Compressor::Plain),
+    ] {
+        let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &[]);
+        let shared = std::sync::Arc::new(WritableImage(Mutex::new(image)));
+        block_on(async {
+            let mut writer = Writer::mount(
+                SharedImage(shared.clone()),
+                no_uuid as fn() -> [u8; 16],
+                std::thread::available_parallelism().unwrap(),
+                compressor,
+            )
+            .await
+            .unwrap();
+            let when = Timestamp {
+                seconds: 1_800_000_100,
+                nanoseconds: 0,
+            };
+            let mut tx = writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let file = tx
+                .create_file(
+                    Name {
+                        parent: &root,
+                        bytes: b"compressible",
+                    },
+                    Attributes {
+                        permissions: 0o644,
+                        uid: 0,
+                        gid: 0,
+                    },
+                    when,
+                )
+                .await
+                .unwrap();
+            for (index, chunk) in payload.chunks(CHUNK).enumerate() {
+                assert_eq!(
+                    tx.write_file(&file, (index * CHUNK) as u64, chunk, when)
+                        .await
+                        .unwrap(),
+                    chunk.len()
+                );
+            }
+            tx.commit().await.unwrap();
+            let view = writer.snapshot().unwrap();
+            let inode = view.resolve(b"/compressible").await.unwrap();
+            let mut readback = vec![0; payload.len()];
+            assert_eq!(
+                view.read(&inode, 0, &mut readback).await.unwrap(),
+                payload.len()
+            );
+            assert_eq!(readback, payload);
+        });
+
+        let scratch = tempfile::NamedTempFile::new().unwrap();
+        {
+            use std::io::Seek;
+            let mut image = shared.0.lock().unwrap();
+            image.seek(std::io::SeekFrom::Start(0)).unwrap();
+            std::io::copy(&mut *image, &mut scratch.reopen().unwrap()).unwrap();
+        }
+        let check = std::process::Command::new("btrfs")
+            .args(["check", "--readonly"])
+            .arg(scratch.path())
+            .output()
+            .expect("btrfs-progs must be installed");
+        assert!(
+            check.status.success(),
+            "btrfs check (zstd={zstd})\n{}\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+        let dump = std::process::Command::new("btrfs")
+            .args(["inspect-internal", "dump-tree", "-t", "5"])
+            .arg(scratch.path())
+            .output()
+            .expect("btrfs-progs must be installed");
+        assert!(dump.status.success());
+        let text = String::from_utf8_lossy(&dump.stdout);
+        if zstd {
+            assert!(
+                text.contains("extent compression 3 (zstd)"),
+                "expected zstd extents in fs-tree dump:\n{text}"
+            );
+        } else {
+            assert!(
+                !text.contains("extent compression 3 (zstd)"),
+                "plain mount must not write zstd extents:\n{text}"
+            );
+        }
+    }
 }

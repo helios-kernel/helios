@@ -34,7 +34,8 @@ pub(crate) struct DataChange<R> {
 
 #[cfg(feature = "write")]
 pub(crate) struct DataWrite<'a> {
-    pub(crate) bytes: &'a [u8],
+    /// The extent's bytes, as whole sectors laid end to end.
+    pub(crate) pieces: &'a [&'a [u8]],
     pub(crate) reference: DataReference,
     pub(crate) checksummed: bool,
 }
@@ -103,19 +104,22 @@ impl Accounting {
         concurrency: core::num::NonZeroUsize,
     ) -> Result<Key, WriteError> {
         let DataWrite {
-            bytes,
+            pieces,
             reference,
             checksummed,
         } = data;
+        let length = pieces.iter().map(|piece| piece.len() as u64).sum();
         let key = self
-            .allocate_data(volume, trees, space, bytes.len() as u64, reference)
+            .allocate_data(volume, trees, space, length, reference)
             .await?;
         if checksummed {
             self.checksums
-                .set(volume, trees, space, key.objectid, bytes)
+                .set(volume, trees, space, key.objectid, pieces)
                 .await?;
         }
-        volume.stage(key.objectid, bytes, concurrency).await?;
+        volume
+            .stage_pieces(key.objectid, pieces, concurrency)
+            .await?;
         Ok(key)
     }
 

@@ -119,10 +119,15 @@ fn a_compressing_mount_writes_extents_the_reader_reads_back() {
         let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
         let cache = formatted_writable_image(tree, FormatOptions::new([0x61; 16], time));
         block_on(async {
+            // Linux's bounds on a 1 GiB machine: the 8 KiB write rounds stay
+            // dirty until the sync writes them back as one run.
             let (fs, service) = BtrfsFs::mount_writable(
                 cache.disk(0),
                 || DeviceId::new(100),
-                write_options(2, policy),
+                crate::vfs::BtrfsWriteOptions {
+                    commit: Some(crate::vfs::CommitPolicy::for_machine(1 << 30)),
+                    ..write_options(2, policy)
+                },
             )
             .await
             .expect("writable mount");
@@ -182,12 +187,231 @@ fn a_compressing_mount_writes_extents_the_reader_reads_back() {
                 assert_eq!(extent.kind, ExtentKind::Regular, "{policy:?} {extent:?}");
                 assert_eq!(extent.compression, algorithm, "{policy:?} {extent:?}");
             }
+            // Extents form at writeback, whatever the rounds: windows of
+            // BTRFS_MAX_UNCOMPRESSED when compressed, one extent otherwise.
+            let window = 128 << 10;
+            let lengths: Vec<u64> = extents.iter().map(|extent| extent.len).collect();
+            if algorithm.is_some() {
+                assert!(
+                    lengths.iter().rev().skip(1).all(|&len| len == window)
+                        && lengths.last().is_some_and(|&len| len <= window),
+                    "{policy:?} {lengths:?}"
+                );
+            } else {
+                assert_eq!(
+                    lengths,
+                    [payload.len().next_multiple_of(4096) as u64],
+                    "{policy:?}"
+                );
+            }
             assert_eq!(
                 snapshot.superblock().incompat_flags() & (1 << 3 | 1 << 4),
                 bit
             );
         });
     }
+}
+
+/// Streamed guest writes that arrive in 4096-byte chunks coalesce in delayed
+/// allocation under `compress=zstd:3` and become 128 KiB zstd extents at
+/// writeback (#1052, #1060).
+#[test]
+fn chunked_stream_writes_coalesce_into_zstd_extents() {
+    use helios_btrfs::write::CompressionPolicy;
+    use helios_btrfs::{Compression, ExtentKind};
+
+    const ADAPTER_CHUNK: usize = 4096;
+    const WINDOW: u64 = 128 << 10;
+    let payload: Vec<u8> = "compressible line of text, 中文 日本語 한국어\n"
+        .repeat(8000)
+        .into_bytes();
+    let policy = Some(CompressionPolicy::new(Compression::Zstd, 3));
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+    let cache = formatted_writable_image(tree, FormatOptions::new([0x63; 16], time));
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache.disk(0),
+            || DeviceId::new(100),
+            crate::vfs::BtrfsWriteOptions {
+                commit: Some(crate::vfs::CommitPolicy::for_machine(2 << 30)),
+                ..write_options(2, policy)
+            },
+        )
+        .await
+        .expect("writable mount");
+        let payload = &payload;
+        let client = async move {
+            fs.open(
+                path("compressible"),
+                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                1_000_000_000,
+            )
+            .await
+            .expect("create");
+            for (index, chunk) in payload.chunks(ADAPTER_CHUNK).enumerate() {
+                let landed = write_with(
+                    &fs,
+                    path("compressible"),
+                    WritePosition::End,
+                    chunk.len(),
+                    1_000_000_001 + index as u64,
+                    |_, bytes| bytes.copy_from_slice(chunk),
+                )
+                .await
+                .expect("4 KiB chunk write");
+                assert_eq!(landed.offset, (index * ADAPTER_CHUNK) as u64);
+                assert_eq!(landed.len, chunk.len());
+            }
+            // Before sync, reads return all written bytes from dirty pages,
+            // and only the initial 4 KiB promotion left no regular extents.
+            assert_eq!(
+                fs.read_at(path("compressible"), 0, payload.len())
+                    .await
+                    .unwrap(),
+                payload.as_slice()
+            );
+            {
+                let snapshot = fs.inner.reader.lock().clone();
+                let inode = snapshot.resolve(b"/compressible").await.unwrap();
+                assert!(snapshot.file_extents(&inode).await.unwrap().is_empty());
+            }
+            fs.sync(path("compressible")).await.expect("fsync");
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+
+        let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
+            .await
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .read_at(path("compressible"), 0, payload.len())
+                .await
+                .unwrap(),
+            payload.as_slice()
+        );
+        let snapshot = reopened.inner.reader.lock().clone();
+        let inode = snapshot.resolve(b"/compressible").await.unwrap();
+        let extents = snapshot.file_extents(&inode).await.unwrap();
+        let aligned = payload.len().next_multiple_of(4096) as u64;
+        assert_eq!(extents.len() as u64, aligned.div_ceil(WINDOW));
+        for (index, extent) in extents.iter().enumerate() {
+            assert_eq!(extent.kind, ExtentKind::Regular);
+            assert_eq!(extent.compression, Some(Compression::Zstd));
+            if index + 1 < extents.len() {
+                assert_eq!(extent.len, WINDOW);
+            } else {
+                assert_eq!(extent.len, aligned - WINDOW * index as u64);
+            }
+        }
+    });
+}
+
+/// Multi-round prepared writes fill each round synchronously at its cumulative
+/// offset, preserve their initial `Landed::offset` across rounds under
+/// concurrent append contention, and coalesce into one extent at writeback.
+#[test]
+fn prepared_writes_fill_rounds_synchronously_keep_start_offset_and_coalesce() {
+    use helios_btrfs::ExtentKind;
+
+    const ROUND: usize = crate::CACHE_BLOCK_BYTES * 2;
+    const FIRST_LEN: usize = ROUND * 3 + 1234;
+    const SECOND_LEN: usize = ROUND * 2 + 567;
+    let first_bytes: Vec<u8> = (0..FIRST_LEN).map(|i| (i % 251) as u8).collect();
+    let second_bytes: Vec<u8> = (0..SECOND_LEN).map(|i| ((i + 97) % 251) as u8).collect();
+
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+    let cache = formatted_writable_image(tree, FormatOptions::new([0x64; 16], time));
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache.disk(0),
+            || DeviceId::new(100),
+            crate::vfs::BtrfsWriteOptions {
+                commit: Some(crate::vfs::CommitPolicy::for_machine(1 << 30)),
+                ..write_options(2, None)
+            },
+        )
+        .await
+        .expect("writable mount");
+        let (first_bytes, second_bytes) = (&first_bytes, &second_bytes);
+        let client = async move {
+            fs.open(
+                path("rounds"),
+                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                1_000_000_000,
+            )
+            .await
+            .expect("create");
+            let drive = async |fs: &BtrfsFs<MemoryDisk>, data: &[u8], stamp: u64| {
+                let mut current = fs
+                    .prepare_write(path("rounds"), WritePosition::End, data.len(), stamp)
+                    .await
+                    .expect("prepare");
+                let mut seen_offsets = Vec::new();
+                loop {
+                    let expected_staged = (data.len()
+                        - seen_offsets.iter().map(|&(_, len)| len).sum::<usize>())
+                    .min(ROUND);
+                    assert_eq!(current.staged_len(), expected_staged);
+                    let filled = current.fill(|offset, buf| {
+                        seen_offsets.push((offset, buf.len()));
+                        buf.copy_from_slice(&data[offset..offset + buf.len()]);
+                    });
+                    match filled.submit().await.expect("round submit") {
+                        WriteProgress::More(next) => current = next,
+                        WriteProgress::Done(landed) => return (landed, seen_offsets),
+                    }
+                }
+            };
+            let ((first_landed, first_rounds), (second_landed, second_rounds)) =
+                futures::future::join(
+                    drive(&fs, first_bytes, 1_000_000_001),
+                    drive(&fs, second_bytes, 1_000_000_002),
+                )
+                .await;
+            assert_eq!(
+                first_rounds,
+                [
+                    (0, ROUND),
+                    (ROUND, ROUND),
+                    (ROUND * 2, ROUND),
+                    (ROUND * 3, 1234)
+                ]
+            );
+            assert_eq!(
+                second_rounds,
+                [(0, ROUND), (ROUND, ROUND), (ROUND * 2, 567)]
+            );
+            assert_eq!(first_landed.len, FIRST_LEN);
+            assert_eq!(second_landed.len, SECOND_LEN);
+            let mut expected = Vec::with_capacity(FIRST_LEN + SECOND_LEN);
+            if first_landed.offset == 0 {
+                assert_eq!(second_landed.offset, FIRST_LEN as u64);
+                expected.extend_from_slice(first_bytes);
+                expected.extend_from_slice(second_bytes);
+            } else {
+                assert_eq!(second_landed.offset, 0);
+                assert_eq!(first_landed.offset, SECOND_LEN as u64);
+                expected.extend_from_slice(second_bytes);
+                expected.extend_from_slice(first_bytes);
+            }
+            assert_eq!(
+                fs.read_at(path("rounds"), 0, expected.len()).await.unwrap(),
+                expected.as_slice()
+            );
+            fs.sync(path("rounds")).await.expect("sync");
+            let snapshot = fs.inner.reader.lock().clone();
+            let inode = snapshot.resolve(b"/rounds").await.unwrap();
+            let extents = snapshot.file_extents(&inode).await.unwrap();
+            assert_eq!(extents.len(), 1, "all rounds coalesce into one extent");
+            assert_eq!(extents[0].kind, ExtentKind::Regular);
+            assert_eq!(extents[0].len, expected.len().next_multiple_of(4096) as u64);
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+    });
 }
 
 /// The bytes of a btrfs volume holding `tree`.
@@ -991,7 +1215,7 @@ fn the_commit_interval_commits_a_waiting_change_and_follows_its_operator() {
     let timer = crate::test_support::test_timer(clock.clone());
     let policy = |seconds| CommitPolicy {
         interval: Duration::from_secs(seconds),
-        ..CommitPolicy::default()
+        ..CommitPolicy::machine_default()
     };
     block_on(async {
         let (fs, service) = BtrfsFs::mount_writable(
@@ -1037,6 +1261,79 @@ fn the_commit_interval_commits_a_waiting_change_and_follows_its_operator() {
     });
 }
 
+/// Dirty data past its bound is written back into extents without a commit,
+/// and the bound is the operator's to move.
+#[test]
+fn the_dirty_data_bound_writes_back_without_a_commit() {
+    use crate::vfs::CommitPolicy;
+
+    let disk = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    let cache = cache_over(&disk, 256, 1);
+    let start = durable_generation(&disk);
+    let bound = |dirty_data_limit| CommitPolicy {
+        dirty_data_limit,
+        ..CommitPolicy::for_machine(1 << 30)
+    };
+    const NAME: &str = "回写-書き戻し-되쓰기";
+    let payload = "延迟分配 遅延割り当て 지연 할당\n"
+        .repeat(4000)
+        .into_bytes();
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache.disk(0),
+            || DeviceId::new(100),
+            commit_options(bound(u64::MAX)),
+        )
+        .await
+        .expect("writable mount");
+        let disk = &disk;
+        let payload = &payload;
+        let client = async {
+            let extents = || async {
+                let snapshot = fs.inner.reader.lock().clone();
+                let inode = snapshot.resolve(NAME.as_bytes()).await.unwrap();
+                snapshot.file_extents(&inode).await.unwrap()
+            };
+            fs.open(path(NAME), OpenFlags::CREATE, 1_000_000_000)
+                .await
+                .expect("create");
+            write_with(
+                &fs,
+                path(NAME),
+                WritePosition::At(0),
+                payload.len(),
+                1_000_000_001,
+                |offset, bytes| bytes.copy_from_slice(&payload[offset..offset + bytes.len()]),
+            )
+            .await
+            .expect("write");
+            idle().await;
+            assert!(extents().await.is_empty(), "dirty within its bound");
+            assert_eq!(
+                fs.read_at(path(NAME), 0, payload.len()).await.unwrap(),
+                payload.as_slice()
+            );
+            fs.set_commit_policy(bound(1)).expect("writable mount");
+            idle().await;
+            let written = extents().await;
+            assert_eq!(
+                written.iter().map(|extent| extent.len).sum::<u64>(),
+                payload.len().next_multiple_of(4096) as u64,
+                "written back past its bound: {written:?}"
+            );
+            assert_eq!(durable_generation(disk), start, "writeback is no commit");
+            assert_eq!(
+                fs.read_at(path(NAME), 0, payload.len()).await.unwrap(),
+                payload.as_slice()
+            );
+            fs.sync(path(NAME)).await.expect("sync");
+            assert_eq!(durable_generation(disk), start + 1);
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+    });
+}
+
 /// Dirty metadata past the bound commits without a sync, and the bound is the
 /// operator's to move.
 #[test]
@@ -1048,7 +1345,7 @@ fn the_dirty_bound_commits_without_a_sync() {
     let start = durable_generation(&disk);
     let bound = |dirty_metadata_limit| CommitPolicy {
         dirty_metadata_limit,
-        ..CommitPolicy::default()
+        ..CommitPolicy::machine_default()
     };
     block_on(async {
         // One dirty byte is past this bound: every change commits.
@@ -1065,7 +1362,7 @@ fn the_dirty_bound_commits_without_a_sync() {
                 .await
                 .expect("mkdir");
             settle(|| durable_generation(disk) == start + 1).await;
-            fs.set_commit_policy(CommitPolicy::default())
+            fs.set_commit_policy(CommitPolicy::machine_default())
                 .expect("writable mount");
             fs.create_directory(path("目录-ディレクトリ-디렉터리/内"), 2_000_000_000)
                 .await
@@ -1286,16 +1583,17 @@ fn the_commit_option_of_a_mount_request_sets_its_interval() {
     use crate::vfs::CommitPolicy;
     use core::time::Duration;
 
-    assert_eq!(CommitPolicy::from_commit_option(0), CommitPolicy::default());
+    let linux = CommitPolicy::machine_default();
+    assert_eq!(linux.with_commit_option(0), linux);
     assert_eq!(
-        CommitPolicy::from_commit_option(600).interval,
+        linux.with_commit_option(600).interval,
         Duration::from_secs(600),
         "past Linux's warning, still taken"
     );
     let disk = MemoryDisk::holding_writable("btrfs-test", &empty_image());
     let start = durable_generation(&disk);
     let namespace = mount_point_namespace();
-    let service = request_writable(&namespace, &disk, Some(CommitPolicy::from_commit_option(5)));
+    let service = request_writable(&namespace, &disk, Some(linux.with_commit_option(5)));
     let clock = ManualClockCpu::new();
     let timer = crate::test_support::test_timer(clock.clone());
     let client = async {
@@ -1326,7 +1624,7 @@ fn the_commit_option_of_a_mount_request_sets_its_interval() {
             "/mnt",
             false,
             crate::vfs::BtrfsWriteOptions {
-                commit: Some(CommitPolicy::from_commit_option(5)),
+                commit: Some(linux.with_commit_option(5)),
                 ..write_options(1, None)
             },
         )),

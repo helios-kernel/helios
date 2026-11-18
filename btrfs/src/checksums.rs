@@ -26,27 +26,31 @@ impl Checksums {
         trees: &mut Trees,
         space: &mut Space,
         logical: u64,
-        data: &[u8],
+        pieces: &[&[u8]],
     ) -> Result<(), WriteError> {
         let sector = volume.superblock().sectorsize() as usize;
         let algorithm = volume.superblock().csum_type();
+        let length: usize = pieces.iter().map(|piece| piece.len()).sum();
         let end = logical
-            .checked_add(data.len() as u64)
+            .checked_add(length as u64)
             .ok_or(WriteError::Checksum { key: key(logical) })?;
         self.remove(volume, trees, space, logical..end).await?;
         let per_item = (volume.superblock().nodesize() as usize
             - size_of::<RawHeader>()
             - size_of::<RawItem>())
             / algorithm.size();
-        for (index, chunk) in data.chunks(per_item * sector).enumerate() {
-            let mut bytes = Vec::with_capacity(chunk.len() / sector * algorithm.size());
-            for sector in chunk.chunks_exact(sector) {
-                bytes.extend_from_slice(algorithm.digest(sector).as_bytes());
+        let mut digests = Vec::with_capacity(length / sector * algorithm.size());
+        for piece in pieces {
+            for sector in piece.chunks_exact(sector) {
+                digests.extend_from_slice(algorithm.digest(sector).as_bytes());
             }
-            let start = logical + (index * per_item * sector) as u64;
+        }
+        let mut start = logical;
+        for bytes in digests.chunks(per_item * algorithm.size()) {
             self.root = trees
-                .apply(volume, self.root, key(start), Some(&bytes), space)
+                .apply(volume, self.root, key(start), Some(bytes), space)
                 .await?;
+            start += (per_item * sector) as u64;
         }
         Ok(())
     }
