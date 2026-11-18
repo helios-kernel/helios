@@ -9,6 +9,7 @@ mod memory;
 use memory::*;
 mod descriptor;
 use descriptor::*;
+pub(crate) use descriptor::{Preview1SignalExit, WasixSignalState};
 mod display;
 pub(super) use display::add_display_to_linker;
 pub use display::{DisplayHandle, SurfaceHandle};
@@ -60,6 +61,8 @@ use wasix_epoll::*;
 mod linux;
 #[cfg(feature = "linux")]
 use linux::*;
+#[cfg(test)]
+mod child_exit_tests;
 
 use super::*;
 use crate::isa::GuestIsa;
@@ -518,7 +521,7 @@ impl ChildHandle {
 #[derive(Clone, Debug)]
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
-    pub exit_code: u32,
+    pub termination: helios_unix::ChildTermination,
     filesystem: Option<MemoryFs>,
 }
 
@@ -1607,13 +1610,33 @@ where
         let (stdout, (stderr, exit)) =
             futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
         let exit = exit?;
+        let exit_code = match exit.termination {
+            helios_unix::ChildTermination::Exited(code) => code,
+            helios_unix::ChildTermination::Signaled(sig) => {
+                128u32.saturating_add(u32::from(sig.signal))
+            }
+            helios_unix::ChildTermination::Trapped => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: ProgramExecErrorDetail::ChildTrapped,
+                });
+            }
+            helios_unix::ChildTermination::Killed => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: ProgramExecErrorDetail::ChildKilled,
+                });
+            }
+        };
 
-        Ok(ExecResult {
-            instance_id: exit.instance_id,
-            exit_code: exit.exit_code,
-            output: crate::ExecOutput { stdout, stderr },
-        })
-        .map(|result| (result, exit.filesystem))
+        Ok((
+            ExecResult {
+                instance_id: exit.instance_id,
+                exit_code,
+                output: crate::ExecOutput { stdout, stderr },
+            },
+            exit.filesystem,
+        ))
     }
 
     pub(crate) async fn aot(
@@ -2651,7 +2674,11 @@ const WASIX_JOIN_FLAG_NON_BLOCKING: u32 = 1 << 0;
 const WASIX_JOIN_FLAGS_SUPPORTED: u32 = WASIX_JOIN_FLAG_NON_BLOCKING | (1 << 1);
 const WASIX_JOIN_STATUS_NOTHING: u8 = 0;
 const WASIX_JOIN_STATUS_EXIT_NORMAL: u8 = 1;
+const WASIX_JOIN_STATUS_EXIT_SIGNAL: u8 = 2;
 const WASIX_JOIN_STATUS_UNION_OFFSET: u32 = 2;
+const WASIX_ERRNO_SIGNAL_SIGNAL_OFFSET: u32 = 4;
+const WASIX_SIGABRT: u8 = 6;
+const WASIX_SIGKILL: u8 = 9;
 const WASIX_SOCK_TYPE_STREAM: i32 = 1;
 const WASIX_SOCK_TYPE_DGRAM: i32 = 2;
 const WASIX_SOCK_STATUS_OPENED: u8 = 1;

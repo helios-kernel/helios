@@ -1,15 +1,15 @@
 use super::*;
 #[derive(Clone)]
-pub(super) struct SignalTarget {
-    pub(super) interrupts: Arc<GuestInterrupts>,
-    pub(super) instance: crate::InstanceId,
+pub(crate) struct SignalTarget {
+    pub(crate) interrupts: Arc<GuestInterrupts>,
+    pub(crate) instance: crate::InstanceId,
 }
 impl helios_unix::InterruptTarget for SignalTarget {
     fn interrupt(&self) {
         self.interrupts.interrupt_instance(self.instance);
     }
 }
-pub(super) type WasixSignalState = helios_unix::SignalState<SignalTarget>;
+pub(crate) type WasixSignalState = helios_unix::SignalState<SignalTarget>;
 pub(super) type WasixProcessThreads<Image> =
     helios_unix::ProcessThreads<SignalTarget, Image, ProgramExecError>;
 pub(super) type WasixProcessEnd<Image> = helios_unix::ProcessEnd<Image, ProgramExecError>;
@@ -21,7 +21,7 @@ pub(super) struct WasixChildProcess {
     pub(super) signal_state: WasixSignalState,
     pub(super) exit:
         Option<futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>>,
-    pub(super) completed: Option<u32>,
+    pub(super) completed: Option<helios_unix::ChildTermination>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,33 +411,26 @@ impl WasixThreadExitRequested {
 }
 
 /// A pending WASIX signal raised on the process ended the guest. The
-/// program exits with `128 + signal`, whatever the guest asked for
-/// before it, and on any thread the whole process does.
+/// program ends with that signal, whatever the guest asked for before it,
+/// and on any thread the whole process does.
 #[derive(Debug, Error)]
 #[error("guest ended by wasix signal {signal}")]
-pub(super) struct Preview1SignalExit {
-    pub(super) signal: u32,
-}
-
-impl Preview1SignalExit {
-    pub(super) fn exit_code(&self) -> u32 {
-        128u32.saturating_add(self.signal)
-    }
+pub(crate) struct Preview1SignalExit {
+    pub(crate) signal: u8,
 }
 
 /// A WASIX signal raised on one thread alone (`thread_signal`) ended
-/// that thread's call. The thread exits with `128 + signal`, whatever it
-/// asked for before; a spawned thread ends alone, so a joiner sees the
-/// status, and main ends the image with it.
+/// that thread's call. A spawned thread ends alone with `128 + signal`,
+/// so a joiner sees the status, and main ends the image with the signal.
 #[derive(Debug, Error)]
 #[error("wasix thread ended by thread-directed signal {signal}")]
 pub(super) struct WasixThreadSignalExit {
-    pub(super) signal: u32,
+    pub(super) signal: u8,
 }
 
 impl WasixThreadSignalExit {
     pub(super) fn exit_code(&self) -> u32 {
-        128u32.saturating_add(self.signal)
+        128u32.saturating_add(u32::from(self.signal))
     }
 }
 
@@ -461,34 +454,65 @@ impl WasixThreadEnded {
     }
 }
 
-/// The exit status of a program whose call ended in `error`, given the
+/// The termination of a program whose call ended in `error`, given the
 /// status the guest `requested` before: the signal that ended it, raised
-/// on its process or its thread, otherwise the requested status,
-/// otherwise none, and the error is a failure.
-pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u32>) -> Option<u32> {
+/// on its process or its thread, otherwise an owner kill, otherwise the
+/// requested exit status, otherwise none.
+pub(super) fn preview1_exit_status(
+    error: &wasmtime::Error,
+    requested: Option<u32>,
+) -> Option<helios_unix::ChildTermination> {
     if let Some(exit) = error.downcast_ref::<Preview1SignalExit>() {
-        return Some(exit.exit_code());
+        return Some(helios_unix::ChildTermination::Signaled(
+            helios_unix::SignalTermination {
+                signal: exit.signal,
+                core_dumped: false,
+            },
+        ));
     }
     if let Some(exit) = error.downcast_ref::<WasixThreadSignalExit>() {
-        return Some(exit.exit_code());
+        return Some(helios_unix::ChildTermination::Signaled(
+            helios_unix::SignalTermination {
+                signal: exit.signal,
+                core_dumped: false,
+            },
+        ));
     }
-    requested
+    if let Some(killed) = error.downcast_ref::<crate::InstanceKilled>() {
+        return match killed.reason {
+            crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                Some(helios_unix::ChildTermination::Killed)
+            }
+            crate::KillReason::OutOfMemory
+            | crate::KillReason::SupervisorRestart
+            | crate::KillReason::StoreFailed => None,
+        };
+    }
+    if caused_by_out_of_memory(error) {
+        return None;
+    }
+    requested.map(helios_unix::ChildTermination::Exited)
 }
 
-/// How a process ends when one of its calls ended in `error`, given the
-/// status the guest `requested` before: the exit status
-/// [`preview1_exit_status`] finds, otherwise the failure the error is
-/// (a trap, an out-of-memory kill, any other runtime error). Main's own
-/// end and a spawned thread's end of its process both report through
-/// this, so a trap ends the process the same way on any thread.
+/// How a running process ends when one of its guest calls ended in `error`,
+/// given the status the guest `requested` before: the signal, owner kill or
+/// requested exit [`preview1_exit_status`] finds, otherwise an out-of-memory
+/// or supervisor failure when condemned for one, otherwise a guest trap.
+/// Main's own end, a spawned thread's end of its process, and a component's
+/// `run` all report through this, so every guest kind classifies endings
+/// identically.
 pub(super) fn preview1_process_end(
     error: wasmtime::Error,
     requested: Option<u32>,
-) -> Result<u32, ProgramExecError> {
-    match preview1_exit_status(&error, requested) {
-        Some(code) => Ok(code),
-        None => Err(map_program_runtime_error(error)),
+) -> Result<helios_unix::ChildTermination, ProgramExecError> {
+    if let Some(termination) = preview1_exit_status(&error, requested) {
+        return Ok(termination);
     }
+    if caused_by_out_of_memory(&error) || error.downcast_ref::<crate::InstanceKilled>().is_some() {
+        return Err(map_program_runtime_error(error));
+    }
+    tracing::debug!(?error, "guest program trapped");
+    Ok(helios_unix::ChildTermination::Trapped)
 }
 
 /// The signals one store answers to: those raised on its own thread and
@@ -520,11 +544,15 @@ impl WasixStoreSignals {
             return Some(wasmtime::Error::new(WasixThreadEnded));
         }
         if let Some(signal) = self.thread.take_pending() {
-            return Some(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+            return Some(wasmtime::Error::new(WasixThreadSignalExit {
+                signal: u8::try_from(signal).unwrap_or(u8::MAX),
+            }));
         }
-        self.process
-            .take_pending()
-            .map(|signal| wasmtime::Error::new(Preview1SignalExit { signal }))
+        self.process.take_pending().map(|signal| {
+            wasmtime::Error::new(Preview1SignalExit {
+                signal: u8::try_from(signal).unwrap_or(u8::MAX),
+            })
+        })
     }
 }
 
