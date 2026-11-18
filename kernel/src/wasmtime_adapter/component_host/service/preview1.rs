@@ -49,7 +49,7 @@ where
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
     pub(super) descriptors: Preview1DescriptorTable<Net>,
     pub(super) asyncify: WasixAsyncifyState<Net>,
-    pub(super) children: Vec<WasixChildProcess>,
+    pub(super) children: WasixChildren,
     pub(super) thread_id: u32,
     /// The threads of this store's process, shared by every store of it.
     pub(super) threads: WasixImageThreads<CpuImpl, Net, StorageImpl>,
@@ -134,7 +134,7 @@ where
             signal_dispositions,
             descriptors,
             asyncify: WasixAsyncifyState::new(),
-            children: Vec::new(),
+            children: WasixChildren::new(),
             thread_id: 0,
             threads,
             requested_exit: None,
@@ -427,64 +427,22 @@ where
         &mut self,
         pid: u32,
         signal_state: WasixSignalState,
-        exit: futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>,
+        exit: WasixChildExit,
     ) {
-        self.children.push(WasixChildProcess {
-            pid,
-            signal_state,
-            exit: Some(exit),
-            completed: None,
-        });
+        self.children.insert(pid, signal_state, exit);
     }
 
-    pub(super) fn poll_child_exit(
+    /// [`WasixChildren::poll_join`] on this store's children, with each
+    /// filesystem layer an exit hands back adopted into this store's
+    /// namespace.
+    pub(super) fn poll_child_join(
         &mut self,
-        index: usize,
-    ) -> Result<Option<helios_unix::ChildTermination>, i32> {
-        if let Some(termination) = self.children[index].completed {
-            return Ok(Some(termination));
-        }
-        let Some(exit) = self.children[index].exit.as_mut() else {
-            return Ok(self.children[index].completed);
-        };
-        let waker = futures::task::noop_waker_ref();
-        let mut context = Context::from_waker(waker);
-        match Pin::new(exit).poll(&mut context) {
-            Poll::Pending => Ok(None),
-            Poll::Ready(Ok(Ok(exit))) => {
-                let termination = exit.termination;
-                if let Some(filesystem) = exit.filesystem {
-                    self.filesystem.adopt_root_layer(filesystem);
-                }
-                self.children[index].completed = Some(termination);
-                self.children[index].exit = None;
-                Ok(Some(termination))
-            }
-            Poll::Ready(Ok(Err(error))) => {
-                self.children.swap_remove(index);
-                Err(p1_errno_from_program_exec_error(&error))
-            }
-            Poll::Ready(Err(_)) => {
-                self.children.swap_remove(index);
-                Err(p1::errno::IO)
-            }
-        }
-    }
-
-    pub(super) fn find_child_index(&self, pid: Option<u32>) -> Option<usize> {
-        match pid {
-            Some(pid) => self.children.iter().position(|child| child.pid == pid),
-            None => {
-                if let Some(index) = self
-                    .children
-                    .iter()
-                    .position(|child| child.completed.is_some())
-                {
-                    return Some(index);
-                }
-                (!self.children.is_empty()).then_some(0)
-            }
-        }
+        pid: Option<u32>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<WasixJoinedChild>> {
+        let filesystem = &mut self.filesystem;
+        self.children
+            .poll_join(pid, cx, |layer| filesystem.adopt_root_layer(layer))
     }
 
     pub(super) async fn read_stdin(&mut self, fd: i32, max_bytes: u32) -> Bytes {
@@ -4115,6 +4073,14 @@ pub(super) fn p1_errno_from_wasmtime_error(error: &wasmtime::Error) -> i32 {
 }
 
 pub(super) fn p1_errno_from_program_exec_error(error: &ProgramExecError) -> i32 {
+    if matches!(
+        error.detail,
+        ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds
+            | ProgramExecErrorDetail::GuestMemoryAccessOverflow
+            | ProgramExecErrorDetail::InvalidProgramPathEncoding
+    ) {
+        return p1::errno::FAULT;
+    }
     match error.kind {
         ProgramExecErrorKind::InvalidBinary
         | ProgramExecErrorKind::MissingEntry
