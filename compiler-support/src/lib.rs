@@ -765,13 +765,15 @@ mod tests {
             );
         }
 
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
         {
-            let host_floor = cwasm_target_isa_levels("aarch64-apple-darwin")
-                .floor()
-                .name();
+            #[cfg(target_os = "linux")]
+            const HOST_AARCH64_TARGET: &str = "aarch64-unknown-linux-gnu";
+            #[cfg(target_os = "macos")]
+            const HOST_AARCH64_TARGET: &str = "aarch64-apple-darwin";
+            let host_floor = cwasm_target_isa_levels(HOST_AARCH64_TARGET).floor().name();
             let host_target =
-                CwasmTarget::new("aarch64-apple-darwin", host_floor).expect("a defined level");
+                CwasmTarget::new(HOST_AARCH64_TARGET, host_floor).expect("a defined level");
             let config = build_engine_config(&host_target, AotCompileHint::Performance, 1)
                 .expect("host config builds");
             let engine = wasmtime::Engine::new(&config).expect("host engine builds");
