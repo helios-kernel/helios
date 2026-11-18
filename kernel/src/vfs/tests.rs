@@ -483,6 +483,7 @@ fn a_mount_request_without_mount_authority_is_refused() {
                 concurrency: core::num::NonZeroUsize::new(1).unwrap(),
                 compress: None,
                 commit: None,
+                max_inline: None,
             },
         )),
         Err(crate::MountRequestError::Authority(
@@ -511,6 +512,7 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
             concurrency: core::num::NonZeroUsize::new(1).unwrap(),
             compress: None,
             commit: None,
+            max_inline: None,
         },
     ))
     .expect("root may mount the boot image");
@@ -537,6 +539,7 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
                 concurrency: core::num::NonZeroUsize::new(1).unwrap(),
                 compress: None,
                 commit: None,
+                max_inline: None,
             },
         )),
         Err(crate::MountRequestError::HostShareUnavailable)
@@ -555,6 +558,7 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
                 concurrency: core::num::NonZeroUsize::new(1).unwrap(),
     compress: None,
             commit: None,
+            max_inline: None,
             },
         )),
             Err(crate::MountRequestError::DiskUnavailable { serial: refused }) if refused == serial

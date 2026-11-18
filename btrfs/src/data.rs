@@ -47,7 +47,7 @@ impl<'a, S: BlockSource, N: NodeSource> Reader<'a, S, N> {
         file: File<'_>,
     ) -> Result<Vec<crate::fs::ExtentInfo>, Error> {
         use crate::fs::{ExtentInfo, ExtentKind};
-        use crate::ondisk::{RawFileExtentHead, view};
+        use crate::ondisk::{RawFileExtentBody, RawFileExtentHead, view};
         let mut cursor = Cursor::floor(
             self.nodes,
             file.root,
@@ -82,11 +82,22 @@ impl<'a, S: BlockSource, N: NodeSource> Reader<'a, S, N> {
                 2 => Some(crate::Compression::Lzo),
                 _ => Some(crate::Compression::Zstd),
             };
+            let stored = match extent.data {
+                ExtentData::Inline { data, .. } => data.len() as u64,
+                ExtentData::Regular { disk_num_bytes, .. } => disk_num_bytes,
+                ExtentData::Zero => {
+                    view::<RawFileExtentBody>(&item[size_of::<RawFileExtentHead>()..])
+                        .expect("validated file extent body")
+                        .disk_num_bytes
+                        .get()
+                }
+            };
             found.push(ExtentInfo {
                 offset: extent.start,
                 len: extent.end - extent.start,
                 kind,
                 compression,
+                stored,
             });
             cursor.advance(self.nodes).await?;
         }

@@ -2493,6 +2493,7 @@ dependencies = [
  "futures",
  "futures-lite",
  "getrandom 0.4.3",
+ "helios-btrfs",
  "helios-hal",
  "libc",
  "libfuzzer-sys",
