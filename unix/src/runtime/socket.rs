@@ -213,12 +213,14 @@ pub enum TcpSocket<Net: SocketNetwork> {
     },
     Bound {
         family: SocketFamily,
+        local_address: Net::Address,
         local_port: u16,
         options: SocketOptions,
     },
     Listening {
         family: SocketFamily,
         listener: Arc<OwnedTcpListener<Net>>,
+        local_address: Net::Address,
         local_port: u16,
         options: SocketOptions,
     },
@@ -240,6 +242,7 @@ pub enum UdpSocket<Net: SocketNetwork> {
     Bound {
         family: SocketFamily,
         socket: Arc<OwnedUdpSocket<Net>>,
+        local_address: Net::Address,
         local_port: u16,
         options: SocketOptions,
     },

@@ -773,7 +773,7 @@ impl ByteWriter {
     /// A producer that parks on something other than this channel has
     /// no other way to learn that the consumer went away: it is not
     /// waiting on the queue, so the close that wakes writability wakes
-    /// nothing it holds. The preview2 TCP bridge is one — it parks on a
+    /// nothing it holds. A TCP bridge is one — it parks on a
     /// socket read with no deadline — and a bridge that never learns
     /// its channel is gone never ends, keeping the socket it reads from
     /// alive for the rest of the boot (#184).
@@ -1184,8 +1184,8 @@ mod tests {
     }
 
     /// A producer parked on something other than the queue still has
-    /// to learn that the consumer went away. Without this the preview2
-    /// TCP bridge, which parks on a deadline-free socket read, outlived
+    /// to learn that the consumer went away. Without this a TCP
+    /// bridge, which parks on a deadline-free socket read, outlived
     /// the instance whose channel it was feeding and kept that
     /// instance's connection open for the rest of the boot (#184).
     #[test]

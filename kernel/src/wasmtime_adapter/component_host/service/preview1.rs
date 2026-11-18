@@ -238,10 +238,25 @@ where
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
     }
 
-    pub(super) fn require_privileged_bind_authority(&self) -> i32 {
-        self.authority
-            .derive_privileged_bind_cap()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+    pub(super) fn require_socket_bind_authority(
+        &self,
+        authority: WasixSocketAuthority,
+        local_port: u16,
+    ) -> i32 {
+        let base = match authority {
+            WasixSocketAuthority::LocalOnly => return p1::errno::SUCCESS,
+            WasixSocketAuthority::Tcp => crate::NetworkAuthorityRights::TCP,
+            WasixSocketAuthority::Udp => crate::NetworkAuthorityRights::UDP,
+        };
+        if self
+            .authority
+            .network_rights()
+            .contains(base.bind_rights(local_port))
+        {
+            p1::errno::SUCCESS
+        } else {
+            p1::errno::NOTCAPABLE
+        }
     }
 
     pub(super) fn require_spawn_authority(&self) -> Result<SpawnAuthority, i32> {
@@ -536,15 +551,44 @@ where
         Ok(reader.read_limit(max_bytes).await.unwrap_or_default())
     }
 
-    pub(super) async fn read_socket_pair(
+    pub(super) async fn recv_socket_pair(
         &mut self,
         fd: i32,
         max_bytes: usize,
+        nonblocking: bool,
+        peek: bool,
     ) -> Result<Bytes, i32> {
+        if max_bytes == 0 {
+            return match self.descriptors.get(fd) {
+                Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => Ok(Bytes::new()),
+                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
+                Some(_) => Err(p1::errno::NOTSOCK),
+                None => Err(p1::errno::BADF),
+            };
+        }
+
         let reader = match self.descriptors.get_mut(fd) {
             Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) => {
                 if !carry.is_empty() {
-                    return Ok(take_preview1_carry(carry, max_bytes));
+                    return Ok(if peek {
+                        carry.slice(..carry.len().min(max_bytes))
+                    } else {
+                        take_preview1_carry(carry, max_bytes)
+                    });
+                }
+                if nonblocking {
+                    return match reader.try_read() {
+                        crate::TryRead::Ready(bytes) => {
+                            *carry = bytes;
+                            Ok(if peek {
+                                carry.slice(..carry.len().min(max_bytes))
+                            } else {
+                                take_preview1_carry(carry, max_bytes)
+                            })
+                        }
+                        crate::TryRead::Eof => Ok(Bytes::new()),
+                        crate::TryRead::Pending => Err(p1::errno::AGAIN),
+                    };
                 }
                 reader.clone()
             }
@@ -560,34 +604,11 @@ where
             return Err(p1::errno::BADF);
         };
         *carry = bytes;
-        Ok(take_preview1_carry(carry, max_bytes))
-    }
-
-    pub(super) fn try_read_socket_pair(
-        &mut self,
-        fd: i32,
-        max_bytes: usize,
-    ) -> Result<Option<Bytes>, i32> {
-        let Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) =
-            self.descriptors.get_mut(fd)
-        else {
-            return match self.descriptors.get(fd) {
-                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
-                Some(_) => Err(p1::errno::NOTSOCK),
-                None => Err(p1::errno::BADF),
-            };
-        };
-        if !carry.is_empty() {
-            return Ok(Some(take_preview1_carry(carry, max_bytes)));
-        }
-        match reader.try_read() {
-            crate::TryRead::Ready(bytes) => {
-                *carry = bytes;
-                Ok(Some(take_preview1_carry(carry, max_bytes)))
-            }
-            crate::TryRead::Eof => Ok(Some(Bytes::new())),
-            crate::TryRead::Pending => Ok(None),
-        }
+        Ok(if peek {
+            carry.slice(..carry.len().min(max_bytes))
+        } else {
+            take_preview1_carry(carry, max_bytes)
+        })
     }
 
     pub(super) fn getcwd(&self) -> Result<&str, i32> {
@@ -949,7 +970,7 @@ where
              count: i32,
              size: i32|
              -> i32 {
-                let thread_count = compiler_plugin_worker_threads(&caller.data().context.cpu);
+                let thread_count = caller.data().context.shared.worker_threads();
                 let env_len = compiler_rayon_env_len(thread_count);
                 let memory = caller.data().memory();
                 let first = write_u32(memory, GuestAddress::wasm32(count as u32), 1);
@@ -1024,6 +1045,11 @@ where
                     return -1;
                 };
                 let thread_id = previous + 1;
+                let worker_slot = context
+                    .shared
+                    .session_worker_cursor
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                let preferred = context.affinity_plan.worker(worker_slot);
                 let instance_pre = context
                     .shared
                     .instance_pre
@@ -1031,9 +1057,10 @@ where
                     .unwrap_or_else(|| panic!("compiler thread-spawn called before instance pre"))
                     .clone();
                 let spawner = context.spawner.clone();
+                let affinity_plan = context.affinity_plan.clone();
                 let shared = context.shared.clone();
                 let spawned_ns = crate::monotonic_nanos(&context.cpu);
-                let task = spawner.spawn(async move {
+                let task = affinity_plan.spawn_pinned(&spawner, preferred, async move {
                     let started_ns = crate::monotonic_nanos(&context.cpu);
                     let processor = helios_hal::cpu::current_processor().id();
                     // The worker's own store, accounted and driven like the
@@ -1071,7 +1098,7 @@ where
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
                         store.data().context.condemn_for_store_end(error)
                     });
-                    CompilerThreadReport {
+                    SharedMemoryThreadReport {
                         trap,
                         thread_id,
                         processor,
@@ -2412,17 +2439,13 @@ where
     StorageImpl: crate::Storage,
 {
     let stat = GuestAddress::wasm32(stat);
-    if matches!(
-        caller.data().descriptors.get(fd),
-        Some(Preview1Descriptor::NullDevice)
-    ) {
-        return p1_write_filestat(
-            caller,
-            stat,
-            p1_null_device_identity(),
-            p1_null_device_stat(),
-        )
-        .await;
+    if let Some((identity, stat_value)) = caller
+        .data()
+        .descriptors
+        .get(fd)
+        .and_then(p1_synthetic_descriptor_stat)
+    {
+        return p1_write_filestat(caller, stat, identity, stat_value).await;
     }
     let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
     else {
@@ -2887,8 +2910,12 @@ const P1_DIRENT_BYTES: usize = 24;
 
 /// The `dirent` records of `entries` from `cookie` on, each header followed
 /// by its name, cut off at `buf_len` bytes: what `fd_readdir` copies to the
-/// guest's buffer. A name the buffer cannot hold whole is cut, which ends
-/// the listing.
+/// guest's buffer.
+///
+/// Preview 1 callers (`wasi-libc` `readdir`) read `bufused < buf_len` as
+/// end-of-directory, so whenever another entry exists the remaining bytes of
+/// `buf` must be filled, truncating the `dirent` header itself when fewer than
+/// `P1_DIRENT_BYTES` remain.
 pub(super) fn p1_fd_readdir_records(
     entries: &[fs_types::DirectoryEntry],
     buf_len: u32,
@@ -2904,16 +2931,18 @@ pub(super) fn p1_fd_readdir_records(
         }
         let next = u64::try_from(index + 1).map_err(|_| p1::errno::OVERFLOW)?;
         let name = entry.name.as_bytes();
-        if capacity - used < P1_DIRENT_BYTES {
+        // The header is `d_next`, `d_ino`, `d_namlen`, `d_type` and 3 padding bytes.
+        let mut header = [0_u8; P1_DIRENT_BYTES];
+        header[0..8].copy_from_slice(&next.to_le_bytes());
+        header[8..16].copy_from_slice(&next.to_le_bytes());
+        header[16..20]
+            .copy_from_slice(&u32::try_from(name.len()).unwrap_or(u32::MAX).to_le_bytes());
+        header[20] = p1_filetype_from_descriptor_type(entry.type_.clone());
+        let header_copied = (capacity - used).min(P1_DIRENT_BYTES);
+        records.extend_from_slice(&header[..header_copied]);
+        if header_copied < P1_DIRENT_BYTES {
             break;
         }
-        // The header is `d_next`, `d_ino`, `d_namlen` and `d_type`.
-        records.extend_from_slice(&next.to_le_bytes());
-        records.extend_from_slice(&next.to_le_bytes());
-        records.extend_from_slice(&u32::try_from(name.len()).unwrap_or(u32::MAX).to_le_bytes());
-        records.push(p1_filetype_from_descriptor_type(entry.type_.clone()));
-        // Bytes 21..24 are padding.
-        records.resize(used + P1_DIRENT_BYTES, 0);
         let copied = (capacity - records.len()).min(name.len());
         records.extend_from_slice(&name[..copied]);
         if copied < name.len() {
@@ -4183,22 +4212,15 @@ where
         caller.data().descriptors.get(fd),
         Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. }))
     ) {
-        let bytes = if capacity == 0 {
-            Bytes::new()
-        } else if p1_fdflags_nonblocking(fdflags) {
-            match caller
-                .data_mut()
-                .try_read_socket_pair(fd, capacity as usize)?
-            {
-                Some(bytes) => bytes,
-                None => return Ok(p1::errno::AGAIN),
-            }
-        } else {
-            caller
-                .data_mut()
-                .read_socket_pair(fd, capacity as usize)
-                .await?
-        };
+        let bytes = caller
+            .data_mut()
+            .recv_socket_pair(
+                fd,
+                capacity as usize,
+                p1_fdflags_nonblocking(fdflags),
+                false,
+            )
+            .await?;
         return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
     }
     let stream = match caller.data().descriptors.get(fd) {
@@ -4909,6 +4931,9 @@ pub(super) fn p1_errno_from_dns_error(error: crate::DnsError) -> i32 {
 }
 
 pub(super) fn p1_errno_from_tcp_error(error: crate::TcpError) -> i32 {
+    if matches!(error.detail, crate::NetworkErrorDetail::AddressNotAvailable) {
+        return p1::errno::ADDRNOTAVAIL;
+    }
     match error.kind {
         crate::TcpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::TcpErrorKind::Timeout => p1::errno::TIMEDOUT,
@@ -4928,6 +4953,9 @@ pub(super) fn p1_errno_from_tcp_error_for_fdflags(error: crate::TcpError, fdflag
 }
 
 pub(super) fn p1_errno_from_udp_error(error: crate::UdpError) -> i32 {
+    if matches!(error.detail, crate::NetworkErrorDetail::AddressNotAvailable) {
+        return p1::errno::ADDRNOTAVAIL;
+    }
     match error.kind {
         crate::UdpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::UdpErrorKind::Unsupported => p1::errno::NOTSUP,
@@ -5258,6 +5286,7 @@ mod tests {
             Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
                 family: SocketFamily::Ipv4,
                 listener: OwnedTcpListener::new(crate::UnixNetwork::new(service), listener),
+                local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
                 local_port: 8080,
                 options: unix_socket_options::<Net>(),
             })),
@@ -5455,6 +5484,7 @@ mod tests {
             Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
                 family: SocketFamily::Ipv4,
                 socket: OwnedUdpSocket::new(crate::UnixNetwork::new(service), socket),
+                local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
                 local_port: 5353,
                 options: unix_socket_options::<Net>(),
             })),
@@ -6572,5 +6602,35 @@ mod tests {
             Err(P1Stop::Trap(crate::memory::SwapFaultError::Backend))
         );
         assert!(p1_reply(stop).is_err(), "the guest traps");
+    }
+
+    #[test]
+    fn readdir_truncates_trailing_header_so_partial_buffer_never_signals_eof_early() {
+        let entries = [
+            fs_types::DirectoryEntry {
+                type_: fs_types::DescriptorType::RegularFile,
+                name: "alpha".into(),
+            },
+            fs_types::DirectoryEntry {
+                type_: fs_types::DescriptorType::RegularFile,
+                name: "utf_8.py".into(),
+            },
+        ];
+        // `"alpha"` takes 24 + 5 = 29 bytes, leaving 7 bytes (< P1_DIRENT_BYTES)
+        // in a 36-byte buffer. Preview 1 `readdir` treats `bufused < buf_len` as
+        // end-of-directory, so those 7 bytes must hold the prefix of the next
+        // header rather than leaving `buf` short.
+        let first = p1_fd_readdir_records(&entries, 36, 0).expect("first readdir pass");
+        assert_eq!(first.len(), 36);
+        assert_eq!(u64::from_le_bytes(first[0..8].try_into().unwrap()), 1);
+        assert_eq!(&first[24..29], b"alpha");
+        assert_eq!(&first[29..36], &2_u64.to_le_bytes()[..7]);
+
+        // Resuming from the last complete entry's `d_next` (1) yields the full
+        // second entry and `bufused < buf_len` (32 < 36) to signal true EOF.
+        let second = p1_fd_readdir_records(&entries, 36, 1).expect("second readdir pass");
+        assert_eq!(second.len(), 32);
+        assert_eq!(u64::from_le_bytes(second[0..8].try_into().unwrap()), 2);
+        assert_eq!(&second[24..32], b"utf_8.py");
     }
 }

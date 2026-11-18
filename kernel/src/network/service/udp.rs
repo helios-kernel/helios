@@ -4,6 +4,7 @@ use super::*;
 pub(super) struct UdpSocketState {
     pub(super) stack_socket: helios_netstack::UdpSocketId,
     pub(super) binding: UdpSocketBinding,
+    pub(super) bound_local_address: Option<IpAddress>,
 }
 
 impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
@@ -11,8 +12,12 @@ where
     CpuImpl: Cpu + Clone,
     DeviceImpl: NetworkDevice,
 {
-    pub async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
-        self.execute_udp_bind(local_port).await
+    pub async fn udp_bind(
+        &self,
+        local_address: NetworkIpAddress,
+        local_port: u16,
+    ) -> Result<UdpBinding<UdpSocketId>, UdpError> {
+        self.execute_udp_bind(local_address, local_port).await
     }
 
     pub fn udp_connect(
@@ -65,7 +70,17 @@ where
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> Result<Option<UdpDatagram>, UdpError> {
-        self.execute_udp_receive(socket, max_bytes, timeout_nanos)
+        self.execute_udp_receive(socket, max_bytes, timeout_nanos, false)
+            .await
+    }
+
+    pub async fn udp_peek(
+        &self,
+        socket: UdpSocketId,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        self.execute_udp_receive(socket, max_bytes, timeout_nanos, true)
             .await
     }
 
@@ -154,13 +169,21 @@ where
 
     pub(super) async fn execute_udp_bind(
         &self,
+        local_address: NetworkIpAddress,
         local_port: u16,
     ) -> Result<UdpBinding<UdpSocketId>, UdpError> {
-        // A wildcard-bound datagram socket cannot belong to one shard:
-        // it accepts datagrams from arbitrary peers, and each of those
-        // flows hashes wherever it hashes. The socket is therefore
-        // installed on every shard in one slab slot the whole set
-        // agrees on, each with its own receive queue.
+        if !local_address.is_unspecified() && !self.owns_ip_address(local_address) {
+            return Err(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::AddressNotAvailable,
+            });
+        }
+        self.synchronize_control_plane();
+        // A datagram socket cannot belong to one shard: even when bound to
+        // a local IP, peers arrive from arbitrary sources and each flow
+        // hashes wherever it hashes. The socket is therefore installed on
+        // every shard in one slab slot the whole set agrees on, each with
+        // its own receive queue.
         let slot = self.inner.state.udp_slots.allocate().ok_or(UdpError {
             kind: UdpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UdpPortInUse,
@@ -186,7 +209,7 @@ where
         };
         let install = self.inner.state.install_replica(
             slot,
-            |shard, slot| shard.install_udp_bind(slot, local_port),
+            |shard, slot| shard.install_udp_bind(slot, local_address, local_port),
             NetworkShard::remove_udp_replica,
         );
         if let Err(error) = install {
@@ -323,6 +346,7 @@ where
         socket: UdpSocketId,
         max_bytes: u32,
         timeout_nanos: u64,
+        peek: bool,
     ) -> Result<Option<UdpDatagram>, UdpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
@@ -335,7 +359,7 @@ where
             let start = self.receiving_shard_idx();
             self.drive_udp().await?;
             let received = self.inner.state.find_in_replicas(start, |state| {
-                state.poll_udp_receive(socket, max_bytes as usize)
+                state.poll_udp_datagram(socket, max_bytes as usize, peek)
             })?;
             match received {
                 Some(datagram) => return Ok(Some(datagram)),
@@ -428,9 +452,10 @@ impl NetworkShard {
     pub(super) fn install_udp_bind(
         &mut self,
         slot: usize,
+        local_address: NetworkIpAddress,
         local_port: u16,
     ) -> Result<(), UdpError> {
-        let binding = UdpSocketBinding::wildcard(local_port);
+        let binding = udp_socket_binding(local_address, local_port);
         if !self.stack.udp_binding_free(binding) {
             return Err(UdpError {
                 kind: UdpErrorKind::Unavailable,
@@ -443,6 +468,7 @@ impl NetworkShard {
             UdpSocketState {
                 stack_socket,
                 binding,
+                bound_local_address: binding.local_address,
             },
         );
         Ok(())
@@ -456,9 +482,27 @@ impl NetworkShard {
     ) -> Result<(), UdpError> {
         let slot = ReplicaHandle::from(socket).slot();
         let state = *self.udp_socket(socket)?;
-        let local = self
-            .udp_local_endpoint(state.binding.local_port, destination)
-            .map_err(map_udp_connect_error)?;
+        let local = match state.bound_local_address {
+            Some(local_address) => {
+                if !matches!(
+                    (local_address, destination),
+                    (IpAddress::Ipv4(_), IpAddress::Ipv4(_))
+                        | (IpAddress::Ipv6(_), IpAddress::Ipv6(_))
+                ) {
+                    return Err(UdpError {
+                        kind: UdpErrorKind::Unsupported,
+                        detail: NetworkErrorDetail::UnsupportedAddressFamily,
+                    });
+                }
+                UdpEndpoint {
+                    address: local_address,
+                    port: state.binding.local_port,
+                }
+            }
+            None => self
+                .udp_local_endpoint(state.binding.local_port, destination)
+                .map_err(map_udp_connect_error)?,
+        };
         let remote = UdpEndpoint {
             address: destination,
             port,
@@ -498,7 +542,11 @@ impl NetworkShard {
                 detail: NetworkErrorDetail::UdpDisconnectFailed,
             });
         }
-        let binding = UdpSocketBinding::wildcard(state.binding.local_port);
+        let binding = UdpSocketBinding {
+            local_address: state.bound_local_address,
+            local_port: state.binding.local_port,
+            remote: None,
+        };
         self.stack
             .rebind_udp(state.stack_socket, binding)
             .map_err(map_udp_disconnect_error)?;
@@ -544,10 +592,20 @@ impl NetworkShard {
             })
     }
 
+    #[cfg(test)]
     pub(super) fn poll_udp_receive(
         &mut self,
         socket: UdpSocketId,
         max_bytes: usize,
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        self.poll_udp_datagram(socket, max_bytes, false)
+    }
+
+    pub(super) fn poll_udp_datagram(
+        &mut self,
+        socket: UdpSocketId,
+        max_bytes: usize,
+        peek: bool,
     ) -> Result<Option<UdpDatagram>, UdpError> {
         let stack_socket = self.udp_socket(socket)?.stack_socket;
         if let Some(error) = self
@@ -560,6 +618,23 @@ impl NetworkShard {
         {
             return Err(map_udp_socket_error(error));
         }
+        if peek {
+            let Some(datagram) = self.stack.peek_udp(stack_socket).map_err(|_| UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UdpReceiveFailed,
+            })?
+            else {
+                return Ok(None);
+            };
+            let slice = datagram.bytes.as_slice();
+            let original_len = slice.len();
+            return Ok(Some(UdpDatagram {
+                address: map_ip_address(datagram.source),
+                port: datagram.source_port,
+                bytes: Bytes::copy_from_slice(&slice[..original_len.min(max_bytes)]),
+                original_len,
+            }));
+        }
         let Some(datagram) = self.stack.take_udp(stack_socket).map_err(|_| UdpError {
             kind: UdpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UdpReceiveFailed,
@@ -567,10 +642,12 @@ impl NetworkShard {
         else {
             return Ok(None);
         };
+        let original_len = datagram.bytes.len();
         Ok(Some(UdpDatagram {
             address: map_ip_address(datagram.source),
             port: datagram.source_port,
             bytes: limit_udp_datagram_bytes(datagram.bytes, max_bytes),
+            original_len,
         }))
     }
 
@@ -741,4 +818,15 @@ impl NetworkShard {
 
 pub(super) fn limit_udp_datagram_bytes(bytes: UdpPayload, max_bytes: usize) -> Bytes {
     bytes.into_limited_bytes(max_bytes)
+}
+
+fn udp_socket_binding(local_address: NetworkIpAddress, local_port: u16) -> UdpSocketBinding {
+    if local_address.is_unspecified() {
+        UdpSocketBinding::wildcard(local_port)
+    } else {
+        UdpSocketBinding::exact(UdpEndpoint {
+            address: map_network_ip_address(local_address),
+            port: local_port,
+        })
+    }
 }
