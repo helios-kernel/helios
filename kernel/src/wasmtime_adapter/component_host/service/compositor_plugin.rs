@@ -61,7 +61,7 @@ use crate::wasmtime_adapter::bindings::compositor::bindings::{CompositorHost, ex
 use crate::wasmtime_adapter::component_host::{guest_memory, view_trap};
 use crate::{DeviceClassRights, ProcessAuthority, ProviderReceiver, provider_channel};
 use thiserror::Error;
-use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceAny, ResourceTable};
+use wasmtime::component::{Accessor, ResourceAny, ResourceTable};
 
 /// Bootfs path of the plugin. Absent on a kernel image built without it,
 /// in which case `helios:system/surface` reports `unavailable`.
@@ -303,16 +303,20 @@ where
             let desktop = guest.desktop().call_constructor(accessor).await?;
             // The desktop itself, as a task of this store, so the calls
             // into it are not queued behind it.
-            accessor.spawn(RunDesktop {
-                guest: guest.clone(),
-                desktop,
-                _marker: core::marker::PhantomData,
+            let run_guest = guest.clone();
+            accessor.spawn(async move |accessor| {
+                run_desktop::<CpuImpl, Net, StorageImpl>(accessor, run_guest, desktop).await
             })?;
-            accessor.spawn(DrainReturnedSurfaces {
-                guest: guest.clone(),
-                desktop,
-                registry: serve_registry.clone(),
-                _marker: core::marker::PhantomData,
+            let drain_guest = guest.clone();
+            let drain_registry = serve_registry.clone();
+            accessor.spawn(async move |accessor| {
+                drain_returned_surfaces::<CpuImpl, Net, StorageImpl>(
+                    accessor,
+                    drain_guest,
+                    desktop,
+                    drain_registry,
+                )
+                .await
             })?;
             while let Some(request) = receiver.recv().await {
                 serve_request(
@@ -584,94 +588,62 @@ const fn from_guest_error(
     }
 }
 
-/// The store's type parameters, carried by a task that names them
-/// without holding a value of any of them.
-type StoreTypeMarker<CpuImpl, Net, StorageImpl> =
-    core::marker::PhantomData<fn() -> (CpuImpl, Net, StorageImpl)>;
-
 /// The desktop itself: one `helios:system/compositor.desktop.run` that lasts as
 /// long as the instance does.
-struct RunDesktop<CpuImpl, Net, StorageImpl> {
+async fn run_desktop<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: exports::helios::system::compositor::Guest,
     desktop: ResourceAny,
-    _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
-}
-
-impl<CpuImpl, Net, StorageImpl>
-    AccessorTask<
-        StoreData<CpuImpl, Net, StorageImpl>,
-        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-    > for RunDesktop<CpuImpl, Net, StorageImpl>
+) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn run(
-        self,
-        accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-    ) -> wasmtime::Result<()> {
-        let outcome = self
-            .guest
-            .desktop()
-            .call_run(accessor, self.desktop)
-            .await?;
-        // A compositor that returned is a desktop that stopped, whatever
-        // it says about why. Reporting it as an error is what ends the
-        // concurrent run and hands the supervisor its rebuild.
-        Err(match outcome {
-            Ok(()) => wasmtime::Error::msg("the compositor returned from run"),
-            Err(error) => wasmtime::Error::msg(alloc::format!(
-                "the compositor gave up the desktop: {:?}",
-                error
-            )),
-        })
-    }
+    let outcome = guest.desktop().call_run(accessor, desktop).await?;
+    // A compositor that returned is a desktop that stopped, whatever
+    // it says about why. Reporting it as an error is what ends the
+    // concurrent run and hands the supervisor its rebuild.
+    Err(match outcome {
+        Ok(()) => wasmtime::Error::msg("the compositor returned from run"),
+        Err(error) => wasmtime::Error::msg(alloc::format!(
+            "the compositor gave up the desktop: {:?}",
+            error
+        )),
+    })
 }
 
 /// The drain that takes back every window a client let go: the windows
 /// of a client that died, a window a client dropped, and a window whose
 /// `create` its client stopped waiting for.
-struct DrainReturnedSurfaces<CpuImpl, Net, StorageImpl> {
+async fn drain_returned_surfaces<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: exports::helios::system::compositor::Guest,
     desktop: ResourceAny,
     registry: SurfaceService,
-    _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
-}
-
-impl<CpuImpl, Net, StorageImpl>
-    AccessorTask<
-        StoreData<CpuImpl, Net, StorageImpl>,
-        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-    > for DrainReturnedSurfaces<CpuImpl, Net, StorageImpl>
+) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn run(
-        self,
-        accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-    ) -> wasmtime::Result<()> {
-        let registry = self.registry;
-        // Armed before the first look, and re-armed as part of every
-        // completed wait: windows handed back between a drain and a park
-        // are ones this task is owed.
-        let mut waiter = registry.returns_waiter();
-        loop {
-            for returned in registry.take_returned() {
-                // The view ends and the window goes off the desktop;
-                // the client's buffer goes back to its pool with the
-                // view's reference.
-                destroy_surface(accessor, &self.guest, self.desktop, returned.id()).await?;
-                // Only now does the window's slot come back. A failure
-                // above ends this task and drops the guards it still
-                // holds, which releases them the way the dead
-                // compositor's windows are.
-                returned.drained();
-            }
-            core::future::poll_fn(|cx| registry.poll_returns(cx, &mut waiter)).await;
+    // Armed before the first look, and re-armed as part of every
+    // completed wait: windows handed back between a drain and a park
+    // are ones this task is owed.
+    let mut waiter = registry.returns_waiter();
+    loop {
+        for returned in registry.take_returned() {
+            // The view ends and the window goes off the desktop;
+            // the client's buffer goes back to its pool with the
+            // view's reference.
+            destroy_surface(accessor, &guest, desktop, returned.id()).await?;
+            // Only now does the window's slot come back. A failure
+            // above ends this task and drops the guards it still
+            // holds, which releases them the way the dead
+            // compositor's windows are.
+            returned.drained();
         }
+        core::future::poll_fn(|cx| registry.poll_returns(cx, &mut waiter)).await;
     }
 }
 

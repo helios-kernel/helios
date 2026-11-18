@@ -1336,7 +1336,7 @@ where
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
         if this.pending.is_none() {
-            let capacity = destination.remaining(&mut store);
+            let capacity = destination.remaining(&mut store)?;
             if capacity == Some(0) {
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
@@ -1474,7 +1474,7 @@ where
                     if finish {
                         return Poll::Ready(Ok(StreamResult::Cancelled));
                     }
-                    let available = source.remaining().len();
+                    let available = source.remaining()?.len();
                     if available == 0 {
                         return Poll::Ready(Ok(StreamResult::Completed));
                     }
@@ -1539,7 +1539,7 @@ where
             };
             let len = staged.staged_len();
             let filled = {
-                let bytes = source.remaining();
+                let bytes = source.remaining()?;
                 let mut cursor = 0;
                 let filled = staged.fill(|_, destination| {
                     let end = cursor + destination.len();

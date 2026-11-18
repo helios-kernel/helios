@@ -108,13 +108,13 @@ where
                 .get_or_insert_with(|| writer.debug_serial_output_waiter());
             let mut source = source.as_direct(store);
             loop {
-                let bytes = source.remaining();
+                let bytes = source.remaining()?;
                 if bytes.is_empty() {
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
                 let written = sink.write(&cpu, &runtime, writer, bytes);
                 source.mark_read(written);
-                if source.remaining().is_empty() {
+                if source.remaining()?.is_empty() {
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
                 match writer.poll_debug_serial_output_ready(cx, wait) {
@@ -125,7 +125,7 @@ where
         }
 
         if self.pending.is_none() {
-            let available = source.remaining(&mut store);
+            let available = source.remaining(&mut store)?;
             if available == 0 {
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
@@ -337,7 +337,7 @@ impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
         _: bool,
     ) -> Poll<Result<StreamResult>> {
         if self.pending.is_none() {
-            let available = source.remaining(&mut store);
+            let available = source.remaining(&mut store)?;
             if available == 0 {
                 return Poll::Ready(Ok(StreamResult::Completed));
             }

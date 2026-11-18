@@ -30,7 +30,7 @@ use crate::wasmtime_adapter::wasi::WasiRequest;
 use crate::wasmtime_adapter::wasi::http::kernel_error_code;
 use crate::wasmtime_adapter::wasi::http_bindings::{HttpHost, exports};
 use crate::{HttpErrorCode, HttpExchange, ProcessAuthority, ProviderReceiver, provider_channel};
-use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceTable};
+use wasmtime::component::{Accessor, ResourceTable};
 
 /// Bootfs path of the plugin. Absent on a kernel image built without it, in
 /// which case `wasi:http/client` reports `configuration-error`.
@@ -218,91 +218,71 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    accessor.spawn(HandleExchange {
-        guest: guest.clone(),
-        exchange,
-        _marker: core::marker::PhantomData,
+    let guest = guest.clone();
+    accessor.spawn(async move |accessor| {
+        handle_exchange::<CpuImpl, Net, StorageImpl>(accessor, guest, exchange).await
     })?;
     Ok(())
 }
 
-/// The store's type parameters, carried by a task that names them without
-/// holding a value of any of them.
-type StoreTypeMarker<CpuImpl, Net, StorageImpl> =
-    core::marker::PhantomData<fn() -> (CpuImpl, Net, StorageImpl)>;
-
 /// One `wasi:http/handler.handle` call, start to finish.
-struct HandleExchange<CpuImpl, Net, StorageImpl> {
+async fn handle_exchange<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: exports::wasi::http::handler::Guest,
     exchange: HttpExchange,
-    _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
-}
-
-impl<CpuImpl, Net, StorageImpl>
-    AccessorTask<
-        StoreData<CpuImpl, Net, StorageImpl>,
-        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-    > for HandleExchange<CpuImpl, Net, StorageImpl>
+) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn run(
-        self,
-        accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-    ) -> wasmtime::Result<()> {
-        let Self {
-            guest, exchange, ..
-        } = self;
-        let HttpExchange {
-            head,
-            body,
-            response,
-        } = exchange;
+    let HttpExchange {
+        head,
+        body,
+        response,
+    } = exchange;
 
-        // Push the request into the plugin's own table. Its headers are
-        // already immutable, so the plugin reads the caller's request exactly
-        // as the caller built it.
-        let request =
-            accessor.with(|mut access| access.get().table.push(WasiRequest::from_host(head, body)));
-        let request = match request {
-            Ok(request) => request,
-            Err(error) => {
-                let _ = response.send(Err(internal_error(&error)));
-                return Err(error.into());
-            }
-        };
+    // Push the request into the plugin's own table. Its headers are
+    // already immutable, so the plugin reads the caller's request exactly
+    // as the caller built it.
+    let request =
+        accessor.with(|mut access| access.get().table.push(WasiRequest::from_host(head, body)));
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = response.send(Err(internal_error(&error)));
+            return Err(error.into());
+        }
+    };
 
-        match guest.call_handle(accessor, request).await {
-            Ok(Ok(produced)) => {
-                let converted = accessor.with(|mut access| {
-                    let produced = access.get().table.delete(produced)?;
-                    produced.into_host_response(&mut access)
-                });
-                match converted {
-                    Ok(http_response) => {
-                        let _ = response.send(Ok(http_response));
-                        Ok(())
-                    }
-                    Err(error) => {
-                        let _ = response.send(Err(internal_error(&error)));
-                        Err(error)
-                    }
+    match guest.call_handle(accessor, request).await {
+        Ok(Ok(produced)) => {
+            let converted = accessor.with(|mut access| {
+                let produced = access.get().table.delete(produced)?;
+                produced.into_host_response(&mut access)
+            });
+            match converted {
+                Ok(http_response) => {
+                    let _ = response.send(Ok(http_response));
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = response.send(Err(internal_error(&error)));
+                    Err(error)
                 }
             }
-            // The plugin reported a protocol-level failure; that is a normal
-            // answer, not a reason to rebuild the instance.
-            Ok(Err(code)) => {
-                let _ = response.send(Err(kernel_error_code(code)));
-                Ok(())
-            }
-            // A trap leaves the store unusable, so tell the caller and let the
-            // supervisor rebuild.
-            Err(trap) => {
-                let _ = response.send(Err(internal_error(&trap)));
-                Err(trap)
-            }
+        }
+        // The plugin reported a protocol-level failure; that is a normal
+        // answer, not a reason to rebuild the instance.
+        Ok(Err(code)) => {
+            let _ = response.send(Err(kernel_error_code(code)));
+            Ok(())
+        }
+        // A trap leaves the store unusable, so tell the caller and let the
+        // supervisor rebuild.
+        Err(trap) => {
+            let _ = response.send(Err(internal_error(&trap)));
+            Err(trap)
         }
     }
 }

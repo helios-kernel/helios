@@ -4195,7 +4195,7 @@ mod tests {
             maximum_pages: 1,
         };
         let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
-        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        let memory = SharedMemory::new(&engine, spec.memory_type().unwrap()).unwrap();
         let ptr = memory.data().as_ptr().cast::<u8>() as *mut u8;
         unsafe {
             ptr.write(0xa5);
@@ -4226,7 +4226,7 @@ mod tests {
             maximum_pages: 1,
         };
         let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
-        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        let memory = SharedMemory::new(&engine, spec.memory_type().unwrap()).unwrap();
         assert!(pool.reserve_for_recycle(spec, &memory));
         futures_lite::future::block_on(scrub_shared_memory(&memory));
         pool.finish_recycle(spec, memory);

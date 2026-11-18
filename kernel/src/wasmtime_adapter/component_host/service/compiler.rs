@@ -1074,8 +1074,11 @@ mod tests {
             );
             let registry = crate::InstanceRegistry::new();
             let instance = registry.register("compiler-plugin", 0);
-            let memory = SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1))
-                .expect("the engine enables shared memories");
+            let memory = SharedMemory::new(
+                &engine,
+                wasmtime::MemoryType::shared(1, 1).expect("1..=1 is a valid shared memory type"),
+            )
+            .expect("the engine enables shared memories");
             let shared = Arc::new(CompilerCoreShared {
                 memory,
                 entropy: Mutex::new(crate::EntropyPool::derive(runtime_state.root_entropy(), 0)),
