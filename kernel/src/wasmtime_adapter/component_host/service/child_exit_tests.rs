@@ -182,10 +182,29 @@ fn child_wait_reports_each_of_the_four_endings_distinctly() {
     assert_eq!(failed.kind, prog_wit::SpawnErrorKind::OutOfMemory);
 }
 
+struct CountingJoinWaker(core::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for CountingJoinWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
+type ChildExitSender = futures::channel::oneshot::Sender<Result<ChildExit, ProgramExecError>>;
+type Exec3Args = (u32, u32, u32, u32, u32, u32, i32, u32, u32);
+type Exec2Args = (u32, u32, u32, u32, u32, u32);
+
 struct WasixJoinHarness {
     store: wasmtime::Store<Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage>>,
     memory: SharedMemory,
     join: wasmtime::TypedFunc<(u32, u32, u32), i32>,
+    exec3: wasmtime::TypedFunc<Exec3Args, i32>,
+    exec2: wasmtime::TypedFunc<Exec2Args, ()>,
+    caller_probe: wasmtime::TypedFunc<u32, u32>,
 }
 
 impl WasixJoinHarness {
@@ -237,8 +256,8 @@ impl WasixJoinHarness {
             interrupts,
             instance,
             None,
-            Vec::new(),
-            Vec::new(),
+            alloc::vec!["/bin/parent".to_owned()],
+            alloc::vec![("INHERITED".to_owned(), "keep".to_owned())],
             ProcessAuthority::root(),
             OutputMode::Serial,
             |_, _| {},
@@ -269,11 +288,107 @@ impl WasixJoinHarness {
         .typed::<(u32, u32, u32), i32>(&store)
         .expect("proc_join signature matches");
 
+        // Simulates a WASIX guest frame calling `proc_exec3` and then
+        // continuing in the caller when `proc_exec3` returns an errno
+        // instead of unwinding into a replacement image.
+        let exec3 = wasmtime::Func::wrap_async(
+            &mut store,
+            |mut caller: Caller<
+                '_,
+                Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage>,
+            >,
+             (name, name_len, args, args_len, env, env_len, search_path, path, path_len): Exec3Args| {
+                Box::new(async move {
+                    let errno = wasix_proc_exec3(
+                        &mut caller,
+                        name,
+                        name_len,
+                        args,
+                        args_len,
+                        env,
+                        env_len,
+                        search_path,
+                        path,
+                        path_len,
+                    )
+                    .await?;
+                    if let Some(mem) = p1_async_memory(&mut caller) {
+                        let _ = mem.write_u32(GuestAddress::wasm32(256), 0xcafe_babe).await;
+                    }
+                    Ok(errno)
+                })
+            },
+        )
+        .typed::<Exec3Args, i32>(&store)
+        .expect("proc_exec3 signature matches");
+
+        let exec2 = wasmtime::Func::wrap_async(
+            &mut store,
+            |mut caller: Caller<
+                '_,
+                Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage>,
+            >,
+             (name, name_len, args, args_len, env, env_len): Exec2Args| {
+                Box::new(async move {
+                    wasix_proc_exec(
+                        &mut caller,
+                        name,
+                        name_len,
+                        args,
+                        args_len,
+                        Some((env, env_len)),
+                    )
+                    .await
+                })
+            },
+        )
+        .typed::<Exec2Args, ()>(&store)
+        .expect("proc_exec2 signature matches");
+
+        let caller_probe = wasmtime::Func::wrap(
+            &mut store,
+            |caller: Caller<
+                '_,
+                Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage>,
+            >,
+             step: u32|
+             -> u32 {
+                assert_eq!(caller.data().arguments, ["/bin/parent"]);
+                assert_eq!(
+                    caller.data().environment,
+                    [("INHERITED".to_owned(), "keep".to_owned())]
+                );
+                step + 1
+            },
+        )
+        .typed::<u32, u32>(&store)
+        .expect("caller_probe signature matches");
+
         Self {
             store,
             memory,
             join,
+            exec3,
+            exec2,
+            caller_probe,
         }
+    }
+
+    fn spawn_child(&mut self, pid: u32) -> ChildExitSender {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.store
+            .data_mut()
+            .insert_child(pid, WasixSignalState::new(), rx);
+        tx
+    }
+
+    fn finish_child(tx: ChildExitSender, pid: u32, termination: ChildTermination) {
+        tx.send(Ok(ChildExit {
+            instance_id: crate::InstanceId::from_raw(u64::from(pid)),
+            termination,
+            filesystem: None,
+        }))
+        .unwrap_or_else(|_| panic!("child {pid}'s exit receiver was dropped"));
     }
 
     fn write_guest(&self, offset: usize, bytes: &[u8]) {
@@ -290,7 +405,7 @@ impl WasixJoinHarness {
             .collect()
     }
 
-    fn call_join(&mut self, requested_pid: Option<u32>, flags: u32) -> (i32, Option<u32>, [u8; 6]) {
+    fn prepare_join_buffers(&self, requested_pid: Option<u32>) -> (u32, u32) {
         let pid_ptr = 16_u32;
         let status_ptr = 32_u32;
         self.write_guest(pid_ptr as usize, &[0_u8; 8]);
@@ -307,11 +422,10 @@ impl WasixJoinHarness {
                 self.write_guest(pid_ptr as usize, &[WASIX_OPTION_NONE]);
             }
         }
-        let errno = block_on(
-            self.join
-                .call_async(&mut self.store, (pid_ptr, flags, status_ptr)),
-        )
-        .expect("host proc_join call completes");
+        (pid_ptr, status_ptr)
+    }
+
+    fn decode_join_buffers(&self, pid_ptr: u32, status_ptr: u32) -> (Option<u32>, [u8; 6]) {
         let pid_bytes = self.read_guest(pid_ptr as usize, 8);
         let joined_pid = (pid_bytes[0] == WASIX_OPTION_SOME)
             .then(|| u32::from_le_bytes(pid_bytes[4..8].try_into().expect("four pid bytes")));
@@ -319,6 +433,17 @@ impl WasixJoinHarness {
             .read_guest(status_ptr as usize, 6)
             .try_into()
             .expect("six status bytes");
+        (joined_pid, status)
+    }
+
+    fn call_join(&mut self, requested_pid: Option<u32>, flags: u32) -> (i32, Option<u32>, [u8; 6]) {
+        let (pid_ptr, status_ptr) = self.prepare_join_buffers(requested_pid);
+        let errno = block_on(
+            self.join
+                .call_async(&mut self.store, (pid_ptr, flags, status_ptr)),
+        )
+        .expect("host proc_join call completes");
+        let (joined_pid, status) = self.decode_join_buffers(pid_ptr, status_ptr);
         (errno, joined_pid, status)
     }
 }
@@ -405,6 +530,283 @@ fn wasix_proc_join_produces_each_of_the_four_endings_from_the_shared_record() {
         assert_eq!(errno, p1::errno::NOMEM);
         assert!(harness.store.data().children.is_empty());
     }
+}
+
+/// `proc_join` with no pid under `WNOHANG` checks every child: when two
+/// children exist and the second exits first while the first stays running,
+/// `WNOHANG` reaps the second child immediately, reports `NOTHING` while
+/// only the running first child remains, and reaps the first once it exits.
+#[test]
+fn wnohang_any_child_join_reaps_second_child_while_first_stays_running() {
+    let mut harness = WasixJoinHarness::new();
+    let first = harness.spawn_child(10);
+    let second = harness.spawn_child(11);
+    WasixJoinHarness::finish_child(second, 11, ChildTermination::Exited(7));
+
+    let (errno, joined_pid, status) = harness.call_join(None, WASIX_JOIN_FLAG_NON_BLOCKING);
+    assert_eq!(errno, p1::errno::SUCCESS);
+    assert_eq!(joined_pid, Some(11));
+    assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_NORMAL);
+    assert_eq!(u16::from_le_bytes([status[2], status[3]]), 7);
+
+    let (errno, joined_pid, status) = harness.call_join(None, WASIX_JOIN_FLAG_NON_BLOCKING);
+    assert_eq!(errno, p1::errno::SUCCESS);
+    assert_eq!(joined_pid, None);
+    assert_eq!(status[0], WASIX_JOIN_STATUS_NOTHING);
+
+    WasixJoinHarness::finish_child(first, 10, ChildTermination::Exited(3));
+    let (errno, joined_pid, status) = harness.call_join(None, WASIX_JOIN_FLAG_NON_BLOCKING);
+    assert_eq!(errno, p1::errno::SUCCESS);
+    assert_eq!(joined_pid, Some(10));
+    assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_NORMAL);
+    assert_eq!(u16::from_le_bytes([status[2], status[3]]), 3);
+
+    let (errno, joined_pid, status) = harness.call_join(None, WASIX_JOIN_FLAG_NON_BLOCKING);
+    assert_eq!(errno, p1::errno::SUCCESS);
+    assert_eq!(joined_pid, None);
+    assert_eq!(status[0], WASIX_JOIN_STATUS_NOTHING);
+}
+
+/// A blocking `proc_join` with no pid registers its waker on every running
+/// child: when the second child exits while the first stays running, the
+/// parked join wakes immediately and reaps the second child without waiting
+/// on the first.
+#[test]
+fn blocking_any_child_join_waits_on_all_children_and_wakes_when_second_exits_first() {
+    let mut harness = WasixJoinHarness::new();
+    let first = harness.spawn_child(20);
+    let second = harness.spawn_child(21);
+
+    let (pid_ptr, status_ptr) = harness.prepare_join_buffers(None);
+    let wakes = Arc::new(CountingJoinWaker(core::sync::atomic::AtomicUsize::new(0)));
+    let waker = core::task::Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+
+    {
+        let mut join_fut = core::pin::pin!(
+            harness
+                .join
+                .call_async(&mut harness.store, (pid_ptr, 0, status_ptr))
+        );
+        assert!(
+            join_fut.as_mut().poll(&mut cx).is_pending(),
+            "both children are still running"
+        );
+        assert_eq!(wakes.0.load(AtomicOrdering::SeqCst), 0);
+
+        WasixJoinHarness::finish_child(second, 21, ChildTermination::Exited(9));
+        assert_eq!(
+            wakes.0.load(AtomicOrdering::SeqCst),
+            1,
+            "the second child's exit wakes the parked any-child join"
+        );
+
+        let Poll::Ready(Ok(errno)) = join_fut.as_mut().poll(&mut cx) else {
+            panic!("woken any-child join completes on next poll");
+        };
+        assert_eq!(errno, p1::errno::SUCCESS);
+    }
+
+    let (joined_pid, status) = harness.decode_join_buffers(pid_ptr, status_ptr);
+    assert_eq!(joined_pid, Some(21));
+    assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_NORMAL);
+    assert_eq!(u16::from_le_bytes([status[2], status[3]]), 9);
+    assert!(
+        harness.store.data().children.signal_target(20).is_some(),
+        "the first child remains running in the table"
+    );
+    assert!(harness.store.data().children.signal_target(21).is_none());
+
+    WasixJoinHarness::finish_child(first, 20, ChildTermination::Exited(4));
+    let (errno, joined_pid, status) = harness.call_join(None, 0);
+    assert_eq!(errno, p1::errno::SUCCESS);
+    assert_eq!(joined_pid, Some(20));
+    assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_NORMAL);
+    assert_eq!(u16::from_le_bytes([status[2], status[3]]), 4);
+}
+
+/// An any-child `proc_join` reports signaled and trapped children with
+/// `EXIT_SIGNAL` and failed launches or dropped channels as errnos; only a
+/// child's own exit yields `EXIT_NORMAL`.
+#[test]
+fn any_child_proc_join_reports_trapped_signaled_and_failed_launch_distinctly() {
+    let mut harness = WasixJoinHarness::new();
+
+    for flags in [0_u32, WASIX_JOIN_FLAG_NON_BLOCKING] {
+        let running = harness.spawn_child(30);
+        let signaled = harness.spawn_child(31);
+        WasixJoinHarness::finish_child(
+            signaled,
+            31,
+            ChildTermination::Signaled(SignalTermination {
+                signal: 15,
+                core_dumped: false,
+            }),
+        );
+        let (errno, joined_pid, status) = harness.call_join(None, flags);
+        assert_eq!(errno, p1::errno::SUCCESS);
+        assert_eq!(joined_pid, Some(31));
+        assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_SIGNAL);
+        assert_eq!(u16::from_le_bytes([status[2], status[3]]), 0);
+        assert_eq!(status[4], 15);
+
+        let trapped = harness.spawn_child(32);
+        WasixJoinHarness::finish_child(trapped, 32, ChildTermination::Trapped);
+        let (errno, joined_pid, status) = harness.call_join(None, flags);
+        assert_eq!(errno, p1::errno::SUCCESS);
+        assert_eq!(joined_pid, Some(32));
+        assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_SIGNAL);
+        assert_eq!(u16::from_le_bytes([status[2], status[3]]), 0);
+        assert_eq!(status[4], WASIX_SIGABRT);
+
+        let failed_launch = harness.spawn_child(33);
+        failed_launch
+            .send(Err(ProgramExecError {
+                kind: ProgramExecErrorKind::NotFound,
+                detail: ProgramExecErrorDetail::MissingArtifactPayload,
+            }))
+            .expect("receiver is alive");
+        let (errno, _joined_pid, status) = harness.call_join(None, flags);
+        assert_eq!(errno, p1::errno::NOENT);
+        assert_ne!(
+            status[0], WASIX_JOIN_STATUS_EXIT_NORMAL,
+            "a failed launch never writes EXIT_NORMAL"
+        );
+
+        let dropped = harness.spawn_child(34);
+        drop(dropped);
+        let (errno, _joined_pid, status) = harness.call_join(None, flags);
+        assert_eq!(errno, p1::errno::IO);
+        assert_ne!(status[0], WASIX_JOIN_STATUS_EXIT_NORMAL);
+
+        WasixJoinHarness::finish_child(running, 30, ChildTermination::Exited(0));
+        let (errno, joined_pid, status) = harness.call_join(None, flags);
+        assert_eq!(errno, p1::errno::SUCCESS);
+        assert_eq!(joined_pid, Some(30));
+        assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_NORMAL);
+        assert_eq!(u16::from_le_bytes([status[2], status[3]]), 0);
+        assert!(harness.store.data().children.is_empty());
+    }
+}
+
+/// `proc_exec3` with an out-of-bounds or non-UTF-8 environment fails with
+/// `EFAULT`, leaves no pending `WasixExecReplacement`, and returns to the
+/// caller so the caller keeps running; legacy `_Noreturn` `proc_exec2`
+/// likewise refuses the unreadable environment with `EFAULT` instead of
+/// proceeding with an empty environment.
+#[test]
+fn proc_exec_with_unreadable_environment_fails_with_efault_and_caller_keeps_running() {
+    let mut harness = WasixJoinHarness::new();
+
+    // Seed an executable file at `/prog.wasm` in the store's filesystem so
+    // path lookup and source read succeed whenever `proc_exec*` reaches them.
+    let ns = harness.store.data().filesystem.clone();
+    block_on(async {
+        let root_dir = FsDescriptor {
+            path: String::from("/"),
+            kind: FsNodeKind::Directory,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        let created = wasi_fs::open_at(
+            &ns,
+            root_dir.grant().expect("root directory grant"),
+            fs_types::PathFlags::empty(),
+            "prog.wasm",
+            fs_types::OpenFlags::CREATE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+            1,
+        )
+        .await
+        .expect("creates /prog.wasm");
+        wasi_fs::write(
+            &ns,
+            created.grant().expect("file write grant"),
+            helios_hal::fs::WritePosition::At(0),
+            b"\0asm\x01\0\0\0",
+            1,
+        )
+        .await
+        .expect("writes /prog.wasm");
+        read_program_source_from(&ns, &harness.store.data().authority, "/prog.wasm")
+            .await
+            .expect("/prog.wasm is readable as a program source");
+    });
+
+    let name = b"/prog.wasm";
+    let args = b"prog\n";
+    harness.write_guest(64, name);
+    harness.write_guest(96, args);
+    harness.write_guest(128, &[0xff, 0xfe, 0xff, 0xfe]);
+
+    let bad_envs: &[(u32, u32)] = &[
+        (65_530, 16),  // straddles the end of the 64 KiB linear memory
+        (65_536, 1),   // starts one byte past linear memory
+        (u32::MAX, 4), // u32 address wraparound
+        (128, 4),      // in-bounds invalid UTF-8
+    ];
+
+    for (step, &(env_ptr, env_len)) in bad_envs.iter().enumerate() {
+        harness.write_guest(256, &[0_u8; 4]);
+        let errno = block_on(harness.exec3.call_async(
+            &mut harness.store,
+            (
+                64,
+                name.len() as u32,
+                96,
+                args.len() as u32,
+                env_ptr,
+                env_len,
+                0,
+                0,
+                0,
+            ),
+        ))
+        .expect("proc_exec3 returns errno instead of trapping the caller");
+
+        assert_eq!(
+            errno,
+            p1::errno::FAULT,
+            "env=({env_ptr:#x}, {env_len}) must fail with EFAULT"
+        );
+        let witness = u32::from_le_bytes(
+            harness
+                .read_guest(256, 4)
+                .try_into()
+                .expect("four witness bytes"),
+        );
+        assert_eq!(
+            witness, 0xcafe_babe,
+            "caller frame must keep running after proc_exec3 returns EFAULT"
+        );
+        assert!(
+            harness.store.data_mut().take_exec_replacement().is_none(),
+            "failed proc_exec3 must never queue an exec replacement"
+        );
+        // Subsequent calls on the same store continue executing normally with
+        // the caller's original arguments and environment intact.
+        let next_step = block_on(
+            harness
+                .caller_probe
+                .call_async(&mut harness.store, step as u32),
+        )
+        .expect("caller store keeps running subsequent calls");
+        assert_eq!(next_step, step as u32 + 1);
+    }
+
+    // Legacy `_Noreturn` `proc_exec2` has no errno return slot in its wasm
+    // signature, so it unwinds with a `ProgramExecError` whose errno is
+    // `EFAULT` and queues no replacement.
+    let error = block_on(harness.exec2.call_async(
+        &mut harness.store,
+        (64, name.len() as u32, 96, args.len() as u32, 65_530, 16),
+    ))
+    .expect_err("proc_exec2 unwinds on out-of-bounds environment");
+    assert_eq!(p1_errno_from_wasmtime_error(&error), p1::errno::FAULT);
+    assert!(harness.store.data_mut().take_exec_replacement().is_none());
 }
 
 #[test]

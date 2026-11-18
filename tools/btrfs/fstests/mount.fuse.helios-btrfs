@@ -1,26 +1,55 @@
 #!/usr/bin/env bash
 # mount(8) helper for `mount -t fuse.helios-btrfs <device> <mountpoint>`.
 # Installed as /sbin/mount.fuse.helios-btrfs. Starts the fuse-btrfs daemon
-# named by HELIOS_FUSE_BTRFS detached, and returns once the mountpoint is
-# mounted or the daemon has failed.
+# named by HELIOS_FUSE_BTRFS detached, and returns once the daemon reports
+# its mount up, or fails with mount(8)'s exit codes once it exits without
+# doing so.
 #
 # Optional environment: HELIOS_FUSE_BTRFS_LOG, a file the daemon appends its
-# diagnostics to; HELIOS_FUSE_BTRFS_RUN_DIR, a directory that receives the
-# daemon's pid as <device basename>.pid.
+# diagnostics to.
 set -euo pipefail
 
-# Longest the daemon may take to mount, in seconds.
+# Longest the daemon may take to mount, or to release its device if killed on
+# timeout, in seconds.
 readonly mount_deadline=30
 
-fail() {
+# util-linux mount(8) exit codes (include/mount-api-utils.h).
+readonly MNT_EX_USAGE=1
+readonly MNT_EX_FAIL=32
+
+fail_usage() {
     echo "mount.fuse.helios-btrfs: $*" >&2
-    exit 1
+    exit "$MNT_EX_USAGE"
 }
 
-: "${HELIOS_FUSE_BTRFS:?set HELIOS_FUSE_BTRFS to the fuse-btrfs binary}"
+fail_mount() {
+    echo "mount.fuse.helios-btrfs: $*" >&2
+    exit "$MNT_EX_FAIL"
+}
 
-device=${1:?usage: mount.fuse.helios-btrfs <device> <mountpoint> [-o options]}
-mountpoint=${2:?usage: mount.fuse.helios-btrfs <device> <mountpoint> [-o options]}
+stop_timed_out_daemon() {
+    local pid=$1 device=$2
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    local deadline=$((SECONDS + 5))
+    while kill -0 "$pid" 2>/dev/null; do
+        if ((SECONDS >= deadline)); then
+            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+            break
+        fi
+        sleep 0.05
+    done
+    wait "$pid" 2>/dev/null || true
+    if [[ -b "$device" ]] && ! findmnt --noheadings --source "$device" >/dev/null 2>&1; then
+        flock --shared --timeout "$mount_deadline" "$device" true || true
+    fi
+}
+
+[[ -n "${HELIOS_FUSE_BTRFS:-}" ]] || fail_usage "set HELIOS_FUSE_BTRFS to the fuse-btrfs binary"
+[[ -x "$HELIOS_FUSE_BTRFS" ]] || fail_mount "$HELIOS_FUSE_BTRFS is not an executable"
+
+(($# >= 2)) || fail_usage "usage: mount.fuse.helios-btrfs <device> <mountpoint> [-o options]"
+device=$1
+mountpoint=$2
 shift 2
 
 # The arguments mount(8) adds to a helper: -o options, and the flags for
@@ -28,26 +57,59 @@ shift 2
 options=()
 while (($#)); do
     case "$1" in
-        -o) options=(-o "${2:?-o needs its options}"); shift 2 ;;
-        -t) shift 2 ;;
+        -o)
+            (($# >= 2)) || fail_usage "-o needs its options"
+            options=(-o "$2")
+            shift 2
+            ;;
+        -t)
+            (($# >= 2)) || fail_usage "-t needs its type"
+            shift 2
+            ;;
         -n | -s | -v | -f) shift ;;
-        *) fail "unexpected argument $1" ;;
+        *) fail_usage "unexpected argument $1" ;;
     esac
 done
 
-setsid "$HELIOS_FUSE_BTRFS" "$device" "$mountpoint" "${options[@]}" \
-    >>"${HELIOS_FUSE_BTRFS_LOG:-/dev/null}" 2>&1 </dev/null &
-pid=$!
-if [[ -n "${HELIOS_FUSE_BTRFS_RUN_DIR:-}" ]]; then
-    echo "$pid" >"$HELIOS_FUSE_BTRFS_RUN_DIR/$(basename "$device").pid"
+# The daemon writes one line to stdout before closing it: `mounted` once its
+# mount serves, or `failed <code> <message>` if startup failed before then.
+# Detached into its own session, and into system.slice when systemd runs so
+# fstests' per-test transient scope teardown (`systemctl stop`) does not kill
+# a live mount's daemon before unmount commits.
+cmd=("$HELIOS_FUSE_BTRFS" "$device" "$mountpoint" "${options[@]}")
+if [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null; then
+    exec {ready}< <(exec setsid systemd-run --quiet --collect --scope --slice=system.slice -- \
+        "${cmd[@]}" 2>>"${HELIOS_FUSE_BTRFS_LOG:-/dev/null}" </dev/null)
+else
+    exec {ready}< <(exec setsid "${cmd[@]}" \
+        2>>"${HELIOS_FUSE_BTRFS_LOG:-/dev/null}" </dev/null)
 fi
+pid=$!
 
-deadline=$((SECONDS + mount_deadline))
-until mountpoint -q "$mountpoint"; do
-    kill -0 "$pid" 2>/dev/null || fail "fuse-btrfs exited before mounting $device on $mountpoint"
-    if ((SECONDS >= deadline)); then
-        kill "$pid"
-        fail "fuse-btrfs did not mount $device on $mountpoint within ${mount_deadline}s"
-    fi
-    sleep 0.1
-done
+status=
+read_status=0
+IFS= read -r -t "$mount_deadline" -u "$ready" status || read_status=$?
+exec {ready}<&-
+
+case "$read_status" in
+    0)
+        if [[ "$status" == mounted ]]; then
+            exit 0
+        fi
+        if [[ "$status" =~ ^failed\ ([0-9]+)\ (.*)$ ]]; then
+            wait "$pid" 2>/dev/null || true
+            echo "${BASH_REMATCH[2]}" >&2
+            exit "${BASH_REMATCH[1]}"
+        fi
+        stop_timed_out_daemon "$pid" "$device"
+        fail_mount "fuse-btrfs reported '$status' instead of mounting $device on $mountpoint"
+        ;;
+    1)
+        wait "$pid" 2>/dev/null || true
+        fail_mount "fuse-btrfs exited before mounting $device on $mountpoint"
+        ;;
+    *)
+        stop_timed_out_daemon "$pid" "$device"
+        fail_mount "fuse-btrfs did not mount $device on $mountpoint within ${mount_deadline}s"
+        ;;
+esac

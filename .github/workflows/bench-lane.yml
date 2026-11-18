@@ -112,13 +112,14 @@ jobs:
           ref: ${{ inputs.ref || (github.event_name == 'schedule' && 'dev') || github.ref }}
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            qemu-system-x86 ovmf \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build
+            qemu-system-x86 ovmf
             iproute2 nftables dnsmasq-base
+      - name: Grant KVM access
+        run: |
           # GitHub's x86-64 runners expose /dev/kvm; the inspector picks
           # the accelerator by capability, this only fixes permissions.
           if [ -e /dev/kvm ]; then
