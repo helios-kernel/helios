@@ -499,6 +499,10 @@ does.
 
 ## 6. WASI tooling
 
+- WASI 0.3 is the kernel's first-class ABI. Programs, tools and host
+  interfaces use 0.3 wherever it covers the need. Preview 1 and WASIX
+  are supported for programs built against them; Preview 2 is not a
+  supported ABI.
 - `tools/wasi-apps/build.sh` is the single entry point that stages the WASI
   shared-fs tooling: it downloads the official CPython WASI build into
   `artifacts/python3-root/` (`python3.wasm` plus the standard library) and

@@ -955,66 +955,6 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a;
 
-    /// Drains up to `max_bytes` of what `stream`'s receive queue already
-    /// holds, without parking and without driving the device.
-    ///
-    /// This is the non-blocking `read` of a socket-backed byte stream: it
-    /// runs on the guest task's own poll, so the only bytes it may report
-    /// are the ones already delivered to the shard — anything still in
-    /// the device's rings belongs to the readiness wait that follows a
-    /// `Pending` answer. A drain that relieves receive backpressure
-    /// raises the shard's arrival signal itself.
-    fn tcp_try_read(
-        &self,
-        stream: Self::TcpStream,
-        max_bytes: usize,
-    ) -> Result<TcpReadProgress, TcpError>;
-
-    /// What `stream`'s send side does with a write right now — the
-    /// permit a stream reports.
-    ///
-    /// `Room` is the byte count a `write` may queue without parking,
-    /// `Pending` is a full send queue on a live connection, and `Closed`
-    /// is a connection that cannot send again — so a caller parking on
-    /// the answer does not sleep through a shutdown.
-    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError>;
-
-    /// Queues up to `bytes.len()` on `stream`'s send path and publishes
-    /// it synchronously: the stack's segment production, the egress drain
-    /// onto the rings and the doorbell all run on the caller's own poll.
-    /// `Room` is the count `bytes` gave up; whatever did not fit stays
-    /// in `bytes` for the caller to park or complete later. `Pending`
-    /// and `Closed` are a queue that took nothing, classified under the
-    /// same lock that ran the write: a full send queue on a live
-    /// connection, or a send side that cannot send again — so the one
-    /// call answers what a separate probe would take a second lock to
-    /// say.
-    ///
-    /// Synchronous because a guest stream's `write` may not block:
-    /// everything it touches — the shard lock, the ring's `try_lock`
-    /// submit — is held for the call and released before it returns.
-    fn tcp_try_write(
-        &self,
-        stream: Self::TcpStream,
-        bytes: &mut Bytes,
-    ) -> Result<TcpWriteProgress, TcpError>;
-
-    /// Resolves when `stream`'s send queue has room, when the send side
-    /// can no longer send, or when the stream is gone — a socket-backed
-    /// output stream's readiness wait.
-    ///
-    /// A dead send side resolves the wait rather than failing it: the
-    /// pollable contract is that a closed stream is ready, and the
-    /// accessor that follows reports the state. The implementation
-    /// samples the owning shard's arrival mark and the queue pair's
-    /// event mark before it probes the send queue, so an ACK — or a
-    /// reset — another processor drains between the probe and the park
-    /// resolves the wait rather than being slept through.
-    fn tcp_write_ready(
-        &self,
-        stream: Self::TcpStream,
-    ) -> impl Future<Output = Result<(), TcpError>> + Send + '_;
-
     /// Waits up to `timeout_nanos` for `stream` to have received bytes
     /// and copies them out of its receive queue straight into `buffer`.
     ///

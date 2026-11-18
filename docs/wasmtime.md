@@ -5,13 +5,23 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/caller-memory`):
+The local checkout must be at (branch `helios/realloc-task-context`):
 
 ```text
-5048e15b9626f0382e9a5df653668a0d44b017ed
+a5decfb590ab82212c6946f8b13de9cf7004da2c
 ```
 
-`helios/caller-memory` is `helios/register-component-hosts` at
+`helios/realloc-task-context` is `helios/caller-memory` at
+`5048e15b9626f0382e9a5df653668a0d44b017ed` plus upstream
+bytecodealliance/wasmtime#13949 (`fb8c7616d6`), which zeros the
+`VMStoreContext` component-context slots before invoking a canonical-ABI
+`realloc` callback and restores the caller's slots afterwards, as
+`wasm32-wasip3`'s `wasi-libc` `__wasilibc_task_hook` requires
+(WebAssembly/component-model#680).
+
+The revision it replaces is `helios/caller-memory` at
+`5048e15b9626f0382e9a5df653668a0d44b017ed`, which is
+`helios/register-component-hosts` at
 `e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e` plus one additive commit, which
 tells a host function the linear memory of the call it is serving:
 

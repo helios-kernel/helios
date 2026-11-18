@@ -7,7 +7,7 @@ description = "Tight loop over wasi:clocks/monotonic-clock.now, the cheapest hos
 [dependencies]
 helios-bench-metrics = { path = "../bench-metrics" }
 thiserror = "2.0.17"
-wasi = "0.14.2"
+wit-bindgen = { version = "0.61.1", default-features = false, features = ["async", "macros"] }
 
 [[bin]]
 name = "helios_hostcall_loop_wasi"

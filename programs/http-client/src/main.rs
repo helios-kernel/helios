@@ -113,6 +113,9 @@ async fn exchange(
     scheme: Scheme,
     outcome: &BodyOutcome,
 ) -> Result<types::Response, ErrorCode> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls_pure::provider().install_default();
+    }
     // No proxy: a guest reaches the network directly.
     let mut transport = Transport::builder().proxy(Proxy::none());
     if matches!(scheme, Scheme::Https) {

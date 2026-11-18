@@ -178,6 +178,7 @@ inherits = "kernel-release"
 # ring it shares with the host; the fork guards the type under a lock.
 # The generator's crates come from one source, or their types disagree.
 [patch.crates-io]
+executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "main" }
 wit-bindgen = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
 wit-bindgen-core = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
 wit-bindgen-rust = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }

@@ -4,7 +4,7 @@
 //! The generated Rust types carry `size_of`, `align_of` and `offset_of`
 //! assertions for 4- and 8-byte pointers, computed by `venus-gen`'s layout
 //! model; they are evaluated for whichever width the crate is built for
-//! (`wasm32-wasip2` builds check the 4-byte ones). This test closes the loop
+//! (`wasm32-wasip3` builds check the 4-byte ones). This test closes the loop
 //! on every host: it renders the same numbers as C `_Static_assert`s over the
 //! pinned `vulkan.h` and has `clang` check them for a wasm32 target and for
 //! the host, so the model equals the C ABI of both. Together they show the

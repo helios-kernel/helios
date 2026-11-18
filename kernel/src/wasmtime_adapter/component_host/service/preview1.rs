@@ -2433,17 +2433,13 @@ where
     StorageImpl: crate::Storage,
 {
     let stat = GuestAddress::wasm32(stat);
-    if matches!(
-        caller.data().descriptors.get(fd),
-        Some(Preview1Descriptor::NullDevice)
-    ) {
-        return p1_write_filestat(
-            caller,
-            stat,
-            p1_null_device_identity(),
-            p1_null_device_stat(),
-        )
-        .await;
+    if let Some((identity, stat_value)) = caller
+        .data()
+        .descriptors
+        .get(fd)
+        .and_then(p1_synthetic_descriptor_stat)
+    {
+        return p1_write_filestat(caller, stat, identity, stat_value).await;
     }
     let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
     else {
@@ -2908,8 +2904,12 @@ const P1_DIRENT_BYTES: usize = 24;
 
 /// The `dirent` records of `entries` from `cookie` on, each header followed
 /// by its name, cut off at `buf_len` bytes: what `fd_readdir` copies to the
-/// guest's buffer. A name the buffer cannot hold whole is cut, which ends
-/// the listing.
+/// guest's buffer.
+///
+/// Preview 1 callers (`wasi-libc` `readdir`) read `bufused < buf_len` as
+/// end-of-directory, so whenever another entry exists the remaining bytes of
+/// `buf` must be filled, truncating the `dirent` header itself when fewer than
+/// `P1_DIRENT_BYTES` remain.
 pub(super) fn p1_fd_readdir_records(
     entries: &[fs_types::DirectoryEntry],
     buf_len: u32,
@@ -2925,16 +2925,18 @@ pub(super) fn p1_fd_readdir_records(
         }
         let next = u64::try_from(index + 1).map_err(|_| p1::errno::OVERFLOW)?;
         let name = entry.name.as_bytes();
-        if capacity - used < P1_DIRENT_BYTES {
+        // The header is `d_next`, `d_ino`, `d_namlen`, `d_type` and 3 padding bytes.
+        let mut header = [0_u8; P1_DIRENT_BYTES];
+        header[0..8].copy_from_slice(&next.to_le_bytes());
+        header[8..16].copy_from_slice(&next.to_le_bytes());
+        header[16..20]
+            .copy_from_slice(&u32::try_from(name.len()).unwrap_or(u32::MAX).to_le_bytes());
+        header[20] = p1_filetype_from_descriptor_type(entry.type_.clone());
+        let header_copied = (capacity - used).min(P1_DIRENT_BYTES);
+        records.extend_from_slice(&header[..header_copied]);
+        if header_copied < P1_DIRENT_BYTES {
             break;
         }
-        // The header is `d_next`, `d_ino`, `d_namlen` and `d_type`.
-        records.extend_from_slice(&next.to_le_bytes());
-        records.extend_from_slice(&next.to_le_bytes());
-        records.extend_from_slice(&u32::try_from(name.len()).unwrap_or(u32::MAX).to_le_bytes());
-        records.push(p1_filetype_from_descriptor_type(entry.type_.clone()));
-        // Bytes 21..24 are padding.
-        records.resize(used + P1_DIRENT_BYTES, 0);
         let copied = (capacity - records.len()).min(name.len());
         records.extend_from_slice(&name[..copied]);
         if copied < name.len() {
@@ -6594,5 +6596,35 @@ mod tests {
             Err(P1Stop::Trap(crate::memory::SwapFaultError::Backend))
         );
         assert!(p1_reply(stop).is_err(), "the guest traps");
+    }
+
+    #[test]
+    fn readdir_truncates_trailing_header_so_partial_buffer_never_signals_eof_early() {
+        let entries = [
+            fs_types::DirectoryEntry {
+                type_: fs_types::DescriptorType::RegularFile,
+                name: "alpha".into(),
+            },
+            fs_types::DirectoryEntry {
+                type_: fs_types::DescriptorType::RegularFile,
+                name: "utf_8.py".into(),
+            },
+        ];
+        // `"alpha"` takes 24 + 5 = 29 bytes, leaving 7 bytes (< P1_DIRENT_BYTES)
+        // in a 36-byte buffer. Preview 1 `readdir` treats `bufused < buf_len` as
+        // end-of-directory, so those 7 bytes must hold the prefix of the next
+        // header rather than leaving `buf` short.
+        let first = p1_fd_readdir_records(&entries, 36, 0).expect("first readdir pass");
+        assert_eq!(first.len(), 36);
+        assert_eq!(u64::from_le_bytes(first[0..8].try_into().unwrap()), 1);
+        assert_eq!(&first[24..29], b"alpha");
+        assert_eq!(&first[29..36], &2_u64.to_le_bytes()[..7]);
+
+        // Resuming from the last complete entry's `d_next` (1) yields the full
+        // second entry and `bufused < buf_len` (32 < 36) to signal true EOF.
+        let second = p1_fd_readdir_records(&entries, 36, 1).expect("second readdir pass");
+        assert_eq!(second.len(), 32);
+        assert_eq!(u64::from_le_bytes(second[0..8].try_into().unwrap()), 2);
+        assert_eq!(&second[24..32], b"utf_8.py");
     }
 }

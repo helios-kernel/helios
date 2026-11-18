@@ -1,11 +1,6 @@
-use alloc::boxed::Box;
 use core::convert::Infallible;
-use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 use pin_project_lite::pin_project;
-
-use wasmtime_wasi_io::poll::Pollable;
-use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError};
 
 use crate::{ComponentHostNetwork, NetworkHandle, RetiredNetworkHandle, SocketRetirementSender};
 
@@ -26,44 +21,6 @@ pub(crate) fn wasi_tcp_bind_rights(local_port: u16) -> crate::NetworkAuthorityRi
     crate::NetworkAuthorityRights::TCP.bind_rights(local_port)
 }
 
-pub struct P2Network;
-
-/// Every address a lookup resolved, in both families, or why it failed.
-///
-/// `wasi:sockets` `resolve-address-stream` promises no ordering, so the
-/// resolver's own answer order is preserved.
-type P2Resolution = core::result::Result<Vec<crate::NetworkIpAddress>, crate::DnsError>;
-
-/// The `wasi:sockets` `resolve-address-stream` of one lookup.
-///
-/// The stream owns its state outright, in the resource table. The task
-/// that runs the lookup holds the other end of a oneshot
-/// ([`P2ResolveCompletion`]) and hands the answer back through it; the
-/// stream takes the answer the first time it is asked for it.
-pub struct P2ResolveAddressStream {
-    state: P2ResolveState,
-}
-
-enum P2ResolveState {
-    /// The lookup task has not answered yet.
-    Pending(oneshot::Receiver<P2Resolution>),
-    Resolved {
-        resolution: P2Resolution,
-        cursor: usize,
-    },
-}
-
-/// The lookup task's end of a [`P2ResolveAddressStream`].
-pub(crate) struct P2ResolveCompletion(oneshot::Sender<P2Resolution>);
-
-impl P2ResolveCompletion {
-    /// Hands the lookup's answer to the stream. A stream the guest
-    /// already dropped has no one to read it.
-    pub(crate) fn complete(self, resolution: P2Resolution) {
-        let _ = self.0.send(resolution);
-    }
-}
-
 /// A kernel network handle a `wasi:sockets` socket owns: dropping it
 /// queues the handle's close.
 ///
@@ -81,7 +38,7 @@ impl P2ResolveCompletion {
 /// the moment the network service returns it: the connected stream
 /// (#184), the listener (#191), a connection a background accept
 /// produced before anyone adopted it (#225), a datagram socket (#190)
-/// and its unfinished p2 bind. A background task whose socket died in
+/// and its unfinished bind. A background task whose socket died in
 /// the meantime cannot deliver its answer, and dropping the answer
 /// retires what it carried.
 ///
@@ -123,42 +80,24 @@ impl Drop for OwnedNetworkHandle {
 ///
 /// # Ownership and concurrency
 ///
-/// The socket holds one reference, and every stream over the
-/// connection holds another: the two p2 `wasi:io` streams, and the p3
-/// `send` and `receive` streams, which the guest may keep using after
-/// it dropped the socket resource. The kernel stream is retired when
-/// the last reference goes.
-///
-/// Everything is fixed at construction except the two shutdown flags,
-/// which the socket's `shutdown` sets and the streams read, from
-/// whichever processor the guest's task is running on. Each is an
-/// independent boolean that publishes no other memory, so `Relaxed`
-/// is the whole of the ordering it needs.
+/// The socket holds one reference, and the `send` and `receive`
+/// streams over the connection each hold another: the guest may keep
+/// using them after it dropped the socket resource. The kernel stream
+/// is retired when the last reference goes. Nothing in it changes after
+/// construction.
 pub(super) struct TcpConnection {
     stream: OwnedNetworkHandle,
-    receive_shutdown: AtomicBool,
-    send_shutdown: AtomicBool,
 }
 
 impl TcpConnection {
     pub(super) fn new(retire: SocketRetirementSender, stream: u64) -> Self {
         Self {
             stream: OwnedNetworkHandle::new(retire, RetiredNetworkHandle::TcpStream(stream)),
-            receive_shutdown: AtomicBool::new(false),
-            send_shutdown: AtomicBool::new(false),
         }
     }
 
     pub(super) fn stream(&self) -> u64 {
         self.stream.raw()
-    }
-
-    pub(super) fn receive_shutdown(&self) -> bool {
-        self.receive_shutdown.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn send_shutdown(&self) -> bool {
-        self.send_shutdown.load(Ordering::Relaxed)
     }
 }
 
@@ -294,50 +233,24 @@ fn in_flight(marker: &mut Option<InFlight>) -> bool {
     marker.as_mut().is_some_and(InFlight::is_live)
 }
 
-/// A p2 `start-connect`'s task, and where it was asked to connect.
-pub(super) struct PendingConnect {
-    pub(super) answer: TcpAnswer<TcpConnection>,
-    pub(super) remote_address: WasiTcpSocketAddress,
-}
-
-/// When the socket takes in the listener a listen task opened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ListenAdoption {
-    /// p2: the answer waits for `finish-listen`, which reports a failure.
-    Finish,
-    /// p3: a listener is adopted on arrival; the listen stream, which
-    /// has its own copy of the answer, reports a failure.
-    Arrival,
-}
-
-/// A listen task's answer and how the socket takes it in.
-pub(super) struct PendingListen {
-    pub(super) answer: TcpAnswer<Arc<OwnedTcpListener>>,
-    pub(super) adoption: ListenAdoption,
-}
-
 /// A `wasi:sockets` TCP socket.
 ///
 /// # Ownership and concurrency
 ///
 /// The socket has one owner, its resource-table entry; nothing clones
 /// it and nothing locks it. A host call borrows it from the table for
-/// a synchronous stretch. A p2 call, which holds the store across its
-/// awaits, may keep the borrow through them; a p3 call, which yields
-/// the store while it awaits, gives the socket back first and fetches
-/// it again to apply what the await produced.
+/// a synchronous stretch. A call that awaits yields the store, so it
+/// gives the socket back first and fetches it again to apply what the
+/// await produced.
 ///
 /// What has to outlive a borrow is split off into objects of its own
 /// that hold no lock: the [`TcpConnection`] the streams share and the
-/// [`OwnedTcpListener`] the accept tasks and the p3 listen stream
-/// share.
+/// [`OwnedTcpListener`] the accept tasks and the listen stream share.
 ///
-/// Background tasks never reach the socket. A p2 connect, listen or
-/// accept, and a p3 listen, runs on a detached task that hands its
-/// answer back through a oneshot the socket keeps (`pending_*`). Every
-/// accessor that reads state those answers change settles them first,
-/// on the calling task; the p2 pollable parks on the same receivers.
-/// The p3 listen stream keeps its own accept answers.
+/// A listen runs on a detached task that hands its answer back through
+/// a oneshot the socket keeps (`pending_listen`). Every accessor that
+/// reads state that answer changes settles it first, on the calling
+/// task. The listen stream keeps its own accept answers.
 pub struct TcpSocket {
     /// Where the handles this socket comes to own go when they die.
     pub(super) retire: SocketRetirementSender,
@@ -346,19 +259,13 @@ pub struct TcpSocket {
     pub(super) listener: Option<Arc<OwnedTcpListener>>,
     pub(super) local_address: Option<WasiTcpSocketAddress>,
     pub(super) remote_address: Option<WasiTcpSocketAddress>,
-    pub(super) pending_connect: Option<PendingConnect>,
-    /// A p2 connect's answer, waiting for `finish-connect`.
-    pub(super) connect_result: Option<core::result::Result<Arc<TcpConnection>, crate::TcpError>>,
     /// A p3 `connect` under way.
     pub(super) p3_connect: Option<InFlight>,
-    pub(super) pending_listen: Option<PendingListen>,
-    /// A p2 listen's answer, waiting for `finish-listen`.
-    pub(super) listen_result: Option<core::result::Result<Arc<OwnedTcpListener>, crate::TcpError>>,
+    /// A `listen`'s answer, which the socket takes in on arrival; the
+    /// listen stream, which has its own copy of the answer, reports a
+    /// failure.
+    pub(super) pending_listen: Option<TcpAnswer<Arc<OwnedTcpListener>>>,
     pub(super) listen_backlog: u16,
-    pub(super) pending_accept: Option<TcpAnswer<AcceptedConnection>>,
-    /// A p2 accept's answer, waiting for the next `accept` to turn it
-    /// into a guest resource.
-    pub(super) accept_result: Option<core::result::Result<AcceptedConnection, crate::TcpError>>,
     pub(super) keep_alive_enabled: bool,
     pub(super) keep_alive_idle_time: u64,
     pub(super) keep_alive_interval: u64,
@@ -464,14 +371,14 @@ pub(super) struct ListenRequest {
 }
 
 /// Opens a listener on a detached task and answers through the
-/// returned receiver, and through `stream` as well when a p3 listen
-/// stream waits for the same listener.
+/// returned receiver, and through `stream` as well: the listen stream
+/// waits for the same listener.
 pub(super) fn spawn_listen<CpuImpl, Net>(
     spawner: &crate::InstanceSpawner<CpuImpl>,
     service: Net,
     retire: SocketRetirementSender,
     request: ListenRequest,
-    stream: Option<oneshot::Sender<core::result::Result<Arc<OwnedTcpListener>, crate::TcpError>>>,
+    stream: oneshot::Sender<core::result::Result<Arc<OwnedTcpListener>, crate::TcpError>>,
 ) -> core::result::Result<TcpAnswer<Arc<OwnedTcpListener>>, crate::TaskCapacityError>
 where
     CpuImpl: Cpu + Clone,
@@ -496,9 +403,7 @@ where
                     },
                 ))
             });
-        if let Some(stream) = stream {
-            let _ = stream.send(result.clone());
-        }
+        let _ = stream.send(result.clone());
         let _ = answer.send(result);
     });
     if let Err(error) = spawned {
@@ -528,9 +433,6 @@ pub(super) async fn read_socket<Net: ComponentHostNetwork>(
     let Some(connection) = connection else {
         return Err(socket_types::ErrorCode::InvalidState);
     };
-    if connection.receive_shutdown() {
-        return Ok(None);
-    }
     service
         .tcp_read(
             NetworkHandle::from_raw(connection.stream()),
@@ -554,9 +456,6 @@ pub(super) async fn write_socket<Net: ComponentHostNetwork>(
     let Some(connection) = connection else {
         return Err(socket_types::ErrorCode::InvalidState);
     };
-    if connection.send_shutdown() {
-        return Err(socket_types::ErrorCode::InvalidState);
-    }
     service
         .tcp_write_all_bytes(
             NetworkHandle::from_raw(connection.stream()),
@@ -751,84 +650,6 @@ impl WasiTcpIpAddress {
     }
 }
 
-impl P2ResolveAddressStream {
-    /// A stream whose lookup has not answered yet, and the end the
-    /// lookup task answers through.
-    pub(crate) fn pending() -> (Self, P2ResolveCompletion) {
-        let (sender, receiver) = oneshot::channel();
-        (
-            Self {
-                state: P2ResolveState::Pending(receiver),
-            },
-            P2ResolveCompletion(sender),
-        )
-    }
-
-    /// Takes the lookup's answer in, if it has arrived, and says whether
-    /// the stream holds one.
-    pub(crate) fn is_ready(&mut self) -> bool {
-        if let P2ResolveState::Pending(receiver) = &mut self.state {
-            match receiver.try_recv() {
-                Ok(Some(resolution)) => self.settle(Ok(resolution)),
-                Ok(None) => return false,
-                Err(canceled) => self.settle(Err(canceled)),
-            }
-        }
-        true
-    }
-
-    /// Resolves once the lookup has answered.
-    ///
-    /// Cancel-safe: the answer stays in the oneshot until it is taken.
-    pub(crate) async fn wait_ready(&mut self) {
-        if let P2ResolveState::Pending(receiver) = &mut self.state {
-            let answer = receiver.await;
-            self.settle(answer);
-        }
-    }
-
-    fn settle(&mut self, answer: core::result::Result<P2Resolution, oneshot::Canceled>) {
-        let resolution = answer.unwrap_or_else(|oneshot::Canceled| {
-            // The lookup task owns the only sender and answers before it
-            // ends; a task that was dropped unanswered means the instance
-            // is being torn down around this stream.
-            debug_assert!(false, "a dns lookup task ended without answering");
-            tracing::error!(
-                target: "helios_kernel::program",
-                "a dns lookup task ended without answering its resolve stream"
-            );
-            Err(crate::DnsError {
-                kind: crate::DnsErrorKind::Unavailable,
-                detail: crate::NetworkErrorDetail::DnsLookupFailed,
-            })
-        });
-        self.state = P2ResolveState::Resolved {
-            resolution,
-            cursor: 0,
-        };
-    }
-
-    pub(crate) fn next_address(
-        &mut self,
-    ) -> core::result::Result<Option<crate::NetworkIpAddress>, crate::DnsError> {
-        if !self.is_ready() {
-            return Err(crate::DnsError {
-                kind: crate::DnsErrorKind::Unavailable,
-                detail: crate::NetworkErrorDetail::DnsResultNotReady,
-            });
-        }
-        let P2ResolveState::Resolved { resolution, cursor } = &mut self.state else {
-            unreachable!("is_ready settled the stream");
-        };
-        let addresses = resolution.as_ref().map_err(Clone::clone)?;
-        let address = addresses.get(*cursor).copied();
-        if address.is_some() {
-            *cursor += 1;
-        }
-        Ok(address)
-    }
-}
-
 impl TcpSocket {
     pub(super) fn new(retire: SocketRetirementSender, family: WasiTcpSocketFamily) -> Self {
         Self {
@@ -838,14 +659,9 @@ impl TcpSocket {
             listener: None,
             local_address: None,
             remote_address: None,
-            pending_connect: None,
-            connect_result: None,
             p3_connect: None,
             pending_listen: None,
-            listen_result: None,
             listen_backlog: DEFAULT_WASI_TCP_LISTEN_BACKLOG,
-            pending_accept: None,
-            accept_result: None,
             keep_alive_enabled: false,
             keep_alive_idle_time: DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS,
             keep_alive_interval: DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
@@ -871,58 +687,19 @@ impl TcpSocket {
         (socket, connection)
     }
 
-    /// Takes in every background answer that has already arrived.
-    pub(super) fn settle(&mut self) {
-        let _ = self.poll_settled(&mut Context::from_waker(Waker::noop()));
-    }
-
-    /// Takes in every background answer that has arrived, and resolves
-    /// once no background operation is left in flight.
+    /// Takes in the listen answer if it has already arrived.
     ///
-    /// Polling a receiver registers `cx` before it reports the answer
-    /// missing, so an answer that lands after this returns `Pending`
-    /// wakes the task (§4's arm-before-test). A receiver that answered
-    /// leaves its slot, so each answer is taken in exactly once.
-    pub(super) fn poll_settled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let Some(pending) = &mut self.pending_connect
-            && let Poll::Ready(answer) = poll_answer(&mut pending.answer, cx, "connect")
+    /// A receiver that answered leaves its slot, so the answer is taken
+    /// in exactly once.
+    pub(super) fn settle(&mut self) {
+        if let Some(answer) = &mut self.pending_listen
+            && let Poll::Ready(answer) =
+                poll_answer(answer, &mut Context::from_waker(Waker::noop()), "listen")
         {
-            let remote_address = pending.remote_address;
-            self.pending_connect = None;
-            self.connect_result = Some(match answer {
-                Ok(connection) => {
-                    let connection = Arc::new(connection);
-                    self.connection = Some(connection.clone());
-                    self.remote_address = Some(remote_address);
-                    Ok(connection)
-                }
-                Err(error) => Err(error),
-            });
-        }
-        if let Some(pending) = &mut self.pending_listen
-            && let Poll::Ready(answer) = poll_answer(&mut pending.answer, cx, "listen")
-        {
-            let adoption = pending.adoption;
             self.pending_listen = None;
-            match (adoption, answer) {
-                (ListenAdoption::Finish, answer) => self.listen_result = Some(answer),
-                (ListenAdoption::Arrival, Ok(listener)) => self.adopt_listener(listener),
-                (ListenAdoption::Arrival, Err(_)) => {}
+            if let Ok(listener) = answer {
+                self.adopt_listener(listener);
             }
-        }
-        if let Some(answer) = &mut self.pending_accept
-            && let Poll::Ready(answer) = poll_answer(answer, cx, "accept")
-        {
-            self.pending_accept = None;
-            self.accept_result = Some(answer);
-        }
-        if self.pending_connect.is_none()
-            && self.pending_listen.is_none()
-            && self.pending_accept.is_none()
-        {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
         }
     }
 
@@ -968,12 +745,7 @@ impl TcpSocket {
         local_address: WasiTcpSocketAddress,
     ) -> core::result::Result<(), socket_types::ErrorCode> {
         self.settle();
-        if self.connection.is_some()
-            || self.listener.is_some()
-            || self.pending_connect.is_some()
-            || self.pending_listen.is_some()
-            || self.pending_accept.is_some()
-        {
+        if self.connection.is_some() || self.listener.is_some() || self.pending_listen.is_some() {
             return Err(socket_types::ErrorCode::InvalidState);
         }
         self.local_address = Some(local_address);
@@ -999,28 +771,17 @@ impl TcpSocket {
             return Err(socket_types::ErrorCode::InvalidArgument);
         }
         self.settle();
-        if self.connection.is_some()
-            || self.pending_connect.is_some()
-            || self.connect_result.is_some()
-            || self.listener.is_some()
-            || self.pending_listen.is_some()
-            || self.listen_result.is_some()
-            || self.pending_accept.is_some()
-        {
+        if self.connection.is_some() || self.listener.is_some() || self.pending_listen.is_some() {
             return Err(socket_types::ErrorCode::InvalidState);
         }
         self.listen_backlog = backlog;
         Ok(())
     }
 
-    /// Whether a p2 `start-listen` or a p3 `listen` may begin.
+    /// Whether a `listen` may begin.
     pub(super) fn may_listen(&mut self) -> bool {
         self.settle();
-        !(self.connection.is_some()
-            || self.listener.is_some()
-            || self.pending_connect.is_some()
-            || self.pending_listen.is_some()
-            || self.listen_result.is_some())
+        !(self.connection.is_some() || self.listener.is_some() || self.pending_listen.is_some())
     }
 
     /// What a listen on this socket opens its listener with: the bound
@@ -1234,294 +995,6 @@ impl TcpSocket {
     pub(super) fn connection(&mut self) -> Option<Arc<TcpConnection>> {
         self.settle();
         self.connection.clone()
-    }
-
-    pub(super) fn shutdown_receive(&mut self) -> core::result::Result<(), socket_types::ErrorCode> {
-        let connection = self
-            .connection()
-            .ok_or(socket_types::ErrorCode::InvalidState)?;
-        connection.receive_shutdown.store(true, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Marks the send side shut and answers the connection whose FIN
-    /// the caller queues.
-    pub(super) fn shutdown_send(
-        &mut self,
-    ) -> core::result::Result<Arc<TcpConnection>, socket_types::ErrorCode> {
-        let connection = self
-            .connection()
-            .ok_or(socket_types::ErrorCode::InvalidState)?;
-        connection.send_shutdown.store(true, Ordering::Relaxed);
-        Ok(connection)
-    }
-}
-
-/// A `wasi:io` `input-stream` on a connected `wasi:sockets` TCP socket,
-/// driven by the guest task's own poll rather than a bridge task.
-///
-/// # Concurrency contract
-///
-/// The connection lives on one `NetworkShard`, the shard its flow hash
-/// placed on the processor that opened or accepted it; the shard's spin
-/// lock serializes every stack access this stream makes, and the shard's
-/// arrival signal is the only cross-processor hand-off. The guest task
-/// polling this stream may be running on any processor the executor put
-/// it on: `read` takes the owning shard's lock for exactly one queue
-/// drain ([`ComponentNetworkService::tcp_try_read`]), and `ready` parks
-/// the guest task on the shard's arrival signal plus the device event of
-/// the queue pair this processor drains — both marks sampled before the
-/// receive queue is probed, so a segment placed by another processor
-/// between the probe and the park resolves the wait rather than being
-/// slept through (§4's arm-before-test). Nothing here blocks,
-/// busy-waits, or holds a lock across an await.
-///
-/// What replaced the bridge's per-chunk channel messages: nothing.
-/// `read` hands the caller the `Bytes` the receive path already produced
-/// — the one allocation a socket read has always had — with no channel
-/// hop between the socket and the guest.
-pub struct TcpSocketInputStream<Net>
-where
-    Net: ComponentHostNetwork,
-{
-    connection: Arc<TcpConnection>,
-    service: Net,
-    /// The failure `ready` saw driving the device — one `read`'s own
-    /// non-parking probe can never reproduce, since it does not drive —
-    /// kept so the next accessor reports it instead of returning empty
-    /// forever. The way `wasi-io`'s own stream impls carry a prior
-    /// error.
-    failed: Option<crate::TcpError>,
-}
-
-impl<Net> TcpSocketInputStream<Net>
-where
-    Net: ComponentHostNetwork,
-{
-    pub(super) fn new(connection: Arc<TcpConnection>, service: Net) -> Self {
-        Self {
-            connection,
-            service,
-            failed: None,
-        }
-    }
-}
-
-/// The recorded failure a stream accessor reports as the operation that
-/// failed.
-fn recorded_failure(error: &crate::TcpError) -> StreamError {
-    StreamError::LastOperationFailed(wasmtime::Error::new(error.clone()))
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl<Net> Pollable for TcpSocketInputStream<Net>
-where
-    Net: ComponentHostNetwork,
-{
-    async fn ready(&mut self) {
-        if self.connection.receive_shutdown() {
-            // A guest-directed shutdown reads as end-of-stream, and a
-            // closed stream is always ready: there is nothing to wait
-            // for.
-            return;
-        }
-        let stream = self.connection.stream();
-        // A zero-length read is the readiness probe: it resolves when
-        // the receive queue is non-empty or the connection has ended,
-        // without consuming a byte. The service samples the shard's
-        // arrival mark before it inspects the queue, which is what makes
-        // this a wait rather than a spin. A drive-level failure is kept
-        // rather than dropped: `read`'s own probe cannot see it, and a
-        // resolving `ready` whose read answers empty forever is a spin.
-        if let Err(error) = self
-            .service
-            .tcp_read(NetworkHandle::from_raw(stream), 0, u64::MAX)
-            .await
-        {
-            self.failed = Some(error);
-        }
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl<Net> InputStream for TcpSocketInputStream<Net>
-where
-    Net: ComponentHostNetwork,
-{
-    fn read(&mut self, size: usize) -> core::result::Result<Bytes, StreamError> {
-        if let Some(error) = &self.failed {
-            return Err(recorded_failure(error));
-        }
-        if self.connection.receive_shutdown() {
-            return Err(StreamError::Closed);
-        }
-        match self
-            .service
-            .tcp_try_read(NetworkHandle::from_raw(self.connection.stream()), size)
-        {
-            Ok(crate::TcpReadProgress::Data(bytes)) => Ok(bytes),
-            // Empty is "not ready": the guest's `ready` is the wait.
-            Ok(crate::TcpReadProgress::Pending) => Ok(Bytes::new()),
-            Ok(crate::TcpReadProgress::Eof) => Err(StreamError::Closed),
-            Err(error) => Err(StreamError::LastOperationFailed(wasmtime::Error::new(
-                error,
-            ))),
-        }
-    }
-}
-
-/// A `wasi:io` `output-stream` on the same connection, under the same
-/// contract as [`TcpSocketInputStream`].
-///
-/// `write` queues onto the socket's send path and drives it to the wire
-/// — the shard's segment production, the ring submit and the doorbell —
-/// inside the caller's own poll, the publish the detached write bridge
-/// used to do one channel hop later. A batch the send queue could not
-/// take whole is parked in `pending`: `ready` completes it through the
-/// service's own write wait, and `check_write` withholds the next permit
-/// until it is gone — the same flow control the channel output stream
-/// applied, minus the hop.
-pub struct TcpSocketOutputStream<Net>
-where
-    Net: ComponentHostNetwork,
-{
-    connection: Arc<TcpConnection>,
-    service: Net,
-    /// The unwritten remainder of a `write` the send queue could not
-    /// take, completed by `ready` before the next permit is issued. It
-    /// stays parked until that write succeeds — a failed one keeps the
-    /// bytes and records the error, which `check_write` and `flush`
-    /// then report.
-    pending: Option<Bytes>,
-    /// The failure a `ready` pass hit, reported by the next accessor —
-    /// see [`TcpSocketInputStream::failed`].
-    failed: Option<crate::TcpError>,
-}
-
-impl<Net> TcpSocketOutputStream<Net>
-where
-    Net: ComponentHostNetwork,
-{
-    pub(super) fn new(connection: Arc<TcpConnection>, service: Net) -> Self {
-        Self {
-            connection,
-            service,
-            pending: None,
-            failed: None,
-        }
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl<Net> Pollable for TcpSocketOutputStream<Net>
-where
-    Net: ComponentHostNetwork,
-{
-    async fn ready(&mut self) {
-        // The send-side mirror of the input stream's `receive_shutdown`
-        // early-out: a shut-down send side is permanently ready — the
-        // accessor that follows reports `closed`.
-        if self.connection.send_shutdown() {
-            return;
-        }
-        let handle = NetworkHandle::from_raw(self.connection.stream());
-        if let Some(bytes) = self.pending.clone() {
-            // The service's write-all carries the batch through whatever
-            // window opens — its own loop arms the shard wait before it
-            // re-tries the queue, and ends the write rather than parking
-            // on a send side that can no longer send.
-            match self
-                .service
-                .tcp_write_all_bytes(handle, bytes, u64::MAX)
-                .await
-            {
-                Ok(()) => self.pending = None,
-                Err(error) => self.failed = Some(error),
-            }
-            return;
-        }
-        if let Err(error) = self.service.tcp_write_ready(handle).await {
-            self.failed = Some(error);
-        }
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl<Net> OutputStream for TcpSocketOutputStream<Net>
-where
-    Net: ComponentHostNetwork,
-{
-    fn write(&mut self, bytes: Bytes) -> core::result::Result<(), StreamError> {
-        if let Some(error) = &self.failed {
-            return Err(recorded_failure(error));
-        }
-        if self.connection.send_shutdown() {
-            return Err(StreamError::Closed);
-        }
-        if self.pending.is_some() {
-            return Err(StreamError::trap(
-                "TCP output stream write exceeded its check-write permit",
-            ));
-        }
-        let handle = NetworkHandle::from_raw(self.connection.stream());
-        let mut bytes = bytes;
-        // One locked pass both queues and classifies a queue that took
-        // nothing: `Pending` is a full send queue on a live connection,
-        // `Closed` a send side that cannot send again — the answer a
-        // separate probe used to fetch under a second lock.
-        match self.service.tcp_try_write(handle, &mut bytes) {
-            // What the send queue could not take is parked rather than
-            // dropped or errored: `ready` completes it, and
-            // `check_write` withholds the next permit until then.
-            Ok(crate::TcpWriteProgress::Room(_)) | Ok(crate::TcpWriteProgress::Pending) => {}
-            Ok(crate::TcpWriteProgress::Closed(_)) => return Err(StreamError::Closed),
-            Err(error) => {
-                return Err(StreamError::LastOperationFailed(wasmtime::Error::new(
-                    error,
-                )));
-            }
-        }
-        if !bytes.is_empty() {
-            self.pending = Some(bytes);
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> core::result::Result<(), StreamError> {
-        // A write has already pushed its bytes to the wire, and a parked
-        // batch is `ready`'s to complete — `check_write` pends on it,
-        // which is the contract's "flush completes" point. There is
-        // nothing left to push here.
-        if let Some(error) = &self.failed {
-            return Err(recorded_failure(error));
-        }
-        if self.connection.send_shutdown() {
-            return Err(StreamError::Closed);
-        }
-        Ok(())
-    }
-
-    fn check_write(&mut self) -> core::result::Result<usize, StreamError> {
-        if let Some(error) = &self.failed {
-            return Err(recorded_failure(error));
-        }
-        if self.connection.send_shutdown() {
-            return Err(StreamError::Closed);
-        }
-        if self.pending.is_some() {
-            return Ok(0);
-        }
-        match self
-            .service
-            .tcp_send_room(NetworkHandle::from_raw(self.connection.stream()))
-        {
-            Ok(crate::TcpWriteProgress::Room(room)) => Ok(room),
-            Ok(crate::TcpWriteProgress::Pending) => Ok(0),
-            Ok(crate::TcpWriteProgress::Closed(_)) => Err(StreamError::Closed),
-            Err(error) => Err(StreamError::LastOperationFailed(wasmtime::Error::new(
-                error,
-            ))),
-        }
     }
 }
 
@@ -1928,45 +1401,22 @@ pub(super) struct UdpReceive {
 /// # Ownership and concurrency
 ///
 /// One owner, its resource-table entry, with no clone and no lock, as
-/// for [`TcpSocket`]. The p2 datagram streams are the socket's table
-/// children and reach it through the table; the table keeps a parent
-/// alive while it has children, so the socket outlives them. Every p2
-/// call and the p3 `bind` and `connect` hold the store, and the socket,
-/// across their awaits. The p3 `send` and `receive` release it: they
-/// take the [`UdpBinding`] they need, and a `send` on an unbound socket
-/// marks its implicit bind in `implicit_bind` and fetches the socket
-/// again to install the result.
+/// for [`TcpSocket`]. The `bind` and `connect` hold the store, and the
+/// socket, across their awaits. The `send` and `receive` release it:
+/// they take the [`UdpBinding`] they need, and a `send` on an unbound
+/// socket marks its implicit bind in `implicit_bind` and fetches the
+/// socket again to install the result.
 pub struct UdpSocket {
     /// Where the kernel socket goes when it dies.
     pub(super) retire: SocketRetirementSender,
     pub(super) family: WasiUdpSocketFamily,
     pub(super) bound: Option<UdpBinding>,
-    /// A p2 `start-bind`'s kernel socket, waiting for `finish-bind`; a
-    /// guest is free to exit between the two, and the binding retires
-    /// then too.
-    pub(super) pending_bind: Option<UdpBinding>,
-    /// A p3 `send`'s implicit bind under way.
+    /// A `send`'s implicit bind under way.
     pub(super) implicit_bind: Option<InFlight>,
     pub(super) remote_address: Option<WasiUdpSocketAddress>,
     pub(super) hop_limit: u8,
     pub(super) receive_buffer_size: u64,
     pub(super) send_buffer_size: u64,
-    pub(super) open_stream_handles: usize,
-}
-
-/// The p2 `incoming-datagram-stream`, a table child of its socket.
-pub struct P2IncomingDatagramStream {
-    /// The parent socket's entry.
-    pub(super) socket: Resource<UdpSocket>,
-    pub(super) remote_address: Option<WasiUdpSocketAddress>,
-}
-
-/// The p2 `outgoing-datagram-stream`, a table child of its socket.
-pub struct P2OutgoingDatagramStream {
-    /// The parent socket's entry.
-    pub(super) socket: Resource<UdpSocket>,
-    pub(super) remote_address: Option<WasiUdpSocketAddress>,
-    pub(super) check_send_permit_count: u64,
 }
 
 #[derive(Debug)]
@@ -1974,7 +1424,6 @@ pub(super) enum WasiUdpSocketError {
     NotSupported,
     InvalidArgument,
     InvalidState,
-    NotInProgress,
     AddressNotBindable,
     DatagramTooLarge,
     WouldBlock,
@@ -1993,13 +1442,11 @@ impl UdpSocket {
             retire,
             family,
             bound: None,
-            pending_bind: None,
             implicit_bind: None,
             remote_address: None,
             hop_limit: DEFAULT_WASI_UDP_HOP_LIMIT,
             receive_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
             send_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
-            open_stream_handles: 0,
         }
     }
 
@@ -2042,7 +1489,7 @@ impl UdpSocket {
             return Err(WasiUdpSocketError::InvalidArgument);
         }
         self.hop_limit = value;
-        if let Some(bound) = self.bound.as_ref().or(self.pending_bind.as_ref()) {
+        if let Some(bound) = &self.bound {
             service
                 .udp_set_hop_limit(NetworkHandle::from_raw(bound.socket()), value)
                 .map_err(WasiUdpSocketError::Backend)?;
@@ -2086,30 +1533,8 @@ impl UdpSocket {
         local_address: WasiUdpSocketAddress,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         validate_udp_local_address(self.family, local_address)?;
-        self.bind_backend(service, local_address.address, local_address.port, false)
+        self.bind_backend(service, local_address.address, local_address.port)
             .await
-    }
-
-    pub(super) async fn start_bind_p2<Net: ComponentHostNetwork>(
-        &mut self,
-        service: &Net,
-        local_address: WasiUdpSocketAddress,
-    ) -> core::result::Result<(), WasiUdpSocketError> {
-        validate_udp_local_address(self.family, local_address)?;
-        self.bind_backend(service, local_address.address, local_address.port, true)
-            .await
-    }
-
-    pub(super) fn finish_bind_p2(&mut self) -> core::result::Result<(), WasiUdpSocketError> {
-        let Some(bound) = self.pending_bind.take() else {
-            return Err(WasiUdpSocketError::NotInProgress);
-        };
-        assert!(
-            self.bound.is_none(),
-            "udp socket completed a p2 bind while already bound"
-        );
-        self.bound = Some(bound);
-        Ok(())
     }
 
     pub(super) async fn connect<Net: ComponentHostNetwork>(
@@ -2148,52 +1573,6 @@ impl UdpSocket {
             .map_err(WasiUdpSocketError::Backend)?;
         self.remote_address = None;
         Ok(())
-    }
-
-    /// Readies the socket for its p2 datagram stream pair and answers
-    /// the remote address both streams carry.
-    pub(super) fn open_p2_streams<Net: ComponentHostNetwork>(
-        &mut self,
-        service: &Net,
-        remote_address: Option<WasiUdpSocketAddress>,
-    ) -> core::result::Result<Option<WasiUdpSocketAddress>, WasiUdpSocketError> {
-        if let Some(remote_address) = remote_address {
-            validate_udp_remote_address(self.family, remote_address)?;
-        }
-        if self.pending_bind.is_some() || self.open_stream_handles != 0 {
-            return Err(WasiUdpSocketError::InvalidState);
-        }
-        let Some(bound) = &self.bound else {
-            return Err(WasiUdpSocketError::InvalidState);
-        };
-        let socket = NetworkHandle::from_raw(bound.socket());
-        if let Some(remote_address) = remote_address {
-            service
-                .udp_connect(socket, remote_address.address, remote_address.port)
-                .map_err(WasiUdpSocketError::Backend)?;
-        } else if self.remote_address.is_some() {
-            service
-                .udp_disconnect(socket)
-                .map_err(WasiUdpSocketError::Backend)?;
-        }
-        self.remote_address = remote_address;
-        self.open_stream_handles = 2;
-        Ok(remote_address)
-    }
-
-    pub(super) fn release_stream_handle<Net: ComponentHostNetwork>(&mut self, service: &Net) {
-        if self.open_stream_handles == 0 {
-            return;
-        }
-        self.open_stream_handles -= 1;
-        if self.open_stream_handles == 0
-            && let (Some(bound), Some(_)) = (&self.bound, self.remote_address)
-        {
-            service
-                .udp_disconnect(NetworkHandle::from_raw(bound.socket()))
-                .unwrap_or_else(|error| panic!("failed to disconnect closed UDP streams: {error}"));
-            self.remote_address = None;
-        }
     }
 
     /// Admits a send: checks the datagram and its target, and answers
@@ -2248,31 +1627,11 @@ impl UdpSocket {
         drop(guard);
         self.implicit_bind = None;
         let binding = outcome?;
-        if self.bound.is_some() || self.pending_bind.is_some() {
+        if self.bound.is_some() {
             return Err(WasiUdpSocketError::InvalidState);
         }
         self.bound = Some(binding.clone());
         Ok(binding)
-    }
-
-    /// A send on a socket the caller holds throughout: the p2 outgoing
-    /// datagram stream's.
-    pub(super) async fn send_datagram<Net: ComponentHostNetwork>(
-        &mut self,
-        service: &Net,
-        bytes: &[u8],
-        remote_address: Option<WasiUdpSocketAddress>,
-        timeout_nanos: u64,
-    ) -> core::result::Result<(), WasiUdpSocketError> {
-        let UdpSend { target, binding } = self.start_send(bytes.len(), remote_address)?;
-        let binding = match binding {
-            UdpSendBinding::Bound(binding) => binding,
-            UdpSendBinding::Unbound(bind) => {
-                let (guard, outcome) = bind.run(service).await;
-                self.finish_implicit_bind(guard, outcome)?
-            }
-        };
-        send_on(service, &binding, target, bytes, timeout_nanos).await
     }
 
     /// Admits a receive and answers what it reads with.
@@ -2280,9 +1639,6 @@ impl UdpSocket {
         &self,
         remote_address: Option<WasiUdpSocketAddress>,
     ) -> core::result::Result<UdpReceive, WasiUdpSocketError> {
-        if self.pending_bind.is_some() {
-            return Err(WasiUdpSocketError::InvalidState);
-        }
         let binding = self.bound.clone().ok_or(WasiUdpSocketError::InvalidState)?;
         Ok(UdpReceive {
             binding,
@@ -2291,23 +1647,10 @@ impl UdpSocket {
         })
     }
 
-    /// A receive on a socket the caller holds throughout: the p2
-    /// incoming datagram stream's.
-    pub(super) async fn receive_datagram<Net: ComponentHostNetwork>(
-        &self,
-        service: &Net,
-        remote_address: Option<WasiUdpSocketAddress>,
-        timeout_nanos: u64,
-    ) -> core::result::Result<WasiUdpSocketDatagram, WasiUdpSocketError> {
-        receive_on(service, self.start_receive(remote_address)?, timeout_nanos).await
-    }
-
-    /// Admits a bind, refusing one on a socket that is bound, has a p2
-    /// bind waiting for `finish-bind`, or has a p3 send's implicit bind
-    /// under way.
+    /// Admits a bind, refusing one on a socket that is bound or has a
+    /// send's implicit bind under way.
     fn start_bind(&mut self) -> core::result::Result<UdpBindRequest, WasiUdpSocketError> {
-        if self.pending_bind.is_some() || self.bound.is_some() || in_flight(&mut self.implicit_bind)
-        {
+        if self.bound.is_some() || in_flight(&mut self.implicit_bind) {
             return Err(WasiUdpSocketError::InvalidState);
         }
         Ok(UdpBindRequest {
@@ -2322,15 +1665,9 @@ impl UdpSocket {
         service: &Net,
         local_address: crate::NetworkIpAddress,
         local_port: u16,
-        pending_bind: bool,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         let request = self.start_bind()?;
-        let binding = bind_kernel_socket(service, request, local_address, local_port).await?;
-        if pending_bind {
-            self.pending_bind = Some(binding);
-        } else {
-            self.bound = Some(binding);
-        }
+        self.bound = Some(bind_kernel_socket(service, request, local_address, local_port).await?);
         Ok(())
     }
 
@@ -2343,7 +1680,7 @@ impl UdpSocket {
         if let Some(bound) = &self.bound {
             return Ok(bound.clone());
         }
-        self.bind_backend(service, local_address, local_port, false)
+        self.bind_backend(service, local_address, local_port)
             .await?;
         self.bound.clone().ok_or(WasiUdpSocketError::InvalidState)
     }
@@ -2984,14 +2321,10 @@ where
         );
         let stream = StreamReader::new(&mut access, producer)?;
         let retire = access.get().table.get(&socket_resource)?.retire.clone();
-        let Ok(answer) = spawn_listen(&spawner, service, retire, request, Some(stream_answer))
-        else {
+        let Ok(answer) = spawn_listen(&spawner, service, retire, request, stream_answer) else {
             return Ok(Err(socket_types::ErrorCode::OutOfMemory));
         };
-        access.get().table.get_mut(&socket_resource)?.pending_listen = Some(PendingListen {
-            answer,
-            adoption: ListenAdoption::Arrival,
-        });
+        access.get().table.get_mut(&socket_resource)?.pending_listen = Some(answer);
         Ok(Ok(stream))
     }
 
@@ -3385,9 +2718,7 @@ pub(super) fn map_p3_udp_socket_error(error: WasiUdpSocketError) -> socket_types
     match error {
         WasiUdpSocketError::NotSupported => socket_types::ErrorCode::NotSupported,
         WasiUdpSocketError::InvalidArgument => socket_types::ErrorCode::InvalidArgument,
-        WasiUdpSocketError::InvalidState | WasiUdpSocketError::NotInProgress => {
-            socket_types::ErrorCode::InvalidState
-        }
+        WasiUdpSocketError::InvalidState => socket_types::ErrorCode::InvalidState,
         WasiUdpSocketError::AddressNotBindable => socket_types::ErrorCode::AddressNotBindable,
         WasiUdpSocketError::DatagramTooLarge => socket_types::ErrorCode::DatagramTooLarge,
         WasiUdpSocketError::WouldBlock

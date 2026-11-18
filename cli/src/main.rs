@@ -1014,7 +1014,7 @@ impl<'a> WasmSource<'a> {
         }
     }
 
-    /// The `wasm32-wasip2` core module or component `manifest_path`
+    /// The `wasm32-wasip3` core module or component `manifest_path`
     /// builds, whose file is named `artifact_name`.
     fn component(
         &self,
@@ -2515,7 +2515,7 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     report
 }
 
-/// The target directory every `wasm32-wasip2` component program builds
+/// The target directory every `wasm32-wasip3` component program builds
 /// into. The programs are workspace members built with one profile
 /// environment and one `RUSTFLAGS`, so their shared dependencies compile
 /// once; each program is still its own `cargo build`, so its feature
@@ -2523,7 +2523,7 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 const COMPONENT_PROGRAMS_TARGET_DIR: &str = "component-programs-target";
 
 /// The target the component programs build for.
-const COMPONENT_TRIPLE: &str = "wasm32-wasip2";
+const COMPONENT_TRIPLE: &str = "wasm32-wasip3";
 
 /// The target directory, by name, a component program with these
 /// requirements builds into.
@@ -2625,7 +2625,7 @@ fn build_environment(
 }
 
 impl WasmBuilder<'_> {
-    /// The `wasm32-wasip2` core module or component `manifest_path`
+    /// The `wasm32-wasip3` core module or component `manifest_path`
     /// builds, whose file is named `artifact_name`.
     fn component(
         &self,
@@ -3459,13 +3459,13 @@ mod tests {
 
     #[test]
     fn wasm_target_features_are_explicit_and_do_not_replace_threaded_link_arguments() {
-        let ordinary = wasm_rustflags("wasm32-wasip2", &[]);
+        let ordinary = wasm_rustflags("wasm32-wasip3", &[]);
         assert!(
             !ordinary
                 .iter()
                 .any(|flag| flag.starts_with("target-feature="))
         );
-        let gpu = wasm_rustflags("wasm32-wasip2", &["atomics".to_owned()]);
+        let gpu = wasm_rustflags("wasm32-wasip3", &["atomics".to_owned()]);
         assert!(gpu.iter().any(|flag| flag == "target-feature=+atomics"));
         let threaded = wasm_rustflags("wasm32-wasip1-threads", &[]);
         assert!(
