@@ -2638,7 +2638,10 @@ const WASIX_SOCK_OPTION_TTL: i32 = 23;
 const WASIX_SOCK_OPTION_MULTICAST_TTL_V4: i32 = 24;
 const WASIX_SOCK_OPTION_TYPE: i32 = 25;
 const WASIX_SOCK_OPTION_PROTO: i32 = 26;
-const WASIX_RIFLAGS_DATA_TRUNCATED: u16 = 1 << 2;
+const WASIX_RIFLAGS_RECV_PEEK: u16 = 1 << 0;
+const WASIX_RIFLAGS_RECV_DONT_WAIT: u16 = 1 << 3;
+const WASIX_RIFLAGS_SUPPORTED: u16 = WASIX_RIFLAGS_RECV_PEEK | WASIX_RIFLAGS_RECV_DONT_WAIT;
+const WASIX_ROFLAGS_DATA_TRUNCATED: u16 = 1 << 0;
 const WASIX_ADDRESS_FAMILY_UNSPEC: u8 = 0;
 const WASIX_ADDRESS_FAMILY_IP_INET4: u8 = 1;
 const WASIX_ADDRESS_FAMILY_IP_INET6: u8 = 2;
@@ -3783,6 +3786,7 @@ mod tests {
                 crate::UnixNetwork::new(crate::test_support::test_network_service()),
                 2,
             ),
+            local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
             local_port: 5353,
             options: unix_socket_options::<TestNet>(),
         }));

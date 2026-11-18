@@ -19,19 +19,11 @@ pub(crate) fn has_wasi_network_rights(
 }
 
 pub(crate) fn wasi_udp_bind_rights(local_port: u16) -> crate::NetworkAuthorityRights {
-    if local_port != 0 && local_port < 1024 {
-        crate::NetworkAuthorityRights::UDP | crate::NetworkAuthorityRights::PRIVILEGED_BIND
-    } else {
-        crate::NetworkAuthorityRights::UDP
-    }
+    crate::NetworkAuthorityRights::UDP.bind_rights(local_port)
 }
 
 pub(crate) fn wasi_tcp_bind_rights(local_port: u16) -> crate::NetworkAuthorityRights {
-    if local_port != 0 && local_port < 1024 {
-        crate::NetworkAuthorityRights::TCP | crate::NetworkAuthorityRights::PRIVILEGED_BIND
-    } else {
-        crate::NetworkAuthorityRights::TCP
-    }
+    crate::NetworkAuthorityRights::TCP.bind_rights(local_port)
 }
 
 pub struct P2Network;
@@ -1817,6 +1809,15 @@ pub(super) enum WasiUdpSocketFamily {
     Ipv6,
 }
 
+impl WasiUdpSocketFamily {
+    pub(super) const fn unspecified_address(self) -> crate::NetworkIpAddress {
+        match self {
+            Self::Ipv4 => crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+            Self::Ipv6 => crate::NetworkIpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct WasiUdpSocketAddress {
     pub(super) address: crate::NetworkIpAddress,
@@ -1834,6 +1835,7 @@ pub(super) struct WasiUdpSocketAddress {
 #[derive(Clone)]
 pub(super) struct UdpBinding {
     socket: Arc<OwnedNetworkHandle>,
+    pub(super) local_address: crate::NetworkIpAddress,
     pub(super) local_port: u16,
 }
 
@@ -1855,10 +1857,11 @@ pub(super) struct UdpBindRequest {
 async fn bind_kernel_socket<Net: ComponentHostNetwork>(
     service: &Net,
     request: UdpBindRequest,
+    local_address: crate::NetworkIpAddress,
     local_port: u16,
 ) -> core::result::Result<UdpBinding, WasiUdpSocketError> {
     let binding = service
-        .udp_bind(local_port)
+        .udp_bind(local_address, local_port)
         .await
         .map_err(WasiUdpSocketError::Backend)?;
     let local_port = binding.local_port;
@@ -1872,6 +1875,7 @@ async fn bind_kernel_socket<Net: ComponentHostNetwork>(
         .map_err(WasiUdpSocketError::Backend)?;
     Ok(UdpBinding {
         socket: Arc::new(socket),
+        local_address,
         local_port,
     })
 }
@@ -1881,6 +1885,7 @@ async fn bind_kernel_socket<Net: ComponentHostNetwork>(
 pub(super) struct ImplicitUdpBind {
     guard: InFlightGuard,
     request: UdpBindRequest,
+    local_address: crate::NetworkIpAddress,
 }
 
 impl ImplicitUdpBind {
@@ -1893,7 +1898,7 @@ impl ImplicitUdpBind {
         InFlightGuard,
         core::result::Result<UdpBinding, WasiUdpSocketError>,
     ) {
-        let outcome = bind_kernel_socket(service, self.request, 0).await;
+        let outcome = bind_kernel_socket(service, self.request, self.local_address, 0).await;
         (self.guard, outcome)
     }
 }
@@ -2009,14 +2014,7 @@ impl UdpSocket {
             return Err(WasiUdpSocketError::InvalidState);
         };
         Ok(WasiUdpSocketAddress {
-            address: match self.family {
-                WasiUdpSocketFamily::Ipv4 => {
-                    crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0]))
-                }
-                WasiUdpSocketFamily::Ipv6 => {
-                    crate::NetworkIpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
-                }
-            },
+            address: bound.local_address,
             port: bound.local_port,
         })
     }
@@ -2088,7 +2086,8 @@ impl UdpSocket {
         local_address: WasiUdpSocketAddress,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         validate_udp_local_address(self.family, local_address)?;
-        self.bind_backend(service, local_address.port, false).await
+        self.bind_backend(service, local_address.address, local_address.port, false)
+            .await
     }
 
     pub(super) async fn start_bind_p2<Net: ComponentHostNetwork>(
@@ -2097,7 +2096,8 @@ impl UdpSocket {
         local_address: WasiUdpSocketAddress,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         validate_udp_local_address(self.family, local_address)?;
-        self.bind_backend(service, local_address.port, true).await
+        self.bind_backend(service, local_address.address, local_address.port, true)
+            .await
     }
 
     pub(super) fn finish_bind_p2(&mut self) -> core::result::Result<(), WasiUdpSocketError> {
@@ -2118,7 +2118,9 @@ impl UdpSocket {
         remote_address: WasiUdpSocketAddress,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         validate_udp_remote_address(self.family, remote_address)?;
-        let bound = self.ensure_bound(service, 0).await?;
+        let bound = self
+            .ensure_bound(service, self.family.unspecified_address(), 0)
+            .await?;
         service
             .udp_connect(
                 NetworkHandle::from_raw(bound.socket()),
@@ -2223,7 +2225,11 @@ impl UdpSocket {
         self.implicit_bind = Some(marker);
         Ok(UdpSend {
             target,
-            binding: UdpSendBinding::Unbound(ImplicitUdpBind { guard, request }),
+            binding: UdpSendBinding::Unbound(ImplicitUdpBind {
+                guard,
+                request,
+                local_address: self.family.unspecified_address(),
+            }),
         })
     }
 
@@ -2314,11 +2320,12 @@ impl UdpSocket {
     pub(super) async fn bind_backend<Net: ComponentHostNetwork>(
         &mut self,
         service: &Net,
+        local_address: crate::NetworkIpAddress,
         local_port: u16,
         pending_bind: bool,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         let request = self.start_bind()?;
-        let binding = bind_kernel_socket(service, request, local_port).await?;
+        let binding = bind_kernel_socket(service, request, local_address, local_port).await?;
         if pending_bind {
             self.pending_bind = Some(binding);
         } else {
@@ -2330,12 +2337,14 @@ impl UdpSocket {
     pub(super) async fn ensure_bound<Net: ComponentHostNetwork>(
         &mut self,
         service: &Net,
+        local_address: crate::NetworkIpAddress,
         local_port: u16,
     ) -> core::result::Result<UdpBinding, WasiUdpSocketError> {
         if let Some(bound) = &self.bound {
             return Ok(bound.clone());
         }
-        self.bind_backend(service, local_port, false).await?;
+        self.bind_backend(service, local_address, local_port, false)
+            .await?;
         self.bound.clone().ok_or(WasiUdpSocketError::InvalidState)
     }
 
