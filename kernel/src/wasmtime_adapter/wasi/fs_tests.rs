@@ -2664,9 +2664,8 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
 fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() {
     use bytes::Bytes;
     use core::num::NonZeroUsize;
-    use ferrosys::{
-        FormatOptions, Metadata as BtrfsSeedMeta, Timestamp as BtrfsStamp, TreeBuilder, format_to,
-    };
+    use ferrosys::btrfs::{FormatOptions, format_to};
+    use ferrosys::{Metadata as BtrfsSeedMeta, Timestamp as BtrfsStamp, TreeBuilder};
     use helios_hal::fs::{DeviceId, FsPath};
     use std::io::{Read as _, Seek as _, SeekFrom};
 
@@ -2727,7 +2726,10 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
         crate::BootFs::new(EmbeddedBootFs::empty(), BOOT_DEVICE),
         1,
     ));
-    let root_upper = namespace.root().upper().clone();
+    let MountedFs::Root(root_fs) = namespace.resolve("/").unwrap().fs() else {
+        unreachable!("the root of a namespace is a RootFs");
+    };
+    let root_upper = root_fs.upper().clone();
     let mem_fs = MemoryFs::new(namespace.table().allocate_device());
     let host_fs = MemoryHostFileSystem::new(namespace.table().allocate_device());
 
@@ -2819,9 +2821,15 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
             )
             .await
             .expect("WASI ignores stored Unix mode and ACLs");
-            write(&namespace, held(&secret), 0, b"granted-by-mount", 21)
-                .await
-                .expect("WASI writes through mount rights");
+            super::write(
+                &namespace,
+                held(&secret),
+                WritePosition::At(0),
+                b"granted-by-mount",
+                21,
+            )
+            .await
+            .expect("WASI writes through mount rights");
             assert_eq!(
                 read(&namespace, held(&secret), 0, 64)
                     .await
@@ -2867,7 +2875,7 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
                 }
             }
             namespace
-                .unmount(&authority.derive_mount_cap("/btrfs").unwrap())
+                .unmount(&authority.derive_unmount_cap("/btrfs").unwrap())
                 .await
                 .unwrap();
             btrfs_fs.unmount().await;

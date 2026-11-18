@@ -704,7 +704,7 @@ fn private_and_shared_mounts_distinguish_container_views_and_capabilities() {
             Some(CAPABILITY)
         );
     }
-    block_on(namespace.unmount(&cap("/mnt"))).expect("unmounts");
+    block_on(namespace.unmount(&unmount_cap("/mnt"))).expect("unmounts");
 
     // Mounted shared (read-write and read-only): every node appears owned by
     // `CONTAINER`, modes follow the mount's rights with set-id and sticky
@@ -733,9 +733,7 @@ fn private_and_shared_mounts_distinguish_container_views_and_capabilities() {
             ("link", 0o777),
         ] {
             let full = alloc::format!("/mnt/{name}");
-            let resolved = namespace
-                .resolve_entry(&full, Follow::No)
-                .expect("resolves");
+            let resolved = namespace.resolve(&full).expect("resolves");
             let grant = resolved.grant();
             let stored = tree.unix_metadata(resolved.path()).unwrap();
             assert_eq!(
@@ -759,6 +757,6 @@ fn private_and_shared_mounts_distinguish_container_views_and_capabilities() {
         let cap_bytes = tree.xattr(resolved.path(), "security.capability").unwrap();
         assert_eq!(cap_bytes.as_deref(), Some(CAPABILITY));
         assert_eq!(resolved.grant().file_capability(cap_bytes.as_deref()), None);
-        block_on(namespace.unmount(&cap("/mnt"))).expect("unmounts");
+        block_on(namespace.unmount(&unmount_cap("/mnt"))).expect("unmounts");
     }
 }

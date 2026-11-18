@@ -59,43 +59,79 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Arguments, Err
         [device, mountpoint, flag, options] if flag == "-o" => (device, mountpoint, Some(options)),
         _ => return Err(Error::Usage(arguments)),
     };
-    let mut parsed = Arguments {
-        device: device.into(),
-        mountpoint: mountpoint.into(),
-        read_only: false,
-        // The kernel checks permissions from the modes the filesystem
-        // reports, and any user may reach the mount. The mount's type stays
-        // plain `fuse`, with no subtype and no `blkdev`: fstests' init_rc
-        // refuses a TEST_DEV whose `df -T` type is not exactly $FSTYP. The
-        // device always holds a complete committed tree, and the unmount's
-        // commit runs as the session ends: what was written before the
-        // unmount is durable once this process has exited.
-        mount_options: vec![
-            MountOption::FSName(device.to_string_lossy().into_owned()),
-            MountOption::DefaultPermissions,
-        ],
-    };
+    let mut read_only = false;
+    // Block-filesystem defaults (`mount(8)`): `suid`, `dev` and `exec` are on
+    // unless `-o` clears them, whereas fuser's own default sets `MS_NOSUID`
+    // and `MS_NODEV` unless told otherwise. Resolving the final state of each
+    // pair also avoids handing conflicting flags to fuser.
+    let mut suid = true;
+    let mut dev = true;
+    let mut exec = true;
+    let mut atime: Option<bool> = None;
     let options = options.map(|options| options.to_string_lossy().into_owned());
     for option in options.iter().flat_map(|options| options.split(',')) {
         match option {
-            "defaults" => {}
-            "ro" => {
-                parsed.read_only = true;
-                parsed.mount_options.push(MountOption::RO);
+            "defaults" => {
+                read_only = false;
+                suid = true;
+                dev = true;
+                exec = true;
             }
-            "rw" => parsed.mount_options.push(MountOption::RW),
-            "suid" => parsed.mount_options.push(MountOption::Suid),
-            "nosuid" => parsed.mount_options.push(MountOption::NoSuid),
-            "dev" => parsed.mount_options.push(MountOption::Dev),
-            "nodev" => parsed.mount_options.push(MountOption::NoDev),
-            "exec" => parsed.mount_options.push(MountOption::Exec),
-            "noexec" => parsed.mount_options.push(MountOption::NoExec),
-            "atime" => parsed.mount_options.push(MountOption::Atime),
-            "noatime" => parsed.mount_options.push(MountOption::NoAtime),
+            "ro" => read_only = true,
+            "rw" => read_only = false,
+            "suid" => suid = true,
+            "nosuid" => suid = false,
+            "dev" => dev = true,
+            "nodev" => dev = false,
+            "exec" => exec = true,
+            "noexec" => exec = false,
+            "atime" => atime = Some(true),
+            "noatime" => atime = Some(false),
             other => return Err(Error::Option(other.to_owned())),
         }
     }
-    Ok(parsed)
+    // The kernel checks permissions from the modes the filesystem reports,
+    // and any user may reach the mount. The mount's type stays plain `fuse`,
+    // with no subtype and no `blkdev`: fstests' init_rc refuses a TEST_DEV
+    // whose `df -T` type is not exactly $FSTYP. The device always holds a
+    // complete committed tree, and the unmount's commit runs as the session
+    // ends: what was written before the unmount is durable once this process
+    // has exited.
+    let mut mount_options = vec![
+        MountOption::FSName(device.to_string_lossy().into_owned()),
+        MountOption::DefaultPermissions,
+        if read_only {
+            MountOption::RO
+        } else {
+            MountOption::RW
+        },
+        if suid {
+            MountOption::Suid
+        } else {
+            MountOption::NoSuid
+        },
+        if dev {
+            MountOption::Dev
+        } else {
+            MountOption::NoDev
+        },
+        if exec {
+            MountOption::Exec
+        } else {
+            MountOption::NoExec
+        },
+    ];
+    match atime {
+        Some(true) => mount_options.push(MountOption::Atime),
+        Some(false) => mount_options.push(MountOption::NoAtime),
+        None => {}
+    }
+    Ok(Arguments {
+        device: device.into(),
+        mountpoint: mountpoint.into(),
+        read_only,
+        mount_options,
+    })
 }
 
 /// Serves the filesystem in the foreground until it is unmounted.

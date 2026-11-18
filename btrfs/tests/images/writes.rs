@@ -375,9 +375,9 @@ impl BlockSink for SharedImage {
     }
 }
 
-/// Runs `sudo` without a password prompt; the node and the attribute below
-/// need privileges the test user lacks.
-fn sudo(args: &[&str]) {
+/// Runs `sudo` without a password prompt and returns stdout; the nodes and
+/// attributes below need privileges the test user lacks.
+fn sudo_output(args: &[&str]) -> Vec<u8> {
     let output = std::process::Command::new("sudo")
         .arg("-n")
         .args(args)
@@ -388,9 +388,43 @@ fn sudo(args: &[&str]) {
         "sudo {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    output.stdout
 }
 
-/// What a file's metadata and security attribute say, for comparing views.
+fn sudo(args: &[&str]) {
+    let _ = sudo_output(args);
+}
+
+fn hex_value(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(2 + bytes.len() * 2);
+    encoded.push_str("0x");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").unwrap();
+    }
+    encoded
+}
+
+fn load_sparse_image(path: &std::path::Path, bytes: u64) -> SparseImage {
+    use std::io::Read as _;
+    let mut image = SparseImage::new(bytes);
+    let mut file = std::fs::File::open(path).unwrap();
+    let mut block = vec![0; 1 << 16];
+    let mut offset = 0;
+    loop {
+        let count = file.read(&mut block).unwrap();
+        if count == 0 {
+            break;
+        }
+        if block[..count].iter().any(|byte| *byte != 0) {
+            image.write_bytes(offset, &block[..count]);
+        }
+        offset += count as u64;
+    }
+    image
+}
+
+/// What a file's metadata and extended attributes say, for comparing views.
 #[derive(Debug, PartialEq)]
 struct Authority {
     kind: helios_btrfs::FileKind,
@@ -402,45 +436,126 @@ struct Authority {
     size: u64,
     ctime: Timestamp,
     mtime: Timestamp,
+    capability: Option<Vec<u8>>,
+    acl: Option<Vec<u8>>,
+    trusted: Option<Vec<u8>>,
     security: Option<Vec<u8>>,
 }
 
-/// A Linux image carries a setuid file, a character device node and a
-/// `security.*` attribute (lexoliu/helios#1037). Mounted writable, the writer
-/// keeps all three intact through unrelated writes, and `btrfs check` is clean.
+/// A Linux image carries a setuid file, a character device node, a file
+/// capability (`security.capability`), a POSIX access ACL
+/// (`system.posix_acl_access`), a `trusted.*` attribute and a `security.*`
+/// label (lexoliu/helios#1037). Mounted writable, the writer keeps all of
+/// them intact through unrelated writes, `btrfs check` is clean, and Linux
+/// reads them back identically.
 #[test]
-#[ignore = "needs mkfs.btrfs and btrfs check from btrfs-progs, passwordless sudo, and setfattr; the Linux CI lane runs it with --run-ignored"]
+#[ignore = "needs mkfs.btrfs and btrfs check from btrfs-progs, passwordless sudo, a Linux kernel with btrfs, and setfattr/getfattr; the Linux CI lane runs it with --run-ignored"]
 fn linux_authority_survives_unrelated_writes() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    use helios_btrfs::DeviceNumber;
+
+    const IMAGE_BYTES: u64 = 128 << 20;
     const NAMES: [&str; 3] = ["中文新文件", "日本語の新しいファイル", "한국어새파일"];
     const LABEL: &[u8] = b"system_u:object_r:helios_t:s0";
+    const TRUSTED: &[u8] = b"private-mount-authority";
+    // `vfs_cap_data` (`VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE`,
+    // `CAP_NET_RAW` permitted) from `include/uapi/linux/capability.h`.
+    const VFS_CAP_V2: &[u8] = &[
+        0x01, 0x00, 0x00, 0x02, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    // Canonical 5-entry `posix_acl_xattr_header` v2 (`u::rwx,u:1000:r-x,g::r-x,m::r-x,o::r-x`)
+    // from `include/uapi/linux/posix_acl_xattr.h`.
+    const POSIX_ACL_V2: &[u8] = &[
+        0x02, 0x00, 0x00, 0x00, // version 2
+        0x01, 0x00, 0x07, 0x00, 0xff, 0xff, 0xff, 0xff, // ACL_USER_OBJ rwx
+        0x02, 0x00, 0x05, 0x00, 0xe8, 0x03, 0x00, 0x00, // ACL_USER 1000 r-x
+        0x04, 0x00, 0x05, 0x00, 0xff, 0xff, 0xff, 0xff, // ACL_GROUP_OBJ r-x
+        0x10, 0x00, 0x05, 0x00, 0xff, 0xff, 0xff, 0xff, // ACL_MASK r-x
+        0x20, 0x00, 0x05, 0x00, 0xff, 0xff, 0xff, 0xff, // ACL_OTHER r-x
+    ];
 
-    let tree = tempfile::tempdir().unwrap();
-    let path = |name: &str| tree.path().join(name);
-    let utf8 = |name: &str| path(name).to_str().unwrap().to_owned();
-    std::fs::write(path("suid"), b"#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(
-        path("suid"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o4755),
-    )
-    .unwrap();
-    // /dev/null's numbers; the node is never opened.
-    sudo(&["mknod", &utf8("中文设备"), "c", "1", "3"]);
-    std::fs::write(path("日本語のファイル"), "こんにちは\n").unwrap();
-    std::fs::write(path("한국어파일"), "안녕하세요\n").unwrap();
-    std::fs::write(path("doomed"), b"unlinked below").unwrap();
-    std::fs::write(path("moved"), b"renamed below").unwrap();
-    for name in ["suid", "中文设备"] {
+    let seeded = tempfile::NamedTempFile::new().unwrap();
+    seeded.as_file().set_len(IMAGE_BYTES).unwrap();
+    let mkfs = std::process::Command::new("mkfs.btrfs")
+        .args(["-q", "-f"])
+        .arg(seeded.path())
+        .output()
+        .expect("btrfs-progs must be installed");
+    assert!(
+        mkfs.status.success(),
+        "mkfs.btrfs failed: {}",
+        String::from_utf8_lossy(&mkfs.stderr)
+    );
+
+    let mount_dir = tempfile::tempdir().unwrap();
+    let point = mount_dir.path().to_str().unwrap().to_owned();
+    sudo(&[
+        "mount",
+        "-t",
+        "btrfs",
+        "-o",
+        "loop,acl",
+        seeded.path().to_str().unwrap(),
+        &point,
+    ]);
+    let populated = (|| -> std::io::Result<()> {
+        sudo(&["chmod", "0777", &point]);
+        let path = |name: &str| mount_dir.path().join(name);
+        let utf8 = |name: &str| path(name).to_str().unwrap().to_owned();
+        std::fs::write(path("suid"), b"#!/bin/sh\n")?;
         sudo(&[
             "setfattr",
             "-n",
-            "security.helios",
+            "system.posix_acl_access",
             "-v",
-            std::str::from_utf8(LABEL).unwrap(),
-            &utf8(name),
+            &hex_value(POSIX_ACL_V2),
+            &utf8("suid"),
         ]);
-    }
-    let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &[]);
+        std::fs::set_permissions(path("suid"), std::fs::Permissions::from_mode(0o4755))?;
+        sudo(&[
+            "setfattr",
+            "-n",
+            "security.capability",
+            "-v",
+            &hex_value(VFS_CAP_V2),
+            &utf8("suid"),
+        ]);
+        // /dev/null's numbers; the node is never opened.
+        sudo(&["mknod", &utf8("中文设备"), "c", "1", "3"]);
+        std::fs::write(path("日本語のファイル"), "こんにちは\n")?;
+        std::fs::write(path("한국어파일"), "안녕하세요\n")?;
+        std::fs::write(path("doomed"), b"unlinked below")?;
+        std::fs::write(path("moved"), b"renamed below")?;
+        for name in ["suid", "中文设备"] {
+            sudo(&[
+                "setfattr",
+                "-h",
+                "-n",
+                "security.helios",
+                "-v",
+                &hex_value(LABEL),
+                &utf8(name),
+            ]);
+            sudo(&[
+                "setfattr",
+                "-h",
+                "-n",
+                "trusted.helios",
+                "-v",
+                &hex_value(TRUSTED),
+                &utf8(name),
+            ]);
+        }
+        Ok(())
+    })();
+    sudo(&["umount", &point]);
+    populated.unwrap();
+
+    let image = load_sparse_image(seeded.path(), IMAGE_BYTES);
     let shared = std::sync::Arc::new(WritableImage(Mutex::new(image)));
+    let null = DeviceNumber::new(1, 3).unwrap();
 
     block_on(async {
         let mut writer = Writer::mount(
@@ -454,12 +569,13 @@ fn linux_authority_survives_unrelated_writes() {
             let view = writer.snapshot().unwrap();
             let inode = view.resolve(format!("/{name}").as_bytes()).await.unwrap();
             let metadata = *inode.metadata();
-            let mut value = [0; 64];
-            let security = view
-                .xattr(&inode, b"security.helios", &mut value)
-                .await
-                .unwrap()
-                .map(|length| value[..length].to_vec());
+            let read_attr = async |attr: &[u8]| {
+                let mut value = [0; 128];
+                view.xattr(&inode, attr, &mut value)
+                    .await
+                    .unwrap()
+                    .map(|length| value[..length].to_vec())
+            };
             Authority {
                 kind: metadata.kind,
                 permissions: metadata.permissions,
@@ -470,16 +586,22 @@ fn linux_authority_survives_unrelated_writes() {
                 size: metadata.size,
                 ctime: metadata.ctime,
                 mtime: metadata.mtime,
-                security,
+                capability: read_attr(b"security.capability").await,
+                acl: read_attr(b"system.posix_acl_access").await,
+                trusted: read_attr(b"trusted.helios").await,
+                security: read_attr(b"security.helios").await,
             }
         };
         let suid = authority(&writer, "suid").await;
         let device = authority(&writer, "中文设备").await;
         assert_eq!(suid.permissions, 0o4755);
-        assert_eq!(device.kind, helios_btrfs::FileKind::CharDevice);
-        // `mkfs.btrfs --rootdir` stores every rdev as 0 (btrfs-progs
-        // mkfs/rootdir.c), so only its preservation below is checked.
+        assert_eq!(suid.capability.as_deref(), Some(VFS_CAP_V2));
+        assert_eq!(suid.acl.as_deref(), Some(POSIX_ACL_V2));
+        assert_eq!(suid.trusted.as_deref(), Some(TRUSTED));
         assert_eq!(suid.security.as_deref(), Some(LABEL));
+        assert_eq!(device.kind, helios_btrfs::FileKind::CharDevice);
+        assert_eq!(device.rdev, null);
+        assert_eq!(device.trusted.as_deref(), Some(TRUSTED));
         assert_eq!(device.security.as_deref(), Some(LABEL));
 
         // Create, write, rename and unlink elsewhere.
@@ -541,7 +663,67 @@ fn linux_authority_survives_unrelated_writes() {
             .unwrap();
     });
 
-    btrfs_check(&shared);
+    let checked = btrfs_check(&shared);
+    let readback_dir = tempfile::tempdir().unwrap();
+    let readback_point = readback_dir.path().to_str().unwrap().to_owned();
+    sudo(&[
+        "mount",
+        "-t",
+        "btrfs",
+        "-o",
+        "loop,ro,acl",
+        checked.path().to_str().unwrap(),
+        &readback_point,
+    ]);
+    let linux_readback = (|| -> std::io::Result<_> {
+        let suid_path = readback_dir.path().join("suid");
+        let dev_path = readback_dir.path().join("中文设备");
+        let suid_meta = std::fs::symlink_metadata(&suid_path)?;
+        let dev_meta = std::fs::symlink_metadata(&dev_path)?;
+        let get_attr = |target: &std::path::Path, attr: &str| {
+            sudo_output(&[
+                "getfattr",
+                "-h",
+                "--absolute-names",
+                "--only-values",
+                "-n",
+                attr,
+                target.to_str().unwrap(),
+            ])
+        };
+        Ok((
+            suid_meta.mode(),
+            get_attr(&suid_path, "security.capability"),
+            get_attr(&suid_path, "system.posix_acl_access"),
+            get_attr(&suid_path, "trusted.helios"),
+            get_attr(&suid_path, "security.helios"),
+            dev_meta.file_type().is_char_device(),
+            dev_meta.rdev(),
+            get_attr(&dev_path, "trusted.helios"),
+            get_attr(&dev_path, "security.helios"),
+        ))
+    })();
+    sudo(&["umount", &readback_point]);
+    let (
+        suid_mode,
+        suid_cap,
+        suid_acl,
+        suid_trusted,
+        suid_sec,
+        dev_is_chr,
+        dev_rdev,
+        dev_trusted,
+        dev_sec,
+    ) = linux_readback.unwrap();
+    assert_eq!(suid_mode, 0o104_755);
+    assert_eq!(suid_cap, VFS_CAP_V2);
+    assert_eq!(suid_acl, POSIX_ACL_V2);
+    assert_eq!(suid_trusted, TRUSTED);
+    assert_eq!(suid_sec, LABEL);
+    assert!(dev_is_chr);
+    assert_eq!(dev_rdev, u64::from(null.encode()));
+    assert_eq!(dev_trusted, TRUSTED);
+    assert_eq!(dev_sec, LABEL);
 }
 
 /// Copies the image to a file, which `btrfs check` must find clean.
@@ -583,6 +765,8 @@ fn linux_reads_back_the_authority_helios_sets() {
     const NAMES: [&str; 3] = ["中文", "日本語", "한국어"];
     let tree = tempfile::tempdir().unwrap();
     std::fs::write(tree.path().join("chmod-me"), b"#!/bin/sh\n").unwrap();
+    let initial = std::fs::metadata(tree.path().join("chmod-me")).unwrap();
+    let (initial_uid, initial_gid) = (initial.uid(), initial.gid());
     std::fs::write(tree.path().join("chown-me"), b"#!/bin/sh\n").unwrap();
     std::fs::set_permissions(
         tree.path().join("chown-me"),
@@ -618,7 +802,13 @@ fn linux_reads_back_the_authority_helios_sets() {
         }
         let chmod = tx.lookup(&root, b"chmod-me").await.unwrap().unwrap();
         tx.set_permissions(&chmod, 0o7755, when).await.unwrap();
-        expected.push(("chmod-me".to_owned(), 0o107_755, 0, 0, 0));
+        expected.push((
+            "chmod-me".to_owned(),
+            0o107_755,
+            initial_uid,
+            initial_gid,
+            0,
+        ));
         let chown = tx.lookup(&root, b"chown-me").await.unwrap().unwrap();
         tx.set_owner(&chown, Some(1000), Some(1000), when)
             .await

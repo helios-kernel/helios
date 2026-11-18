@@ -255,9 +255,8 @@ impl Filesystem for Daemon {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        // Both flags together, `RENAME_WHITEOUT` (a whiteout is a device
-        // node, which the writer cannot create) and unknown bits are `EINVAL`
-        // as on Linux.
+        // Both flags together, `RENAME_WHITEOUT` (which `rename` does not
+        // implement) and unknown bits are `EINVAL` as on Linux.
         let mode = if flags.is_empty() {
             RenameMode::Replace
         } else if flags == RenameFlags::RENAME_NOREPLACE {

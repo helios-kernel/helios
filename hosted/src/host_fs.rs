@@ -200,11 +200,18 @@ impl HostFileSystem for HostedFileSystem {
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         blocking_path(self.resolve(path), move |path| {
             let file = fs::File::create_new(&path).map_err(map_io_error)?;
-            if file.metadata().map_err(map_io_error)?.gid() != creation.gid {
-                unix_fs::fchown(&file, None, Some(creation.gid)).map_err(map_io_error)?;
+            let configured = (|| {
+                if file.metadata().map_err(map_io_error)?.gid() != creation.gid {
+                    unix_fs::fchown(&file, None, Some(creation.gid)).map_err(map_io_error)?;
+                }
+                file.set_permissions(fs::Permissions::from_mode(creation.permissions))
+                    .map_err(map_io_error)
+            })();
+            if configured.is_err() {
+                drop(file);
+                let _ = fs::remove_file(&path);
             }
-            file.set_permissions(fs::Permissions::from_mode(creation.permissions))
-                .map_err(map_io_error)
+            configured
         })
     }
 
@@ -215,9 +222,15 @@ impl HostFileSystem for HostedFileSystem {
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         blocking_path(self.resolve(path), move |path| {
             fs::create_dir(&path).map_err(map_io_error)?;
-            in_group(&path, creation.gid)?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(creation.permissions))
-                .map_err(map_io_error)
+            let configured = (|| {
+                in_group(&path, creation.gid)?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(creation.permissions))
+                    .map_err(map_io_error)
+            })();
+            if configured.is_err() {
+                let _ = fs::remove_dir(&path);
+            }
+            configured
         })
     }
 
@@ -268,7 +281,11 @@ impl HostFileSystem for HostedFileSystem {
         let target = PathBuf::from(target);
         blocking_path(self.resolve(link_path), move |link_path| {
             unix_fs::symlink(target, &link_path).map_err(map_io_error)?;
-            in_group(&link_path, gid)
+            let configured = in_group(&link_path, gid);
+            if configured.is_err() {
+                let _ = fs::remove_file(&link_path);
+            }
+            configured
         })
     }
 

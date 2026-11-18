@@ -377,8 +377,11 @@ impl MemoryFs {
     pub fn xattr(&self, path: FsPath<'_>, name: &str) -> FsResult<Option<Bytes>> {
         let state = self.state.lock();
         let (_, inode) = state.inode(path)?;
-        validate_xattr_name(inode.kind, name, false)?;
-        Ok(inode.xattrs.get(name).cloned())
+        match validate_xattr_name(inode.kind, name, XattrOp::Read) {
+            Ok(()) => Ok(inode.xattrs.get(name).cloned()),
+            Err(FsError::NoEntry) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Lists every extended attribute name stored on the inode at `path`,
@@ -406,7 +409,7 @@ impl MemoryFs {
         }
         let mut state = self.state.lock();
         let inode = state.inode_mut(path)?;
-        validate_xattr_name(inode.kind, name, true)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Set)?;
         let exists = inode.xattrs.contains_key(name);
         match (mode, exists) {
             (XattrSetMode::Create, true) => return Err(FsError::Exists),
@@ -423,7 +426,7 @@ impl MemoryFs {
     pub fn remove_xattr(&self, path: FsPath<'_>, name: &str, now: u64) -> FsResult<bool> {
         let mut state = self.state.lock();
         let inode = state.inode_mut(path)?;
-        validate_xattr_name(inode.kind, name, false)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Remove)?;
         let removed = inode.xattrs.remove(name).is_some();
         if removed {
             inode.status_nanos = now;
@@ -558,20 +561,36 @@ fn validate_permissions(permissions: u32) -> FsResult<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XattrOp {
+    Read,
+    Set,
+    Remove,
+}
+
 /// Validates an extended attribute name against Linux's tmpfs handlers
-/// (`shmem_xattr_handlers` in `mm/shmem.c`, `xattr_resolve_name` and
-/// `xattr_permission` in `fs/xattr.c`, and `posix_acl_xattr_set` in
+/// (`shmem_xattr_handlers` in `mm/shmem.c`, `xattr_permission` and
+/// `xattr_resolve_name` in `fs/xattr.c`, and `posix_acl_xattr_set` in
 /// `fs/posix_acl.c`). No attribute is refused for what its value means.
-fn validate_xattr_name(kind: NodeKind, name: &str, writing: bool) -> FsResult<()> {
-    if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return Err(FsError::Overflow);
+fn validate_xattr_name(kind: NodeKind, name: &str, op: XattrOp) -> FsResult<()> {
+    if name.len() > XATTR_NAME_MAX {
+        return Err(FsError::NameTooLong);
     }
     if let Some(suffix) = name.strip_prefix("user.") {
+        // `xattr_permission` in `fs/xattr.c` runs before `xattr_resolve_name`:
+        // `user.*` applies to regular files, directories and sockets, and any
+        // other kind answers `EPERM` for `MAY_WRITE` and `ENODATA` for `MAY_READ`.
+        if !matches!(
+            kind,
+            NodeKind::File | NodeKind::Directory | NodeKind::Socket
+        ) {
+            return Err(match op {
+                XattrOp::Read => FsError::NoEntry,
+                XattrOp::Set | XattrOp::Remove => FsError::NotPermitted,
+            });
+        }
         if suffix.is_empty() {
             return Err(FsError::Invalid);
-        }
-        if !matches!(kind, NodeKind::File | NodeKind::Directory) {
-            return Err(FsError::NotPermitted);
         }
         return Ok(());
     }
@@ -594,7 +613,7 @@ fn validate_xattr_name(kind: NodeKind, name: &str, writing: bool) -> FsResult<()
         if kind == NodeKind::Symlink {
             return Err(FsError::Unsupported);
         }
-        if writing && kind != NodeKind::Directory {
+        if op == XattrOp::Set && kind != NodeKind::Directory {
             return Err(FsError::NotPermitted);
         }
         return Ok(());
@@ -1688,8 +1707,22 @@ mod tests {
             ),
             Err(FsError::NotPermitted)
         );
-        // `user.*` is refused on symlinks and special nodes (`xattr_permission`);
-        // `security.*` and `trusted.*` are kept on them.
+        // `user.*` applies to regular files, directories and sockets
+        // (`xattr_permission` in `fs/xattr.c`), and is refused with `EPERM`
+        // for `MAY_WRITE` and `ENODATA` for `MAY_READ` on other kinds;
+        // `security.*` and `trusted.*` are kept on every kind.
+        fs.set_xattr(
+            path("sock"),
+            "user.varlink",
+            Bytes::from_static(b"1"),
+            XattrSetMode::Create,
+            4,
+        )
+        .expect("user xattr on socket");
+        assert_eq!(
+            fs.xattr(path("sock"), "user.varlink").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
         assert_eq!(
             fs.set_xattr(
                 path("chr"),
@@ -1700,6 +1733,19 @@ mod tests {
             ),
             Err(FsError::NotPermitted)
         );
+        assert_eq!(fs.xattr(path("chr"), "user.label").unwrap(), None);
+        assert_eq!(fs.xattr(path("chr"), "user.").unwrap(), None);
+        assert_eq!(
+            fs.remove_xattr(path("chr"), "user.label", 4),
+            Err(FsError::NotPermitted)
+        );
+        for bare in ["user.", "security.", "trusted."] {
+            assert_eq!(
+                fs.xattr(path("suid"), bare),
+                Err(FsError::Invalid),
+                "{bare}"
+            );
+        }
         fs.set_xattr(
             path("chr"),
             "security.selinux",
@@ -1716,6 +1762,27 @@ mod tests {
             4,
         )
         .expect("trusted xattr on symlink");
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                "",
+                Bytes::from_static(b"no"),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::Unsupported)
+        );
+        let overlong = alloc::format!("user.{}", "x".repeat(256));
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                &overlong,
+                Bytes::from_static(b"no"),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::NameTooLong)
+        );
         assert_eq!(
             fs.set_xattr(
                 path("suid"),

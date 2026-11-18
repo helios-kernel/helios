@@ -205,7 +205,7 @@ impl MountGrant {
     /// from the attribute `stored` on the file. A shared mount is nosuid,
     /// so `get_file_caps` in `security/commoncap.c` ignores any stored
     /// capability (`!mnt_may_suid`).
-    pub fn file_capability<'a>(self, stored: Option<&'a [u8]>) -> Option<&'a [u8]> {
+    pub fn file_capability(self, stored: Option<&[u8]>) -> Option<&[u8]> {
         if self.flags().honours_exec_privileges() {
             stored
         } else {
