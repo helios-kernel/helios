@@ -349,11 +349,9 @@ jobs:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev cmake ninja-build
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: libudev-dev cmake ninja-build
       # Each program's wasm, kept with the files its build read (#1022): a
       # program none of whose inputs changed is taken from the cache
       # instead of built. The key carries the run id so that each
@@ -448,16 +446,26 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install format lint dependencies
+        if: matrix.name == 'lint-fmt'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: just
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs attr libclang-dev
-      - uses: taiki-e/install-action@v2
+        if: matrix.name != 'lint-fmt'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: libudev-dev just cmake ninja-build erofs-utils btrfs-progs attr libclang-dev
+      - if: matrix.name == 'lint-fmt'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - if: matrix.name != 'lint-fmt'
+        uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools,cargo-deny,nextest
-      - uses: ./helios/.github/actions/setup-zig
+      - if: matrix.name != 'lint-fmt'
+        uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Restore WASI tooling artifacts
@@ -500,7 +508,8 @@ jobs:
           workspaces: helios
           key: ${{ matrix.name }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
-      - uses: astral-sh/setup-uv@v6
+      - if: matrix.name != 'lint-fmt'
+        uses: astral-sh/setup-uv@v6
       # After the Rust cache, so a lane whose cache holds the binary
       # builds it from there when no other job has uploaded it yet.
       - uses: ./helios/.github/actions/helios-cli
@@ -591,13 +600,13 @@ jobs:
           key: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
             qemu-system-misc opensbi
-          qemu-system-riscv64 --version
+      - name: Record QEMU version
+        run: qemu-system-riscv64 --version
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
@@ -942,14 +951,15 @@ jobs:
           key: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
-            python3-venv pkg-config flex bison \
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
             swtpm
+      - name: Record swtpm and KVM availability
+        run: |
           swtpm --version
           # Recorded rather than required: the accelerator is picked by
           # capability and today's Arm runners publish no KVM node.
@@ -1461,13 +1471,12 @@ jobs:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils \
-            python3-venv pkg-config flex bison \
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
             swtpm
       - name: Restore the pinned QEMU install prefix
         id: qemu-cache
@@ -1558,12 +1567,13 @@ jobs:
           key: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
             qemu-system-x86 ovmf swtpm
+      - name: Record QEMU, swtpm and KVM availability
+        run: |
           qemu-system-x86_64 --version
           swtpm --version
           # The inspector picks the accelerator by capability; this only
@@ -2702,12 +2712,13 @@ jobs:
           key: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils
             qemu-system-x86 ovmf swtpm socat
+      - name: Record QEMU and KVM availability
+        run: |
           qemu-system-x86_64 --version
           if [ -e /dev/kvm ]; then
             sudo chmod 666 /dev/kvm
@@ -2870,17 +2881,16 @@ jobs:
           key: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          # The build dependencies of both pinned builds, Mesa's lavapipe
-          # as the host Vulkan driver.
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build meson ovmf \
-            python3-venv pkg-config flex bison \
-            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev \
-            libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build meson ovmf
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev
+            libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev
             mesa-vulkan-drivers libegl-mesa0 gdb
+      - name: Configure Venus render devices
+        run: |
           # vgem gives a GPU-less runner the render node QEMU's EGL
           # context opens; the azure kernel's own modules package carries
           # it.
@@ -3126,9 +3136,9 @@ jobs:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install upstream test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends btrfs-progs wamerican libclang-dev
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: btrfs-progs wamerican libclang-dev
       - name: Build Helios upstream test adapters
         working-directory: helios
         run: cargo build --locked -p helios-btrfs --examples --features test-support
@@ -3164,14 +3174,17 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Resolve running kernel headers package
+        id: kernel-headers
+        run: echo "headers=linux-headers-$(uname -r)" >> "$GITHUB_OUTPUT"
       - name: Install fstests, btrfs-progs and FUSE
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            acl attr automake bc dbench dump e2fsprogs fio gawk gcc git indent \
-            libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin \
-            liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev \
-            uuid-runtime xfsprogs "linux-headers-$(uname -r)" sqlite3 \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            acl attr automake bc dbench dump e2fsprogs fio gawk gcc git indent
+            libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin
+            liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev
+            uuid-runtime xfsprogs ${{ steps.kernel-headers.outputs.headers }} sqlite3
             libgdbm-compat-dev xfslibs-dev btrfs-progs fuse3 libclang-dev
       - name: Build the FUSE adapter
         working-directory: helios
@@ -3411,25 +3424,25 @@ jobs:
           path: ${{ env.HELIOS_ARTIFACT_CACHE }}
           key: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-
-      - name: Install host dependencies
-        if: steps.cases.outputs.count != '0'
-        env:
-          ARCH: ${{ matrix.arch }}
+      - name: Install host dependencies (x86_64)
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: libudev-dev just cmake ninja-build erofs-utils btrfs-progs qemu-system-x86 ovmf
+      - name: Record QEMU and KVM availability (x86_64)
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64'
         run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          if [[ "$ARCH" == x86_64 ]]; then
-            sudo apt-get install -y --no-install-recommends \
-              libudev-dev just cmake ninja-build erofs-utils btrfs-progs qemu-system-x86 ovmf
-            qemu-system-x86_64 --version
-            sudo chmod 666 /dev/kvm
-            ls -la /dev/kvm
-          else
-            sudo apt-get install -y --no-install-recommends \
-              libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
-              python3-venv pkg-config flex bison \
-              libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
-          fi
+          qemu-system-x86_64 --version
+          sudo chmod 666 /dev/kvm
+          ls -la /dev/kvm
+      - name: Install host dependencies (aarch64)
+        if: steps.cases.outputs.count != '0' && matrix.arch != 'x86_64'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
       - name: Restore the pinned QEMU install prefix
         if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
         id: qemu-cache
