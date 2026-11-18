@@ -407,8 +407,20 @@ where
         }
     }
 
+    pub(super) fn stdin_route(&self) -> crate::ComponentInputRoute {
+        self.output_mode.stdin_route()
+    }
+
     pub(super) fn output_route(&self, stream: crate::ComponentOutputStreamKind) -> OutputRoute {
         self.output_mode.route(stream)
+    }
+
+    pub(super) fn fork_output_mode(&self) -> OutputMode {
+        OutputMode::RoutedChild {
+            stdin: self.stdin_route(),
+            stdout: self.output_route(crate::ComponentOutputStreamKind::Stdout),
+            stderr: self.output_route(crate::ComponentOutputStreamKind::Stderr),
+        }
     }
 
     pub(super) fn insert_child(
@@ -475,31 +487,37 @@ where
         }
     }
 
-    pub(super) async fn read_stdin(&mut self, max_bytes: u32) -> Bytes {
-        let descriptor = self.descriptors.get_mut(0);
-        let Some(Preview1Descriptor::Stdin { carry }) = descriptor else {
+    pub(super) async fn read_stdin(&mut self, fd: i32, max_bytes: u32) -> Bytes {
+        if max_bytes == 0 {
+            return Bytes::new();
+        }
+        let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd) else {
             return Bytes::new();
         };
-        if carry.is_empty() {
-            match &self.output_mode {
-                OutputMode::Serial => loop {
-                    let wait = self.write_serial.wait_for_debug_serial_input();
-                    (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
-                    if !self.serial_read_buffer.is_empty() {
-                        *carry = Bytes::copy_from_slice(&self.serial_read_buffer);
-                        break;
-                    }
-                    wait.await;
-                },
-                OutputMode::Trace => {}
-                OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                    if let Some(bytes) = stdin_rx.read().await {
-                        *carry = bytes;
-                    }
-                }
-            }
+        if !carry.is_empty() {
+            return take_preview1_carry(carry, max_bytes as usize);
         }
-        take_preview1_carry(carry, max_bytes as usize)
+        match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial => loop {
+                let wait = self.write_serial.wait_for_debug_serial_input();
+                (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
+                if !self.serial_read_buffer.is_empty() {
+                    let bytes = Bytes::copy_from_slice(&self.serial_read_buffer);
+                    let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd)
+                    else {
+                        return Bytes::new();
+                    };
+                    *carry = bytes;
+                    return take_preview1_carry(carry, max_bytes as usize);
+                }
+                wait.await;
+            },
+            crate::ComponentInputRoute::Closed => Bytes::new(),
+            crate::ComponentInputRoute::Child(stdin_rx) => stdin_rx
+                .read_limit(max_bytes as usize)
+                .await
+                .unwrap_or_default(),
+        }
     }
 
     /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
@@ -507,8 +525,8 @@ where
     /// Serial-backed stdin waits on the console's receive signal, so the
     /// probe pulls whatever the console already has into the descriptor's
     /// carry; a later `fd_read` drains that carry, so nothing is lost. A
-    /// child's stdin is a byte channel that answers directly, and trace
-    /// output never delivers input at all.
+    /// child's stdin is a byte channel that answers directly, and trace/closed
+    /// input never delivers input at all.
     pub(super) fn probe_stdin(&mut self, fd: i32) -> P1Readiness {
         match self.descriptors.get(fd) {
             Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
@@ -521,12 +539,10 @@ where
         }
         // Resolve the mode to a plain value first so the console read below
         // does not overlap the borrow of `output_mode`.
-        let channel_readable = match &self.output_mode {
-            OutputMode::Serial => None,
-            OutputMode::Trace => return P1Readiness::Hangup,
-            OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                Some(stdin_rx.is_readable())
-            }
+        let channel_readable = match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial => None,
+            crate::ComponentInputRoute::Closed => return P1Readiness::Hangup,
+            crate::ComponentInputRoute::Child(stdin_rx) => Some(stdin_rx.is_readable()),
         };
         if let Some(readable) = channel_readable {
             return if readable {
@@ -2239,7 +2255,7 @@ where
     let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
     let capacity = layout.byte_len;
     let bytes = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(capacity).await,
+        Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(fd, capacity).await,
         Some(Preview1Descriptor::PipeRead { .. }) => {
             caller.data_mut().read_pipe(fd, capacity as usize).await?
         }
@@ -4717,7 +4733,9 @@ where
     StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => Ok(caller.data_mut().read_stdin(capacity).await),
+        Some(Preview1Descriptor::Stdin { .. }) => {
+            Ok(caller.data_mut().read_stdin(fd, capacity).await)
+        }
         Some(Preview1Descriptor::PipeRead { .. }) => {
             caller.data_mut().read_pipe(fd, capacity as usize).await
         }

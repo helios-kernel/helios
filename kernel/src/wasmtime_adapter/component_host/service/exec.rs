@@ -1815,16 +1815,7 @@ where
         detail: ProgramExecErrorDetail::InvalidEntryPoint,
     })?;
     let environment = store.data().environment.clone();
-    let (_, stdin_reader) = crate::byte_channel();
-    let output_mode = OutputMode::RoutedChild {
-        stdin_rx: stdin_reader,
-        stdout: store
-            .data()
-            .output_route(crate::ComponentOutputStreamKind::Stdout),
-        stderr: store
-            .data()
-            .output_route(crate::ComponentOutputStreamKind::Stderr),
-    };
+    let output_mode = store.data().fork_output_mode();
     let mut child = service.spawn_loaded_with_output_mode(
         store.data().exec_context(),
         ProgramExecutable::ForkedCoreModule { compiled, restore },
