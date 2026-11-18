@@ -314,7 +314,7 @@ where
     pub(super) fn take_process_end(
         &mut self,
         error: wasmtime::Error,
-    ) -> Result<u32, ProgramExecError> {
+    ) -> Result<helios_unix::ChildTermination, ProgramExecError> {
         preview1_process_end(error, self.requested_exit.take())
     }
 
@@ -407,8 +407,20 @@ where
         }
     }
 
+    pub(super) fn stdin_route(&self) -> crate::ComponentInputRoute {
+        self.output_mode.stdin_route()
+    }
+
     pub(super) fn output_route(&self, stream: crate::ComponentOutputStreamKind) -> OutputRoute {
         self.output_mode.route(stream)
+    }
+
+    pub(super) fn fork_output_mode(&self) -> OutputMode {
+        OutputMode::RoutedChild {
+            stdin: self.stdin_route(),
+            stdout: self.output_route(crate::ComponentOutputStreamKind::Stdout),
+            stderr: self.output_route(crate::ComponentOutputStreamKind::Stderr),
+        }
     }
 
     pub(super) fn insert_child(
@@ -425,9 +437,12 @@ where
         });
     }
 
-    pub(super) fn poll_child_exit(&mut self, index: usize) -> Result<Option<u32>, i32> {
-        if let Some(code) = self.children[index].completed {
-            return Ok(Some(code));
+    pub(super) fn poll_child_exit(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<helios_unix::ChildTermination>, i32> {
+        if let Some(termination) = self.children[index].completed {
+            return Ok(Some(termination));
         }
         let Some(exit) = self.children[index].exit.as_mut() else {
             return Ok(self.children[index].completed);
@@ -437,19 +452,21 @@ where
         match Pin::new(exit).poll(&mut context) {
             Poll::Pending => Ok(None),
             Poll::Ready(Ok(Ok(exit))) => {
-                let code = exit.exit_code;
+                let termination = exit.termination;
                 if let Some(filesystem) = exit.filesystem {
                     self.filesystem.adopt_root_layer(filesystem);
                 }
-                self.children[index].completed = Some(code);
+                self.children[index].completed = Some(termination);
                 self.children[index].exit = None;
-                Ok(Some(code))
+                Ok(Some(termination))
             }
-            Poll::Ready(Ok(Err(_))) | Poll::Ready(Err(_)) => {
-                let code = u32::from(p1::errno::IO as u16);
-                self.children[index].completed = Some(code);
-                self.children[index].exit = None;
-                Ok(Some(code))
+            Poll::Ready(Ok(Err(error))) => {
+                self.children.swap_remove(index);
+                Err(p1_errno_from_program_exec_error(&error))
+            }
+            Poll::Ready(Err(_)) => {
+                self.children.swap_remove(index);
+                Err(p1::errno::IO)
             }
         }
     }
@@ -470,31 +487,37 @@ where
         }
     }
 
-    pub(super) async fn read_stdin(&mut self, max_bytes: u32) -> Bytes {
-        let descriptor = self.descriptors.get_mut(0);
-        let Some(Preview1Descriptor::Stdin { carry }) = descriptor else {
+    pub(super) async fn read_stdin(&mut self, fd: i32, max_bytes: u32) -> Bytes {
+        if max_bytes == 0 {
+            return Bytes::new();
+        }
+        let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd) else {
             return Bytes::new();
         };
-        if carry.is_empty() {
-            match &self.output_mode {
-                OutputMode::Serial => loop {
-                    let wait = self.write_serial.wait_for_debug_serial_input();
-                    (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
-                    if !self.serial_read_buffer.is_empty() {
-                        *carry = Bytes::copy_from_slice(&self.serial_read_buffer);
-                        break;
-                    }
-                    wait.await;
-                },
-                OutputMode::Trace => {}
-                OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                    if let Some(bytes) = stdin_rx.read().await {
-                        *carry = bytes;
-                    }
-                }
-            }
+        if !carry.is_empty() {
+            return take_preview1_carry(carry, max_bytes as usize);
         }
-        take_preview1_carry(carry, max_bytes as usize)
+        match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial => loop {
+                let wait = self.write_serial.wait_for_debug_serial_input();
+                (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
+                if !self.serial_read_buffer.is_empty() {
+                    let bytes = Bytes::copy_from_slice(&self.serial_read_buffer);
+                    let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd)
+                    else {
+                        return Bytes::new();
+                    };
+                    *carry = bytes;
+                    return take_preview1_carry(carry, max_bytes as usize);
+                }
+                wait.await;
+            },
+            crate::ComponentInputRoute::Closed => Bytes::new(),
+            crate::ComponentInputRoute::Child(stdin_rx) => stdin_rx
+                .read_limit(max_bytes as usize)
+                .await
+                .unwrap_or_default(),
+        }
     }
 
     /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
@@ -502,8 +525,8 @@ where
     /// Serial-backed stdin waits on the console's receive signal, so the
     /// probe pulls whatever the console already has into the descriptor's
     /// carry; a later `fd_read` drains that carry, so nothing is lost. A
-    /// child's stdin is a byte channel that answers directly, and trace
-    /// output never delivers input at all.
+    /// child's stdin is a byte channel that answers directly, and trace/closed
+    /// input never delivers input at all.
     pub(super) fn probe_stdin(&mut self, fd: i32) -> P1Readiness {
         match self.descriptors.get(fd) {
             Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
@@ -516,12 +539,10 @@ where
         }
         // Resolve the mode to a plain value first so the console read below
         // does not overlap the borrow of `output_mode`.
-        let channel_readable = match &self.output_mode {
-            OutputMode::Serial => None,
-            OutputMode::Trace => return P1Readiness::Hangup,
-            OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                Some(stdin_rx.is_readable())
-            }
+        let channel_readable = match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial => None,
+            crate::ComponentInputRoute::Closed => return P1Readiness::Hangup,
+            crate::ComponentInputRoute::Child(stdin_rx) => Some(stdin_rx.is_readable()),
         };
         if let Some(readable) = channel_readable {
             return if readable {
@@ -2234,7 +2255,7 @@ where
     let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
     let capacity = layout.byte_len;
     let bytes = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(capacity).await,
+        Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(fd, capacity).await,
         Some(Preview1Descriptor::PipeRead { .. }) => {
             caller.data_mut().read_pipe(fd, capacity as usize).await?
         }
@@ -4005,7 +4026,7 @@ async fn p1_read_subscriptions(
 }
 
 pub(super) fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     signal: u32,
 ) -> wasmtime::Result<i32>
 where
@@ -4013,10 +4034,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    caller
-        .data_mut()
-        .request_exit(128u32.saturating_add(signal));
-    Err(wasmtime::Error::new(Preview1Exit))
+    let Ok(signal) = u8::try_from(signal) else {
+        return Ok(p1::errno::INVAL);
+    };
+    Err(wasmtime::Error::new(Preview1SignalExit { signal }))
 }
 
 pub(super) fn p1_errno_from_wasmtime_error(error: &wasmtime::Error) -> i32 {
@@ -4712,7 +4733,9 @@ where
     StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => Ok(caller.data_mut().read_stdin(capacity).await),
+        Some(Preview1Descriptor::Stdin { .. }) => {
+            Ok(caller.data_mut().read_stdin(fd, capacity).await)
+        }
         Some(Preview1Descriptor::PipeRead { .. }) => {
             caller.data_mut().read_pipe(fd, capacity as usize).await
         }
@@ -5764,7 +5787,15 @@ mod tests {
 
         let error =
             drive_wasix_call(&activity, &signal_state, call).expect_err("the signal ends the call");
-        assert_eq!(preview1_exit_status(&error, Some(0)), Some(143));
+        assert_eq!(
+            preview1_exit_status(&error, Some(0)),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 15,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(
             signal_state.take_pending(),
             None,
@@ -5823,7 +5854,15 @@ mod tests {
         let core::task::Poll::Ready(Err(error)) = driven.as_mut().poll(&mut cx) else {
             panic!("the signal ends the suspended call");
         };
-        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 9,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(signal_state.take_pending(), None, "delivered once");
     }
 
@@ -5881,7 +5920,15 @@ mod tests {
         let core::task::Poll::Ready(Err(error)) = target_call.as_mut().poll(&mut target_cx) else {
             panic!("the signal ends the target thread's suspended call");
         };
-        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 9,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(target_thread.take_pending(), None, "delivered once");
         assert_eq!(
             process.take_pending(),
@@ -5955,7 +6002,15 @@ mod tests {
         let error =
             drive_wasix_call(&activity, &signal_state, call).expect_err("the call is stopped");
         assert!(error.downcast_ref::<crate::InstanceKilled>().is_none());
-        assert_eq!(preview1_exit_status(&error, None), Some(130));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 2,
+                    core_dumped: false,
+                }
+            ))
+        );
     }
 
     fn memory_of(bytes: &[u8]) -> Preview1Memory {

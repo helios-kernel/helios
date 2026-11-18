@@ -1,0 +1,853 @@
+use super::*;
+use crate::test_support::{TestCpu, TestNetworkService, UnsupportedStorage};
+use futures_lite::future::block_on;
+use helios_hal::cpu::ProcessorId;
+use helios_hal::watchdog::ProgressCounter;
+use helios_unix::{ChildTermination, SignalTermination};
+use wasmtime::component::HasSelf;
+
+fn child_handle_with_result(
+    instance_id: crate::InstanceId,
+    result: Result<ChildTermination, ProgramExecError>,
+) -> ChildHandle {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let _ = tx.send(result.map(|termination| ChildExit {
+        instance_id,
+        termination,
+        filesystem: None,
+    }));
+    let (stdin_tx, _stdin_rx) = crate::byte_channel();
+    let (_stdout_tx, stdout_rx) = crate::byte_channel();
+    let (_stderr_tx, stderr_rx) = crate::byte_channel();
+    ChildHandle {
+        instance_id,
+        signal_state: WasixSignalState::new(),
+        stdin: Some(stdin_tx),
+        stdout: Some(stdout_rx),
+        stderr: Some(stderr_rx),
+        exit: Some(rx),
+    }
+}
+
+fn component_test_engine() -> wasmtime::Engine {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    config.wasm_component_model_async(true);
+    config.concurrency_support(true);
+    wasmtime::Engine::new(&config).expect("component test engine initializes")
+}
+
+fn await_program_wit_wait(
+    handle: ChildHandle,
+) -> Result<
+    super::super::program_bindings::helios::system::programs::ExitStatus,
+    super::super::program_bindings::helios::system::programs::SpawnError,
+> {
+    use super::super::program_bindings::helios::system::programs::HostChildWithStore;
+
+    let engine = component_test_engine();
+    let mut store = wasmtime::Store::new(
+        &engine,
+        test_store::store_data_authorized(ProcessAuthority::root(), |_| {}),
+    );
+    let resource = store
+        .data_mut()
+        .table
+        .push(handle)
+        .expect("resource table admits child handle");
+    block_on(store.run_concurrent(async move |accessor| {
+        <HasSelf<test_store::TestStoreData> as HostChildWithStore<_>>::wait(accessor, resource)
+            .await
+    }))
+    .expect("concurrent run succeeds")
+    .expect("wait host call succeeds")
+}
+
+fn await_debugger_wit_wait(
+    handle: ChildHandle,
+) -> Result<
+    super::super::debugger_bindings::helios::system::programs::ExitStatus,
+    super::super::debugger_bindings::helios::system::programs::SpawnError,
+> {
+    use super::super::debugger_bindings::helios::system::programs::HostChildWithStore;
+
+    let engine = component_test_engine();
+    let mut store = wasmtime::Store::new(
+        &engine,
+        test_store::store_data_authorized(ProcessAuthority::root(), |_| {}),
+    );
+    let resource = store
+        .data_mut()
+        .table
+        .push(handle)
+        .expect("resource table admits child handle");
+    block_on(store.run_concurrent(async move |accessor| {
+        <HasSelf<test_store::TestStoreData> as HostChildWithStore<_>>::wait(accessor, resource)
+            .await
+    }))
+    .expect("concurrent run succeeds")
+    .expect("wait host call succeeds")
+}
+
+#[test]
+fn child_wait_reports_each_of_the_four_endings_distinctly() {
+    use super::super::debugger_bindings::helios::system::programs as dbg_wit;
+    use super::super::program_bindings::helios::system::programs as prog_wit;
+
+    let cases = [
+        (41_u64, ChildTermination::Exited(0)),
+        (42_u64, ChildTermination::Exited(137)),
+        (
+            43_u64,
+            ChildTermination::Signaled(SignalTermination {
+                signal: 15,
+                core_dumped: false,
+            }),
+        ),
+        (
+            44_u64,
+            ChildTermination::Signaled(SignalTermination {
+                signal: 11,
+                core_dumped: true,
+            }),
+        ),
+        (45_u64, ChildTermination::Trapped),
+        (46_u64, ChildTermination::Killed),
+    ];
+
+    for (raw_id, expected) in cases {
+        let id = crate::InstanceId::from_raw(raw_id);
+        let direct = block_on(child_handle_with_result(id, Ok(expected)).wait())
+            .expect("child handle wait succeeds");
+        assert_eq!(direct.instance_id, id);
+        assert_eq!(direct.termination, expected);
+
+        let prog_status = await_program_wit_wait(child_handle_with_result(id, Ok(expected)))
+            .expect("program WIT child.wait reports termination");
+        assert_eq!(prog_status.instance_id, raw_id);
+        match (expected, prog_status.termination) {
+            (ChildTermination::Exited(a), prog_wit::ChildTermination::Exited(b)) => {
+                assert_eq!(a, b);
+            }
+            (
+                ChildTermination::Signaled(SignalTermination {
+                    signal: a_sig,
+                    core_dumped: a_core,
+                }),
+                prog_wit::ChildTermination::Signaled(prog_wit::SignalTermination {
+                    signal: b_sig,
+                    core_dumped: b_core,
+                }),
+            ) => {
+                assert_eq!((a_sig, a_core), (b_sig, b_core));
+            }
+            (ChildTermination::Trapped, prog_wit::ChildTermination::Trapped)
+            | (ChildTermination::Killed, prog_wit::ChildTermination::Killed) => {}
+            other => panic!("mismatched program WIT termination: {other:?}"),
+        }
+
+        let dbg_status = await_debugger_wit_wait(child_handle_with_result(id, Ok(expected)))
+            .expect("debugger WIT child.wait reports termination");
+        assert_eq!(dbg_status.instance_id, raw_id);
+        match (expected, dbg_status.termination) {
+            (ChildTermination::Exited(a), dbg_wit::ChildTermination::Exited(b)) => {
+                assert_eq!(a, b);
+            }
+            (
+                ChildTermination::Signaled(SignalTermination {
+                    signal: a_sig,
+                    core_dumped: a_core,
+                }),
+                dbg_wit::ChildTermination::Signaled(dbg_wit::SignalTermination {
+                    signal: b_sig,
+                    core_dumped: b_core,
+                }),
+            ) => {
+                assert_eq!((a_sig, a_core), (b_sig, b_core));
+            }
+            (ChildTermination::Trapped, dbg_wit::ChildTermination::Trapped)
+            | (ChildTermination::Killed, dbg_wit::ChildTermination::Killed) => {}
+            other => panic!("mismatched debugger WIT termination: {other:?}"),
+        }
+    }
+
+    let failed = await_program_wit_wait(child_handle_with_result(
+        crate::InstanceId::from_raw(99),
+        Err(ProgramExecError {
+            kind: ProgramExecErrorKind::OutOfMemory,
+            detail: ProgramExecErrorDetail::ExecutorTaskCapacityExhausted,
+        }),
+    ))
+    .expect_err("a launch or OOM failure stays a SpawnError");
+    assert_eq!(failed.kind, prog_wit::SpawnErrorKind::OutOfMemory);
+}
+
+struct WasixJoinHarness {
+    store: wasmtime::Store<Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage>>,
+    memory: SharedMemory,
+    join: wasmtime::TypedFunc<(u32, u32, u32), i32>,
+}
+
+impl WasixJoinHarness {
+    fn new() -> Self {
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true);
+        config.shared_memory(true);
+        let engine = wasmtime::Engine::new(&config).expect("shared-memory engine initializes");
+        let memory = SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1))
+            .expect("shared memory allocates");
+
+        let cpu = TestCpu::with_entropy(0x5a);
+        let runtime_state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
+            crate::RuntimeState::new(
+                cpu.timebase(),
+                1,
+                0,
+                crate::BootPayload::for_tests(),
+                GuestIsa::for_build_target(cpu.native_feature_probe()),
+            );
+        runtime_state.install_root_entropy(triomphe::Arc::new(
+            crate::RootEntropy::from_platform(
+                &cpu,
+                None,
+                None,
+                crate::MachineGeneration::new(None),
+            )
+            .expect("test CPU has entropy"),
+        ));
+        let executor = crate::Executor::isolated(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("wasix-parent", 0);
+        let interrupts = Arc::new(GuestInterrupts::new(1, cpu.timebase()));
+        let threads = WasixProcessThreads::new();
+        let store_data = Preview1ProgramStore::new(
+            cpu,
+            executor.timer(cpu),
+            executor
+                .spawner(cpu)
+                .instance_spawner(crate::TaskFunding::Instance, &instance),
+            runtime_state,
+            interrupts,
+            instance,
+            None,
+            Vec::new(),
+            Vec::new(),
+            ProcessAuthority::root(),
+            OutputMode::Serial,
+            |_, _| {},
+            crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
+            Some(memory.clone()),
+            None,
+            None,
+            WasixSignalState::new(),
+            threads.main_mailbox(),
+            Vec::new(),
+            None,
+            true,
+            threads,
+        );
+        let mut store = wasmtime::Store::new(&engine, store_data);
+        let join = wasmtime::Func::wrap_async(
+            &mut store,
+            |mut caller: Caller<
+                '_,
+                Preview1ProgramStore<TestCpu, TestNetworkService, UnsupportedStorage>,
+            >,
+             (pid_ptr, flags, ret_status): (u32, u32, u32)| {
+                Box::new(async move {
+                    p1_reply(wasix_proc_join(&mut caller, pid_ptr, flags, ret_status).await)
+                })
+            },
+        )
+        .typed::<(u32, u32, u32), i32>(&store)
+        .expect("proc_join signature matches");
+
+        Self {
+            store,
+            memory,
+            join,
+        }
+    }
+
+    fn write_guest(&self, offset: usize, bytes: &[u8]) {
+        for (i, &b) in bytes.iter().enumerate() {
+            unsafe {
+                self.memory.data()[offset + i].get().write(b);
+            }
+        }
+    }
+
+    fn read_guest(&self, offset: usize, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| unsafe { self.memory.data()[offset + i].get().read() })
+            .collect()
+    }
+
+    fn call_join(&mut self, requested_pid: Option<u32>, flags: u32) -> (i32, Option<u32>, [u8; 6]) {
+        let pid_ptr = 16_u32;
+        let status_ptr = 32_u32;
+        self.write_guest(pid_ptr as usize, &[0_u8; 8]);
+        self.write_guest(status_ptr as usize, &[0xff_u8; 6]);
+        match requested_pid {
+            Some(pid) => {
+                self.write_guest(pid_ptr as usize, &[WASIX_OPTION_SOME]);
+                self.write_guest(
+                    (pid_ptr + WASIX_OPTION_UNION_U32_OFFSET) as usize,
+                    &pid.to_le_bytes(),
+                );
+            }
+            None => {
+                self.write_guest(pid_ptr as usize, &[WASIX_OPTION_NONE]);
+            }
+        }
+        let errno = block_on(
+            self.join
+                .call_async(&mut self.store, (pid_ptr, flags, status_ptr)),
+        )
+        .expect("host proc_join call completes");
+        let pid_bytes = self.read_guest(pid_ptr as usize, 8);
+        let joined_pid = (pid_bytes[0] == WASIX_OPTION_SOME)
+            .then(|| u32::from_le_bytes(pid_bytes[4..8].try_into().expect("four pid bytes")));
+        let status: [u8; 6] = self
+            .read_guest(status_ptr as usize, 6)
+            .try_into()
+            .expect("six status bytes");
+        (errno, joined_pid, status)
+    }
+}
+
+#[test]
+fn wasix_proc_join_produces_each_of_the_four_endings_from_the_shared_record() {
+    let mut harness = WasixJoinHarness::new();
+
+    for flags in [0_u32, WASIX_JOIN_FLAG_NON_BLOCKING] {
+        let cases = [
+            (101_u32, ChildTermination::Exited(42)),
+            (
+                102_u32,
+                ChildTermination::Signaled(SignalTermination {
+                    signal: 15,
+                    core_dumped: false,
+                }),
+            ),
+            (
+                103_u32,
+                ChildTermination::Signaled(SignalTermination {
+                    signal: 11,
+                    core_dumped: true,
+                }),
+            ),
+            (104_u32, ChildTermination::Trapped),
+            (105_u32, ChildTermination::Killed),
+        ];
+
+        for (pid, termination) in cases {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let _ = tx.send(Ok(ChildExit {
+                instance_id: crate::InstanceId::from_raw(u64::from(pid)),
+                termination,
+                filesystem: None,
+            }));
+            harness
+                .store
+                .data_mut()
+                .insert_child(pid, WasixSignalState::new(), rx);
+
+            let (errno, joined_pid, status) = harness.call_join(Some(pid), flags);
+            assert_eq!(errno, p1::errno::SUCCESS);
+            assert_eq!(joined_pid, Some(pid));
+
+            match termination {
+                ChildTermination::Exited(code) => {
+                    assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_NORMAL);
+                    assert_eq!(u16::from_le_bytes([status[2], status[3]]), code as u16,);
+                }
+                ChildTermination::Signaled(SignalTermination {
+                    signal,
+                    core_dumped,
+                }) => {
+                    assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_SIGNAL);
+                    assert_eq!(u16::from_le_bytes([status[2], status[3]]), 0);
+                    assert_eq!(status[4], (signal & 0x7f) | (u8::from(core_dumped) << 7));
+                }
+                ChildTermination::Trapped => {
+                    assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_SIGNAL);
+                    assert_eq!(u16::from_le_bytes([status[2], status[3]]), 0);
+                    assert_eq!(status[4], WASIX_SIGABRT);
+                }
+                ChildTermination::Killed => {
+                    assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_SIGNAL);
+                    assert_eq!(u16::from_le_bytes([status[2], status[3]]), 0);
+                    assert_eq!(status[4], WASIX_SIGKILL);
+                }
+            }
+        }
+
+        // A failed launch or OOM returns its errno and reaps the slot
+        // instead of fabricating an EXIT_NORMAL status.
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let _ = tx.send(Err(ProgramExecError {
+            kind: ProgramExecErrorKind::OutOfMemory,
+            detail: ProgramExecErrorDetail::ExecutorTaskCapacityExhausted,
+        }));
+        harness
+            .store
+            .data_mut()
+            .insert_child(199, WasixSignalState::new(), rx);
+        let (errno, _pid, _status) = harness.call_join(Some(199), flags);
+        assert_eq!(errno, p1::errno::NOMEM);
+        assert!(harness.store.data().children.is_empty());
+    }
+}
+
+#[test]
+fn runtime_end_classification_distinguishes_exits_signals_traps_owner_kills_and_oom() {
+    assert_eq!(
+        preview1_process_end(wasmtime::Error::new(Preview1Exit), Some(19)),
+        Ok(ChildTermination::Exited(19))
+    );
+    assert_eq!(
+        preview1_process_end(
+            wasmtime::Error::new(Preview1SignalExit { signal: 15 }),
+            Some(0)
+        ),
+        Ok(ChildTermination::Signaled(SignalTermination {
+            signal: 15,
+            core_dumped: false,
+        }))
+    );
+    assert_eq!(
+        preview1_process_end(
+            wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached),
+            None,
+        ),
+        Ok(ChildTermination::Trapped)
+    );
+    assert_eq!(
+        preview1_process_end(
+            wasmtime::Error::new(crate::memory::SwapFaultError::Backend),
+            None,
+        ),
+        Ok(ChildTermination::Trapped)
+    );
+    for reason in [
+        crate::KillReason::Operator,
+        crate::KillReason::RequesterGone,
+    ] {
+        assert_eq!(
+            preview1_process_end(
+                wasmtime::Error::from(crate::InstanceKilled { reason }),
+                Some(0),
+            ),
+            Ok(ChildTermination::Killed)
+        );
+    }
+    let oom = preview1_process_end(
+        wasmtime::Error::from(crate::InstanceKilled {
+            reason: crate::KillReason::OutOfMemory,
+        }),
+        Some(0),
+    )
+    .expect_err("OOM kill stays a runtime error");
+    assert_eq!(oom.kind, ProgramExecErrorKind::OutOfMemory);
+
+    // A component child suspended in a host future wakes and ends as
+    // Signaled when its parent raises on its signal_state.
+    let data = test_store::store_data_authorized(ProcessAuthority::root(), |_| {});
+    let signals = WasixSignalState::new();
+    let turns = data.guest_turns_with_epilogue(super::super::ComponentStoreEpilogue::new(
+        data.retirement.turn_queue(),
+        Some(signals.clone()),
+    ));
+    let mut driven = core::pin::pin!(turns.drive(core::future::pending::<wasmtime::Result<()>>()));
+    let waker = futures::task::noop_waker_ref();
+    let mut cx = Context::from_waker(waker);
+    assert!(driven.as_mut().poll(&mut cx).is_pending());
+    signals.raise(15);
+    let Poll::Ready(Err(stop)) = driven.as_mut().poll(&mut cx) else {
+        panic!("signal stops the suspended component turn");
+    };
+    assert_eq!(
+        preview1_process_end(stop, None),
+        Ok(ChildTermination::Signaled(SignalTermination {
+            signal: 15,
+            core_dumped: false,
+        }))
+    );
+}
+
+#[cfg(feature = "linux")]
+mod linux_tests {
+    use super::*;
+    use core::sync::atomic::AtomicUsize;
+    use helios_hal::cpu::{Cpu, Instant, Timebase, TimerInterrupt};
+    use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
+    use helios_hal::hv::RegisterId;
+    use helios_hal::native::{
+        FaultKind, InstructionSet, Mapping, NativeError, NativeExecution, NativeUnavailable, Stop,
+        UserContext, UserFault, UserSpace,
+    };
+    use helios_hal::pmm::PhysFrame;
+    use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
+
+    #[derive(Clone, Copy, Debug)]
+    enum LinuxBehavior {
+        ExitGroup(u8),
+        SuspendInRead,
+        PageFault,
+    }
+
+    #[derive(Clone)]
+    struct MockLinuxCpu {
+        base: TestCpu,
+        behavior: LinuxBehavior,
+    }
+
+    struct MockSpace;
+
+    // SAFETY: MockSpace maps no hardware page tables and never enters user mode.
+    unsafe impl UserSpace for MockSpace {
+        fn map(&self, _: VirtRange, _: &[u8], _: PageFlags) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn map_anywhere(
+            &self,
+            hint: VirtAddr,
+            byte_len: usize,
+            _: PageFlags,
+        ) -> Result<VirtRange, NativeError> {
+            Ok(VirtRange::new(hint, byte_len))
+        }
+        fn read(&self, _: VirtAddr, output: &mut [u8]) -> Result<(), NativeError> {
+            output.fill(0);
+            Ok(())
+        }
+        fn check_writable(&self, _: VirtAddr, _: usize) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn write(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn unmap(&self, _: VirtRange) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn protect(&self, _: VirtRange, _: PageFlags) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn discard(&self, _: VirtRange) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn remap(&self, _: VirtRange, _: VirtRange) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn resolve_fault(&self, _: VirtAddr, _: PageFlags) -> Result<(), NativeError> {
+            Err(NativeError::NotMapped)
+        }
+        fn mapping(&self, _: VirtRange) -> Option<Mapping> {
+            None
+        }
+        fn free_range(&self, hint: VirtAddr, _: usize) -> Option<VirtAddr> {
+            Some(hint)
+        }
+    }
+
+    struct MockContext {
+        behavior: LinuxBehavior,
+        step: AtomicUsize,
+        result: u64,
+        tp: VirtAddr,
+    }
+
+    // SAFETY: MockContext never enters hardware user mode.
+    unsafe impl UserContext for MockContext {
+        type Space = MockSpace;
+
+        fn register(&self, register: RegisterId) -> Result<u64, NativeError> {
+            match (self.behavior, register) {
+                (LinuxBehavior::ExitGroup(_), RegisterId::X86Gpr(0)) => Ok(231),
+                (LinuxBehavior::ExitGroup(code), RegisterId::X86Gpr(7)) => Ok(u64::from(code)),
+                // read(fd = 0, buf = 0x40_1000, count = 1) blocks on empty child stdin.
+                (LinuxBehavior::SuspendInRead, RegisterId::X86Gpr(0)) => Ok(0),
+                (LinuxBehavior::SuspendInRead, RegisterId::X86Gpr(7)) => Ok(0),
+                (LinuxBehavior::SuspendInRead, RegisterId::X86Gpr(6)) => Ok(0x40_1000),
+                (LinuxBehavior::SuspendInRead, RegisterId::X86Gpr(2)) => Ok(1),
+                (_, RegisterId::X86Gpr(_)) => Ok(0),
+                _ => Err(NativeError::Register),
+            }
+        }
+
+        fn set_register(&mut self, register: RegisterId, value: u64) -> Result<(), NativeError> {
+            if matches!(register, RegisterId::X86Gpr(0)) {
+                self.result = value;
+                Ok(())
+            } else {
+                Err(NativeError::Register)
+            }
+        }
+
+        fn thread_pointer(&self) -> VirtAddr {
+            self.tp
+        }
+
+        fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError> {
+            self.tp = address;
+            Ok(())
+        }
+
+        fn resume(&mut self, _: &MockSpace) -> Stop {
+            let _ = self.step.fetch_add(1, AtomicOrdering::Relaxed);
+            match self.behavior {
+                LinuxBehavior::ExitGroup(_) | LinuxBehavior::SuspendInRead => Stop::SystemCall,
+                LinuxBehavior::PageFault => Stop::Fault(UserFault {
+                    kind: FaultKind::Page {
+                        address: VirtAddr::new(0x1000),
+                        access: PageFlags::READ,
+                        present: false,
+                    },
+                    instruction: VirtAddr::new(0x40_0000),
+                }),
+            }
+        }
+    }
+
+    impl NativeExecution for MockLinuxCpu {
+        type Space = MockSpace;
+        type Context = MockContext;
+
+        fn instruction_set(&self) -> InstructionSet {
+            InstructionSet::X86_64
+        }
+
+        fn user_range(&self) -> VirtRange {
+            VirtRange::new(
+                VirtAddr::new(PhysFrame::SIZE),
+                (1usize << 47) - 2 * PhysFrame::SIZE,
+            )
+        }
+
+        fn create_space(&self) -> Result<Self::Space, NativeError> {
+            Ok(MockSpace)
+        }
+
+        fn create_context(&self, _: VirtAddr, _: VirtAddr) -> Result<Self::Context, NativeError> {
+            Ok(MockContext {
+                behavior: self.behavior,
+                step: AtomicUsize::new(0),
+                result: 0,
+                tp: VirtAddr::new(PhysFrame::SIZE),
+            })
+        }
+    }
+
+    impl Cpu for MockLinuxCpu {
+        type Hypervisor = core::convert::Infallible;
+        type Native = Self;
+        const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+
+        fn native(&self) -> Result<&Self::Native, NativeUnavailable> {
+            Ok(self)
+        }
+        fn has_lazy_commit_virtual_memory(&self) -> bool {
+            true
+        }
+        fn processor_count(&self) -> usize {
+            1
+        }
+        fn bootstrap_processor(&self) -> ProcessorId {
+            ProcessorId::new(0)
+        }
+        fn park_current(&self) {}
+        type WakeOnlyMask = ();
+        fn mask_to_wake_only(&self) {
+            unreachable!()
+        }
+        fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {
+            unreachable!()
+        }
+        fn start_processor(&self, _: ProcessorId) {}
+        fn wake_processor(&self, _: ProcessorId) {}
+        fn stop_current(&self) {
+            unreachable!()
+        }
+        fn restart_processor(&self, _: ProcessorId) {
+            unreachable!()
+        }
+        fn now(&self) -> Instant {
+            self.base.now()
+        }
+        fn timebase(&self) -> Timebase {
+            self.base.timebase()
+        }
+        fn set_deadline(&self, _: Instant) {}
+        fn publish_executable(&self, _: *const u8, _: usize) {}
+        fn unpublish_executable(&self, _: *const u8, _: usize) {}
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            self.base.native_feature_probe()
+        }
+        fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
+            self.base.fill_entropy(buffer)
+        }
+        fn shutdown(&self) -> ! {
+            unreachable!()
+        }
+        fn reboot(&self) -> ! {
+            unreachable!()
+        }
+    }
+
+    /// Minimal valid static little-endian x86-64 `ET_EXEC` ELF with one RX
+    /// `PT_LOAD` segment at `0x400000`.
+    fn minimal_x86_64_elf() -> Bytes {
+        let mut elf = vec![0_u8; 4096];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2_u16.to_le_bytes()); // ET_EXEC
+        elf[18..20].copy_from_slice(&62_u16.to_le_bytes()); // EM_X86_64
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes()); // EV_CURRENT
+        let entry = 0x40_0080_u64;
+        elf[24..32].copy_from_slice(&entry.to_le_bytes()); // e_entry
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+        elf[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
+
+        // Program header 0: PT_LOAD, PF_R | PF_X, vaddr 0x400000, filesz/memsz 4096.
+        let ph = &mut elf[64..120];
+        ph[0..4].copy_from_slice(&1_u32.to_le_bytes()); // PT_LOAD
+        ph[4..8].copy_from_slice(&5_u32.to_le_bytes()); // PF_R | PF_X
+        ph[8..16].copy_from_slice(&0_u64.to_le_bytes()); // p_offset
+        ph[16..24].copy_from_slice(&0x40_0000_u64.to_le_bytes()); // p_vaddr
+        ph[24..32].copy_from_slice(&0x40_0000_u64.to_le_bytes()); // p_paddr
+        ph[32..40].copy_from_slice(&4096_u64.to_le_bytes()); // p_filesz
+        ph[40..48].copy_from_slice(&4096_u64.to_le_bytes()); // p_memsz
+        ph[48..56].copy_from_slice(&4096_u64.to_le_bytes()); // p_align
+
+        Bytes::from(elf)
+    }
+
+    fn run_mock_linux(
+        behavior: LinuxBehavior,
+        before_poll: impl FnOnce(&crate::InstanceRegistry, crate::InstanceId, &WasixSignalState),
+    ) -> ChildExit {
+        let cpu = MockLinuxCpu {
+            base: TestCpu::with_entropy(0x5a),
+            behavior,
+        };
+        let runtime_state: HostRuntimeState<MockLinuxCpu, TestNetworkService, UnsupportedStorage> =
+            crate::RuntimeState::new(
+                cpu.timebase(),
+                1,
+                0,
+                crate::BootPayload::for_tests(),
+                GuestIsa::for_build_target(cpu.native_feature_probe()),
+            );
+        runtime_state.install_root_entropy(triomphe::Arc::new(
+            crate::RootEntropy::from_platform(
+                &cpu,
+                None,
+                None,
+                crate::MachineGeneration::new(None),
+            )
+            .expect("entropy"),
+        ));
+        let executor = crate::Executor::isolated(
+            ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            ProcessorId::new(0),
+        );
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("linux-child", 0);
+        let id = instance.id();
+        let exec_context = ProgramExecContext {
+            cpu: cpu.clone(),
+            timer: executor.timer(cpu.clone()),
+            spawner: executor.spawner(cpu.clone()),
+            runtime_state,
+            instance_registry: registry.clone(),
+            parent_instance_id: None,
+            read_serial: |_, _| {},
+            write_serial: crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
+        };
+        let executable =
+            LinuxExecutable::load(&cpu, minimal_x86_64_elf()).expect("minimal x86-64 ELF loads");
+        let signal_state = WasixSignalState::new();
+        let (_stdin_tx_hold, stdin_rx) = crate::byte_channel();
+        let (stdout_tx, _stdout_rx) = crate::byte_channel();
+        let (stderr_tx, _stderr_rx) = crate::byte_channel();
+        let output_mode = OutputMode::Child {
+            stdin_rx,
+            stdout_tx,
+            stderr_tx,
+        };
+        let timeline = phases::Timeline::begin(&cpu, "spawn", "/linux/mock");
+        let argv = ProgramArgv::launched("mock", Vec::new());
+
+        let mut fut = core::pin::pin!(run_linux_process(
+            exec_context,
+            argv,
+            Vec::new(),
+            ProcessAuthority::root(),
+            None,
+            signal_state.clone(),
+            instance,
+            output_mode,
+            executable,
+            &timeline,
+        ));
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        if let Poll::Ready(res) = fut.as_mut().poll(&mut cx) {
+            return res.expect("Linux process completed");
+        }
+        before_poll(&registry, id, &signal_state);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(res) => res.expect("Linux process completed after event"),
+            Poll::Pending => panic!("Linux process remained pending after wake event"),
+        }
+    }
+
+    #[test]
+    fn linux_process_host_reports_exits_signals_faults_and_owner_kills_in_shared_record() {
+        let exited = run_mock_linux(LinuxBehavior::ExitGroup(7), |_, _, _| {});
+        assert_eq!(exited.termination, ChildTermination::Exited(7));
+
+        let faulted = run_mock_linux(LinuxBehavior::PageFault, |_, _, _| {});
+        assert_eq!(
+            faulted.termination,
+            ChildTermination::Signaled(SignalTermination {
+                signal: helios_linux::abi::SIGSEGV,
+                core_dumped: false,
+            })
+        );
+
+        let signaled = run_mock_linux(LinuxBehavior::SuspendInRead, |_, _, signals| {
+            signals.raise(15);
+        });
+        assert_eq!(
+            signaled.termination,
+            ChildTermination::Signaled(SignalTermination {
+                signal: 15,
+                core_dumped: false,
+            })
+        );
+
+        let killed = run_mock_linux(LinuxBehavior::SuspendInRead, |registry, id, _| {
+            assert_eq!(
+                registry.request_kill(
+                    id,
+                    crate::KillReason::Operator,
+                    0,
+                    &crate::UserResidency::default()
+                ),
+                crate::KillOutcome::Requested
+            );
+        });
+        assert_eq!(killed.termination, ChildTermination::Killed);
+    }
+}

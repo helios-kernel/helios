@@ -119,6 +119,7 @@ where
     store: wasmtime::Store<StoreData<CpuImpl, Net, StorageImpl>>,
     interrupts: StoreInterrupts<CpuImpl>,
     run_func: wasmtime::component::TypedFunc<(), (core::result::Result<(), ()>,)>,
+    signal_state: Option<component_host::WasixSignalState>,
 }
 
 impl<CpuImpl, Net, StorageImpl> ComponentExecutor for WasmtimeExecutor<CpuImpl, Net, StorageImpl>
@@ -131,7 +132,11 @@ where
 
     async fn run(mut self) -> Result<ComponentRunResult, Self::Error> {
         let run = self.run_func;
-        let turns = self.store.data().guest_turns();
+        let epilogue = component_host::ComponentStoreEpilogue::new(
+            self.store.data().retirement.turn_queue(),
+            self.signal_state.clone(),
+        );
+        let turns = self.store.data().guest_turns_with_epilogue(epilogue);
         let raw =
             self.interrupts
                 .drive(turns.drive(
@@ -154,8 +159,8 @@ where
 /// out of `run_concurrent` into a clean `(status, exit_code)` pair.
 ///
 /// Runtime traps that correspond to `wasi:cli/exit` requests are treated as
-/// a clean exit with the code the guest supplied; other traps still bubble
-/// up as `wasmtime::Error`.
+/// a clean exit with the code the guest supplied; signals, kills and other
+/// traps bubble up as `wasmtime::Error`.
 fn interpret_run_result<CpuImpl, Net, StorageImpl>(
     raw: wasmtime::Result<wasmtime::Result<(Result<(), ()>,)>>,
     store_data: &mut StoreData<CpuImpl, Net, StorageImpl>,
@@ -168,17 +173,26 @@ where
     match raw {
         Ok(Ok((Ok(()),))) => Ok((ComponentExitStatus::Ok, 0)),
         Ok(Ok((Err(()),))) => Ok((ComponentExitStatus::Failed, 1)),
-        Ok(Err(trap)) | Err(trap) => match store_data.take_requested_exit() {
-            Some(code) => {
-                let status = if code == 0 {
-                    ComponentExitStatus::Ok
-                } else {
-                    ComponentExitStatus::Failed
-                };
-                Ok((status, u32::from(code)))
+        Ok(Err(trap)) | Err(trap) => {
+            if trap
+                .downcast_ref::<component_host::Preview1SignalExit>()
+                .is_some()
+                || trap.downcast_ref::<crate::InstanceKilled>().is_some()
+            {
+                return Err(trap);
             }
-            None => Err(trap),
-        },
+            match store_data.take_requested_exit() {
+                Some(code) => {
+                    let status = if code == 0 {
+                        ComponentExitStatus::Ok
+                    } else {
+                        ComponentExitStatus::Failed
+                    };
+                    Ok((status, u32::from(code)))
+                }
+                None => Err(trap),
+            }
+        }
     }
 }
 
@@ -289,6 +303,7 @@ where
             store,
             interrupts,
             run_func,
+            signal_state: None,
         })
     }
 }

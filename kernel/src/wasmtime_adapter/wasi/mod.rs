@@ -173,12 +173,7 @@ impl WasiImportSet {
 /// rather than the wasi stdin stream, which stays empty; the terminal
 /// resource describes the attachment, not that stream.
 pub(crate) fn stdin_is_terminal(mode: &ComponentOutputMode) -> bool {
-    match mode {
-        ComponentOutputMode::Serial => true,
-        ComponentOutputMode::Trace
-        | ComponentOutputMode::Child { .. }
-        | ComponentOutputMode::RoutedChild { .. } => false,
-    }
+    matches!(mode.stdin_route(), crate::ComponentInputRoute::Serial)
 }
 
 /// Whether the requested output stream is attached to the interactive serial
@@ -446,13 +441,27 @@ mod tests {
 
         let (routed_stdout_tx, _routed_stdout_rx) = crate::byte_channel();
         let routed = ComponentOutputMode::RoutedChild {
-            stdin_rx,
+            stdin: crate::ComponentInputRoute::Child(stdin_rx),
             stdout: ComponentOutputRoute::Child(routed_stdout_tx),
             stderr: ComponentOutputRoute::Serial,
         };
         assert!(!stdin_is_terminal(&routed));
         assert!(!output_is_terminal(&routed, Stdout));
         assert!(output_is_terminal(&routed, Stderr));
+
+        let serial_stdin = ComponentOutputMode::RoutedChild {
+            stdin: crate::ComponentInputRoute::Serial,
+            stdout: ComponentOutputRoute::Discard,
+            stderr: ComponentOutputRoute::Discard,
+        };
+        assert!(stdin_is_terminal(&serial_stdin));
+
+        let closed_stdin = ComponentOutputMode::RoutedChild {
+            stdin: crate::ComponentInputRoute::Closed,
+            stdout: ComponentOutputRoute::Discard,
+            stderr: ComponentOutputRoute::Discard,
+        };
+        assert!(!stdin_is_terminal(&closed_stdin));
     }
 
     #[test]

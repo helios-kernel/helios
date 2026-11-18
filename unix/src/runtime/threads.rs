@@ -68,15 +68,14 @@ struct ThreadGroupTable<T: InterruptTarget, Image, Failure> {
 /// same call would have given main's image (`run_core_module_image`).
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProcessEnd<Image, Failure> {
-    /// `proc_exit` or a fatal signal's default action, with the
-    /// process's exit status.
-    Exit(u32),
+    /// `proc_exit`, a fatal signal's default action, a trap, or a kill
+    /// by the process's owner, with the termination the process reports.
+    Exit(crate::ChildTermination),
     /// `proc_exec*`: the image the process runs next, in place of the
     /// one every thread of it was running.
     Exec(Image),
-    /// A trap or any other failure, with the failure main reports for
-    /// it, as the default action of `SIGSEGV` and `SIGILL` ends the
-    /// process.
+    /// A runtime failure (such as an out-of-memory kill), with the
+    /// failure main reports for it.
     Fail(Failure),
 }
 
