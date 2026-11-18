@@ -4,10 +4,9 @@
 //! responses, and request options are plain kernel values
 //! ([`crate::HttpFields`] and friends) wrapped in resource handles. It owns
 //! none of the *protocol* half. `client.send` is a forwarder: it turns the
-//! caller's request into a transport-neutral [`HttpExchange`], pushes it
-//! through the `http_client` provider slot on
-//! [`RuntimeState`](crate::RuntimeState), and awaits the response the
-//! `http-client` kernel plugin sends back.
+//! caller's request into a transport-neutral [`HttpExchange`], pushes it onto
+//! the executing processor's shard in `RuntimeState::http_client()`, and
+//! awaits the response the `http-client` kernel plugin sends back.
 //!
 //! Exactly one implementation serves both stores. The program's store sees
 //! the *import* side (it constructs a request and calls `client.send`); the

@@ -36,6 +36,8 @@ mod compiler;
 use compiler::*;
 mod exec;
 use exec::*;
+mod component_plugin;
+use component_plugin::*;
 mod http_plugin;
 use http_plugin::*;
 mod network_step;
@@ -363,6 +365,11 @@ where
     /// instruction sampler to name.
     code_map: CodeMap,
     clock_cpu: CpuImpl,
+    /// Shared precompiled `http-client` plugin component, instantiated lazily
+    /// per processor on every core hosting [`NetworkStep`].
+    http_client_pre: spin::Once<Option<PreparedComponent<CpuImpl, Net, StorageImpl>>>,
+    plugin_read_serial: crate::SerialReader,
+    plugin_write_serial: crate::DebugSerialWriter,
     _marker: core::marker::PhantomData<fn() -> StorageImpl>,
 }
 
@@ -633,9 +640,14 @@ where
             compile_slot: SharedMemorySessionSlot::new(),
             code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
+            http_client_pre: spin::Once::new(),
+            plugin_read_serial: read_serial,
+            plugin_write_serial: write_serial,
             _marker: core::marker::PhantomData,
         }),
     };
+    let http_pre = provision_http_client_plugin(&service, cpu, debug_state, write_serial);
+    service.inner.http_client_pre.call_once(|| http_pre);
     debug_state.install_program_service(service.clone());
     spawn_instruction_sample_drain(kernel, &service, debug_state);
     let plugin_context = ProgramExecContext {
@@ -648,7 +660,6 @@ where
         read_serial,
         write_serial,
     };
-    install_http_client_plugin(&service, plugin_context.clone());
     install_compositor_plugin(&service, plugin_context);
     service
 }
@@ -807,7 +818,7 @@ where
 }
 
 pub fn run_program_workers_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
-    _cpu: CpuImpl,
+    cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
 ) -> !
@@ -818,11 +829,13 @@ where
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
 {
-    // The packet pump has to be this processor's own task, because the
-    // pair it drains has its interrupt routed here; the step owns it and
-    // hands the pair off when the processor goes offline.
+    // The packet pump and per-processor WASI 0.3 plugin shards live on this
+    // processor as local tasks: the plugins come up after `NetworkStep` and
+    // go down before it on processor offline.
     let network = NetworkStep::start(&kernel, &debug_state);
-    kernel.run_with_steps(&network)
+    let http_client = PerProcessorPluginStep::start(&cpu, &kernel, &debug_state, HttpClientPlugin);
+    let steps = (network, http_client);
+    kernel.run_with_steps(&steps)
 }
 
 pub fn run_component_host_processor_forever<
@@ -846,11 +859,12 @@ where
     MeasuredBootImpl: MeasuredBoot,
 {
     // Started before the role dispatch decides what else the processor
-    // does: every processor's pump is its own local task. A processor
-    // that goes on to run an embedded component keeps the step alive
-    // for good without lending it to a lifecycle — its component is
-    // pinned local work, so it never goes offline.
+    // does: every processor's pump and lazy WASI 0.3 plugin shards run locally
+    // here. A processor running an embedded component keeps the steps alive
+    // without lending them to a lifecycle, since it never goes offline.
     let network = NetworkStep::start(&kernel, &debug_state);
+    let http_client = PerProcessorPluginStep::start(&cpu, &kernel, &debug_state, HttpClientPlugin);
+    let steps = (network, http_client);
     let topology = kernel.topology();
     // Every backend's bootstrap processor reaches here only after starting
     // its secondaries, and a backend enables its mechanisms on a processor
@@ -866,7 +880,7 @@ where
         topology.bootstrap_processor,
     ) {
         ComponentHostProcessorRole::Kernel => {
-            run_kernel_processor_forever(cpu, kernel, debug_state, &network);
+            run_kernel_processor_forever(cpu, kernel, debug_state, &steps);
         }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
             match debug_state.system_component() {
@@ -887,7 +901,7 @@ where
                     if cfg!(feature = "embedded-debugger") {
                         panic!("embedded init bootfs is missing the system component");
                     }
-                    run_kernel_processor_forever(cpu, kernel, debug_state, &network);
+                    run_kernel_processor_forever(cpu, kernel, debug_state, &steps);
                 }
             }
         }
@@ -934,11 +948,11 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
     );
 }
 
-fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl, Steps>(
     cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
-    network: &NetworkStep<CpuImpl, Net, StorageImpl>,
+    steps: &Steps,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
@@ -946,6 +960,7 @@ where
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
+    Steps: crate::exec::ProcessorStep,
 {
     let processor = helios_hal::cpu::current_processor().id();
     let stack = kernel_processor_profile_stack(processor);
@@ -953,16 +968,14 @@ where
         let progress = if debug_state.profiling_enabled() {
             let started = cpu.now().ticks();
             let counters = cpu.hardware_perf_counters();
-            let stats = kernel.run_until_stalled_with_steps(network);
+            let stats = kernel.run_until_stalled_with_steps(steps);
             let progress = stats.progress_count();
             if progress != 0 {
                 record_executor_metrics(&cpu, &debug_state, &stack, started, counters, stats);
             }
             progress
         } else {
-            kernel
-                .run_until_stalled_with_steps(network)
-                .progress_count()
+            kernel.run_until_stalled_with_steps(steps).progress_count()
         };
 
         if progress != 0 {
