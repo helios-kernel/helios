@@ -19,7 +19,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/lib.sh"
 
 : "${HELIOS_FSTESTS_DIR:?}" "${HELIOS_CRASH_DEV:?}" "${HELIOS_CRASH_LOG_DEV:?}"
-: "${HELIOS_CRASH_MNT:?}" "${HELIOS_FSTESTS_RESULTS:?}" "${HELIOS_FUSE_BTRFS_RUN_DIR:?}"
+: "${HELIOS_CRASH_MNT:?}" "${HELIOS_FSTESTS_RESULTS:?}"
 
 seconds=${HELIOS_CRASH_SECONDS:-30}
 # fsstress's seed, fixed so a failure repeats.
@@ -40,7 +40,9 @@ mkdir -p "$out"
 
 cleanup() {
     set +e
-    mountpoint -q "$HELIOS_CRASH_MNT" && umount "$HELIOS_CRASH_MNT"
+    while findmnt --mountpoint "$HELIOS_CRASH_MNT" >/dev/null; do
+        umount "$HELIOS_CRASH_MNT" || break
+    done
     [[ -e "$target_device" ]] && dmsetup remove --retry "$target"
 }
 trap cleanup EXIT
@@ -76,7 +78,8 @@ while kill -0 -- "-$workload" 2>/dev/null; do
     sleep 0.1
 done
 
-unmount_device "$HELIOS_CRASH_MNT" "$target_device"
+# Returns once the daemon has committed and let go of the device (umount.fuse).
+umount "$HELIOS_CRASH_MNT"
 dmsetup remove --retry "$target"
 
 # Without a FUA write there is no point to check and the replay below would

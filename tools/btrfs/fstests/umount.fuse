@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# umount(8) helper for the fuse-btrfs mounts. util-linux's umount runs
+# /sbin/umount.<type> for a mount of that type, and a fuse-btrfs mount's
+# type is plain `fuse` (see the mount options in fuse-btrfs's daemon.rs).
+# Installed as /sbin/umount.fuse by run.sh.
+#
+# A plain FUSE unmount returns without waiting for the daemon, which commits
+# what it still holds as its session ends. This unmounts, then waits for the
+# daemon to let go of the device: fuse-btrfs holds an exclusive flock on the
+# device node until it has committed and closed the device, so a shared flock
+# returns once that has happened. A lazy unmount (-l) returns at once, as
+# umount(2) does, and the device stays held until the daemon lets go.
+set -euo pipefail
+
+# Longest the daemon may take to commit and let go of the device after its
+# unmount, in seconds.
+readonly release_deadline=30
+
+# util-linux mount(8) / umount(8) exit codes (include/mount-api-utils.h).
+readonly MNT_EX_USAGE=1
+readonly MNT_EX_FAIL=32
+
+fail_usage() {
+    echo "umount.fuse: $*" >&2
+    exit "$MNT_EX_USAGE"
+}
+
+fail_umount() {
+    echo "umount.fuse: $*" >&2
+    exit "$MNT_EX_FAIL"
+}
+
+(($# >= 1)) || fail_usage "usage: umount.fuse <mountpoint> [-n] [-l] [-f] [-v] [-r] [-t type]"
+target=$1
+shift
+
+# The arguments umount(8) gives a helper, but for -N: a mount namespace is
+# not one this helper looks the device up in.
+flags=()
+lazy=false
+while (($#)); do
+    case "$1" in
+        -l) lazy=true; flags+=("$1"); shift ;;
+        -n | -f | -v | -r) flags+=("$1"); shift ;;
+        -t)
+            (($# >= 2)) || fail_usage "-t needs its type"
+            shift 2
+            ;;
+        *) fail_usage "unexpected argument $1" ;;
+    esac
+done
+
+# The source of the topmost mount on the target, which the unmount removes:
+# the device for a fuse-btrfs mount.
+mapfile -t sources < <(findmnt --noheadings --output SOURCE --mountpoint "$target")
+((${#sources[@]})) || fail_umount "findmnt lists no mount on $target"
+source=${sources[-1]}
+
+# -i: this is the helper umount(8) would otherwise run again.
+umount -i "${flags[@]}" "$target"
+
+if [[ "$lazy" == false && -b "$source" ]]; then
+    flock --shared --timeout "$release_deadline" "$source" true ||
+        fail_umount "the daemon serving $source still holds it ${release_deadline}s after its unmount"
+fi

@@ -18,7 +18,7 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "fuse-btrfs failed");
-            std::process::ExitCode::FAILURE
+            error.exit_code()
         }
     }
 }
