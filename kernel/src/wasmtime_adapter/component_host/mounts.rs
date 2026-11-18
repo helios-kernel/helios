@@ -172,6 +172,7 @@ macro_rules! impl_mount_bindings {
                                 commit: request
                                     .commit
                                     .map(crate::vfs::CommitPolicy::from_commit_option),
+                                now: store.now_nanos(),
                             },
                             store.spawner().launch_spawner().clone(),
                             store.timer(),

@@ -53,6 +53,9 @@ pub struct BtrfsWriteOptions {
     /// refused. The mount takes it as its starting value;
     /// [`BtrfsFs::set_commit_policy`] changes it later.
     pub commit: Option<CommitPolicy>,
+    /// Wall-clock nanoseconds since the Unix epoch at the mount request:
+    /// what the replay of a log tree a crash left stamps on what it unlinks.
+    pub now: u64,
 }
 
 /// What the machine keeps of a writable btrfs mount, whatever its device
@@ -320,6 +323,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             concurrency,
             compress,
             commit,
+            now,
         } = options;
         let compressor = Compressor::new(compress)?;
         let serial = disk.serial();
@@ -331,6 +335,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             },
             writer::EntropyUuids(entropy),
             concurrency,
+            writer::timestamp(now),
         )
         .await?;
         let reader = writer.snapshot()?;
