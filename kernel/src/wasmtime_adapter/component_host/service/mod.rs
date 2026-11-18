@@ -59,6 +59,8 @@ mod wasix_epoll;
 use wasix_epoll::*;
 #[cfg(feature = "linux")]
 mod linux;
+#[cfg(test)]
+mod stdin_inheritance_tests;
 #[cfg(feature = "linux")]
 use linux::*;
 #[cfg(test)]
@@ -3201,10 +3203,10 @@ mod tests {
         let mode = table
             .component_output_mode(&session)
             .expect("closed slots are closed streams");
-        let OutputMode::RoutedChild { stdin_rx, .. } = &mode else {
+        let OutputMode::RoutedChild { stdin, .. } = &mode else {
             panic!("a redirected table routes each stream");
         };
-        assert!(matches!(stdin_rx.try_read(), crate::io::TryRead::Eof));
+        assert!(matches!(stdin, crate::ComponentInputRoute::Closed));
         let stdout = component_channel(&mode, crate::ComponentOutputStreamKind::Stdout);
         assert!(matches!(
             stdout.try_write(Bytes::from_static(b"lost\n")),
