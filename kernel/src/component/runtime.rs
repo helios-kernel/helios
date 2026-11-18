@@ -251,6 +251,14 @@ impl LocalOutputSink {
     }
 }
 
+/// Where a component's standard input bytes arrive from.
+#[derive(Clone)]
+pub enum ComponentInputRoute {
+    Serial,
+    Closed,
+    Child(ByteReader),
+}
+
 #[derive(Clone)]
 pub enum ComponentOutputMode {
     Serial,
@@ -261,13 +269,26 @@ pub enum ComponentOutputMode {
         stderr_tx: ByteWriter,
     },
     RoutedChild {
-        stdin_rx: ByteReader,
+        stdin: ComponentInputRoute,
         stdout: ComponentOutputRoute,
         stderr: ComponentOutputRoute,
     },
 }
 
 impl ComponentOutputMode {
+    /// Where standard input arrives from, as a route a child launched from
+    /// this mode can inherit.
+    pub fn stdin_route(&self) -> ComponentInputRoute {
+        match self {
+            ComponentOutputMode::Serial => ComponentInputRoute::Serial,
+            ComponentOutputMode::Trace => ComponentInputRoute::Closed,
+            ComponentOutputMode::Child { stdin_rx, .. } => {
+                ComponentInputRoute::Child(stdin_rx.clone())
+            }
+            ComponentOutputMode::RoutedChild { stdin, .. } => stdin.clone(),
+        }
+    }
+
     /// Obtain a cloneable writer for the requested child stream, when
     /// this mode has one. Returns `None` for `Serial`/`Trace`; callers
     /// that need every route should use [`Self::sink`] instead.
@@ -355,7 +376,10 @@ impl ComponentOutputMode {
     pub fn child_stdin(&self) -> Option<&ByteReader> {
         match self {
             ComponentOutputMode::Child { stdin_rx, .. }
-            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => Some(stdin_rx),
+            | ComponentOutputMode::RoutedChild {
+                stdin: ComponentInputRoute::Child(stdin_rx),
+                ..
+            } => Some(stdin_rx),
             _ => None,
         }
     }
@@ -518,17 +542,6 @@ where
     requested_exit: Option<u8>,
 }
 
-pub struct DeadlinePollable<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    cpu: CpuImpl,
-    timer: Timer<CpuImpl>,
-    runtime_state: RuntimeStateImpl,
-    deadline_nanos: u64,
-}
-
 impl<FileSystem> ComponentExecutionContext<FileSystem> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -627,11 +640,21 @@ where
     pub fn guest_turns(
         &self,
     ) -> super::GuestTurns<CpuImpl, RuntimeStateImpl, super::SocketRetirementQueue> {
+        self.guest_turns_with_epilogue(self.retirement.turn_queue())
+    }
+
+    pub(crate) fn guest_turns_with_epilogue<Epilogue>(
+        &self,
+        epilogue: Epilogue,
+    ) -> super::GuestTurns<CpuImpl, RuntimeStateImpl, Epilogue>
+    where
+        Epilogue: super::StopWake,
+    {
         super::GuestTurns::new(
             self.execution_context.activity.turns(),
             self.cpu.clone(),
             self.runtime_state.clone(),
-            self.retirement.turn_queue(),
+            epilogue,
         )
     }
 
@@ -801,34 +824,29 @@ where
     /// call and park on it.  For `Child` mode, the reader half of the
     /// parent-provided channel is polled once.
     pub fn try_read_stdin(&self, max_bytes: u32) -> Vec<u8> {
-        match &self.execution_context.output_mode {
-            ComponentOutputMode::Serial => {
+        match self.execution_context.output_mode.stdin_route() {
+            ComponentInputRoute::Serial => {
                 let mut bytes = Vec::new();
                 (self.serial_reader)(&mut bytes, max_bytes);
                 bytes
             }
-            ComponentOutputMode::Trace => Vec::new(),
-            ComponentOutputMode::Child { stdin_rx, .. }
-            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => match stdin_rx.try_read() {
-                TryRead::Ready(mut bytes) => {
-                    let cap = max_bytes as usize;
-                    if bytes.len() > cap {
-                        bytes = bytes.slice(..cap);
-                    }
-                    bytes.to_vec()
+            ComponentInputRoute::Closed => Vec::new(),
+            ComponentInputRoute::Child(stdin_rx) => {
+                match stdin_rx.try_read_limit(max_bytes as usize) {
+                    TryRead::Ready(bytes) => bytes.to_vec(),
+                    TryRead::Pending | TryRead::Eof => Vec::new(),
                 }
-                TryRead::Pending | TryRead::Eof => Vec::new(),
-            },
+            }
         }
     }
 
     /// Await the next stdin chunk, parking on the debug console's
     /// receive signal between polls. Returns `None` on EOF (Child mode
-    /// after parent closes stdin, or for Trace mode which never
+    /// after parent closes stdin, or for Trace/Closed mode which never
     /// produces bytes).
     pub async fn await_stdin_chunk(&self) -> Option<Vec<u8>> {
-        match &self.execution_context.output_mode {
-            ComponentOutputMode::Serial => {
+        match self.execution_context.output_mode.stdin_route() {
+            ComponentInputRoute::Serial => {
                 // Arm the wait before testing the FIFO so a byte that
                 // lands between the two still completes it.
                 loop {
@@ -841,9 +859,8 @@ where
                     wait.await;
                 }
             }
-            ComponentOutputMode::Trace => None,
-            ComponentOutputMode::Child { stdin_rx, .. }
-            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => {
+            ComponentInputRoute::Closed => None,
+            ComponentInputRoute::Child(stdin_rx) => {
                 stdin_rx.read().await.map(|bytes| bytes.to_vec())
             }
         }
@@ -864,41 +881,6 @@ where
     /// instance's stores makes immediate.
     pub fn pending_kill(&self) -> Option<KillReason> {
         self.execution_context.activity.pending_kill()
-    }
-}
-
-impl<CpuImpl, RuntimeStateImpl> DeadlinePollable<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    pub fn new(
-        cpu: CpuImpl,
-        timer: Timer<CpuImpl>,
-        runtime_state: RuntimeStateImpl,
-        deadline_nanos: u64,
-    ) -> Self {
-        Self {
-            cpu,
-            timer,
-            runtime_state,
-            deadline_nanos,
-        }
-    }
-
-    pub fn uptime_nanos(&self) -> u64 {
-        self.runtime_state.uptime_nanos(self.cpu.now().ticks())
-    }
-
-    pub fn deadline_nanos(&self) -> u64 {
-        self.deadline_nanos
-    }
-
-    pub async fn ready(&mut self) {
-        let timer = self.timer.clone();
-        let cpu = self.cpu.clone();
-        let runtime_state = self.runtime_state.clone();
-        wait_until_runtime_deadline(timer, cpu, runtime_state, self.deadline_nanos).await;
     }
 }
 

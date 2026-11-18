@@ -5,15 +5,22 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/caller-memory`):
+The local checkout must be at (branch `helios/sync-main-52`):
 
 ```text
-5048e15b9626f0382e9a5df653668a0d44b017ed
+83843e3ad9613bf4d9f5a860ef8bb5aa5d9a9de5
 ```
 
-`helios/caller-memory` is `helios/register-component-hosts` at
-`e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e` plus one additive commit, which
-tells a host function the linear memory of the call it is serving:
+`helios/sync-main-52` replays the 32 surviving Helios fork commits from
+`helios/caller-memory` (`5048e15b9626f0382e9a5df653668a0d44b017ed`) onto
+upstream `bytecodealliance/wasmtime` `main` at
+`591684039699641a3ec725fbc86fc8c9f7681211` (Wasmtime 52.0.0-dev, #1099, which
+already includes bytecodealliance/wasmtime#13949 / `fb8c7616d6` from
+`helios/realloc-task-context`), dropping patches and hunks superseded upstream
+(`a34ece0e5a` via #14524, `18b428e6be` via #14193, and the `custom/vm.rs`
+`decommit_pages` and `decommit_queue.rs` `std::io` hunks via #14774 and #14874).
+
+Its tip commit tells a host function the linear memory of the call it is serving:
 
 - `Access::caller_memory()` returns the memory named by the `canon lower`
   options the guest called through: the calling subcomponent's own memory.
@@ -302,51 +309,54 @@ there and the revision here in the same change.
 This revision is based on upstream Wasmtime commit:
 
 ```text
-2fb59986ce75a005e0d12fd4637f2e772bb659fd
+591684039699641a3ec725fbc86fc8c9f7681211
 ```
 
-It corresponds to Wasmtime 48.0.0-dev and requires Rust 1.95 or newer. Helios
+It corresponds to Wasmtime 52.0.0-dev and requires Rust 1.95 or newer. Helios
 pins `nightly-2026-11-03` in `rust-toolchain.toml` for Rust 1.101 and installs all
 host, bare-metal, and WASI targets used by the workspace.
 
 ## Patch series
 
-The local `helios-upstream-series-ready` branch is organized as a stacked,
-independently reviewable series. Each `pr-ready/*` branch points at the tip intended
-for that upstream pull request:
+The local `helios/sync-main-52` branch carries the remaining Helios fork commits
+on top of upstream `main`:
 
-1. `pr-ready/no-std-threads` — host-provided synchronization primitives and no-std
+1. `no-std-threads` — host-provided synchronization primitives and no-std
    WebAssembly threads support.
-2. `pr-ready/no-std-pooling` — no-std pooling allocator, including deterministic
+2. `no-std-pooling` — no-std pooling allocator, including deterministic
    single-shard selection where host thread-local storage is unavailable.
-3. `pr-ready/generic-fiber-pool` — bounded reuse of generic async fiber stacks.
-4. `pr-ready/custom-vm-accessible-reset` — reset only the accessible prefix of
+3. `generic-fiber-pool` — bounded reuse of generic async fiber stacks.
+4. `custom-vm-accessible-reset` — reset only the accessible prefix of
    custom-VM linear memories.
-5. `pr-ready/global-pass-timing` — aggregate Cranelift pass timings published by
+5. `global-pass-timing` — aggregate Cranelift pass timings published by
    parallel compiler workers.
-6. `pr-ready/riscv64-simd-fail-fast` — reject SIMD and relaxed-SIMD during
-   configuration validation when a riscv64 target does not enable the V
-   extension.
-7. `pr-ready/riscv64-inline-copy` — scalarize fixed-size inline copies when an ISA
-   lacks native 128-bit SIMD. This fixes GC `array.copy` compilation on
-   riscv64 without the V extension and includes a target-specific disassembly
-   regression test.
 
-The final commit on `helios-upstream-series-ready` remains a Helios integration
-patch: it separates Component Model Async ABI compilation
-from Wasmtime's async runtime/fiber support so the compiler plugin can produce
-compatible artifacts while the no-std kernel only loads and runs precompiled
-code. It should remain in the fork unless upstream agrees on that feature
-boundary.
+It also retains the Helios integration patch that separates Component Model
+Async ABI compilation from Wasmtime's async runtime/fiber support so the
+compiler plugin can produce compatible artifacts while the no-std kernel only
+loads and runs precompiled code. It should remain in the fork unless upstream
+agrees on that feature boundary.
 
-Two former fork patches were removed because upstream already provides their
-functionality:
+Former fork patches and hunks were removed because upstream already provides
+their functionality:
 
 - Cranelift pass timing already computes `now.duration_since(start)` correctly.
 - Component async TLS already uses slot 1 of the custom-platform
   `wasmtime_tls_get`/`wasmtime_tls_set` ABI. Helios implements both Wasmtime TLS
   slots through `WasmtimeTlsSlots`; the removed standalone component-TLS symbols
   must not be reintroduced.
+- Inline copy scalarization without native 128-bit SIMD (`a34ece0e5a`,
+  `pr-ready/riscv64-inline-copy`) landed upstream in
+  bytecodealliance/wasmtime#14524 (`fc03998641`).
+- Configuration validation rejecting SIMD and relaxed-SIMD on riscv64 without
+  the V extension (`pr-ready/riscv64-simd-fail-fast`) landed upstream in
+  bytecodealliance/wasmtime#14897 (`d706822a76`).
+- Explicit type arguments on `with_getter` and `Access::new` for the
+  next-generation trait solver (`18b428e6be`, `helios/next-solver-bindgen`)
+  landed upstream in bytecodealliance/wasmtime#14193 (`30dddb6556`).
+- Custom-VM `decommit_pages` and `no_std` `decommit_queue` cleanup from the
+  no-std pooling series landed upstream in bytecodealliance/wasmtime#14774
+  (`db82603b51`) and bytecodealliance/wasmtime#14874 (`c16fd4dee9`).
 
 Do not submit replacement patches for those upstream implementations.
 
@@ -366,7 +376,7 @@ The x86 backend preserves no vector state beyond FXSAVE at interrupts and the
 `preserve_all` trampoline's 128-bit xmm0-xmm15 save at stack-limit checks
 (`x86/src/extended_state.rs`). That is sound only while the fork's x64
 Cranelift backend keeps three properties, which hold at
-`1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` and which every move of the fork
+`83843e3ad9613bf4d9f5a860ef8bb5aa5d9a9de5` and which every move of the fork
 must keep:
 
 - **A, 128-bit only.** Every EVEX instruction in the assembler is declared

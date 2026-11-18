@@ -415,10 +415,17 @@ where
             WASIX_MODULE,
             "sock_accept_v2",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             (fd, _flags, ret_fd, ret_addr): (i32, i32, i32, i32)| {
+             (fd, flags, ret_fd, ret_addr): (i32, i32, i32, i32)| {
                 Box::new(async move {
                     p1_reply(
-                        wasix_sock_accept_v2(&mut caller, fd, ret_fd as u32, ret_addr as u32).await,
+                        wasix_sock_accept_v2(
+                            &mut caller,
+                            fd,
+                            flags,
+                            ret_fd as u32,
+                            ret_addr as u32,
+                        )
+                        .await,
                     )
                 })
             },
@@ -457,7 +464,7 @@ where
                             fd,
                             iovs as u32,
                             iovs_len as u32,
-                            flags as u16,
+                            flags,
                             ret_size as u32,
                             ret_flags as u32,
                             ret_addr as u32,
@@ -1046,15 +1053,13 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    // A bind never names a local address in WASIX, only a port, so the
-    // local address is the socket family's wildcard: `0.0.0.0` or `::`.
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
+            local_address,
             local_port,
-            family,
             ..
         }))) => {
-            let (address, local_port) = (crate::unix::unspecified_address(*family), *local_port);
+            let (address, local_port) = (*local_address, *local_port);
             write_wasix_addr_port(
                 caller,
                 memory,
@@ -1065,13 +1070,17 @@ where
         }
         Some(Preview1Descriptor::Socket(UnixSocket::Tcp(
             UnixTcpSocket::Bound {
-                local_port, family, ..
+                local_address,
+                local_port,
+                ..
             }
             | UnixTcpSocket::Listening {
-                local_port, family, ..
+                local_address,
+                local_port,
+                ..
             },
         ))) => {
-            let (address, local_port) = (crate::unix::unspecified_address(*family), *local_port);
+            let (address, local_port) = (*local_address, *local_port);
             write_wasix_addr_port(
                 caller,
                 memory,
@@ -1644,13 +1653,17 @@ where
     let Some(memory) = p1_async_memory(caller) else {
         return Ok(p1::errno::FAULT);
     };
-    let (_, port) = wasix_read_addr_port(&memory, GuestAddress::wasm32(addr)).await?;
-    Ok(wasix_sock_bind_port(caller, fd, port).await)
+    let (Some(address), port) = wasix_read_addr_port(&memory, GuestAddress::wasm32(addr)).await?
+    else {
+        return Ok(p1::errno::INVAL);
+    };
+    Ok(wasix_sock_bind_address(caller, fd, address, port).await)
 }
 
-async fn wasix_sock_bind_port<CpuImpl, Net, StorageImpl>(
+async fn wasix_sock_bind_address<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
+    address: crate::NetworkIpAddress,
     port: u16,
 ) -> i32
 where
@@ -1663,22 +1676,22 @@ where
         Ok(authority) => authority,
         Err(errno) => return errno,
     };
-    let status = caller.data().require_socket_authority(authority);
+    let status = caller.data().require_socket_bind_authority(authority, port);
     if status != p1::errno::SUCCESS {
         return status;
     }
-    if port < 1024 {
-        let status = caller.data().require_privileged_bind_authority();
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-    }
     match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(_))) => {
+        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound {
+            family,
+            ..
+        }))) => {
+            if !crate::unix::family_accepts(family, address) {
+                return p1::errno::AFNOSUPPORT;
+            }
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
             };
-            let binding = match service.udp_bind(port).await {
+            let binding = match service.udp_bind(address, port).await {
                 Ok(binding) => binding,
                 Err(error) => return p1_errno_from_udp_error(error),
             };
@@ -1700,14 +1713,24 @@ where
                     crate::UnixNetwork::new(service.clone()),
                     binding.socket,
                 ),
+                local_address: address,
                 local_port: binding.local_port,
                 options,
             };
             p1::errno::SUCCESS
         }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => {
-            if caller.data().runtime_state.network_service().is_none() {
+        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
+            family,
+            ..
+        }))) => {
+            if !crate::unix::family_accepts(family, address) {
+                return p1::errno::AFNOSUPPORT;
+            }
+            let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
+            };
+            if !address.is_unspecified() && !service.owns_ip_address(address) {
+                return p1::errno::ADDRNOTAVAIL;
             }
             let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
                 caller.data_mut().descriptors.get_mut(fd)
@@ -1717,6 +1740,7 @@ where
             let options = *slot.options();
             *slot = UnixTcpSocket::Bound {
                 family: slot.family(),
+                local_address: address,
                 local_port: port,
                 options,
             };
@@ -1754,30 +1778,30 @@ where
         Ok(backlog) => backlog,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let (local_port, hop_limit, family) = match caller.data().descriptors.get(fd) {
+    let (local_address, local_port, hop_limit, family) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
             options,
             family,
-        }))) => (0, options.hop_limit(), *family),
+        }))) => (
+            crate::unix::unspecified_address(*family),
+            0,
+            options.hop_limit(),
+            *family,
+        ),
         Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Bound {
+            local_address,
             local_port,
             options,
             family,
-        }))) => (*local_port, options.hop_limit(), *family),
+        }))) => (*local_address, *local_port, options.hop_limit(), *family),
         Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => {
             return p1::errno::INVAL;
         }
         Some(_) => return p1::errno::NOTSOCK,
         None => return p1::errno::BADF,
     };
-    // A wildcard listen means `::` on an AF_INET6 socket, not `0.0.0.0`.
     let listener = match service
-        .tcp_listen(
-            crate::unix::unspecified_address(family),
-            local_port,
-            backlog,
-            hop_limit,
-        )
+        .tcp_listen(local_address, local_port, backlog, hop_limit)
         .await
     {
         Ok(listener) => listener,
@@ -1795,6 +1819,7 @@ where
             crate::UnixNetwork::new(service.clone()),
             listener.listener,
         ),
+        local_address,
         local_port: listener.local_port,
         options,
     };
@@ -1804,6 +1829,7 @@ where
 pub(super) async fn wasix_sock_accept_v2<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
+    flags: i32,
     ret_fd: u32,
     ret_addr: u32,
 ) -> Result<i32, P1Stop>
@@ -1812,10 +1838,17 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let (accepted_fd, peer_address, peer_port) = match wasix_sock_accepted(caller, fd).await {
-        Ok(accepted) => accepted,
-        Err(errno) => return Ok(errno),
+    let Some(accepted_fdflags) = u16::try_from(flags)
+        .ok()
+        .filter(|fdflags| p1_socket_fdflags_supported(*fdflags))
+    else {
+        return Ok(p1::errno::INVAL);
     };
+    let (accepted_fd, peer_address, peer_port) =
+        match wasix_sock_accepted(caller, fd, accepted_fdflags).await {
+            Ok(accepted) => accepted,
+            Err(errno) => return Ok(errno),
+        };
     // The accept awaited, so the guest's pages are checked again as they
     // are written. A descriptor the guest never learned of is closed again.
     let written = async {
@@ -1848,6 +1881,7 @@ where
 async fn wasix_sock_accepted<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
+    accepted_fdflags: u16,
 ) -> Result<(u32, crate::NetworkIpAddress, u16), i32>
 where
     CpuImpl: Cpu + Clone,
@@ -1893,7 +1927,11 @@ where
         peer_port: accepted.port,
         options: unix_socket_options::<Net>(),
     }));
-    let accepted_fd = caller.data_mut().descriptors.insert(descriptor)?;
+    let accepted_fd =
+        caller
+            .data_mut()
+            .descriptors
+            .insert_with_fdflags(descriptor, false, accepted_fdflags)?;
     Ok((accepted_fd, peer_address, accepted.port))
 }
 
@@ -1968,6 +2006,7 @@ where
             local_port,
             options,
             family,
+            ..
         }))) => (
             *local_port,
             options.time(SocketTime::ConnectTimeout),
@@ -2031,7 +2070,7 @@ pub(super) async fn wasix_sock_recv_from<CpuImpl, Net, StorageImpl>(
     fd: i32,
     iovs: u32,
     iovs_len: u32,
-    flags: u16,
+    flags: i32,
     ret_size: u32,
     ret_flags: u32,
     ret_addr: u32,
@@ -2065,7 +2104,7 @@ pub(super) async fn wasix_sock_recv_from_inner<CpuImpl, Net, StorageImpl>(
     fd: i32,
     iovs: u32,
     iovs_len: u32,
-    flags: u16,
+    flags: i32,
     ret_size: u32,
     ret_flags: u32,
     ret_addr: u32,
@@ -2075,6 +2114,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
+    let Some(flags) = u16::try_from(flags)
+        .ok()
+        .filter(|flags| flags & !WASIX_RIFLAGS_SUPPORTED == 0)
+    else {
+        return Ok(p1::errno::INVAL);
+    };
+    let peek = flags & WASIX_RIFLAGS_RECV_PEEK != 0;
+    let dont_wait = flags & WASIX_RIFLAGS_RECV_DONT_WAIT != 0;
     let Some(memory) = p1_async_memory(caller) else {
         return Ok(p1::errno::FAULT);
     };
@@ -2105,19 +2152,35 @@ where
                 return Ok(p1::errno::NETDOWN);
             };
             let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let timeout =
-                wasix_effective_socket_timeout(options.time(SocketTime::ReceiveTimeout), fdflags);
-            let datagram = match service.udp_receive(socket.id(), capacity, timeout).await {
+            let effective_fdflags = fdflags | if dont_wait { P1_FDFLAG_NONBLOCK } else { 0 };
+            let timeout = wasix_effective_socket_timeout(
+                options.time(SocketTime::ReceiveTimeout),
+                effective_fdflags,
+            );
+            let received = if peek {
+                service.udp_peek(socket.id(), capacity, timeout).await
+            } else {
+                service.udp_receive(socket.id(), capacity, timeout).await
+            };
+            let datagram = match received {
                 Ok(Some(datagram)) => datagram,
                 Ok(None) => return Ok(p1::errno::AGAIN),
-                Err(error) => return Ok(p1_errno_from_udp_error_for_fdflags(error, fdflags)),
+                Err(error) => {
+                    return Ok(p1_errno_from_udp_error_for_fdflags(
+                        error,
+                        effective_fdflags,
+                    ));
+                }
             };
             memory
                 .write_iovs_from_bytes(&layout.iovs, &datagram.bytes, ret_size)
                 .await?;
-            memory
-                .write_u16(ret_flags, flags & WASIX_RIFLAGS_DATA_TRUNCATED)
-                .await?;
+            let ro_flags = if datagram.original_len > capacity as usize {
+                WASIX_ROFLAGS_DATA_TRUNCATED
+            } else {
+                0
+            };
+            memory.write_u16(ret_flags, ro_flags).await?;
             write_wasix_addr_port_async(&memory, ret_addr, Some(datagram.address), datagram.port)
                 .await?;
             Ok(p1::errno::SUCCESS)
@@ -2126,9 +2189,16 @@ where
             Ok(p1::errno::INVAL)
         }
         Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => {
+            let fdflags = caller.data().descriptors.fdflags(fd)?;
+            let effective_fdflags = fdflags | if dont_wait { P1_FDFLAG_NONBLOCK } else { 0 };
             let bytes = caller
                 .data_mut()
-                .read_socket_pair(fd, capacity as usize)
+                .recv_socket_pair(
+                    fd,
+                    capacity as usize,
+                    p1_fdflags_nonblocking(effective_fdflags),
+                    peek,
+                )
                 .await?;
             memory
                 .write_iovs_from_bytes(&layout.iovs, &bytes, ret_size)
@@ -2146,19 +2216,33 @@ where
                 return Ok(p1::errno::NETDOWN);
             };
             let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let timeout =
-                wasix_effective_socket_timeout(options.time(SocketTime::ReceiveTimeout), fdflags);
+            let effective_fdflags = fdflags | if dont_wait { P1_FDFLAG_NONBLOCK } else { 0 };
+            let timeout = wasix_effective_socket_timeout(
+                options.time(SocketTime::ReceiveTimeout),
+                effective_fdflags,
+            );
             // The stack copies straight out of its receive queue into the
             // guest's buffers, on this call's own poll, each page checked
             // present in the step that writes it.
             let ranges = memory.iov_ranges(&layout.iovs)?;
             let mut buffer = memory.tcp_receive_buffer(&ranges);
-            let read = service
-                .tcp_read_into(stream.id(), &mut buffer, timeout)
-                .await;
+            let read = if peek {
+                service
+                    .tcp_peek_into(stream.id(), &mut buffer, timeout)
+                    .await
+            } else {
+                service
+                    .tcp_read_into(stream.id(), &mut buffer, timeout)
+                    .await
+            };
             let received = match p1_tcp_received(read)? {
                 Ok(received) => received,
-                Err(error) => return Ok(p1_errno_from_tcp_error_for_fdflags(error, fdflags)),
+                Err(error) => {
+                    return Ok(p1_errno_from_tcp_error_for_fdflags(
+                        error,
+                        effective_fdflags,
+                    ));
+                }
             };
             memory.write_u32(ret_size, received).await?;
             memory.write_u16(ret_flags, 0).await?;
@@ -2243,7 +2327,8 @@ where
                     let Some(service) = caller.data().runtime_state.network_service() else {
                         return Ok(p1::errno::NETDOWN);
                     };
-                    let binding = match service.udp_bind(0).await {
+                    let local_address = crate::unix::unspecified_address(family);
+                    let binding = match service.udp_bind(local_address, 0).await {
                         Ok(binding) => binding,
                         Err(error) => return Ok(p1_errno_from_udp_error(error)),
                     };
@@ -2263,6 +2348,7 @@ where
                             crate::UnixNetwork::new(service.clone()),
                             binding.socket,
                         ),
+                        local_address,
                         local_port: binding.local_port,
                         options,
                     };
@@ -3059,5 +3145,1276 @@ mod tests {
             swap.bytes()[TEST_PAGE - 4..TEST_PAGE + 16] == plain[TEST_PAGE - 4..TEST_PAGE + 16],
             "the record is the one a present page gets"
         );
+    }
+
+    type TestNetService = crate::network::NetworkService<
+        crate::test_support::ManualClockCpu,
+        crate::test_support::RecordingNetworkInterface,
+    >;
+    type TestProgramStore = Preview1ProgramStore<
+        crate::test_support::ManualClockCpu,
+        TestNetService,
+        crate::test_support::UnsupportedStorage,
+    >;
+
+    const TEST_LOCAL_V4_A: helios_netstack::Ipv4Address =
+        helios_netstack::Ipv4Address::new([192, 0, 2, 10]);
+    const TEST_LOCAL_V4_B: helios_netstack::Ipv4Address =
+        helios_netstack::Ipv4Address::new([192, 0, 2, 11]);
+    const TEST_UNOWNED_V4: helios_netstack::Ipv4Address =
+        helios_netstack::Ipv4Address::new([192, 0, 2, 99]);
+    const TEST_PEER_V4: helios_netstack::Ipv4Address =
+        helios_netstack::Ipv4Address::new([192, 0, 2, 20]);
+    const TEST_LOCAL_V6_A: helios_netstack::Ipv6Address =
+        helios_netstack::Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    const TEST_LOCAL_V6_B: helios_netstack::Ipv6Address =
+        helios_netstack::Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    const TEST_UNOWNED_V6: helios_netstack::Ipv6Address =
+        helios_netstack::Ipv6Address::new([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 99]);
+    const TEST_PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
+
+    const fn ip_v4(addr: helios_netstack::Ipv4Address) -> crate::NetworkIpAddress {
+        crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new(addr.octets()))
+    }
+
+    fn configured_test_net_service() -> (
+        crate::test_support::ManualClockCpu,
+        crate::test_support::RecordingNetworkInterface,
+        TestNetService,
+    ) {
+        let clock = crate::test_support::ManualClockCpu::new();
+        let device = crate::test_support::RecordingNetworkInterface::accepting_transmissions(1);
+        let service = crate::network::NetworkService::new(
+            clock.clone(),
+            crate::test_support::single_node_pool(1),
+            crate::test_support::test_profile_sink(),
+            crate::test_support::test_uptime_clock(),
+            crate::test_support::test_timer(clock.clone()),
+            device.clone(),
+            crate::test_support::test_root_entropy(),
+        );
+        service.configure_test_addresses(
+            &[
+                helios_netstack::Ipv4Cidr::new(TEST_LOCAL_V4_A, 24),
+                helios_netstack::Ipv4Cidr::new(TEST_LOCAL_V4_B, 24),
+            ],
+            &[
+                helios_netstack::Ipv6Cidr::new(TEST_LOCAL_V6_A, 64),
+                helios_netstack::Ipv6Cidr::new(TEST_LOCAL_V6_B, 64),
+            ],
+            Some((
+                helios_netstack::IpAddress::Ipv4(TEST_PEER_V4),
+                TEST_PEER_MAC,
+            )),
+        );
+        (clock, device, service)
+    }
+
+    fn run_with_wasix_caller<F>(
+        authority: ProcessAuthority,
+        service: TestNetService,
+        clock: crate::test_support::ManualClockCpu,
+        f: F,
+    ) where
+        F: for<'a> FnOnce(
+                &'a mut Caller<'_, TestProgramStore>,
+            ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let engine = crate::wasmtime_adapter::engine::build_component_engine_for_platform(
+            &crate::test_support::TestCpu::without_entropy(),
+        )
+        .expect("component engine builds on test platform");
+        let memory = wasmtime::SharedMemory::new(
+            &engine,
+            wasmtime::MemoryType::shared(1, 1).expect("1..=1 is a valid shared memory type"),
+        )
+        .expect("shared guest test memory builds");
+        let runtime_state: HostRuntimeState<
+            crate::test_support::ManualClockCpu,
+            TestNetService,
+            crate::test_support::UnsupportedStorage,
+        > = crate::RuntimeState::new(
+            clock.timebase(),
+            1,
+            0,
+            crate::BootPayload::for_tests(),
+            GuestIsa::for_build_target(clock.native_feature_probe()),
+        );
+        runtime_state.install_root_entropy(crate::test_support::test_root_entropy());
+        runtime_state.install_network_service(service);
+        let executor = crate::Executor::new(
+            crate::ProgressCounter::new(),
+            crate::test_support::single_node_pool(1),
+            helios_hal::cpu::ProcessorId::new(0),
+        );
+        let registry = crate::InstanceRegistry::new();
+        let instance = registry.register("wasix-net-test", 0);
+        let interrupts = Arc::new(crate::wasmtime_adapter::GuestInterrupts::new(
+            1,
+            clock.timebase(),
+        ));
+        fn read_nothing(_: &mut Vec<u8>, _: u32) {}
+        let write_serial = crate::DebugSerialWriter::of::<super::test_store::DiscardPort>();
+        let store_data = Preview1ProgramStore::new(
+            clock.clone(),
+            executor.timer(clock.clone()),
+            executor
+                .spawner(clock)
+                .instance_spawner(crate::TaskFunding::Instance, &instance),
+            runtime_state,
+            interrupts,
+            instance,
+            None,
+            Vec::new(),
+            Vec::new(),
+            authority,
+            OutputMode::Serial,
+            read_nothing,
+            write_serial,
+            Some(memory),
+            None,
+            None,
+            WasixSignalState::new(),
+            WasixSignalState::new(),
+            Vec::new(),
+            None,
+            true,
+            WasixProcessThreads::new(),
+        );
+        let mut store = wasmtime::Store::new(&engine, store_data);
+        let f_cell = std::sync::Mutex::new(Some(f));
+        let entry = wasmtime::Func::wrap_async(
+            &mut store,
+            move |mut caller: Caller<'_, TestProgramStore>, (): ()| {
+                let callback = f_cell
+                    .lock()
+                    .expect("test callback mutex")
+                    .take()
+                    .expect("test callback runs once");
+                Box::new(async move {
+                    callback(&mut caller).await;
+                    Ok(())
+                })
+            },
+        );
+        let typed = entry
+            .typed::<(), ()>(&store)
+            .expect("test func signature matches");
+        run(typed.call_async(&mut store, ())).expect("test func run succeeds");
+    }
+
+    fn write_guest_addr_port(
+        caller: &mut Caller<'_, TestProgramStore>,
+        ptr: u32,
+        address: crate::NetworkIpAddress,
+        port: u16,
+    ) {
+        let (record, len) = wasix_addr_port_record(Some(address), port);
+        let memory = p1_async_memory(caller).expect("guest memory");
+        run(memory.write_bytes(GuestAddress::wasm32(ptr), &record[..len]))
+            .expect("addr_port write fits in guest memory");
+    }
+
+    fn read_guest_addr_port(
+        caller: &mut Caller<'_, TestProgramStore>,
+        ptr: u32,
+    ) -> (Option<crate::NetworkIpAddress>, u16) {
+        let memory = p1_async_memory(caller).expect("guest memory");
+        run(wasix_read_addr_port(&memory, GuestAddress::wasm32(ptr)))
+            .expect("addr_port read succeeds")
+    }
+
+    fn write_guest_iov(
+        caller: &mut Caller<'_, TestProgramStore>,
+        iov_ptr: u32,
+        buf_ptr: u32,
+        buf_len: u32,
+    ) {
+        let memory = p1_async_memory(caller).expect("guest memory");
+        run(memory.write_u32(GuestAddress::wasm32(iov_ptr), buf_ptr)).expect("iov buf");
+        run(memory.write_u32(GuestAddress::wasm32(iov_ptr + 4), buf_len)).expect("iov len");
+    }
+
+    fn read_guest_u32(caller: &mut Caller<'_, TestProgramStore>, ptr: u32) -> u32 {
+        let memory = p1_async_memory(caller).expect("guest memory");
+        run(memory.read_u32(GuestAddress::wasm32(ptr))).expect("u32 read")
+    }
+
+    fn read_guest_u16(caller: &mut Caller<'_, TestProgramStore>, ptr: u32) -> u16 {
+        let memory = p1_async_memory(caller).expect("guest memory");
+        run(memory.read_u16(GuestAddress::wasm32(ptr))).expect("u16 read")
+    }
+
+    fn read_guest_bytes(
+        caller: &mut Caller<'_, TestProgramStore>,
+        ptr: u32,
+        len: usize,
+    ) -> Vec<u8> {
+        let memory = p1_async_memory(caller).expect("guest memory");
+        run(memory.read_bytes(GuestAddress::wasm32(ptr), len)).expect("bytes read")
+    }
+
+    fn network_authority(rights: NetworkAuthorityRights) -> ProcessAuthority {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_network_rights(rights);
+        authority
+    }
+
+    fn build_ipv4_udp_frame(
+        local_mac: [u8; 6],
+        dst_ip: helios_netstack::Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        use helios_netstack::{
+            ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol,
+            Ipv4Packet, TransportChecksum, UdpPacket,
+        };
+
+        let mut frame = vec![0_u8; ETHERNET_FRAME_BYTES];
+        let eth_len = EthernetFrame::encode_header(
+            &mut frame,
+            local_mac,
+            TEST_PEER_MAC,
+            EthernetProtocol::Ipv4,
+        )
+        .expect("ethernet header");
+        let udp_start = eth_len + Ipv4Packet::MIN_HEADER_LEN;
+        let udp_len = UdpPacket::encode(
+            &mut frame[udp_start..],
+            IpAddress::Ipv4(TEST_PEER_V4),
+            IpAddress::Ipv4(dst_ip),
+            src_port,
+            dst_port,
+            payload,
+            TransportChecksum::Software,
+        )
+        .expect("udp packet");
+        let ip_len = Ipv4Packet::encode_header(
+            &mut frame[eth_len..],
+            TEST_PEER_V4,
+            dst_ip,
+            IpProtocol::Udp,
+            udp_len,
+            1,
+            64,
+        )
+        .expect("ipv4 header");
+        frame.truncate(eth_len + ip_len + udp_len);
+        frame
+    }
+
+    fn build_ipv4_tcp_frame(
+        local_mac: [u8; 6],
+        dst_ip: helios_netstack::Ipv4Address,
+        header: helios_netstack::TcpHeader,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        use helios_netstack::{
+            ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol,
+            Ipv4Packet, TcpPacket, TransportChecksum,
+        };
+
+        let mut frame = vec![0_u8; ETHERNET_FRAME_BYTES];
+        let eth_len = EthernetFrame::encode_header(
+            &mut frame,
+            local_mac,
+            TEST_PEER_MAC,
+            EthernetProtocol::Ipv4,
+        )
+        .expect("ethernet header");
+        let tcp_start = eth_len + Ipv4Packet::MIN_HEADER_LEN;
+        let tcp_len = TcpPacket::encode(
+            &mut frame[tcp_start..],
+            IpAddress::Ipv4(TEST_PEER_V4),
+            IpAddress::Ipv4(dst_ip),
+            header,
+            payload,
+            TransportChecksum::Software,
+        )
+        .expect("tcp packet");
+        let ip_len = Ipv4Packet::encode_header(
+            &mut frame[eth_len..],
+            TEST_PEER_V4,
+            dst_ip,
+            IpProtocol::Tcp,
+            tcp_len,
+            1,
+            64,
+        )
+        .expect("ipv4 header");
+        frame.truncate(eth_len + ip_len + tcp_len);
+        frame
+    }
+
+    fn find_syn_ack_sequence(
+        device: &crate::test_support::RecordingNetworkInterface,
+        src_ip: helios_netstack::Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+    ) -> u32 {
+        use helios_netstack::{
+            EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, TcpFlags, TcpPacket,
+        };
+
+        for frame in device.transmitted_frames().into_iter().rev() {
+            let Some(eth) = EthernetFrame::parse(&frame) else {
+                continue;
+            };
+            if eth.protocol != EthernetProtocol::Ipv4 {
+                continue;
+            }
+            let Some(ip) = Ipv4Packet::parse(eth.payload) else {
+                continue;
+            };
+            if ip.source != src_ip || ip.protocol != IpProtocol::Tcp {
+                continue;
+            }
+            let Some(tcp) = TcpPacket::parse(ip.payload) else {
+                continue;
+            };
+            if tcp.source_port == src_port
+                && tcp.destination_port == dst_port
+                && tcp.flags.contains(TcpFlags::SYN)
+                && tcp.flags.contains(TcpFlags::ACK)
+            {
+                return tcp.sequence;
+            }
+        }
+        panic!("expected SYN-ACK from {src_ip:?}:{src_port} -> {dst_port}");
+    }
+
+    #[test]
+    fn wasix_sock_bind_keeps_address_and_filters_udp_and_tcp_traffic() {
+        let (clock, device, service) = configured_test_net_service();
+        let local_mac = service.hardware_address();
+        let authority =
+            network_authority(NetworkAuthorityRights::TCP | NetworkAuthorityRights::UDP);
+        run_with_wasix_caller(authority, service, clock, move |caller| {
+            Box::pin(async move {
+                // Unowned IPv4/IPv6 addresses fail with ADDRNOTAVAIL for both UDP and TCP.
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_DGRAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let udp_unowned = read_guest_u32(caller, 100) as i32;
+                write_guest_addr_port(caller, 200, ip_v4(TEST_UNOWNED_V4), 5001);
+                assert_eq!(
+                    wasix_sock_bind(caller, udp_unowned, 200).await,
+                    Ok(p1::errno::ADDRNOTAVAIL)
+                );
+
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET6_I32,
+                        WASIX_SOCK_TYPE_DGRAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let udp6_unowned = read_guest_u32(caller, 100) as i32;
+                write_guest_addr_port(
+                    caller,
+                    200,
+                    crate::NetworkIpAddress::Ipv6(TEST_UNOWNED_V6),
+                    5001,
+                );
+                assert_eq!(
+                    wasix_sock_bind(caller, udp6_unowned, 200).await,
+                    Ok(p1::errno::ADDRNOTAVAIL)
+                );
+
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let tcp_unowned = read_guest_u32(caller, 100) as i32;
+                write_guest_addr_port(caller, 200, ip_v4(TEST_UNOWNED_V4), 8081);
+                assert_eq!(
+                    wasix_sock_bind(caller, tcp_unowned, 200).await,
+                    Ok(p1::errno::ADDRNOTAVAIL)
+                );
+
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET6_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let tcp6_unowned = read_guest_u32(caller, 100) as i32;
+                write_guest_addr_port(
+                    caller,
+                    200,
+                    crate::NetworkIpAddress::Ipv6(TEST_UNOWNED_V6),
+                    8081,
+                );
+                assert_eq!(
+                    wasix_sock_bind(caller, tcp6_unowned, 200).await,
+                    Ok(p1::errno::ADDRNOTAVAIL)
+                );
+
+                // IPv6 UDP bind keeps the specific owned address and reports it via sock_addr_local.
+                write_guest_addr_port(
+                    caller,
+                    200,
+                    crate::NetworkIpAddress::Ipv6(TEST_LOCAL_V6_A),
+                    5002,
+                );
+                assert_eq!(
+                    wasix_sock_bind(caller, udp6_unowned, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(
+                    wasix_sock_addr_local(caller, udp6_unowned, 240),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    read_guest_addr_port(caller, 240),
+                    (Some(crate::NetworkIpAddress::Ipv6(TEST_LOCAL_V6_A)), 5002)
+                );
+
+                // IPv4 UDP bind on TEST_LOCAL_V4_A:5000 only receives packets sent to TEST_LOCAL_V4_A.
+                write_guest_addr_port(caller, 200, ip_v4(TEST_LOCAL_V4_A), 5000);
+                assert_eq!(
+                    wasix_sock_bind(caller, udp_unowned, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(
+                    wasix_sock_addr_local(caller, udp_unowned, 240),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    read_guest_addr_port(caller, 240),
+                    (Some(ip_v4(TEST_LOCAL_V4_A)), 5000)
+                );
+
+                device.deliver_on(
+                    0,
+                    &build_ipv4_udp_frame(local_mac, TEST_LOCAL_V4_B, 40000, 5000, b"wrong-ip"),
+                );
+                write_guest_iov(caller, 300, 400, 32);
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        udp_unowned,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_DONT_WAIT),
+                        500,
+                        504,
+                        512,
+                    )
+                    .await,
+                    Ok(p1::errno::AGAIN),
+                    "UDP socket bound to A must not receive datagram sent to B"
+                );
+
+                device.deliver_on(
+                    0,
+                    &build_ipv4_udp_frame(local_mac, TEST_LOCAL_V4_A, 40001, 5000, b"right-ip"),
+                );
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        udp_unowned,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_DONT_WAIT),
+                        500,
+                        504,
+                        512,
+                    )
+                    .await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                let len = read_guest_u32(caller, 500) as usize;
+                assert_eq!(read_guest_bytes(caller, 400, len), b"right-ip");
+
+                // TCP listeners on A:8080 and B:8080 coexist, report their bound address,
+                // and A:8080 accepts only connections targeting A.
+                write_guest_addr_port(caller, 200, ip_v4(TEST_LOCAL_V4_A), 8080);
+                assert_eq!(
+                    wasix_sock_bind(caller, tcp_unowned, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(
+                    wasix_sock_addr_local(caller, tcp_unowned, 240),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    read_guest_addr_port(caller, 240),
+                    (Some(ip_v4(TEST_LOCAL_V4_A)), 8080)
+                );
+                assert_eq!(
+                    wasix_sock_listen(caller, tcp_unowned, 4).await,
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    wasix_sock_addr_local(caller, tcp_unowned, 240),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    read_guest_addr_port(caller, 240),
+                    (Some(ip_v4(TEST_LOCAL_V4_A)), 8080)
+                );
+
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        104,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let tcp_b = read_guest_u32(caller, 104) as i32;
+                write_guest_addr_port(caller, 200, ip_v4(TEST_LOCAL_V4_B), 8080);
+                assert_eq!(
+                    wasix_sock_bind(caller, tcp_b, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(
+                    wasix_sock_listen(caller, tcp_b, 4).await,
+                    p1::errno::SUCCESS
+                );
+
+                // SYN targeting B:8080 does not wake listener bound to A:8080.
+                let listener_a = tcp_unowned;
+                assert_eq!(
+                    caller
+                        .data_mut()
+                        .descriptors
+                        .set_fdflags(listener_a, P1_FDFLAG_NONBLOCK),
+                    p1::errno::SUCCESS
+                );
+                device.deliver_on(
+                    0,
+                    &build_ipv4_tcp_frame(
+                        local_mac,
+                        TEST_LOCAL_V4_B,
+                        helios_netstack::TcpHeader {
+                            source_port: 41000,
+                            destination_port: 8080,
+                            sequence: 1000,
+                            acknowledgement: 0,
+                            flags: helios_netstack::TcpFlags::SYN,
+                            window_size: u16::MAX,
+                        },
+                        &[],
+                    ),
+                );
+                assert_eq!(
+                    wasix_sock_accept_v2(caller, listener_a, 0, 600, 608).await,
+                    Ok(p1::errno::AGAIN),
+                    "listener bound to A must not accept SYN to B"
+                );
+
+                // SYN targeting A:8080 completes handshake on listener A.
+                assert_eq!(
+                    caller.data_mut().descriptors.set_fdflags(listener_a, 0),
+                    p1::errno::SUCCESS
+                );
+                device.deliver_on(
+                    0,
+                    &build_ipv4_tcp_frame(
+                        local_mac,
+                        TEST_LOCAL_V4_A,
+                        helios_netstack::TcpHeader {
+                            source_port: 41001,
+                            destination_port: 8080,
+                            sequence: 2000,
+                            acknowledgement: 0,
+                            flags: helios_netstack::TcpFlags::SYN,
+                            window_size: u16::MAX,
+                        },
+                        &[],
+                    ),
+                );
+                {
+                    let mut accept_fut =
+                        core::pin::pin!(wasix_sock_accept_v2(caller, listener_a, 0, 600, 608));
+                    assert!(
+                        futures_lite::future::poll_once(accept_fut.as_mut())
+                            .await
+                            .is_none()
+                    );
+                    let seq = find_syn_ack_sequence(&device, TEST_LOCAL_V4_A, 8080, 41001);
+                    device.deliver_on(
+                        0,
+                        &build_ipv4_tcp_frame(
+                            local_mac,
+                            TEST_LOCAL_V4_A,
+                            helios_netstack::TcpHeader {
+                                source_port: 41001,
+                                destination_port: 8080,
+                                sequence: 2001,
+                                acknowledgement: seq.wrapping_add(1),
+                                flags: helios_netstack::TcpFlags::ACK,
+                                window_size: u16::MAX,
+                            },
+                            &[],
+                        ),
+                    );
+                    assert_eq!(accept_fut.await, Ok(p1::errno::SUCCESS));
+                }
+            })
+        });
+    }
+
+    #[test]
+    fn wasix_sock_bind_enforces_shared_privilege_rule_and_exempts_port_zero() {
+        let (clock, _device, service) = configured_test_net_service();
+        let unprivileged =
+            network_authority(NetworkAuthorityRights::TCP | NetworkAuthorityRights::UDP);
+        run_with_wasix_caller(unprivileged, service, clock, move |caller| {
+            Box::pin(async move {
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_DGRAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let udp = read_guest_u32(caller, 100) as i32;
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        104,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let tcp = read_guest_u32(caller, 104) as i32;
+
+                // Low non-zero port 80 requires PRIVILEGED_BIND.
+                write_guest_addr_port(
+                    caller,
+                    200,
+                    crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                    80,
+                );
+                assert_eq!(
+                    wasix_sock_bind(caller, udp, 200).await,
+                    Ok(p1::errno::NOTCAPABLE)
+                );
+                assert_eq!(
+                    wasix_sock_bind(caller, tcp, 200).await,
+                    Ok(p1::errno::NOTCAPABLE)
+                );
+
+                // Ephemeral port 0 is exempt from PRIVILEGED_BIND.
+                write_guest_addr_port(
+                    caller,
+                    200,
+                    crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                    0,
+                );
+                assert_eq!(
+                    wasix_sock_bind(caller, udp, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(wasix_sock_addr_local(caller, udp, 240), p1::errno::SUCCESS);
+                let (_, assigned_port) = read_guest_addr_port(caller, 240);
+                assert_ne!(assigned_port, 0);
+
+                assert_eq!(
+                    wasix_sock_bind(caller, tcp, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(wasix_sock_listen(caller, tcp, 4).await, p1::errno::SUCCESS);
+                assert_eq!(wasix_sock_addr_local(caller, tcp, 240), p1::errno::SUCCESS);
+                let (_, assigned_tcp_port) = read_guest_addr_port(caller, 240);
+                assert_ne!(assigned_tcp_port, 0);
+
+                // Unprivileged port 1024 does not require PRIVILEGED_BIND.
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_DGRAM,
+                        0,
+                        108,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let udp_high = read_guest_u32(caller, 108) as i32;
+                write_guest_addr_port(
+                    caller,
+                    200,
+                    crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                    1024,
+                );
+                assert_eq!(
+                    wasix_sock_bind(caller, udp_high, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+            })
+        });
+
+        let (clock, _device, service) = configured_test_net_service();
+        let privileged = network_authority(
+            NetworkAuthorityRights::TCP
+                | NetworkAuthorityRights::UDP
+                | NetworkAuthorityRights::PRIVILEGED_BIND,
+        );
+        run_with_wasix_caller(privileged, service, clock, move |caller| {
+            Box::pin(async move {
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_DGRAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let udp = read_guest_u32(caller, 100) as i32;
+                write_guest_addr_port(
+                    caller,
+                    200,
+                    crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                    80,
+                );
+                assert_eq!(
+                    wasix_sock_bind(caller, udp, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn wasix_sock_accept_v2_validates_fdflags_and_sets_them_on_accepted_fd() {
+        let (clock, device, service) = configured_test_net_service();
+        let local_mac = service.hardware_address();
+        let authority = network_authority(NetworkAuthorityRights::TCP);
+        run_with_wasix_caller(authority, service, clock, move |caller| {
+            Box::pin(async move {
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let listener = read_guest_u32(caller, 100) as i32;
+                write_guest_addr_port(caller, 200, ip_v4(TEST_LOCAL_V4_A), 9000);
+                assert_eq!(
+                    wasix_sock_bind(caller, listener, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(
+                    wasix_sock_listen(caller, listener, 4).await,
+                    p1::errno::SUCCESS
+                );
+
+                for bad_flags in [i32::from(P1_FDFLAG_APPEND), 0x100, -1] {
+                    assert_eq!(
+                        wasix_sock_accept_v2(caller, listener, bad_flags, 600, 608).await,
+                        Ok(p1::errno::INVAL)
+                    );
+                }
+
+                device.deliver_on(
+                    0,
+                    &build_ipv4_tcp_frame(
+                        local_mac,
+                        TEST_LOCAL_V4_A,
+                        helios_netstack::TcpHeader {
+                            source_port: 42000,
+                            destination_port: 9000,
+                            sequence: 500,
+                            acknowledgement: 0,
+                            flags: helios_netstack::TcpFlags::SYN,
+                            window_size: u16::MAX,
+                        },
+                        &[],
+                    ),
+                );
+                {
+                    let mut accept_fut = core::pin::pin!(wasix_sock_accept_v2(
+                        caller,
+                        listener,
+                        i32::from(P1_FDFLAG_NONBLOCK),
+                        600,
+                        608,
+                    ));
+                    assert!(
+                        futures_lite::future::poll_once(accept_fut.as_mut())
+                            .await
+                            .is_none()
+                    );
+                    let seq = find_syn_ack_sequence(&device, TEST_LOCAL_V4_A, 9000, 42000);
+                    device.deliver_on(
+                        0,
+                        &build_ipv4_tcp_frame(
+                            local_mac,
+                            TEST_LOCAL_V4_A,
+                            helios_netstack::TcpHeader {
+                                source_port: 42000,
+                                destination_port: 9000,
+                                sequence: 501,
+                                acknowledgement: seq.wrapping_add(1),
+                                flags: helios_netstack::TcpFlags::ACK,
+                                window_size: u16::MAX,
+                            },
+                            &[],
+                        ),
+                    );
+                    assert_eq!(accept_fut.await, Ok(p1::errno::SUCCESS));
+                }
+                let accepted_fd = read_guest_u32(caller, 600) as i32;
+                assert_eq!(
+                    caller.data().descriptors.fdflags(accepted_fd),
+                    Ok(P1_FDFLAG_NONBLOCK)
+                );
+
+                write_guest_iov(caller, 300, 400, 16);
+                assert_eq!(
+                    wasix_sock_recv_from(caller, accepted_fd, 300, 1, 0, 500, 504, 0).await,
+                    Ok(p1::errno::AGAIN),
+                    "accepted non-blocking socket must return AGAIN when empty"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn wasix_sock_recv_from_honours_flags_peek_dont_wait_and_data_truncated() {
+        let (clock, device, service) = configured_test_net_service();
+        let local_mac = service.hardware_address();
+        let authority =
+            network_authority(NetworkAuthorityRights::TCP | NetworkAuthorityRights::UDP);
+        run_with_wasix_caller(authority, service, clock, move |caller| {
+            Box::pin(async move {
+                // Create UDP socket, TCP connected socket, and socketpair.
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_DGRAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let udp = read_guest_u32(caller, 100) as i32;
+                write_guest_addr_port(caller, 200, ip_v4(TEST_LOCAL_V4_A), 5050);
+                assert_eq!(
+                    wasix_sock_bind(caller, udp, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        104,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let listener = read_guest_u32(caller, 104) as i32;
+                write_guest_addr_port(caller, 200, ip_v4(TEST_LOCAL_V4_A), 9050);
+                assert_eq!(
+                    wasix_sock_bind(caller, listener, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(
+                    wasix_sock_listen(caller, listener, 4).await,
+                    p1::errno::SUCCESS
+                );
+                device.deliver_on(
+                    0,
+                    &build_ipv4_tcp_frame(
+                        local_mac,
+                        TEST_LOCAL_V4_A,
+                        helios_netstack::TcpHeader {
+                            source_port: 43000,
+                            destination_port: 9050,
+                            sequence: 100,
+                            acknowledgement: 0,
+                            flags: helios_netstack::TcpFlags::SYN,
+                            window_size: u16::MAX,
+                        },
+                        &[],
+                    ),
+                );
+                let seq = {
+                    let mut accept_fut =
+                        core::pin::pin!(wasix_sock_accept_v2(caller, listener, 0, 600, 608));
+                    assert!(
+                        futures_lite::future::poll_once(accept_fut.as_mut())
+                            .await
+                            .is_none()
+                    );
+                    let seq = find_syn_ack_sequence(&device, TEST_LOCAL_V4_A, 9050, 43000);
+                    device.deliver_on(
+                        0,
+                        &build_ipv4_tcp_frame(
+                            local_mac,
+                            TEST_LOCAL_V4_A,
+                            helios_netstack::TcpHeader {
+                                source_port: 43000,
+                                destination_port: 9050,
+                                sequence: 101,
+                                acknowledgement: seq.wrapping_add(1),
+                                flags: helios_netstack::TcpFlags::ACK,
+                                window_size: u16::MAX,
+                            },
+                            &[],
+                        ),
+                    );
+                    assert_eq!(accept_fut.await, Ok(p1::errno::SUCCESS));
+                    seq
+                };
+                let tcp = read_guest_u32(caller, 600) as i32;
+
+                assert_eq!(
+                    wasix_sock_pair(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_UNIX_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        108,
+                        112,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let pair_read = read_guest_u32(caller, 108) as i32;
+                let pair_write = read_guest_u32(caller, 112) as i32;
+
+                // Unknown receive flags return INVAL across UDP, TCP, and socketpair.
+                write_guest_iov(caller, 300, 400, 16);
+                for fd in [udp, tcp, pair_read] {
+                    for bad_flag in [1 << 1, 1 << 2, 1 << 4, 0x1_0000, -1] {
+                        assert_eq!(
+                            wasix_sock_recv_from(caller, fd, 300, 1, bad_flag, 500, 504, 512).await,
+                            Ok(p1::errno::INVAL)
+                        );
+                    }
+                }
+
+                // RECV_DONT_WAIT on empty blocking UDP, TCP, and socketpair returns AGAIN.
+                for fd in [udp, tcp, pair_read] {
+                    assert_eq!(
+                        p1_reply(
+                            wasix_sock_recv_from(
+                                caller,
+                                fd,
+                                300,
+                                1,
+                                i32::from(WASIX_RIFLAGS_RECV_DONT_WAIT),
+                                500,
+                                504,
+                                512,
+                            )
+                            .await
+                        )
+                        .expect("p1 reply"),
+                        p1::errno::AGAIN
+                    );
+                }
+
+                // UDP: RECV_PEEK + DATA_TRUNCATED + full receive.
+                device.deliver_on(
+                    0,
+                    &build_ipv4_udp_frame(local_mac, TEST_LOCAL_V4_A, 44000, 5050, b"hello"),
+                );
+                write_guest_iov(caller, 300, 400, 3);
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        udp,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_PEEK | WASIX_RIFLAGS_RECV_DONT_WAIT),
+                        500,
+                        504,
+                        512,
+                    )
+                    .await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 3);
+                assert_eq!(read_guest_u16(caller, 504), WASIX_ROFLAGS_DATA_TRUNCATED);
+                assert_eq!(read_guest_bytes(caller, 400, 3), b"hel");
+
+                write_guest_iov(caller, 300, 400, 5);
+                assert_eq!(
+                    wasix_sock_recv_from(caller, udp, 300, 1, 0, 500, 504, 512).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 5);
+                assert_eq!(read_guest_u16(caller, 504), 0);
+                assert_eq!(read_guest_bytes(caller, 400, 5), b"hello");
+
+                // Non-peek truncated datagram sets DATA_TRUNCATED, non-truncated larger buffer does not.
+                device.deliver_on(
+                    0,
+                    &build_ipv4_udp_frame(local_mac, TEST_LOCAL_V4_A, 44000, 5050, b"hello"),
+                );
+                write_guest_iov(caller, 300, 400, 3);
+                assert_eq!(
+                    wasix_sock_recv_from(caller, udp, 300, 1, 0, 500, 504, 512).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 3);
+                assert_eq!(read_guest_u16(caller, 504), WASIX_ROFLAGS_DATA_TRUNCATED);
+
+                device.deliver_on(
+                    0,
+                    &build_ipv4_udp_frame(local_mac, TEST_LOCAL_V4_A, 44000, 5050, b"hello"),
+                );
+                write_guest_iov(caller, 300, 400, 8);
+                assert_eq!(
+                    wasix_sock_recv_from(caller, udp, 300, 1, 0, 500, 504, 512).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 5);
+                assert_eq!(read_guest_u16(caller, 504), 0);
+
+                // TCP: RECV_PEEK does not consume stream bytes.
+                device.deliver_on(
+                    0,
+                    &build_ipv4_tcp_frame(
+                        local_mac,
+                        TEST_LOCAL_V4_A,
+                        helios_netstack::TcpHeader {
+                            source_port: 43000,
+                            destination_port: 9050,
+                            sequence: 101,
+                            acknowledgement: seq.wrapping_add(1),
+                            flags: helios_netstack::TcpFlags::ACK
+                                .union(helios_netstack::TcpFlags::PSH),
+                            window_size: u16::MAX,
+                        },
+                        b"hello",
+                    ),
+                );
+                write_guest_iov(caller, 300, 400, 3);
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        tcp,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_PEEK | WASIX_RIFLAGS_RECV_DONT_WAIT),
+                        500,
+                        504,
+                        0,
+                    )
+                    .await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 3);
+                assert_eq!(read_guest_u16(caller, 504), 0);
+                assert_eq!(read_guest_bytes(caller, 400, 3), b"hel");
+
+                write_guest_iov(caller, 300, 400, 8);
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        tcp,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_PEEK),
+                        500,
+                        504,
+                        0,
+                    )
+                    .await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 5);
+                assert_eq!(read_guest_bytes(caller, 400, 5), b"hello");
+
+                assert_eq!(
+                    wasix_sock_recv_from(caller, tcp, 300, 1, 0, 500, 504, 0).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 5);
+                assert_eq!(read_guest_bytes(caller, 400, 5), b"hello");
+
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        tcp,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_DONT_WAIT),
+                        500,
+                        504,
+                        0,
+                    )
+                    .await,
+                    Ok(p1::errno::AGAIN)
+                );
+
+                // Socketpair: RECV_PEEK does not consume buffered bytes.
+                let writer = match caller.data().descriptors.get(pair_write) {
+                    Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })) => {
+                        writer.clone()
+                    }
+                    _ => panic!("expected socketpair writer"),
+                };
+                writer
+                    .write(Bytes::from_static(b"hello"))
+                    .await
+                    .expect("socketpair write succeeds");
+
+                write_guest_iov(caller, 300, 400, 3);
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        pair_read,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_PEEK | WASIX_RIFLAGS_RECV_DONT_WAIT),
+                        500,
+                        504,
+                        512,
+                    )
+                    .await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 3);
+                assert_eq!(read_guest_u16(caller, 504), 0);
+                assert_eq!(read_guest_bytes(caller, 400, 3), b"hel");
+
+                write_guest_iov(caller, 300, 400, 8);
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        pair_read,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_PEEK),
+                        500,
+                        504,
+                        512,
+                    )
+                    .await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 5);
+                assert_eq!(read_guest_bytes(caller, 400, 5), b"hello");
+
+                assert_eq!(
+                    wasix_sock_recv_from(caller, pair_read, 300, 1, 0, 500, 504, 512).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 5);
+                assert_eq!(read_guest_bytes(caller, 400, 5), b"hello");
+
+                assert_eq!(
+                    p1_reply(
+                        wasix_sock_recv_from(
+                            caller,
+                            pair_read,
+                            300,
+                            1,
+                            i32::from(WASIX_RIFLAGS_RECV_DONT_WAIT),
+                            500,
+                            504,
+                            512,
+                        )
+                        .await
+                    )
+                    .expect("p1 reply"),
+                    p1::errno::AGAIN
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn wasix_and_preview1_nonblocking_socketpair_empty_and_zero_length() {
+        let (clock, _device, service) = configured_test_net_service();
+        run_with_wasix_caller(ProcessAuthority::empty(), service, clock, move |caller| {
+            Box::pin(async move {
+                assert_eq!(
+                    wasix_sock_pair(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_UNIX_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        100,
+                        104,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let pair_read = read_guest_u32(caller, 100) as i32;
+                assert_eq!(
+                    caller
+                        .data_mut()
+                        .descriptors
+                        .set_fdflags(pair_read, P1_FDFLAG_NONBLOCK),
+                    p1::errno::SUCCESS
+                );
+
+                // Empty nonblocking socketpair returns AGAIN with non-zero buffer.
+                write_guest_iov(caller, 300, 400, 8);
+                assert_eq!(
+                    p1_reply(
+                        wasix_sock_recv_from(caller, pair_read, 300, 1, 0, 500, 504, 512).await
+                    )
+                    .expect("p1 reply"),
+                    p1::errno::AGAIN
+                );
+                assert_eq!(
+                    p1_reply(p1_sock_recv_inner(caller, pair_read, 300, 1, 0, 500, 504).await)
+                        .expect("p1 reply"),
+                    p1::errno::AGAIN
+                );
+
+                // Zero-length receive on empty nonblocking socketpair returns SUCCESS immediately.
+                write_guest_iov(caller, 300, 400, 0);
+                assert_eq!(
+                    wasix_sock_recv_from(caller, pair_read, 300, 1, 0, 500, 504, 512).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 0);
+                assert_eq!(read_guest_u16(caller, 504), 0);
+                assert_eq!(
+                    p1_sock_recv_inner(caller, pair_read, 300, 1, 0, 500, 504).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 0);
+            })
+        });
     }
 }

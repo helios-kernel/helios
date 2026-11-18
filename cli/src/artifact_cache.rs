@@ -1334,7 +1334,7 @@ mod tests {
         let directories = package_directories(
             Path::new(&cargo),
             &workspace.join("program/Cargo.toml"),
-            "wasm32-wasip2",
+            "wasm32-wasip3",
         )
         .expect("the closure resolves");
         let directories = directories

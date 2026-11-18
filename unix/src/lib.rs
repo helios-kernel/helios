@@ -6,6 +6,9 @@
 //! crate has no dependency on the kernel, Wasmtime, WASIX or Linux ABI.
 extern crate alloc;
 
+mod termination;
+pub use termination::{ChildTermination, SignalTermination};
+
 #[cfg(feature = "runtime")]
 mod runtime;
 #[cfg(feature = "runtime")]

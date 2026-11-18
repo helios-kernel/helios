@@ -9,6 +9,8 @@ futures-channel = { version = "0.3.34", default-features = false, features = ["a
 futures-lite = { version = "2.6.1", default-features = false }
 helios-api = { path = "../../api", default-features = false, features = ["fs", "http-handler", "http-kit-io", "task"] }
 http = { version = "1.5.0", default-features = false, features = ["std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
+rustls-pure = { version = "0.15.4", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
 zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-backend"] }
 

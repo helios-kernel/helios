@@ -238,10 +238,25 @@ where
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
     }
 
-    pub(super) fn require_privileged_bind_authority(&self) -> i32 {
-        self.authority
-            .derive_privileged_bind_cap()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+    pub(super) fn require_socket_bind_authority(
+        &self,
+        authority: WasixSocketAuthority,
+        local_port: u16,
+    ) -> i32 {
+        let base = match authority {
+            WasixSocketAuthority::LocalOnly => return p1::errno::SUCCESS,
+            WasixSocketAuthority::Tcp => crate::NetworkAuthorityRights::TCP,
+            WasixSocketAuthority::Udp => crate::NetworkAuthorityRights::UDP,
+        };
+        if self
+            .authority
+            .network_rights()
+            .contains(base.bind_rights(local_port))
+        {
+            p1::errno::SUCCESS
+        } else {
+            p1::errno::NOTCAPABLE
+        }
     }
 
     pub(super) fn require_spawn_authority(&self) -> Result<SpawnAuthority, i32> {
@@ -299,7 +314,7 @@ where
     pub(super) fn take_process_end(
         &mut self,
         error: wasmtime::Error,
-    ) -> Result<u32, ProgramExecError> {
+    ) -> Result<helios_unix::ChildTermination, ProgramExecError> {
         preview1_process_end(error, self.requested_exit.take())
     }
 
@@ -392,8 +407,20 @@ where
         }
     }
 
+    pub(super) fn stdin_route(&self) -> crate::ComponentInputRoute {
+        self.output_mode.stdin_route()
+    }
+
     pub(super) fn output_route(&self, stream: crate::ComponentOutputStreamKind) -> OutputRoute {
         self.output_mode.route(stream)
+    }
+
+    pub(super) fn fork_output_mode(&self) -> OutputMode {
+        OutputMode::RoutedChild {
+            stdin: self.stdin_route(),
+            stdout: self.output_route(crate::ComponentOutputStreamKind::Stdout),
+            stderr: self.output_route(crate::ComponentOutputStreamKind::Stderr),
+        }
     }
 
     pub(super) fn insert_child(
@@ -410,9 +437,12 @@ where
         });
     }
 
-    pub(super) fn poll_child_exit(&mut self, index: usize) -> Result<Option<u32>, i32> {
-        if let Some(code) = self.children[index].completed {
-            return Ok(Some(code));
+    pub(super) fn poll_child_exit(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<helios_unix::ChildTermination>, i32> {
+        if let Some(termination) = self.children[index].completed {
+            return Ok(Some(termination));
         }
         let Some(exit) = self.children[index].exit.as_mut() else {
             return Ok(self.children[index].completed);
@@ -422,19 +452,21 @@ where
         match Pin::new(exit).poll(&mut context) {
             Poll::Pending => Ok(None),
             Poll::Ready(Ok(Ok(exit))) => {
-                let code = exit.exit_code;
+                let termination = exit.termination;
                 if let Some(filesystem) = exit.filesystem {
                     self.filesystem.adopt_root_layer(filesystem);
                 }
-                self.children[index].completed = Some(code);
+                self.children[index].completed = Some(termination);
                 self.children[index].exit = None;
-                Ok(Some(code))
+                Ok(Some(termination))
             }
-            Poll::Ready(Ok(Err(_))) | Poll::Ready(Err(_)) => {
-                let code = u32::from(p1::errno::IO as u16);
-                self.children[index].completed = Some(code);
-                self.children[index].exit = None;
-                Ok(Some(code))
+            Poll::Ready(Ok(Err(error))) => {
+                self.children.swap_remove(index);
+                Err(p1_errno_from_program_exec_error(&error))
+            }
+            Poll::Ready(Err(_)) => {
+                self.children.swap_remove(index);
+                Err(p1::errno::IO)
             }
         }
     }
@@ -455,31 +487,37 @@ where
         }
     }
 
-    pub(super) async fn read_stdin(&mut self, max_bytes: u32) -> Bytes {
-        let descriptor = self.descriptors.get_mut(0);
-        let Some(Preview1Descriptor::Stdin { carry }) = descriptor else {
+    pub(super) async fn read_stdin(&mut self, fd: i32, max_bytes: u32) -> Bytes {
+        if max_bytes == 0 {
+            return Bytes::new();
+        }
+        let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd) else {
             return Bytes::new();
         };
-        if carry.is_empty() {
-            match &self.output_mode {
-                OutputMode::Serial => loop {
-                    let wait = self.write_serial.wait_for_debug_serial_input();
-                    (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
-                    if !self.serial_read_buffer.is_empty() {
-                        *carry = Bytes::copy_from_slice(&self.serial_read_buffer);
-                        break;
-                    }
-                    wait.await;
-                },
-                OutputMode::Trace => {}
-                OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                    if let Some(bytes) = stdin_rx.read().await {
-                        *carry = bytes;
-                    }
-                }
-            }
+        if !carry.is_empty() {
+            return take_preview1_carry(carry, max_bytes as usize);
         }
-        take_preview1_carry(carry, max_bytes as usize)
+        match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial => loop {
+                let wait = self.write_serial.wait_for_debug_serial_input();
+                (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
+                if !self.serial_read_buffer.is_empty() {
+                    let bytes = Bytes::copy_from_slice(&self.serial_read_buffer);
+                    let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd)
+                    else {
+                        return Bytes::new();
+                    };
+                    *carry = bytes;
+                    return take_preview1_carry(carry, max_bytes as usize);
+                }
+                wait.await;
+            },
+            crate::ComponentInputRoute::Closed => Bytes::new(),
+            crate::ComponentInputRoute::Child(stdin_rx) => stdin_rx
+                .read_limit(max_bytes as usize)
+                .await
+                .unwrap_or_default(),
+        }
     }
 
     /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
@@ -487,8 +525,8 @@ where
     /// Serial-backed stdin waits on the console's receive signal, so the
     /// probe pulls whatever the console already has into the descriptor's
     /// carry; a later `fd_read` drains that carry, so nothing is lost. A
-    /// child's stdin is a byte channel that answers directly, and trace
-    /// output never delivers input at all.
+    /// child's stdin is a byte channel that answers directly, and trace/closed
+    /// input never delivers input at all.
     pub(super) fn probe_stdin(&mut self, fd: i32) -> P1Readiness {
         match self.descriptors.get(fd) {
             Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
@@ -501,12 +539,10 @@ where
         }
         // Resolve the mode to a plain value first so the console read below
         // does not overlap the borrow of `output_mode`.
-        let channel_readable = match &self.output_mode {
-            OutputMode::Serial => None,
-            OutputMode::Trace => return P1Readiness::Hangup,
-            OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                Some(stdin_rx.is_readable())
-            }
+        let channel_readable = match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial => None,
+            crate::ComponentInputRoute::Closed => return P1Readiness::Hangup,
+            crate::ComponentInputRoute::Child(stdin_rx) => Some(stdin_rx.is_readable()),
         };
         if let Some(readable) = channel_readable {
             return if readable {
@@ -536,15 +572,44 @@ where
         Ok(reader.read_limit(max_bytes).await.unwrap_or_default())
     }
 
-    pub(super) async fn read_socket_pair(
+    pub(super) async fn recv_socket_pair(
         &mut self,
         fd: i32,
         max_bytes: usize,
+        nonblocking: bool,
+        peek: bool,
     ) -> Result<Bytes, i32> {
+        if max_bytes == 0 {
+            return match self.descriptors.get(fd) {
+                Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => Ok(Bytes::new()),
+                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
+                Some(_) => Err(p1::errno::NOTSOCK),
+                None => Err(p1::errno::BADF),
+            };
+        }
+
         let reader = match self.descriptors.get_mut(fd) {
             Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) => {
                 if !carry.is_empty() {
-                    return Ok(take_preview1_carry(carry, max_bytes));
+                    return Ok(if peek {
+                        carry.slice(..carry.len().min(max_bytes))
+                    } else {
+                        take_preview1_carry(carry, max_bytes)
+                    });
+                }
+                if nonblocking {
+                    return match reader.try_read() {
+                        crate::TryRead::Ready(bytes) => {
+                            *carry = bytes;
+                            Ok(if peek {
+                                carry.slice(..carry.len().min(max_bytes))
+                            } else {
+                                take_preview1_carry(carry, max_bytes)
+                            })
+                        }
+                        crate::TryRead::Eof => Ok(Bytes::new()),
+                        crate::TryRead::Pending => Err(p1::errno::AGAIN),
+                    };
                 }
                 reader.clone()
             }
@@ -560,34 +625,11 @@ where
             return Err(p1::errno::BADF);
         };
         *carry = bytes;
-        Ok(take_preview1_carry(carry, max_bytes))
-    }
-
-    pub(super) fn try_read_socket_pair(
-        &mut self,
-        fd: i32,
-        max_bytes: usize,
-    ) -> Result<Option<Bytes>, i32> {
-        let Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) =
-            self.descriptors.get_mut(fd)
-        else {
-            return match self.descriptors.get(fd) {
-                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
-                Some(_) => Err(p1::errno::NOTSOCK),
-                None => Err(p1::errno::BADF),
-            };
-        };
-        if !carry.is_empty() {
-            return Ok(Some(take_preview1_carry(carry, max_bytes)));
-        }
-        match reader.try_read() {
-            crate::TryRead::Ready(bytes) => {
-                *carry = bytes;
-                Ok(Some(take_preview1_carry(carry, max_bytes)))
-            }
-            crate::TryRead::Eof => Ok(Some(Bytes::new())),
-            crate::TryRead::Pending => Ok(None),
-        }
+        Ok(if peek {
+            carry.slice(..carry.len().min(max_bytes))
+        } else {
+            take_preview1_carry(carry, max_bytes)
+        })
     }
 
     pub(super) fn getcwd(&self) -> Result<&str, i32> {
@@ -949,7 +991,7 @@ where
              count: i32,
              size: i32|
              -> i32 {
-                let thread_count = compiler_plugin_worker_threads(&caller.data().context.cpu);
+                let thread_count = caller.data().context.shared.worker_threads();
                 let env_len = compiler_rayon_env_len(thread_count);
                 let memory = caller.data().memory();
                 let first = write_u32(memory, GuestAddress::wasm32(count as u32), 1);
@@ -1024,6 +1066,11 @@ where
                     return -1;
                 };
                 let thread_id = previous + 1;
+                let worker_slot = context
+                    .shared
+                    .session_worker_cursor
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                let preferred = context.affinity_plan.worker(worker_slot);
                 let instance_pre = context
                     .shared
                     .instance_pre
@@ -1031,9 +1078,10 @@ where
                     .unwrap_or_else(|| panic!("compiler thread-spawn called before instance pre"))
                     .clone();
                 let spawner = context.spawner.clone();
+                let affinity_plan = context.affinity_plan.clone();
                 let shared = context.shared.clone();
                 let spawned_ns = crate::monotonic_nanos(&context.cpu);
-                let task = spawner.spawn(async move {
+                let task = affinity_plan.spawn_pinned(&spawner, preferred, async move {
                     let started_ns = crate::monotonic_nanos(&context.cpu);
                     let processor = helios_hal::cpu::current_processor().id();
                     // The worker's own store, accounted and driven like the
@@ -1071,7 +1119,7 @@ where
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
                         store.data().context.condemn_for_store_end(error)
                     });
-                    CompilerThreadReport {
+                    SharedMemoryThreadReport {
                         trap,
                         thread_id,
                         processor,
@@ -1315,20 +1363,20 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_fdstat_set_rights",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             fd: i32,
-             rights_base: i64,
-             rights_inheriting: i64|
-             -> i32 {
-                p1_fd_fdstat_set_rights(
-                    &mut caller,
-                    fd,
-                    rights_base as u64,
-                    rights_inheriting as u64,
-                )
+             (fd, rights_base, rights_inheriting): (i32, i64, i64)| {
+                Box::new(async move {
+                    p1_fd_fdstat_set_rights(
+                        &mut caller,
+                        fd,
+                        rights_base as u64,
+                        rights_inheriting as u64,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -1508,13 +1556,13 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_tell",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             fd: i32,
-             offset: i32|
-             -> i32 { p1_fd_tell(&mut caller, fd, offset as u32) },
+             (fd, offset): (i32, i32)| {
+                Box::new(async move { p1_reply(p1_fd_tell(&mut caller, fd, offset as u32).await) })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -2207,21 +2255,17 @@ where
     let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
     let capacity = layout.byte_len;
     let bytes = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(capacity).await,
+        Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(fd, capacity).await,
         Some(Preview1Descriptor::PipeRead { .. }) => {
             caller.data_mut().read_pipe(fd, capacity as usize).await?
         }
         Some(Preview1Descriptor::File(file)) => {
             let file = file.clone();
-            let offset = file.offset();
             let namespace = p1_namespace(caller);
-            let grant = p1_grant(file.node())?;
-            let bytes = match wasi_fs::read(&namespace, grant, offset, capacity as usize).await {
+            match p1_read_open_file(&namespace, &file, capacity as usize).await {
                 Ok(bytes) => bytes,
-                Err(error) => return Ok(p1_errno_from_fs(error)),
-            };
-            file.set_offset(offset.saturating_add(bytes.len() as u64));
-            bytes
+                Err(errno) => return Ok(errno),
+            }
         }
         _ => p1_read_descriptor(caller, fd, capacity).await?,
     };
@@ -2352,7 +2396,7 @@ where
     }
 }
 
-pub(super) fn p1_fd_fdstat_set_rights<CpuImpl, Net, StorageImpl>(
+pub(super) async fn p1_fd_fdstat_set_rights<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     rights_base: u64,
@@ -2372,6 +2416,12 @@ where
         return p1::errno::NOTCAPABLE;
     }
     let lowered_flags = p1_descriptor_flags(requested, 0);
+    let file_offset = if let Preview1Descriptor::File(file) = descriptor {
+        let file = file.clone();
+        Some(p1_tell_open_file(&file).await)
+    } else {
+        None
+    };
     let Some(entry) = caller.data_mut().descriptors.get_entry_mut(fd) else {
         return p1::errno::BADF;
     };
@@ -2387,8 +2437,10 @@ where
         Preview1Descriptor::File(file) => {
             let mut node = file.node().clone();
             node.flags &= lowered_flags;
-            let narrowed = OpenFile::new(node);
-            narrowed.set_offset(file.offset());
+            let narrowed = OpenFile::new_at(
+                node,
+                file_offset.expect("file descriptor remained a file across await"),
+            );
             let own = Preview1DescriptorEntry::new(
                 Preview1Descriptor::File(narrowed),
                 entry.close_on_exec,
@@ -2412,17 +2464,13 @@ where
     StorageImpl: crate::Storage,
 {
     let stat = GuestAddress::wasm32(stat);
-    if matches!(
-        caller.data().descriptors.get(fd),
-        Some(Preview1Descriptor::NullDevice)
-    ) {
-        return p1_write_filestat(
-            caller,
-            stat,
-            p1_null_device_identity(),
-            p1_null_device_stat(),
-        )
-        .await;
+    if let Some((identity, stat_value)) = caller
+        .data()
+        .descriptors
+        .get(fd)
+        .and_then(p1_synthetic_descriptor_stat)
+    {
+        return p1_write_filestat(caller, stat, identity, stat_value).await;
     }
     let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
     else {
@@ -2711,17 +2759,48 @@ where
     let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
         return Ok(p1::errno::BADF);
     };
-    let descriptor = file.node().clone();
+    let open = file.clone();
     let namespace = p1_namespace(caller);
-    let file = p1_grant(&descriptor)?;
-    let bytes = match wasi_fs::read(&namespace, file, offset, layout.byte_len as usize).await {
+    let bytes = match p1_pread_open_file(&namespace, &open, offset, layout.byte_len as usize).await
+    {
         Ok(bytes) => bytes,
-        Err(error) => return Ok(p1_errno_from_fs(error)),
+        Err(errno) => return Ok(errno),
     };
     memory
         .write_iovs_from_bytes(&layout.iovs, &bytes, GuestAddress::wasm32(nread))
         .await?;
     Ok(p1::errno::SUCCESS)
+}
+
+/// Positioned read on `open` at `offset`: bypasses and preserves the open
+/// file description's position lock and offset.
+async fn p1_pread_open_file<StorageImpl: crate::Storage>(
+    namespace: &Namespace<StorageImpl>,
+    open: &OpenFile<FsDescriptor>,
+    offset: u64,
+    capacity: usize,
+) -> Result<Bytes, i32> {
+    let grant = p1_grant(open.node())?;
+    wasi_fs::read(namespace, grant, offset, capacity)
+        .await
+        .map_err(p1_errno_from_fs)
+}
+
+/// Offset-advancing read on `open`: serialises with other offset-using
+/// operations via [`OpenFile::lock_position`] across the read and update.
+async fn p1_read_open_file<StorageImpl: crate::Storage>(
+    namespace: &Namespace<StorageImpl>,
+    open: &OpenFile<FsDescriptor>,
+    capacity: usize,
+) -> Result<Bytes, i32> {
+    let grant = p1_grant(open.node())?;
+    let mut position = open.lock_position().await;
+    let offset = position.get();
+    let bytes = wasi_fs::read(namespace, grant, offset, capacity)
+        .await
+        .map_err(p1_errno_from_fs)?;
+    position.set(offset.saturating_add(bytes.len() as u64));
+    Ok(bytes)
 }
 
 pub(super) async fn p1_fd_pwrite<CpuImpl, Net, StorageImpl>(
@@ -2787,30 +2866,39 @@ async fn p1_write_open_file<StorageImpl: crate::Storage>(
     at: Option<u64>,
     now_nanos: u64,
 ) -> Result<u32, P1Stop> {
-    let position = match at {
-        Some(at) => WritePosition::At(at),
-        None if append => WritePosition::End,
-        None => WritePosition::At(open.offset()),
-    };
     let mut gather = Preview1Gather::new(memory, layout)?;
-    let (end, written) = {
-        let file =
-            wasi_fs::writable_file(namespace, p1_grant(open.node())?).map_err(p1_errno_from_fs)?;
-        let mut file = ResolvedFileChunks {
-            file: &file,
-            now_nanos,
-        };
-        p1_write_gathered(memory, &mut gather, position, &mut file)
-            .await?
-            .map_err(p1_errno_from_fs)?
+    let file =
+        wasi_fs::writable_file(namespace, p1_grant(open.node())?).map_err(p1_errno_from_fs)?;
+    let mut resolved = ResolvedFileChunks {
+        file: &file,
+        now_nanos,
     };
-    if at.is_none() {
-        // After an append the offset is the end of the file the write
-        // reached, which another writer may have moved meanwhile. Every
-        // descriptor sharing the open file description sees it.
-        open.set_offset(end);
+    match at {
+        Some(at) => {
+            let (_end, written) =
+                p1_write_gathered(memory, &mut gather, WritePosition::At(at), &mut resolved)
+                    .await?
+                    .map_err(p1_errno_from_fs)?;
+            Ok(written)
+        }
+        None => {
+            let mut position = open.lock_position().await;
+            let write_position = if append {
+                WritePosition::End
+            } else {
+                WritePosition::At(position.get())
+            };
+            let (end, written) =
+                p1_write_gathered(memory, &mut gather, write_position, &mut resolved)
+                    .await?
+                    .map_err(p1_errno_from_fs)?;
+            // After an append the offset is the end of the file the write
+            // reached, which another writer may have moved meanwhile. Every
+            // descriptor sharing the open file description sees it.
+            position.set(end);
+            Ok(written)
+        }
     }
-    Ok(written)
 }
 
 /// A resolved file as what a gathered write lands in: each chunk goes
@@ -2887,8 +2975,12 @@ const P1_DIRENT_BYTES: usize = 24;
 
 /// The `dirent` records of `entries` from `cookie` on, each header followed
 /// by its name, cut off at `buf_len` bytes: what `fd_readdir` copies to the
-/// guest's buffer. A name the buffer cannot hold whole is cut, which ends
-/// the listing.
+/// guest's buffer.
+///
+/// Preview 1 callers (`wasi-libc` `readdir`) read `bufused < buf_len` as
+/// end-of-directory, so whenever another entry exists the remaining bytes of
+/// `buf` must be filled, truncating the `dirent` header itself when fewer than
+/// `P1_DIRENT_BYTES` remain.
 pub(super) fn p1_fd_readdir_records(
     entries: &[fs_types::DirectoryEntry],
     buf_len: u32,
@@ -2904,16 +2996,18 @@ pub(super) fn p1_fd_readdir_records(
         }
         let next = u64::try_from(index + 1).map_err(|_| p1::errno::OVERFLOW)?;
         let name = entry.name.as_bytes();
-        if capacity - used < P1_DIRENT_BYTES {
+        // The header is `d_next`, `d_ino`, `d_namlen`, `d_type` and 3 padding bytes.
+        let mut header = [0_u8; P1_DIRENT_BYTES];
+        header[0..8].copy_from_slice(&next.to_le_bytes());
+        header[8..16].copy_from_slice(&next.to_le_bytes());
+        header[16..20]
+            .copy_from_slice(&u32::try_from(name.len()).unwrap_or(u32::MAX).to_le_bytes());
+        header[20] = p1_filetype_from_descriptor_type(entry.type_.clone());
+        let header_copied = (capacity - used).min(P1_DIRENT_BYTES);
+        records.extend_from_slice(&header[..header_copied]);
+        if header_copied < P1_DIRENT_BYTES {
             break;
         }
-        // The header is `d_next`, `d_ino`, `d_namlen` and `d_type`.
-        records.extend_from_slice(&next.to_le_bytes());
-        records.extend_from_slice(&next.to_le_bytes());
-        records.extend_from_slice(&u32::try_from(name.len()).unwrap_or(u32::MAX).to_le_bytes());
-        records.push(p1_filetype_from_descriptor_type(entry.type_.clone()));
-        // Bytes 21..24 are padding.
-        records.resize(used + P1_DIRENT_BYTES, 0);
         let copied = (capacity - records.len()).min(name.len());
         records.extend_from_slice(&name[..copied]);
         if copied < name.len() {
@@ -2953,27 +3047,11 @@ where
         Some(_) => return Ok(p1::errno::SPIPE),
         None => return Ok(p1::errno::BADF),
     };
-    let base = match whence {
-        0 => 0,
-        1 => file.offset(),
-        2 => {
-            let namespace = p1_namespace(caller);
-            match wasi_fs::stat_path(&namespace, &file.node().path, crate::Follow::No).await {
-                Ok(metadata) => metadata.size,
-                Err(error) => return Ok(p1_errno_from_fs(error)),
-            }
-        }
-        _ => return Ok(p1::errno::INVAL),
+    let namespace = p1_namespace(caller);
+    let next = match p1_seek_open_file(&namespace, &file, offset, whence).await {
+        Ok(next) => next,
+        Err(errno) => return Ok(errno),
     };
-    let next = if offset >= 0 {
-        base.checked_add(offset as u64)
-    } else {
-        base.checked_sub(offset.unsigned_abs())
-    };
-    let Some(next) = next else {
-        return Ok(p1::errno::INVAL);
-    };
-    file.set_offset(next);
     let Some(memory) = p1_async_memory(caller) else {
         return Ok(p1::errno::FAULT);
     };
@@ -2983,25 +3061,65 @@ where
     Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn p1_fd_tell<CpuImpl, Net, StorageImpl>(
+/// Seeks `open` under its position lock so concurrent reads, writes and seeks
+/// never observe or clobber an in-flight offset update.
+async fn p1_seek_open_file<StorageImpl: crate::Storage>(
+    namespace: &Namespace<StorageImpl>,
+    open: &OpenFile<FsDescriptor>,
+    offset: i64,
+    whence: u8,
+) -> Result<u64, i32> {
+    if whence > 2 {
+        return Err(p1::errno::INVAL);
+    }
+    let mut position = open.lock_position().await;
+    let base = match whence {
+        0 => 0,
+        1 => position.get(),
+        2 => match wasi_fs::stat_path(namespace, &open.node().path, crate::Follow::No).await {
+            Ok(metadata) => metadata.size,
+            Err(error) => return Err(p1_errno_from_fs(error)),
+        },
+        _ => unreachable!("validated whence <= 2"),
+    };
+    let next = if offset >= 0 {
+        base.checked_add(offset as u64)
+    } else {
+        base.checked_sub(offset.unsigned_abs())
+    }
+    .ok_or(p1::errno::INVAL)?;
+    position.set(next);
+    Ok(next)
+}
+
+/// Reads `open`'s current offset after any in-flight offset update completes.
+async fn p1_tell_open_file(open: &OpenFile<FsDescriptor>) -> u64 {
+    open.lock_position().await.get()
+}
+
+pub(super) async fn p1_fd_tell<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     offset_out: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let offset = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File(file)) => file.offset(),
-        Some(_) => return p1::errno::SPIPE,
-        None => return p1::errno::BADF,
+    let file = match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::File(file)) => file.clone(),
+        Some(_) => return Ok(p1::errno::SPIPE),
+        None => return Ok(p1::errno::BADF),
     };
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let offset = p1_tell_open_file(&file).await;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    p1_write_u64(caller, memory, GuestAddress::wasm32(offset_out), offset)
+    memory
+        .write_u64(GuestAddress::wasm32(offset_out), offset)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3976,7 +4094,7 @@ async fn p1_read_subscriptions(
 }
 
 pub(super) fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     signal: u32,
 ) -> wasmtime::Result<i32>
 where
@@ -3984,10 +4102,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    caller
-        .data_mut()
-        .request_exit(128u32.saturating_add(signal));
-    Err(wasmtime::Error::new(Preview1Exit))
+    let Ok(signal) = u8::try_from(signal) else {
+        return Ok(p1::errno::INVAL);
+    };
+    Err(wasmtime::Error::new(Preview1SignalExit { signal }))
 }
 
 pub(super) fn p1_errno_from_wasmtime_error(error: &wasmtime::Error) -> i32 {
@@ -4183,22 +4301,15 @@ where
         caller.data().descriptors.get(fd),
         Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. }))
     ) {
-        let bytes = if capacity == 0 {
-            Bytes::new()
-        } else if p1_fdflags_nonblocking(fdflags) {
-            match caller
-                .data_mut()
-                .try_read_socket_pair(fd, capacity as usize)?
-            {
-                Some(bytes) => bytes,
-                None => return Ok(p1::errno::AGAIN),
-            }
-        } else {
-            caller
-                .data_mut()
-                .read_socket_pair(fd, capacity as usize)
-                .await?
-        };
+        let bytes = caller
+            .data_mut()
+            .recv_socket_pair(
+                fd,
+                capacity as usize,
+                p1_fdflags_nonblocking(fdflags),
+                false,
+            )
+            .await?;
         return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
     }
     let stream = match caller.data().descriptors.get(fd) {
@@ -4690,7 +4801,9 @@ where
     StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => Ok(caller.data_mut().read_stdin(capacity).await),
+        Some(Preview1Descriptor::Stdin { .. }) => {
+            Ok(caller.data_mut().read_stdin(fd, capacity).await)
+        }
         Some(Preview1Descriptor::PipeRead { .. }) => {
             caller.data_mut().read_pipe(fd, capacity as usize).await
         }
@@ -4703,18 +4816,8 @@ where
         Some(Preview1Descriptor::NullDevice) => Ok(Bytes::new()),
         Some(Preview1Descriptor::File(file)) => {
             let file = file.clone();
-            let offset = file.offset();
             let namespace = p1_namespace(caller);
-            let bytes = wasi_fs::read(
-                &namespace,
-                p1_grant(file.node())?,
-                offset,
-                capacity as usize,
-            )
-            .await
-            .map_err(p1_errno_from_fs)?;
-            file.set_offset(offset.saturating_add(bytes.len() as u64));
-            Ok(bytes)
+            p1_read_open_file(&namespace, &file, capacity as usize).await
         }
         Some(_) => Err(p1::errno::BADF),
         None => Err(p1::errno::BADF),
@@ -4909,6 +5012,9 @@ pub(super) fn p1_errno_from_dns_error(error: crate::DnsError) -> i32 {
 }
 
 pub(super) fn p1_errno_from_tcp_error(error: crate::TcpError) -> i32 {
+    if matches!(error.detail, crate::NetworkErrorDetail::AddressNotAvailable) {
+        return p1::errno::ADDRNOTAVAIL;
+    }
     match error.kind {
         crate::TcpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::TcpErrorKind::Timeout => p1::errno::TIMEDOUT,
@@ -4928,6 +5034,9 @@ pub(super) fn p1_errno_from_tcp_error_for_fdflags(error: crate::TcpError, fdflag
 }
 
 pub(super) fn p1_errno_from_udp_error(error: crate::UdpError) -> i32 {
+    if matches!(error.detail, crate::NetworkErrorDetail::AddressNotAvailable) {
+        return p1::errno::ADDRNOTAVAIL;
+    }
     match error.kind {
         crate::UdpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::UdpErrorKind::Unsupported => p1::errno::NOTSUP,
@@ -5136,7 +5245,7 @@ mod tests {
             let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
                 panic!("descriptor {fd} must name the file");
             };
-            assert_eq!(file.offset(), expected.len() as u64);
+            assert_eq!(block_on(p1_tell_open_file(file)), expected.len() as u64);
         }
         let contents = block_on(wasi_fs::read(
             &namespace,
@@ -5258,6 +5367,7 @@ mod tests {
             Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
                 family: SocketFamily::Ipv4,
                 listener: OwnedTcpListener::new(crate::UnixNetwork::new(service), listener),
+                local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
                 local_port: 8080,
                 options: unix_socket_options::<Net>(),
             })),
@@ -5455,6 +5565,7 @@ mod tests {
             Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
                 family: SocketFamily::Ipv4,
                 socket: OwnedUdpSocket::new(crate::UnixNetwork::new(service), socket),
+                local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
                 local_port: 5353,
                 options: unix_socket_options::<Net>(),
             })),
@@ -5734,7 +5845,15 @@ mod tests {
 
         let error =
             drive_wasix_call(&activity, &signal_state, call).expect_err("the signal ends the call");
-        assert_eq!(preview1_exit_status(&error, Some(0)), Some(143));
+        assert_eq!(
+            preview1_exit_status(&error, Some(0)),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 15,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(
             signal_state.take_pending(),
             None,
@@ -5793,7 +5912,15 @@ mod tests {
         let core::task::Poll::Ready(Err(error)) = driven.as_mut().poll(&mut cx) else {
             panic!("the signal ends the suspended call");
         };
-        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 9,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(signal_state.take_pending(), None, "delivered once");
     }
 
@@ -5851,7 +5978,15 @@ mod tests {
         let core::task::Poll::Ready(Err(error)) = target_call.as_mut().poll(&mut target_cx) else {
             panic!("the signal ends the target thread's suspended call");
         };
-        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 9,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(target_thread.take_pending(), None, "delivered once");
         assert_eq!(
             process.take_pending(),
@@ -5925,7 +6060,15 @@ mod tests {
         let error =
             drive_wasix_call(&activity, &signal_state, call).expect_err("the call is stopped");
         assert!(error.downcast_ref::<crate::InstanceKilled>().is_none());
-        assert_eq!(preview1_exit_status(&error, None), Some(130));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 2,
+                    core_dumped: false,
+                }
+            ))
+        );
     }
 
     fn memory_of(bytes: &[u8]) -> Preview1Memory {
@@ -6572,5 +6715,324 @@ mod tests {
             Err(P1Stop::Trap(crate::memory::SwapFaultError::Backend))
         );
         assert!(p1_reply(stop).is_err(), "the guest traps");
+    }
+
+    #[test]
+    fn readdir_truncates_trailing_header_so_partial_buffer_never_signals_eof_early() {
+        let entries = [
+            fs_types::DirectoryEntry {
+                type_: fs_types::DescriptorType::RegularFile,
+                name: "alpha".into(),
+            },
+            fs_types::DirectoryEntry {
+                type_: fs_types::DescriptorType::RegularFile,
+                name: "utf_8.py".into(),
+            },
+        ];
+        // `"alpha"` takes 24 + 5 = 29 bytes, leaving 7 bytes (< P1_DIRENT_BYTES)
+        // in a 36-byte buffer. Preview 1 `readdir` treats `bufused < buf_len` as
+        // end-of-directory, so those 7 bytes must hold the prefix of the next
+        // header rather than leaving `buf` short.
+        let first = p1_fd_readdir_records(&entries, 36, 0).expect("first readdir pass");
+        assert_eq!(first.len(), 36);
+        assert_eq!(u64::from_le_bytes(first[0..8].try_into().unwrap()), 1);
+        assert_eq!(&first[24..29], b"alpha");
+        assert_eq!(&first[29..36], &2_u64.to_le_bytes()[..7]);
+
+        // Resuming from the last complete entry's `d_next` (1) yields the full
+        // second entry and `bufused < buf_len` (32 < 36) to signal true EOF.
+        let second = p1_fd_readdir_records(&entries, 36, 1).expect("second readdir pass");
+        assert_eq!(second.len(), 32);
+        assert_eq!(u64::from_le_bytes(second[0..8].try_into().unwrap()), 2);
+        assert_eq!(&second[24..32], b"utf_8.py");
+    }
+}
+
+#[cfg(test)]
+mod open_file_offset_tests {
+    use super::*;
+    use core::pin::Pin;
+    use futures_lite::future::{block_on, poll_once};
+
+    fn poll<T>(future: Pin<&mut impl core::future::Future<Output = T>>) -> Option<T> {
+        block_on(poll_once(future))
+    }
+
+    fn namespace_with_rw_file() -> (
+        crate::Namespace<crate::test_support::UnsupportedStorage>,
+        FsDescriptor,
+        Preview1DescriptorTable<crate::test_support::TestNetworkService>,
+    ) {
+        let namespace = crate::Namespace::new(crate::MountTable::new(
+            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+            1,
+        ));
+        let root = FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+        };
+        let opened = block_on(wasi_fs::open_at(
+            &namespace,
+            root.grant().expect("root directory grant"),
+            fs_types::PathFlags::empty(),
+            "shared.txt",
+            fs_types::OpenFlags::CREATE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+            1,
+        ))
+        .expect("creates shared.txt");
+        let table =
+            Preview1DescriptorTable::<crate::test_support::TestNetworkService>::from_entries(
+                alloc::vec![
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stdin {
+                            carry: Bytes::new(),
+                        },
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::File(OpenFile::new(opened.clone())),
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stderr,
+                        false,
+                    )),
+                ],
+            );
+        (namespace, opened, table)
+    }
+
+    fn open_file_at(
+        table: &Preview1DescriptorTable<crate::test_support::TestNetworkService>,
+        fd: i32,
+    ) -> &OpenFile<FsDescriptor> {
+        let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
+            panic!("descriptor {fd} must name a file");
+        };
+        file
+    }
+
+    /// Two overlapping writes through duplicated descriptors (`cmd > out 2>&1`)
+    /// serialise on the open file description's position lock so neither
+    /// overwrites the other's bytes and every byte of both reads back in order.
+    #[test]
+    fn concurrent_writes_through_duplicated_descriptors_preserve_every_byte() {
+        let (namespace, node, mut table) = namespace_with_rw_file();
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+
+        let first_payload = "標準出力 日本語 ".as_bytes();
+        let mut swap = crate::memory::GuestSwap::new(1);
+        swap.bytes_mut()[..first_payload.len()].copy_from_slice(first_payload);
+        swap.evict(0);
+        let first_memory = Preview1AsyncMemory::over_swap(&swap);
+        let first_layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, first_payload.len() as u32)]),
+            byte_len: first_payload.len() as u32,
+        };
+
+        let second_payload = "표준 출력 한국어".as_bytes();
+        let mut second_guest = second_payload.to_vec();
+        let second_memory = Preview1AsyncMemory::new(Preview1Memory {
+            base: second_guest.as_mut_ptr() as usize,
+            len: second_guest.len(),
+        });
+        let second_layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, second_payload.len() as u32)]),
+            byte_len: second_payload.len() as u32,
+        };
+
+        let fd1 = open_file_at(&table, 1).clone();
+        let fd2 = open_file_at(&table, 2).clone();
+
+        let mut first_write = core::pin::pin!(p1_write_open_file(
+            &namespace,
+            &fd1,
+            false,
+            &first_memory,
+            &first_layout,
+            None,
+            10,
+        ));
+        let mut second_write = core::pin::pin!(p1_write_open_file(
+            &namespace,
+            &fd2,
+            false,
+            &second_memory,
+            &second_layout,
+            None,
+            11,
+        ));
+
+        // First write acquires the position lock and suspends bringing in its guest page.
+        assert!(
+            poll(first_write.as_mut()).is_none(),
+            "first write suspends on evicted guest page while holding position lock"
+        );
+        assert_eq!(swap.queued_faults(), 1);
+        // Second write on the duplicated fd must park on the position lock rather than
+        // reading offset 0 and overwriting the first write.
+        assert!(
+            poll(second_write.as_mut()).is_none(),
+            "second write must wait for the first write's position lock"
+        );
+
+        swap.serve();
+        assert_eq!(
+            poll(first_write.as_mut()),
+            Some(Ok(first_payload.len() as u32))
+        );
+        assert_eq!(
+            poll(second_write.as_mut()),
+            Some(Ok(second_payload.len() as u32))
+        );
+
+        let expected: Vec<u8> = [first_payload, second_payload].concat();
+        assert_eq!(block_on(p1_tell_open_file(&fd1)), expected.len() as u64);
+        assert_eq!(block_on(p1_tell_open_file(&fd2)), expected.len() as u64);
+
+        let contents = block_on(wasi_fs::read(
+            &namespace,
+            p1_grant(&node).expect("read grant"),
+            0,
+            expected.len() + 16,
+        ))
+        .expect("file reads back");
+        assert_eq!(contents.as_ref(), expected.as_slice());
+    }
+
+    /// Positioned I/O (`pread` and `pwrite`) does not acquire the open file
+    /// description's position lock and completes immediately even while a
+    /// sequential write is in flight.
+    #[test]
+    fn positioned_io_does_not_block_on_held_offset_lock() {
+        let (namespace, node, mut table) = namespace_with_rw_file();
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+
+        let seq_payload = "sequential-日本語".as_bytes();
+        let mut swap = crate::memory::GuestSwap::new(1);
+        swap.bytes_mut()[..seq_payload.len()].copy_from_slice(seq_payload);
+        swap.evict(0);
+        let seq_memory = Preview1AsyncMemory::over_swap(&swap);
+        let seq_layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, seq_payload.len() as u32)]),
+            byte_len: seq_payload.len() as u32,
+        };
+
+        let pwrite_payload = "pwrite-한국어".as_bytes();
+        let mut pwrite_guest = pwrite_payload.to_vec();
+        let pwrite_memory = Preview1AsyncMemory::new(Preview1Memory {
+            base: pwrite_guest.as_mut_ptr() as usize,
+            len: pwrite_guest.len(),
+        });
+        let pwrite_layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, pwrite_payload.len() as u32)]),
+            byte_len: pwrite_payload.len() as u32,
+        };
+
+        let fd1 = open_file_at(&table, 1).clone();
+        let fd2 = open_file_at(&table, 2).clone();
+
+        let mut seq_write = core::pin::pin!(p1_write_open_file(
+            &namespace,
+            &fd1,
+            false,
+            &seq_memory,
+            &seq_layout,
+            None,
+            10,
+        ));
+        assert!(poll(seq_write.as_mut()).is_none());
+
+        // Positioned write and read on the duplicated descriptor must finish immediately.
+        let pwrite_at = 64_u64;
+        let written = block_on(poll_once(p1_write_open_file(
+            &namespace,
+            &fd2,
+            false,
+            &pwrite_memory,
+            &pwrite_layout,
+            Some(pwrite_at),
+            11,
+        )))
+        .expect("pwrite must not block on the offset lock")
+        .expect("pwrite succeeds");
+        assert_eq!(written, pwrite_payload.len() as u32);
+
+        let pread_back = block_on(poll_once(p1_pread_open_file(
+            &namespace,
+            &fd2,
+            pwrite_at,
+            pwrite_payload.len(),
+        )))
+        .expect("pread must not block on the offset lock")
+        .expect("pread succeeds");
+        assert_eq!(pread_back.as_ref(), pwrite_payload);
+
+        // Complete the sequential write; offset advances only by seq_payload.len().
+        swap.serve();
+        assert_eq!(poll(seq_write.as_mut()), Some(Ok(seq_payload.len() as u32)));
+        assert_eq!(block_on(p1_tell_open_file(&fd1)), seq_payload.len() as u64);
+
+        let head = block_on(wasi_fs::read(
+            &namespace,
+            p1_grant(&node).expect("read grant"),
+            0,
+            seq_payload.len(),
+        ))
+        .expect("sequential prefix reads back");
+        assert_eq!(head.as_ref(), seq_payload);
+    }
+
+    /// Reads, seeks and tells through one open file description serialise
+    /// against an in-flight write and observe the post-write offset.
+    #[test]
+    fn concurrent_read_seek_and_tell_serialise_against_in_flight_write() {
+        let (namespace, _node, mut table) = namespace_with_rw_file();
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+
+        let payload = "Cjk-日本語-한국어".as_bytes();
+        let mut swap = crate::memory::GuestSwap::new(1);
+        swap.bytes_mut()[..payload.len()].copy_from_slice(payload);
+        swap.evict(0);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, payload.len() as u32)]),
+            byte_len: payload.len() as u32,
+        };
+
+        let fd1 = open_file_at(&table, 1).clone();
+        let fd2 = open_file_at(&table, 2).clone();
+
+        let mut in_flight_write = core::pin::pin!(p1_write_open_file(
+            &namespace, &fd1, false, &memory, &layout, None, 10,
+        ));
+        assert!(poll(in_flight_write.as_mut()).is_none());
+
+        let mut tell_fut = core::pin::pin!(p1_tell_open_file(&fd2));
+        let mut seek_fut = core::pin::pin!(p1_seek_open_file(&namespace, &fd2, 0, 0));
+        let mut read_fut = core::pin::pin!(p1_read_open_file(&namespace, &fd2, payload.len()));
+
+        assert!(poll(tell_fut.as_mut()).is_none(), "tell parks on lock");
+        assert!(poll(seek_fut.as_mut()).is_none(), "seek parks on lock");
+        assert!(poll(read_fut.as_mut()).is_none(), "read parks on lock");
+
+        swap.serve();
+        assert_eq!(
+            poll(in_flight_write.as_mut()),
+            Some(Ok(payload.len() as u32))
+        );
+        assert_eq!(poll(tell_fut.as_mut()), Some(payload.len() as u64));
+        assert_eq!(poll(seek_fut.as_mut()), Some(Ok(0)));
+        assert_eq!(
+            poll(read_fut.as_mut()).map(|res| res.map(|b| b.to_vec())),
+            Some(Ok(payload.to_vec()))
+        );
+        assert_eq!(block_on(p1_tell_open_file(&fd1)), payload.len() as u64);
     }
 }

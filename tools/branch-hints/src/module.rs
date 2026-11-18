@@ -129,6 +129,7 @@ impl<'a> CoreModule<'a> {
         for payload in Parser::new(0).parse_all(bytes) {
             let payload = payload.map_err(Error::parse("core module"))?;
             if let Some((id, content)) = payload.as_section() {
+                let content = wasm::usize_range(content);
                 module.sections.push(SectionSpan {
                     id,
                     header_start: wasm::header_start(bytes, id, &content),
@@ -203,10 +204,11 @@ impl<'a> CoreModule<'a> {
                 }
                 Payload::ExportSection(reader) => {
                     let count = reader.count();
-                    let end = reader.range().end;
+                    let end = wasm::as_usize(reader.range().end);
                     let mut starts = Vec::new();
                     for entry in reader.into_iter_with_offsets() {
                         let (start, export) = entry.map_err(Error::parse("export section"))?;
+                        let start = wasm::as_usize(start);
                         starts.push(start);
                         let index_start = start
                             + wasm::leb_u32(
@@ -324,7 +326,7 @@ fn read_body(
     body: &wasmparser::FunctionBody<'_>,
     proc_exit: Option<u32>,
 ) -> Result<Body, Error> {
-    let content = body.range();
+    let content = wasm::usize_range(body.range());
     let mut locals_reader = body
         .get_locals_reader()
         .map_err(Error::parse("function locals"))?;
@@ -340,18 +342,19 @@ fn read_body(
     let mut operators = body
         .get_operators_reader()
         .map_err(Error::parse("function body"))?;
-    let instructions_start = operators.original_position();
+    let instructions_start = wasm::as_usize(operators.original_position());
     let mut branches = Vec::new();
     let mut proc_exit_calls = Vec::new();
     while !operators.eof() {
         let (operator, absolute) = operators
             .read_with_offset()
             .map_err(Error::parse("function body"))?;
+        let absolute = wasm::as_usize(absolute);
         let kind = match operator {
             Operator::If { .. } => BranchKind::If,
             Operator::BrIf { .. } => BranchKind::BrIf,
             Operator::Call { function_index } if Some(function_index) == proc_exit => {
-                proc_exit_calls.push(absolute..operators.original_position());
+                proc_exit_calls.push(absolute..wasm::as_usize(operators.original_position()));
                 continue;
             }
             _ => continue,

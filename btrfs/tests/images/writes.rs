@@ -2,7 +2,9 @@
 
 use std::sync::Mutex;
 
-use helios_btrfs::write::{Attributes, CloneRange, Name, WriteError, WriteOptions, Writer, Zstd};
+use helios_btrfs::write::{
+    Attributes, CloneRange, DEFAULT_MAX_INLINE, Name, WriteError, WriteOptions, Writer, Zstd,
+};
 use helios_btrfs::{BlockSink, BlockSource, READ_ALIGNMENT, Timestamp};
 use helios_hal::fs::RenameMode;
 use helios_hal::io::IoResult;
@@ -233,6 +235,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
                 when,
                 concurrency,
                 encoder: &mut encoder,
+                max_inline: DEFAULT_MAX_INLINE,
             },
         );
         assert_send(&write);
@@ -250,8 +253,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
                 destination_offset: 0,
                 length: data.len() as u64,
             },
-            when,
-            concurrency,
+            WriteOptions::plain(when, concurrency),
         )
         .await
         .unwrap();
@@ -547,10 +549,14 @@ fn linux_authority_survives_unrelated_writes() {
             .unwrap();
     });
 
+    assert_btrfs_check(&shared.0);
+}
+
+fn assert_btrfs_check(shared: &Mutex<SparseImage>) {
     let scratch = tempfile::NamedTempFile::new().unwrap();
     {
         use std::io::Seek;
-        let mut image = shared.0.lock().unwrap();
+        let mut image = shared.lock().unwrap();
         image.seek(std::io::SeekFrom::Start(0)).unwrap();
         std::io::copy(&mut *image, &mut scratch.reopen().unwrap()).unwrap();
     }
@@ -1002,4 +1008,546 @@ fn attributes_cross_between_linux_and_helios() {
         .output()
         .unwrap();
     assert!(!removed.status.success());
+}
+
+fn inline_text(length: usize) -> Vec<u8> {
+    let mut bytes = "内联数据 インラインデータ 인라인 데이터 "
+        .repeat(length)
+        .into_bytes();
+    bytes.truncate(length);
+    bytes
+}
+
+fn inline_noise(length: usize, seed: u32) -> Vec<u8> {
+    let mut state = seed;
+    (0..length)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+fn zstd_stored_len(content: &[u8]) -> u64 {
+    use helios_btrfs::write::Encoder;
+    Zstd::new(3)
+        .unwrap()
+        .encode(content, 4096)
+        .unwrap()
+        .expect("compressible content")
+        .bytes
+        .len() as u64
+}
+
+fn exercise_inline_limits(image: SparseImage) -> std::sync::Arc<WritableImage> {
+    use helios_btrfs::write::Plain;
+    use helios_btrfs::{Compression, ExtentKind};
+    use std::collections::BTreeMap;
+
+    const SECTOR: u64 = 4096;
+    const WHEN: Timestamp = Timestamp {
+        seconds: 1_700_000_200,
+        nanoseconds: 0,
+    };
+
+    let shared = std::sync::Arc::new(WritableImage(Mutex::new(image)));
+    block_on(async {
+        let concurrency = std::thread::available_parallelism().unwrap();
+        let mut writer = Writer::mount(
+            SharedImage(shared.clone()),
+            no_uuid as fn() -> [u8; 16],
+            concurrency,
+        )
+        .await
+        .unwrap();
+        let nodesize = u64::from(writer.snapshot().unwrap().superblock().nodesize());
+        // `BTRFS_MAX_INLINE_DATA_SIZE` (`fs/btrfs/ctree.h`): `nodesize` minus
+        // `btrfs_header` (101) + `btrfs_item` (25) + inline `btrfs_file_extent_item` header (21).
+        let max_node_inline = (SECTOR - 1).min(nodesize - 147);
+        let mut encoder = Zstd::new(3).unwrap();
+        let mut expected: BTreeMap<&str, (Vec<u8>, Option<Option<Compression>>)> = BTreeMap::new();
+
+        let plain = |max_inline| WriteOptions {
+            when: WHEN,
+            concurrency,
+            encoder: Plain,
+            max_inline,
+        };
+        let attrs = Attributes {
+            permissions: 0o644,
+            uid: 1000,
+            gid: 1000,
+            umask: 0,
+        };
+
+        // Write paths: uncompressed & compressed, at and across limits.
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let dir = tx
+            .create_directory(
+                Name {
+                    parent: &root,
+                    bytes: "内联-インライン-인라인".as_bytes(),
+                },
+                Attributes {
+                    permissions: 0o755,
+                    uid: 1000,
+                    gid: 1000,
+                    umask: 0,
+                },
+                WHEN,
+            )
+            .await
+            .unwrap();
+        for (name, content, max_inline, layout) in [
+            (
+                "plain_at",
+                inline_noise(2048, 1),
+                DEFAULT_MAX_INLINE,
+                Some(None),
+            ),
+            (
+                "plain_over",
+                inline_noise(2049, 2),
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+            ("plain_sector", inline_noise(4096, 3), 4096, None),
+            (
+                "plain_node_at",
+                inline_noise(max_node_inline as usize, 4),
+                4096,
+                Some(None),
+            ),
+            (
+                "plain_node_over",
+                inline_noise(max_node_inline as usize + 1, 5),
+                4096,
+                None,
+            ),
+            ("plain_zero", inline_noise(16, 6), 0, None),
+            (
+                "append_plain_at",
+                inline_noise(2000, 7),
+                DEFAULT_MAX_INLINE,
+                Some(None),
+            ),
+            (
+                "append_plain_over",
+                inline_noise(2000, 8),
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+            (
+                "trunc_plain_at",
+                inline_noise(100, 9),
+                DEFAULT_MAX_INLINE,
+                Some(None),
+            ),
+            (
+                "trunc_plain_over",
+                inline_noise(100, 10),
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+            ("trunc_plain_sector", inline_noise(100, 11), 4096, None),
+            (
+                "clone_dest_inline",
+                inline_noise(100, 12),
+                DEFAULT_MAX_INLINE,
+                Some(None),
+            ),
+            (
+                "clone_dest_off_sector",
+                inline_noise(100, 13),
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+        ] {
+            let file = tx
+                .create_file(
+                    Name {
+                        parent: &dir,
+                        bytes: name.as_bytes(),
+                    },
+                    attrs,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+            tx.write_file(&file, 0, &content, plain(max_inline))
+                .await
+                .unwrap();
+            expected.insert(name, (content, layout));
+        }
+
+        let comp_3000 = inline_text(3000);
+        let comp_3000_len = zstd_stored_len(&comp_3000);
+        let mut padded_trunc = inline_text(2000);
+        padded_trunc.resize(SECTOR as usize, 0);
+        let padded_trunc_len = zstd_stored_len(&padded_trunc);
+        for (name, content, max_inline, layout) in [
+            (
+                "comp_sector",
+                inline_text(4096),
+                DEFAULT_MAX_INLINE,
+                Some(Some(Compression::Zstd)),
+            ),
+            (
+                "comp_over_sector",
+                inline_text(4097),
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+            (
+                "comp_at",
+                comp_3000.clone(),
+                comp_3000_len,
+                Some(Some(Compression::Zstd)),
+            ),
+            ("comp_over", comp_3000, comp_3000_len - 1, None),
+            (
+                "comp_noise",
+                inline_noise(3000, 14),
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+            (
+                "append_comp_at",
+                inline_text(2000),
+                DEFAULT_MAX_INLINE,
+                Some(Some(Compression::Zstd)),
+            ),
+            (
+                "append_comp_over",
+                inline_text(2000),
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+            (
+                "trunc_comp_at",
+                inline_text(2000),
+                DEFAULT_MAX_INLINE,
+                Some(Some(Compression::Zstd)),
+            ),
+            (
+                "trunc_comp_over",
+                inline_text(2000),
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+            (
+                "trunc_comp_sector_over",
+                inline_text(2000),
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+        ] {
+            let file = tx
+                .create_file(
+                    Name {
+                        parent: &dir,
+                        bytes: name.as_bytes(),
+                    },
+                    attrs,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+            tx.write_file(
+                &file,
+                0,
+                &content,
+                WriteOptions {
+                    when: WHEN,
+                    concurrency,
+                    encoder: &mut encoder,
+                    max_inline,
+                },
+            )
+            .await
+            .unwrap();
+            expected.insert(name, (content, layout));
+        }
+        tx.commit().await.unwrap();
+
+        // Append & truncate up paths.
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let dir = tx
+            .lookup(&root, "内联-インライン-인라인".as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        let open = async |tx: &helios_btrfs::write::WriteTransaction<'_, _, _>, name: &str| {
+            tx.lookup(&dir, name.as_bytes()).await.unwrap().unwrap()
+        };
+
+        let f = open(&tx, "append_plain_at").await;
+        let tail_48 = inline_noise(48, 15);
+        tx.write_file(&f, 2000, &tail_48, plain(DEFAULT_MAX_INLINE))
+            .await
+            .unwrap();
+        expected
+            .get_mut("append_plain_at")
+            .unwrap()
+            .0
+            .extend_from_slice(&tail_48);
+
+        let f = open(&tx, "append_plain_over").await;
+        let tail_49 = inline_noise(49, 16);
+        tx.write_file(&f, 2000, &tail_49, plain(DEFAULT_MAX_INLINE))
+            .await
+            .unwrap();
+        expected
+            .get_mut("append_plain_over")
+            .unwrap()
+            .0
+            .extend_from_slice(&tail_49);
+
+        let comp_joined = inline_text(4096);
+        let comp_joined_len = zstd_stored_len(&comp_joined);
+        let comp_tail = &comp_joined[2000..];
+        let f = open(&tx, "append_comp_at").await;
+        tx.write_file(
+            &f,
+            2000,
+            comp_tail,
+            WriteOptions {
+                when: WHEN,
+                concurrency,
+                encoder: &mut encoder,
+                max_inline: comp_joined_len,
+            },
+        )
+        .await
+        .unwrap();
+        expected
+            .get_mut("append_comp_at")
+            .unwrap()
+            .0
+            .extend_from_slice(comp_tail);
+
+        let f = open(&tx, "append_comp_over").await;
+        tx.write_file(
+            &f,
+            2000,
+            comp_tail,
+            WriteOptions {
+                when: WHEN,
+                concurrency,
+                encoder: &mut encoder,
+                max_inline: comp_joined_len - 1,
+            },
+        )
+        .await
+        .unwrap();
+        expected
+            .get_mut("append_comp_over")
+            .unwrap()
+            .0
+            .extend_from_slice(comp_tail);
+
+        for (name, size, max_inline) in [
+            ("trunc_plain_at", 2048, DEFAULT_MAX_INLINE),
+            ("trunc_plain_over", 2049, DEFAULT_MAX_INLINE),
+            ("trunc_plain_sector", SECTOR, 4096),
+        ] {
+            let f = open(&tx, name).await;
+            tx.truncate_file(&f, size, plain(max_inline)).await.unwrap();
+            expected.get_mut(name).unwrap().0.resize(size as usize, 0);
+        }
+        for (name, size, max_inline) in [
+            ("trunc_comp_at", SECTOR, padded_trunc_len),
+            ("trunc_comp_over", SECTOR, padded_trunc_len - 1),
+            ("trunc_comp_sector_over", SECTOR + 1, DEFAULT_MAX_INLINE),
+        ] {
+            let f = open(&tx, name).await;
+            tx.truncate_file(
+                &f,
+                size,
+                WriteOptions {
+                    when: WHEN,
+                    concurrency,
+                    encoder: &mut encoder,
+                    max_inline,
+                },
+            )
+            .await
+            .unwrap();
+            expected.get_mut(name).unwrap().0.resize(size as usize, 0);
+        }
+        tx.commit().await.unwrap();
+
+        // Reflink paths: inline source at/across `max_inline`, at offset 4096,
+        // and regular source promoting an inline destination.
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let dir = tx
+            .lookup(&root, "内联-インライン-인라인".as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        let open = async |tx: &helios_btrfs::write::WriteTransaction<'_, _, _>, name: &str| {
+            tx.lookup(&dir, name.as_bytes()).await.unwrap().unwrap()
+        };
+
+        let comp_sector_len = zstd_stored_len(&inline_text(4096));
+        for (source_name, dest_name, dest_offset, max_inline, layout) in [
+            (
+                "plain_at",
+                "clone_plain_at",
+                0,
+                DEFAULT_MAX_INLINE,
+                Some(None),
+            ),
+            (
+                "plain_at",
+                "clone_plain_over",
+                0,
+                DEFAULT_MAX_INLINE - 1,
+                None,
+            ),
+            (
+                "plain_at",
+                "clone_plain_off_sector",
+                SECTOR,
+                DEFAULT_MAX_INLINE,
+                None,
+            ),
+            (
+                "comp_sector",
+                "clone_comp_at",
+                0,
+                comp_sector_len,
+                Some(Some(Compression::Zstd)),
+            ),
+            (
+                "comp_sector",
+                "clone_comp_over",
+                0,
+                comp_sector_len - 1,
+                None,
+            ),
+        ] {
+            let from = open(&tx, source_name).await;
+            let to = tx
+                .create_file(
+                    Name {
+                        parent: &dir,
+                        bytes: dest_name.as_bytes(),
+                    },
+                    attrs,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+            let src_bytes = expected[source_name].0.clone();
+            tx.clone_range(
+                CloneRange {
+                    source: &from,
+                    destination: &to,
+                    source_offset: 0,
+                    destination_offset: dest_offset,
+                    length: src_bytes.len() as u64,
+                },
+                plain(max_inline),
+            )
+            .await
+            .unwrap();
+            let mut content = vec![0; dest_offset as usize];
+            content.extend_from_slice(&src_bytes);
+            expected.insert(dest_name, (content, layout));
+        }
+
+        let from_plain = open(&tx, "plain_at").await;
+        let to_inline = open(&tx, "clone_dest_inline").await;
+        let src_bytes = expected["plain_at"].0.clone();
+        tx.clone_range(
+            CloneRange {
+                source: &from_plain,
+                destination: &to_inline,
+                source_offset: 0,
+                destination_offset: 0,
+                length: src_bytes.len() as u64,
+            },
+            plain(DEFAULT_MAX_INLINE),
+        )
+        .await
+        .unwrap();
+        expected.get_mut("clone_dest_inline").unwrap().0 = src_bytes;
+
+        let from_reg = open(&tx, "plain_over").await;
+        let to_off = open(&tx, "clone_dest_off_sector").await;
+        let reg_bytes = expected["plain_over"].0.clone();
+        tx.clone_range(
+            CloneRange {
+                source: &from_reg,
+                destination: &to_off,
+                source_offset: 0,
+                destination_offset: SECTOR,
+                length: reg_bytes.len() as u64,
+            },
+            plain(DEFAULT_MAX_INLINE),
+        )
+        .await
+        .unwrap();
+        let dest_bytes = &mut expected.get_mut("clone_dest_off_sector").unwrap().0;
+        dest_bytes.resize(SECTOR as usize, 0);
+        dest_bytes.extend_from_slice(&reg_bytes);
+
+        tx.commit().await.unwrap();
+
+        let view = writer.snapshot().unwrap();
+        for (name, (bytes, layout)) in &expected {
+            let path = format!("/内联-インライン-인라인/{name}");
+            let inode = view.resolve(path.as_bytes()).await.unwrap();
+            assert_eq!(inode.metadata().size, bytes.len() as u64, "{name}");
+            let mut actual = vec![0; bytes.len()];
+            assert_eq!(
+                view.read(&inode, 0, &mut actual).await.unwrap(),
+                bytes.len(),
+                "{name}"
+            );
+            assert!(actual == *bytes, "{name}: content mismatch");
+            let extents = view.file_extents(&inode).await.unwrap();
+            for extent in extents.iter().filter(|e| e.kind == ExtentKind::Inline) {
+                assert!(extent.stored <= max_node_inline, "{name}: {extent:?}");
+                if extent.compression.is_none() {
+                    assert_eq!(extent.stored, extent.len, "{name}: {extent:?}");
+                } else {
+                    assert!(extent.len <= SECTOR, "{name}: {extent:?}");
+                }
+            }
+            match layout {
+                Some(compression) => {
+                    assert_eq!(extents.len(), 1, "{name}: {extents:?}");
+                    assert_eq!(extents[0].kind, ExtentKind::Inline, "{name}: {extents:?}");
+                    assert_eq!(extents[0].compression, *compression, "{name}: {extents:?}");
+                }
+                None => assert!(
+                    extents.iter().all(|e| e.kind != ExtentKind::Inline),
+                    "{name}: {extents:?}"
+                ),
+            }
+        }
+    });
+    shared
+}
+
+#[test]
+fn public_writer_enforces_inline_extent_limits() {
+    let _ = exercise_inline_limits(base_image());
+}
+
+#[test]
+#[ignore = "needs mkfs.btrfs and btrfs check from btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn inline_extent_limits_pass_btrfs_check() {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("seed.txt"), b"seed\n").unwrap();
+    for args in [&[][..], &["--nodesize", "4096"][..]] {
+        let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, args);
+        let shared = exercise_inline_limits(image);
+        assert_btrfs_check(&shared.0);
+    }
 }

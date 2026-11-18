@@ -5,8 +5,8 @@
 //! directory listing order. They resolve every path through the store's
 //! [`Namespace`], so the mount that owns a path decides which filesystem
 //! answers; no surface knows which filesystems exist. Preview3 below,
-//! preview2 (`preview2.rs`) and preview1 (`component_host::service`) call
-//! them and only translate types.
+//! and preview1 (`component_host::service`) call them and only translate
+//! types.
 
 use helios_hal::fs::{
     FileSystem, FilledWrite, FsError as VfsError, FsResult, Landed, Metadata, NodeKind, OpenFlags,
@@ -609,6 +609,10 @@ where
 /// Writes `bytes` to the file `descriptor` names, and resolves with where
 /// they landed and how many did: fewer than `bytes` only when the
 /// filesystem ran out of space after storing a prefix.
+///
+/// The guests' write paths are streams over [`write_resolved`]; this is
+/// the one-shot form the filesystem tests drive.
+#[cfg(test)]
 pub(crate) async fn write<StorageImpl>(
     namespace: &Namespace<StorageImpl>,
     file: Granted<'_, RegularFile, Write>,
@@ -1362,7 +1366,7 @@ where
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
         if this.pending.is_none() {
-            let capacity = destination.remaining(&mut store);
+            let capacity = destination.remaining(&mut store)?;
             if capacity == Some(0) {
                 return Poll::Ready(Ok(StreamResult::Completed));
             }
@@ -1500,7 +1504,7 @@ where
                     if finish {
                         return Poll::Ready(Ok(StreamResult::Cancelled));
                     }
-                    let available = source.remaining().len();
+                    let available = source.remaining()?.len();
                     if available == 0 {
                         return Poll::Ready(Ok(StreamResult::Completed));
                     }
@@ -1565,7 +1569,7 @@ where
             };
             let len = staged.staged_len();
             let filled = {
-                let bytes = source.remaining();
+                let bytes = source.remaining()?;
                 let mut cursor = 0;
                 let filled = staged.fill(|_, destination| {
                     let end = cursor + destination.len();

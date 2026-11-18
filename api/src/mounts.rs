@@ -9,25 +9,12 @@ pub use crate::bindings::helios::system::mounts::{
     MountError, MountErrorKind, MountRequest, MountSource,
 };
 
-/// Attaches `source` at `path`, a directory path in the caller's authority.
-/// `compress` is the value of Linux's `compress=` option for a writable btrfs
-/// mount, such as `zstd:3`, and `commit` the value of its `commit=` option,
-/// in seconds.
-pub async fn mount(
-    source: MountSource,
-    path: impl Into<String>,
-    read_only: bool,
-    compress: Option<String>,
-    commit: Option<u32>,
-) -> Result<(), MountError> {
-    raw::mount(MountRequest {
-        source,
-        path: path.into(),
-        read_only,
-        compress,
-        commit,
-    })
-    .await
+/// Attaches `request.source` at `request.path`, a directory path in the
+/// caller's authority. The request's options carry Linux's mount options of
+/// the same names for a writable btrfs mount: `compress=` (such as
+/// `zstd:3`), `commit=` in seconds and `max_inline=` in bytes.
+pub async fn mount(request: MountRequest) -> Result<(), MountError> {
+    raw::mount(request).await
 }
 
 /// Detaches the filesystem mounted at `path`.

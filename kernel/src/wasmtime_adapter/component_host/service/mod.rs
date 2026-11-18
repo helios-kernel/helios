@@ -9,6 +9,7 @@ mod memory;
 use memory::*;
 mod descriptor;
 use descriptor::*;
+pub(crate) use descriptor::{Preview1SignalExit, WasixSignalState};
 mod display;
 pub(super) use display::add_display_to_linker;
 pub use display::{DisplayHandle, SurfaceHandle};
@@ -30,12 +31,14 @@ mod hv;
 pub(super) use hv::add_hv_to_linker;
 mod processors;
 pub(super) use processors::add_processors_to_linker;
-mod compile_session;
-use compile_session::*;
+mod shared_memory_plugin;
+use shared_memory_plugin::*;
 mod compiler;
 use compiler::*;
 mod exec;
 use exec::*;
+mod component_plugin;
+use component_plugin::*;
 mod http_plugin;
 use http_plugin::*;
 mod network_step;
@@ -56,8 +59,12 @@ mod wasix_epoll;
 use wasix_epoll::*;
 #[cfg(feature = "linux")]
 mod linux;
+#[cfg(test)]
+mod stdin_inheritance_tests;
 #[cfg(feature = "linux")]
 use linux::*;
+#[cfg(test)]
+mod child_exit_tests;
 
 use super::*;
 use crate::isa::GuestIsa;
@@ -85,7 +92,7 @@ use alloc::vec;
 use bytes::Bytes;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+use core::sync::atomic::Ordering as AtomicOrdering;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use hashbrown::HashMap;
@@ -125,8 +132,8 @@ const WASIX_STREAM_SECURITY_CLASSIC_ENCRYPTION: u8 = 1 << 2;
 const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
-type CompilerThreadTasks = SmallVec<[crate::JoinHandle<CompilerThreadReport>; 8]>;
-type CompilerThreadReports = SmallVec<[CompilerThreadReport; 8]>;
+type CompilerThreadTasks = SmallVec<[crate::JoinHandle<SharedMemoryThreadReport>; 8]>;
+type CompilerThreadReports = SmallVec<[SharedMemoryThreadReport; 8]>;
 type CompilerPluginHandle<CpuImpl, Net, StorageImpl> =
     Arc<CompilerPluginRuntime<CpuImpl, Net, StorageImpl>>;
 
@@ -139,9 +146,10 @@ struct CompileJob {
     profile: bool,
 }
 
-/// How a compile's body ended, with the phase timestamps it filled in.
+/// How a compile's body ended, with the phase timestamps and live worker count.
 struct CompileEnd {
     result: Result<(Vec<u8>, CompilerThreadReports), ProgramExecError>,
+    worker_threads: u32,
     phases: CompilerPhaseTimestamps,
 }
 
@@ -149,9 +157,9 @@ struct CompileEnd {
 pub(crate) struct AotArtifact {
     /// The signed `cwasm` artifact.
     pub(crate) signed: Vec<u8>,
-    /// The worker count the compiler plugin was told to compile with
-    /// (`compiler_plugin_worker_threads`), reported so a caller comparing
-    /// this compile with another can hold the count fixed.
+    /// The live worker count the compiler plugin was told to compile with,
+    /// reported so a caller comparing this compile with another can hold the
+    /// count fixed.
     pub(crate) worker_threads: u32,
 }
 
@@ -357,11 +365,16 @@ where
     /// buffers. The slot is held only on the kernel side; the rayon
     /// worker pool inside the plugin still parallelises a single
     /// compile across all cores.
-    compile_slot: CompilerCompileSlot,
+    compile_slot: SharedMemorySessionSlot,
     /// Every wasm image this service loaded, by address, for the
     /// instruction sampler to name.
     code_map: CodeMap,
     clock_cpu: CpuImpl,
+    /// Shared precompiled `http-client` plugin component, instantiated lazily
+    /// per processor on every core hosting [`NetworkStep`].
+    http_client_pre: spin::Once<Option<PreparedComponent<CpuImpl, Net, StorageImpl>>>,
+    plugin_read_serial: crate::SerialReader,
+    plugin_write_serial: crate::DebugSerialWriter,
     _marker: core::marker::PhantomData<fn() -> StorageImpl>,
 }
 
@@ -510,7 +523,7 @@ impl ChildHandle {
 #[derive(Clone, Debug)]
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
-    pub exit_code: u32,
+    pub termination: helios_unix::ChildTermination,
     filesystem: Option<MemoryFs>,
 }
 
@@ -629,12 +642,17 @@ where
             cwasm_signing_key,
             guest_isa,
             compiler_plugin: Mutex::new(None),
-            compile_slot: CompilerCompileSlot::new(),
+            compile_slot: SharedMemorySessionSlot::new(),
             code_map: CodeMap::new(),
             clock_cpu: cpu.clone(),
+            http_client_pre: spin::Once::new(),
+            plugin_read_serial: read_serial,
+            plugin_write_serial: write_serial,
             _marker: core::marker::PhantomData,
         }),
     };
+    let http_pre = provision_http_client_plugin(&service, cpu, debug_state, write_serial);
+    service.inner.http_client_pre.call_once(|| http_pre);
     debug_state.install_program_service(service.clone());
     spawn_instruction_sample_drain(kernel, &service, debug_state);
     let plugin_context = ProgramExecContext {
@@ -647,7 +665,6 @@ where
         read_serial,
         write_serial,
     };
-    install_http_client_plugin(&service, plugin_context.clone());
     install_compositor_plugin(&service, plugin_context);
     service
 }
@@ -806,7 +823,7 @@ where
 }
 
 pub fn run_program_workers_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
-    _cpu: CpuImpl,
+    cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
 ) -> !
@@ -817,11 +834,13 @@ where
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
 {
-    // The packet pump has to be this processor's own task, because the
-    // pair it drains has its interrupt routed here; the step owns it and
-    // hands the pair off when the processor goes offline.
+    // The packet pump and per-processor WASI 0.3 plugin shards live on this
+    // processor as local tasks: the plugins come up after `NetworkStep` and
+    // go down before it on processor offline.
     let network = NetworkStep::start(&kernel, &debug_state);
-    kernel.run_with_steps(&network)
+    let http_client = PerProcessorPluginStep::start(&cpu, &kernel, &debug_state, HttpClientPlugin);
+    let steps = (network, http_client);
+    kernel.run_with_steps(&steps)
 }
 
 pub fn run_component_host_processor_forever<
@@ -845,11 +864,12 @@ where
     MeasuredBootImpl: MeasuredBoot,
 {
     // Started before the role dispatch decides what else the processor
-    // does: every processor's pump is its own local task. A processor
-    // that goes on to run an embedded component keeps the step alive
-    // for good without lending it to a lifecycle — its component is
-    // pinned local work, so it never goes offline.
+    // does: every processor's pump and lazy WASI 0.3 plugin shards run locally
+    // here. A processor running an embedded component keeps the steps alive
+    // without lending them to a lifecycle, since it never goes offline.
     let network = NetworkStep::start(&kernel, &debug_state);
+    let http_client = PerProcessorPluginStep::start(&cpu, &kernel, &debug_state, HttpClientPlugin);
+    let steps = (network, http_client);
     let topology = kernel.topology();
     // Every backend's bootstrap processor reaches here only after starting
     // its secondaries, and a backend enables its mechanisms on a processor
@@ -865,7 +885,7 @@ where
         topology.bootstrap_processor,
     ) {
         ComponentHostProcessorRole::Kernel => {
-            run_kernel_processor_forever(cpu, kernel, debug_state, &network);
+            run_kernel_processor_forever(cpu, kernel, debug_state, &steps);
         }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
             match debug_state.system_component() {
@@ -886,7 +906,7 @@ where
                     if cfg!(feature = "embedded-debugger") {
                         panic!("embedded init bootfs is missing the system component");
                     }
-                    run_kernel_processor_forever(cpu, kernel, debug_state, &network);
+                    run_kernel_processor_forever(cpu, kernel, debug_state, &steps);
                 }
             }
         }
@@ -933,11 +953,11 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
     );
 }
 
-fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl, Steps>(
     cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
-    network: &NetworkStep<CpuImpl, Net, StorageImpl>,
+    steps: &Steps,
 ) -> !
 where
     CpuImpl: Cpu + Clone,
@@ -945,6 +965,7 @@ where
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
     MeasuredBootImpl: MeasuredBoot,
+    Steps: crate::exec::ProcessorStep,
 {
     let processor = helios_hal::cpu::current_processor().id();
     let stack = kernel_processor_profile_stack(processor);
@@ -952,16 +973,14 @@ where
         let progress = if debug_state.profiling_enabled() {
             let started = cpu.now().ticks();
             let counters = cpu.hardware_perf_counters();
-            let stats = kernel.run_until_stalled_with_steps(network);
+            let stats = kernel.run_until_stalled_with_steps(steps);
             let progress = stats.progress_count();
             if progress != 0 {
                 record_executor_metrics(&cpu, &debug_state, &stack, started, counters, stats);
             }
             progress
         } else {
-            kernel
-                .run_until_stalled_with_steps(network)
-                .progress_count()
+            kernel.run_until_stalled_with_steps(steps).progress_count()
         };
 
         if progress != 0 {
@@ -1593,13 +1612,33 @@ where
         let (stdout, (stderr, exit)) =
             futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
         let exit = exit?;
+        let exit_code = match exit.termination {
+            helios_unix::ChildTermination::Exited(code) => code,
+            helios_unix::ChildTermination::Signaled(sig) => {
+                128u32.saturating_add(u32::from(sig.signal))
+            }
+            helios_unix::ChildTermination::Trapped => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: ProgramExecErrorDetail::ChildTrapped,
+                });
+            }
+            helios_unix::ChildTermination::Killed => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: ProgramExecErrorDetail::ChildKilled,
+                });
+            }
+        };
 
-        Ok(ExecResult {
-            instance_id: exit.instance_id,
-            exit_code: exit.exit_code,
-            output: crate::ExecOutput { stdout, stderr },
-        })
-        .map(|result| (result, exit.filesystem))
+        Ok((
+            ExecResult {
+                instance_id: exit.instance_id,
+                exit_code,
+                output: crate::ExecOutput { stdout, stderr },
+            },
+            exit.filesystem,
+        ))
     }
 
     pub(crate) async fn aot(
@@ -1610,13 +1649,8 @@ where
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<AotArtifact, ProgramExecError> {
-        let signed = self
-            .compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
-            .await?;
-        Ok(AotArtifact {
-            signed,
-            worker_threads: compiler_plugin_worker_threads(&exec_context.cpu),
-        })
+        self.compile_raw_component_to_signed_artifact(compile, exec_context, wasm, hint, profile)
+            .await
     }
 
     async fn load_executable(
@@ -1667,7 +1701,7 @@ where
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
                     .map_err(map_artifact_profile_error)?;
                 let hint = hint.unwrap_or(AotCompileHint::Performance);
-                let signed = self
+                let compiled = self
                     .compile_raw_component_to_signed_artifact(
                         compile,
                         exec_context,
@@ -1676,7 +1710,7 @@ where
                         false,
                     )
                     .await?;
-                let signed = Bytes::from(signed);
+                let signed = Bytes::from(compiled.signed);
                 trusted_signed_payload(&signed, &self.inner.cwasm_signing_key)?
             }
         };
@@ -1896,7 +1930,7 @@ where
         wasm: &Bytes,
         hint: AotCompileHint,
         profile: bool,
-    ) -> Result<Vec<u8>, ProgramExecError> {
+    ) -> Result<AotArtifact, ProgramExecError> {
         let phases = CompilerPhaseTimestamps {
             processor: if profile {
                 helios_hal::cpu::current_processor().id()
@@ -1920,7 +1954,7 @@ where
         // The compile runs in a task of its own, whichever route asked for
         // it, and this call holds only the receiving half of its reply: the
         // compile outlives a requester that stops waiting, and stops itself
-        // when that happens (`run_compile_session`).
+        // when that happens (`run_shared_memory_session`).
         let (reply, artifact) = futures::channel::oneshot::channel();
         exec_context.spawner.spawn_detached({
             let service = self.clone();
@@ -1940,18 +1974,18 @@ where
         }
     }
 
-    /// The compile session task: waits for the compile slot, runs the compile
-    /// with the slot held until every worker is joined, condemns the compile
+    /// The compile session task: waits for the session slot, runs the compile
+    /// with core affinity until every worker is joined, condemns the compile
     /// if its requester leaves, and replies with the signed artifact.
     async fn compile_session(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         job: CompileJob,
         phases: CompilerPhaseTimestamps,
-        reply: futures::channel::oneshot::Sender<Result<Vec<u8>, ProgramExecError>>,
+        reply: futures::channel::oneshot::Sender<Result<AotArtifact, ProgramExecError>>,
     ) {
         let profile = job.profile;
-        run_compile_session(
+        run_shared_memory_session(
             &self.inner.compile_slot,
             reply,
             || {
@@ -1970,7 +2004,7 @@ where
                     let runtime_state = exec_context.runtime_state.clone();
                     let id = instance.id();
                     move || {
-                        condemn_compile(
+                        condemn_session(
                             &registry,
                             &interrupts,
                             id,
@@ -1996,8 +2030,12 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         profile: bool,
         end: CompileEnd,
-    ) -> Result<Vec<u8>, ProgramExecError> {
-        let CompileEnd { result, mut phases } = end;
+    ) -> Result<AotArtifact, ProgramExecError> {
+        let CompileEnd {
+            result,
+            worker_threads,
+            mut phases,
+        } = end;
         let (payload, thread_reports) = result?;
         let signed = cwasm::sign_artifact_payload(&payload, &self.inner.cwasm_signing_key)
             .map_err(map_artifact_trust_error)?;
@@ -2021,12 +2059,15 @@ where
                 signed.len(),
             );
         }
-        Ok(signed)
+        Ok(AotArtifact {
+            signed,
+            worker_threads,
+        })
     }
 
     /// The compile proper, run with the compile slot held: the plugin's call,
-    /// then the join of every worker task the plugin spawned, so the slot is
-    /// never released while one still runs on the plugin's memory.
+    /// then the join of every core-pinned worker task the plugin spawned, so the
+    /// slot is never released while one still runs on the plugin's memory.
     async fn run_compile(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
@@ -2045,17 +2086,24 @@ where
         } else {
             0
         };
+        let affinity_plan = CoreAffinityPlan::capture(
+            &exec_context.cpu,
+            exec_context.spawner.processor_control().online_set(),
+            helios_hal::cpu::current_processor(),
+        );
+        let worker_threads = affinity_plan.worker_count();
         let result = self
             .invoke_compiler_inner(
                 exec_context,
                 &compiler_payload,
                 instance,
                 CompileRequest {
-                    wasm: &wasm,
+                    wasm,
                     guest_isa: self.inner.guest_isa,
                     hint,
                     profile,
                 },
+                affinity_plan,
                 &mut phases,
             )
             .await;
@@ -2086,6 +2134,7 @@ where
         }
         CompileEnd {
             result: result.map(|payload| (payload, thread_reports)),
+            worker_threads,
             phases,
         }
     }
@@ -2122,13 +2171,15 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         compiler_payload: &Bytes,
         compiler_instance: crate::RegisteredInstance,
-        request: CompileRequest<'_>,
+        request: CompileRequest,
+        affinity_plan: CoreAffinityPlan,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let profile = request.profile;
         let (plugin, plugin_cached) = self
-            .ensure_compiler_plugin(exec_context, compiler_payload)
+            .ensure_compiler_plugin(exec_context, compiler_payload, affinity_plan.worker_count())
             .await?;
+        plugin.shared.begin_session(&affinity_plan);
         phases.plugin_cached = plugin_cached;
         phases.plugin_ready_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
@@ -2142,14 +2193,34 @@ where
             instance: compiler_instance,
             registry: exec_context.instance_registry.clone(),
             shared: plugin.shared.clone(),
+            affinity_plan: affinity_plan.clone(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         };
-        // The main thread's part ends here, before the workers are joined, so
-        // a failure condemns the compile while they can still be ended.
-        let result = self
-            .run_main_thread(exec_context, &plugin, context.clone(), request, phases)
+        // Pin the compile's main store to `affinity_plan.main()` so main and all
+        // workers execute deterministically across the live `Kernel` cores.
+        let main_core = affinity_plan.main();
+        let (result, updated_phases) = affinity_plan
+            .spawn_pinned(&exec_context.spawner, main_core, {
+                let service = self.clone();
+                let exec_context = exec_context.clone();
+                let context = context.clone();
+                let mut local_phases = *phases;
+                async move {
+                    let result = service
+                        .run_main_thread(
+                            &exec_context,
+                            &plugin,
+                            context,
+                            request,
+                            &mut local_phases,
+                        )
+                        .await;
+                    (result, local_phases)
+                }
+            })
             .await;
+        *phases = updated_phases;
         context.end_main_part(result)
     }
 
@@ -2160,7 +2231,7 @@ where
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         plugin: &CompilerPluginHandle<CpuImpl, Net, StorageImpl>,
         context: CompilerCompileContext<CpuImpl, Net, StorageImpl>,
-        request: CompileRequest<'_>,
+        request: CompileRequest,
         phases: &mut CompilerPhaseTimestamps,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let profile = request.profile;
@@ -2252,7 +2323,7 @@ where
         store: &mut wasmtime::Store<CompilerCoreStore<CpuImpl, Net, StorageImpl>>,
         exports: &CompilerExports,
         allocations: &mut CompilerAllocations,
-        request: CompileRequest<'_>,
+        request: CompileRequest,
         phases: &mut CompilerPhaseTimestamps,
     ) -> CompilerCallOutcome {
         let CompileRequest {
@@ -2307,7 +2378,7 @@ where
         let memory = Preview1AsyncMemory::of_shared(store.data().memory());
         let written = in_guest_turn(store.data().guest_turns(), async {
             memory
-                .write_bytes(GuestAddress::wasm32(wasm_ptr), wasm)
+                .write_bytes(GuestAddress::wasm32(wasm_ptr), &wasm)
                 .await?;
             memory
                 .write_bytes(GuestAddress::wasm32(target_ptr), target)
@@ -2378,6 +2449,7 @@ where
         &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         compiler_payload: &Bytes,
+        worker_threads: u32,
     ) -> Result<(CompilerPluginHandle<CpuImpl, Net, StorageImpl>, bool), ProgramExecError> {
         let cached = self.inner.compiler_plugin.lock().clone();
         if let Some(plugin) = cached {
@@ -2396,7 +2468,6 @@ where
             });
         }
 
-        let worker_threads = compiler_plugin_worker_threads(&exec_context.cpu);
         tracing::info!(
             worker_threads,
             "building cached compiler plugin runtime (one-time per kernel boot)"
@@ -2410,17 +2481,12 @@ where
             .code_map
             .register_module(COMPILER_PLUGIN_PATH, &module);
         let shared_memory = compiler_shared_memory(engine, &module)?;
-        let shared = Arc::new(CompilerCoreShared {
-            memory: shared_memory.clone(),
-            entropy: Mutex::new(crate::EntropyPool::derive(
-                exec_context.runtime_state.root_entropy(),
-                0,
-            )),
-            instance_pre: spin::Once::new(),
-            next_thread_id: AtomicI32::new(0),
-            thread_tasks: Mutex::new(Vec::new()),
-            interrupts: self.inner.engine.interrupts().clone(),
-        });
+        let shared = Arc::new(SharedMemoryCoreShared::new(
+            shared_memory.clone(),
+            crate::EntropyPool::derive(exec_context.runtime_state.root_entropy(), 0),
+            self.inner.engine.interrupts().clone(),
+            worker_threads,
+        ));
         let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, Net, StorageImpl>> =
             CoreLinker::new(engine);
         add_compiler_core_imports(&mut linker, shared_memory.clone())?;
@@ -2445,6 +2511,7 @@ where
             instance: scratch_instance,
             registry: exec_context.instance_registry.clone(),
             shared: shared.clone(),
+            affinity_plan: CoreAffinityPlan::single(exec_context.cpu.bootstrap_processor()),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         });
@@ -2609,7 +2676,11 @@ const WASIX_JOIN_FLAG_NON_BLOCKING: u32 = 1 << 0;
 const WASIX_JOIN_FLAGS_SUPPORTED: u32 = WASIX_JOIN_FLAG_NON_BLOCKING | (1 << 1);
 const WASIX_JOIN_STATUS_NOTHING: u8 = 0;
 const WASIX_JOIN_STATUS_EXIT_NORMAL: u8 = 1;
+const WASIX_JOIN_STATUS_EXIT_SIGNAL: u8 = 2;
 const WASIX_JOIN_STATUS_UNION_OFFSET: u32 = 2;
+const WASIX_ERRNO_SIGNAL_SIGNAL_OFFSET: u32 = 4;
+const WASIX_SIGABRT: u8 = 6;
+const WASIX_SIGKILL: u8 = 9;
 const WASIX_SOCK_TYPE_STREAM: i32 = 1;
 const WASIX_SOCK_TYPE_DGRAM: i32 = 2;
 const WASIX_SOCK_STATUS_OPENED: u8 = 1;
@@ -2638,7 +2709,10 @@ const WASIX_SOCK_OPTION_TTL: i32 = 23;
 const WASIX_SOCK_OPTION_MULTICAST_TTL_V4: i32 = 24;
 const WASIX_SOCK_OPTION_TYPE: i32 = 25;
 const WASIX_SOCK_OPTION_PROTO: i32 = 26;
-const WASIX_RIFLAGS_DATA_TRUNCATED: u16 = 1 << 2;
+const WASIX_RIFLAGS_RECV_PEEK: u16 = 1 << 0;
+const WASIX_RIFLAGS_RECV_DONT_WAIT: u16 = 1 << 3;
+const WASIX_RIFLAGS_SUPPORTED: u16 = WASIX_RIFLAGS_RECV_PEEK | WASIX_RIFLAGS_RECV_DONT_WAIT;
+const WASIX_ROFLAGS_DATA_TRUNCATED: u16 = 1 << 0;
 const WASIX_ADDRESS_FAMILY_UNSPEC: u8 = 0;
 const WASIX_ADDRESS_FAMILY_IP_INET4: u8 = 1;
 const WASIX_ADDRESS_FAMILY_IP_INET6: u8 = 2;
@@ -2853,7 +2927,7 @@ mod tests {
         let code =
             crate::wasmtime_adapter::wasi::fs_error_code(helios_hal::fs::FsError::NameTooLong);
 
-        // Preview 2 and 3 return the code itself; preview 1 and WASIX
+        // Preview 3 returns the code itself; preview 1 and WASIX
         // answer its errno.
         assert!(matches!(code, fs_types::ErrorCode::NameTooLong));
         assert_eq!(
@@ -3129,10 +3203,10 @@ mod tests {
         let mode = table
             .component_output_mode(&session)
             .expect("closed slots are closed streams");
-        let OutputMode::RoutedChild { stdin_rx, .. } = &mode else {
+        let OutputMode::RoutedChild { stdin, .. } = &mode else {
             panic!("a redirected table routes each stream");
         };
-        assert!(matches!(stdin_rx.try_read(), crate::io::TryRead::Eof));
+        assert!(matches!(stdin, crate::ComponentInputRoute::Closed));
         let stdout = component_channel(&mode, crate::ComponentOutputStreamKind::Stdout);
         assert!(matches!(
             stdout.try_write(Bytes::from_static(b"lost\n")),
@@ -3783,6 +3857,7 @@ mod tests {
                 crate::UnixNetwork::new(crate::test_support::test_network_service()),
                 2,
             ),
+            local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
             local_port: 5353,
             options: unix_socket_options::<TestNet>(),
         }));
@@ -4197,7 +4272,7 @@ mod tests {
             maximum_pages: 1,
         };
         let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
-        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        let memory = SharedMemory::new(&engine, spec.memory_type().unwrap()).unwrap();
         let ptr = memory.data().as_ptr().cast::<u8>() as *mut u8;
         unsafe {
             ptr.write(0xa5);
@@ -4228,7 +4303,7 @@ mod tests {
             maximum_pages: 1,
         };
         let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
-        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        let memory = SharedMemory::new(&engine, spec.memory_type().unwrap()).unwrap();
         assert!(pool.reserve_for_recycle(spec, &memory));
         futures_lite::future::block_on(scrub_shared_memory(&memory));
         pool.finish_recycle(spec, memory);
@@ -4446,6 +4521,31 @@ mod tests {
         assert_ne!(identity.domain(), crate::AuthorityDomain::HOST_SHARE_9P);
         assert_ne!(identity.domain().raw(), 0);
         assert_ne!(identity.local(), 0);
+    }
+
+    #[test]
+    fn stdio_and_pipe_descriptors_report_character_device_filestat() {
+        let (writer, reader) = crate::byte_channel();
+        let descriptors: [TestDescriptor; 5] = [
+            Preview1Descriptor::Stdin {
+                carry: Bytes::new(),
+            },
+            Preview1Descriptor::Stdout,
+            Preview1Descriptor::Stderr,
+            Preview1Descriptor::PipeRead { reader },
+            Preview1Descriptor::PipeWrite { writer },
+        ];
+        for descriptor in &descriptors {
+            let (identity, stat) =
+                p1_synthetic_descriptor_stat(descriptor).expect("stdio/pipe must have filestat");
+            assert_eq!(identity.domain(), crate::AuthorityDomain::GUEST_DEVICES);
+            assert_ne!(identity.local(), 0);
+            assert_ne!(identity, p1_null_device_identity());
+            assert!(matches!(
+                stat.type_,
+                fs_types::DescriptorType::CharacterDevice
+            ));
+        }
     }
 
     #[test]
