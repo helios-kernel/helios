@@ -53,7 +53,10 @@ fn number_base_0(value: &str) -> Option<(&str, u32, &str)> {
         .or_else(|| value.strip_prefix("0X"))
     {
         (hex, 16)
-    } else if value.len() > 1 && value.starts_with('0') {
+    } else if value
+        .strip_prefix('0')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    {
         (&value[1..], 8)
     } else {
         (value, 10)
@@ -289,6 +292,7 @@ mod tests {
         for (value, bytes) in [
             ("2048", 2048),
             ("0", 0),
+            ("0k", 0),
             ("04000", 2048),
             ("0x800", 2048),
             ("2k", 2048),
