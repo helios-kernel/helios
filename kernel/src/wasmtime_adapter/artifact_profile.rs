@@ -76,7 +76,7 @@ pub fn classify_raw_wasm(bytes: &[u8]) -> Result<ArtifactProfileReport, Artifact
             }
             Payload::ComponentImportSection(section) => {
                 for import in section {
-                    component_imports.push(import?.name.0.to_string());
+                    component_imports.push(import?.name.name.to_string());
                 }
             }
             _ => {}

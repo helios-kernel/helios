@@ -1055,7 +1055,7 @@ where
         if finish {
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
-        if destination.remaining(&mut store) == Some(0) {
+        if destination.remaining(&mut store)? == Some(0) {
             return Poll::Ready(Ok(StreamResult::Completed));
         }
         let this = self.as_mut().get_mut();
@@ -1171,7 +1171,7 @@ where
 
         loop {
             if this.pending.is_none() {
-                let capacity = destination.remaining(&mut store);
+                let capacity = destination.remaining(&mut store)?;
                 if capacity == Some(0) {
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
@@ -1242,7 +1242,7 @@ where
         let mut this = self.project();
         loop {
             if this.pending.is_none() {
-                let available = source.remaining(&mut store);
+                let available = source.remaining(&mut store)?;
                 if available == 0 {
                     complete_socket_transfer(this.completion, Ok(()));
                     return Poll::Ready(Ok(StreamResult::Completed));
