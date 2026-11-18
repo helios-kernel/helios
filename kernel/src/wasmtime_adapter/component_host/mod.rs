@@ -2388,11 +2388,7 @@ fn tcp_connect_network_rights() -> NetworkAuthorityRights {
 }
 
 fn udp_bind_network_rights(local_port: u16) -> NetworkAuthorityRights {
-    if local_port != 0 && local_port < 1024 {
-        NetworkAuthorityRights::UDP | NetworkAuthorityRights::PRIVILEGED_BIND
-    } else {
-        NetworkAuthorityRights::UDP
-    }
+    NetworkAuthorityRights::UDP.bind_rights(local_port)
 }
 
 fn add_net_to_linker<CpuImpl, Net, StorageImpl>(
@@ -2529,7 +2525,12 @@ where
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(unavailable_udp_error()),));
                 };
-                let bound = service.udp_bind(local_port).await;
+                let bound = service
+                    .udp_bind(
+                        crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                        local_port,
+                    )
+                    .await;
                 let response =
                     match bound {
                         Ok(binding) => {
@@ -2828,7 +2829,12 @@ where
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(unavailable_program_udp_error()),));
                 };
-                let bound = service.udp_bind(local_port).await;
+                let bound = service
+                    .udp_bind(
+                        crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                        local_port,
+                    )
+                    .await;
                 let response =
                     match bound {
                         Ok(binding) => {

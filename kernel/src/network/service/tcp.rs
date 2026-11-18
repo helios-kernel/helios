@@ -247,7 +247,17 @@ where
         buffer: &mut RegisteredTcpReadBuffer<'_>,
         timeout_nanos: u64,
     ) -> Result<TcpReadInto, TcpError> {
-        self.execute_tcp_read_into(stream, buffer, timeout_nanos)
+        self.execute_tcp_read_into(stream, buffer, timeout_nanos, false)
+            .await
+    }
+
+    pub async fn tcp_peek_into(
+        &self,
+        stream: TcpStreamId,
+        buffer: &mut RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> Result<TcpReadInto, TcpError> {
+        self.execute_tcp_read_into(stream, buffer, timeout_nanos, true)
             .await
     }
 
@@ -544,6 +554,13 @@ where
         backlog: u16,
         hop_limit: u8,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
+        if !local_address.is_unspecified() && !self.owns_ip_address(local_address) {
+            return Err(TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::AddressNotAvailable,
+            });
+        }
+        self.synchronize_control_plane();
         let backlog = TcpListenBacklog::try_new(backlog).map_err(|_| TcpError {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::TcpListenStartFailed,
@@ -741,16 +758,17 @@ where
         stream: TcpStreamId,
         buffer: &mut RegisteredTcpReadBuffer<'_>,
         timeout_nanos: u64,
+        peek: bool,
     ) -> Result<TcpReadInto, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
             let wait = self.shard_wait_for_handle(stream);
             match self
-                .poll_tcp_read_into_round(stream, buffer, deadline_nanos)
+                .poll_tcp_read_into_round(stream, buffer, deadline_nanos, peek)
                 .await?
             {
                 TcpReadIntoProgress::Data(bytes) => {
-                    return self.finish_tcp_read_into(stream, buffer, bytes).await;
+                    return self.finish_tcp_read_into(stream, buffer, bytes, peek).await;
                 }
                 TcpReadIntoProgress::Eof => return Ok(TcpReadInto::Eof),
                 TcpReadIntoProgress::PageAbsent => {
@@ -790,12 +808,18 @@ where
         stream: TcpStreamId,
         buffer: &mut RegisteredTcpReadBuffer<'_>,
         mut delivered: usize,
+        peek: bool,
     ) -> Result<TcpReadInto, TcpError> {
-        while buffer.awaits_page() && self.tcp_receive_queued(stream)? {
+        while buffer.awaits_page() && self.tcp_receive_has_more(stream, buffer.written(), peek)? {
             if let Err(error) = buffer.bring_in_next_page().await {
                 return Ok(TcpReadInto::PageLost(error));
             }
-            match self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoInitial)? {
+            match self.poll_tcp_read_into_once(
+                stream,
+                buffer,
+                TcpReadPhasePrefix::IntoInitial,
+                peek,
+            )? {
                 TcpReadIntoProgress::Data(more) => delivered += more,
                 // Taken again before this poll; the loop brings it back.
                 TcpReadIntoProgress::PageAbsent => {}
@@ -805,17 +829,28 @@ where
         Ok(TcpReadInto::Data(delivered))
     }
 
-    /// Whether `stream`'s receive queue holds bytes a read would take
-    /// now, without taking them or driving the device.
-    fn tcp_receive_queued(&self, stream: TcpStreamId) -> Result<bool, TcpError> {
-        let now = StackInstant::from_nanos(self.now_nanos());
+    /// Whether `stream`'s receive queue still has unread bytes past `already_peeked`
+    /// without consuming them or driving the device.
+    fn tcp_receive_has_more(
+        &self,
+        stream: TcpStreamId,
+        already_peeked: usize,
+        peek: bool,
+    ) -> Result<bool, TcpError> {
         self.inner.state.with_handle(stream, |state| {
             let socket = state.tcp_socket(stream)?;
-            let read = state.stack.tcp_read(socket, 0, now).map_err(|_| TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpReceiveFailed,
-            })?;
-            Ok(matches!(read, TcpReadState::Data(_)))
+            let queued = state
+                .stack
+                .tcp_receive_queued_bytes(socket)
+                .map_err(|_| TcpError {
+                    kind: TcpErrorKind::Unavailable,
+                    detail: NetworkErrorDetail::TcpReceiveFailed,
+                })?;
+            Ok(if peek {
+                queued > already_peeked
+            } else {
+                queued > 0
+            })
         })
     }
 
@@ -828,8 +863,10 @@ where
         stream: TcpStreamId,
         buffer: &mut RegisteredTcpReadBuffer<'_>,
         deadline_nanos: u64,
+        peek: bool,
     ) -> Result<TcpReadIntoProgress, TcpError> {
-        let read = self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoInitial)?;
+        let read =
+            self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoInitial, peek)?;
         if !matches!(read, TcpReadIntoProgress::Pending) {
             return Ok(read);
         }
@@ -837,11 +874,11 @@ where
         self.drive_tcp_read_network_burst(buffer.capacity()).await?;
         self.record_network_profile("tcp-read-into-drive-network", drive_started);
         let read =
-            self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoAfterDrive)?;
+            self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoAfterDrive, peek)?;
         if !matches!(read, TcpReadIntoProgress::Pending) {
             return Ok(read);
         }
-        self.poll_tcp_read_into_without_interrupt_sleep(stream, buffer, deadline_nanos)
+        self.poll_tcp_read_into_without_interrupt_sleep(stream, buffer, deadline_nanos, peek)
             .await
     }
 
@@ -905,15 +942,21 @@ where
         stream: TcpStreamId,
         buffer: &mut RegisteredTcpReadBuffer<'_>,
         profile_prefix: TcpReadPhasePrefix,
+        peek: bool,
     ) -> Result<TcpReadIntoProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read =
+        let read = if peek {
+            self.inner
+                .state
+                .with_handle(stream, |state| state.poll_tcp_peek_into(stream, buffer))?
+        } else {
             self.inner
                 .state
                 .with_handle_receive_drain(stream, &self.inner.pairs, |state| {
                     state.poll_tcp_read_into(stream, buffer, now)
-                })?;
+                })?
+        };
         self.record_tcp_read_into_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -979,6 +1022,7 @@ where
         stream: TcpStreamId,
         buffer: &mut RegisteredTcpReadBuffer<'_>,
         deadline_nanos: u64,
+        peek: bool,
     ) -> Result<TcpReadIntoProgress, TcpError> {
         let capabilities = self.inner.device.capabilities().events;
         if !capabilities.polling || capabilities.interrupts {
@@ -1001,7 +1045,12 @@ where
                     TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
                 })?;
             self.record_network_profile("tcp-read-into-polling-drive-network", drive_started);
-            match self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoPolling)? {
+            match self.poll_tcp_read_into_once(
+                stream,
+                buffer,
+                TcpReadPhasePrefix::IntoPolling,
+                peek,
+            )? {
                 ready @ (TcpReadIntoProgress::Data(_)
                 | TcpReadIntoProgress::Eof
                 | TcpReadIntoProgress::PageAbsent) => {
@@ -1845,12 +1894,6 @@ impl NetworkShard {
         backlog: TcpListenBacklog,
         hop_limit: u8,
     ) -> Result<(), TcpError> {
-        if !self.is_tcp_local_port_free(local_port) {
-            return Err(TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpListenStartFailed,
-            });
-        }
         let stack_socket = self
             .stack
             .open_tcp_listen(
@@ -2046,25 +2089,30 @@ impl NetworkShard {
         now: StackInstant,
     ) -> Result<TcpReadIntoProgress, TcpError> {
         let socket = self.tcp_socket(stream)?;
-        match self
+        let read = self
             .stack
             .tcp_read_into(socket, buffer, now)
             .map_err(|_| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpReceiveFailed,
-            })? {
-            TcpReadIntoState::Pending => Ok(TcpReadIntoProgress::Pending),
-            // The stack hands over nothing, though bytes are queued, only
-            // when the buffer reported no room: full, or its next page out.
-            TcpReadIntoState::Data(0) if buffer.awaits_page() => {
-                Ok(TcpReadIntoProgress::PageAbsent)
-            }
-            TcpReadIntoState::Data(bytes) => Ok(TcpReadIntoProgress::Data(bytes)),
-            TcpReadIntoState::Closed(close) => match tcp_close_error(close) {
-                Some(error) => Err(error),
-                None => Ok(TcpReadIntoProgress::Eof),
-            },
-        }
+            })?;
+        map_tcp_read_into_state(read, buffer)
+    }
+
+    pub(super) fn poll_tcp_peek_into(
+        &self,
+        stream: TcpStreamId,
+        buffer: &mut RegisteredTcpReadBuffer<'_>,
+    ) -> Result<TcpReadIntoProgress, TcpError> {
+        let socket = self.tcp_socket(stream)?;
+        let read = self
+            .stack
+            .tcp_peek_into(socket, buffer.written(), buffer)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpReceiveFailed,
+            })?;
+        map_tcp_read_into_state(read, buffer)
     }
 
     /// Retires `stream` and hands what is left of the connection to the
@@ -2147,6 +2195,23 @@ impl NetworkShard {
         self.tcp_listeners
             .iter()
             .all(|state| state.local_port != port)
+    }
+}
+
+fn map_tcp_read_into_state(
+    read: TcpReadIntoState,
+    buffer: &RegisteredTcpReadBuffer<'_>,
+) -> Result<TcpReadIntoProgress, TcpError> {
+    match read {
+        TcpReadIntoState::Pending => Ok(TcpReadIntoProgress::Pending),
+        // The stack hands over nothing, though bytes are queued, only
+        // when the buffer reported no room: full, or its next page out.
+        TcpReadIntoState::Data(0) if buffer.awaits_page() => Ok(TcpReadIntoProgress::PageAbsent),
+        TcpReadIntoState::Data(bytes) => Ok(TcpReadIntoProgress::Data(bytes)),
+        TcpReadIntoState::Closed(close) => match tcp_close_error(close) {
+            Some(error) => Err(error),
+            None => Ok(TcpReadIntoProgress::Eof),
+        },
     }
 }
 

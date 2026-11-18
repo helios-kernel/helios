@@ -607,6 +607,10 @@ impl ComponentNetworkService for BenchNetworkService {
         [2, 0, 0, 0, 0, 1]
     }
 
+    fn owns_ip_address(&self, _address: NetworkIpAddress) -> bool {
+        false
+    }
+
     fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
         core::future::ready(())
     }
@@ -746,6 +750,15 @@ impl ComponentNetworkService for BenchNetworkService {
         ))
     }
 
+    async fn tcp_peek_into<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> Result<TcpReadInto, TcpError> {
+        self.tcp_read_into(stream, buffer, timeout_nanos).await
+    }
+
     async fn tcp_shutdown_send(&self, _stream: Self::TcpStream) -> Result<(), TcpError> {
         Ok(())
     }
@@ -754,7 +767,11 @@ impl ComponentNetworkService for BenchNetworkService {
 
     fn tcp_listener_close(&self, _listener: Self::TcpListener) {}
 
-    async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
+    async fn udp_bind(
+        &self,
+        _local_address: NetworkIpAddress,
+        local_port: u16,
+    ) -> Result<UdpBinding<Self::UdpSocket>, UdpError> {
         Ok(UdpBinding {
             socket: 1,
             local_port,
@@ -790,6 +807,15 @@ impl ComponentNetworkService for BenchNetworkService {
         _timeout_nanos: u64,
     ) -> Result<Option<UdpDatagram>, UdpError> {
         Err(bench_udp_error())
+    }
+
+    async fn udp_peek(
+        &self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        self.udp_receive(socket, max_bytes, timeout_nanos).await
     }
 
     async fn udp_join_multicast_v4(

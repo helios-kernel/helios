@@ -466,6 +466,8 @@ pub enum NetworkErrorDetail {
     NetworkAuthorityMissing,
     #[error("privileged bind authority is required for this port")]
     PrivilegedBindDenied,
+    #[error("requested local address is not available")]
+    AddressNotAvailable,
     #[error("virtio network device advance failed")]
     VirtioAdvanceFailed,
     #[error("DNS servers are not configured")]
@@ -581,6 +583,7 @@ impl NetworkErrorDetail {
             Self::NetworkServiceUnavailable => "network service is unavailable",
             Self::NetworkAuthorityMissing => "network authority is missing required rights",
             Self::PrivilegedBindDenied => "privileged bind authority is required for this port",
+            Self::AddressNotAvailable => "requested local address is not available",
             Self::VirtioAdvanceFailed => "virtio network device advance failed",
             Self::DnsServersUnavailable => "DNS servers are not configured",
             Self::DnsQueryStartFailed => "DNS query could not be started",
@@ -643,6 +646,8 @@ pub struct UdpDatagram {
     pub address: NetworkIpAddress,
     pub port: u16,
     pub bytes: Bytes,
+    /// Full payload length of the datagram before truncation to the caller's buffer.
+    pub original_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -661,6 +666,17 @@ pub struct TcpListener<Listener> {
 pub enum NetworkIpAddress {
     Ipv4(Ipv4Address),
     Ipv6(helios_netstack::Ipv6Address),
+}
+
+impl NetworkIpAddress {
+    /// Whether this address is the wildcard (`0.0.0.0` or `::`).
+    #[must_use]
+    pub const fn is_unspecified(self) -> bool {
+        match self {
+            Self::Ipv4(address) => u32::from_be_bytes(address.octets()) == 0,
+            Self::Ipv6(address) => address.is_unspecified(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -834,6 +850,9 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     fn hardware_address(&self) -> [u8; 6];
 
+    /// Whether the stack currently owns `address` as a configured local address.
+    fn owns_ip_address(&self, address: NetworkIpAddress) -> bool;
+
     /// Asks the DHCP server whether the lease the interface holds is
     /// still good, after a machine restore may have moved the machine to
     /// another network. An interface that is not DHCP-configured does
@@ -951,6 +970,16 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<TcpReadInto, TcpError>> + Send + 'a;
 
+    /// Waits up to `timeout_nanos` for `stream` to have received bytes
+    /// and copies them into `buffer` without consuming them from the
+    /// stream's receive queue.
+    fn tcp_peek_into<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<TcpReadInto, TcpError>> + Send + 'a;
+
     fn tcp_shutdown_send(
         &self,
         stream: Self::TcpStream,
@@ -976,6 +1005,7 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     fn udp_bind(
         &self,
+        local_address: NetworkIpAddress,
         local_port: u16,
     ) -> impl Future<Output = Result<UdpBinding<Self::UdpSocket>, UdpError>> + Send + '_;
 
@@ -1010,6 +1040,15 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<u64, UdpError>> + Send + 'a;
 
     fn udp_receive<'a>(
+        &'a self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a;
+
+    /// Waits up to `timeout_nanos` for a datagram on `socket` and returns a
+    /// copy without removing it from the receive queue.
+    fn udp_peek<'a>(
         &'a self,
         socket: Self::UdpSocket,
         max_bytes: u32,
