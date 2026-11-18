@@ -67,7 +67,8 @@ pub fn component_host_worker_count(
     processor_count
 }
 
-pub fn component_host_kernel_processor_count(
+#[cfg(test)]
+pub(crate) fn component_host_kernel_processor_count(
     processor_count: usize,
     bootstrap_processor: ProcessorId,
 ) -> usize {
