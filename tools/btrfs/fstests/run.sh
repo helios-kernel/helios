@@ -12,7 +12,7 @@
 # Every entry of expunged.txt is `<test> # <one-line reason>`.
 #
 # Environment: HELIOS_FUSE_BTRFS (the fuse-btrfs binary, default
-# target/debug/examples/fuse-btrfs), HELIOS_FSTESTS_WORK (default target/fstests),
+# target/release/examples/fuse-btrfs), HELIOS_FSTESTS_WORK (default target/fstests),
 # HELIOS_FSTESTS_DEVICE_SIZE (default 10G), HELIOS_CRASH_SECONDS (see crash.sh).
 set -euo pipefail
 
@@ -23,8 +23,8 @@ root=$(cd "$here/../../.." && pwd)
 
 [[ $EUID -eq 0 ]] || die "run as root: it sets up loop devices, mounts and device-mapper targets"
 
-HELIOS_FUSE_BTRFS=${HELIOS_FUSE_BTRFS:-$root/target/debug/examples/fuse-btrfs}
-[[ -x "$HELIOS_FUSE_BTRFS" ]] || die "$HELIOS_FUSE_BTRFS is not an executable; build the fuse-btrfs example first"
+HELIOS_FUSE_BTRFS=${HELIOS_FUSE_BTRFS:-$root/target/release/examples/fuse-btrfs}
+[[ -x "$HELIOS_FUSE_BTRFS" ]] || die "$HELIOS_FUSE_BTRFS is not an executable; build the fuse-btrfs example with --release first"
 work=${HELIOS_FSTESTS_WORK:-$root/target/fstests}
 device_size=${HELIOS_FSTESTS_DEVICE_SIZE:-10G}
 # The log device records every write the crash workload makes.
@@ -36,7 +36,6 @@ mounts=/mnt/helios-fstests
 
 export HELIOS_FUSE_BTRFS
 export HELIOS_FUSE_BTRFS_LOG=$results/fuse-btrfs.log
-export HELIOS_FUSE_BTRFS_RUN_DIR=$work/run
 export HELIOS_FSTESTS_DIR=$fstests
 export HELIOS_FSTESTS_RESULTS=$results/fstests
 export HELIOS_FSTESTS_TEST_DIR=$mounts/test
@@ -50,13 +49,15 @@ cleanup() {
     set +e
     local mountpoint
     for mountpoint in "$HELIOS_FSTESTS_TEST_DIR" "$HELIOS_FSTESTS_SCRATCH_MNT" "$HELIOS_CRASH_MNT"; do
-        mountpoint -q "$mountpoint" && umount "$mountpoint"
+        while findmnt --mountpoint "$mountpoint" >/dev/null; do
+            umount "$mountpoint" || break
+        done
     done
     local loop
     for loop in "${loops[@]}"; do
         losetup --detach "$loop"
     done
-    rm -f /sbin/mount.fuse.helios-btrfs
+    rm -f /sbin/mount.fuse.helios-btrfs /sbin/umount.fuse
     chmod -R a+rX "$results"
 }
 
@@ -115,7 +116,11 @@ make_loop() {
 
 "$here/fetch.sh" "$fstests"
 
-mkdir -p "$results" "$HELIOS_FUSE_BTRFS_RUN_DIR" "$HELIOS_FSTESTS_RESULTS" \
+# umount(8) runs /sbin/umount.fuse for every plain FUSE mount, and the cleanup
+# removes the one this installs, so it must not replace one already there.
+[[ ! -e /sbin/umount.fuse ]] || die "/sbin/umount.fuse already exists; this installs its own and removes it afterwards"
+
+mkdir -p "$results" "$HELIOS_FSTESTS_RESULTS" \
     "$HELIOS_FSTESTS_TEST_DIR" "$HELIOS_FSTESTS_SCRATCH_MNT" "$HELIOS_CRASH_MNT"
 trap cleanup EXIT
 
@@ -133,6 +138,7 @@ mkfs.btrfs --force "$HELIOS_FSTESTS_TEST_DEV"
 mkfs.btrfs --force "$HELIOS_FSTESTS_SCRATCH_DEV"
 
 install --mode 0755 "$here/mount.fuse.helios-btrfs" /sbin/mount.fuse.helios-btrfs
+install --mode 0755 "$here/umount.fuse" /sbin/umount.fuse
 cp "$here/local.config" "$fstests/local.config"
 
 # The users and group fstests' README asks for; tests that need them are
@@ -161,8 +167,12 @@ check_status=0
 ((check_status == 0)) || failed+=("fstests ./check exited $check_status")
 
 echo "== btrfs check"
-mountpoint -q "$HELIOS_FSTESTS_TEST_DIR" && unmount_device "$HELIOS_FSTESTS_TEST_DIR" "$HELIOS_FSTESTS_TEST_DEV"
-mountpoint -q "$HELIOS_FSTESTS_SCRATCH_MNT" && unmount_device "$HELIOS_FSTESTS_SCRATCH_MNT" "$HELIOS_FSTESTS_SCRATCH_DEV"
+if findmnt --mountpoint "$HELIOS_FSTESTS_TEST_DIR" >/dev/null; then
+    umount "$HELIOS_FSTESTS_TEST_DIR"
+fi
+if findmnt --mountpoint "$HELIOS_FSTESTS_SCRATCH_MNT" >/dev/null; then
+    umount "$HELIOS_FSTESTS_SCRATCH_MNT"
+fi
 for device in "$HELIOS_FSTESTS_TEST_DEV" "$HELIOS_FSTESTS_SCRATCH_DEV"; do
     btrfs check --readonly "$device" || failed+=("btrfs check found damage on $device")
 done
