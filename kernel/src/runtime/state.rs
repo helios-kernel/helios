@@ -23,7 +23,7 @@ use spin::{Mutex, Once};
 use crate::memory::BalloonHandle;
 
 use crate::ComponentHostVsockService;
-use crate::component::{ComponentRuntimeState, ProviderSlot};
+use crate::component::{ComponentRuntimeState, PerProcessorProvider, ProviderSlot};
 use crate::device::DeviceGrantRegistry;
 use crate::network::HttpExchange;
 use crate::{AttachedStorage, BlockCache, BlockService, HostFileSystem, Storage};
@@ -57,10 +57,11 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// after each machine restore. Unseeded on a machine that carries no
     /// such clock, where wall time is uptime.
     wall_clock: crate::exec::WallClock,
-    /// Queue into the `http-client` kernel plugin. Empty on a kernel image
-    /// that does not provision the plugin, in which case the runtime adapter
-    /// answers a configuration error rather than trapping.
-    http_client: ProviderSlot<HttpExchange>,
+    /// Per-processor sharded queues into the `http-client` kernel plugin.
+    /// Empty on a kernel image that does not provision the plugin, in which
+    /// case the runtime adapter answers a configuration error rather than
+    /// trapping.
+    http_client: PerProcessorProvider<HttpExchange>,
     host_fs_service: Mutex<Option<StorageImpl::HostShare>>,
     /// The block cache over the machine's mount-source disks, once the
     /// kernel identified them. Empty on a machine with none, where a
@@ -348,7 +349,7 @@ where
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
                 wall_clock: crate::exec::WallClock::new(),
-                http_client: ProviderSlot::new(),
+                http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
                 mount_sources: Once::new(),
                 block_service: Once::new(),
@@ -849,13 +850,14 @@ where
         }
     }
 
-    /// The hand-off slot for the `http-client` kernel plugin.
+    /// The per-processor sharded hand-off slot for the `http-client` kernel
+    /// plugin.
     ///
-    /// The plugin supervisor installs the queue during startup; the runtime
-    /// adapter's HTTP client binding sends every exchange through it. The slot
-    /// stays empty when the plugin is not provisioned, which that binding
-    /// reports to the guest as a configuration error.
-    pub fn http_client(&self) -> &ProviderSlot<HttpExchange> {
+    /// Each online processor sends into its own cache-padded NUMA-local shard;
+    /// processor hot-unplug atomically redirects queued and future work to its
+    /// successor. The slot stays empty when the plugin is not provisioned,
+    /// which the adapter reports to the guest as a configuration error.
+    pub fn http_client(&self) -> &PerProcessorProvider<HttpExchange> {
         &self.inner.http_client
     }
 

@@ -32,8 +32,8 @@ pub use fs_path::{
     resolve_absolute_path, resolve_child_path, resolve_guest_path, strip_directory_prefix,
 };
 pub use provider::{
-    ProviderAlreadyInstalled, ProviderError, ProviderReceiver, ProviderSender, ProviderSlot,
-    provider_channel,
+    PerProcessorProvider, ProviderAlreadyInstalled, ProviderError, ProviderReceiver,
+    ProviderSender, ProviderSlot, provider_channel,
 };
 pub use resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
@@ -46,8 +46,8 @@ pub use retire::{
 };
 pub use runtime::{
     COMPONENT_ASYNC_STACK_SIZE, ComponentOutputMode, ComponentOutputRoute, ComponentOutputSink,
-    ComponentOutputStreamKind, ComponentRuntimeState, ComponentStoreData, DeadlinePollable,
-    InstanceKilled, LocalOutputSink, MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT,
+    ComponentOutputStreamKind, ComponentRuntimeState, ComponentStoreData, InstanceKilled,
+    LocalOutputSink, MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT,
     MAX_MEMORIES_PER_COMPONENT, MAX_POOLED_ADDRESS_SPACE, MAX_POOLED_USER_MEMORY,
     MAX_TABLES_PER_COMPONENT, TABLES_PER_INSTANCE, store_kernel_heap_bytes,
     wait_until_runtime_deadline,

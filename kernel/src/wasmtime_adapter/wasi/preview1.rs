@@ -75,6 +75,8 @@ pub(crate) const PREVIEW1_FUNCTIONS: &[&str] = &[
 pub(crate) mod errno {
     pub(crate) const SUCCESS: i32 = 0;
     pub(crate) const ACCES: i32 = 2;
+    /// `__WASI_ERRNO_ADDRNOTAVAIL`: address not available
+    pub(crate) const ADDRNOTAVAIL: i32 = 4;
     /// `__WASI_ERRNO_AFNOSUPPORT`: the address family is not supported
     /// by this socket, which is what an `AF_INET` socket must report for
     /// an `AF_INET6` peer address and vice versa.

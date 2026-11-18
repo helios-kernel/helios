@@ -61,7 +61,7 @@ use crate::wasmtime_adapter::bindings::compositor::bindings::{CompositorHost, ex
 use crate::wasmtime_adapter::component_host::{guest_memory, view_trap};
 use crate::{DeviceClassRights, ProcessAuthority, ProviderReceiver, provider_channel};
 use thiserror::Error;
-use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceAny, ResourceTable};
+use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceAny};
 
 /// Bootfs path of the plugin. Absent on a kernel image built without it,
 /// in which case `helios:system/surface` reports `unavailable`.
@@ -229,46 +229,23 @@ where
     let started_at = exec_context
         .runtime_state
         .uptime_nanos(exec_context.cpu.now().ticks());
-    let instance = exec_context.instance_registry.register_with_policy(
-        COMPOSITOR_PLUGIN_INSTANCE_NAME,
-        started_at,
-        crate::OomPolicy::KernelPlugin,
-    );
-    let instance_id = instance.id();
-
-    let payload = trusted_bootfs_payload(artifact);
-    let instance_pre = service.load_precompiled_component(
+    let instance_pre = load_kernel_plugin_instance_pre(
+        service,
         COMPOSITOR_PLUGIN_PATH,
-        payload,
+        artifact,
         exec_context.write_serial,
         started_at,
-        &phases::Timeline::disabled(),
     )?;
 
-    let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
-        &service.inner.engine,
-        StoreData::<CpuImpl, Net, StorageImpl>::new(
-            ResourceTable::new(),
-            exec_context.cpu.clone(),
-            exec_context.timer.clone(),
-            // A kernel plugin is kernel infrastructure: its tasks come
-            // out of the arena's kernel reserve, so user-mode load
-            // cannot starve the desktop.
-            exec_context
-                .spawner
-                .instance_spawner(crate::TaskFunding::Kernel, &instance),
-            exec_context.runtime_state.clone(),
-            exec_context.instance_registry.clone(),
-            instance,
-            None,
-            exec_context.runtime_state.root_namespace().descend(),
-            alloc::vec![String::from(COMPOSITOR_PLUGIN_PATH)],
-            Vec::new(),
-            compositor_authority(),
-            OutputMode::Serial,
-            exec_context.read_serial,
-            exec_context.write_serial,
-        ),
+    let (mut store, interrupts, instance_id) = open_kernel_plugin_store(
+        service,
+        exec_context,
+        KernelPluginSpec {
+            instance_name: COMPOSITOR_PLUGIN_INSTANCE_NAME,
+            bootfs_path: COMPOSITOR_PLUGIN_PATH,
+            authority: compositor_authority(),
+            started_at,
+        },
     );
 
     let turns = store.data().guest_turns();

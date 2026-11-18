@@ -190,9 +190,11 @@ maintainer's decision and the fork's revision moves once, per §1.
   startup, trusted for signed `cwasm` output.
 - The HTTP client is a kernel plugin (`programs/http-client`): the kernel
   implements `wasi:http/types` only and forwards `wasi:http/client.send`
-  through a typed provider slot to the plugin's `wasi:http/handler`; HTTP/1.1
-  framing, DNS and TLS run in user memory. The provider slot is the
-  route for any future interface a plugin serves.
+  through a cache-padded, NUMA-local `PerProcessorProvider` shard to that
+  core's lazy plugin `wasi:http/handler`; HTTP/1.1 framing, DNS and TLS run in
+  user memory, synchronized with `ProcessorStep` CPU hotplug so departing cores
+  drain/redirect work to their successor. `ProviderSlot` remains the route for
+  singleton plugins with exclusive hardware ownership (such as `compositor`).
 - Plugins share the user-memory and allocation contract of every program.
   There is no plugin-private allocator policy, memory floor, or oversized
   linker memory. A plugin may fail with a typed OOM result and be discarded
@@ -499,6 +501,10 @@ does.
 
 ## 6. WASI tooling
 
+- WASI 0.3 is the kernel's first-class ABI. Programs, tools and host
+  interfaces use 0.3 wherever it covers the need. Preview 1 and WASIX
+  are supported for programs built against them; Preview 2 is not a
+  supported ABI.
 - `tools/wasi-apps/build.sh` is the single entry point that stages the WASI
   shared-fs tooling: it downloads the official CPython WASI build into
   `artifacts/python3-root/` (`python3.wasm` plus the standard library) and

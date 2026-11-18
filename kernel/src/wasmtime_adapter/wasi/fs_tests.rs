@@ -2164,7 +2164,6 @@ fn memory_host_store_data() -> (
 
 #[test]
 fn open_at_refuses_create_directory_before_host_mutation() {
-    use super::preview2::p2fs;
     use crate::wasmtime_adapter::component_host::service::test_store;
 
     let namespace = namespace_with_host();
@@ -2178,28 +2177,8 @@ fn open_at_refuses_create_directory_before_host_mutation() {
     );
     assert!(matches!(refused, Err(fs_types::ErrorCode::Invalid)));
 
-    // Both preview2 and p3 share the same validation and refuse before reaching the host.
     let mut store = test_store::store_data_with(|_| {});
     mount_unreachable_host(store.filesystem(), "/mnt");
-    let p2_base = store
-        .table
-        .push(directory_holding("/mnt/a", root().flags))
-        .expect("p2 base must fit");
-    let p2_prepared =
-        <wasmtime::component::HasSelf<_> as p2fs::HostDescriptorWithStore<()>>::prepare_open_at(
-            &mut &mut store,
-            p2_base,
-            p2fs::PathFlags::empty(),
-            "newdir",
-            p2fs::OpenFlags::CREATE | p2fs::OpenFlags::DIRECTORY,
-            p2fs::DescriptorFlags::READ,
-        )
-        .expect("prepare_open_at must not trap");
-    assert!(matches!(
-        block_on(super::fs::execute_open(p2_prepared)),
-        Err(fs_types::ErrorCode::Invalid)
-    ));
-
     let p3_base = store
         .table
         .push(directory_holding("/mnt/a", root().flags))
@@ -2220,8 +2199,7 @@ fn open_at_refuses_create_directory_before_host_mutation() {
 }
 
 #[test]
-fn preview2_and_p3_open_at_validate_all_open_flags_on_embedded_and_host_share() {
-    use super::preview2::p2fs;
+fn p3_open_at_validates_all_open_flags_on_embedded_and_host_share() {
     use helios_hal::fs::FileSystem as _;
 
     let (mut store, host_fs) = memory_host_store_data();
@@ -2266,25 +2244,7 @@ fn preview2_and_p3_open_at_validate_all_open_flags_on_embedded_and_host_share() 
     assert_eq!(read_all(&root_ns, &emb_file), b"payload");
 
     for base_path in ["/emb", "/host"] {
-        let base_p2 = store
-            .table
-            .push(directory_holding(base_path, root().flags))
-            .expect("base fits");
-        // CREATE | EXCLUSIVE on existing file -> Exist (in preview2 and p3).
-        let p2_excl = <wasmtime::component::HasSelf<_> as p2fs::HostDescriptorWithStore<()>>::prepare_open_at(
-            &mut &mut store,
-            base_p2,
-            p2fs::PathFlags::empty(),
-            "existing.txt",
-            p2fs::OpenFlags::CREATE | p2fs::OpenFlags::EXCLUSIVE,
-            p2fs::DescriptorFlags::READ,
-        )
-        .expect("prepare");
-        assert!(matches!(
-            block_on(super::fs::execute_open(p2_excl)),
-            Err(fs_types::ErrorCode::Exist)
-        ));
-
+        // CREATE | EXCLUSIVE on existing file -> Exist.
         let base_p3 = store
             .table
             .push(directory_holding(base_path, root().flags))
@@ -2303,24 +2263,24 @@ fn preview2_and_p3_open_at_validate_all_open_flags_on_embedded_and_host_share() 
             Err(fs_types::ErrorCode::Exist)
         ));
 
-        // DIRECTORY on a regular file -> NotDirectory (in preview2 and p3).
-        let base_p2 = store
+        // DIRECTORY on a regular file -> NotDirectory.
+        let base_p3 = store
             .table
             .push(directory_holding(base_path, root().flags))
             .expect("base fits");
-        let p2_dir_on_file = <wasmtime::component::HasSelf<_> as p2fs::HostDescriptorWithStore<
+        let p3_dir_on_file = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<
             (),
         >>::prepare_open_at(
             &mut &mut store,
-            base_p2,
-            p2fs::PathFlags::empty(),
+            base_p3,
+            fs_types::PathFlags::empty(),
             "existing.txt",
-            p2fs::OpenFlags::DIRECTORY,
-            p2fs::DescriptorFlags::READ,
+            fs_types::OpenFlags::DIRECTORY,
+            fs_types::DescriptorFlags::READ,
         )
         .expect("prepare");
         assert!(matches!(
-            block_on(super::fs::execute_open(p2_dir_on_file)),
+            block_on(super::fs::execute_open(p3_dir_on_file)),
             Err(fs_types::ErrorCode::NotDirectory)
         ));
 
@@ -2345,21 +2305,21 @@ fn preview2_and_p3_open_at_validate_all_open_flags_on_embedded_and_host_share() 
             FsNodeKind::Directory
         );
 
-        let base_p2 = store
+        let base_p3 = store
             .table
             .push(directory_holding(base_path, root().flags))
             .expect("base fits");
-        let p2_no_dir = <wasmtime::component::HasSelf<_> as p2fs::HostDescriptorWithStore<()>>::prepare_open_at(
+        let p3_no_dir = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<()>>::prepare_open_at(
             &mut &mut store,
-            base_p2,
-            p2fs::PathFlags::empty(),
+            base_p3,
+            fs_types::PathFlags::empty(),
             "subdir",
-            p2fs::OpenFlags::empty(),
-            p2fs::DescriptorFlags::READ,
+            fs_types::OpenFlags::empty(),
+            fs_types::DescriptorFlags::READ,
         )
         .expect("prepare");
         assert!(matches!(
-            block_on(super::fs::execute_open(p2_no_dir)),
+            block_on(super::fs::execute_open(p3_no_dir)),
             Err(fs_types::ErrorCode::IsDirectory)
         ));
 
@@ -2391,38 +2351,40 @@ fn preview2_and_p3_open_at_validate_all_open_flags_on_embedded_and_host_share() 
         ));
 
         // TRUNCATE on regular file truncates to 0; on directory -> IsDirectory.
-        let base_p2 = store
+        let base_p3 = store
             .table
             .push(directory_holding(base_path, root().flags))
             .expect("base fits");
-        let p2_trunc_dir = <wasmtime::component::HasSelf<_> as p2fs::HostDescriptorWithStore<()>>::prepare_open_at(
+        let p3_trunc_dir = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<
+            (),
+        >>::prepare_open_at(
             &mut &mut store,
-            base_p2,
-            p2fs::PathFlags::empty(),
+            base_p3,
+            fs_types::PathFlags::empty(),
             "subdir",
-            p2fs::OpenFlags::DIRECTORY | p2fs::OpenFlags::TRUNCATE,
-            p2fs::DescriptorFlags::READ,
+            fs_types::OpenFlags::DIRECTORY | fs_types::OpenFlags::TRUNCATE,
+            fs_types::DescriptorFlags::READ,
         )
         .expect("prepare");
         assert!(matches!(
-            block_on(super::fs::execute_open(p2_trunc_dir)),
+            block_on(super::fs::execute_open(p3_trunc_dir)),
             Err(fs_types::ErrorCode::IsDirectory)
         ));
 
-        let base_p2 = store
+        let base_p3 = store
             .table
             .push(directory_holding(base_path, root().flags))
             .expect("base fits");
-        let p2_trunc = <wasmtime::component::HasSelf<_> as p2fs::HostDescriptorWithStore<()>>::prepare_open_at(
+        let p3_trunc = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<()>>::prepare_open_at(
             &mut &mut store,
-            base_p2,
-            p2fs::PathFlags::empty(),
+            base_p3,
+            fs_types::PathFlags::empty(),
             "existing.txt",
-            p2fs::OpenFlags::TRUNCATE,
-            p2fs::DescriptorFlags::READ,
+            fs_types::OpenFlags::TRUNCATE,
+            fs_types::DescriptorFlags::READ,
         )
         .expect("prepare");
-        let truncated = block_on(super::fs::execute_open(p2_trunc)).expect("truncate succeeds");
+        let truncated = block_on(super::fs::execute_open(p3_trunc)).expect("truncate succeeds");
         assert_eq!(
             block_on(read(store.filesystem(), held(&truncated), 0, 64))
                 .expect("read truncated")
@@ -2434,7 +2396,6 @@ fn preview2_and_p3_open_at_validate_all_open_flags_on_embedded_and_host_share() 
 
 #[test]
 fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_set_times() {
-    use super::preview2::p2fs;
     use helios_hal::fs::{FileSystem as _, FilledWrite as _, PreparedWrite as _};
 
     let (mut store, host_fs) = memory_host_store_data();
@@ -2618,25 +2579,26 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
         assert_eq!(opened_dir.kind, FsNodeKind::Directory);
 
         // set-times-at without SYMLINK_FOLLOW updates the link itself; with SYMLINK_FOLLOW updates target.
-        // Exercise both preview2 and p3 prepare_set_times_at entry points.
-        let base_p2 = store.table.push(base.clone()).expect("base fits");
-        let p2_nofollow = <wasmtime::component::HasSelf<_> as p2fs::HostDescriptorWithStore<()>>::prepare_set_times_at(
+        let base_p3 = store.table.push(base.clone()).expect("base fits");
+        let p3_nofollow = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<
+            (),
+        >>::prepare_set_times_at(
             &mut &mut store,
-            base_p2,
-            p2fs::PathFlags::empty(),
+            base_p3,
+            fs_types::PathFlags::empty(),
             "file-link",
-            p2fs::NewTimestamp::Timestamp(p2fs::Datetime {
+            fs_types::NewTimestamp::Timestamp(fs_types::Instant {
                 seconds: 1,
                 nanoseconds: 111,
             }),
-            p2fs::NewTimestamp::Timestamp(p2fs::Datetime {
+            fs_types::NewTimestamp::Timestamp(fs_types::Instant {
                 seconds: 2,
                 nanoseconds: 222,
             }),
         )
         .expect("prepare")
         .expect("prepared");
-        block_on(p2_nofollow.execute()).expect("p2 set-times-at nofollow succeeds");
+        block_on(p3_nofollow.execute()).expect("p3 set-times-at nofollow succeeds");
 
         let link_meta = block_on(stat_at(
             store.filesystem(),
