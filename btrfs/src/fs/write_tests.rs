@@ -21,7 +21,7 @@ use helios_hal::io::{IoError, IoResult};
 use super::Filesystem;
 use crate::source::BlockSource;
 #[cfg(feature = "write")]
-use crate::transaction::file::WriteOptions;
+use crate::transaction::file::{DEFAULT_MAX_INLINE, WriteOptions};
 use crate::tree::edit::{Header, Leaf};
 use crate::tree::write::{MetadataAllocator, Trees, WriteError};
 use crate::tree::{Expected, Node, TreeRoot};
@@ -489,6 +489,7 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
                     when,
                     concurrency,
                     encoder: &mut encoder,
+                    max_inline: DEFAULT_MAX_INLINE,
                 },
             )
             .await
@@ -496,7 +497,12 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
     }
     let tail = ids["tail"];
     tx.edits()
-        .truncate_file(tail.tree, tail.inode, 17, when, concurrency)
+        .truncate_file(
+            tail.tree,
+            tail.inode,
+            17,
+            WriteOptions::plain(when, concurrency),
+        )
         .await
         .unwrap();
     expected.get_mut("tail").unwrap().truncate(17);
@@ -527,8 +533,7 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
                     destination_offset,
                     length,
                 },
-                when,
-                concurrency,
+                WriteOptions::plain(when, concurrency),
             )
             .await
             .unwrap_err();
@@ -561,8 +566,7 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
                     destination_offset: destination_offset as u64,
                     length: length as u64,
                 },
-                when,
-                concurrency,
+                WriteOptions::plain(when, concurrency),
             )
             .await
             .unwrap();
@@ -1272,7 +1276,8 @@ async fn exercise_file_writes<E: crate::compress::write::Encoder>(
                         WriteOptions {
                             when,
                             concurrency,
-                            encoder: &mut encoder
+                            encoder: &mut encoder,
+                            max_inline: DEFAULT_MAX_INLINE,
                         }
                     )
                     .await
@@ -1373,7 +1378,12 @@ async fn exercise_file_writes<E: crate::compress::write::Encoder>(
         let mut transaction = writer.join().await.unwrap();
         let edits = transaction.edits();
         edits
-            .truncate_file(inode.tree(), inode.number(), size as u64, when, concurrency)
+            .truncate_file(
+                inode.tree(),
+                inode.number(),
+                size as u64,
+                WriteOptions::plain(when, concurrency),
+            )
             .await
             .unwrap();
         expected.resize(size, 0);
@@ -1747,7 +1757,10 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
             tx,
             tx.write_file(file, 0, b"replace", WriteOptions::plain(when, concurrency))
         );
-        refused!(tx, tx.truncate_file(file, 0, when, concurrency));
+        refused!(
+            tx,
+            tx.truncate_file(file, 0, WriteOptions::plain(when, concurrency))
+        );
         refused!(tx, tx.set_times(file, Some(when), None, when));
         refused!(tx, tx.set_permissions(file, 0o600, when));
         refused!(tx, tx.set_owner(file, Some(1), Some(2), when));
@@ -1775,8 +1788,7 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
                     destination_offset: 0,
                     length: initial.len() as u64
                 },
-                when,
-                concurrency
+                WriteOptions::plain(when, concurrency)
             )
         );
     }
@@ -1852,8 +1864,7 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
             destination_offset: 0,
             length: initial.len() as u64,
         },
-        when,
-        concurrency,
+        WriteOptions::plain(when, concurrency),
     )
     .await
     .unwrap();
@@ -2039,9 +2050,19 @@ fn a_policy_compresses_only_inodes_that_linux_would_compress() {
             }
             for (_, file) in &files {
                 assert_eq!(
-                    tx.write_file_with_policy(file, 0, &data, when, concurrency, &mut compressor)
-                        .await
-                        .unwrap(),
+                    tx.write_file_with_policy(
+                        file,
+                        0,
+                        &data,
+                        super::writer::MountPolicy {
+                            when,
+                            concurrency,
+                            compressor: &mut compressor,
+                            max_inline: DEFAULT_MAX_INLINE,
+                        },
+                    )
+                    .await
+                    .unwrap(),
                     data.len()
                 );
             }
@@ -2166,8 +2187,7 @@ fn reflink_from_readonly_subvolume_preserves_source() {
                 destination_offset: 0,
                 length: contents.len() as u64,
             },
-            when,
-            concurrency,
+            WriteOptions::plain(when, concurrency),
         )
         .await
         .unwrap();
@@ -2277,7 +2297,10 @@ fn owned_mutations_preserve_readonly_subvolumes() {
                 WriteOptions::plain(when, concurrency)
             )
         );
-        refused!(tx, tx.truncate_file(&file, 0, when, concurrency));
+        refused!(
+            tx,
+            tx.truncate_file(&file, 0, WriteOptions::plain(when, concurrency))
+        );
         refused!(tx, tx.set_times(&file, Some(when), Some(when), when));
         refused!(tx, tx.create_file(name(b"new"), attributes(), when));
         refused!(tx, tx.hard_link(name(b"alias"), &file, when));
@@ -2297,8 +2320,7 @@ fn owned_mutations_preserve_readonly_subvolumes() {
                     destination_offset: 4096,
                     length: contents.len() as u64,
                 },
-                when,
-                concurrency
+                WriteOptions::plain(when, concurrency)
             )
         );
         let tx = writer.join().await.unwrap();
@@ -2533,7 +2555,7 @@ fn owned_mutations_commit_as_one_generation() {
             .await
             .unwrap();
         assert_eq!(count, bytes.len());
-        tx.truncate_file(&source, 8192, when, concurrency)
+        tx.truncate_file(&source, 8192, WriteOptions::plain(when, concurrency))
             .await
             .unwrap();
         let destination = tx
@@ -2548,8 +2570,7 @@ fn owned_mutations_commit_as_one_generation() {
                 destination_offset: 0,
                 length: 8192,
             },
-            when,
-            concurrency,
+            WriteOptions::plain(when, concurrency),
         )
         .await
         .unwrap();
@@ -3398,6 +3419,7 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                     when,
                     concurrency,
                     encoder: Zstd::new(3).unwrap(),
+                    max_inline: DEFAULT_MAX_INLINE,
                 },
             )
             .await
@@ -3432,8 +3454,7 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                     destination_offset: 0,
                     length: 131_072,
                 },
-                when,
-                concurrency,
+                WriteOptions::plain(when, concurrency),
             )
             .await
             .unwrap();
@@ -3467,7 +3488,7 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                 .unwrap()
                 .unwrap();
             let clone = tx.lookup(&directory, b"clone.bin").await.unwrap().unwrap();
-            tx.truncate_file(&clone, 4096, when, concurrency)
+            tx.truncate_file(&clone, 4096, WriteOptions::plain(when, concurrency))
                 .await
                 .unwrap();
             tx.unlink_name(
@@ -3505,6 +3526,7 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                     when,
                     concurrency,
                     encoder: Plain,
+                    max_inline: DEFAULT_MAX_INLINE,
                 },
             )
             .await
@@ -4030,7 +4052,7 @@ fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sec
         assert!(tx.edits().space.largest_free(DATA) < PIECE as u64);
         // Free every second piece: the free ranges are now 64 KiB holes and
         // the device has no room for another chunk.
-        tx.truncate_file(&freed, 0, when, concurrency)
+        tx.truncate_file(&freed, 0, WriteOptions::plain(when, concurrency))
             .await
             .unwrap();
         assert_eq!(tx.edits().space.largest_free(DATA), PIECE as u64);
@@ -6529,7 +6551,7 @@ fn a_view_keeps_released_private_data_from_reuse_until_it_is_dropped() {
             let mut tx = writer.join().await.unwrap();
             let root = tx.root().await.unwrap();
             let file = tx.lookup(&root, name).await.unwrap().unwrap();
-            tx.truncate_file(&file, 0, RUNNING_WHEN, concurrency)
+            tx.truncate_file(&file, 0, WriteOptions::plain(RUNNING_WHEN, concurrency))
                 .await
                 .unwrap();
             tx.edits().space.held_data_bytes()
@@ -6692,10 +6714,11 @@ fn a_full_device_refuses_mutations_and_the_writer_keeps_committing() {
         }
         tx.commit().await.unwrap();
 
-        // Small files go inline, into metadata, until it has no room left.
+        // Small files go inline, into metadata, until it has no room left:
+        // 62 copies of 33 bytes stay within Linux's default `max_inline`.
         let contents = |index: usize| {
             alloc::format!("{index:05} 文件 ファイル 파일 ")
-                .repeat(64)
+                .repeat(62)
                 .into_bytes()
         };
         let name = |index: usize| alloc::format!("小-小さい-작은-{index:05}");
