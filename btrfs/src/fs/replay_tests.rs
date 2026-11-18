@@ -205,6 +205,14 @@ async fn committed_extent(fs: &Filesystem<Disk>, inode: u64, offset: u64) -> Raw
     )
     .await
     .unwrap();
+    assert_eq!(
+        RawFileExtentHead::ref_from_prefix(&bytes)
+            .unwrap()
+            .0
+            .extent_type,
+        1,
+        "expected a regular extent"
+    );
     *RawFileExtentBody::ref_from_prefix(&bytes[size_of::<RawFileExtentHead>()..])
         .unwrap()
         .0
@@ -695,9 +703,9 @@ async fn links(check: bool) {
         let mut tx = writer.join().await.unwrap();
         let edits = tx.edits();
         let dir = create(edits, tree, root, "目录", None).await;
-        let removed = create(edits, tree, dir, "删除.txt", Some(&pattern(SECTOR, 1))).await;
+        let removed = create(edits, tree, dir, "删除.txt", Some(&pattern(2 * SECTOR, 1))).await;
         let kept = create(edits, tree, dir, "保留.txt", Some(b"kept")).await;
-        let original = create(edits, tree, root, "原本.txt", Some(&pattern(SECTOR, 2))).await;
+        let original = create(edits, tree, root, "原本.txt", Some(&pattern(2 * SECTOR, 2))).await;
         (dir, removed, kept, original)
     };
     writer.commit().await.unwrap();
@@ -773,7 +781,7 @@ async fn directories(check: bool) {
         let edits = tx.edits();
         let parent = create(edits, tree, root, "父", None).await;
         let child = create(edits, tree, parent, "子目录", None).await;
-        create(edits, tree, child, "孫.txt", Some(&pattern(SECTOR, 4))).await;
+        create(edits, tree, child, "孫.txt", Some(&pattern(2 * SECTOR, 4))).await;
         create(edits, tree, parent, "空", None).await;
         (parent, [child, child + 1, child + 2])
     };
@@ -826,7 +834,7 @@ async fn extents(check: bool) {
     let (tree, root) = root_of(&writer).await;
     let (old, small_old, long_old) = (
         pattern(3 * SECTOR, 11),
-        pattern(SECTOR, 12),
+        pattern(2 * SECTOR, 12),
         pattern(3 * SECTOR, 13),
     );
     let (split, small, truncated) = {
@@ -1090,7 +1098,7 @@ async fn entries(check: bool) {
         let edits = tx.edits();
         let shelf = create(edits, tree, root, "书架", None).await;
         let linked = create(edits, tree, root, "本.txt", Some(b"book")).await;
-        let replaced = create(edits, tree, shelf, "棚.txt", Some(&pattern(SECTOR, 6))).await;
+        let replaced = create(edits, tree, shelf, "棚.txt", Some(&pattern(2 * SECTOR, 6))).await;
         let extended = create(edits, tree, root, "확장.txt", Some(b"ext")).await;
         (shelf, linked, replaced, extended)
     };
