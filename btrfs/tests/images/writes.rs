@@ -618,6 +618,8 @@ fn exercise_inline_limits(image: SparseImage) -> std::sync::Arc<WritableImage> {
         .await
         .unwrap();
         let nodesize = u64::from(writer.snapshot().unwrap().superblock().nodesize());
+        // `BTRFS_MAX_INLINE_DATA_SIZE` (`fs/btrfs/ctree.h`): `nodesize` minus
+        // `btrfs_header` (101) + `btrfs_item` (25) + inline `btrfs_file_extent_item` header (21).
         let max_node_inline = (SECTOR - 1).min(nodesize - 147);
         let mut encoder = Zstd::new(3).unwrap();
         let mut expected: BTreeMap<&str, (Vec<u8>, Option<Option<Compression>>)> = BTreeMap::new();
