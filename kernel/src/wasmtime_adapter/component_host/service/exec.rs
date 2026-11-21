@@ -30,6 +30,7 @@ pub(super) struct CoreModuleRestore<Net: ComponentHostNetwork> {
     pub(super) memory_spec: SharedMemorySpec,
     pub(super) descriptors: Preview1DescriptorTable<Net>,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
+    pub(super) signal_callback: Option<Arc<str>>,
     pub(super) rewind: WasixRewind,
 }
 
@@ -201,6 +202,39 @@ impl<Net: ComponentHostNetwork> WasixAsyncifyState<Net> {
             rewind_value: None,
             process_snapshot_rewinding: false,
         }
+    }
+
+    /// True when the guest is neither unwinding out of Wasm nor rewinding back
+    /// to a checkpointed host call, so invoking a `callback_signal` export is
+    /// safe.
+    pub(super) const fn is_idle(&self) -> bool {
+        matches!(self.phase, WasixAsyncifyPhase::Idle)
+            && self.rewind_value.is_none()
+            && !self.process_snapshot_rewinding
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AsyncifyOutcome {
+    Idle,
+    Rewinding,
+}
+
+#[derive(Debug)]
+pub(super) enum AsyncifyError {
+    /// A stop or runtime trap (`WasixThreadEnded`, `WasixThreadSignalExit`,
+    /// `Preview1SignalExit`, `InstanceKilled`, `Trap`, `SwapFaultError`) met
+    /// during an asyncify turn or helper call, classified identically to an
+    /// error returned directly by the guest's entry point.
+    GuestStop(wasmtime::Error),
+    /// A structural binary or launch failure (`StackBoundsInvalid`,
+    /// `UnwindExportInvalid`, `OutOfMemory` spawning a fork child).
+    Exec(ProgramExecError),
+}
+
+impl From<ProgramExecError> for AsyncifyError {
+    fn from(error: ProgramExecError) -> Self {
+        Self::Exec(error)
     }
 }
 
@@ -559,6 +593,7 @@ where
                 None => return Err(map_program_runtime_error(error)),
             },
         };
+        store.data_mut().guest_instance = Some(instance);
         super::emit_program_stage_marker(write_serial, "program:instantiate-core-ok");
         timeline.record(&run_cpu, LaunchPhase::Instantiate);
 
@@ -570,7 +605,6 @@ where
         let completion = run_core_module_image(
             &mut store,
             &interrupts,
-            &instance,
             start,
             CoreModuleImageRun {
                 spawner: &spawner,
@@ -695,6 +729,10 @@ where
                 threads.clone(),
             ),
         );
+        store
+            .data()
+            .process_signals
+            .set_callback(restore.signal_callback);
         let interrupts = configure_preview1_program_store(&mut store);
         record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare-rewind");
         timeline.record(&run_cpu, LaunchPhase::StorePrepare);
@@ -747,11 +785,28 @@ where
                 None => return Err(map_program_runtime_error(error)),
             },
         };
+        store.data_mut().guest_instance = Some(instance);
         timeline.record(&run_cpu, LaunchPhase::Instantiate);
         super::emit_program_stage_marker(write_serial, "program:instantiate-core-ok");
 
         let rewind_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
-        wasix_begin_rewind(&mut store, &interrupts, &instance, restore.rewind).await?;
+        if let Err(error) = wasix_begin_rewind(&mut store, &interrupts, restore.rewind).await {
+            let termination = match error {
+                AsyncifyError::GuestStop(stop) => store.data_mut().take_process_end(stop)?,
+                AsyncifyError::Exec(exec) => return Err(exec),
+            };
+            return Ok(CoreModuleImageEnd {
+                completion: CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                    instance_id,
+                    termination,
+                    filesystem: Some(store.data().filesystem.root_layer()),
+                })),
+                store_teardown_profile: start_program_kernel_profile(
+                    &profile_runtime_state,
+                    &run_cpu,
+                ),
+            });
+        }
         record_program_kernel_profile_sample(rewind_profile, "core-begin-rewind");
 
         let resolve_start_profile = start_program_kernel_profile(&profile_runtime_state, &run_cpu);
@@ -762,7 +817,6 @@ where
         let completion = run_core_module_image(
             &mut store,
             &interrupts,
-            &instance,
             start,
             CoreModuleImageRun {
                 spawner: &spawner,
@@ -854,7 +908,6 @@ where
 async fn run_core_module_image<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
     start: wasmtime::TypedFunc<(), ()>,
     run: CoreModuleImageRun<'_, CpuImpl, Net, StorageImpl>,
 ) -> Result<CoreModuleRunCompletion<CpuImpl, Net, StorageImpl>, ProgramExecError>
@@ -883,19 +936,15 @@ where
         let result = interrupts
             .drive(turns.drive(start.call_async(&mut *store, ())))
             .await;
-        // A spawned thread ended the process: no unwind is completed.
-        if result.as_ref().is_err_and(WasixThreadEnded::is) {
+        if result.is_err() {
+            store.data_mut().asyncify.phase = WasixAsyncifyPhase::Idle;
             break result;
         }
-        match handle_wasix_asyncify_completion(store, interrupts, instance).await {
-            Ok(true) => continue,
-            Ok(false) => break result,
-            // A spawned thread ended the process while main was between
-            // an unwind and its rewind; the rewind's call met the end.
-            Err(_) if store.data().thread_signals.thread_ended() => {
-                break Err(wasmtime::Error::new(WasixThreadEnded));
-            }
-            Err(error) => return Err(error),
+        match finish_wasix_guest_call(store, interrupts).await {
+            Ok(AsyncifyOutcome::Rewinding) => continue,
+            Ok(AsyncifyOutcome::Idle) => break Ok(()),
+            Err(AsyncifyError::GuestStop(error)) => break Err(error),
+            Err(AsyncifyError::Exec(error)) => return Err(error),
         }
     };
     run.timeline.record(run.cpu, LaunchPhase::GuestEnd);
@@ -1250,11 +1299,61 @@ where
     })
 }
 
+async fn in_wasix_guest_turn<CpuImpl, RuntimeStateImpl, Epilogue, Value>(
+    turns: crate::component::GuestTurns<CpuImpl, RuntimeStateImpl, Epilogue>,
+    access: impl Future<Output = Result<Value, GuestAccessError>>,
+) -> Result<Value, AsyncifyError>
+where
+    CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: crate::ComponentRuntimeState,
+    Epilogue: crate::component::TurnEpilogue<RuntimeStateImpl, wasmtime::Error>,
+{
+    let driven = turns
+        .drive(async { Ok::<_, wasmtime::Error>(access.await) })
+        .await
+        .map_err(AsyncifyError::GuestStop)?;
+    driven.map_err(|error| match error {
+        GuestAccessError::OutOfBounds => AsyncifyError::Exec(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
+        }),
+        GuestAccessError::Swap(error) => AsyncifyError::GuestStop(wasmtime::Error::new(error)),
+    })
+}
+
+/// Completes any asyncify transition left by a guest entry point, then
+/// delivers pending signals when idle. If a post-return signal handler itself
+/// starts an asyncify unwind (such as `stack_restore`), loops so that unwind
+/// is processed through [`handle_wasix_asyncify_completion`] before rewinding
+/// back into the entry point.
+pub(super) async fn finish_wasix_guest_call<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
+) -> Result<AsyncifyOutcome, AsyncifyError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    loop {
+        match handle_wasix_asyncify_completion(store, interrupts).await? {
+            AsyncifyOutcome::Rewinding => return Ok(AsyncifyOutcome::Rewinding),
+            AsyncifyOutcome::Idle => {
+                wasix_deliver_pending_signals_on_store(store, interrupts)
+                    .await
+                    .map_err(AsyncifyError::GuestStop)?;
+                if matches!(store.data().asyncify.phase, WasixAsyncifyPhase::Idle) {
+                    return Ok(AsyncifyOutcome::Idle);
+                }
+            }
+        }
+    }
+}
+
 pub(super) async fn handle_wasix_asyncify_completion<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
-) -> Result<bool, ProgramExecError>
+) -> Result<AsyncifyOutcome, AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1265,7 +1364,7 @@ where
         WasixAsyncifyPhase::Idle,
     );
     match phase {
-        WasixAsyncifyPhase::Idle => Ok(false),
+        WasixAsyncifyPhase::Idle => Ok(AsyncifyOutcome::Idle),
         WasixAsyncifyPhase::Capturing {
             snapshot,
             ret_value,
@@ -1275,15 +1374,10 @@ where
             mut memory_stack,
             stack_pointer,
         } => {
-            let rewind_stack = wasix_read_unwound_stack(
-                store,
-                instance,
-                stack_lower,
-                unwind_stack_begin,
-                stack_pointer,
-            )
-            .await?;
-            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
+            let rewind_stack =
+                wasix_read_unwound_stack(store, stack_lower, unwind_stack_begin, stack_pointer)
+                    .await?;
+            wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
 
             let hash = wasix_next_stack_hash(store);
             let snapshot_bytes = wasix_stack_snapshot_bytes(ret_value, hash);
@@ -1300,8 +1394,8 @@ where
                     memory_stack[offset..end].copy_from_slice(&snapshot_bytes);
                 }
             } else {
-                let memory = Preview1AsyncMemory::of_instance(store, instance)?;
-                in_guest_turn(
+                let memory = Preview1AsyncMemory::of_store(store)?;
+                in_wasix_guest_turn(
                     store.data().guest_turns(),
                     memory.write_bytes(GuestAddress::wasm32(snapshot), &snapshot_bytes),
                 )
@@ -1321,7 +1415,6 @@ where
             wasix_begin_rewind(
                 store,
                 interrupts,
-                instance,
                 WasixRewind {
                     stack_lower,
                     stack_upper,
@@ -1332,14 +1425,14 @@ where
                 },
             )
             .await?;
-            Ok(true)
+            Ok(AsyncifyOutcome::Rewinding)
         }
         WasixAsyncifyPhase::Restoring {
             hash,
             value,
             stack_lower,
         } => {
-            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
+            wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
             let snapshot = store
                 .data()
                 .asyncify
@@ -1351,11 +1444,10 @@ where
                     kind: ProgramExecErrorKind::InvalidBinary,
                     detail: ProgramExecErrorDetail::StackSnapshotMissing,
                 })?;
-            let stack_upper = wasix_global_u32_from_instance(store, instance, "__heap_base")?;
+            let stack_upper = wasix_global_u32_from_store(store, "__heap_base")?;
             wasix_begin_rewind(
                 store,
                 interrupts,
-                instance,
                 WasixRewind {
                     stack_lower,
                     stack_upper,
@@ -1366,7 +1458,7 @@ where
                 },
             )
             .await?;
-            Ok(true)
+            Ok(AsyncifyOutcome::Rewinding)
         }
         WasixAsyncifyPhase::Forking {
             ret_pid,
@@ -1376,15 +1468,10 @@ where
             mut memory_stack,
             stack_pointer,
         } => {
-            let rewind_stack = wasix_read_unwound_stack(
-                store,
-                instance,
-                stack_lower,
-                unwind_stack_begin,
-                stack_pointer,
-            )
-            .await?;
-            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
+            let rewind_stack =
+                wasix_read_unwound_stack(store, stack_lower, unwind_stack_begin, stack_pointer)
+                    .await?;
+            wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
             let child_pid = spawn_wasix_fork_child(
                 store,
                 stack_lower,
@@ -1406,8 +1493,8 @@ where
                     memory_stack[offset..end].copy_from_slice(&snapshot_bytes);
                 }
             } else {
-                let memory = Preview1AsyncMemory::of_instance(store, instance)?;
-                in_guest_turn(
+                let memory = Preview1AsyncMemory::of_store(store)?;
+                in_wasix_guest_turn(
                     store.data().guest_turns(),
                     memory.write_bytes(GuestAddress::wasm32(ret_pid), &snapshot_bytes),
                 )
@@ -1416,7 +1503,6 @@ where
             wasix_begin_rewind(
                 store,
                 interrupts,
-                instance,
                 WasixRewind {
                     stack_lower,
                     stack_upper,
@@ -1427,7 +1513,7 @@ where
                 },
             )
             .await?;
-            Ok(true)
+            Ok(AsyncifyOutcome::Rewinding)
         }
         WasixAsyncifyPhase::ProcessSnapshot {
             stack_lower,
@@ -1436,15 +1522,10 @@ where
             memory_stack,
             stack_pointer,
         } => {
-            let rewind_stack = wasix_read_unwound_stack(
-                store,
-                instance,
-                stack_lower,
-                unwind_stack_begin,
-                stack_pointer,
-            )
-            .await?;
-            wasix_call_instance_func0(store, interrupts, instance, "asyncify_stop_unwind").await?;
+            let rewind_stack =
+                wasix_read_unwound_stack(store, stack_lower, unwind_stack_begin, stack_pointer)
+                    .await?;
+            wasix_call_instance_func0(store, interrupts, "asyncify_stop_unwind").await?;
             let snapshot = wasix_capture_process_snapshot(
                 store,
                 stack_lower,
@@ -1463,7 +1544,6 @@ where
             wasix_begin_rewind(
                 store,
                 interrupts,
-                instance,
                 WasixRewind {
                     stack_lower,
                     stack_upper,
@@ -1474,7 +1554,7 @@ where
                 },
             )
             .await?;
-            Ok(true)
+            Ok(AsyncifyOutcome::Rewinding)
         }
     }
 }
@@ -1484,11 +1564,10 @@ where
 /// store's turns.
 async fn wasix_read_unwound_stack<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    instance: &wasmtime::Instance,
     stack_lower: u32,
     unwind_stack_begin: u32,
     stack_pointer: u32,
-) -> Result<Vec<u8>, ProgramExecError>
+) -> Result<Vec<u8>, AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1498,8 +1577,8 @@ where
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::StackBoundsInvalid,
     };
-    let memory = Preview1AsyncMemory::of_instance(store, instance)?;
-    let unwound = in_guest_turn(store.data().guest_turns(), async {
+    let memory = Preview1AsyncMemory::of_store(store)?;
+    let unwound = in_wasix_guest_turn(store.data().guest_turns(), async {
         let unwind_stack_finish = memory.read_u32(GuestAddress::wasm32(stack_lower)).await?;
         if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
             return Ok(None);
@@ -1511,15 +1590,14 @@ where
             .map(Some)
     })
     .await?;
-    unwound.ok_or(bounds_invalid)
+    unwound.ok_or_else(|| AsyncifyError::Exec(bounds_invalid))
 }
 
 pub(super) async fn wasix_begin_rewind<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
     rewind: WasixRewind,
-) -> Result<(), ProgramExecError>
+) -> Result<(), AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1534,18 +1612,18 @@ where
         value,
     } = rewind;
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
-        return Err(ProgramExecError {
+        return Err(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::StackBoundsInvalid,
-        });
+        }));
     }
-    let memory = Preview1AsyncMemory::of_instance(store, instance)?;
-    in_guest_turn(
+    let memory = Preview1AsyncMemory::of_store(store)?;
+    in_wasix_guest_turn(
         store.data().guest_turns(),
         memory.write_bytes(GuestAddress::wasm32(stack_pointer), &memory_stack),
     )
     .await?;
-    wasix_set_global_u32_from_instance(store, instance, "__stack_pointer", stack_pointer)?;
+    wasix_set_global_u32_from_store(store, "__stack_pointer", stack_pointer)?;
 
     let rewind_stack_begin =
         stack_lower
@@ -1565,14 +1643,14 @@ where
             detail: ProgramExecErrorDetail::StackBoundsInvalid,
         })?;
     if rewind_stack_end > stack_upper {
-        return Err(ProgramExecError {
+        return Err(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::StackBoundsInvalid,
-        });
+        }));
     }
-    let memory = Preview1AsyncMemory::of_instance(store, instance)?;
+    let memory = Preview1AsyncMemory::of_store(store)?;
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    in_guest_turn(store.data().guest_turns(), async {
+    in_wasix_guest_turn(store.data().guest_turns(), async {
         memory
             .write_u32(stack_lower_address, rewind_stack_end)
             .await?;
@@ -1585,14 +1663,7 @@ where
     })
     .await?;
     store.data_mut().asyncify.rewind_value = value;
-    wasix_call_instance_func1(
-        store,
-        interrupts,
-        instance,
-        "asyncify_start_rewind",
-        stack_lower,
-    )
-    .await?;
+    wasix_call_instance_func1(store, interrupts, "asyncify_start_rewind", stack_lower).await?;
     Ok(())
 }
 
@@ -1603,7 +1674,7 @@ pub(super) async fn wasix_capture_process_snapshot<CpuImpl, Net, StorageImpl>(
     stack_pointer: u32,
     memory_stack: Vec<u8>,
     rewind_stack: Vec<u8>,
-) -> Result<WasixProcessSnapshot<Net>, ProgramExecError>
+) -> Result<WasixProcessSnapshot<Net>, AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1629,7 +1700,7 @@ where
         kind: ProgramExecErrorKind::OutOfMemory,
         detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
     })?;
-    let memory_bytes = in_guest_turn(
+    let memory_bytes = in_wasix_guest_turn(
         store.data().guest_turns(),
         memory.read_bytes(GuestAddress::wasm32(0), memory_len),
     )
@@ -1696,7 +1767,7 @@ pub(super) async fn spawn_wasix_fork_child<CpuImpl, Net, StorageImpl>(
     stack_pointer: u32,
     memory_stack: Vec<u8>,
     rewind_stack: Vec<u8>,
-) -> Result<u32, ProgramExecError>
+) -> Result<u32, AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -1733,10 +1804,10 @@ where
     // front the ceiling is unallocatable once the parent holds one.
     let maximum_pages = user_shared_memory_budget_pages();
     if maximum_pages < current_pages {
-        return Err(ProgramExecError {
+        return Err(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::OutOfMemory,
             detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
-        });
+        }));
     }
     let memory_spec = SharedMemorySpec {
         initial_pages: current_pages,
@@ -1752,10 +1823,10 @@ where
     )
     .await?;
     if fork_memory.data_size() < current_bytes {
-        return Err(ProgramExecError {
+        return Err(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::OutOfMemory,
             detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
-        });
+        }));
     }
     let copy_started = store
         .data()
@@ -1763,7 +1834,7 @@ where
         .profiling_enabled()
         .then(|| store.data().cpu.now().ticks());
     let parent = Preview1AsyncMemory::of_shared(&parent_memory);
-    in_guest_turn(
+    in_wasix_guest_turn(
         store.data().guest_turns(),
         parent.read(GuestAddress::wasm32(0), current_bytes, |source| {
             // SAFETY: the fork's memory came out of the pool for this
@@ -1800,6 +1871,7 @@ where
         memory_spec,
         descriptors: store.data().descriptors.clone(),
         signal_dispositions: store.data().signal_dispositions.clone(),
+        signal_callback: store.data().process_signals.callback(),
         rewind: WasixRewind {
             stack_lower,
             stack_upper,
@@ -1871,55 +1943,54 @@ pub(super) fn wasix_stack_snapshot_bytes(user: u32, hash: u128) -> [u8; WASIX_ST
 pub(super) async fn wasix_call_instance_func0<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
     name: &str,
-) -> Result<(), ProgramExecError>
+) -> Result<(), AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let function = instance
-        .get_typed_func::<(), ()>(&mut *store, name)
-        .map_err(|_| ProgramExecError {
+    let function = p1_store_export(store, name)
+        .and_then(wasmtime::Extern::into_func)
+        .and_then(|func| func.typed::<(), ()>(&mut *store).ok())
+        .ok_or(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
-        })?;
+        }))?;
     let turns = store.data().guest_turns();
     interrupts
         .drive(turns.drive(function.call_async(&mut *store, ())))
         .await
-        .map_err(map_program_runtime_error)
+        .map_err(AsyncifyError::GuestStop)
 }
 
 pub(super) async fn wasix_call_instance_func1<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    instance: &wasmtime::Instance,
     name: &str,
     value: u32,
-) -> Result<(), ProgramExecError>
+) -> Result<(), AsyncifyError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let function = instance
-        .get_typed_func::<i32, ()>(&mut *store, name)
-        .map_err(|_| ProgramExecError {
+    let function = p1_store_export(store, name)
+        .and_then(wasmtime::Extern::into_func)
+        .and_then(|func| func.typed::<i32, ()>(&mut *store).ok())
+        .ok_or(AsyncifyError::Exec(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
-        })?;
+        }))?;
     let turns = store.data().guest_turns();
     interrupts
         .drive(turns.drive(function.call_async(&mut *store, value as i32)))
         .await
-        .map_err(map_program_runtime_error)
+        .map_err(AsyncifyError::GuestStop)
 }
 
-pub(super) fn wasix_global_u32_from_instance<CpuImpl, Net, StorageImpl>(
+pub(super) fn wasix_global_u32_from_store<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    instance: &wasmtime::Instance,
     name: &str,
 ) -> Result<u32, ProgramExecError>
 where
@@ -1927,8 +1998,8 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let global = instance
-        .get_global(&mut *store, name)
+    let global = p1_store_export(store, name)
+        .and_then(wasmtime::Extern::into_global)
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
@@ -1942,9 +2013,8 @@ where
     }
 }
 
-pub(super) fn wasix_set_global_u32_from_instance<CpuImpl, Net, StorageImpl>(
+pub(super) fn wasix_set_global_u32_from_store<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    instance: &wasmtime::Instance,
     name: &str,
     value: u32,
 ) -> Result<(), ProgramExecError>
@@ -1953,8 +2023,8 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let global = instance
-        .get_global(&mut *store, name)
+    let global = p1_store_export(store, name)
+        .and_then(wasmtime::Extern::into_global)
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
