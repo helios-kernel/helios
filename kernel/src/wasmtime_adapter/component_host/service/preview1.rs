@@ -584,57 +584,19 @@ where
         nonblocking: bool,
         peek: bool,
     ) -> Result<Bytes, i32> {
-        if max_bytes == 0 {
-            return match self.descriptors.get(fd) {
-                Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => Ok(Bytes::new()),
-                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
-                Some(_) => Err(p1::errno::NOTSOCK),
-                None => Err(p1::errno::BADF),
-            };
-        }
-
-        let reader = match self.descriptors.get_mut(fd) {
-            Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) => {
-                if !carry.is_empty() {
-                    return Ok(if peek {
-                        carry.slice(..carry.len().min(max_bytes))
-                    } else {
-                        take_preview1_carry(carry, max_bytes)
-                    });
-                }
-                if nonblocking {
-                    return match reader.try_read() {
-                        crate::TryRead::Ready(bytes) => {
-                            *carry = bytes;
-                            Ok(if peek {
-                                carry.slice(..carry.len().min(max_bytes))
-                            } else {
-                                take_preview1_carry(carry, max_bytes)
-                            })
-                        }
-                        crate::TryRead::Eof => Ok(Bytes::new()),
-                        crate::TryRead::Pending => Err(p1::errno::AGAIN),
-                    };
-                }
-                reader.clone()
-            }
+        let socket = match self.descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(socket)) if socket.is_pair() => socket.clone(),
             Some(Preview1Descriptor::Socket(_)) => return Err(p1::errno::INVAL),
             Some(_) => return Err(p1::errno::NOTSOCK),
             None => return Err(p1::errno::BADF),
         };
-
-        let bytes = reader.read().await.unwrap_or_default();
-        let Some(Preview1Descriptor::Socket(UnixSocket::Pair { carry, .. })) =
-            self.descriptors.get_mut(fd)
-        else {
-            return Err(p1::errno::BADF);
-        };
-        *carry = bytes;
-        Ok(if peek {
-            carry.slice(..carry.len().min(max_bytes))
-        } else {
-            take_preview1_carry(carry, max_bytes)
-        })
+        socket
+            .recv_pair(max_bytes, nonblocking, peek)
+            .await
+            .map_err(|error| match error {
+                helios_unix::PairRecvError::NotPair => p1::errno::INVAL,
+                helios_unix::PairRecvError::WouldBlock => p1::errno::AGAIN,
+            })
     }
 
     pub(super) fn getcwd(&self) -> Result<&str, i32> {
@@ -4415,12 +4377,12 @@ where
         return Err(status);
     }
     let (listener, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
-            listener,
-            family,
-            ..
-        }))) => (listener.id(), *family),
-        Some(Preview1Descriptor::Socket(_)) => return Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Listening {
+                listener, family, ..
+            }) => (listener.id(), family),
+            _ => return Err(p1::errno::INVAL),
+        },
         Some(_) => return Err(p1::errno::NOTSOCK),
         None => return Err(p1::errno::BADF),
     };
@@ -4436,7 +4398,7 @@ where
         .tcp_accept(listener, timeout)
         .await
         .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
-    let descriptor = Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+    let descriptor = Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
         family,
         stream: OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), accepted.stream),
         peer_address: accepted.address,
@@ -4459,11 +4421,10 @@ where
     StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-            stream,
-            ..
-        }))) => Ok(stream.id()),
-        Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Connected { stream, .. }) => Ok(stream.id()),
+            _ => Err(p1::errno::INVAL),
+        },
         Some(_) => Err(p1::errno::NOTSOCK),
         None => Err(p1::errno::BADF),
     }
@@ -4533,7 +4494,7 @@ where
     let fdflags = caller.data().descriptors.fdflags(fd)?;
     if matches!(
         caller.data().descriptors.get(fd),
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. }))
+        Some(Preview1Descriptor::Socket(socket)) if socket.is_pair()
     ) {
         let bytes = caller
             .data_mut()
@@ -4547,11 +4508,10 @@ where
         return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
     }
     let stream = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-            stream,
-            ..
-        }))) => stream.id(),
-        Some(Preview1Descriptor::Socket(_)) => return Ok(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Connected { stream, .. }) => stream.id(),
+            _ => return Ok(p1::errno::INVAL),
+        },
         Some(_) => return Ok(p1::errno::NOTSOCK),
         None => return Ok(p1::errno::BADF),
     };
@@ -4668,7 +4628,9 @@ where
     let layout = p1_read_iovs_with_byte_len(&memory, si_data, si_data_len).await?;
     let mut gather = Preview1Gather::new(&memory, &layout)?;
     let descriptor = caller.data().descriptors.get(fd).cloned();
-    if let Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })) = descriptor {
+    if let Some(Preview1Descriptor::Socket(socket)) = &descriptor
+        && let Some(writer) = socket.pair_writer()
+    {
         let fdflags = caller.data().descriptors.fdflags(fd)?;
         let written = p1_send_gathered(&memory, &mut gather, |chunk| {
             p1_send_to_socketpair(&writer, chunk, fdflags)
@@ -4677,10 +4639,13 @@ where
         memory.write_u32(so_datalen, written).await?;
         return Ok(p1::errno::SUCCESS);
     }
-    let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-        stream, ..
-    }))) = &descriptor
-    else {
+    let Some(stream_id) = (match &descriptor {
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Connected { stream, .. }) => Some(stream.id()),
+            _ => None,
+        },
+        _ => None,
+    }) else {
         return Ok(p1_connected_tcp_stream(caller, fd)
             .err()
             .unwrap_or(p1::errno::INVAL));
@@ -4699,7 +4664,7 @@ where
         u64::MAX
     };
     let written = p1_send_gathered(&memory, &mut gather, |chunk| {
-        let (service, stream) = (&service, stream.id());
+        let (service, stream) = (&service, stream_id);
         async move {
             service
                 .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
@@ -4727,65 +4692,70 @@ where
     }
     let descriptor = caller.data().descriptors.get(fd).cloned();
     match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected { .. }))) => {
-            let status = caller.data().require_tcp_authority();
-            if status != p1::errno::SUCCESS {
-                return status;
+        Some(Preview1Descriptor::Socket(socket)) => {
+            if let Some(tcp) = socket.tcp_state() {
+                if !matches!(tcp, UnixTcpSocket::Connected { .. }) {
+                    return p1::errno::INVAL;
+                }
+                let status = caller.data().require_tcp_authority();
+                if status != p1::errno::SUCCESS {
+                    return status;
+                }
+                if caller.data().runtime_state.network_service().is_none() {
+                    return p1::errno::NETDOWN;
+                }
+                // Replacing the state drops this socket's handle, and the
+                // stream is retired once the last duplicate is gone.
+                socket
+                    .with_tcp_mut(|slot| {
+                        if !matches!(slot, UnixTcpSocket::Connected { .. }) {
+                            return p1::errno::INVAL;
+                        }
+                        let options = *slot.options();
+                        *slot = UnixTcpSocket::Unconnected {
+                            family: slot.family(),
+                            options,
+                        };
+                        p1::errno::SUCCESS
+                    })
+                    .unwrap_or(p1::errno::INVAL)
+            } else if let Some(udp) = socket.udp_state() {
+                if !matches!(udp, UnixUdpSocket::Bound { .. }) {
+                    return p1::errno::INVAL;
+                }
+                let status = caller.data().require_udp_authority();
+                if status != p1::errno::SUCCESS {
+                    return status;
+                }
+                if caller.data().runtime_state.network_service().is_none() {
+                    return p1::errno::NETDOWN;
+                }
+                // Replacing the state drops this socket's handle, and the
+                // socket is retired once the last duplicate is gone.
+                socket
+                    .with_udp_mut(|slot| {
+                        if !matches!(slot, UnixUdpSocket::Bound { .. }) {
+                            return p1::errno::INVAL;
+                        }
+                        let options = *slot.options();
+                        *slot = UnixUdpSocket::Unbound {
+                            family: slot.family(),
+                            options,
+                        };
+                        p1::errno::SUCCESS
+                    })
+                    .unwrap_or(p1::errno::INVAL)
+            } else if let Some((reader, writer)) = socket.pair_ends() {
+                if how & P1_SDFLAGS_RD != 0 {
+                    reader.close();
+                }
+                if how & P1_SDFLAGS_WR != 0 {
+                    writer.close();
+                }
+                p1::errno::SUCCESS
+            } else {
+                p1::errno::INVAL
             }
-            if caller.data().runtime_state.network_service().is_none() {
-                return p1::errno::NETDOWN;
-            }
-            let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                return p1::errno::BADF;
-            };
-            // Replacing the slot drops this descriptor's handle, and the
-            // stream is retired once the last one is gone.
-            let options = *slot.options();
-            *slot = UnixTcpSocket::Unconnected {
-                family: slot.family(),
-                options,
-            };
-            p1::errno::SUCCESS
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            ..
-        }))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound { .. }))) => {
-            let status = caller.data().require_udp_authority();
-            if status != p1::errno::SUCCESS {
-                return status;
-            }
-            if caller.data().runtime_state.network_service().is_none() {
-                return p1::errno::NETDOWN;
-            }
-            let Some(Preview1Descriptor::Socket(UnixSocket::Udp(slot))) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                return p1::errno::BADF;
-            };
-            // Replacing the slot drops this descriptor's handle, and the
-            // socket is retired once the last one is gone.
-            let options = *slot.options();
-            *slot = UnixUdpSocket::Unbound {
-                family: slot.family(),
-                options,
-            };
-            p1::errno::SUCCESS
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound { .. }))) => {
-            p1::errno::INVAL
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, writer, .. })) => {
-            if how & P1_SDFLAGS_RD != 0 {
-                reader.close();
-            }
-            if how & P1_SDFLAGS_WR != 0 {
-                writer.close();
-            }
-            p1::errno::SUCCESS
         }
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -5580,7 +5550,7 @@ mod tests {
         stream: Net::TcpStream,
     ) -> Preview1DescriptorEntry<Net> {
         Preview1DescriptorEntry::new(
-            Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
                 family: SocketFamily::Ipv4,
                 stream: OwnedTcpStream::new(crate::UnixNetwork::new(service), stream),
                 peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
@@ -5598,7 +5568,7 @@ mod tests {
         listener: Net::TcpListener,
     ) -> Preview1DescriptorEntry<Net> {
         Preview1DescriptorEntry::new(
-            Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
+            Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Listening {
                 family: SocketFamily::Ipv4,
                 listener: OwnedTcpListener::new(crate::UnixNetwork::new(service), listener),
                 local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
@@ -5796,7 +5766,7 @@ mod tests {
         socket: Net::UdpSocket,
     ) -> Preview1DescriptorEntry<Net> {
         Preview1DescriptorEntry::new(
-            Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
+            Preview1Descriptor::Socket(UnixSocket::from_udp(UnixUdpSocket::Bound {
                 family: SocketFamily::Ipv4,
                 socket: OwnedUdpSocket::new(crate::UnixNetwork::new(service), socket),
                 local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
@@ -5853,7 +5823,7 @@ mod tests {
     }
 
     fn connected_socket() -> Preview1Descriptor<crate::test_support::TestNetworkService> {
-        Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+        Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
             family: SocketFamily::Ipv4,
             stream: OwnedTcpStream::new(
                 crate::UnixNetwork::new(crate::test_support::test_network_service()),

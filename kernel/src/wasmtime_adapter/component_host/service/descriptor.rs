@@ -534,16 +534,27 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
                 wait: reader.wait_state(),
             });
         }
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. }))
-            if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
-        {
-            wait.notified.push(EpollWaitTarget::ByteReader {
-                reader: reader.clone(),
-                wait: reader.wait_state(),
-            });
+        Some(Preview1Descriptor::Socket(socket)) => {
+            if let Some((reader, carry_len)) = socket.pair_read_probe() {
+                if event_type == P1_EVENTTYPE_FD_READ && carry_len == 0 {
+                    wait.notified.push(EpollWaitTarget::ByteReader {
+                        reader: reader.clone(),
+                        wait: reader.wait_state(),
+                    });
+                } else if event_type == P1_EVENTTYPE_FD_WRITE
+                    && let Some(writer) = socket.pair_writer()
+                    && !writer.is_writable()
+                {
+                    wait.notified.push(EpollWaitTarget::ByteWriter {
+                        writer: writer.clone(),
+                        wait: writer.wait_state(),
+                    });
+                }
+            } else if socket.handle().is_some() {
+                wait.repoll = true;
+            }
         }
         Some(Preview1Descriptor::PipeWrite { writer })
-        | Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. }))
             if event_type == P1_EVENTTYPE_FD_WRITE && !writer.is_writable() =>
         {
             wait.notified.push(EpollWaitTarget::ByteWriter {
@@ -583,10 +594,6 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
                 crate::ComponentInputRoute::Closed => {}
             }
         }
-        Some(Preview1Descriptor::Socket(
-            UnixSocket::Tcp(UnixTcpSocket::Connected { .. } | UnixTcpSocket::Listening { .. })
-            | UnixSocket::Udp(UnixUdpSocket::Bound { .. }),
-        )) => wait.repoll = true,
         _ => {}
     }
 }
@@ -1663,13 +1670,13 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
                 P1Readiness::Pending
             })
         }
-        (
-            Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })),
-            P1_EVENTTYPE_FD_READ,
-        ) => {
-            if !carry.is_empty() {
+        (Some(Preview1Descriptor::Socket(socket)), P1_EVENTTYPE_FD_READ) if socket.is_pair() => {
+            let Some((reader, carry_len)) = socket.pair_read_probe() else {
+                return Err(p1::errno::INVAL);
+            };
+            if carry_len != 0 {
                 return local(P1Readiness::Ready {
-                    bytes: carry.len() as u64,
+                    bytes: carry_len as u64,
                 });
             }
             // `is_readable` covers queued bytes and a closed writer alike;
@@ -1706,11 +1713,19 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // guest that polls for `POLLOUT` sleeps instead of spinning on a
         // full pipe. `is_writable` also covers a vanished peer, where the
         // write itself reports the error.
-        (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE)
-        | (
-            Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })),
-            P1_EVENTTYPE_FD_WRITE,
-        ) => {
+        (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE) => {
+            if writer.is_writable() {
+                local(P1Readiness::Ready {
+                    bytes: usize::MAX as u64,
+                })
+            } else {
+                local(P1Readiness::Pending)
+            }
+        }
+        (Some(Preview1Descriptor::Socket(socket)), P1_EVENTTYPE_FD_WRITE) if socket.is_pair() => {
+            let Some(writer) = socket.pair_writer() else {
+                return Err(p1::errno::INVAL);
+            };
             if writer.is_writable() {
                 local(P1Readiness::Ready {
                     bytes: usize::MAX as u64,
@@ -1736,11 +1751,9 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // progress; it is not an error to poll it, it simply never becomes
         // ready.
         (
-            Some(Preview1Descriptor::Socket(
-                socket @ (UnixSocket::<Net>::Tcp(_) | UnixSocket::<Net>::Udp(_)),
-            )),
+            Some(Preview1Descriptor::Socket(socket)),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => match socket.handle() {
+        ) if !socket.is_pair() => match socket.handle() {
             Some(handle) => Ok(P1Probe::Network(handle)),
             None => local(P1Readiness::Pending),
         },
