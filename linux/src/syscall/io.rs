@@ -205,17 +205,13 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
         _ => errno(EBADF),
     }
 }
-pub(super) async fn read<R: Resources, M: UserMemory, O: Stdio>(
-    table: &mut Descriptors<R>,
+pub(super) async fn read_resource<R: Resources, M: UserMemory>(
+    entry: &Entry<R>,
     args: [u64; 6],
     memory: &mut M,
-    stdio: &mut O,
 ) -> u64 {
-    let Some(entry) = table.get_entry_mut(args[0] as u32 as i32) else {
-        return errno(EBADF);
-    };
     let nonblock = entry.fdflags() & NONBLOCK != 0;
-    match &mut entry.descriptor {
+    match &entry.descriptor {
         FileDescriptor::Event(event) => {
             if args[2] < 8 {
                 return errno(EINVAL);
@@ -254,28 +250,6 @@ pub(super) async fn read<R: Resources, M: UserMemory, O: Stdio>(
             let Some(bytes) = next else {
                 return 0;
             };
-            if memory.write(args[1], &bytes).is_err() {
-                return errno(EFAULT);
-            }
-            bytes.len() as u64
-        }
-        FileDescriptor::Stdin { carry } => {
-            let limit = args[2].min(MAX_RW_COUNT) as usize;
-            if limit == 0 {
-                return 0;
-            }
-            if memory.check_writable(args[1], limit).is_err() {
-                return errno(EFAULT);
-            }
-            // Bytes a reader of the same description took past what it
-            // asked for are this read's first.
-            if carry.is_empty() {
-                match stdio.read_input(limit).await {
-                    Ok(bytes) => *carry = bytes,
-                    Err(Denied) => return errno(EACCES),
-                }
-            }
-            let bytes = carry.split_to(carry.len().min(limit));
             if memory.write(args[1], &bytes).is_err() {
                 return errno(EFAULT);
             }

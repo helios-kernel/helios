@@ -474,7 +474,14 @@ fn set_times_impl(
         timespec_from_optional_nanos(access_nanos)?,
         timespec_from_optional_nanos(modified_nanos)?,
     ];
-    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+    let result = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
@@ -588,6 +595,41 @@ mod tests {
             assert_eq!(metadata.atime_nsec(), 500_000_002);
             assert_eq!(metadata.mtime(), 2);
             assert_eq!(metadata.mtime_nsec(), 3);
+        });
+    }
+
+    #[test]
+    fn hosted_filesystem_set_times_acts_on_symlink_itself() {
+        run_hosted_fs_test(async {
+            use std::os::unix::fs::MetadataExt;
+
+            let root = test_root();
+            std::fs::write(root.path().join("target"), b"payload").expect("target must be written");
+            std::os::unix::fs::symlink("target", root.path().join("sym"))
+                .expect("symlink must be created");
+            let filesystem = filesystem(&root);
+
+            filesystem
+                .set_times("target", Some(10_000_000_001), Some(20_000_000_002))
+                .await
+                .expect("target times must be set");
+            filesystem
+                .set_times("sym", Some(30_000_000_003), Some(40_000_000_004))
+                .await
+                .expect("symlink times must be set");
+
+            let target =
+                std::fs::symlink_metadata(root.path().join("target")).expect("target stat");
+            assert_eq!(target.atime(), 10);
+            assert_eq!(target.atime_nsec(), 1);
+            assert_eq!(target.mtime(), 20);
+            assert_eq!(target.mtime_nsec(), 2);
+
+            let link = std::fs::symlink_metadata(root.path().join("sym")).expect("symlink stat");
+            assert_eq!(link.atime(), 30);
+            assert_eq!(link.atime_nsec(), 3);
+            assert_eq!(link.mtime(), 40);
+            assert_eq!(link.mtime_nsec(), 4);
         });
     }
 

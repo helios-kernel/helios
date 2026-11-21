@@ -101,11 +101,12 @@ struct LiveThread {
 pub(super) struct ThreadGroup {
     next_tid: u32,
     live: Vec<LiveThread>,
-    /// Closed once `exit_group`, a fatal signal or a fault condemns the
-    /// thread group; no further threads are admitted.
+    /// Closed once `exit_group`, a fatal signal, a fault or an owner kill
+    /// condemns the thread group; no further threads are admitted.
     closed: bool,
-    /// First group-wide exit status (`exit_group`, fatal signal or fault).
-    group_exit: Option<u32>,
+    /// First group-wide termination (`exit_group`, fatal signal, fault or
+    /// owner kill).
+    group_termination: Option<ChildTermination>,
     /// Status passed to the most recent single-thread `exit(2)`, reported
     /// when the last thread exits without `exit_group`.
     last_thread_exit: u32,
@@ -125,7 +126,7 @@ impl ThreadGroup {
                 robust_list,
             }],
             closed: false,
-            group_exit: None,
+            group_termination: None,
             last_thread_exit: 0,
         }
     }
@@ -149,8 +150,9 @@ impl ThreadGroup {
         self.live.is_empty()
     }
 
-    pub(super) fn exit_status(&self) -> u32 {
-        self.group_exit.unwrap_or(self.last_thread_exit)
+    pub(super) fn termination(&self) -> ChildTermination {
+        self.group_termination
+            .unwrap_or(ChildTermination::Exited(self.last_thread_exit))
     }
 
     /// Admits a new thread into the group, enforcing `max_threads`
@@ -201,8 +203,8 @@ impl ThreadGroup {
             Exit::Group(code) => {
                 let first = !self.closed;
                 self.closed = true;
-                if self.group_exit.is_none() {
-                    self.group_exit = Some(u32::from(code));
+                if self.group_termination.is_none() {
+                    self.group_termination = Some(ChildTermination::Exited(u32::from(code)));
                 }
                 first
             }
@@ -211,13 +213,17 @@ impl ThreadGroup {
         (broadcast, all_exited)
     }
 
-    /// Condemns the thread group with `exit_code` (first group exit wins) and
-    /// withdraws `tid` if still present.
-    pub(super) fn terminate_group(&mut self, tid: Option<NonZeroU32>, exit_code: u32) -> bool {
+    /// Condemns the thread group with `termination` (first group termination
+    /// wins) and withdraws `tid` if still present.
+    pub(super) fn terminate_group(
+        &mut self,
+        tid: Option<NonZeroU32>,
+        termination: ChildTermination,
+    ) -> bool {
         let first = !self.closed;
         self.closed = true;
-        if self.group_exit.is_none() {
-            self.group_exit = Some(exit_code);
+        if self.group_termination.is_none() {
+            self.group_termination = Some(termination);
         }
         if let Some(tid) = tid {
             self.withdraw(tid);

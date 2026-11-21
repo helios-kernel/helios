@@ -1145,7 +1145,7 @@ mod network {
 
     use bytes::Bytes;
 
-    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use triomphe::Arc;
 
@@ -1182,48 +1182,11 @@ mod network {
         closed: Arc<TestClosedStreams>,
         closed_udp: Arc<TestClosedStreams>,
         closed_listeners: Arc<TestClosedStreams>,
-        /// The failure switch a stream test arms: once set, the calls a
-        /// device poll sits behind — `tcp_read`, `tcp_write_all_bytes`,
-        /// `tcp_write_ready` — fail the way a device fault fails them,
-        /// while the synchronous probes keep answering: `tcp_try_read`
-        /// still drains and the send side reports a full queue, since a
-        /// device that cannot be polled also cannot drain one.
-        drive_failure: Arc<AtomicBool>,
-        /// Bytes `tcp_write_all` accepted — the evidence a parked batch
-        /// was retried rather than dropped.
-        bytes_written: Arc<AtomicU64>,
     }
 
     impl TestNetworkService {
         pub(crate) fn new() -> Self {
             Self::default()
-        }
-
-        /// Arm the driving calls to fail — see `drive_failure`.
-        pub(crate) fn fail_drives(&self) {
-            self.drive_failure.store(true, Ordering::Release);
-        }
-
-        /// Disarm the switch, so a retried write can show what a parked
-        /// batch kept.
-        pub(crate) fn heal_drives(&self) {
-            self.drive_failure.store(false, Ordering::Release);
-        }
-
-        /// Total bytes `tcp_write_all` has accepted.
-        pub(crate) fn bytes_written(&self) -> u64 {
-            self.bytes_written.load(Ordering::Acquire)
-        }
-
-        /// The error a real device fault surfaces as from a driving
-        /// call, when the switch is armed.
-        fn drive_error(&self) -> Option<crate::TcpError> {
-            self.drive_failure
-                .load(Ordering::Acquire)
-                .then_some(crate::TcpError {
-                    kind: crate::TcpErrorKind::Internal,
-                    detail: crate::NetworkErrorDetail::VirtioAdvanceFailed,
-                })
         }
 
         /// The TCP retirement log this service writes to, which is
@@ -1287,6 +1250,10 @@ mod network {
 
         fn hardware_address(&self) -> [u8; 6] {
             [2, 0, 0, 0, 0, 1]
+        }
+
+        fn owns_ip_address(&self, address: crate::NetworkIpAddress) -> bool {
+            address == crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1]))
         }
 
         fn revalidate_lease(&self) -> impl Future<Output = ()> + Send + '_ {
@@ -1412,18 +1379,10 @@ mod network {
         fn tcp_write_all(
             &self,
             _: Self::TcpStream,
-            bytes: &[u8],
+            _: &[u8],
             _: u64,
         ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
-            let written = bytes.len() as u64;
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => {
-                    self.bytes_written.fetch_add(written, Ordering::AcqRel);
-                    Ok(())
-                }
-            })
+            core::future::ready(Ok(()))
         }
 
         fn tcp_read(
@@ -1433,19 +1392,7 @@ mod network {
             _: u64,
         ) -> impl core::future::Future<Output = Result<Option<Bytes>, crate::TcpError>> + Send + '_
         {
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => Ok(Some(Bytes::from_static(&[4, 2]))),
-            })
-        }
-
-        fn tcp_try_read(
-            &self,
-            _: Self::TcpStream,
-            _: usize,
-        ) -> Result<crate::TcpReadProgress, crate::TcpError> {
-            Ok(crate::TcpReadProgress::Data(Bytes::from_static(&[4, 2])))
+            core::future::ready(Ok(Some(Bytes::from_static(&[4, 2]))))
         }
 
         /// The same reply as [`Self::tcp_read`], as much of it as the
@@ -1457,49 +1404,19 @@ mod network {
             _: u64,
         ) -> impl core::future::Future<Output = Result<crate::TcpReadInto, crate::TcpError>> + Send + 'a
         {
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => Ok(crate::TcpReadInto::Data(
-                    helios_netstack::TcpReceiveBuffer::write_from(buffer, &[4, 2]),
-                )),
-            })
+            core::future::ready(Ok(crate::TcpReadInto::Data(
+                helios_netstack::TcpReceiveBuffer::write_from(buffer, &[4, 2]),
+            )))
         }
 
-        fn tcp_send_room(
-            &self,
-            _: Self::TcpStream,
-        ) -> Result<crate::TcpWriteProgress, crate::TcpError> {
-            Ok(match self.drive_failure.load(Ordering::Acquire) {
-                // A device whose polls fail drains nothing: the send
-                // queue reads as full.
-                true => crate::TcpWriteProgress::Pending,
-                false => crate::TcpWriteProgress::Room(usize::MAX),
-            })
-        }
-
-        fn tcp_try_write(
-            &self,
-            _: Self::TcpStream,
-            bytes: &mut Bytes,
-        ) -> Result<crate::TcpWriteProgress, crate::TcpError> {
-            if self.drive_failure.load(Ordering::Acquire) {
-                return Ok(crate::TcpWriteProgress::Pending);
-            }
-            let written = bytes.len();
-            bytes.clear();
-            Ok(crate::TcpWriteProgress::Room(written))
-        }
-
-        fn tcp_write_ready(
-            &self,
-            _: Self::TcpStream,
-        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
-            let failure = self.drive_error();
-            core::future::ready(match failure {
-                Some(error) => Err(error),
-                None => Ok(()),
-            })
+        fn tcp_peek_into<'a>(
+            &'a self,
+            stream: Self::TcpStream,
+            buffer: &'a mut crate::RegisteredTcpReadBuffer<'_>,
+            timeout_nanos: u64,
+        ) -> impl core::future::Future<Output = Result<crate::TcpReadInto, crate::TcpError>> + Send + 'a
+        {
+            self.tcp_read_into(stream, buffer, timeout_nanos)
         }
 
         fn tcp_shutdown_send(
@@ -1519,6 +1436,7 @@ mod network {
 
         fn udp_bind(
             &self,
+            _: crate::NetworkIpAddress,
             local_port: u16,
         ) -> impl core::future::Future<
             Output = Result<crate::UdpBinding<Self::UdpSocket>, crate::UdpError>,
@@ -1580,6 +1498,18 @@ mod network {
         > + Send
         + '_ {
             core::future::ready(Ok(None))
+        }
+
+        fn udp_peek(
+            &self,
+            socket: Self::UdpSocket,
+            max_bytes: u32,
+            timeout_nanos: u64,
+        ) -> impl core::future::Future<
+            Output = Result<Option<crate::UdpDatagram>, crate::UdpError>,
+        > + Send
+        + '_ {
+            self.udp_receive(socket, max_bytes, timeout_nanos)
         }
 
         fn udp_join_multicast_v4(

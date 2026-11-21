@@ -12,12 +12,53 @@ use crate::wit_bindgen::{FutureReader, StreamReader};
 use futures_lite::future::zip;
 
 pub use crate::bindings::helios::system::programs::{
-    AotHint, AotRequest, AotResult, CapabilityGrant, ClockGrant, ClockRight, DeviceClass,
-    DeviceGrant, DiagnosticsGrant, DiagnosticsRight, DirectoryGrant, ExecError, ExecErrorKind,
-    ExecOutput, ExecRequest, ExecResult, ExitStatus, FilesystemRight, LinkGrant, LinkRight,
-    MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant,
-    ProcessRight, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
+    AotHint, AotRequest, AotResult, CapabilityGrant, ChildTermination, ClockGrant, ClockRight,
+    DeviceClass, DeviceGrant, DiagnosticsGrant, DiagnosticsRight, DirectoryGrant, ExecError,
+    ExecErrorKind, ExecOutput, ExecRequest, ExecResult, ExitStatus, FilesystemRight, LinkGrant,
+    LinkRight, MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight,
+    ProcessGrant, ProcessRight, SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest,
+    TerminalGrant, TerminalRight,
 };
+
+impl PartialEq for ChildTermination {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Exited(a), Self::Exited(b)) => a == b,
+            (
+                Self::Signaled(SignalTermination {
+                    signal: a_sig,
+                    core_dumped: a_core,
+                }),
+                Self::Signaled(SignalTermination {
+                    signal: b_sig,
+                    core_dumped: b_core,
+                }),
+            ) => a_sig == b_sig && a_core == b_core,
+            (Self::Trapped, Self::Trapped) | (Self::Killed, Self::Killed) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ChildTermination {}
+
+impl core::fmt::Display for ChildTermination {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Exited(code) => write!(f, "exited with code {code}"),
+            Self::Signaled(SignalTermination {
+                signal,
+                core_dumped: false,
+            }) => write!(f, "ended by signal {signal}"),
+            Self::Signaled(SignalTermination {
+                signal,
+                core_dumped: true,
+            }) => write!(f, "ended by signal {signal} (core dumped)"),
+            Self::Trapped => f.write_str("trapped"),
+            Self::Killed => f.write_str("was killed"),
+        }
+    }
+}
 
 /// Build a directory capability grant for `helios:system/programs`.
 pub fn directory_grant(

@@ -481,11 +481,11 @@ where
     }
 
     async fn read_input(&mut self, limit: usize) -> Result<Bytes, Denied> {
-        Ok(match &self.shared.output_mode {
-            OutputMode::Serial if self.shared.grants.terminal_input.is_none() => {
+        Ok(match self.shared.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {
                 return Err(Denied);
             }
-            OutputMode::Serial => loop {
+            crate::ComponentInputRoute::Serial => loop {
                 let wait = self.shared.write_serial.wait_for_debug_serial_input();
                 (self.shared.read_serial)(
                     &mut self.serial_input,
@@ -496,9 +496,9 @@ where
                 }
                 wait.await;
             },
-            OutputMode::Trace => Bytes::new(),
-            OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                stdin_rx.read().await.unwrap_or_default()
+            crate::ComponentInputRoute::Closed => Bytes::new(),
+            crate::ComponentInputRoute::Child(stdin_rx) => {
+                stdin_rx.read_limit(limit).await.unwrap_or_default()
             }
         })
     }
@@ -674,17 +674,31 @@ where
     StorageImpl: crate::Storage,
 {
     if let Some(reason) = shared.launched_instance.pending_kill() {
-        shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
-            crate::InstanceKilled { reason },
-        )));
-        process.terminate_group(0);
+        match reason {
+            crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                process.terminate_group(helios_unix::ChildTermination::Killed);
+            }
+            crate::KillReason::OutOfMemory
+            | crate::KillReason::SupervisorRestart
+            | crate::KillReason::StoreFailed => {
+                shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
+                    crate::InstanceKilled { reason },
+                )));
+                process.terminate_group(helios_unix::ChildTermination::Killed);
+            }
+        }
         return true;
     }
     if process.group_ended() {
         return true;
     }
     if let Some(signal) = shared.signal_state.take_pending() {
-        process.terminate_group(abi::signal_exit_status(signal));
+        process.terminate_group(helios_unix::ChildTermination::Signaled(
+            helios_unix::SignalTermination {
+                signal: u8::try_from(signal).unwrap_or(u8::MAX),
+                core_dumped: false,
+            },
+        ));
         return true;
     }
     false
@@ -702,8 +716,12 @@ fn terminate_on_fault<Net: ComponentHostNetwork>(
         ?fault,
         "Linux thread faulted"
     );
-    let status = abi::signal_exit_status(u32::from(abi::fault_signal(fault.kind)));
-    process.terminate_group(status);
+    process.terminate_group(helios_unix::ChildTermination::Signaled(
+        helios_unix::SignalTermination {
+            signal: abi::fault_signal(fault.kind),
+            core_dumped: false,
+        },
+    ));
 }
 
 /// Drives one Linux thread (`main` or a `clone`-spawned worker) until that
@@ -815,7 +833,7 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                         Ok(()) => {}
                         Err(NativeError::OutOfMemory) => {
                             shared.record_fatal(native_error(NativeError::OutOfMemory));
-                            process.terminate_group(0);
+                            process.terminate_group(helios_unix::ChildTermination::Killed);
                             break;
                         }
                         Err(NativeError::NotMapped)
@@ -841,7 +859,9 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                                             shared.record_fatal(native_error(
                                                 NativeError::OutOfMemory,
                                             ));
-                                            process.terminate_group(0);
+                                            process.terminate_group(
+                                                helios_unix::ChildTermination::Killed,
+                                            );
                                             break;
                                         }
                                         Err(NativeError::NotMapped) => {
@@ -855,7 +875,7 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                                 }
                                 Err(NativeError::OutOfMemory) => {
                                     shared.record_fatal(native_error(NativeError::OutOfMemory));
-                                    process.terminate_group(0);
+                                    process.terminate_group(helios_unix::ChildTermination::Killed);
                                     break;
                                 }
                                 Err(error) => {
@@ -1043,14 +1063,28 @@ where
         let mut signal_wait = shared.signal_state.wait_state();
         let mut kill_wait = shared.launched_instance.arm_kill_wait();
         if let Some(reason) = shared.launched_instance.pending_kill() {
-            shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
-                crate::InstanceKilled { reason },
-            )));
-            observer.terminate_group(0);
+            match reason {
+                crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                    observer.terminate_group(helios_unix::ChildTermination::Killed);
+                }
+                crate::KillReason::OutOfMemory
+                | crate::KillReason::SupervisorRestart
+                | crate::KillReason::StoreFailed => {
+                    shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
+                        crate::InstanceKilled { reason },
+                    )));
+                    observer.terminate_group(helios_unix::ChildTermination::Killed);
+                }
+            }
         } else if !observer.group_ended()
             && let Some(signal) = shared.signal_state.take_pending()
         {
-            observer.terminate_group(abi::signal_exit_status(signal));
+            observer.terminate_group(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: u8::try_from(signal).unwrap_or(u8::MAX),
+                    core_dumped: false,
+                },
+            ));
         }
         if observer.all_threads_exited() {
             break;
@@ -1080,7 +1114,7 @@ where
     timeline.record(&cpu, LaunchPhase::GuestEnd);
 
     let fatal = shared.take_fatal();
-    let exit_code = observer.exit_status();
+    let termination = observer.termination();
     drop(observer);
     drop(shared);
 
@@ -1088,7 +1122,7 @@ where
         Some(error) => Err(error),
         None => Ok(ChildExit {
             instance_id,
-            exit_code,
+            termination,
             filesystem: None,
         }),
     }

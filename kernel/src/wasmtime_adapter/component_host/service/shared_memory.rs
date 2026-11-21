@@ -14,8 +14,11 @@ impl SharedMemorySpec {
             .expect("shared-memory byte size overflow")
     }
 
-    pub(super) fn memory_type(self) -> MemoryType {
-        MemoryType::shared(self.initial_pages, self.maximum_pages)
+    pub(super) fn memory_type(self) -> Result<MemoryType, ProgramExecError> {
+        MemoryType::shared(self.initial_pages, self.maximum_pages).map_err(|_| ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::ImportedSharedMemoryContractInvalid,
+        })
     }
 }
 
@@ -60,8 +63,9 @@ impl SharedMemoryPool {
             return Ok(memory);
         }
 
+        let memory_type = spec.memory_type()?;
         loop {
-            match SharedMemory::new(engine, spec.memory_type()) {
+            match SharedMemory::new(engine, memory_type.clone()) {
                 Ok(memory) => return Ok(memory),
                 Err(error) => {
                     if !self.evict_one() {
@@ -277,7 +281,7 @@ pub(super) fn imported_shared_memory(
     let Some(spec) = imported_shared_memory_spec(module, maximum_pages_budget)? else {
         return Ok(None);
     };
-    SharedMemory::new(engine, spec.memory_type())
+    SharedMemory::new(engine, spec.memory_type()?)
         .map(Some)
         .map_err(map_program_runtime_error)
 }

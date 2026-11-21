@@ -541,7 +541,25 @@ where
             );
             instance
         };
-        let instance = instance.map_err(map_program_runtime_error)?;
+        let instance = match instance {
+            Ok(instance) => instance,
+            Err(error) => match instantiate_termination(&error) {
+                Some(termination) => {
+                    return Ok(CoreModuleImageEnd {
+                        completion: CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                            instance_id,
+                            termination,
+                            filesystem: Some(store.data().filesystem.root_layer()),
+                        })),
+                        store_teardown_profile: start_program_kernel_profile(
+                            &profile_runtime_state,
+                            &run_cpu,
+                        ),
+                    });
+                }
+                None => return Err(map_program_runtime_error(error)),
+            },
+        };
         super::emit_program_stage_marker(write_serial, "program:instantiate-core-ok");
         timeline.record(&run_cpu, LaunchPhase::Instantiate);
 
@@ -711,7 +729,25 @@ where
             "instantiate-core-rewind",
             instantiate_started,
         );
-        let instance = instance.map_err(map_program_runtime_error)?;
+        let instance = match instance {
+            Ok(instance) => instance,
+            Err(error) => match instantiate_termination(&error) {
+                Some(termination) => {
+                    return Ok(CoreModuleImageEnd {
+                        completion: CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                            instance_id,
+                            termination,
+                            filesystem: Some(store.data().filesystem.root_layer()),
+                        })),
+                        store_teardown_profile: start_program_kernel_profile(
+                            &profile_runtime_state,
+                            &run_cpu,
+                        ),
+                    });
+                }
+                None => return Err(map_program_runtime_error(error)),
+            },
+        };
         timeline.record(&run_cpu, LaunchPhase::Instantiate);
         super::emit_program_stage_marker(write_serial, "program:instantiate-core-ok");
 
@@ -879,20 +915,20 @@ where
     let completion = match result {
         Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
             instance_id: run.instance_id,
-            exit_code: 0,
+            termination: helios_unix::ChildTermination::Exited(0),
             filesystem: Some(store.data().filesystem.root_layer()),
         })),
         // Main's call stopped because a spawned thread ended the process;
-        // the process ends the way that thread's call ended it: it exits
-        // with its status, runs the image its exec asked for, or fails
-        // with the failure a trap on main would have reported.
+        // the process ends the way that thread's call ended it: it ends
+        // with its termination, runs the image its exec asked for, or
+        // fails with the failure main would have reported.
         Err(error) if WasixThreadEnded::is(&error) => {
             match store.data().threads.take_process_end().expect(
                 "main's image is ended only by a spawned thread that recorded the process's end first",
             ) {
-                WasixProcessEnd::Exit(code) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
+                WasixProcessEnd::Exit(termination) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
                     instance_id: run.instance_id,
-                    exit_code: code,
+                    termination,
                     filesystem: Some(store.data().filesystem.root_layer()),
                 })),
                 WasixProcessEnd::Exec(replacement) => CoreModuleRunCompletion::Exec(replacement),
@@ -904,9 +940,9 @@ where
                 CoreModuleRunCompletion::Exec(Box::new(replacement))
             } else {
                 let end = store.data_mut().take_process_end(error);
-                CoreModuleRunCompletion::Exit(end.map(|exit_code| ChildExit {
+                CoreModuleRunCompletion::Exit(end.map(|termination| ChildExit {
                     instance_id: run.instance_id,
-                    exit_code,
+                    termination,
                     filesystem: Some(store.data().filesystem.root_layer()),
                 }))
             }
@@ -1031,7 +1067,7 @@ pub(super) async fn run_program_component<CpuImpl, Net, StorageImpl>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<Namespace<StorageImpl>>,
-    _signal_state: WasixSignalState,
+    signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     instance_pre: PreparedComponent<CpuImpl, Net, StorageImpl>,
@@ -1049,6 +1085,10 @@ where
     use crate::ComponentExecutor;
 
     let instance_id = launched_instance.id();
+    signal_state.attach(SignalTarget {
+        interrupts: engine.interrupts().clone(),
+        instance: instance_id,
+    });
 
     let argv = argv.into_vec();
     let run_started_at = monotonic_nanos(&exec_context.cpu);
@@ -1068,7 +1108,7 @@ where
         .then(|| profile_cpu.now().ticks());
     let filesystem =
         filesystem.unwrap_or_else(|| exec_context.runtime_state.root_namespace().descend());
-    let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
+    let (mut store, interrupts) = super::super::store_with_signal_state(
         engine,
         StoreData::<CpuImpl, Net, StorageImpl>::new(
             wasmtime::component::ResourceTable::new(),
@@ -1087,6 +1127,7 @@ where
             exec_context.read_serial,
             exec_context.write_serial,
         ),
+        Some(signal_state.clone()),
     );
     if let Some(store_prepare_started) = store_prepare_started {
         record_program_kernel_profile(
@@ -1100,7 +1141,12 @@ where
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
     timeline.record(&run_cpu, LaunchPhase::StorePrepare);
-    let turns = store.data().guest_turns();
+    let turns = store
+        .data()
+        .guest_turns_with_epilogue(super::super::ComponentStoreEpilogue::new(
+            store.data().retirement.turn_queue(),
+            Some(signal_state.clone()),
+        ));
     let instance = interrupts
         .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
         .await;
@@ -1113,28 +1159,49 @@ where
             instantiate_instance_started,
         );
     }
-    let executor = instance.and_then(|instance| {
-        let resolve_started = profile_runtime_state
-            .profiling_enabled()
-            .then(|| profile_cpu.now().ticks());
-        let resolved = crate::wasmtime_adapter::engine::resolve_wasi_cli_run(
-            instance_pre.component(),
-            &instance,
-            &mut store,
-        );
-        if let Some(resolve_started) = resolve_started {
+    let instance = match instance {
+        Ok(instance) => instance,
+        Err(error) => {
             record_program_kernel_profile(
                 &profile_runtime_state,
                 &profile_cpu,
-                "resolve-component-run",
-                resolve_started,
+                "instantiate-component",
+                instantiate_started,
             );
+            match instantiate_termination(&error) {
+                Some(termination) => {
+                    timeline.record(&run_cpu, LaunchPhase::Completion);
+                    return Ok(ChildExit {
+                        instance_id,
+                        termination,
+                        filesystem: None,
+                    });
+                }
+                None => return Err(map_program_runtime_error(error)),
+            }
         }
-        resolved.map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor {
-            store,
-            interrupts,
-            run_func,
-        })
+    };
+    let resolve_started = profile_runtime_state
+        .profiling_enabled()
+        .then(|| profile_cpu.now().ticks());
+    let resolved = crate::wasmtime_adapter::engine::resolve_wasi_cli_run(
+        instance_pre.component(),
+        &instance,
+        &mut store,
+    );
+    if let Some(resolve_started) = resolve_started {
+        record_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "resolve-component-run",
+            resolve_started,
+        );
+    }
+    let executor = resolved.map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor {
+        store,
+        interrupts,
+        run_func,
+        signal_state: Some(signal_state),
     });
     record_program_kernel_profile(
         &profile_runtime_state,
@@ -1170,13 +1237,16 @@ where
         run_phase_started,
     );
     drop(run_heartbeat);
-    let result = result.map_err(map_program_runtime_error)?;
+    let termination = match result {
+        Ok(result) => helios_unix::ChildTermination::Exited(result.exit_code),
+        Err(error) => preview1_process_end(error, None)?,
+    };
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-end");
     timeline.record(&run_cpu, LaunchPhase::Completion);
 
     Ok(ChildExit {
-        instance_id: result.instance_id,
-        exit_code: result.exit_code,
+        instance_id,
+        termination,
         filesystem: None,
     })
 }
@@ -1746,16 +1816,7 @@ where
         detail: ProgramExecErrorDetail::InvalidEntryPoint,
     })?;
     let environment = store.data().environment.clone();
-    let (_, stdin_reader) = crate::byte_channel();
-    let output_mode = OutputMode::RoutedChild {
-        stdin_rx: stdin_reader,
-        stdout: store
-            .data()
-            .output_route(crate::ComponentOutputStreamKind::Stdout),
-        stderr: store
-            .data()
-            .output_route(crate::ComponentOutputStreamKind::Stderr),
-    };
+    let output_mode = store.data().fork_output_mode();
     let mut child = service.spawn_loaded_with_output_mode(
         store.data().exec_context(),
         ProgramExecutable::ForkedCoreModule { compiled, restore },
@@ -1972,10 +2033,27 @@ pub(super) fn plugin_runtime_should_be_recycled(error: &ProgramExecError) -> boo
 /// arrives through `SharedMemory::new` was being classified as an internal
 /// failure. Walking the chain is what tells a caller it ran out of memory
 /// rather than hitting a bug (#62).
-fn caused_by_out_of_memory(error: &wasmtime::Error) -> bool {
+pub(super) fn caused_by_out_of_memory(error: &wasmtime::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<crate::ProgramOutOfMemory>())
+}
+
+/// Classifies an error met during `instantiate_async`: a signal, an owner
+/// kill, or a trap inside the module's start function is the child's own
+/// termination; link/instantiation or OOM errors stay launch failures.
+fn instantiate_termination(error: &wasmtime::Error) -> Option<helios_unix::ChildTermination> {
+    if let Some(termination) = preview1_exit_status(error, None) {
+        return Some(termination);
+    }
+    if error.downcast_ref::<wasmtime::Trap>().is_some()
+        || error
+            .downcast_ref::<crate::memory::SwapFaultError>()
+            .is_some()
+    {
+        return Some(helios_unix::ChildTermination::Trapped);
+    }
+    None
 }
 
 /// A task the executor refused to place for this instance.

@@ -9,8 +9,8 @@ use core::task::{Context, Poll};
 use helios_hal::vmm::PageFlags;
 use helios_sync::{Notify, NotifyWaiter, RawMutex};
 use helios_unix::{
-    DescriptorSlots, FileDescriptor, FileDescriptorEntry, FutexTable, NoNetwork, ProcessIdentity,
-    ProcessMemoryIdentity, SocketNetwork,
+    ChildTermination, DescriptorSlots, FileDescriptor, FileDescriptorEntry, FutexTable, NoNetwork,
+    ProcessIdentity, ProcessMemoryIdentity, SocketNetwork,
 };
 
 mod futex;
@@ -300,8 +300,8 @@ impl ProcessObserver {
         self.lifecycle.threads.lock().all_exited()
     }
 
-    pub fn exit_status(&self) -> u32 {
-        self.lifecycle.threads.lock().exit_status()
+    pub fn termination(&self) -> ChildTermination {
+        self.lifecycle.threads.lock().termination()
     }
 
     pub fn waiter(&self) -> NotifyWaiter {
@@ -312,12 +312,12 @@ impl ProcessObserver {
         self.lifecycle.changed.poll_notified(cx, waiter)
     }
 
-    pub fn terminate_group(&self, exit_code: u32) {
+    pub fn terminate_group(&self, termination: ChildTermination) {
         let broadcast = self
             .lifecycle
             .threads
             .lock()
-            .terminate_group(None, exit_code);
+            .terminate_group(None, termination);
         if broadcast {
             self.lifecycle.changed.notify_all();
         }
@@ -381,11 +381,20 @@ impl<R: Resources> Process<R> {
         abi: Abi,
         id: NonZeroU32,
         program_break: u64,
-        descriptors: Descriptors<R>,
+        mut descriptors: Descriptors<R>,
         start: Start,
     ) -> Self {
         let open_files = descriptors.limit;
         let futex = start.futex.clone();
+        let mut initial_stdin_carry = Bytes::new();
+        for slot in descriptors.entries.iter_mut().flatten() {
+            if let Descriptor::<R>::Stdin { carry } = &mut slot.descriptor
+                && !carry.is_empty()
+            {
+                initial_stdin_carry = core::mem::take(carry);
+                break;
+            }
+        }
         let robust_list = Arc::new(AtomicU64::new(0));
         let lifecycle = Arc::new(GroupLifecycle {
             threads: spin::Mutex::new(thread::ThreadGroup::new(id, robust_list.clone())),
@@ -399,7 +408,7 @@ impl<R: Resources> Process<R> {
                 futex,
                 descriptors: spin::Mutex::new(descriptors),
                 stdin_lock: RawMutex::new(),
-                stdin_carry: spin::Mutex::new(Bytes::new()),
+                stdin_carry: spin::Mutex::new(initial_stdin_carry),
                 attributes: spin::Mutex::new(system::Attributes::new(start, open_files)),
                 program_break: spin::Mutex::new(memory::ProgramBreak::new(program_break)),
                 threads: lifecycle,
@@ -446,12 +455,13 @@ impl<R: Resources> Process<R> {
         self.shared.threads.changed.poll_notified(cx, waiter)
     }
 
-    /// Condemns the entire thread group from this thread (for a fatal signal
-    /// or unhandled fault) and withdraws this thread from the live set.
-    pub fn terminate_group(&mut self, exit_code: u32) {
+    /// Condemns the entire thread group from this thread (for a fatal signal,
+    /// unhandled fault or owner kill) and withdraws this thread from the live
+    /// set.
+    pub fn terminate_group(&mut self, termination: ChildTermination) {
         let tid = (!self.exited).then_some(self.tid);
         self.exited = true;
-        let broadcast = self.shared.threads.lock().terminate_group(tid, exit_code);
+        let broadcast = self.shared.threads.lock().terminate_group(tid, termination);
         if broadcast {
             self.shared.threads.changed.notify_all();
         }
@@ -683,14 +693,7 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
         }
         return bytes.len() as u64;
     }
-    let mut single = DescriptorSlots::from_entries(alloc::vec![Some(entry)]);
-    io::read::<R, _, _>(
-        &mut single,
-        [0, args[1], args[2], args[3], args[4], args[5]],
-        memory,
-        output,
-    )
-    .await
+    io::read_resource::<R, M>(&entry, args, memory).await
 }
 
 async fn write<R: Resources, M: UserMemory, O: Stdio>(
@@ -896,11 +899,20 @@ mod tests {
         assert_eq!(target, 9);
 
         let original = open_file(&descriptors, fd as i32);
-        original.set_offset(7);
+        original
+            .try_lock_position()
+            .expect("the position lock is free")
+            .set(7);
         for copy in [duplicate as i32, 9] {
             let shared = open_file(&descriptors, copy);
             assert!(shared.same_description(original));
-            assert_eq!(shared.offset(), 7);
+            assert_eq!(
+                shared
+                    .try_lock_position()
+                    .expect("the position lock is free")
+                    .get(),
+                7
+            );
         }
         // Only close-on-exec belongs to the slot.
         assert!(descriptors.get_entry(9).unwrap().close_on_exec);

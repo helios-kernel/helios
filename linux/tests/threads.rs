@@ -486,7 +486,10 @@ fn clone_and_clone3_assign_distinct_tids_share_tgid_and_handle_exit_vs_exit_grou
             ControlFlow::Break(Exit::Group(42))
         );
         assert!(observer.group_ended());
-        assert_eq!(observer.exit_status(), 42);
+        assert_eq!(
+            observer.termination(),
+            helios_unix::ChildTermination::Exited(42)
+        );
         drop(main);
         drop(child1);
         drop(child2);
@@ -908,4 +911,44 @@ fn dispatch_future_is_send() {
         &mut platform,
     ));
     assert_eq!(drive(future), ControlFlow::Continue(1));
+}
+
+#[test]
+fn inherited_stdin_carry_is_delivered_before_requesting_more_input() {
+    let slots =
+        helios_unix::DescriptorSlots::from_entries(vec![Some(helios_linux::syscall::Entry::<
+            NoBacking,
+        >::new(
+            helios_linux::syscall::Descriptor::<NoBacking>::Stdin {
+                carry: bytes::Bytes::from_static("中文 日本語 한국어".as_bytes()),
+            },
+            false,
+        ))]);
+    let mut process = Process::<NoBacking>::with_descriptors(
+        Abi::X86_64,
+        NonZeroU32::new(1).unwrap(),
+        PROGRAM_BREAK,
+        slots,
+        Start::default(),
+    );
+    let mut memory = SharedMemory::new(0x10_000);
+    let mut thread = HostThread::new();
+    let mut platform = Platform::default();
+
+    assert_eq!(
+        drive(dispatch(
+            &mut process,
+            Call {
+                number: number(Abi::X86_64, Operation::Read),
+                arguments: [0, 0x2000, 64, 0, 0, 0],
+            },
+            &mut memory,
+            &mut thread,
+            &mut platform,
+        )),
+        ControlFlow::Continue("中文 日本語 한국어".len() as u64)
+    );
+    let mut out = vec![0u8; "中文 日本語 한국어".len()];
+    memory.read(0x2000, &mut out).unwrap();
+    assert_eq!(out, "中文 日本語 한국어".as_bytes());
 }
