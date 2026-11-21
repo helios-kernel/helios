@@ -28,11 +28,15 @@ where
     pub(super) write_serial: crate::DebugSerialWriter,
     pub(super) imported_memory: Option<SharedMemory>,
     pub(super) current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
+    pub(super) guest_instance: Option<wasmtime::Instance>,
+    #[cfg(test)]
+    pub(super) test_exports: Vec<(Arc<str>, wasmtime::Extern)>,
     pub(super) wasix_abi: bool,
     pub(super) entropy: crate::EntropyPool,
     pub(super) authority: ProcessAuthority,
     pub(super) tty_state: WasixTtyState,
-    pub(super) signal_callback: Option<String>,
+    pub(super) process_signals: WasixProcessSignals,
+    pub(super) active_signal_handlers: helios_unix::SignalSet,
     pub(super) signal_state: WasixSignalState,
     /// Signals raised on this store's thread alone (`thread_signal`),
     /// and the end of its process. Main's is its process table's
@@ -99,6 +103,7 @@ where
         let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
         let cwd = preview1_cwd_from_authority(&authority);
         let tty_state = WasixTtyState::from_authority(&authority);
+        let process_signals = WasixProcessSignals::from_dispositions(&signal_dispositions);
         Self {
             cpu,
             timer,
@@ -123,11 +128,15 @@ where
             write_serial,
             imported_memory,
             current_core_module,
+            guest_instance: None,
+            #[cfg(test)]
+            test_exports: Vec::new(),
             wasix_abi,
             entropy,
             authority,
             tty_state,
-            signal_callback: None,
+            process_signals,
+            active_signal_handlers: helios_unix::SignalSet::EMPTY,
             signal_state,
             thread_signals,
             signal_interval: None,
@@ -163,6 +172,19 @@ where
             helios_unix::ProcessMemoryIdentity::new(self.instance().id().raw()),
             GuestAddress::wasm32(address),
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn define_test_export(&mut self, name: &str, export: wasmtime::Extern) {
+        if let Some((_, slot)) = self
+            .test_exports
+            .iter_mut()
+            .find(|(existing, _)| existing.as_ref() == name)
+        {
+            *slot = export;
+            return;
+        }
+        self.test_exports.push((Arc::from(name), export));
     }
 
     pub(super) fn set_system_time_nanos(&mut self, nanos: u64) -> i32 {
@@ -356,9 +378,25 @@ where
     }
 
     /// The signals this store answers to: its own thread's, ahead of its
-    /// process's.
+    /// process's, resolved through the process image's shared dispositions.
     pub(super) fn signals(&self) -> WasixStoreSignals {
-        WasixStoreSignals::new(self.thread_signals.clone(), self.signal_state.clone())
+        WasixStoreSignals::with_dispositions(
+            self.thread_signals.clone(),
+            self.signal_state.clone(),
+            self.process_signals.clone(),
+        )
+    }
+
+    pub(super) fn with_process_signals(mut self, process_signals: WasixProcessSignals) -> Self {
+        self.process_signals = process_signals;
+        self
+    }
+
+    pub(super) fn has_deliverable_catch(&self) -> bool {
+        self.asyncify.is_idle()
+            && self
+                .signals()
+                .has_deliverable_catch(self.active_signal_handlers)
     }
 
     /// The interrupt callback for this store: where the end of the
@@ -373,7 +411,7 @@ where
     /// the host first meets them where it completes (see
     /// [`crate::component::TurnEpilogue::take_stop`]). The thread's end
     /// comes first, then a signal, then a kill.
-    fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
+    pub(super) fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
         if let Some(stop) = self.signals().owed_stop() {
             return Err(stop);
         }
@@ -430,6 +468,15 @@ where
         exit: WasixChildExit,
     ) {
         self.children.insert(pid, signal_state, exit);
+    }
+
+    /// Returns child `pid`'s signal mailbox if it is still running, recording
+    /// any already-arrived completion in place without reaping it.
+    pub(super) fn live_child_signal_target(&mut self, pid: u32) -> Option<WasixSignalState> {
+        let filesystem = &mut self.filesystem;
+        self.children
+            .poll_signal_target(pid, |layer| filesystem.adopt_root_layer(layer))
+            .cloned()
     }
 
     /// [`WasixChildren::poll_join`] on this store's children, with each
@@ -537,57 +584,19 @@ where
         nonblocking: bool,
         peek: bool,
     ) -> Result<Bytes, i32> {
-        if max_bytes == 0 {
-            return match self.descriptors.get(fd) {
-                Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => Ok(Bytes::new()),
-                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
-                Some(_) => Err(p1::errno::NOTSOCK),
-                None => Err(p1::errno::BADF),
-            };
-        }
-
-        let reader = match self.descriptors.get_mut(fd) {
-            Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })) => {
-                if !carry.is_empty() {
-                    return Ok(if peek {
-                        carry.slice(..carry.len().min(max_bytes))
-                    } else {
-                        take_preview1_carry(carry, max_bytes)
-                    });
-                }
-                if nonblocking {
-                    return match reader.try_read() {
-                        crate::TryRead::Ready(bytes) => {
-                            *carry = bytes;
-                            Ok(if peek {
-                                carry.slice(..carry.len().min(max_bytes))
-                            } else {
-                                take_preview1_carry(carry, max_bytes)
-                            })
-                        }
-                        crate::TryRead::Eof => Ok(Bytes::new()),
-                        crate::TryRead::Pending => Err(p1::errno::AGAIN),
-                    };
-                }
-                reader.clone()
-            }
+        let socket = match self.descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(socket)) if socket.is_pair() => socket.clone(),
             Some(Preview1Descriptor::Socket(_)) => return Err(p1::errno::INVAL),
             Some(_) => return Err(p1::errno::NOTSOCK),
             None => return Err(p1::errno::BADF),
         };
-
-        let bytes = reader.read().await.unwrap_or_default();
-        let Some(Preview1Descriptor::Socket(UnixSocket::Pair { carry, .. })) =
-            self.descriptors.get_mut(fd)
-        else {
-            return Err(p1::errno::BADF);
-        };
-        *carry = bytes;
-        Ok(if peek {
-            carry.slice(..carry.len().min(max_bytes))
-        } else {
-            take_preview1_carry(carry, max_bytes)
-        })
+        socket
+            .recv_pair(max_bytes, nonblocking, peek)
+            .await
+            .map_err(|error| match error {
+                helios_unix::PairRecvError::NotPair => p1::errno::INVAL,
+                helios_unix::PairRecvError::WouldBlock => p1::errno::AGAIN,
+            })
     }
 
     pub(super) fn getcwd(&self) -> Result<&str, i32> {
@@ -1214,10 +1223,10 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "sched_yield",
-            |_caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
                 Box::new(async move {
                     crate::yield_now().await;
-                    p1::errno::SUCCESS
+                    p1_finish_errno_call(&mut caller, p1::errno::SUCCESS).await
                 })
             },
         )
@@ -1239,16 +1248,15 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nwritten): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
-                        p1_fd_write(
-                            &mut caller,
-                            fd,
-                            iovs as u32,
-                            iovs_len as u32,
-                            nwritten as u32,
-                        )
-                        .await,
+                    let answer = p1_fd_write(
+                        &mut caller,
+                        fd,
+                        iovs as u32,
+                        iovs_len as u32,
+                        nwritten as u32,
                     )
+                    .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -1260,10 +1268,10 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nread): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
+                    let answer =
                         p1_fd_read(&mut caller, fd, iovs as u32, iovs_len as u32, nread as u32)
-                            .await,
-                    )
+                            .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -1811,27 +1819,27 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (subscriptions, events, nsubscriptions, nevents): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
-                        p1_poll_oneoff(
-                            &mut caller,
-                            subscriptions as u32,
-                            events as u32,
-                            nsubscriptions as u32,
-                            nevents as u32,
-                        )
-                        .await,
+                    let answer = p1_poll_oneoff(
+                        &mut caller,
+                        subscriptions as u32,
+                        events as u32,
+                        nsubscriptions as u32,
+                        nevents as u32,
                     )
+                    .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "proc_raise",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             signal: i32|
-             -> wasmtime::Result<i32> { p1_proc_raise(&mut caller, signal as u32) },
+             (signal,): (i32,)| {
+                Box::new(async move { p1_proc_raise(&mut caller, signal).await })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -3807,12 +3815,19 @@ where
         if !pass.ready.is_empty() {
             break pass.ready;
         }
+        if caller.data().has_deliverable_catch() {
+            return Ok(p1::errno::INTR);
+        }
 
         // Nothing is ready and no deadline has expired: sleep until one
-        // of the armed descriptors makes progress or the earliest
-        // deadline arrives.
+        // of the armed descriptors makes progress, a caught signal arrives,
+        // or the earliest deadline arrives.
         let timer = caller.data().timer();
-        p1_wait_step(&timer, &mut wait, pass.earliest).await;
+        let signals = caller.data().signals();
+        let active_handlers = caller.data().active_signal_handlers;
+        if p1_wait_step(&timer, &mut wait, pass.earliest, &signals, active_handlers).await {
+            return Ok(p1::errno::INTR);
+        }
     };
 
     // The wait above awaited, so the guest's pages are checked again here,
@@ -4051,19 +4066,234 @@ async fn p1_read_subscriptions(
     Ok(parsed)
 }
 
-pub(super) fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
-    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    signal: u32,
+pub(super) async fn p1_finish_async_call<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    answer: Result<i32, P1Stop>,
 ) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Ok(signal) = u8::try_from(signal) else {
+    let errno = p1_reply(answer)?;
+    wasix_deliver_pending_signals(caller).await?;
+    Ok(errno)
+}
+
+pub(super) async fn p1_finish_errno_call<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    errno: i32,
+) -> wasmtime::Result<i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    wasix_deliver_pending_signals(caller).await?;
+    Ok(errno)
+}
+
+pub(super) fn p1_caller_export<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    name: &str,
+) -> Option<wasmtime::Extern>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if let Some(export) = caller.get_export(name) {
+        return Some(export);
+    }
+    if let Some(instance) = caller.data().guest_instance {
+        return instance.get_export(&mut *caller, name);
+    }
+    #[cfg(test)]
+    {
+        caller
+            .data()
+            .test_exports
+            .iter()
+            .find(|(export_name, _)| export_name.as_ref() == name)
+            .map(|(_, export)| export.clone())
+    }
+    #[cfg(not(test))]
+    None
+}
+
+pub(super) fn p1_store_export<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    name: &str,
+) -> Option<wasmtime::Extern>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if let Some(instance) = store.data().guest_instance {
+        return instance.get_export(&mut *store, name);
+    }
+    #[cfg(test)]
+    {
+        store
+            .data()
+            .test_exports
+            .iter()
+            .find(|(export_name, _)| export_name.as_ref() == name)
+            .map(|(_, export)| export.clone())
+    }
+    #[cfg(not(test))]
+    None
+}
+
+fn missing_catch_fallback_stop(
+    signal: helios_unix::Signal,
+    thread_directed: bool,
+) -> Option<wasmtime::Error> {
+    match signal.default_action() {
+        helios_unix::DefaultSignalAction::Ignore | helios_unix::DefaultSignalAction::Continue => {
+            None
+        }
+        helios_unix::DefaultSignalAction::Terminate
+        | helios_unix::DefaultSignalAction::CoreDump
+        | helios_unix::DefaultSignalAction::Stop => {
+            if thread_directed {
+                Some(wasmtime::Error::new(WasixThreadSignalExit {
+                    signal: signal.raw(),
+                }))
+            } else {
+                Some(wasmtime::Error::new(Preview1SignalExit {
+                    signal: signal.raw(),
+                }))
+            }
+        }
+    }
+}
+
+/// Delivers pending signals at a host-call safe point when asyncify is idle,
+/// invoking the registered `callback_signal` export `(i32) -> ()` for caught
+/// signals and stopping the thread or process on fatal ones.
+pub(super) async fn wasix_deliver_pending_signals<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if !caller.data().asyncify.is_idle() {
+        if let Some(stop) = caller.data().signals().owed_stop() {
+            return Err(stop);
+        }
+        return Ok(());
+    }
+    while caller.data().asyncify.is_idle() {
+        let signals = caller.data().signals();
+        let active = caller.data().active_signal_handlers;
+        match signals.take_next_delivery(active) {
+            None => return Ok(()),
+            Some(WasixPendingDelivery::ThreadEnded) => {
+                return Err(wasmtime::Error::new(WasixThreadEnded));
+            }
+            Some(WasixPendingDelivery::TerminateThread(signal)) => {
+                return Err(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::TerminateProcess(signal)) => {
+                return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed,
+            }) => {
+                let handler = p1_caller_export(caller, &callback)
+                    .and_then(wasmtime::Extern::into_func)
+                    .and_then(|func| func.typed::<i32, ()>(&mut *caller).ok());
+                if let Some(handler) = handler {
+                    caller.data_mut().active_signal_handlers.insert(signal);
+                    let outcome = handler
+                        .call_async(&mut *caller, i32::from(signal.raw()))
+                        .await;
+                    caller.data_mut().active_signal_handlers.remove(signal);
+                    outcome?;
+                } else if let Some(stop) = missing_catch_fallback_stop(signal, thread_directed) {
+                    return Err(stop);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delivers pending signals on `store` after a top-level guest export returns
+/// cleanly with asyncify idle.
+pub(super) async fn wasix_deliver_pending_signals_on_store<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    while store.data().asyncify.is_idle() {
+        let signals = store.data().signals();
+        let active = store.data().active_signal_handlers;
+        match signals.take_next_delivery(active) {
+            None => return Ok(()),
+            Some(WasixPendingDelivery::ThreadEnded) => {
+                return Err(wasmtime::Error::new(WasixThreadEnded));
+            }
+            Some(WasixPendingDelivery::TerminateThread(signal)) => {
+                return Err(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::TerminateProcess(signal)) => {
+                return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed,
+            }) => {
+                let handler = p1_store_export(store, &callback)
+                    .and_then(wasmtime::Extern::into_func)
+                    .and_then(|func| func.typed::<i32, ()>(&mut *store).ok());
+                if let Some(handler) = handler {
+                    store.data_mut().active_signal_handlers.insert(signal);
+                    let turns = store.data().guest_turns();
+                    let outcome = interrupts
+                        .drive(
+                            turns.drive(handler.call_async(&mut *store, i32::from(signal.raw()))),
+                        )
+                        .await;
+                    store.data_mut().active_signal_handlers.remove(signal);
+                    outcome?;
+                } else if let Some(stop) = missing_catch_fallback_stop(signal, thread_directed) {
+                    return Err(stop);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    signal: i32,
+) -> wasmtime::Result<i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if !(0..=31).contains(&signal) {
         return Ok(p1::errno::INVAL);
-    };
-    Err(wasmtime::Error::new(Preview1SignalExit { signal }))
+    }
+    if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+        caller.data().signal_state.raise(signal);
+    }
+    wasix_deliver_pending_signals(caller).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) fn p1_errno_from_wasmtime_error(error: &wasmtime::Error) -> i32 {
@@ -4147,12 +4377,12 @@ where
         return Err(status);
     }
     let (listener, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
-            listener,
-            family,
-            ..
-        }))) => (listener.id(), *family),
-        Some(Preview1Descriptor::Socket(_)) => return Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Listening {
+                listener, family, ..
+            }) => (listener.id(), family),
+            _ => return Err(p1::errno::INVAL),
+        },
         Some(_) => return Err(p1::errno::NOTSOCK),
         None => return Err(p1::errno::BADF),
     };
@@ -4168,7 +4398,7 @@ where
         .tcp_accept(listener, timeout)
         .await
         .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
-    let descriptor = Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+    let descriptor = Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
         family,
         stream: OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), accepted.stream),
         peer_address: accepted.address,
@@ -4191,11 +4421,10 @@ where
     StorageImpl: crate::Storage,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-            stream,
-            ..
-        }))) => Ok(stream.id()),
-        Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Connected { stream, .. }) => Ok(stream.id()),
+            _ => Err(p1::errno::INVAL),
+        },
         Some(_) => Err(p1::errno::NOTSOCK),
         None => Err(p1::errno::BADF),
     }
@@ -4265,7 +4494,7 @@ where
     let fdflags = caller.data().descriptors.fdflags(fd)?;
     if matches!(
         caller.data().descriptors.get(fd),
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. }))
+        Some(Preview1Descriptor::Socket(socket)) if socket.is_pair()
     ) {
         let bytes = caller
             .data_mut()
@@ -4279,11 +4508,10 @@ where
         return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
     }
     let stream = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-            stream,
-            ..
-        }))) => stream.id(),
-        Some(Preview1Descriptor::Socket(_)) => return Ok(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Connected { stream, .. }) => stream.id(),
+            _ => return Ok(p1::errno::INVAL),
+        },
         Some(_) => return Ok(p1::errno::NOTSOCK),
         None => return Ok(p1::errno::BADF),
     };
@@ -4400,7 +4628,9 @@ where
     let layout = p1_read_iovs_with_byte_len(&memory, si_data, si_data_len).await?;
     let mut gather = Preview1Gather::new(&memory, &layout)?;
     let descriptor = caller.data().descriptors.get(fd).cloned();
-    if let Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })) = descriptor {
+    if let Some(Preview1Descriptor::Socket(socket)) = &descriptor
+        && let Some(writer) = socket.pair_writer()
+    {
         let fdflags = caller.data().descriptors.fdflags(fd)?;
         let written = p1_send_gathered(&memory, &mut gather, |chunk| {
             p1_send_to_socketpair(&writer, chunk, fdflags)
@@ -4409,10 +4639,13 @@ where
         memory.write_u32(so_datalen, written).await?;
         return Ok(p1::errno::SUCCESS);
     }
-    let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-        stream, ..
-    }))) = &descriptor
-    else {
+    let Some(stream_id) = (match &descriptor {
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Connected { stream, .. }) => Some(stream.id()),
+            _ => None,
+        },
+        _ => None,
+    }) else {
         return Ok(p1_connected_tcp_stream(caller, fd)
             .err()
             .unwrap_or(p1::errno::INVAL));
@@ -4431,7 +4664,7 @@ where
         u64::MAX
     };
     let written = p1_send_gathered(&memory, &mut gather, |chunk| {
-        let (service, stream) = (&service, stream.id());
+        let (service, stream) = (&service, stream_id);
         async move {
             service
                 .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
@@ -4459,65 +4692,70 @@ where
     }
     let descriptor = caller.data().descriptors.get(fd).cloned();
     match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected { .. }))) => {
-            let status = caller.data().require_tcp_authority();
-            if status != p1::errno::SUCCESS {
-                return status;
+        Some(Preview1Descriptor::Socket(socket)) => {
+            if let Some(tcp) = socket.tcp_state() {
+                if !matches!(tcp, UnixTcpSocket::Connected { .. }) {
+                    return p1::errno::INVAL;
+                }
+                let status = caller.data().require_tcp_authority();
+                if status != p1::errno::SUCCESS {
+                    return status;
+                }
+                if caller.data().runtime_state.network_service().is_none() {
+                    return p1::errno::NETDOWN;
+                }
+                // Replacing the state drops this socket's handle, and the
+                // stream is retired once the last duplicate is gone.
+                socket
+                    .with_tcp_mut(|slot| {
+                        if !matches!(slot, UnixTcpSocket::Connected { .. }) {
+                            return p1::errno::INVAL;
+                        }
+                        let options = *slot.options();
+                        *slot = UnixTcpSocket::Unconnected {
+                            family: slot.family(),
+                            options,
+                        };
+                        p1::errno::SUCCESS
+                    })
+                    .unwrap_or(p1::errno::INVAL)
+            } else if let Some(udp) = socket.udp_state() {
+                if !matches!(udp, UnixUdpSocket::Bound { .. }) {
+                    return p1::errno::INVAL;
+                }
+                let status = caller.data().require_udp_authority();
+                if status != p1::errno::SUCCESS {
+                    return status;
+                }
+                if caller.data().runtime_state.network_service().is_none() {
+                    return p1::errno::NETDOWN;
+                }
+                // Replacing the state drops this socket's handle, and the
+                // socket is retired once the last duplicate is gone.
+                socket
+                    .with_udp_mut(|slot| {
+                        if !matches!(slot, UnixUdpSocket::Bound { .. }) {
+                            return p1::errno::INVAL;
+                        }
+                        let options = *slot.options();
+                        *slot = UnixUdpSocket::Unbound {
+                            family: slot.family(),
+                            options,
+                        };
+                        p1::errno::SUCCESS
+                    })
+                    .unwrap_or(p1::errno::INVAL)
+            } else if let Some((reader, writer)) = socket.pair_ends() {
+                if how & P1_SDFLAGS_RD != 0 {
+                    reader.close();
+                }
+                if how & P1_SDFLAGS_WR != 0 {
+                    writer.close();
+                }
+                p1::errno::SUCCESS
+            } else {
+                p1::errno::INVAL
             }
-            if caller.data().runtime_state.network_service().is_none() {
-                return p1::errno::NETDOWN;
-            }
-            let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                return p1::errno::BADF;
-            };
-            // Replacing the slot drops this descriptor's handle, and the
-            // stream is retired once the last one is gone.
-            let options = *slot.options();
-            *slot = UnixTcpSocket::Unconnected {
-                family: slot.family(),
-                options,
-            };
-            p1::errno::SUCCESS
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            ..
-        }))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound { .. }))) => {
-            let status = caller.data().require_udp_authority();
-            if status != p1::errno::SUCCESS {
-                return status;
-            }
-            if caller.data().runtime_state.network_service().is_none() {
-                return p1::errno::NETDOWN;
-            }
-            let Some(Preview1Descriptor::Socket(UnixSocket::Udp(slot))) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                return p1::errno::BADF;
-            };
-            // Replacing the slot drops this descriptor's handle, and the
-            // socket is retired once the last one is gone.
-            let options = *slot.options();
-            *slot = UnixUdpSocket::Unbound {
-                family: slot.family(),
-                options,
-            };
-            p1::errno::SUCCESS
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound { .. }))) => {
-            p1::errno::INVAL
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, writer, .. })) => {
-            if how & P1_SDFLAGS_RD != 0 {
-                reader.close();
-            }
-            if how & P1_SDFLAGS_WR != 0 {
-                writer.close();
-            }
-            p1::errno::SUCCESS
         }
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -5312,7 +5550,7 @@ mod tests {
         stream: Net::TcpStream,
     ) -> Preview1DescriptorEntry<Net> {
         Preview1DescriptorEntry::new(
-            Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+            Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
                 family: SocketFamily::Ipv4,
                 stream: OwnedTcpStream::new(crate::UnixNetwork::new(service), stream),
                 peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
@@ -5330,7 +5568,7 @@ mod tests {
         listener: Net::TcpListener,
     ) -> Preview1DescriptorEntry<Net> {
         Preview1DescriptorEntry::new(
-            Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
+            Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Listening {
                 family: SocketFamily::Ipv4,
                 listener: OwnedTcpListener::new(crate::UnixNetwork::new(service), listener),
                 local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
@@ -5528,7 +5766,7 @@ mod tests {
         socket: Net::UdpSocket,
     ) -> Preview1DescriptorEntry<Net> {
         Preview1DescriptorEntry::new(
-            Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
+            Preview1Descriptor::Socket(UnixSocket::from_udp(UnixUdpSocket::Bound {
                 family: SocketFamily::Ipv4,
                 socket: OwnedUdpSocket::new(crate::UnixNetwork::new(service), socket),
                 local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
@@ -5585,7 +5823,7 @@ mod tests {
     }
 
     fn connected_socket() -> Preview1Descriptor<crate::test_support::TestNetworkService> {
-        Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+        Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
             family: SocketFamily::Ipv4,
             stream: OwnedTcpStream::new(
                 crate::UnixNetwork::new(crate::test_support::test_network_service()),
@@ -5805,7 +6043,7 @@ mod tests {
         // The last host call is where the program is signalled; it
         // returns without suspending, and so does the export.
         let call = core::future::poll_fn(move |_| {
-            sender.raise(15);
+            sender.raise(helios_unix::Signal::SIGTERM);
             core::task::Poll::Ready(Ok(()))
         });
 
@@ -5861,7 +6099,7 @@ mod tests {
         let mut driven = core::pin::pin!(turns.drive(call));
 
         assert!(driven.as_mut().poll(&mut cx).is_pending());
-        signal_state.raise(9);
+        signal_state.raise(helios_unix::Signal::SIGKILL);
         assert_eq!(
             registry.request_kill(
                 instance.id(),
@@ -5922,7 +6160,7 @@ mod tests {
 
         assert!(caller_call.as_mut().poll(&mut caller_cx).is_pending());
         assert!(target_call.as_mut().poll(&mut target_cx).is_pending());
-        target_thread.raise(9);
+        target_thread.raise(helios_unix::Signal::SIGKILL);
 
         assert_eq!(
             caller_wakes.wakes.load(AtomicOrdering::Acquire),
@@ -5970,8 +6208,8 @@ mod tests {
         let process = WasixSignalState::new();
         let thread = WasixSignalState::new();
         let signals = WasixStoreSignals::new(thread.clone(), process.clone());
-        process.raise(15);
-        thread.raise(9);
+        process.raise(helios_unix::Signal::SIGTERM);
+        thread.raise(helios_unix::Signal::SIGKILL);
 
         let stop = signals.owed_stop().expect("a raised thread owes a stop");
         assert_eq!(
@@ -6010,7 +6248,7 @@ mod tests {
         let signal_state = WasixSignalState::new();
         let sender = signal_state.clone();
         let call = core::future::poll_fn(move |_| {
-            sender.raise(2);
+            sender.raise(helios_unix::Signal::SIGINT);
             assert_eq!(
                 registry.request_kill(
                     instance.id(),

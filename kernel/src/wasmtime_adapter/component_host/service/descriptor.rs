@@ -78,15 +78,24 @@ impl WasixChildren {
         });
     }
 
-    /// The signal mailbox of child `pid` while it can still take a
-    /// signal: `None` for a pid that names no child and for a child
-    /// whose completion has been seen.
-    pub(super) fn signal_target(&self, pid: u32) -> Option<&WasixSignalState> {
-        self.children
-            .iter()
-            .find(|child| child.pid == pid)
-            .filter(|child| matches!(child.state, WasixChildState::Running(_)))
-            .map(|child| &child.signal_state)
+    /// The signal mailbox of child `pid` while it is still running: `None`
+    /// for a pid that names no child and for a child whose completion has
+    /// already arrived on its exit channel. Any completion observed here is
+    /// recorded in place without reaping the child, so a subsequent
+    /// [`Self::poll_join`] still reports its termination or launch error.
+    pub(super) fn poll_signal_target(
+        &mut self,
+        pid: u32,
+        mut adopt: impl FnMut(MemoryFs),
+    ) -> Option<&WasixSignalState> {
+        let child = self.children.iter_mut().find(|child| child.pid == pid)?;
+        if let WasixChildState::Running(exit) = &mut child.state {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            if let Poll::Ready(result) = Pin::new(exit).poll(&mut cx) {
+                child.state = WasixChildState::Completed(child_exit_outcome(result, &mut adopt));
+            }
+        }
+        matches!(child.state, WasixChildState::Running(_)).then_some(&child.signal_state)
     }
 
     /// Joins the child `pid` names, or any child for `None`.
@@ -172,6 +181,106 @@ pub(super) struct WasixSignalDisposition {
 pub(super) enum WasixSignalDispositionAction {
     Default,
     Ignore,
+}
+
+/// Process-wide WASIX signal state shared by every thread of one process
+/// image: the initial `Ignore` set inherited from spawn or exec plus the guest
+/// handler export registered through `callback_signal`, if any.
+///
+/// # Concurrency
+///
+/// Any thread of the process may register or clear `callback_signal`, and any
+/// thread's store may sample the state at an interrupt check, turn epilogue,
+/// or safe point. Every caller runs in task context (never an interrupt
+/// handler), copies an 8-byte [`helios_unix::SignalSet`] and optional
+/// [`Arc<str>`] under the spin lock, and drops the guard before any `.await`
+/// or guest call.
+#[derive(Clone, Default)]
+pub(super) struct WasixProcessSignals {
+    inner: Arc<Mutex<WasixProcessSignalsState>>,
+}
+
+#[derive(Default)]
+struct WasixProcessSignalsState {
+    ignored: helios_unix::SignalSet,
+    callback: Option<Arc<str>>,
+}
+
+impl WasixProcessSignals {
+    pub(super) fn from_dispositions(dispositions: &[WasixSignalDisposition]) -> Self {
+        let mut ignored = helios_unix::SignalSet::EMPTY;
+        for disposition in dispositions {
+            let Some(signal) = helios_unix::Signal::from_standard(disposition.signal) else {
+                continue;
+            };
+            if signal.is_uncatchable() {
+                continue;
+            }
+            match disposition.action {
+                WasixSignalDispositionAction::Ignore => ignored.insert(signal),
+                WasixSignalDispositionAction::Default => {
+                    ignored.remove(signal);
+                }
+            }
+        }
+        Self {
+            inner: Arc::new(Mutex::new(WasixProcessSignalsState {
+                ignored,
+                callback: None,
+            })),
+        }
+    }
+
+    pub(super) fn set_callback(&self, callback: Option<Arc<str>>) {
+        self.inner.lock().callback = callback;
+    }
+
+    pub(super) fn callback(&self) -> Option<Arc<str>> {
+        self.inner.lock().callback.clone()
+    }
+
+    fn summary(&self) -> (helios_unix::SignalSet, bool) {
+        let state = self.inner.lock();
+        (state.ignored, state.callback.is_some())
+    }
+
+    fn snapshot(&self) -> (helios_unix::SignalSet, Option<Arc<str>>) {
+        let state = self.inner.lock();
+        (state.ignored, state.callback.clone())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WasixResolvedAction<H> {
+    Ignore,
+    Catch(H),
+    Terminate,
+}
+
+fn resolve_wasix_signal<H: Copy>(
+    signal: helios_unix::Signal,
+    ignored: helios_unix::SignalSet,
+    callback: Option<H>,
+) -> WasixResolvedAction<H> {
+    let disposition = if ignored.contains(signal) {
+        helios_unix::SignalDisposition::Ignore
+    } else if let Some(handler) = callback {
+        helios_unix::SignalDisposition::Catch(handler)
+    } else {
+        helios_unix::SignalDisposition::Default
+    };
+    match signal.resolve(disposition) {
+        helios_unix::ResolvedSignal::Ignore
+        | helios_unix::ResolvedSignal::Default(
+            helios_unix::DefaultSignalAction::Ignore | helios_unix::DefaultSignalAction::Continue,
+        ) => WasixResolvedAction::Ignore,
+        helios_unix::ResolvedSignal::Catch(handler) => WasixResolvedAction::Catch(handler),
+        helios_unix::ResolvedSignal::Default(
+            helios_unix::DefaultSignalAction::Terminate
+            | helios_unix::DefaultSignalAction::CoreDump
+            | helios_unix::DefaultSignalAction::Stop,
+        ) => WasixResolvedAction::Terminate,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -318,26 +427,30 @@ impl P1WaitSet {
     }
 }
 
-/// Sleep until a watched descriptor wakes us, the re-probe cadence elapses,
-/// or `remaining` runs out.
+/// Sleep until a watched descriptor wakes us, a catchable handled signal
+/// arrives, the re-probe cadence elapses, or `remaining` runs out.
 ///
 /// The caller re-probes after every step, so this only has to guarantee that
 /// it yields control and comes back when something might have changed.
 /// `remaining` of `None` means "no deadline": block until a descriptor makes
-/// progress.
+/// progress or a handled signal interrupts the wait.
 pub(super) async fn p1_wait_step<CpuImpl>(
     timer: &crate::Timer<CpuImpl>,
     wait: &mut P1WaitSet,
     remaining: Option<Duration>,
-) where
+    signals: &WasixStoreSignals,
+    active_handlers: helios_unix::SignalSet,
+) -> bool
+where
     CpuImpl: Cpu + Clone,
 {
+    let mut catch_signal = core::pin::pin!(signals.wait_for_catch_signal(active_handlers));
     if wait.is_empty() && remaining.is_none() {
         // Nothing subscribed can ever become ready and no deadline will end
-        // the call. Park rather than spin; the task is dropped with the
-        // instance.
-        core::future::pending::<()>().await;
-        return;
+        // the call; only a caught signal (or a fatal stop on the outer turn)
+        // can wake it.
+        catch_signal.await;
+        return true;
     }
 
     // A descriptor without a wakeup source needs us back on a fixed cadence;
@@ -347,36 +460,56 @@ pub(super) async fn p1_wait_step<CpuImpl>(
         (true, None) => P1_READINESS_REPOLL_INTERVAL,
         (false, Some(remaining)) => remaining,
         (false, None) => {
-            // Every subscribed descriptor can wake us, so wait on them alone.
+            // Every subscribed descriptor can wake us, so wait on them and
+            // any caught signal.
             let targets = &mut wait.notified;
-            core::future::poll_fn(|cx| poll_epoll_wait_targets(targets, cx)).await;
-            return;
+            return core::future::poll_fn(|cx| {
+                if catch_signal.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                if poll_epoll_wait_targets(targets, cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                Poll::Pending
+            })
+            .await;
         }
     };
 
     if sleep.is_zero() {
-        return;
+        return signals.has_deliverable_catch(active_handlers);
     }
 
     let mut timer = core::pin::pin!(timer.sleep_for(sleep));
     if wait.notified.is_empty() {
-        timer.await;
-        return;
+        return core::future::poll_fn(|cx| {
+            if catch_signal.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(true);
+            }
+            if timer.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(false);
+            }
+            Poll::Pending
+        })
+        .await;
     }
 
-    // Race the wakeup sources against the sleep: whichever comes first ends
-    // this step and sends the caller back to re-probe.
+    // Race the wakeup sources against the sleep and caught signals: whichever
+    // comes first ends this step and sends the caller back to re-probe.
     let targets = &mut wait.notified;
     core::future::poll_fn(|cx| {
+        if catch_signal.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(true);
+        }
         if poll_epoll_wait_targets(targets, cx).is_ready() {
-            return Poll::Ready(());
+            return Poll::Ready(false);
         }
         if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(());
+            return Poll::Ready(false);
         }
         Poll::Pending
     })
-    .await;
+    .await
 }
 
 /// Register whatever wakes `fd` into `wait`.
@@ -401,16 +534,27 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
                 wait: reader.wait_state(),
             });
         }
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. }))
-            if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
-        {
-            wait.notified.push(EpollWaitTarget::ByteReader {
-                reader: reader.clone(),
-                wait: reader.wait_state(),
-            });
+        Some(Preview1Descriptor::Socket(socket)) => {
+            if let Some((reader, carry_len)) = socket.pair_read_probe() {
+                if event_type == P1_EVENTTYPE_FD_READ && carry_len == 0 {
+                    wait.notified.push(EpollWaitTarget::ByteReader {
+                        reader: reader.clone(),
+                        wait: reader.wait_state(),
+                    });
+                } else if event_type == P1_EVENTTYPE_FD_WRITE
+                    && let Some(writer) = socket.pair_writer()
+                    && !writer.is_writable()
+                {
+                    wait.notified.push(EpollWaitTarget::ByteWriter {
+                        writer: writer.clone(),
+                        wait: writer.wait_state(),
+                    });
+                }
+            } else if socket.handle().is_some() {
+                wait.repoll = true;
+            }
         }
         Some(Preview1Descriptor::PipeWrite { writer })
-        | Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. }))
             if event_type == P1_EVENTTYPE_FD_WRITE && !writer.is_writable() =>
         {
             wait.notified.push(EpollWaitTarget::ByteWriter {
@@ -450,10 +594,6 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
                 crate::ComponentInputRoute::Closed => {}
             }
         }
-        Some(Preview1Descriptor::Socket(
-            UnixSocket::Tcp(UnixTcpSocket::Connected { .. } | UnixTcpSocket::Listening { .. })
-            | UnixSocket::Udp(UnixUdpSocket::Bound { .. }),
-        )) => wait.repoll = true,
         _ => {}
     }
 }
@@ -655,44 +795,193 @@ pub(super) fn preview1_process_end(
     Ok(helios_unix::ChildTermination::Trapped)
 }
 
+/// Next safe-point signal action claimed from a store's mailboxes.
+pub(super) enum WasixPendingDelivery {
+    ThreadEnded,
+    TerminateThread(u8),
+    TerminateProcess(u8),
+    Catch {
+        signal: helios_unix::Signal,
+        callback: Arc<str>,
+        thread_directed: bool,
+    },
+}
+
 /// The signals one store answers to: those raised on its own thread and
-/// those raised on its process. A thread-directed raise reaches only this
+/// those raised on its process, resolved through the process's shared
+/// [`WasixProcessSignals`]. A thread-directed raise reaches only this
 /// store's turn; a process-directed one goes to whichever store of the
 /// process takes it first.
 ///
 /// # Concurrency
 ///
-/// As [`WasixSignalState`]: either mailbox is raised from any processor,
-/// and one turn of this store at a time takes.
+/// As [`WasixSignalState`] and [`WasixProcessSignals`]: either mailbox is
+/// raised from any processor, dispositions are sampled under a short
+/// task-context spin lock never held across `.await`, and atomic bitmask
+/// compare-exchange ensures each signal is claimed once.
 #[derive(Clone)]
 pub(super) struct WasixStoreSignals {
     thread: WasixSignalState,
     process: WasixSignalState,
+    dispositions: WasixProcessSignals,
 }
 
 impl WasixStoreSignals {
+    #[cfg(test)]
     pub(super) fn new(thread: WasixSignalState, process: WasixSignalState) -> Self {
-        Self { thread, process }
+        Self::with_dispositions(thread, process, WasixProcessSignals::default())
     }
 
-    /// The stop this store owes its guest, if any: the end of its
-    /// thread's process, which stays owed, then a pending signal, which
-    /// is delivered once. The interrupt callback and the turn both read
-    /// it, so a running guest and a suspended one meet the same stop.
+    pub(super) fn with_dispositions(
+        thread: WasixSignalState,
+        process: WasixSignalState,
+        dispositions: WasixProcessSignals,
+    ) -> Self {
+        Self {
+            thread,
+            process,
+            dispositions,
+        }
+    }
+
+    /// The fatal stop this store owes its guest now, if any: the end of its
+    /// thread's process, which stays owed, then a pending signal whose
+    /// disposition is to terminate. Ignored signals are dropped in place and
+    /// caught signals stay pending in the bitmask until the next safe point.
     pub(super) fn owed_stop(&self) -> Option<wasmtime::Error> {
         if self.thread.thread_ended() {
             return Some(wasmtime::Error::new(WasixThreadEnded));
         }
-        if let Some(signal) = self.thread.take_pending() {
+        let (ignored, has_callback) = self.dispositions.summary();
+        let classify = |signal: helios_unix::Signal| match resolve_wasix_signal(
+            signal,
+            ignored,
+            has_callback.then_some(()),
+        ) {
+            WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Retain,
+            WasixResolvedAction::Terminate => helios_unix::SignalSweep::Take,
+        };
+        if let Some(signal) = self.thread.sweep_pending(classify) {
             return Some(wasmtime::Error::new(WasixThreadSignalExit {
-                signal: u8::try_from(signal).unwrap_or(u8::MAX),
+                signal: signal.raw(),
             }));
         }
-        self.process.take_pending().map(|signal| {
+        self.process.sweep_pending(classify).map(|signal| {
             wasmtime::Error::new(Preview1SignalExit {
-                signal: u8::try_from(signal).unwrap_or(u8::MAX),
+                signal: signal.raw(),
             })
         })
+    }
+
+    /// Claims the next deliverable action at a safe point, prioritizing fatal
+    /// signals ahead of caught handlers and skipping caught signals already
+    /// masked in `active_handlers` while their own callback runs.
+    pub(super) fn take_next_delivery(
+        &self,
+        active_handlers: helios_unix::SignalSet,
+    ) -> Option<WasixPendingDelivery> {
+        if self.thread.thread_ended() {
+            return Some(WasixPendingDelivery::ThreadEnded);
+        }
+        let (ignored, callback) = self.dispositions.snapshot();
+        let has_callback = callback.is_some();
+        let classify_fatal = |signal: helios_unix::Signal| match resolve_wasix_signal(
+            signal,
+            ignored,
+            has_callback.then_some(()),
+        ) {
+            WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Retain,
+            WasixResolvedAction::Terminate => helios_unix::SignalSweep::Take,
+        };
+        if let Some(signal) = self.thread.sweep_pending(classify_fatal) {
+            return Some(WasixPendingDelivery::TerminateThread(signal.raw()));
+        }
+        if let Some(signal) = self.process.sweep_pending(classify_fatal) {
+            return Some(WasixPendingDelivery::TerminateProcess(signal.raw()));
+        }
+        let callback = callback?;
+        let classify_catch =
+            |signal: helios_unix::Signal| match resolve_wasix_signal(signal, ignored, Some(())) {
+                WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+                WasixResolvedAction::Terminate => helios_unix::SignalSweep::Retain,
+                WasixResolvedAction::Catch(()) if active_handlers.contains(signal) => {
+                    helios_unix::SignalSweep::Retain
+                }
+                WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Take,
+            };
+        if let Some(signal) = self.thread.sweep_pending(classify_catch) {
+            return Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed: true,
+            });
+        }
+        self.process
+            .sweep_pending(classify_catch)
+            .map(|signal| WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed: false,
+            })
+    }
+
+    /// Sweeps any ignored signals and reports whether an unmasked caught
+    /// signal is waiting for safe-point delivery.
+    pub(super) fn has_deliverable_catch(&self, active_handlers: helios_unix::SignalSet) -> bool {
+        if self.thread.thread_ended() {
+            return false;
+        }
+        let (ignored, has_callback) = self.dispositions.summary();
+        let drop_ignored = |signal: helios_unix::Signal| match resolve_wasix_signal(
+            signal,
+            ignored,
+            has_callback.then_some(()),
+        ) {
+            WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) | WasixResolvedAction::Terminate => {
+                helios_unix::SignalSweep::Retain
+            }
+        };
+        let _ = self.thread.sweep_pending(drop_ignored);
+        let _ = self.process.sweep_pending(drop_ignored);
+        if !has_callback {
+            return false;
+        }
+        let mut candidates = self
+            .thread
+            .pending_set()
+            .union(self.process.pending_set())
+            .difference(active_handlers);
+        while let Some(signal) = candidates.take_first() {
+            if matches!(
+                resolve_wasix_signal(signal, ignored, Some(())),
+                WasixResolvedAction::Catch(())
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Waits until an unmasked caught signal is ready for safe-point delivery,
+    /// arming its broadcast waiter before inspecting the mailboxes.
+    pub(super) async fn wait_for_catch_signal(&self, active_handlers: helios_unix::SignalSet) {
+        use crate::component::StopWake as _;
+
+        let mut wait = self.arm_stop_wait();
+        core::future::poll_fn(|cx| {
+            loop {
+                if self.has_deliverable_catch(active_handlers) {
+                    return Poll::Ready(());
+                }
+                if self.poll_stop_wait(cx, &mut wait).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+        })
+        .await;
     }
 }
 
@@ -1381,13 +1670,13 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
                 P1Readiness::Pending
             })
         }
-        (
-            Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })),
-            P1_EVENTTYPE_FD_READ,
-        ) => {
-            if !carry.is_empty() {
+        (Some(Preview1Descriptor::Socket(socket)), P1_EVENTTYPE_FD_READ) if socket.is_pair() => {
+            let Some((reader, carry_len)) = socket.pair_read_probe() else {
+                return Err(p1::errno::INVAL);
+            };
+            if carry_len != 0 {
                 return local(P1Readiness::Ready {
-                    bytes: carry.len() as u64,
+                    bytes: carry_len as u64,
                 });
             }
             // `is_readable` covers queued bytes and a closed writer alike;
@@ -1424,11 +1713,19 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // guest that polls for `POLLOUT` sleeps instead of spinning on a
         // full pipe. `is_writable` also covers a vanished peer, where the
         // write itself reports the error.
-        (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE)
-        | (
-            Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })),
-            P1_EVENTTYPE_FD_WRITE,
-        ) => {
+        (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE) => {
+            if writer.is_writable() {
+                local(P1Readiness::Ready {
+                    bytes: usize::MAX as u64,
+                })
+            } else {
+                local(P1Readiness::Pending)
+            }
+        }
+        (Some(Preview1Descriptor::Socket(socket)), P1_EVENTTYPE_FD_WRITE) if socket.is_pair() => {
+            let Some(writer) = socket.pair_writer() else {
+                return Err(p1::errno::INVAL);
+            };
             if writer.is_writable() {
                 local(P1Readiness::Ready {
                     bytes: usize::MAX as u64,
@@ -1454,11 +1751,9 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // progress; it is not an error to poll it, it simply never becomes
         // ready.
         (
-            Some(Preview1Descriptor::Socket(
-                socket @ (UnixSocket::<Net>::Tcp(_) | UnixSocket::<Net>::Udp(_)),
-            )),
+            Some(Preview1Descriptor::Socket(socket)),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => match socket.handle() {
+        ) if !socket.is_pair() => match socket.handle() {
             Some(handle) => Ok(P1Probe::Network(handle)),
             None => local(P1Readiness::Pending),
         },

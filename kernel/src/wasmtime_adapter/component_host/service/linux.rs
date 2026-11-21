@@ -695,7 +695,7 @@ where
     if let Some(signal) = shared.signal_state.take_pending() {
         process.terminate_group(helios_unix::ChildTermination::Signaled(
             helios_unix::SignalTermination {
-                signal: u8::try_from(signal).unwrap_or(u8::MAX),
+                signal: signal.raw(),
                 core_dumped: false,
             },
         ));
@@ -1081,7 +1081,7 @@ where
         {
             observer.terminate_group(helios_unix::ChildTermination::Signaled(
                 helios_unix::SignalTermination {
-                    signal: u8::try_from(signal).unwrap_or(u8::MAX),
+                    signal: signal.raw(),
                     core_dumped: false,
                 },
             ));
