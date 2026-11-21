@@ -1389,7 +1389,7 @@ where
         Ok(cwd) => cwd,
         Err(errno) => return errno,
     };
-    let needed = match wasix_getcwd_required_len(cwd) {
+    let needed = match wasix_getcwd_required_len(&cwd) {
         Ok(needed) => needed,
         Err(errno) => return errno,
     };
@@ -1974,7 +1974,7 @@ where
         .inspect_err(|error| trace.exit_error(error))
         .map_err(wasmtime::Error::new)?;
     let exec_context = caller.data().exec_context();
-    let authority = caller.data().authority.clone();
+    let authority = caller.data().effective_authority();
     let descriptors = caller.data().descriptors.clone_for_exec();
     let filesystem = Some(caller.data().filesystem.clone());
     let signal_state = caller.data().signal_state.clone();
@@ -2178,7 +2178,7 @@ where
         if chroot {
             return Ok(launch_exit_errno(&trace, p1::errno::INVAL));
         }
-        caller.data().authority.clone()
+        caller.data().effective_authority()
     } else {
         let preopen = match wasix_read_exec_string(&memory, preopen, preopen_len).await {
             Ok(preopen) => preopen,
@@ -2311,7 +2311,8 @@ where
     let mut chroot_entry = None;
     for entry in wasix_split_lines(preopen) {
         let store = caller.data();
-        let guest_name = wasix_proc_spawn_preopen_guest_name(store.cwd.as_ref(), &entry)?;
+        let cwd = store.cwd.get();
+        let guest_name = wasix_proc_spawn_preopen_guest_name(cwd.as_ref(), &entry)?;
         let (source_path, flags) = store.resolve_absolute_guest_path(&guest_name)?;
         wasix_require_directory(&namespace, &source_path).await?;
         let store = caller.data();
@@ -2628,11 +2629,7 @@ where
     let (pid, ret_status) = (GuestAddress::wasm32(pid), GuestAddress::wasm32(ret_status));
     let requested_pid = wasix_read_option_pid(&memory, pid).await?;
     let joined = if flags & WASIX_JOIN_FLAG_NON_BLOCKING != 0 {
-        let polled = caller.data_mut().poll_child_join(
-            requested_pid,
-            &mut Context::from_waker(futures::task::noop_waker_ref()),
-        );
-        match polled {
+        match caller.data_mut().try_child_join(requested_pid) {
             Poll::Ready(joined) => joined,
             Poll::Pending => {
                 crate::yield_now().await;
@@ -2640,13 +2637,18 @@ where
             }
         }
     } else {
+        let (mut children_wait, _join_guard) = caller.data().children.begin_blocking_join();
         let signals = caller.data().signals();
         let active_handlers = caller.data().active_signal_handlers;
         let mut catch_wait = core::pin::pin!(signals.wait_for_catch_signal(active_handlers));
         let outcome = core::future::poll_fn(|cx| {
             // Check already-completed children first so a completed child is
             // never left unjoined when a caught signal is also pending.
-            if let Poll::Ready(joined) = caller.data_mut().poll_child_join(requested_pid, cx) {
+            if let Poll::Ready(joined) =
+                caller
+                    .data_mut()
+                    .poll_child_join(requested_pid, cx, &mut children_wait)
+            {
                 return Poll::Ready(Ok(joined));
             }
             if catch_wait.as_mut().poll(cx).is_ready() {
@@ -2991,12 +2993,12 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let cwd = caller
-        .data()
-        .cwd
-        .as_ref()
-        .map(|cwd| cwd.guest_name.as_str());
-    let candidate = wasix_search_path_candidate(cwd, directory, name)?;
+    let cwd = caller.data().cwd.get();
+    let candidate = wasix_search_path_candidate(
+        cwd.as_ref().map(|cwd| cwd.guest_name.as_str()),
+        directory,
+        name,
+    )?;
     wasix_prepare_program_from_guest_name(caller, candidate)
         .await
         .ok()
@@ -3036,11 +3038,11 @@ where
     if fd_ops == 0 && fd_ops_len != 0 {
         return Err(P1Stop::Errno(p1::errno::FAULT));
     }
-    let mut snapshot = wasix_spawn_initial_snapshot(
-        &caller.data().descriptors,
-        &caller.data().authority,
-        caller.data().cwd.as_ref(),
-    );
+    let parent_descriptors = caller.data().descriptors.snapshot();
+    let parent_authority = caller.data().effective_authority();
+    let parent_cwd = caller.data().cwd.get();
+    let mut snapshot =
+        wasix_spawn_initial_snapshot(&parent_descriptors, &parent_authority, parent_cwd.as_ref());
     let fd_ops = GuestAddress::wasm32(fd_ops);
     for index in 0..fd_ops_len {
         let op = fd_ops.offset(u64::from(index) * u64::from(WASIX_PROC_SPAWN_FD_OP_SIZE));
@@ -3498,7 +3500,7 @@ where
         });
     }
 
-    let Some(cwd) = store.cwd.as_ref() else {
+    let Some(cwd) = store.cwd.get() else {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::PermissionDenied,
             detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
@@ -3584,7 +3586,7 @@ where
     let runtime_state = caller.data().runtime_state.clone();
     let service = runtime_state.wait_for_program_service().await;
     let exec_context = caller.data().exec_context();
-    let authority = authority.unwrap_or_else(|| caller.data().authority.clone());
+    let authority = authority.unwrap_or_else(|| caller.data().effective_authority());
     let filesystem = Some(caller.data().filesystem.clone());
     let launch_started = p1_kernel_profile_start(caller.data());
     let mut child = service
@@ -4566,7 +4568,7 @@ mod spawn_descriptor_tests {
     #[test]
     fn proc_spawn2_no_actions_inherits_open_file_and_pipe_without_cloexec() {
         let fixture = std::sync::Arc::new(SpawnFixture::new());
-        let mut parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
 
         let shared_file_fd = parent
             .descriptors
@@ -4584,8 +4586,8 @@ mod spawn_descriptor_tests {
             .insert_with_close_on_exec(open_file_descriptor("/mnt/workspace/secret.txt"), true)
             .expect("cloexec fd inserts") as i32;
 
-        let parent_file = match parent.descriptors.get(shared_file_fd) {
-            Some(Preview1Descriptor::File(file)) => file.clone(),
+        let parent_file = match parent.descriptors.get_cloned(shared_file_fd) {
+            Some(Preview1Descriptor::File(file)) => file,
             _ => panic!("parent must hold open file"),
         };
 
@@ -4607,13 +4609,13 @@ mod spawn_descriptor_tests {
                     inheritance.descriptors,
                 );
 
-                match child.descriptors.get(shared_file_fd) {
+                match child.descriptors.get_cloned(shared_file_fd) {
                     Some(Preview1Descriptor::File(child_file)) => {
                         assert!(child_file.same_description(&parent_file));
                     }
                     _ => panic!("child must inherit parent's open file at fd {shared_file_fd}"),
                 }
-                match child.descriptors.get(pipe_fd) {
+                match child.descriptors.get_cloned(pipe_fd) {
                     Some(Preview1Descriptor::PipeRead { reader }) => {
                         pipe_writer
                             .write(Bytes::from_static(b"spawn2-pipe"))
@@ -4627,7 +4629,7 @@ mod spawn_descriptor_tests {
                     _ => panic!("child must inherit parent's pipe at fd {pipe_fd}"),
                 }
                 assert!(
-                    child.descriptors.get(cloexec_fd).is_none(),
+                    child.descriptors.get_cloned(cloexec_fd).is_none(),
                     "close-on-exec descriptor must be removed in child"
                 );
             })
@@ -4640,7 +4642,7 @@ mod spawn_descriptor_tests {
     #[test]
     fn proc_spawn2_no_actions_equals_empty_action_list_and_action_base() {
         let fixture = std::sync::Arc::new(SpawnFixture::new());
-        let mut parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
 
         let file_fd = parent
             .descriptors
@@ -4718,7 +4720,7 @@ mod spawn_descriptor_tests {
     #[test]
     fn proc_spawn2_dup2_redirects_cloexec_pipe_and_closes_source_fd() {
         let fixture = std::sync::Arc::new(SpawnFixture::new());
-        let mut parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
         let (pipe_writer, pipe_reader) = crate::byte_channel();
         let cloexec_pipe_fd = parent
             .descriptors
@@ -4779,11 +4781,11 @@ mod spawn_descriptor_tests {
                 );
 
                 assert!(
-                    child.descriptors.get(cloexec_pipe_fd).is_none(),
+                    child.descriptors.get_cloned(cloexec_pipe_fd).is_none(),
                     "original close_on_exec pipe fd must be closed in child"
                 );
                 assert_eq!(child.descriptors.close_on_exec(1), Ok(false));
-                match child.descriptors.get(1) {
+                match child.descriptors.get_cloned(1) {
                     Some(Preview1Descriptor::PipeWrite { writer }) => {
                         writer
                             .write(Bytes::from_static(b"cloexec-dup2"))
@@ -4806,7 +4808,7 @@ mod spawn_descriptor_tests {
     #[test]
     fn proc_spawn_uses_fresh_table_from_scoped_authority_unlike_proc_spawn2() {
         let fixture = SpawnFixture::new();
-        let mut parent = fixture.make_store("parent", fixture.authority.clone(), None);
+        let parent = fixture.make_store("parent", fixture.authority.clone(), None);
         let file_fd = parent
             .descriptors
             .insert(open_file_descriptor("/mnt/workspace/parent-only.txt"))
@@ -4816,8 +4818,8 @@ mod spawn_descriptor_tests {
             .descriptors
             .insert(Preview1Descriptor::PipeRead { reader })
             .expect("pipe fd inserts") as i32;
-        assert!(parent.descriptors.get(file_fd).is_some());
-        assert!(parent.descriptors.get(pipe_fd).is_some());
+        assert!(parent.descriptors.get_cloned(file_fd).is_some());
+        assert!(parent.descriptors.get_cloned(pipe_fd).is_some());
 
         let inheritance =
             wasix_proc_spawn_inheritance::<TestNetworkService>(fixture.authority.clone());
@@ -4831,27 +4833,27 @@ mod spawn_descriptor_tests {
             inheritance.descriptors,
         );
         assert!(matches!(
-            child.descriptors.get(0),
+            child.descriptors.get_cloned(0),
             Some(Preview1Descriptor::Stdin { .. })
         ));
         assert!(matches!(
-            child.descriptors.get(1),
+            child.descriptors.get_cloned(1),
             Some(Preview1Descriptor::Stdout)
         ));
         assert!(matches!(
-            child.descriptors.get(2),
+            child.descriptors.get_cloned(2),
             Some(Preview1Descriptor::Stderr)
         ));
         assert!(matches!(
-            child.descriptors.get(3),
+            child.descriptors.get_cloned(3),
             Some(Preview1Descriptor::Preopen { guest_name, .. }) if guest_name == "/workspace"
         ));
         assert!(
-            child.descriptors.get(file_fd).is_none(),
+            child.descriptors.get_cloned(file_fd).is_none(),
             "proc_spawn must not inherit parent's open file"
         );
         assert!(
-            child.descriptors.get(pipe_fd).is_none(),
+            child.descriptors.get_cloned(pipe_fd).is_none(),
             "proc_spawn must not inherit parent's pipe"
         );
     }

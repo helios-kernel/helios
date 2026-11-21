@@ -93,13 +93,19 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(_)) => {}
-        Some(_) => return p1::errno::INVAL,
-        None => return p1::errno::BADF,
-    }
-    if caller.data().descriptors.get(fd).is_none() {
-        return p1::errno::BADF;
+    let precheck = caller.data().descriptors.with(|descriptors| {
+        match descriptors.get(epfd) {
+            Some(Preview1Descriptor::Epoll(_)) => {}
+            Some(_) => return p1::errno::INVAL,
+            None => return p1::errno::BADF,
+        }
+        if descriptors.get(fd).is_none() {
+            return p1::errno::BADF;
+        }
+        p1::errno::SUCCESS
+    });
+    if precheck != p1::errno::SUCCESS {
+        return precheck;
     }
     let interest = if op == WASIX_EPOLL_CTL_DEL {
         None
@@ -112,20 +118,22 @@ where
             Err(errno) => return errno,
         }
     };
-    let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd) else {
-        return p1::errno::BADF;
-    };
-    let result = match (op, interest) {
-        (WASIX_EPOLL_CTL_ADD, Some(interest)) => epoll.add(interest),
-        (WASIX_EPOLL_CTL_MOD, Some(interest)) => epoll.modify(interest),
-        (WASIX_EPOLL_CTL_DEL, None) => epoll.remove(fd),
-        _ => return p1::errno::INVAL,
-    };
-    match result {
-        Ok(()) => p1::errno::SUCCESS,
-        Err(helios_unix::InterestError::Exists) => p1::errno::EXIST,
-        Err(helios_unix::InterestError::NotFound) => p1::errno::NOENT,
-    }
+    caller.data().descriptors.with_mut(|descriptors| {
+        let Some(Preview1Descriptor::Epoll(epoll)) = descriptors.get_mut(epfd) else {
+            return p1::errno::BADF;
+        };
+        let result = match (op, interest) {
+            (WASIX_EPOLL_CTL_ADD, Some(interest)) => epoll.add(interest),
+            (WASIX_EPOLL_CTL_MOD, Some(interest)) => epoll.modify(interest),
+            (WASIX_EPOLL_CTL_DEL, None) => epoll.remove(fd),
+            _ => return p1::errno::INVAL,
+        };
+        match result {
+            Ok(()) => p1::errno::SUCCESS,
+            Err(helios_unix::InterestError::Exists) => p1::errno::EXIST,
+            Err(helios_unix::InterestError::NotFound) => p1::errno::NOENT,
+        }
+    })
 }
 
 pub(super) async fn wasix_epoll_wait<CpuImpl, Net, StorageImpl>(
@@ -151,10 +159,16 @@ where
         Ok(maxevents) => maxevents,
         Err(_) => return Ok(p1::errno::INVAL),
     };
-    match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(_)) => {}
-        Some(_) => return Ok(p1::errno::INVAL),
-        None => return Ok(p1::errno::BADF),
+    let epfd_check = caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(epfd) {
+            Some(Preview1Descriptor::Epoll(_)) => p1::errno::SUCCESS,
+            Some(_) => p1::errno::INVAL,
+            None => p1::errno::BADF,
+        });
+    if epfd_check != p1::errno::SUCCESS {
+        return Ok(epfd_check);
     }
     // A negative timeout blocks indefinitely; otherwise anchor the deadline
     // once so the wait loop cannot restart its countdown on every re-probe.
@@ -274,11 +288,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let interests = match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests(),
-        Some(_) => return Err(p1::errno::INVAL),
-        None => return Err(p1::errno::BADF),
-    };
+    let interests = caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(epfd) {
+            Some(Preview1Descriptor::Epoll(epoll)) => Ok(epoll.interests()),
+            Some(_) => Err(p1::errno::INVAL),
+            None => Err(p1::errno::BADF),
+        })?;
     let mut wait = P1WaitSet::new();
     for interest in interests {
         if interest.events & WASIX_EPOLL_TYPE_EPOLLIN != 0 {
@@ -367,9 +384,15 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let interests = match caller.data().descriptors.get(epfd) {
-        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests(),
-        _ => return Vec::new(),
+    let interests = caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(epfd) {
+            Some(Preview1Descriptor::Epoll(epoll)) => Some(epoll.interests()),
+            _ => None,
+        });
+    let Some(interests) = interests else {
+        return Vec::new();
     };
     let mut ready = Vec::new();
     let mut oneshot_fds = Vec::new();
@@ -388,12 +411,14 @@ where
         }
         ready.push(interest);
     }
-    if !oneshot_fds.is_empty()
-        && let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd)
-    {
-        for fd in oneshot_fds {
-            epoll.delivered(fd);
-        }
+    if !oneshot_fds.is_empty() {
+        caller.data().descriptors.with_mut(|descriptors| {
+            if let Some(Preview1Descriptor::Epoll(epoll)) = descriptors.get_mut(epfd) {
+                for fd in oneshot_fds {
+                    epoll.delivered(fd);
+                }
+            }
+        });
     }
     ready
 }
@@ -415,7 +440,11 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    if caller.data().descriptors.get(fd).is_none() {
+    if caller
+        .data()
+        .descriptors
+        .with(|descriptors| descriptors.get(fd).is_none())
+    {
         return WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP;
     }
     let mut ready = 0;
