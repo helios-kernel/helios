@@ -1054,43 +1054,43 @@ where
         return p1::errno::FAULT;
     };
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
-            local_address,
-            local_port,
-            ..
-        }))) => {
-            let (address, local_port) = (*local_address, *local_port);
-            write_wasix_addr_port(
-                caller,
-                memory,
-                GuestAddress::wasm32(ret_addr),
-                address,
-                local_port,
-            )
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(
-            UnixTcpSocket::Bound {
+        Some(Preview1Descriptor::Socket(socket)) => {
+            if let Some(UnixUdpSocket::Bound {
                 local_address,
                 local_port,
                 ..
+            }) = socket.udp_state()
+            {
+                write_wasix_addr_port(
+                    caller,
+                    memory,
+                    GuestAddress::wasm32(ret_addr),
+                    local_address,
+                    local_port,
+                )
+            } else if let Some(
+                UnixTcpSocket::Bound {
+                    local_address,
+                    local_port,
+                    ..
+                }
+                | UnixTcpSocket::Listening {
+                    local_address,
+                    local_port,
+                    ..
+                },
+            ) = socket.tcp_state()
+            {
+                write_wasix_addr_port(
+                    caller,
+                    memory,
+                    GuestAddress::wasm32(ret_addr),
+                    local_address,
+                    local_port,
+                )
+            } else {
+                write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr))
             }
-            | UnixTcpSocket::Listening {
-                local_address,
-                local_port,
-                ..
-            },
-        ))) => {
-            let (address, local_port) = (*local_address, *local_port);
-            write_wasix_addr_port(
-                caller,
-                memory,
-                GuestAddress::wasm32(ret_addr),
-                address,
-                local_port,
-            )
-        }
-        Some(Preview1Descriptor::Socket(_)) => {
-            write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr))
         }
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -1111,19 +1111,23 @@ where
         return p1::errno::FAULT;
     };
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-            peer_address,
-            peer_port,
-            ..
-        }))) => write_wasix_addr_port(
-            caller,
-            memory,
-            GuestAddress::wasm32(ret_addr),
-            *peer_address,
-            *peer_port,
-        ),
-        Some(Preview1Descriptor::Socket(_)) => {
-            write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr))
+        Some(Preview1Descriptor::Socket(socket)) => {
+            if let Some(UnixTcpSocket::Connected {
+                peer_address,
+                peer_port,
+                ..
+            }) = socket.tcp_state()
+            {
+                write_wasix_addr_port(
+                    caller,
+                    memory,
+                    GuestAddress::wasm32(ret_addr),
+                    peer_address,
+                    peer_port,
+                )
+            } else {
+                write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr))
+            }
         }
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -1296,69 +1300,85 @@ where
 pub(super) fn wasix_sock_recv_authority<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Result<WasixSocketAuthority, i32> {
-    match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound { .. }))) => {
-            Ok(WasixSocketAuthority::Udp)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound { .. }))) => {
-            Err(p1::errno::INVAL)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected { .. }))) => {
-            Ok(WasixSocketAuthority::Tcp)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Err(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => {
-            Ok(WasixSocketAuthority::LocalOnly)
-        }
-        Some(_) => Err(p1::errno::NOTSOCK),
-        None => Err(p1::errno::BADF),
+    let Some(descriptor) = descriptor else {
+        return Err(p1::errno::BADF);
+    };
+    let Preview1Descriptor::Socket(socket) = descriptor else {
+        return Err(p1::errno::NOTSOCK);
+    };
+    if let Some(udp) = socket.udp_state() {
+        return match udp {
+            UnixUdpSocket::Bound { .. } => Ok(WasixSocketAuthority::Udp),
+            UnixUdpSocket::Unbound { .. } => Err(p1::errno::INVAL),
+        };
     }
+    if let Some(tcp) = socket.tcp_state() {
+        return match tcp {
+            UnixTcpSocket::Connected { .. } => Ok(WasixSocketAuthority::Tcp),
+            _ => Err(p1::errno::INVAL),
+        };
+    }
+    Ok(WasixSocketAuthority::LocalOnly)
 }
 
 pub(super) fn wasix_sock_send_authority<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Result<WasixSocketAuthority, i32> {
-    match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(_))) => Ok(WasixSocketAuthority::Udp),
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected { .. }))) => {
-            Ok(WasixSocketAuthority::Tcp)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Err(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => {
-            Ok(WasixSocketAuthority::LocalOnly)
-        }
-        Some(_) => Err(p1::errno::NOTSOCK),
-        None => Err(p1::errno::BADF),
+    let Some(descriptor) = descriptor else {
+        return Err(p1::errno::BADF);
+    };
+    let Preview1Descriptor::Socket(socket) = descriptor else {
+        return Err(p1::errno::NOTSOCK);
+    };
+    if socket.is_udp() {
+        return Ok(WasixSocketAuthority::Udp);
     }
+    if let Some(tcp) = socket.tcp_state() {
+        return match tcp {
+            UnixTcpSocket::Connected { .. } => Ok(WasixSocketAuthority::Tcp),
+            _ => Err(p1::errno::INVAL),
+        };
+    }
+    Ok(WasixSocketAuthority::LocalOnly)
 }
 
 pub(super) fn wasix_sock_bind_authority<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Result<WasixSocketAuthority, i32> {
-    match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound { .. }))) => {
-            Ok(WasixSocketAuthority::Udp)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            ..
-        }))) => Ok(WasixSocketAuthority::Tcp),
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound { .. }))) => {
-            Err(p1::errno::INVAL)
-        }
-        Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
-        Some(_) => Err(p1::errno::NOTSOCK),
-        None => Err(p1::errno::BADF),
+    let Some(descriptor) = descriptor else {
+        return Err(p1::errno::BADF);
+    };
+    let Preview1Descriptor::Socket(socket) = descriptor else {
+        return Err(p1::errno::NOTSOCK);
+    };
+    if let Some(udp) = socket.udp_state() {
+        return match udp {
+            UnixUdpSocket::Unbound { .. } => Ok(WasixSocketAuthority::Udp),
+            UnixUdpSocket::Bound { .. } => Err(p1::errno::INVAL),
+        };
     }
+    if let Some(tcp) = socket.tcp_state() {
+        return match tcp {
+            UnixTcpSocket::Unconnected { .. } => Ok(WasixSocketAuthority::Tcp),
+            _ => Err(p1::errno::INVAL),
+        };
+    }
+    Err(p1::errno::INVAL)
 }
 
 pub(super) fn wasix_sock_listen_authority<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Result<WasixSocketAuthority, i32> {
-    match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Ok(WasixSocketAuthority::Tcp),
-        Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
-        Some(_) => Err(p1::errno::NOTSOCK),
-        None => Err(p1::errno::BADF),
+    let Some(descriptor) = descriptor else {
+        return Err(p1::errno::BADF);
+    };
+    let Preview1Descriptor::Socket(socket) = descriptor else {
+        return Err(p1::errno::NOTSOCK);
+    };
+    if socket.is_tcp() {
+        Ok(WasixSocketAuthority::Tcp)
+    } else {
+        Err(p1::errno::INVAL)
     }
 }
 
@@ -1378,8 +1398,7 @@ where
         1 => true,
         _ => return p1::errno::INVAL,
     };
-    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data_mut().descriptors.get_mut(fd)
-    else {
+    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
         return match caller.data().descriptors.get(fd) {
             Some(_) => p1::errno::NOTSOCK,
             None => p1::errno::BADF,
@@ -1433,8 +1452,7 @@ where
         Ok(time) => time,
         Err(errno) => return errno,
     };
-    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data_mut().descriptors.get_mut(fd)
-    else {
+    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
         return match caller.data().descriptors.get(fd) {
             Some(_) => p1::errno::NOTSOCK,
             None => p1::errno::BADF,
@@ -1485,8 +1503,7 @@ where
         Ok(size) => size,
         Err(_) => return p1::errno::INVAL,
     };
-    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data_mut().descriptors.get_mut(fd)
-    else {
+    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
         return match caller.data().descriptors.get(fd) {
             Some(_) => p1::errno::NOTSOCK,
             None => p1::errno::BADF,
@@ -1633,7 +1650,7 @@ pub(super) fn wasix_udp_socket_descriptor_status<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> i32 {
     match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(_))) => p1::errno::SUCCESS,
+        Some(Preview1Descriptor::Socket(socket)) if socket.is_udp() => p1::errno::SUCCESS,
         Some(Preview1Descriptor::Socket(_)) => p1::errno::INVAL,
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -1680,74 +1697,69 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound {
-            family,
-            ..
-        }))) => {
-            if !crate::unix::family_accepts(family, address) {
-                return p1::errno::AFNOSUPPORT;
-            }
-            let Some(service) = caller.data().runtime_state.network_service() else {
-                return p1::errno::NETDOWN;
-            };
-            let binding = match service.udp_bind(address, port).await {
-                Ok(binding) => binding,
-                Err(error) => return p1_errno_from_udp_error(error),
-            };
-            let Some(Preview1Descriptor::Socket(UnixSocket::Udp(slot))) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                return p1::errno::BADF;
-            };
-            let options = *slot.options();
-            let family = slot.family();
-            // Nothing can leave a datagram socket before its bind completes,
-            // so applying the descriptor's TTL here covers every packet.
-            if let Err(error) = service.udp_set_hop_limit(binding.socket, options.hop_limit()) {
-                return p1_errno_from_udp_error(error);
-            }
-            *slot = UnixUdpSocket::Bound {
-                family,
-                socket: OwnedUdpSocket::new(
-                    crate::UnixNetwork::new(service.clone()),
-                    binding.socket,
-                ),
-                local_address: address,
-                local_port: binding.local_port,
-                options,
-            };
-            p1::errno::SUCCESS
+    let Some(Preview1Descriptor::Socket(socket)) = descriptor else {
+        return p1::errno::BADF;
+    };
+    if let Some(UnixUdpSocket::Unbound { family, .. }) = socket.udp_state() {
+        if !crate::unix::family_accepts(family, address) {
+            return p1::errno::AFNOSUPPORT;
         }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            family,
-            ..
-        }))) => {
-            if !crate::unix::family_accepts(family, address) {
-                return p1::errno::AFNOSUPPORT;
-            }
-            let Some(service) = caller.data().runtime_state.network_service() else {
-                return p1::errno::NETDOWN;
-            };
-            if !address.is_unspecified() && !service.owns_ip_address(address) {
-                return p1::errno::ADDRNOTAVAIL;
-            }
-            let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                return p1::errno::BADF;
-            };
-            let options = *slot.options();
-            *slot = UnixTcpSocket::Bound {
-                family: slot.family(),
-                local_address: address,
-                local_port: port,
-                options,
-            };
-            p1::errno::SUCCESS
+        let Some(service) = caller.data().runtime_state.network_service() else {
+            return p1::errno::NETDOWN;
+        };
+        let binding = match service.udp_bind(address, port).await {
+            Ok(binding) => binding,
+            Err(error) => return p1_errno_from_udp_error(error),
+        };
+        let owned = OwnedUdpSocket::new(crate::UnixNetwork::new(service.clone()), binding.socket);
+        // Nothing can leave a datagram socket before its bind completes,
+        // so applying the descriptor's TTL here covers every packet.
+        let hop_limit = socket.options().hop_limit();
+        if let Err(error) = service.udp_set_hop_limit(binding.socket, hop_limit) {
+            return p1_errno_from_udp_error(error);
         }
-        _ => p1::errno::BADF,
+        return socket
+            .with_udp_mut(|slot| match *slot {
+                UnixUdpSocket::Unbound { family, options } => {
+                    *slot = UnixUdpSocket::Bound {
+                        family,
+                        socket: owned,
+                        local_address: address,
+                        local_port: binding.local_port,
+                        options,
+                    };
+                    p1::errno::SUCCESS
+                }
+                UnixUdpSocket::Bound { .. } => p1::errno::INVAL,
+            })
+            .unwrap_or(p1::errno::INVAL);
     }
+    if let Some(UnixTcpSocket::Unconnected { family, .. }) = socket.tcp_state() {
+        if !crate::unix::family_accepts(family, address) {
+            return p1::errno::AFNOSUPPORT;
+        }
+        let Some(service) = caller.data().runtime_state.network_service() else {
+            return p1::errno::NETDOWN;
+        };
+        if !address.is_unspecified() && !service.owns_ip_address(address) {
+            return p1::errno::ADDRNOTAVAIL;
+        }
+        return socket
+            .with_tcp_mut(|slot| match *slot {
+                UnixTcpSocket::Unconnected { family, options } => {
+                    *slot = UnixTcpSocket::Bound {
+                        family,
+                        local_address: address,
+                        local_port: port,
+                        options,
+                    };
+                    p1::errno::SUCCESS
+                }
+                _ => p1::errno::INVAL,
+            })
+            .unwrap_or(p1::errno::INVAL);
+    }
+    p1::errno::BADF
 }
 
 pub(super) async fn wasix_sock_listen<CpuImpl, Net, StorageImpl>(
@@ -1778,27 +1790,24 @@ where
         Ok(backlog) => backlog,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let (local_address, local_port, hop_limit, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            options,
-            family,
-        }))) => (
-            crate::unix::unspecified_address(*family),
+    let Some(Preview1Descriptor::Socket(socket)) = caller.data().descriptors.get(fd).cloned()
+    else {
+        return p1::errno::BADF;
+    };
+    let (local_address, local_port, hop_limit) = match socket.tcp_state() {
+        Some(UnixTcpSocket::Unconnected { options, family }) => (
+            crate::unix::unspecified_address(family),
             0,
             options.hop_limit(),
-            *family,
         ),
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Bound {
+        Some(UnixTcpSocket::Bound {
             local_address,
             local_port,
             options,
-            family,
-        }))) => (*local_address, *local_port, options.hop_limit(), *family),
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => {
-            return p1::errno::INVAL;
-        }
-        Some(_) => return p1::errno::NOTSOCK,
-        None => return p1::errno::BADF,
+            ..
+        }) => (local_address, local_port, options.hop_limit()),
+        Some(_) => return p1::errno::INVAL,
+        None => return p1::errno::INVAL,
     };
     let listener = match service
         .tcp_listen(local_address, local_port, backlog, hop_limit)
@@ -1807,23 +1816,25 @@ where
         Ok(listener) => listener,
         Err(error) => return p1_errno_from_tcp_error(error),
     };
-    let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
-        caller.data_mut().descriptors.get_mut(fd)
-    else {
-        return p1::errno::BADF;
-    };
-    let options = *slot.options();
-    *slot = UnixTcpSocket::Listening {
-        family,
-        listener: OwnedTcpListener::new(
-            crate::UnixNetwork::new(service.clone()),
-            listener.listener,
-        ),
-        local_address,
-        local_port: listener.local_port,
-        options,
-    };
-    p1::errno::SUCCESS
+    let owned = OwnedTcpListener::new(crate::UnixNetwork::new(service.clone()), listener.listener);
+    socket
+        .with_tcp_mut(|slot| match *slot {
+            UnixTcpSocket::Unconnected { family, options }
+            | UnixTcpSocket::Bound {
+                family, options, ..
+            } => {
+                *slot = UnixTcpSocket::Listening {
+                    family,
+                    listener: owned,
+                    local_address,
+                    local_port: listener.local_port,
+                    options,
+                };
+                p1::errno::SUCCESS
+            }
+            _ => p1::errno::INVAL,
+        })
+        .unwrap_or(p1::errno::INVAL)
 }
 
 pub(super) async fn wasix_sock_accept_v2<CpuImpl, Net, StorageImpl>(
@@ -1894,19 +1905,19 @@ where
         return Err(status);
     }
     let (listener, accept_timeout, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening {
-            listener,
-            options,
-            family,
-            ..
-        }))) => (
-            listener.id(),
-            options.time(SocketTime::AcceptTimeout),
-            *family,
-        ),
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => {
-            return Err(p1::errno::INVAL);
-        }
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Listening {
+                listener,
+                options,
+                family,
+                ..
+            }) => (
+                listener.id(),
+                options.time(SocketTime::AcceptTimeout),
+                family,
+            ),
+            _ => return Err(p1::errno::INVAL),
+        },
         Some(_) => return Err(p1::errno::NOTSOCK),
         None => return Err(p1::errno::BADF),
     };
@@ -1920,7 +1931,7 @@ where
         .await
         .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
     let peer_address = accepted.address;
-    let descriptor = Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+    let descriptor = Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
         family,
         stream: OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), accepted.stream),
         peer_address,
@@ -1992,38 +2003,37 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (local_port, connect_timeout, hop_limit, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            options,
-            family,
-        }))) => (
+    let Some(Preview1Descriptor::Socket(socket)) = caller.data().descriptors.get(fd).cloned()
+    else {
+        return match caller.data().descriptors.get(fd) {
+            Some(_) => p1::errno::NOTSOCK,
+            None => p1::errno::BADF,
+        };
+    };
+    let Some(tcp) = socket.tcp_state() else {
+        return p1::errno::NOTSOCK;
+    };
+    let (local_port, connect_timeout, hop_limit, family) = match tcp {
+        UnixTcpSocket::Unconnected { options, family } => (
             0,
             options.time(SocketTime::ConnectTimeout),
             options.hop_limit(),
-            *family,
+            family,
         ),
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Bound {
+        UnixTcpSocket::Bound {
             local_port,
             options,
             family,
             ..
-        }))) => (
-            *local_port,
+        } => (
+            local_port,
             options.time(SocketTime::ConnectTimeout),
             options.hop_limit(),
-            *family,
+            family,
         ),
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected { .. }))) => {
+        UnixTcpSocket::Connected { .. } | UnixTcpSocket::Listening { .. } => {
             return p1::errno::INVAL;
         }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Listening { .. }))) => {
-            return p1::errno::INVAL;
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(_))) => {
-            return p1::errno::NOTSOCK;
-        }
-        Some(_) => return p1::errno::NOTSOCK,
-        None => return p1::errno::BADF,
     };
     if !crate::unix::family_accepts(family, address) {
         return p1::errno::AFNOSUPPORT;
@@ -2045,20 +2055,25 @@ where
         Ok(stream) => stream,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
-    let Some(Preview1Descriptor::Socket(UnixSocket::Tcp(slot))) =
-        caller.data_mut().descriptors.get_mut(fd)
-    else {
-        return p1::errno::BADF;
-    };
-    let options = *slot.options();
-    *slot = UnixTcpSocket::Connected {
-        family,
-        stream: OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), stream),
-        peer_address: address,
-        peer_port: port,
-        options,
-    };
-    p1::errno::SUCCESS
+    let owned = OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), stream);
+    socket
+        .with_tcp_mut(|slot| match *slot {
+            UnixTcpSocket::Unconnected { family, options }
+            | UnixTcpSocket::Bound {
+                family, options, ..
+            } => {
+                *slot = UnixTcpSocket::Connected {
+                    family,
+                    stream: owned,
+                    peer_address: address,
+                    peer_port: port,
+                    options,
+                };
+                p1::errno::SUCCESS
+            }
+            UnixTcpSocket::Connected { .. } | UnixTcpSocket::Listening { .. } => p1::errno::INVAL,
+        })
+        .unwrap_or(p1::errno::INVAL)
 }
 
 #[expect(
@@ -2142,119 +2157,123 @@ where
     if status != p1::errno::SUCCESS {
         return Ok(status);
     }
-    match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
-            socket,
-            options,
-            ..
-        }))) => {
-            let Some(service) = caller.data().runtime_state.network_service() else {
-                return Ok(p1::errno::NETDOWN);
-            };
-            let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let effective_fdflags = fdflags | if dont_wait { P1_FDFLAG_NONBLOCK } else { 0 };
-            let timeout = wasix_effective_socket_timeout(
-                options.time(SocketTime::ReceiveTimeout),
-                effective_fdflags,
-            );
-            let received = if peek {
-                service.udp_peek(socket.id(), capacity, timeout).await
-            } else {
-                service.udp_receive(socket.id(), capacity, timeout).await
-            };
-            let datagram = match received {
-                Ok(Some(datagram)) => datagram,
-                Ok(None) => return Ok(p1::errno::AGAIN),
-                Err(error) => {
-                    return Ok(p1_errno_from_udp_error_for_fdflags(
-                        error,
-                        effective_fdflags,
-                    ));
-                }
-            };
-            memory
-                .write_iovs_from_bytes(&layout.iovs, &datagram.bytes, ret_size)
-                .await?;
-            let ro_flags = if datagram.original_len > capacity as usize {
-                WASIX_ROFLAGS_DATA_TRUNCATED
-            } else {
-                0
-            };
-            memory.write_u16(ret_flags, ro_flags).await?;
-            write_wasix_addr_port_async(&memory, ret_addr, Some(datagram.address), datagram.port)
-                .await?;
-            Ok(p1::errno::SUCCESS)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound { .. }))) => {
-            Ok(p1::errno::INVAL)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { .. })) => {
-            let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let effective_fdflags = fdflags | if dont_wait { P1_FDFLAG_NONBLOCK } else { 0 };
-            let bytes = caller
-                .data_mut()
-                .recv_socket_pair(
-                    fd,
-                    capacity as usize,
-                    p1_fdflags_nonblocking(effective_fdflags),
-                    peek,
+    let Some(Preview1Descriptor::Socket(socket)) = descriptor else {
+        return Ok(p1::errno::BADF);
+    };
+    if let Some(udp) = socket.udp_state() {
+        return match udp {
+            UnixUdpSocket::Bound {
+                socket, options, ..
+            } => {
+                let Some(service) = caller.data().runtime_state.network_service() else {
+                    return Ok(p1::errno::NETDOWN);
+                };
+                let fdflags = caller.data().descriptors.fdflags(fd)?;
+                let effective_fdflags = fdflags | if dont_wait { P1_FDFLAG_NONBLOCK } else { 0 };
+                let timeout = wasix_effective_socket_timeout(
+                    options.time(SocketTime::ReceiveTimeout),
+                    effective_fdflags,
+                );
+                let received = if peek {
+                    service.udp_peek(socket.id(), capacity, timeout).await
+                } else {
+                    service.udp_receive(socket.id(), capacity, timeout).await
+                };
+                let datagram = match received {
+                    Ok(Some(datagram)) => datagram,
+                    Ok(None) => return Ok(p1::errno::AGAIN),
+                    Err(error) => {
+                        return Ok(p1_errno_from_udp_error_for_fdflags(
+                            error,
+                            effective_fdflags,
+                        ));
+                    }
+                };
+                memory
+                    .write_iovs_from_bytes(&layout.iovs, &datagram.bytes, ret_size)
+                    .await?;
+                let ro_flags = if datagram.original_len > capacity as usize {
+                    WASIX_ROFLAGS_DATA_TRUNCATED
+                } else {
+                    0
+                };
+                memory.write_u16(ret_flags, ro_flags).await?;
+                write_wasix_addr_port_async(
+                    &memory,
+                    ret_addr,
+                    Some(datagram.address),
+                    datagram.port,
                 )
                 .await?;
-            memory
-                .write_iovs_from_bytes(&layout.iovs, &bytes, ret_size)
-                .await?;
-            memory.write_u16(ret_flags, 0).await?;
-            write_wasix_addr_port_async(&memory, ret_addr, None, 0).await?;
-            Ok(p1::errno::SUCCESS)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-            stream,
-            options,
-            ..
-        }))) => {
-            let Some(service) = caller.data().runtime_state.network_service() else {
-                return Ok(p1::errno::NETDOWN);
-            };
-            let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let effective_fdflags = fdflags | if dont_wait { P1_FDFLAG_NONBLOCK } else { 0 };
-            let timeout = wasix_effective_socket_timeout(
-                options.time(SocketTime::ReceiveTimeout),
-                effective_fdflags,
-            );
-            // The stack copies straight out of its receive queue into the
-            // guest's buffers, on this call's own poll, each page checked
-            // present in the step that writes it.
-            let ranges = memory.iov_ranges(&layout.iovs)?;
-            let mut buffer = memory.tcp_receive_buffer(&ranges);
-            let read = if peek {
-                service
-                    .tcp_peek_into(stream.id(), &mut buffer, timeout)
-                    .await
-            } else {
-                service
-                    .tcp_read_into(stream.id(), &mut buffer, timeout)
-                    .await
-            };
-            let received = match p1_tcp_received(read)? {
-                Ok(received) => received,
-                Err(error) => {
-                    return Ok(p1_errno_from_tcp_error_for_fdflags(
-                        error,
-                        effective_fdflags,
-                    ));
-                }
-            };
-            memory.write_u32(ret_size, received).await?;
-            memory.write_u16(ret_flags, 0).await?;
-            Ok(p1::errno::SUCCESS)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            ..
-        }))) => Ok(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Ok(p1::errno::INVAL),
-        Some(_) => Ok(p1::errno::NOTSOCK),
-        None => Ok(p1::errno::BADF),
+                Ok(p1::errno::SUCCESS)
+            }
+            UnixUdpSocket::Unbound { .. } => Ok(p1::errno::INVAL),
+        };
     }
+    if socket.is_pair() {
+        let fdflags = caller.data().descriptors.fdflags(fd)?;
+        let effective_fdflags = fdflags | if dont_wait { P1_FDFLAG_NONBLOCK } else { 0 };
+        let bytes = caller
+            .data_mut()
+            .recv_socket_pair(
+                fd,
+                capacity as usize,
+                p1_fdflags_nonblocking(effective_fdflags),
+                peek,
+            )
+            .await?;
+        memory
+            .write_iovs_from_bytes(&layout.iovs, &bytes, ret_size)
+            .await?;
+        memory.write_u16(ret_flags, 0).await?;
+        write_wasix_addr_port_async(&memory, ret_addr, None, 0).await?;
+        return Ok(p1::errno::SUCCESS);
+    }
+    if let Some(tcp) = socket.tcp_state() {
+        return match tcp {
+            UnixTcpSocket::Connected {
+                stream, options, ..
+            } => {
+                let Some(service) = caller.data().runtime_state.network_service() else {
+                    return Ok(p1::errno::NETDOWN);
+                };
+                let fdflags = caller.data().descriptors.fdflags(fd)?;
+                let effective_fdflags = fdflags | if dont_wait { P1_FDFLAG_NONBLOCK } else { 0 };
+                let timeout = wasix_effective_socket_timeout(
+                    options.time(SocketTime::ReceiveTimeout),
+                    effective_fdflags,
+                );
+                // The stack copies straight out of its receive queue into the
+                // guest's buffers, on this call's own poll, each page checked
+                // present in the step that writes it.
+                let ranges = memory.iov_ranges(&layout.iovs)?;
+                let mut buffer = memory.tcp_receive_buffer(&ranges);
+                let read = if peek {
+                    service
+                        .tcp_peek_into(stream.id(), &mut buffer, timeout)
+                        .await
+                } else {
+                    service
+                        .tcp_read_into(stream.id(), &mut buffer, timeout)
+                        .await
+                };
+                let received = match p1_tcp_received(read)? {
+                    Ok(received) => received,
+                    Err(error) => {
+                        return Ok(p1_errno_from_tcp_error_for_fdflags(
+                            error,
+                            effective_fdflags,
+                        ));
+                    }
+                };
+                memory.write_u32(ret_size, received).await?;
+                memory.write_u16(ret_flags, 0).await?;
+                Ok(p1::errno::SUCCESS)
+            }
+            _ => Ok(p1::errno::INVAL),
+        };
+    }
+    Ok(p1::errno::INVAL)
 }
 
 pub(super) async fn wasix_sock_send_to<CpuImpl, Net, StorageImpl>(
@@ -2312,119 +2331,115 @@ where
     if status != p1::errno::SUCCESS {
         return Ok(status);
     }
-    match descriptor {
-        Some(Preview1Descriptor::Socket(UnixSocket::Udp(socket))) => {
-            let (Some(address), port) =
-                wasix_read_addr_port(&memory, GuestAddress::wasm32(addr)).await?
-            else {
-                return Ok(p1::errno::INVAL);
-            };
-            let (socket, send_timeout) = match socket {
-                UnixUdpSocket::Bound {
-                    socket, options, ..
-                } => (socket.id(), options.time(SocketTime::SendTimeout)),
-                UnixUdpSocket::Unbound { options, family } => {
-                    let Some(service) = caller.data().runtime_state.network_service() else {
-                        return Ok(p1::errno::NETDOWN);
-                    };
-                    let local_address = crate::unix::unspecified_address(family);
-                    let binding = match service.udp_bind(local_address, 0).await {
-                        Ok(binding) => binding,
-                        Err(error) => return Ok(p1_errno_from_udp_error(error)),
-                    };
-                    if let Err(error) =
-                        service.udp_set_hop_limit(binding.socket, options.hop_limit())
-                    {
-                        return Ok(p1_errno_from_udp_error(error));
-                    }
-                    let Some(Preview1Descriptor::Socket(UnixSocket::Udp(slot))) =
-                        caller.data_mut().descriptors.get_mut(fd)
-                    else {
-                        return Ok(p1::errno::BADF);
-                    };
-                    *slot = UnixUdpSocket::Bound {
-                        family,
-                        socket: OwnedUdpSocket::new(
-                            crate::UnixNetwork::new(service.clone()),
-                            binding.socket,
-                        ),
-                        local_address,
-                        local_port: binding.local_port,
-                        options,
-                    };
-                    let Some(Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
-                        socket,
-                        options,
-                        ..
-                    }))) = caller.data().descriptors.get(fd)
-                    else {
-                        return Ok(p1::errno::BADF);
-                    };
-                    (socket.id(), options.time(SocketTime::SendTimeout))
+    let Some(Preview1Descriptor::Socket(socket)) = descriptor else {
+        return Ok(p1::errno::BADF);
+    };
+    if let Some(udp) = socket.udp_state() {
+        let (Some(address), port) =
+            wasix_read_addr_port(&memory, GuestAddress::wasm32(addr)).await?
+        else {
+            return Ok(p1::errno::INVAL);
+        };
+        let (udp_id, send_timeout) = match udp {
+            UnixUdpSocket::Bound {
+                socket, options, ..
+            } => (socket.id(), options.time(SocketTime::SendTimeout)),
+            UnixUdpSocket::Unbound { options, family } => {
+                let Some(service) = caller.data().runtime_state.network_service() else {
+                    return Ok(p1::errno::NETDOWN);
+                };
+                let local_address = crate::unix::unspecified_address(family);
+                let binding = match service.udp_bind(local_address, 0).await {
+                    Ok(binding) => binding,
+                    Err(error) => return Ok(p1_errno_from_udp_error(error)),
+                };
+                let owned =
+                    OwnedUdpSocket::new(crate::UnixNetwork::new(service.clone()), binding.socket);
+                if let Err(error) = service.udp_set_hop_limit(binding.socket, options.hop_limit()) {
+                    return Ok(p1_errno_from_udp_error(error));
                 }
-            };
-            let Some(service) = caller.data().runtime_state.network_service() else {
-                return Ok(p1::errno::NETDOWN);
-            };
-            let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let timeout = wasix_effective_socket_timeout(send_timeout, fdflags);
-            let bytes = gather
-                .datagram(
-                    &memory,
-                    crate::wasmtime_adapter::wasi::MAX_WASI_UDP_DATAGRAM_BYTES,
-                )
-                .await?;
-            let sent = match service
-                .udp_send_address(socket, address, port, &bytes, timeout)
-                .await
-            {
-                Ok(sent) => sent,
-                Err(error) => return Ok(p1_errno_from_udp_error_for_fdflags(error, fdflags)),
-            };
-            let sent = u32::try_from(sent).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
-            memory.write_u32(ret_size, sent).await?;
-            Ok(p1::errno::SUCCESS)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-            stream,
-            options,
-            ..
-        }))) => {
-            let Some(service) = caller.data().runtime_state.network_service() else {
-                return Ok(p1::errno::NETDOWN);
-            };
-            let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let timeout =
-                wasix_effective_socket_timeout(options.time(SocketTime::SendTimeout), fdflags);
-            let written = p1_send_gathered(&memory, &mut gather, |chunk| {
-                let (service, stream) = (&service, stream.id());
-                async move {
-                    service
-                        .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
-                        .await
-                        .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))
-                }
-            })
+                socket
+                    .with_udp_mut(|slot| match *slot {
+                        UnixUdpSocket::Unbound { family, options } => {
+                            let id = owned.id();
+                            let send_timeout = options.time(SocketTime::SendTimeout);
+                            *slot = UnixUdpSocket::Bound {
+                                family,
+                                socket: owned,
+                                local_address,
+                                local_port: binding.local_port,
+                                options,
+                            };
+                            (id, send_timeout)
+                        }
+                        UnixUdpSocket::Bound {
+                            ref socket,
+                            options,
+                            ..
+                        } => (socket.id(), options.time(SocketTime::SendTimeout)),
+                    })
+                    .expect("UDP socket state kind cannot change")
+            }
+        };
+        let Some(service) = caller.data().runtime_state.network_service() else {
+            return Ok(p1::errno::NETDOWN);
+        };
+        let fdflags = caller.data().descriptors.fdflags(fd)?;
+        let timeout = wasix_effective_socket_timeout(send_timeout, fdflags);
+        let bytes = gather
+            .datagram(
+                &memory,
+                crate::wasmtime_adapter::wasi::MAX_WASI_UDP_DATAGRAM_BYTES,
+            )
             .await?;
-            memory.write_u32(ret_size, written).await?;
-            Ok(p1::errno::SUCCESS)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            ..
-        }))) => Ok(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(_))) => Ok(p1::errno::INVAL),
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })) => {
-            let fdflags = caller.data().descriptors.fdflags(fd)?;
-            let written = p1_send_gathered(&memory, &mut gather, |chunk| {
-                p1_send_to_socketpair(&writer, chunk, fdflags)
-            })
-            .await?;
-            memory.write_u32(ret_size, written).await?;
-            Ok(p1::errno::SUCCESS)
-        }
-        Some(_) => Ok(p1::errno::NOTSOCK),
-        None => Ok(p1::errno::BADF),
+        let sent = match service
+            .udp_send_address(udp_id, address, port, &bytes, timeout)
+            .await
+        {
+            Ok(sent) => sent,
+            Err(error) => return Ok(p1_errno_from_udp_error_for_fdflags(error, fdflags)),
+        };
+        let sent = u32::try_from(sent).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+        memory.write_u32(ret_size, sent).await?;
+        return Ok(p1::errno::SUCCESS);
     }
+    if let Some(tcp) = socket.tcp_state() {
+        return match tcp {
+            UnixTcpSocket::Connected {
+                stream, options, ..
+            } => {
+                let Some(service) = caller.data().runtime_state.network_service() else {
+                    return Ok(p1::errno::NETDOWN);
+                };
+                let fdflags = caller.data().descriptors.fdflags(fd)?;
+                let timeout =
+                    wasix_effective_socket_timeout(options.time(SocketTime::SendTimeout), fdflags);
+                let written = p1_send_gathered(&memory, &mut gather, |chunk| {
+                    let (service, stream) = (&service, stream.id());
+                    async move {
+                        service
+                            .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
+                            .await
+                            .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))
+                    }
+                })
+                .await?;
+                memory.write_u32(ret_size, written).await?;
+                Ok(p1::errno::SUCCESS)
+            }
+            _ => Ok(p1::errno::INVAL),
+        };
+    }
+    if let Some(writer) = socket.pair_writer() {
+        let fdflags = caller.data().descriptors.fdflags(fd)?;
+        let written = p1_send_gathered(&memory, &mut gather, |chunk| {
+            p1_send_to_socketpair(&writer, chunk, fdflags)
+        })
+        .await?;
+        memory.write_u32(ret_size, written).await?;
+        return Ok(p1::errno::SUCCESS);
+    }
+    Ok(p1::errno::INVAL)
 }
 
 /// Reads one range of a `sock_send_file` source descriptor.
@@ -2501,43 +2516,51 @@ where
     let bytes = wasix_read_send_file_range(caller, &file, offset, count).await?;
     let written = u64::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
     match caller.data().descriptors.get(out_fd).cloned() {
-        Some(Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
-            stream,
-            options,
-            ..
-        }))) => {
-            let status = caller
-                .data()
-                .require_socket_authority(WasixSocketAuthority::Tcp);
-            if status != p1::errno::SUCCESS {
-                return Err(status);
+        Some(Preview1Descriptor::Socket(socket)) => {
+            if let Some(tcp) = socket.tcp_state() {
+                return match tcp {
+                    UnixTcpSocket::Connected {
+                        stream, options, ..
+                    } => {
+                        let status = caller
+                            .data()
+                            .require_socket_authority(WasixSocketAuthority::Tcp);
+                        if status != p1::errno::SUCCESS {
+                            return Err(status);
+                        }
+                        let Some(service) = caller.data().runtime_state.network_service() else {
+                            return Err(p1::errno::NETDOWN);
+                        };
+                        let fdflags = caller.data().descriptors.fdflags(out_fd)?;
+                        let timeout = wasix_effective_socket_timeout(
+                            options.time(SocketTime::SendTimeout),
+                            fdflags,
+                        );
+                        service
+                            .tcp_write_all_bytes(stream.id(), bytes, timeout)
+                            .await
+                            .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
+                        Ok(written)
+                    }
+                    _ => Err(p1::errno::INVAL),
+                };
             }
-            let Some(service) = caller.data().runtime_state.network_service() else {
-                return Err(p1::errno::NETDOWN);
-            };
-            let fdflags = caller.data().descriptors.fdflags(out_fd)?;
-            let timeout =
-                wasix_effective_socket_timeout(options.time(SocketTime::SendTimeout), fdflags);
-            service
-                .tcp_write_all_bytes(stream.id(), bytes, timeout)
-                .await
-                .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
-            Ok(written)
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })) => {
-            let fdflags = caller.data().descriptors.fdflags(out_fd)?;
-            if p1_fdflags_nonblocking(fdflags) {
-                match writer.try_write(bytes) {
-                    crate::TryWrite::Written => {}
-                    crate::TryWrite::Full(_) => return Err(p1::errno::AGAIN),
-                    crate::TryWrite::Closed => return Err(p1::errno::IO),
+            if let Some(writer) = socket.pair_writer() {
+                let fdflags = caller.data().descriptors.fdflags(out_fd)?;
+                if p1_fdflags_nonblocking(fdflags) {
+                    match writer.try_write(bytes) {
+                        crate::TryWrite::Written => {}
+                        crate::TryWrite::Full(_) => return Err(p1::errno::AGAIN),
+                        crate::TryWrite::Closed => return Err(p1::errno::IO),
+                    }
+                } else if writer.write(bytes).await.is_err() {
+                    return Err(p1::errno::IO);
                 }
-            } else if writer.write(bytes).await.is_err() {
-                return Err(p1::errno::IO);
+                Ok(written)
+            } else {
+                Err(p1::errno::INVAL)
             }
-            Ok(written)
         }
-        Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
         Some(_) => Err(p1::errno::NOTSOCK),
         None => Err(p1::errno::BADF),
     }
@@ -2795,7 +2818,7 @@ const fn wasix_socket_option_status(result: Result<(), SocketOptionError>) -> i3
 
 /// `sock_set_opt_flag` on a socket, as its errno.
 pub(super) fn wasix_socket_set_flag<Net: ComponentHostNetwork>(
-    socket: &mut UnixSocket<Net>,
+    socket: &UnixSocket<Net>,
     option: i32,
     flag: bool,
 ) -> i32 {
@@ -2815,7 +2838,7 @@ pub(super) fn wasix_socket_flag<Net: ComponentHostNetwork>(
 
 /// `sock_set_opt_size` on a socket's recorded options, as its errno.
 pub(super) fn wasix_socket_set_size<Net: ComponentHostNetwork>(
-    socket: &mut UnixSocket<Net>,
+    socket: &UnixSocket<Net>,
     option: i32,
     size: u64,
 ) -> i32 {
@@ -2835,7 +2858,7 @@ pub(super) fn wasix_socket_size<Net: ComponentHostNetwork>(
 
 /// `sock_set_opt_time` on a socket, as its errno.
 pub(super) fn wasix_socket_set_time<Net: ComponentHostNetwork>(
-    socket: &mut UnixSocket<Net>,
+    socket: &UnixSocket<Net>,
     option: i32,
     time: Option<u64>,
 ) -> i32 {
@@ -4286,10 +4309,10 @@ mod tests {
 
                 // Socketpair: RECV_PEEK does not consume buffered bytes.
                 let writer = match caller.data().descriptors.get(pair_write) {
-                    Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })) => {
-                        writer.clone()
+                    Some(Preview1Descriptor::Socket(socket)) => {
+                        socket.pair_writer().expect("expected socketpair writer")
                     }
-                    _ => panic!("expected socketpair writer"),
+                    _ => panic!("expected socketpair descriptor"),
                 };
                 writer
                     .write(Bytes::from_static(b"hello"))
@@ -4414,6 +4437,462 @@ mod tests {
                     Ok(p1::errno::SUCCESS)
                 );
                 assert_eq!(read_guest_u32(caller, 500), 0);
+            })
+        });
+    }
+
+    #[test]
+    fn wasix_duplicated_udp_socket_shares_bind_and_options() {
+        let (clock, device, service) = configured_test_net_service();
+        let local_mac = service.hardware_address();
+        let authority = network_authority(NetworkAuthorityRights::UDP);
+        run_with_wasix_caller(authority, service, clock, move |caller| {
+            Box::pin(async move {
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_DGRAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let fd1 = read_guest_u32(caller, 100) as i32;
+                let fd2 = caller.data_mut().descriptors.dup(fd1).expect("dup") as i32;
+                let fd3 = caller
+                    .data_mut()
+                    .descriptors
+                    .dup_to(fd1, 20, true)
+                    .expect("dup_to") as i32;
+
+                // Option changes through one duplicate are visible through all others.
+                assert_eq!(
+                    wasix_sock_set_opt_flag(caller, fd2, WASIX_SOCK_OPTION_REUSE_ADDR, 1),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    wasix_sock_set_opt_size(caller, fd2, WASIX_SOCK_OPTION_TTL, 42),
+                    p1::errno::SUCCESS
+                );
+                let memory = p1_async_memory(caller).expect("guest memory");
+                memory
+                    .write_bytes(
+                        GuestAddress::wasm32(200),
+                        &wasix_optional_timestamp_record(Some(123_456)),
+                    )
+                    .await
+                    .expect("write timeout");
+                assert_eq!(
+                    wasix_sock_set_opt_time(caller, fd2, WASIX_SOCK_OPTION_RECV_TIMEOUT, 200),
+                    p1::errno::SUCCESS
+                );
+
+                for dup_fd in [fd1, fd3] {
+                    assert_eq!(
+                        wasix_sock_get_opt_flag(caller, dup_fd, WASIX_SOCK_OPTION_REUSE_ADDR, 220),
+                        p1::errno::SUCCESS
+                    );
+                    assert_eq!(read_guest_bytes(caller, 220, 1), [1]);
+
+                    assert_eq!(
+                        wasix_sock_get_opt_size(caller, dup_fd, WASIX_SOCK_OPTION_TTL, 232),
+                        p1::errno::SUCCESS
+                    );
+                    let ttl_bytes = read_guest_bytes(caller, 232, 8);
+                    assert_eq!(u64::from_le_bytes(ttl_bytes.try_into().unwrap()), 42);
+
+                    assert_eq!(
+                        wasix_sock_get_opt_time(
+                            caller,
+                            dup_fd,
+                            WASIX_SOCK_OPTION_RECV_TIMEOUT,
+                            240
+                        ),
+                        p1::errno::SUCCESS
+                    );
+                    let time_bytes = read_guest_bytes(caller, 240, 16);
+                    assert_eq!(time_bytes[0], WASIX_OPTION_SOME);
+                    let off = WASIX_OPTION_UNION_U64_OFFSET as usize;
+                    assert_eq!(
+                        u64::from_le_bytes(time_bytes[off..off + 8].try_into().unwrap()),
+                        123_456
+                    );
+                }
+
+                // A bind through fd1 is observed via sock_addr_local and sock_recv_from on fd3.
+                write_guest_addr_port(caller, 260, ip_v4(TEST_LOCAL_V4_A), 41000);
+                assert_eq!(
+                    wasix_sock_bind(caller, fd1, 260).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(wasix_sock_addr_local(caller, fd3, 280), p1::errno::SUCCESS);
+                assert_eq!(
+                    read_guest_addr_port(caller, 280),
+                    (Some(ip_v4(TEST_LOCAL_V4_A)), 41000)
+                );
+
+                device.deliver_on(
+                    0,
+                    &build_ipv4_udp_frame(local_mac, TEST_LOCAL_V4_A, 49000, 41000, b"dup-udp"),
+                );
+                write_guest_iov(caller, 300, 400, 32);
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        fd3,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_DONT_WAIT),
+                        500,
+                        504,
+                        512,
+                    )
+                    .await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                let len = read_guest_u32(caller, 500) as usize;
+                assert_eq!(read_guest_bytes(caller, 400, len), b"dup-udp");
+                assert_eq!(
+                    read_guest_addr_port(caller, 512),
+                    (Some(ip_v4(TEST_PEER_V4)), 49000)
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn wasix_duplicated_tcp_socket_shares_bind_listen_connect_and_options() {
+        use helios_netstack::{
+            EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, TcpFlags, TcpHeader, TcpPacket,
+        };
+
+        let (clock, device, service) = configured_test_net_service();
+        let local_mac = service.hardware_address();
+        let authority = network_authority(NetworkAuthorityRights::TCP);
+        run_with_wasix_caller(authority, service, clock, move |caller| {
+            Box::pin(async move {
+                // Server socket: bind on fd1, listen on fd2, accept on fd1.
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        100,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let listener_1 = read_guest_u32(caller, 100) as i32;
+                let listener_2 = caller.data_mut().descriptors.dup(listener_1).expect("dup") as i32;
+
+                assert_eq!(
+                    wasix_sock_set_opt_flag(caller, listener_1, WASIX_SOCK_OPTION_REUSE_ADDR, 1),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    wasix_sock_get_opt_flag(caller, listener_2, WASIX_SOCK_OPTION_REUSE_ADDR, 220),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(read_guest_bytes(caller, 220, 1), [1]);
+
+                write_guest_addr_port(caller, 200, ip_v4(TEST_LOCAL_V4_A), 42000);
+                assert_eq!(
+                    wasix_sock_bind(caller, listener_1, 200).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(
+                    wasix_sock_addr_local(caller, listener_2, 240),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    read_guest_addr_port(caller, 240),
+                    (Some(ip_v4(TEST_LOCAL_V4_A)), 42000)
+                );
+
+                assert_eq!(
+                    wasix_sock_listen(caller, listener_2, 4).await,
+                    p1::errno::SUCCESS
+                );
+                device.deliver_on(
+                    0,
+                    &build_ipv4_tcp_frame(
+                        local_mac,
+                        TEST_LOCAL_V4_A,
+                        TcpHeader {
+                            source_port: 43001,
+                            destination_port: 42000,
+                            sequence: 3000,
+                            acknowledgement: 0,
+                            flags: TcpFlags::SYN,
+                            window_size: u16::MAX,
+                        },
+                        &[],
+                    ),
+                );
+                {
+                    let mut accept_fut =
+                        core::pin::pin!(wasix_sock_accept_v2(caller, listener_1, 0, 600, 608));
+                    assert!(
+                        futures_lite::future::poll_once(accept_fut.as_mut())
+                            .await
+                            .is_none()
+                    );
+                    let seq = find_syn_ack_sequence(&device, TEST_LOCAL_V4_A, 42000, 43001);
+                    device.deliver_on(
+                        0,
+                        &build_ipv4_tcp_frame(
+                            local_mac,
+                            TEST_LOCAL_V4_A,
+                            TcpHeader {
+                                source_port: 43001,
+                                destination_port: 42000,
+                                sequence: 3001,
+                                acknowledgement: seq.wrapping_add(1),
+                                flags: TcpFlags::ACK,
+                                window_size: u16::MAX,
+                            },
+                            &[],
+                        ),
+                    );
+                    assert_eq!(accept_fut.await, Ok(p1::errno::SUCCESS));
+                }
+                assert_eq!(
+                    read_guest_addr_port(caller, 608),
+                    (Some(ip_v4(TEST_PEER_V4)), 43001)
+                );
+
+                // Client socket: fork/dup shares connect state, peer address, and receive stream.
+                assert_eq!(
+                    wasix_sock_open(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        104,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let client_1 = read_guest_u32(caller, 104) as i32;
+                let client_2 = caller.data_mut().descriptors.dup(client_1).expect("dup") as i32;
+                let forked = caller.data().descriptors.clone_for_exec();
+
+                write_guest_addr_port(caller, 200, ip_v4(TEST_PEER_V4), 44000);
+                let (src_port, client_seq) = {
+                    let mut connect_fut =
+                        core::pin::pin!(wasix_sock_connect(caller, client_1, 200));
+                    assert!(
+                        futures_lite::future::poll_once(connect_fut.as_mut())
+                            .await
+                            .is_none()
+                    );
+                    let (src_port, client_seq) = device
+                        .transmitted_frames()
+                        .into_iter()
+                        .rev()
+                        .find_map(|frame| {
+                            let eth = EthernetFrame::parse(&frame)?;
+                            (eth.protocol == EthernetProtocol::Ipv4).then_some(())?;
+                            let ip = Ipv4Packet::parse(eth.payload)?;
+                            (ip.protocol == IpProtocol::Tcp && ip.destination == TEST_PEER_V4)
+                                .then_some(())?;
+                            let tcp = TcpPacket::parse(ip.payload)?;
+                            (tcp.destination_port == 44000
+                                && tcp.flags.contains(TcpFlags::SYN)
+                                && !tcp.flags.contains(TcpFlags::ACK))
+                            .then_some((tcp.source_port, tcp.sequence))
+                        })
+                        .expect("outgoing SYN to TEST_PEER_V4:44000");
+
+                    device.deliver_on(
+                        0,
+                        &build_ipv4_tcp_frame(
+                            local_mac,
+                            TEST_LOCAL_V4_A,
+                            TcpHeader {
+                                source_port: 44000,
+                                destination_port: src_port,
+                                sequence: 9000,
+                                acknowledgement: client_seq.wrapping_add(1),
+                                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                                window_size: u16::MAX,
+                            },
+                            &[],
+                        ),
+                    );
+                    assert_eq!(connect_fut.await, Ok(p1::errno::SUCCESS));
+                    (src_port, client_seq)
+                };
+
+                assert_eq!(
+                    wasix_sock_addr_peer(caller, client_2, 240),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    read_guest_addr_port(caller, 240),
+                    (Some(ip_v4(TEST_PEER_V4)), 44000)
+                );
+
+                // The descriptor entry cloned before connect also shares the connected state.
+                let Some(Preview1Descriptor::Socket(forked_sock)) = forked.get(client_1) else {
+                    panic!("forked descriptor missing client_1 socket");
+                };
+                assert!(matches!(
+                    forked_sock.tcp_state(),
+                    Some(UnixTcpSocket::Connected {
+                        peer_port: 44000,
+                        ..
+                    })
+                ));
+
+                device.deliver_on(
+                    0,
+                    &build_ipv4_tcp_frame(
+                        local_mac,
+                        TEST_LOCAL_V4_A,
+                        TcpHeader {
+                            source_port: 44000,
+                            destination_port: src_port,
+                            sequence: 9001,
+                            acknowledgement: client_seq.wrapping_add(1),
+                            flags: TcpFlags::ACK.union(TcpFlags::PSH),
+                            window_size: u16::MAX,
+                        },
+                        b"dup-tcp",
+                    ),
+                );
+                write_guest_iov(caller, 300, 400, 32);
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        client_2,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_DONT_WAIT),
+                        500,
+                        504,
+                        512,
+                    )
+                    .await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                let len = read_guest_u32(caller, 500) as usize;
+                assert_eq!(read_guest_bytes(caller, 400, len), b"dup-tcp");
+            })
+        });
+    }
+
+    #[test]
+    fn wasix_duplicated_socketpair_shares_carry_and_options() {
+        let (clock, _device, service) = configured_test_net_service();
+        run_with_wasix_caller(ProcessAuthority::empty(), service, clock, move |caller| {
+            Box::pin(async move {
+                assert_eq!(
+                    wasix_sock_pair(
+                        caller,
+                        WASIX_ADDRESS_FAMILY_UNIX_I32,
+                        WASIX_SOCK_TYPE_STREAM,
+                        0,
+                        100,
+                        104,
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let pair_read_1 = read_guest_u32(caller, 100) as i32;
+                let pair_write = read_guest_u32(caller, 104) as i32;
+                let pair_read_2 =
+                    caller.data_mut().descriptors.dup(pair_read_1).expect("dup") as i32;
+                let forked = caller.data().descriptors.clone_for_exec();
+
+                assert_eq!(
+                    wasix_sock_set_opt_size(
+                        caller,
+                        pair_read_1,
+                        WASIX_SOCK_OPTION_RECV_BUF_SIZE,
+                        2048
+                    ),
+                    p1::errno::SUCCESS
+                );
+                assert_eq!(
+                    wasix_sock_get_opt_size(
+                        caller,
+                        pair_read_2,
+                        WASIX_SOCK_OPTION_RECV_BUF_SIZE,
+                        232
+                    ),
+                    p1::errno::SUCCESS
+                );
+                let buf_bytes = read_guest_bytes(caller, 232, 8);
+                assert_eq!(u64::from_le_bytes(buf_bytes.try_into().unwrap()), 2048);
+
+                let writer = match caller.data().descriptors.get(pair_write) {
+                    Some(Preview1Descriptor::Socket(socket)) => {
+                        socket.pair_writer().expect("socketpair writer")
+                    }
+                    _ => panic!("expected socketpair descriptor"),
+                };
+                writer
+                    .write(Bytes::from_static(b"hello world"))
+                    .await
+                    .expect("pair write");
+
+                // Consume "hello" via pair_read_1; " world" stays in the shared carry buffer.
+                write_guest_iov(caller, 300, 400, 5);
+                assert_eq!(
+                    wasix_sock_recv_from(caller, pair_read_1, 300, 1, 0, 500, 504, 512).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 5);
+                assert_eq!(read_guest_bytes(caller, 400, 5), b"hello");
+
+                // The forked descriptor snapshot sees the same 6 carried bytes.
+                let Some(Preview1Descriptor::Socket(forked_read)) = forked.get(pair_read_1) else {
+                    panic!("forked descriptor missing pair_read_1");
+                };
+                assert_eq!(forked_read.pair_read_probe().expect("pair").1, 6);
+
+                // RECV_PEEK via pair_read_2 reads from shared carry without consuming it.
+                write_guest_iov(caller, 300, 420, 16);
+                assert_eq!(
+                    wasix_sock_recv_from(
+                        caller,
+                        pair_read_2,
+                        300,
+                        1,
+                        i32::from(WASIX_RIFLAGS_RECV_PEEK | WASIX_RIFLAGS_RECV_DONT_WAIT),
+                        500,
+                        504,
+                        512,
+                    )
+                    .await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 6);
+                assert_eq!(read_guest_bytes(caller, 420, 6), b" world");
+
+                // Next read through pair_read_2 drains the shared carry buffer.
+                write_guest_iov(caller, 300, 440, 16);
+                assert_eq!(
+                    wasix_sock_recv_from(caller, pair_read_2, 300, 1, 0, 500, 504, 512).await,
+                    Ok(p1::errno::SUCCESS)
+                );
+                assert_eq!(read_guest_u32(caller, 500), 6);
+                assert_eq!(read_guest_bytes(caller, 440, 6), b" world");
+
+                // Nonblocking read on pair_read_1 now sees an empty buffer.
+                assert_eq!(
+                    caller
+                        .data_mut()
+                        .descriptors
+                        .set_fdflags(pair_read_1, P1_FDFLAG_NONBLOCK),
+                    p1::errno::SUCCESS
+                );
+                write_guest_iov(caller, 300, 460, 8);
+                assert_eq!(
+                    p1_reply(p1_sock_recv_inner(caller, pair_read_1, 300, 1, 0, 500, 504).await)
+                        .expect("p1 reply"),
+                    p1::errno::AGAIN
+                );
             })
         });
     }
