@@ -43,7 +43,21 @@
     ]
   },
   "lint-host": {
-    "command": "just clippy-host && just clippy-programs",
+    "command": "just clippy-host",
+    "helios-cli": "debug",
+    "rust-cache": true,
+    "surfaces": [
+      "kernel",
+      "unix",
+      "btrfs_src",
+      "venus",
+      "hosted",
+      "host_tools",
+      "programs"
+    ]
+  },
+  "lint-programs": {
+    "command": "just clippy-programs",
     "helios-cli": "debug",
     "rust-cache": true,
     "surfaces": [
