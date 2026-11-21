@@ -512,10 +512,11 @@ pub(super) async fn clock_nanosleep<M: UserMemory, O: Clock + System>(
     let clock = match args[0] as u32 as i32 {
         0 | 11 => SleepClock::Realtime,
         1 | 2 | 7 => SleepClock::Monotonic,
-        // `posix_cpu_nsleep` explicitly rejects `CLOCK_THREAD_CPUTIME_ID` with
-        // `EINVAL`; clocks whose `k_clock.nsleep` is null answer `EOPNOTSUPP`.
-        3 => return errno(EINVAL),
-        4..=6 => return errno(EOPNOTSUPP),
+        // `clock_thread`, `clock_monotonic_raw`, `clock_realtime_coarse`, and
+        // `clock_monotonic_coarse` have `.nsleep = NULL` in Linux v6.12
+        // (`kernel/time/posix-timers.c`, `kernel/time/posix-cpu-timers.c`), so
+        // `clock_nanosleep` answers `EOPNOTSUPP`.
+        3..=6 => return errno(EOPNOTSUPP),
         _ => return errno(EINVAL),
     };
     let mut bytes = [0u8; 16];

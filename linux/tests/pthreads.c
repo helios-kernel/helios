@@ -84,7 +84,7 @@ static void check_identity_and_scheduling(int expect_four_cpus) {
         target.tv_nsec -= 1000000000L;
     }
     CHECK(SYS(SYS_clock_nanosleep, CLOCK_MONOTONIC, TIMER_ABSTIME, &target, &rem) == 0);
-    CHECK(SYS(SYS_clock_nanosleep, CLOCK_THREAD_CPUTIME_ID, 0, &req, NULL) == -EINVAL);
+    CHECK(SYS(SYS_clock_nanosleep, CLOCK_THREAD_CPUTIME_ID, 0, &req, NULL) == -EOPNOTSUPP);
     CHECK(SYS(SYS_clock_nanosleep, CLOCK_MONOTONIC_RAW, 0, &req, NULL) == -EOPNOTSUPP);
     CHECK(SYS(SYS_clock_nanosleep, 999, 0, &req, NULL) == -EINVAL);
 }

@@ -928,6 +928,23 @@ fn futex_operations_and_robust_list_cleanup_match_linux_semantics() {
             ControlFlow::Continue(0)
         );
         assert_eq!(platform.now_nanos(), before + 25_000_000);
+        // `clock_thread` (3) and `clock_monotonic_raw` (4) have null `.nsleep`
+        // and answer `EOPNOTSUPP` (-95); unknown clocks answer `EINVAL` (-22).
+        for (clock_id, expected) in [(3, -95i64), (4, -95i64), (999, -22i64)] {
+            assert_eq!(
+                drive(dispatch(
+                    &mut main,
+                    Call {
+                        number: number(abi, Operation::ClockNanosleep),
+                        arguments: [clock_id, 0, 0x3400, 0, 0, 0],
+                    },
+                    &mut memory,
+                    &mut main_thread,
+                    &mut platform,
+                )),
+                ControlFlow::Continue(expected as u64)
+            );
+        }
     }
 }
 
