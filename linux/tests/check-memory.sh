@@ -93,7 +93,13 @@ mmap write and execute: ok
 rwx code returns: 42
 mprotect rw to rwx: ok
 rw to rwx code returns: 42
-rewritten code returns: 7'
+rewritten code returns: 7
+mmap over totalram: ok
+touch reserved ends: ok
+mmap over freeram: ok
+touch sparse ends: ok
+mremap over freeram: ok
+mremap touch tail: ok'
 failed=0
 
 check() {

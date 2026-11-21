@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <unistd.h>
 
 /* Allocates and frees through malloc, moves the break, unmaps, reprotects,
@@ -240,6 +241,64 @@ static void executing(void) {
     munmap(memory, page);
 }
 
+static void reservation(void) {
+    struct sysinfo info;
+    if (sysinfo(&info) != 0) exit(97);
+    uint64_t unit = info.mem_unit ? info.mem_unit : 1;
+    uint64_t total = (uint64_t)info.totalram * unit;
+    uint64_t free_ram = (uint64_t)info.freeram * unit;
+    size_t over_total = (size_t)((total + (64ULL << 20) + page - 1) & ~(uint64_t)(page - 1));
+    size_t over_free = (size_t)((free_ram + (64ULL << 20) + page - 1) & ~(uint64_t)(page - 1));
+
+    /* Reserve strictly more than total guest RAM, commit two boundary pages
+     * via mprotect + touch, and verify zero-fill and readback. */
+    char *reserved = mmap(0, over_total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    report("mmap over totalram", reserved == MAP_FAILED ? -1 : 0);
+    if (reserved != MAP_FAILED) {
+        int ok = mprotect(reserved, page, PROT_READ | PROT_WRITE) == 0
+            && mprotect(reserved + over_total - page, page, PROT_READ | PROT_WRITE) == 0
+            && holds(reserved, page, 0)
+            && holds(reserved + over_total - page, page, 0);
+        if (ok) {
+            reserved[0] = 0x33;
+            reserved[over_total - 1] = 0x44;
+            ok = reserved[0] == 0x33 && reserved[over_total - 1] == 0x44;
+        }
+        printf("touch reserved ends: %s\n", ok ? "ok" : "failed");
+        munmap(reserved, over_total);
+    }
+
+    /* Anonymous RW mmap larger than free memory commits only touched pages. */
+    char *sparse = mmap(0, over_free, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    report("mmap over freeram", sparse == MAP_FAILED ? -1 : 0);
+    if (sparse != MAP_FAILED) {
+        int ok = holds(sparse, page, 0) && holds(sparse + over_free - page, page, 0);
+        if (ok) {
+            sparse[0] = 0x55;
+            sparse[over_free - 1] = 0x66;
+            ok = sparse[0] == 0x55 && sparse[over_free - 1] == 0x66;
+        }
+        printf("touch sparse ends: %s\n", ok ? "ok" : "failed");
+        munmap(sparse, over_free);
+    }
+
+    /* mremap growth larger than free memory keeps existing contents and leaves
+     * the tail zero-filled on demand. */
+    char *grown = map(2);
+    memset(grown, 0x71, 2 * page);
+    char *moved = mremap(grown, 2 * page, over_free, MREMAP_MAYMOVE);
+    report("mremap over freeram", moved == MAP_FAILED ? -1 : 0);
+    if (moved != MAP_FAILED) {
+        int ok = holds(moved, 2 * page, 0x71) && holds(moved + over_free - page, page, 0);
+        if (ok) {
+            moved[over_free - 1] = 0x72;
+            ok = moved[over_free - 1] == 0x72;
+        }
+        printf("mremap touch tail: %s\n", ok ? "ok" : "failed");
+        munmap(moved, over_free);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 100;
     page = sysconf(_SC_PAGESIZE);
@@ -249,6 +308,7 @@ int main(int argc, char **argv) {
     discarding();
     remapping();
     executing();
+    reservation();
     if (!strcmp(argv[1], "exit")) {
         printf("end: exit\n");
         return 0;
