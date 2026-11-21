@@ -1532,13 +1532,10 @@ where
             signal: signal as u8,
         }));
     }
-    let Some(index) = caller.data().find_child_index(Some(pid)) else {
+    let Some(target) = caller.data().children.signal_target(pid) else {
         return Ok(p1::errno::SRCH);
     };
-    if caller.data().children[index].completed.is_some() {
-        return Ok(p1::errno::SRCH);
-    }
-    caller.data().children[index].signal_state.raise(signal);
+    target.raise(signal);
     Ok(p1::errno::SUCCESS)
 }
 
@@ -1823,6 +1820,41 @@ fn launch_exit_error_stop<CpuImpl: Cpu>(
     }
 }
 
+async fn wasix_read_exec_arguments(
+    memory: &Preview1AsyncMemory,
+    args: u32,
+    args_len: u32,
+    env: Option<(u32, u32)>,
+) -> Result<(Vec<String>, Option<Vec<(String, String)>>), ExecReadError> {
+    let argv = wasix_split_lines(&wasix_read_exec_string(memory, args, args_len).await?);
+    let environment = match env {
+        Some((ptr, len)) => Some(wasix_split_environment(
+            &wasix_read_exec_string(memory, ptr, len).await?,
+        )),
+        None => None,
+    };
+    Ok((argv, environment))
+}
+
+/// Translates an error on `proc_exec3`'s errno-returning path: a
+/// [`ProgramExecError`] records its kind and errno on `trace` and
+/// returns `Ok(errno)` so the caller keeps running, while a replacement
+/// unwind (`Preview1Exit`), lost swap page (`SwapFaultError`), signal or
+/// kill unwinds the store.
+fn wasix_exec3_error<CpuImpl: Cpu>(
+    trace: &phases::Trace<CpuImpl>,
+    error: wasmtime::Error,
+) -> wasmtime::Result<i32> {
+    if let Some(exec_error) = error.downcast_ref::<ProgramExecError>() {
+        let errno = p1_errno_from_program_exec_error(exec_error);
+        return Ok(trace.exit_error_errno(exec_error, errno));
+    }
+    if error.is::<crate::memory::SwapFaultError>() {
+        trace.failed(ProgramExecErrorKind::Internal);
+    }
+    Err(error)
+}
+
 pub(super) async fn wasix_proc_exec<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: u32,
@@ -1860,6 +1892,10 @@ where
         }
     };
     let compile_authority = CompileAuthority::from(&exec_authority);
+    let (argv, environment) = wasix_read_exec_arguments(&memory, args, args_len, env)
+        .await
+        .map_err(ExecReadError::into_error)
+        .inspect_err(|error| launch_exit_error(&trace, error))?;
     let prepared = match wasix_prepare_program(caller, &memory, name, name_len).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1869,59 +1905,32 @@ where
     };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
-    // Emission hands to the exec path's own guard.
-    trace.disarm();
     wasix_exec_prepared_program(
         caller,
         &compile_authority,
-        &memory,
         prepared,
-        args,
-        args_len,
-        env,
-        trace.timeline().clone(),
+        argv,
+        environment,
+        &mut trace,
     )
     .await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the compile authority is the one argument that must be spelled out so no exec reaches the compiler without a process right"
-)]
 pub(super) async fn wasix_exec_prepared_program<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     compile: &CompileAuthority,
-    memory: &Preview1AsyncMemory,
     prepared: WasixPreparedProgram,
-    args: u32,
-    args_len: u32,
-    env: Option<(u32, u32)>,
-    timeline: phases::Timeline,
+    argv: Vec<String>,
+    environment: Option<Vec<(String, String)>>,
+    trace: &mut phases::Trace<CpuImpl>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let mut trace = phases::Trace::adopt(caller.data().cpu.clone(), timeline);
-    let argv = wasix_read_exec_string(memory, args, args_len)
-        .await
-        .map(|value| wasix_split_lines(&value))
-        .map_err(ExecReadError::into_error)
-        .inspect_err(|error| launch_exit_error(&trace, error))?;
     let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
-    let environment = match env {
-        Some((ptr, len)) => match wasix_read_exec_string(memory, ptr, len).await {
-            Ok(value) => wasix_split_environment(&value),
-            Err(ExecReadError::Program(_)) => Vec::new(),
-            Err(error @ ExecReadError::Swap(_)) => {
-                let error = error.into_error();
-                launch_exit_error(&trace, &error);
-                return Err(error);
-            }
-        },
-        None => caller.data().environment.clone(),
-    };
+    let environment = environment.unwrap_or_else(|| caller.data().environment.clone());
     // The replacement keeps this instance, so it keeps this instance's id.
     let environment =
         LaunchEnvironment::from_guest(environment).into_process_env(caller.data().instance().id());
@@ -1952,7 +1961,7 @@ where
         )
         .await
         .map_err(wasmtime::Error::new)
-        .inspect_err(|error| launch_exit_error(&trace, error))?;
+        .inspect_err(|error| launch_exit_error(trace, error))?;
     // The reply of an exec is the replacement itself: the call returns
     // by unwinding the calling instance into the new program, which
     // then owns the timeline's emit at its completion.
@@ -1996,43 +2005,8 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    wasix_proc_exec_with_search(
-        caller,
-        name,
-        name_len,
-        args,
-        args_len,
-        Some((env, env_len)),
-        search_path,
-        path,
-        path_len,
-    )
-    .await
-    .map(|()| p1::errno::SUCCESS)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn wasix_proc_exec_with_search<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    name: u32,
-    name_len: u32,
-    args: u32,
-    args_len: u32,
-    env: Option<(u32, u32)>,
-    search_path: i32,
-    path: u32,
-    path_len: u32,
-) -> wasmtime::Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
     let Some(memory) = p1_async_memory(caller) else {
-        return Err(wasmtime::Error::new(ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
-        }));
+        return Ok(p1::errno::FAULT);
     };
     let program = wasix_launch_program_label(&memory, name, name_len)
         .await
@@ -2040,15 +2014,21 @@ where
     let mut trace = phases::Trace::begin(caller.data().cpu.clone(), "exec", &program);
     let exec_authority = match caller.data().require_exec_authority() {
         Ok(authority) => authority,
-        Err(_) => {
-            trace.refused(ProgramExecErrorKind::PermissionDenied);
-            return Err(wasmtime::Error::new(ProgramExecError {
-                kind: ProgramExecErrorKind::PermissionDenied,
-                detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
-            }));
-        }
+        Err(_) => return Ok(launch_exit_errno(&trace, p1::errno::NOTCAPABLE)),
     };
     let compile_authority = CompileAuthority::from(&exec_authority);
+    let (argv, environment) =
+        match wasix_read_exec_arguments(&memory, args, args_len, Some((env, env_len))).await {
+            Ok(decoded) => decoded,
+            Err(ExecReadError::Program(error)) => {
+                let errno = p1_errno_from_program_exec_error(&error);
+                return Ok(trace.exit_error_errno(&error, errno));
+            }
+            Err(ExecReadError::Swap(error)) => {
+                trace.failed(ProgramExecErrorKind::Internal);
+                return Err(wasmtime::Error::new(error));
+            }
+        };
     let prepared = match wasix_prepare_program_with_search(
         caller,
         &memory,
@@ -2061,25 +2041,23 @@ where
     .await
     {
         Ok(prepared) => prepared,
-        Err(error) => {
-            launch_exit_error(&trace, &error);
-            return Err(error);
-        }
+        Err(error) => return wasix_exec3_error(&trace, error),
     };
     trace.record(LaunchPhase::SourceRead);
     trace.record_source_bytes(prepared.source.payload_len());
-    trace.disarm();
-    wasix_exec_prepared_program(
+    match wasix_exec_prepared_program(
         caller,
         &compile_authority,
-        &memory,
         prepared,
-        args,
-        args_len,
-        env,
-        trace.timeline().clone(),
+        argv,
+        environment,
+        &mut trace,
     )
     .await
+    {
+        Ok(()) => Ok(p1::errno::SUCCESS),
+        Err(error) => wasix_exec3_error(&trace, error),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2620,63 +2598,35 @@ where
     }
     let (pid, ret_status) = (GuestAddress::wasm32(pid), GuestAddress::wasm32(ret_status));
     let requested_pid = wasix_read_option_pid(&memory, pid).await?;
-    let Some(index) = caller.data().find_child_index(requested_pid) else {
-        wasix_write_join_nothing(&memory, ret_status).await?;
-        return Ok(p1::errno::SUCCESS);
-    };
-    if flags & WASIX_JOIN_FLAG_NON_BLOCKING != 0 {
-        match caller.data_mut().poll_child_exit(index) {
-            Ok(Some(termination)) => {
-                let child = caller.data_mut().children.swap_remove(index);
-                wasix_write_join_exit(&memory, pid, ret_status, child.pid, termination).await?;
-            }
-            Ok(None) => {
+    let joined = if flags & WASIX_JOIN_FLAG_NON_BLOCKING != 0 {
+        let polled = caller.data_mut().poll_child_join(
+            requested_pid,
+            &mut Context::from_waker(futures::task::noop_waker_ref()),
+        );
+        match polled {
+            Poll::Ready(joined) => joined,
+            Poll::Pending => {
                 crate::yield_now().await;
-                wasix_write_join_nothing(&memory, ret_status).await?;
+                None
             }
-            Err(errno) => return Ok(errno),
         }
     } else {
-        let child_pid = caller.data().children[index].pid;
-        match caller.data_mut().poll_child_exit(index) {
-            Ok(Some(termination)) => {
-                let child = caller.data_mut().children.swap_remove(index);
-                wasix_write_join_exit(&memory, pid, ret_status, child.pid, termination).await?;
-                return Ok(p1::errno::SUCCESS);
-            }
-            Ok(None) => {}
-            Err(errno) => return Ok(errno),
+        core::future::poll_fn(|cx| caller.data_mut().poll_child_join(requested_pid, cx)).await
+    };
+    match joined {
+        Some(WasixJoinedChild {
+            pid: child_pid,
+            outcome: Ok(termination),
+        }) => {
+            wasix_write_join_exit(&memory, pid, ret_status, child_pid, termination).await?;
         }
-        let Some(exit) = caller.data_mut().children[index].exit.take() else {
-            wasix_write_join_nothing(&memory, ret_status).await?;
-            return Ok(p1::errno::SUCCESS);
-        };
-        let outcome = wasix_child_exit_result(exit.await);
-        let Some(index) = caller.data().find_child_index(Some(child_pid)) else {
-            wasix_write_join_nothing(&memory, ret_status).await?;
-            return Ok(p1::errno::SUCCESS);
-        };
-        let child = caller.data_mut().children.swap_remove(index);
-        let (termination, filesystem) = match outcome {
-            Ok(exit) => exit,
-            Err(errno) => return Ok(errno),
-        };
-        if let Some(filesystem) = filesystem {
-            caller.data_mut().filesystem.adopt_root_layer(filesystem);
-        }
-        wasix_write_join_exit(&memory, pid, ret_status, child.pid, termination).await?;
+        Some(WasixJoinedChild {
+            outcome: Err(errno),
+            ..
+        }) => return Ok(errno),
+        None => wasix_write_join_nothing(&memory, ret_status).await?,
     }
     Ok(p1::errno::SUCCESS)
-}
-
-pub(super) fn wasix_child_exit_result(
-    result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
-) -> Result<(helios_unix::ChildTermination, Option<MemoryFs>), i32> {
-    match result {
-        Ok(Ok(exit)) => Ok((exit.termination, exit.filesystem)),
-        Ok(Err(error)) => Err(p1_errno_from_program_exec_error(&error)),
-        Err(_) => Err(p1::errno::IO),
-    }
 }
 
 pub(super) async fn wasix_proc_snapshot<CpuImpl, Net, StorageImpl>(

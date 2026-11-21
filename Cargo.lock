@@ -1643,7 +1643,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1854,7 +1854,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2493,6 +2493,7 @@ dependencies = [
  "futures",
  "futures-lite",
  "getrandom 0.4.3",
+ "helios-btrfs",
  "helios-hal",
  "libc",
  "libfuzzer-sys",
@@ -3323,7 +3324,7 @@ dependencies = [
 [[package]]
 name = "http-kit"
 version = "0.8.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#070b0cadfc5bb666b7afde378642059d365ab8ef"
 dependencies = [
  "bytes",
  "bytestr",
@@ -3344,7 +3345,7 @@ dependencies = [
 [[package]]
 name = "http-kit-h1"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#070b0cadfc5bb666b7afde378642059d365ab8ef"
 dependencies = [
  "async-channel",
  "bytes",
@@ -3361,7 +3362,7 @@ dependencies = [
 [[package]]
 name = "http-kit-io"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#070b0cadfc5bb666b7afde378642059d365ab8ef"
 dependencies = [
  "bytes",
  "compio-buf",
@@ -3374,7 +3375,7 @@ dependencies = [
 [[package]]
 name = "http-kit-tls"
 version = "0.4.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#dfd5e04d5b75f2dacef6823290d2a3ac97a4cb53"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#070b0cadfc5bb666b7afde378642059d365ab8ef"
 dependencies = [
  "futures-lite",
  "http-kit-io",
@@ -4435,7 +4436,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5587,7 +5588,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5642,7 +5643,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6316,10 +6317,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6351,7 +6352,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7635,7 +7636,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8121,7 +8122,7 @@ dependencies = [
 [[package]]
 name = "zenwave"
 version = "0.12.0"
-source = "git+https://github.com/zen-rs/zenwave?branch=feat%2Frustls-no-ring#4bef8e280adacfcf92728bfd92e83ace24926c00"
+source = "git+https://github.com/zen-rs/zenwave?branch=main#9e8ff65dcc21c80633273134afce93113f79fb0b"
 dependencies = [
  "async-fs",
  "async-io",
@@ -8162,8 +8163,6 @@ dependencies = [
  "serde_json",
  "socket2",
  "thiserror 2.0.21",
- "time",
- "tower-service",
  "tracing",
  "url",
  "wasm-bindgen",

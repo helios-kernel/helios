@@ -26,9 +26,9 @@
 //! holds a reservation, metadata and system chunks ahead of need so a commit
 //! never runs out of tree blocks. A data write that finds the device full uses
 //! the smaller free ranges that remain, and only a device with no free sector
-//! reports out of space. The caller supplies time, compression policy, I/O
-//! concurrency and a UUID generator for root records that lack a valid UUID
-//! extension.
+//! reports out of space. The caller supplies time, compression policy, the
+//! inline data limit (Linux's `max_inline`), I/O concurrency and a UUID
+//! generator for root records that lack a valid UUID extension.
 
 pub use crate::allocation::AllocationDefect;
 pub use crate::allocation::data::DataDefect;
@@ -36,12 +36,12 @@ pub use crate::compress::policy::{CompressionOptionError, CompressionPolicy, Com
 pub use crate::compress::write::{EncodeError, Encoded, Encoder, Lzo, Plain, Zlib, Zstd};
 pub use crate::free_space::FreeSpaceDefect;
 pub use crate::fs::writer::{
-    Attributes, CloneRange, DEFAULT_DIRTY_METADATA_LIMIT, Dirty, InodeHandle, Name, RootUuids,
-    Usage, WriteTransaction, Writer,
+    Attributes, CloneRange, DEFAULT_DIRTY_METADATA_LIMIT, Dirty, InodeHandle, MountPolicy, Name,
+    RootUuids, Usage, WriteTransaction, Writer,
 };
 pub use crate::space::{SpaceDefect, SpaceError};
 pub use crate::transaction::chunks::ChunkError;
-pub use crate::transaction::file::WriteOptions;
+pub use crate::transaction::file::{DEFAULT_MAX_INLINE, WriteOptions};
 pub use crate::tree::edit::EditError;
 pub use crate::tree::write::WriteError;
 pub use crate::uuid_tree::UuidDefect;

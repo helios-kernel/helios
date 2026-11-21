@@ -12,7 +12,7 @@ http = { version = "1.5.0", default-features = false, features = ["std"] }
 rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 rustls-pure = { version = "0.15.4", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
-zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "feat/rustls-no-ring", default-features = false, features = ["native-backend"] }
+zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-backend"] }
 
 [lib]
 name = "helios_http_client"
