@@ -239,11 +239,11 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
                     }
                 },
             );
+            // Both `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` delegate to
+            // `futex_requeue` (`kernel/futex/requeue.c`), which returns
+            // `task_count` (woken + requeued).
             match outcome {
-                Ok(outcome) if cmd == FUTEX_CMP_REQUEUE => {
-                    (outcome.woken + outcome.requeued) as u64
-                }
-                Ok(outcome) => outcome.woken as u64,
+                Ok(outcome) => (outcome.woken + outcome.requeued) as u64,
                 Err(err) => errno(err),
             }
         }
@@ -270,7 +270,7 @@ pub(super) fn get_robust_list<R: Resources, M: UserMemory>(
 ) -> u64 {
     let pid = args[0] as u32 as i32;
     if pid < 0 {
-        return errno(EINVAL);
+        return errno(ESRCH);
     }
     let head = if pid == 0 || pid as u32 == process.tid.get() {
         process

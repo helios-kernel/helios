@@ -472,16 +472,13 @@ pub(super) fn sched_getaffinity<R: Resources, M: UserMemory, O: System>(
 ) -> u64 {
     let pid = args[0] as u32 as i32;
     let len = args[1] as u32 as usize;
-    if pid < 0 {
-        return errno(EINVAL);
-    }
-    if pid != 0 && !process.shared.threads.lock().contains(pid as u32) {
-        return errno(ESRCH);
-    }
     let cpus = output.processor_count().max(1) as usize;
     let required = cpus.div_ceil(64) * 8;
     if !len.is_multiple_of(8) || len < required {
         return errno(EINVAL);
+    }
+    if pid < 0 || (pid != 0 && !process.shared.threads.lock().contains(pid as u32)) {
+        return errno(ESRCH);
     }
     let mut mask = vec![0u8; required];
     for cpu in 0..cpus {

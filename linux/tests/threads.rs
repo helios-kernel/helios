@@ -632,9 +632,10 @@ fn futex_operations_and_robust_list_cleanup_match_linux_semantics() {
             );
             assert!(poll_once(f2.as_mut(), waker).is_pending());
 
-            // Plain `FUTEX_REQUEUE` returns `woken` alone (not `woken + requeued`):
-            // requeue `t2` back from `word2` to `word1` with 0 woken -> returns 0,
-            // then wake `t2` on `word1`.
+            // Plain `FUTEX_REQUEUE` shares `futex_requeue` with
+            // `FUTEX_CMP_REQUEUE` and returns `woken + requeued`: requeue `t2`
+            // back from `word2` to `word1` with 0 woken -> returns 1, then wake
+            // `t2` on `word1`.
             assert_eq!(
                 drive(dispatch(
                     &mut main,
@@ -646,7 +647,7 @@ fn futex_operations_and_robust_list_cleanup_match_linux_semantics() {
                     &mut main_thread,
                     &mut platform,
                 )),
-                ControlFlow::Continue(0)
+                ControlFlow::Continue(1)
             );
             assert_eq!(
                 drive(dispatch(
@@ -868,6 +869,47 @@ fn futex_operations_and_robust_list_cleanup_match_linux_semantics() {
             ControlFlow::Continue(8)
         );
         assert_eq!(memory.u32_at(0x3300), 0b1111);
+        // Negative PIDs answer ESRCH on Linux, while invalid mask length is
+        // checked first and answers EINVAL.
+        assert_eq!(
+            drive(dispatch(
+                &mut main,
+                Call {
+                    number: number(abi, Operation::SchedGetaffinity),
+                    arguments: [u64::from(u32::MAX), 16, 0x3300, 0, 0, 0],
+                },
+                &mut memory,
+                &mut main_thread,
+                &mut platform,
+            )),
+            ControlFlow::Continue((-3i64) as u64)
+        );
+        assert_eq!(
+            drive(dispatch(
+                &mut main,
+                Call {
+                    number: number(abi, Operation::SchedGetaffinity),
+                    arguments: [u64::from(u32::MAX), 4, 0x3300, 0, 0, 0],
+                },
+                &mut memory,
+                &mut main_thread,
+                &mut platform,
+            )),
+            ControlFlow::Continue((-22i64) as u64)
+        );
+        assert_eq!(
+            drive(dispatch(
+                &mut main,
+                Call {
+                    number: number(abi, Operation::GetRobustList),
+                    arguments: [u64::from(u32::MAX), 0x3200, 0x3208, 0, 0, 0],
+                },
+                &mut memory,
+                &mut main_thread,
+                &mut platform,
+            )),
+            ControlFlow::Continue((-3i64) as u64)
+        );
 
         memory.set_u64(0x3400, 0);
         memory.set_u64(0x3408, 25_000_000);

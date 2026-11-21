@@ -43,9 +43,10 @@ static void check_identity_and_scheduling(int expect_four_cpus) {
         CHECK(cpus == 4);
     }
     CHECK(SYS(SYS_sched_getaffinity, tid, sizeof(mask), &mask) == raw_bytes);
-    CHECK(SYS(SYS_sched_getaffinity, -1, sizeof(mask), &mask) == -EINVAL);
+    CHECK(SYS(SYS_sched_getaffinity, -1, sizeof(mask), &mask) == -ESRCH);
     CHECK(SYS(SYS_sched_getaffinity, 0x3fffffff, sizeof(mask), &mask) == -ESRCH);
     CHECK(SYS(SYS_sched_getaffinity, 0, 4, &mask) == -EINVAL);
+    CHECK(SYS(SYS_sched_getaffinity, -1, 4, &mask) == -EINVAL);
     CHECK(SYS(SYS_sched_getaffinity, 0, sizeof(mask), UNMAPPED) == -EFAULT);
 
     CHECK(sched_yield() == 0);
@@ -184,9 +185,9 @@ static void check_create_join_and_tls(void) {
     CHECK(atomic_load(&key_destructor_runs) == 10);
     CHECK(pthread_key_delete(key) == 0);
 
-    struct timespec proc_cpu, main_cpu;
-    CHECK(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &proc_cpu) == 0);
+    struct timespec main_cpu, proc_cpu;
     CHECK(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &main_cpu) == 0);
+    CHECK(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &proc_cpu) == 0);
     int64_t proc_ns = (int64_t)proc_cpu.tv_sec * 1000000000LL + proc_cpu.tv_nsec;
     int64_t main_ns = (int64_t)main_cpu.tv_sec * 1000000000LL + main_cpu.tv_nsec;
     CHECK(proc_ns >= main_ns);
@@ -466,9 +467,10 @@ static void check_raw_futex_ops(void) {
         sched_yield();
     }
     spin_briefly();
-    /* FUTEX_REQUEUE returns only the number woken (1), requeuing the 2nd. */
+    /* Both FUTEX_REQUEUE and FUTEX_CMP_REQUEUE delegate to futex_requeue,
+     * which returns task_count (woken + requeued = 2). */
     CHECK(SYS(SYS_futex, &word1, FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG, 1, (void *)1, &word2, 0)
-          == 1);
+          == 2);
     CHECK(SYS(SYS_futex, &word2, FUTEX_WAKE_PRIVATE, 10, NULL, NULL, 0) == 1);
     for (int i = 0; i < 2; i++) {
         CHECK(pthread_join(rq_threads[i], NULL) == 0);
@@ -514,7 +516,7 @@ static void check_robust_lists(void) {
     void *head = NULL;
     size_t len = 0;
     CHECK(SYS(SYS_set_robust_list, &head, 8) == -EINVAL);
-    CHECK(SYS(SYS_get_robust_list, -1, &head, &len) == -EINVAL);
+    CHECK(SYS(SYS_get_robust_list, -1, &head, &len) == -ESRCH);
     CHECK(SYS(SYS_get_robust_list, 0x3fffffff, &head, &len) == -ESRCH);
     CHECK(SYS(SYS_get_robust_list, 0, UNMAPPED, &len) == -EFAULT);
     CHECK(SYS(SYS_get_robust_list, 0, &head, &len) == 0);
@@ -550,10 +552,11 @@ static void check_robust_lists(void) {
 }
 
 static void check_clone3_validation(void) {
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct clone_args args;
     memset(&args, 0, sizeof(args));
     CHECK(SYS(SYS_clone3, &args, 32) == -EINVAL);
-    CHECK(SYS(SYS_clone3, &args, 8192) == -E2BIG);
+    CHECK(SYS(SYS_clone3, &args, page_size * 2) == -E2BIG);
     CHECK(SYS(SYS_clone3, UNMAPPED, sizeof(args)) == -EFAULT);
 
     /* CLONE_DETACHED (0x00400000) is rejected by clone3. */
