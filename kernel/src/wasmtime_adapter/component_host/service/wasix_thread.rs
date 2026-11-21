@@ -290,17 +290,9 @@ where
             store.data_mut().asyncify.phase = WasixAsyncifyPhase::Idle;
             break result;
         }
-        match handle_wasix_asyncify_completion(store, interrupts).await {
+        match finish_wasix_guest_call(store, interrupts).await {
             Ok(AsyncifyOutcome::Rewinding) => continue,
-            Ok(AsyncifyOutcome::Idle) => {
-                if let Err(stop) = wasix_deliver_pending_signals_on_store(store, interrupts).await {
-                    break Err(stop);
-                }
-                if !matches!(store.data().asyncify.phase, WasixAsyncifyPhase::Idle) {
-                    continue;
-                }
-                break Ok(());
-            }
+            Ok(AsyncifyOutcome::Idle) => break Ok(()),
             Err(AsyncifyError::GuestStop(error)) => break Err(error),
             Err(AsyncifyError::Exec(error)) => return Err(error),
         }

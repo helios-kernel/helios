@@ -2640,7 +2640,25 @@ where
             }
         }
     } else {
-        core::future::poll_fn(|cx| caller.data_mut().poll_child_join(requested_pid, cx)).await
+        let signals = caller.data().signals();
+        let active_handlers = caller.data().active_signal_handlers;
+        let mut catch_wait = core::pin::pin!(signals.wait_for_catch_signal(active_handlers));
+        let outcome = core::future::poll_fn(|cx| {
+            // Check already-completed children first so a completed child is
+            // never left unjoined when a caught signal is also pending.
+            if let Poll::Ready(joined) = caller.data_mut().poll_child_join(requested_pid, cx) {
+                return Poll::Ready(Ok(joined));
+            }
+            if catch_wait.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(p1::errno::INTR));
+            }
+            Poll::Pending
+        })
+        .await;
+        match outcome {
+            Ok(joined) => joined,
+            Err(errno) => return Ok(errno),
+        }
     };
     match joined {
         Some(WasixJoinedChild {

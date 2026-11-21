@@ -867,8 +867,9 @@ impl WasixStoreSignals {
         })
     }
 
-    /// Claims the next deliverable action at a safe point, skipping signals
-    /// already masked in `active_handlers` while their own callback runs.
+    /// Claims the next deliverable action at a safe point, prioritizing fatal
+    /// signals ahead of caught handlers and skipping caught signals already
+    /// masked in `active_handlers` while their own callback runs.
     pub(super) fn take_next_delivery(
         &self,
         active_handlers: helios_unix::SignalSet,
@@ -878,46 +879,45 @@ impl WasixStoreSignals {
         }
         let (ignored, callback) = self.dispositions.snapshot();
         let has_callback = callback.is_some();
-        let classify = |signal: helios_unix::Signal| match resolve_wasix_signal(
+        let classify_fatal = |signal: helios_unix::Signal| match resolve_wasix_signal(
             signal,
             ignored,
             has_callback.then_some(()),
         ) {
             WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Retain,
             WasixResolvedAction::Terminate => helios_unix::SignalSweep::Take,
-            WasixResolvedAction::Catch(()) if active_handlers.contains(signal) => {
-                helios_unix::SignalSweep::Retain
-            }
-            WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Take,
         };
-        if let Some(signal) = self.thread.sweep_pending(classify) {
-            return Some(
-                match resolve_wasix_signal(signal, ignored, has_callback.then_some(())) {
-                    WasixResolvedAction::Terminate => {
-                        WasixPendingDelivery::TerminateThread(signal.raw())
-                    }
-                    WasixResolvedAction::Catch(()) => WasixPendingDelivery::Catch {
-                        signal,
-                        callback: callback.expect("snapshot carried a callback"),
-                        thread_directed: true,
-                    },
-                    WasixResolvedAction::Ignore => unreachable!(),
-                },
-            );
+        if let Some(signal) = self.thread.sweep_pending(classify_fatal) {
+            return Some(WasixPendingDelivery::TerminateThread(signal.raw()));
         }
-        self.process.sweep_pending(classify).map(|signal| {
-            match resolve_wasix_signal(signal, ignored, has_callback.then_some(())) {
-                WasixResolvedAction::Terminate => {
-                    WasixPendingDelivery::TerminateProcess(signal.raw())
+        if let Some(signal) = self.process.sweep_pending(classify_fatal) {
+            return Some(WasixPendingDelivery::TerminateProcess(signal.raw()));
+        }
+        let callback = callback?;
+        let classify_catch =
+            |signal: helios_unix::Signal| match resolve_wasix_signal(signal, ignored, Some(())) {
+                WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+                WasixResolvedAction::Terminate => helios_unix::SignalSweep::Retain,
+                WasixResolvedAction::Catch(()) if active_handlers.contains(signal) => {
+                    helios_unix::SignalSweep::Retain
                 }
-                WasixResolvedAction::Catch(()) => WasixPendingDelivery::Catch {
-                    signal,
-                    callback: callback.expect("snapshot carried a callback"),
-                    thread_directed: false,
-                },
-                WasixResolvedAction::Ignore => unreachable!(),
-            }
-        })
+                WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Take,
+            };
+        if let Some(signal) = self.thread.sweep_pending(classify_catch) {
+            return Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed: true,
+            });
+        }
+        self.process
+            .sweep_pending(classify_catch)
+            .map(|signal| WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed: false,
+            })
     }
 
     /// Sweeps any ignored signals and reports whether an unmasked caught

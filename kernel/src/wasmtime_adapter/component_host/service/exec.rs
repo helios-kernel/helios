@@ -940,17 +940,9 @@ where
             store.data_mut().asyncify.phase = WasixAsyncifyPhase::Idle;
             break result;
         }
-        match handle_wasix_asyncify_completion(store, interrupts).await {
+        match finish_wasix_guest_call(store, interrupts).await {
             Ok(AsyncifyOutcome::Rewinding) => continue,
-            Ok(AsyncifyOutcome::Idle) => {
-                if let Err(stop) = wasix_deliver_pending_signals_on_store(store, interrupts).await {
-                    break Err(stop);
-                }
-                if !matches!(store.data().asyncify.phase, WasixAsyncifyPhase::Idle) {
-                    continue;
-                }
-                break Ok(());
-            }
+            Ok(AsyncifyOutcome::Idle) => break Ok(()),
             Err(AsyncifyError::GuestStop(error)) => break Err(error),
             Err(AsyncifyError::Exec(error)) => return Err(error),
         }
@@ -1327,6 +1319,35 @@ where
         }),
         GuestAccessError::Swap(error) => AsyncifyError::GuestStop(wasmtime::Error::new(error)),
     })
+}
+
+/// Completes any asyncify transition left by a guest entry point, then
+/// delivers pending signals when idle. If a post-return signal handler itself
+/// starts an asyncify unwind (such as `stack_restore`), loops so that unwind
+/// is processed through [`handle_wasix_asyncify_completion`] before rewinding
+/// back into the entry point.
+pub(super) async fn finish_wasix_guest_call<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
+) -> Result<AsyncifyOutcome, AsyncifyError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    loop {
+        match handle_wasix_asyncify_completion(store, interrupts).await? {
+            AsyncifyOutcome::Rewinding => return Ok(AsyncifyOutcome::Rewinding),
+            AsyncifyOutcome::Idle => {
+                wasix_deliver_pending_signals_on_store(store, interrupts)
+                    .await
+                    .map_err(AsyncifyError::GuestStop)?;
+                if matches!(store.data().asyncify.phase, WasixAsyncifyPhase::Idle) {
+                    return Ok(AsyncifyOutcome::Idle);
+                }
+            }
+        }
+    }
 }
 
 pub(super) async fn handle_wasix_asyncify_completion<CpuImpl, Net, StorageImpl>(

@@ -1140,3 +1140,229 @@ fn asyncify_unwind_and_rewind_preserve_thread_and_process_stops_and_defer_caught
         let _ = &harness.executor;
     }
 }
+
+#[test]
+fn fatal_signal_preempts_lower_numbered_caught_signal() {
+    let harness = SignalHarness::new();
+    let (mut store, interrupts, memory, _instance) =
+        harness.open_process_store(ProcessAuthority::root(), Vec::new());
+
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let calls_ref = handler_calls.clone();
+    let on_signal = Func::wrap(
+        &mut store,
+        move |mut caller: Caller<'_, TestProgramStore>, _sig: i32| -> wasmtime::Result<()> {
+            calls_ref.fetch_add(1, Ordering::SeqCst);
+            // Attempt to mask SIGKILL with proc_exit(0) if handler ever ran.
+            caller.data_mut().request_exit(0);
+            Err(wasmtime::Error::new(Preview1Exit))
+        },
+    );
+    store
+        .data_mut()
+        .define_test_export("on_signal", Extern::Func(on_signal));
+    write_guest_bytes(&memory, 16, b"on_signal");
+    let reg = Func::wrap_async(&mut store, |mut caller, (): ()| {
+        Box::new(async move { wasix_callback_signal(&mut caller, 16, 9) })
+    })
+    .typed::<(), ()>(&store)
+    .expect("reg");
+    let turns = store.data().guest_turns();
+    block_on(interrupts.drive(turns.drive(reg.call_async(&mut store, ()))))
+        .expect("registers callback_signal");
+
+    // Raise lower-numbered caught SIGINT (2) on thread mailbox AND uncatchable SIGKILL (9)
+    // on process mailbox before hitting a safe point: SIGKILL must preempt SIGINT without
+    // ever invoking `on_signal`.
+    let call = Func::wrap_async(&mut store, |mut caller, (): ()| {
+        Box::new(async move {
+            caller.data().thread_signals.raise(Signal::SIGINT);
+            caller.data().signal_state.raise(Signal::SIGKILL);
+            p1_finish_errno_call(&mut caller, p1::errno::SUCCESS).await
+        })
+    })
+    .typed::<(), i32>(&store)
+    .expect("call");
+
+    let turns = store.data().guest_turns();
+    let err = block_on(interrupts.drive(turns.drive(call.call_async(&mut store, ()))))
+        .expect_err("SIGKILL preempts lower-numbered caught SIGINT");
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.data_mut().take_process_end(err),
+        Ok(ChildTermination::Signaled(SignalTermination {
+            signal: Signal::SIGKILL.raw(),
+            core_dumped: false,
+        }))
+    );
+}
+
+#[test]
+fn blocking_proc_join_wakes_on_caught_signal_and_runs_handler() {
+    let harness = SignalHarness::new();
+    let (mut store, interrupts, memory, _instance) =
+        harness.open_process_store(ProcessAuthority::root(), Vec::new());
+
+    let delivered = Arc::new(Mutex::new(Vec::<i32>::new()));
+    let delivered_ref = delivered.clone();
+    let on_signal = Func::wrap(&mut store, move |sig: i32| {
+        delivered_ref.lock().push(sig);
+    });
+    store
+        .data_mut()
+        .define_test_export("on_signal", Extern::Func(on_signal));
+    write_guest_bytes(&memory, 16, b"on_signal");
+    let reg = Func::wrap_async(&mut store, |mut caller, (): ()| {
+        Box::new(async move { wasix_callback_signal(&mut caller, 16, 9) })
+    })
+    .typed::<(), ()>(&store)
+    .expect("reg");
+    let turns = store.data().guest_turns();
+    block_on(interrupts.drive(turns.drive(reg.call_async(&mut store, ()))))
+        .expect("registers callback_signal");
+
+    let (child_tx, child_rx) = futures::channel::oneshot::channel();
+    store
+        .data_mut()
+        .insert_child(601, WasixSignalState::new(), child_rx);
+
+    let pid_ptr = 64_u32;
+    let status_ptr = 96_u32;
+    write_guest_bytes(&memory, pid_ptr as usize, &[WASIX_OPTION_SOME, 0, 0, 0]);
+    write_guest_bytes(&memory, (pid_ptr + 4) as usize, &601_u32.to_le_bytes());
+
+    let join_fn = Func::wrap_async(&mut store, move |mut caller, (): ()| {
+        Box::new(async move {
+            let answer = wasix_proc_join(&mut caller, pid_ptr, 0, status_ptr).await;
+            p1_finish_async_call(&mut caller, answer).await
+        })
+    })
+    .typed::<(), i32>(&store)
+    .expect("join_fn");
+
+    let proc_signals = store.data().signal_state.clone();
+    {
+        let turns = store.data().guest_turns();
+        let mut join_fut = pin!(interrupts.drive(turns.drive(join_fn.call_async(&mut store, ()))));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(join_fut.as_mut().poll(&mut cx).is_pending());
+
+        proc_signals.raise(Signal::SIGUSR1);
+        match join_fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(errno)) => assert_eq!(errno, p1::errno::INTR),
+            other => panic!("expected blocking proc_join to wake with EINTR, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        *delivered.lock(),
+        alloc::vec![i32::from(Signal::SIGUSR1.raw())]
+    );
+
+    // Child 601 is still tracked and joins cleanly once it exits.
+    let _ = child_tx.send(Ok(ChildExit {
+        instance_id: crate::InstanceId::from_raw(601),
+        termination: ChildTermination::Exited(11),
+        filesystem: None,
+    }));
+    let turns = store.data().guest_turns();
+    assert_eq!(
+        block_on(interrupts.drive(turns.drive(join_fn.call_async(&mut store, ()))))
+            .expect("second join succeeds"),
+        p1::errno::SUCCESS
+    );
+    let status = read_guest_bytes(&memory, status_ptr as usize, 6);
+    assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_NORMAL);
+    assert_eq!(u16::from_le_bytes([status[2], status[3]]), 11);
+}
+
+#[test]
+fn post_return_signal_handler_unwind_runs_asyncify_completion_before_rewind() {
+    let harness = SignalHarness::new();
+    let (mut store, interrupts, memory, _instance) =
+        harness.open_process_store(ProcessAuthority::root(), Vec::new());
+
+    let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let hook_events = events.clone();
+    install_asyncify_exports(
+        &mut store,
+        memory.clone(),
+        512,
+        1024,
+        1536,
+        move |hook_name, _caller| {
+            let label = match hook_name {
+                "asyncify_start_unwind" => "start_unwind",
+                "asyncify_stop_unwind" => "stop_unwind",
+                "asyncify_start_rewind" => "start_rewind",
+                "asyncify_stop_rewind" => "stop_rewind",
+                _ => "other",
+            };
+            hook_events.lock().push(label);
+            Ok(())
+        },
+    );
+
+    // Capture a valid snapshot first at guest address 64 (24-byte `stack_snapshot`).
+    let checkpoint = Func::wrap_async(&mut store, |mut caller, (): ()| {
+        Box::new(async move { wasix_stack_checkpoint(&mut caller, 64, 96).await })
+    })
+    .typed::<(), i32>(&store)
+    .expect("checkpoint");
+    let turns = store.data().guest_turns();
+    assert_eq!(
+        block_on(interrupts.drive(turns.drive(checkpoint.call_async(&mut store, ()))))
+            .expect("capture unwind"),
+        p1::errno::SUCCESS
+    );
+    assert_eq!(
+        block_on(finish_wasix_guest_call(&mut store, &interrupts)).expect("capture completes"),
+        AsyncifyOutcome::Rewinding
+    );
+    let turns = store.data().guest_turns();
+    assert_eq!(
+        block_on(interrupts.drive(turns.drive(checkpoint.call_async(&mut store, ()))))
+            .expect("capture rewind"),
+        p1::errno::SUCCESS
+    );
+    events.lock().clear();
+
+    // Register a signal handler that calls `wasix_stack_restore(64, 42)` after `_start` returns.
+    let handler_events = events.clone();
+    let on_signal = Func::wrap_async(&mut store, move |mut caller, (signo,): (i32,)| {
+        let handler_events = handler_events.clone();
+        Box::new(async move {
+            assert_eq!(signo, i32::from(Signal::SIGUSR1.raw()));
+            handler_events.lock().push("on_signal");
+            wasix_stack_restore(&mut caller, 64, 42).await
+        })
+    });
+    store
+        .data_mut()
+        .define_test_export("on_signal", Extern::Func(on_signal));
+    write_guest_bytes(&memory, 16, b"on_signal");
+    let reg = Func::wrap_async(&mut store, |mut caller, (): ()| {
+        Box::new(async move { wasix_callback_signal(&mut caller, 16, 9) })
+    })
+    .typed::<(), ()>(&store)
+    .expect("reg");
+    let turns = store.data().guest_turns();
+    block_on(interrupts.drive(turns.drive(reg.call_async(&mut store, ()))))
+        .expect("registers callback_signal");
+
+    // Raise SIGUSR1 and run `finish_wasix_guest_call` as `run_core_module_image` and
+    // `call_wasix_thread` do after `_start` returns cleanly: it must process the handler's
+    // `Restoring` unwind through `handle_wasix_asyncify_completion` before returning `Rewinding`.
+    store.data().signal_state.raise(Signal::SIGUSR1);
+    let outcome = block_on(finish_wasix_guest_call(&mut store, &interrupts))
+        .expect("post-return handler unwind transitions cleanly to Rewinding");
+    assert_eq!(outcome, AsyncifyOutcome::Rewinding);
+    assert_eq!(store.data().asyncify.rewind_value, Some(42));
+    assert!(matches!(
+        store.data().asyncify.phase,
+        WasixAsyncifyPhase::Idle
+    ));
+    assert_eq!(
+        *events.lock(),
+        alloc::vec!["on_signal", "start_unwind", "stop_unwind", "start_rewind"]
+    );
+}
