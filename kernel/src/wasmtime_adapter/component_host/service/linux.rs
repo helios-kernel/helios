@@ -821,8 +821,8 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
             }
             Stop::Preempted | Stop::Interrupted => crate::yield_now().await,
             Stop::Fault(fault) => match fault.kind {
-                // A discarded page's first touch, a translation older than the
-                // page's current access, or growth of the initial stack:
+                // An uncommitted page's first touch, a translation older than
+                // the page's current access, or growth of the initial stack:
                 // resolved atomically against concurrent sibling VM ops.
                 FaultKind::Page {
                     address,
@@ -848,11 +848,11 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                                 .space
                                 .map(page, &[], PageFlags::READ | PageFlags::WRITE)
                             {
-                                Ok(()) => {}
-                                // A sibling thread mapped or grew this stack
-                                // page concurrently; verify the installed page
-                                // satisfies `access`.
-                                Err(NativeError::Overlap) => {
+                                // Commit the new stack page in the same fault
+                                // rather than taking a second fault on resume;
+                                // `Overlap` means a sibling thread already
+                                // mapped or grew this page concurrently.
+                                Ok(()) | Err(NativeError::Overlap) => {
                                     match shared.space.resolve_fault(address, access) {
                                         Ok(()) => {}
                                         Err(NativeError::OutOfMemory) => {
@@ -869,7 +869,7 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                                             break;
                                         }
                                         Err(error) => panic!(
-                                            "resolving a concurrent stack fault on {page:?}: {error}"
+                                            "resolving a stack-growth fault on {page:?}: {error}"
                                         ),
                                     }
                                 }
@@ -1217,5 +1217,193 @@ mod tests {
             memory.atomic_compare_exchange_u32(rw_addr, 0xdead_beef, 1),
             Err(MemoryFault)
         );
+    }
+
+    #[test]
+    fn linux_mmap_brk_and_mremap_commit_only_touched_pages() {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        use helios_linux::syscall::{Clock, NoBacking, dispatch};
+
+        struct DummyThread;
+        impl Thread for DummyThread {
+            fn thread_pointer(&self) -> u64 {
+                0
+            }
+            fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+                Err(Denied)
+            }
+            fn spawn_thread(
+                &mut self,
+                _: Process<NoBacking>,
+                _: SpawnedThread,
+            ) -> Result<(), SpawnError> {
+                unreachable!("no thread spawned")
+            }
+        }
+
+        struct DummyOutput;
+        impl Stdio for DummyOutput {
+            async fn write(&mut self, _: Stream, _: &[u8]) -> Result<usize, WriteError> {
+                Err(WriteError::Io)
+            }
+            async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+                Err(Denied)
+            }
+        }
+        impl Clock for DummyOutput {
+            fn now_nanos(&self) -> u64 {
+                0
+            }
+            async fn sleep_until(&self, _: u64) {}
+        }
+        impl System for DummyOutput {
+            fn realtime_nanos(&self) -> u64 {
+                0
+            }
+            fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+                Err(Denied)
+            }
+            fn cpu_nanos(&self) -> u64 {
+                0
+            }
+            fn fill_random(&mut self, _: &mut [u8]) {}
+            fn memory(&self) -> MemoryTotals {
+                MemoryTotals {
+                    total_bytes: 0,
+                    free_bytes: 0,
+                }
+            }
+            fn process_count(&self) -> u32 {
+                1
+            }
+            fn kernel_version(&self) -> &str {
+                "test"
+            }
+        }
+
+        const MMAP: u64 = 9;
+        const MUNMAP: u64 = 11;
+        const BRK: u64 = 12;
+        const MREMAP: u64 = 25;
+        const PROT_RW: u64 = 0x3;
+        const MAP_PRIVATE_ANON: u64 = 0x22;
+        const MREMAP_MAYMOVE: u64 = 1;
+
+        ensure_pool();
+        let page = PhysFrame::SIZE as u64;
+        let start = PhysFrame::SIZE;
+        let end = 1usize << 32;
+        let space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let user = VirtRange::new(VirtAddr::new(start), end - start);
+        let mut memory = LinuxMemory {
+            space: &space,
+            user,
+        };
+        let mut process = Process::new(Abi::X86_64, NonZeroU32::new(1).unwrap(), 0x50_0000);
+        let mut call = |number: u64, arguments: [u64; 6]| -> u64 {
+            let (mut thread, mut output) = (DummyThread, DummyOutput);
+            let mut fut = core::pin::pin!(dispatch(
+                &mut process,
+                Call { number, arguments },
+                &mut memory,
+                &mut thread,
+                &mut output,
+            ));
+            match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(ControlFlow::Continue(result)) => result,
+                other => panic!("unexpected syscall state: {other:?}"),
+            }
+        };
+
+        let baseline = crate::memory::user_heap_stats().allocated_bytes;
+
+        // An anonymous mapping larger than the entire 4 MiB test pool succeeds
+        // and takes zero frames until touched.
+        let large_len = 16 * 1024 * 1024;
+        let mapped = call(
+            MMAP,
+            [
+                0x1000_0000,
+                large_len,
+                PROT_RW,
+                MAP_PRIVATE_ANON,
+                u64::MAX,
+                0,
+            ],
+        );
+        assert_eq!(mapped, 0x1000_0000);
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+
+        // Touching the first and last pages commits exactly two frames.
+        space
+            .resolve_fault(VirtAddr::new(mapped as usize), PageFlags::WRITE)
+            .unwrap();
+        space
+            .resolve_fault(
+                VirtAddr::new((mapped + large_len - page) as usize),
+                PageFlags::READ,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 2 * PhysFrame::SIZE
+        );
+
+        // `brk` growth takes zero frames until touched, then commits per touched page.
+        let brk_start = call(BRK, [0; 6]);
+        let brk_end = brk_start + 8 * page;
+        assert_eq!(call(BRK, [brk_end, 0, 0, 0, 0, 0]), brk_end);
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 2 * PhysFrame::SIZE
+        );
+        space
+            .resolve_fault(
+                VirtAddr::new((brk_start + 5 * page) as usize),
+                PageFlags::WRITE,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 3 * PhysFrame::SIZE
+        );
+
+        // `mremap` growth (beyond the entire 4 MiB pool!) keeps existing frames
+        // and commits no frames for the new tail until touched.
+        let small = call(MMAP, [0, 2 * page, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0]);
+        space.write(VirtAddr::new(small as usize), b"kept").unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 4 * PhysFrame::SIZE
+        );
+        let grown_len = 8 * 1024 * 1024;
+        let moved = call(MREMAP, [small, 2 * page, grown_len, MREMAP_MAYMOVE, 0, 0]);
+        assert!(moved >= start as u64);
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 4 * PhysFrame::SIZE
+        );
+        let mut head = [0u8; 4];
+        space
+            .read(VirtAddr::new(moved as usize), &mut head)
+            .unwrap();
+        assert_eq!(&head, b"kept");
+        space
+            .resolve_fault(
+                VirtAddr::new((moved + grown_len - page) as usize),
+                PageFlags::WRITE,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 5 * PhysFrame::SIZE
+        );
+
+        // Unmapping and shrinking the break release every committed frame.
+        assert_eq!(call(MUNMAP, [mapped, large_len, 0, 0, 0, 0]), 0);
+        assert_eq!(call(MUNMAP, [moved, grown_len, 0, 0, 0, 0]), 0);
+        assert_eq!(call(BRK, [brk_start, 0, 0, 0, 0, 0]), brk_start);
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
     }
 }

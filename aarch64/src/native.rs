@@ -600,7 +600,9 @@ pub(crate) fn verify_user_isolation(isolation: UserIsolation) {
     });
     for (page, contents, flags) in [
         (code, &RET[..], PageFlags::READ | PageFlags::EXECUTE),
-        (data, &[][..], PageFlags::READ | PageFlags::WRITE),
+        // Non-empty contents commit the data page's PTE up front so the EL1
+        // probe tests a PSTATE.PAN permission fault on a present translation.
+        (data, &[0][..], PageFlags::READ | PageFlags::WRITE),
     ] {
         space
             .map(VirtRange::new(page, PAGE as usize), contents, flags)

@@ -2,12 +2,13 @@
 //! translation tables, shared by every backend that implements
 //! `helios_hal::native`.
 //!
-//! The index maps each mapped user page to the user-memory frame behind it,
-//! or to none for a page whose frame was discarded, and the access it was
-//! mapped with. It answers the lookups the contract's operations need, the
-//! copies of [`helios_hal::native::UserSpace`] and the fault path, in
-//! `O(log n)` per range rather than a scan of every page, and copies each
-//! run of physically adjacent frames in one copy.
+//! The index maps each mapped user range to its access flags and tracks the
+//! backing user-memory frame only for pages that have been committed (leaving
+//! newly reserved and discarded pages without a frame until first touched). It
+//! answers the lookups the contract's operations need, the copies of
+//! [`helios_hal::native::UserSpace`] and the fault path, in `O(log n)` per
+//! range rather than a scan of every page, and copies each run of physically
+//! adjacent frames in one copy.
 //!
 //! # Concurrency
 //!
@@ -214,28 +215,21 @@ impl<Tables: UserTranslation> SpaceState<Tables> {
                 deallocate_user_frame_on(processor, frame);
                 return Err(self.fail(first, base, error));
             }
-            self.pages.insert(
-                base,
-                NativePage {
-                    frame: Some(frame),
-                    flags,
-                },
-            );
+            self.pages.insert_region(base, base + PAGE, flags);
+            self.pages.insert_frame(base, frame);
         }
         Ok(())
     }
 
     /// Takes the pages of `[first, last)` out of the index and the tables.
-    /// Another thread's slice may have reached any of them, so their frames
-    /// wait for the shootdown.
+    /// Another thread's slice may have reached any committed page, so their
+    /// frames wait for the shootdown.
     fn take(&mut self, first: u64, last: u64) -> Removed {
         let mut removed = Removed::new();
-        for (base, page) in self.pages.remove_range(first, last) {
-            if let Some(frame) = page.frame {
-                self.tables.uninstall(base);
-                removed.touch(base);
-                removed.frames.push(frame);
-            }
+        for (base, frame) in self.pages.remove_range(first, last) {
+            self.tables.uninstall(base);
+            removed.touch(base);
+            removed.frames.push(frame);
         }
         removed
     }
@@ -247,7 +241,7 @@ impl<Tables: UserTranslation> SpaceState<Tables> {
         }
     }
 
-    /// Gives discarded page `base` a zero-filled frame.
+    /// Gives uncommitted page `base` a zero-filled frame.
     fn commit(&mut self, base: u64, flags: PageFlags) -> Result<(), NativeError> {
         let processor = helios_hal::cpu::current_processor();
         let frame =
@@ -263,20 +257,20 @@ impl<Tables: UserTranslation> SpaceState<Tables> {
         Ok(())
     }
 
-    /// Gives every discarded page of `[first, last)` its frame. Pages
+    /// Gives every uncommitted page of `[first, last)` its frame. Pages
     /// committed before a failure keep theirs: they read as zeros either
     /// way.
     fn commit_range(&mut self, first: u64, last: u64) -> Result<(), NativeError> {
-        let discarded: Vec<(u64, PageFlags)> = self
-            .pages
-            .pages
-            .range(first..last)
-            .filter(|(_, page)| page.frame.is_none())
-            .map(|(base, page)| (*base, page.flags))
-            .collect();
-        discarded
-            .into_iter()
-            .try_for_each(|(base, flags)| self.commit(base, flags))
+        for base in (first..last).step_by(PAGE as usize) {
+            let page = self
+                .pages
+                .get(base)
+                .expect("write checks every page is mapped first");
+            if page.frame.is_none() {
+                self.commit(base, page.flags)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -306,14 +300,22 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         if state.pages.overlaps(first, last) {
             return Err(NativeError::Overlap);
         }
-        if let Err(failed) = state.install(first, last, flags) {
+        if contents.is_empty() {
+            state.pages.insert_region(first, last, flags);
+            return Ok(());
+        }
+        let (_, contents_last) = state.pages.span(start, contents.len() as u64)?;
+        if let Err(failed) = state.install(first, contents_last, flags) {
             self.complete(&state.tables, failed.removed);
             return Err(failed.error);
+        }
+        if contents_last < last {
+            state.pages.insert_region(contents_last, last, flags);
         }
         state
             .pages
             .write(start, contents, PageFlags::empty())
-            .expect("installed pages cover the range");
+            .expect("installed pages cover contents");
         Ok(())
     }
 
@@ -331,10 +333,9 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             .pages
             .free_range(hint.raw() as u64, byte_len as u64)
             .ok_or(NativeError::OutOfMemory)?;
-        if let Err(failed) = state.install(start, start + byte_len as u64, flags) {
-            self.complete(&state.tables, failed.removed);
-            return Err(failed.error);
-        }
+        state
+            .pages
+            .insert_region(start, start + byte_len as u64, flags);
         Ok(VirtRange::new(VirtAddr::new(start as usize), byte_len))
     }
 
@@ -469,15 +470,12 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         }
         let SpaceState { pages, tables } = &mut *state;
         let mut narrowed = Removed::new();
-        for (base, page) in pages.pages.range_mut(first..last) {
-            if page.frame.is_some() && page.flags != flags {
-                tables.protect(*base, flags);
-                if !flags.contains(page.flags) {
-                    narrowed.touch(*base);
-                }
+        pages.protect_range(first, last, flags, |base, old_flags| {
+            tables.protect(base, flags);
+            if !flags.contains(old_flags) {
+                narrowed.touch(base);
             }
-            page.flags = flags;
-        }
+        });
         self.complete(&state.tables, narrowed);
         Ok(())
     }
@@ -488,12 +486,10 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         state.pages.span(first, last - first)?;
         let SpaceState { pages, tables } = &mut *state;
         let mut removed = Removed::new();
-        for (base, page) in pages.pages.range_mut(first..last) {
-            if let Some(frame) = page.frame.take() {
-                tables.uninstall(*base);
-                removed.touch(*base);
-                removed.frames.push(frame);
-            }
+        for (base, frame) in pages.discard_range(first, last) {
+            tables.uninstall(base);
+            removed.touch(base);
+            removed.frames.push(frame);
         }
         self.complete(&state.tables, removed);
         Ok(())
@@ -518,29 +514,17 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             .pages
             .uniform(from_first, from_last)
             .ok_or(NativeError::NotMapped)?;
-        let moved_last = to_first + (from_last - from_first);
-        // The pages past the moved ones first: their frames are the move's
-        // only new user memory, taken while nothing has moved yet.
-        if let Err(failed) = state.install(moved_last, to_last, flags) {
-            self.complete(&state.tables, failed.removed);
-            return Err(failed.error);
-        }
         // Each moved frame is reachable at both addresses until the source
-        // goes, so a slice racing the move reaches one frame, never two.
-        let committed: Vec<(u64, NonNull<u8>)> = state
-            .pages
-            .pages
-            .range(from_first..from_last)
-            .filter_map(|(base, page)| page.frame.map(|frame| (*base, frame)))
-            .collect();
+        // goes, so a slice racing the move reaches one frame, never two. The
+        // growth tail takes no frames until touched.
+        let committed = state.pages.committed_in(from_first, from_last);
         for (index, (base, frame)) in committed.iter().enumerate() {
             let target = to_first + (base - from_first);
             let physical = state.tables.physical(*frame);
             if let Err(error) = state.tables.install(target, physical, flags) {
-                // Unwind the destination. Its moved translations alias
-                // frames the source still owns, so only the extension's
-                // frames are freed.
-                let mut unwound = state.take(moved_last, to_last);
+                // Unwind the destination. Its moved translations alias frames
+                // the source still owns, so none are freed here.
+                let mut unwound = Removed::new();
                 for (base, _) in &committed[..index] {
                     let target = to_first + (base - from_first);
                     state.tables.uninstall(target);
@@ -552,12 +536,12 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         }
         let SpaceState { pages, tables } = &mut *state;
         let mut source = Removed::new();
-        for (base, page) in pages.remove_range(from_first, from_last) {
-            if page.frame.is_some() {
-                tables.uninstall(base);
-                source.touch(base);
-            }
-            pages.insert(to_first + (base - from_first), page);
+        let moved = pages.remove_range(from_first, from_last);
+        pages.insert_region(to_first, to_last, flags);
+        for (base, frame) in moved {
+            tables.uninstall(base);
+            source.touch(base);
+            pages.insert_frame(to_first + (base - from_first), frame);
         }
         self.complete(&state.tables, source);
         Ok(())
@@ -603,25 +587,34 @@ impl<Tables> Drop for NativeSpace<Tables> {
         // No slice outlives the borrow of this space, and every slice's exit
         // left no translation of it usable on its processor.
         let processor = helios_hal::cpu::current_processor();
-        for page in self.shared.state.get_mut().pages.drain() {
-            if let Some(frame) = page.frame {
-                deallocate_user_frame_on(processor, frame);
-            }
+        for frame in self.shared.state.get_mut().pages.drain_frames() {
+            deallocate_user_frame_on(processor, frame);
         }
     }
 }
 
-/// A mapped user page: its frame's direct-map address, `None` once the
-/// frame was discarded, and its access.
+/// A mapped user page: its frame's direct-map address, `None` when no
+/// frame has been committed, and its access.
 #[derive(Clone, Copy, Debug)]
 pub struct NativePage {
     pub frame: Option<NonNull<u8>>,
     pub flags: PageFlags,
 }
 
-/// Every mapped page of one user address space, by page address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MappedRegion {
+    end: u64,
+    flags: PageFlags,
+}
+
+/// Every mapped page of one user address space: contiguous mapped ranges
+/// with uniform access, and only the pages that currently hold a user frame.
 pub struct NativePages {
-    pages: BTreeMap<u64, NativePage>,
+    /// Non-overlapping, non-empty, page-aligned mapped ranges keyed by start
+    /// address; adjacent ranges with identical `flags` are merged.
+    regions: BTreeMap<u64, MappedRegion>,
+    /// Committed backing frames keyed by page base inside `regions`.
+    frames: BTreeMap<u64, NonNull<u8>>,
     /// The lowest mappable address: page zero stays unmapped.
     start: u64,
     /// The end of the user range.
@@ -637,7 +630,8 @@ unsafe impl Sync for NativePages {}
 impl NativePages {
     pub fn new(start: u64, end: u64) -> Self {
         Self {
-            pages: BTreeMap::new(),
+            regions: BTreeMap::new(),
+            frames: BTreeMap::new(),
             start,
             end,
         }
@@ -653,75 +647,227 @@ impl NativePages {
         Ok((address & !(PAGE - 1), end.next_multiple_of(PAGE)))
     }
 
+    fn region_at(&self, base: u64) -> Option<(u64, MappedRegion)> {
+        let (&start, &region) = self.regions.range(..=base).next_back()?;
+        (base < region.end).then_some((start, region))
+    }
+
     pub fn overlaps(&self, first: u64, last: u64) -> bool {
-        self.pages.range(first..last).next().is_some()
+        if first >= last {
+            return false;
+        }
+        self.regions
+            .range(..last)
+            .next_back()
+            .is_some_and(|(_, region)| region.end > first)
     }
 
     /// Whether every page of the page span `[first, last)` is mapped.
     pub fn covers(&self, first: u64, last: u64) -> bool {
-        self.pages.range(first..last).count() as u64 == (last - first) / PAGE
+        if first >= last {
+            return true;
+        }
+        let Some((_, region)) = self.region_at(first) else {
+            return false;
+        };
+        if region.end >= last {
+            return true;
+        }
+        let mut cursor = region.end;
+        for (&start, &region) in self.regions.range(cursor..last) {
+            if start != cursor {
+                return false;
+            }
+            if region.end >= last {
+                return true;
+            }
+            cursor = region.end;
+        }
+        false
     }
 
     /// The access every page of `[first, last)` is mapped with, `None` when
     /// a page is not mapped or two differ.
     pub fn uniform(&self, first: u64, last: u64) -> Option<PageFlags> {
-        if !self.covers(first, last) {
+        if first >= last {
             return None;
         }
-        let mut pages = self.pages.range(first..last).map(|(_, page)| page.flags);
-        let flags = pages.next()?;
-        pages.all(|other| other == flags).then_some(flags)
+        let (_, region) = self.region_at(first)?;
+        (region.end >= last).then_some(region.flags)
     }
 
     /// The first run of `[first, last)` mapped contiguously with one access.
     pub fn first_run(&self, first: u64, last: u64) -> Option<Mapping> {
-        let mut pages = self.pages.range(first..last);
-        let (&start, head) = pages.next()?;
-        let mut end = start + PAGE;
-        for (&base, page) in pages {
-            if base != end || page.flags != head.flags {
-                break;
-            }
-            end += PAGE;
+        if first >= last {
+            return None;
         }
+        let (start, region) = self.region_at(first).or_else(|| {
+            self.regions
+                .range(first..last)
+                .next()
+                .map(|(&s, &r)| (s, r))
+        })?;
+        let clipped_start = start.max(first);
+        let clipped_end = region.end.min(last);
         Some(Mapping {
-            range: VirtRange::new(VirtAddr::new(start as usize), (end - start) as usize),
-            flags: head.flags,
+            range: VirtRange::new(
+                VirtAddr::new(clipped_start as usize),
+                (clipped_end - clipped_start) as usize,
+            ),
+            flags: region.flags,
         })
     }
 
     pub fn get(&self, base: u64) -> Option<NativePage> {
-        self.pages.get(&base).copied()
+        let (_, region) = self.region_at(base)?;
+        Some(NativePage {
+            frame: self.frames.get(&base).copied(),
+            flags: region.flags,
+        })
     }
 
-    pub fn insert(&mut self, base: u64, page: NativePage) {
-        let previous = self.pages.insert(base, page);
-        assert!(previous.is_none(), "user page {base:#x} mapped twice");
-    }
-
-    /// Gives discarded page `base` the frame `frame`.
-    pub fn commit(&mut self, base: u64, frame: NonNull<u8>) {
-        let page = self
-            .pages
-            .get_mut(&base)
-            .unwrap_or_else(|| panic!("committing unmapped user page {base:#x}"));
+    /// Inserts an unmapped contiguous page-aligned range `[first, last)`,
+    /// coalescing with adjacent neighbors that carry the same `flags`.
+    pub fn insert_region(&mut self, mut first: u64, mut last: u64, flags: PageFlags) {
+        assert!(first < last && first.is_multiple_of(PAGE) && last.is_multiple_of(PAGE));
+        if let Some((&left_start, &left)) = self.regions.range(..first).next_back()
+            && left.end == first
+            && left.flags == flags
+        {
+            self.regions.remove(&left_start);
+            first = left_start;
+        }
+        if let Some(&right) = self.regions.get(&last)
+            && right.flags == flags
+        {
+            self.regions.remove(&last);
+            last = right.end;
+        }
+        let previous = self
+            .regions
+            .insert(first, MappedRegion { end: last, flags });
         assert!(
-            page.frame.replace(frame).is_none(),
-            "user page {base:#x} committed twice"
+            previous.is_none(),
+            "user range {first:#x}..{last:#x} mapped twice"
         );
     }
 
-    /// Takes every page of `[first, last)` out of the index.
-    pub fn remove_range(&mut self, first: u64, last: u64) -> Vec<(u64, NativePage)> {
-        let mut tail = self.pages.split_off(&first);
+    pub fn insert_frame(&mut self, base: u64, frame: NonNull<u8>) {
+        let previous = self.frames.insert(base, frame);
+        assert!(previous.is_none(), "user page {base:#x} framed twice");
+    }
+
+    pub fn insert(&mut self, base: u64, page: NativePage) {
+        assert!(
+            !self.overlaps(base, base + PAGE),
+            "user page {base:#x} mapped twice"
+        );
+        self.insert_region(base, base + PAGE, page.flags);
+        if let Some(frame) = page.frame {
+            self.insert_frame(base, frame);
+        }
+    }
+
+    /// Gives uncommitted page `base` the frame `frame`.
+    pub fn commit(&mut self, base: u64, frame: NonNull<u8>) {
+        assert!(
+            self.region_at(base).is_some(),
+            "committing unmapped user page {base:#x}"
+        );
+        let previous = self.frames.insert(base, frame);
+        assert!(previous.is_none(), "user page {base:#x} committed twice");
+    }
+
+    fn split_at(&mut self, boundary: u64) {
+        let Some((start, region)) = self.region_at(boundary) else {
+            return;
+        };
+        if start < boundary {
+            self.regions.get_mut(&start).expect("region exists").end = boundary;
+            self.regions.insert(
+                boundary,
+                MappedRegion {
+                    end: region.end,
+                    flags: region.flags,
+                },
+            );
+        }
+    }
+
+    fn drain_frames_in_range(&mut self, first: u64, last: u64) -> Vec<(u64, NonNull<u8>)> {
+        let mut tail = self.frames.split_off(&first);
         let mut rest = tail.split_off(&last);
-        self.pages.append(&mut rest);
+        self.frames.append(&mut rest);
         tail.into_iter().collect()
     }
 
-    /// Takes every page out of the index.
-    pub fn drain(&mut self) -> impl Iterator<Item = NativePage> {
-        core::mem::take(&mut self.pages).into_values()
+    /// Replaces the access of `[first, last)` (which must be covered) with
+    /// `flags`, invoking `on_committed(base, old_flags)` for each committed
+    /// frame whose region's access changed.
+    pub fn protect_range(
+        &mut self,
+        first: u64,
+        last: u64,
+        flags: PageFlags,
+        mut on_committed: impl FnMut(u64, PageFlags),
+    ) {
+        if first >= last {
+            return;
+        }
+        self.split_at(first);
+        self.split_at(last);
+        let keys: Vec<(u64, MappedRegion)> = self
+            .regions
+            .range(first..last)
+            .map(|(&start, &region)| (start, region))
+            .collect();
+        for (start, region) in &keys {
+            if region.flags != flags {
+                for (&base, _) in self.frames.range(*start..region.end) {
+                    on_committed(base, region.flags);
+                }
+            }
+            self.regions.remove(start);
+        }
+        self.insert_region(first, last, flags);
+    }
+
+    /// Drops the backing frames of `[first, last)` while keeping the mapped
+    /// ranges and their access intact, returning the `(base, frame)` pairs
+    /// removed.
+    pub fn discard_range(&mut self, first: u64, last: u64) -> Vec<(u64, NonNull<u8>)> {
+        if first >= last {
+            return Vec::new();
+        }
+        self.drain_frames_in_range(first, last)
+    }
+
+    pub fn committed_in(&self, first: u64, last: u64) -> Vec<(u64, NonNull<u8>)> {
+        self.frames
+            .range(first..last)
+            .map(|(&base, &frame)| (base, frame))
+            .collect()
+    }
+
+    /// Takes every page of `[first, last)` out of the index, returning the
+    /// committed `(base, frame)` pairs that were mapped there.
+    pub fn remove_range(&mut self, first: u64, last: u64) -> Vec<(u64, NonNull<u8>)> {
+        if first >= last {
+            return Vec::new();
+        }
+        self.split_at(first);
+        self.split_at(last);
+        let keys: Vec<u64> = self.regions.range(first..last).map(|(&s, _)| s).collect();
+        for key in keys {
+            self.regions.remove(&key);
+        }
+        self.drain_frames_in_range(first, last)
+    }
+
+    /// Takes every committed frame out of the index.
+    pub fn drain_frames(&mut self) -> impl Iterator<Item = NonNull<u8>> {
+        self.regions.clear();
+        core::mem::take(&mut self.frames).into_values()
     }
 
     /// The first free page-aligned range of `length` bytes at or above
@@ -733,12 +879,15 @@ impl NativePages {
 
     fn find(&self, from: u64, length: u64) -> Option<u64> {
         let mut candidate = (from & !(PAGE - 1)).max(self.start);
+        if let Some((_, region)) = self.region_at(candidate) {
+            candidate = region.end;
+        }
         loop {
             let end = candidate
                 .checked_add(length)
                 .filter(|end| *end <= self.end)?;
-            match self.pages.range(candidate..end).next_back() {
-                Some((base, _)) => candidate = base + PAGE,
+            match self.regions.range(candidate..end).next() {
+                Some((_, region)) => candidate = region.end,
                 None => return Some(candidate),
             }
         }
@@ -751,23 +900,32 @@ impl NativePages {
             return Ok(());
         }
         let (first, last) = self.span(address, length as u64)?;
-        let mut expected = first;
-        for (base, page) in self.pages.range(first..last) {
-            if *base != expected || !page.flags.contains(access) {
-                return Err(NativeError::NotMapped);
-            }
-            expected += PAGE;
-        }
-        if expected != last {
+        let Some((_, region)) = self.region_at(first) else {
+            return Err(NativeError::NotMapped);
+        };
+        if !region.flags.contains(access) {
             return Err(NativeError::NotMapped);
         }
-        Ok(())
+        if region.end >= last {
+            return Ok(());
+        }
+        let mut cursor = region.end;
+        for (&start, &region) in self.regions.range(cursor..last) {
+            if start != cursor || !region.flags.contains(access) {
+                return Err(NativeError::NotMapped);
+            }
+            if region.end >= last {
+                return Ok(());
+            }
+            cursor = region.end;
+        }
+        Err(NativeError::NotMapped)
     }
 
     /// Visits `[address, address + length)` as runs of physically adjacent
     /// frames, after checking that every page is mapped with `access`:
     /// `visit(run, bytes, offset)` receives the run's bytes through the
-    /// direct map, or `None` for a run of discarded pages, and the run's
+    /// direct map, or `None` for a run of uncommitted pages, and the run's
     /// offset within the range. Nothing is visited when any page fails the
     /// check.
     pub fn runs(
@@ -782,29 +940,42 @@ impl NativePages {
             return Ok(());
         }
         let (first, last) = self.span(address, length as u64)?;
+        let end_addr = address + length as u64;
         let mut done = 0usize;
         let mut run: Option<(Option<NonNull<u8>>, usize)> = None;
-        for (base, page) in self.pages.range(first..last) {
-            let skip = address.saturating_sub(*base) as usize;
-            let take = (PAGE as usize - skip).min(length - done - run.map_or(0, |(_, n)| n));
-            // SAFETY: `skip` lies inside this page's frame.
-            let start = page
-                .frame
-                .map(|frame| unsafe { NonNull::new_unchecked(frame.as_ptr().add(skip)) });
-            run = match (run, start) {
-                (Some((Some(head), bytes)), Some(start))
-                    if head.as_ptr().wrapping_add(bytes) == start.as_ptr() =>
+        let mut emit = |start: Option<NonNull<u8>>, bytes: usize| {
+            run = match (run.take(), start) {
+                (Some((Some(head), prev)), Some(next))
+                    if head.as_ptr().wrapping_add(prev) == next.as_ptr() =>
                 {
-                    Some((Some(head), bytes + take))
+                    Some((Some(head), prev + bytes))
                 }
-                (Some((None, bytes)), None) => Some((None, bytes + take)),
-                (Some((head, bytes)), start) => {
-                    visit(head, bytes, done);
-                    done += bytes;
-                    Some((start, take))
+                (Some((None, prev)), None) => Some((None, prev + bytes)),
+                (Some((head, prev)), next) => {
+                    visit(head, prev, done);
+                    done += prev;
+                    Some((next, bytes))
                 }
-                (None, start) => Some((start, take)),
+                (None, next) => Some((next, bytes)),
             };
+        };
+
+        let mut cursor = first;
+        for (&base, &frame) in self.frames.range(first..last) {
+            if cursor < base {
+                let gap = (base.min(end_addr) - cursor.max(address)) as usize;
+                emit(None, gap);
+            }
+            let skip = address.saturating_sub(base) as usize;
+            let take = ((base + PAGE).min(end_addr) - base.max(address)) as usize;
+            // SAFETY: `skip` lies inside this page's frame.
+            let start = unsafe { NonNull::new_unchecked(frame.as_ptr().add(skip)) };
+            emit(Some(start), take);
+            cursor = base + PAGE;
+        }
+        if cursor < last {
+            let tail = (last.min(end_addr) - cursor.max(address)) as usize;
+            emit(None, tail);
         }
         if let Some((head, bytes)) = run {
             visit(head, bytes, done);
@@ -1086,6 +1257,11 @@ mod tests {
         assert_eq!(log.events.lock()[0].0, 0x20000);
         assert_eq!(log.events.lock()[0].1, 0x21000);
 
+        // Commit the trailing page first so `discard` has a frame to shoot
+        // down and free.
+        space
+            .resolve_fault(VirtAddr::new(0x21000), PageFlags::WRITE)
+            .unwrap();
         let before_discard = crate::memory::user_heap_stats().allocated_bytes;
         space.discard(range(0x21000, 1)).unwrap();
         let after_discard = crate::memory::user_heap_stats().allocated_bytes;
@@ -1131,5 +1307,147 @@ mod tests {
         assert!(after_unmap < before_unmap);
 
         drop(slice);
+    }
+
+    #[test]
+    fn large_reservations_merge_split_and_skip_uncommitted_scans() {
+        let mut pages = NativePages::new(PAGE, 1 << 47);
+        let rw = PageFlags::READ | PageFlags::WRITE;
+        let rwx = rw | PageFlags::EXECUTE;
+        let gib = 1024 * 1024 * 1024;
+        // A 4 GiB reservation takes one region entry and zero frames.
+        pages.insert_region(gib, 5 * gib, rw);
+        assert_eq!(pages.regions.len(), 1);
+        assert!(pages.frames.is_empty());
+        assert_eq!(pages.free_range(gib, PAGE), Some(5 * gib));
+
+        // Splitting with different flags produces three regions; restoring
+        // the original flags coalesces them back into one.
+        let mut touched = Vec::new();
+        pages.protect_range(2 * gib, 2 * gib + 2 * PAGE, rwx, |b, f| {
+            touched.push((b, f));
+        });
+        assert!(touched.is_empty());
+        assert_eq!(pages.regions.len(), 3);
+        assert_eq!(pages.uniform(2 * gib, 2 * gib + 2 * PAGE), Some(rwx));
+        pages.protect_range(2 * gib, 2 * gib + 2 * PAGE, rw, |_, _| {});
+        assert_eq!(pages.regions.len(), 1);
+
+        // Removing a hole inside the 4 GiB reservation splits into two regions.
+        assert!(pages.remove_range(3 * gib, 3 * gib + 0x1_0000).is_empty());
+        assert_eq!(pages.regions.len(), 2);
+        assert_eq!(pages.free_range(2 * gib, 0x1_0000), Some(3 * gib));
+    }
+
+    struct InstallLog(alloc::sync::Arc<Mutex<Vec<u64>>>);
+
+    // SAFETY: host test counts `install` calls and never runs hardware slices.
+    unsafe impl UserTranslation for InstallLog {
+        fn install(&mut self, base: u64, _: u64, _: PageFlags) -> Result<(), NativeError> {
+            self.0.lock().push(base);
+            Ok(())
+        }
+        fn uninstall(&mut self, _: u64) {}
+        fn protect(&mut self, _: u64, _: PageFlags) {}
+        fn invalidate(&self, _: u64, _: u64) {}
+        fn physical(&self, frame: NonNull<u8>) -> u64 {
+            frame.as_ptr() as u64
+        }
+    }
+
+    #[test]
+    fn anonymous_mappings_commit_only_touched_pages_until_fault_or_write() {
+        ensure_pool();
+        let tables = alloc::sync::Arc::new(Mutex::new(Vec::new()));
+        let space = NativeSpace::new(InstallLog(tables.clone()), PAGE, 1 << 47);
+        let rw = PageFlags::READ | PageFlags::WRITE;
+        let range = |start: usize, pages: usize| {
+            VirtRange::new(VirtAddr::new(start), pages * PAGE as usize)
+        };
+
+        let baseline = crate::memory::user_heap_stats().allocated_bytes;
+
+        // Mapping more bytes than the entire 4 MiB test pool succeeds with 0
+        // frames and 0 table installs.
+        let huge = space
+            .map_anywhere(VirtAddr::new(0x100_0000), 64 * 1024 * 1024, rw)
+            .unwrap();
+        assert_eq!(huge.byte_len, 64 * 1024 * 1024);
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+        assert!(tables.lock().is_empty());
+
+        // Fixed anonymous map (brk growth / MAP_FIXED) also takes 0 frames.
+        space.map(range(0x10_000, 8), &[], rw).unwrap();
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+        assert!(tables.lock().is_empty());
+
+        // Reading or atomic-loading untouched pages yields zeros and commits nothing.
+        let mut zeros = [0xffu8; 64];
+        space.read(VirtAddr::new(0x12_080), &mut zeros).unwrap();
+        assert!(zeros.iter().all(|b| *b == 0));
+        assert_eq!(space.atomic_load_u32(VirtAddr::new(0x13_000)), Ok(0));
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+        assert!(tables.lock().is_empty());
+
+        // First touch on two pages commits exactly two frames.
+        space
+            .resolve_fault(VirtAddr::new(huge.start.raw() + 0x200), PageFlags::READ)
+            .unwrap();
+        space
+            .resolve_fault(
+                VirtAddr::new(huge.start.raw() + 64 * 1024 * 1024 - 16),
+                PageFlags::WRITE,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 2 * PAGE as usize
+        );
+        assert_eq!(tables.lock().len(), 2);
+
+        // Writing a partial-contents segment (.data + .bss tail) commits only
+        // the pages covered by `contents`.
+        space.map(range(0x40_000, 4), b"data", rw).unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 3 * PAGE as usize
+        );
+        assert_eq!(tables.lock().len(), 3);
+
+        // Growing via `remap` keeps the existing committed frame and takes 0
+        // frames for the newly appended pages until touched.
+        space.write(VirtAddr::new(0x10_000), b"head").unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 4 * PAGE as usize
+        );
+        space
+            .remap(range(0x10_000, 8), range(0x80_000, 32))
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 4 * PAGE as usize
+        );
+        let mut back = [0u8; 4];
+        space.read(VirtAddr::new(0x80_000), &mut back).unwrap();
+        assert_eq!(&back, b"head");
+
+        // Touching a page in the grown tail commits that single page.
+        space
+            .resolve_fault(
+                VirtAddr::new(0x80_000 + 20 * PAGE as usize),
+                PageFlags::WRITE,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 5 * PAGE as usize
+        );
+
+        // Unmapping frees only the committed frames and returns to baseline.
+        space.unmap(huge).unwrap();
+        space.unmap(range(0x40_000, 4)).unwrap();
+        space.unmap(range(0x80_000, 32)).unwrap();
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
     }
 }

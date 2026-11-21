@@ -273,17 +273,20 @@ pub trait NativeExecution: Send + Sync + 'static {
 /// with. Dropping a space releases its frames; the caller's borrow during
 /// [`UserContext::resume`] guarantees no slice of it is running then.
 pub unsafe trait UserSpace: Send + Sync + 'static {
-    /// Installs zero-filled private pages covering `range` with `flags`,
-    /// then copies `contents` to `range.start`. `range` need not be page
-    /// aligned; every page it touches is installed. Fails, mapping nothing,
-    /// when `contents` is longer than the range or any covered page is
-    /// already mapped. Any combination of read, write and execute is a
-    /// valid `flags`, write and execute together included.
+    /// Reserves private zero-fill-on-demand pages covering `range` with `flags`
+    /// and copies `contents` to `range.start`, committing frames for the
+    /// pages `contents` touches and leaving any remaining pages uncommitted
+    /// until their first touch. `range` need not be page aligned; every page
+    /// it touches is mapped. Fails, mapping nothing, when `contents` is
+    /// longer than the range or any covered page is already mapped. Any
+    /// combination of read, write and execute is a valid `flags`, write and
+    /// execute together included.
     fn map(&self, range: VirtRange, contents: &[u8], flags: PageFlags) -> Result<(), NativeError>;
 
-    /// Installs `byte_len` bytes (a page multiple) of zero-filled private
-    /// pages at the first free range at or above `hint`, else at the first
-    /// free range of the user range, and returns where.
+    /// Reserves `byte_len` bytes (a page multiple) of private
+    /// zero-fill-on-demand pages at the first free range at or above `hint`,
+    /// else at the first free range of the user range, and returns where.
+    /// Pages take no backing frame until first touched.
     fn map_anywhere(
         &self,
         hint: VirtAddr,
@@ -343,22 +346,23 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     fn discard(&self, range: VirtRange) -> Result<(), NativeError>;
 
     /// Moves the pages of `from` to the start of `to`, each keeping its
-    /// frame (or its discarded state) and its access, and installs
-    /// zero-filled pages with the same access over the rest of `to`. Both
-    /// ranges are page aligned and disjoint, `to` is at least as long as
-    /// `from` and has no mapping, and every page of `from` is mapped with
-    /// one access; anything else fails with nothing changed. When it
-    /// returns, `from` has no mapping and no processor holds a translation
-    /// of it.
+    /// frame (or its uncommitted state) and its access, and reserves
+    /// zero-fill-on-demand pages with the same access over the rest of
+    /// `to` without committing frames until touched. Both ranges are page
+    /// aligned and disjoint, `to` is at least as long as `from` and has no
+    /// mapping, and every page of `from` is mapped with one access; anything
+    /// else fails with nothing changed. When it returns, `from` has no
+    /// mapping and no processor holds a translation of it.
     fn remap(&self, from: VirtRange, to: VirtRange) -> Result<(), NativeError>;
 
     /// Answers a page fault a slice reported at `address` for `access`
     /// (one of read, write or execute). Succeeds, and the context may
-    /// resume, when the page is mapped with that access: a discarded page
-    /// gets its zero-filled frame here, and a page that already has one
-    /// faulted on a translation an earlier, narrower state left on that
-    /// processor. Fails with [`NativeError::NotMapped`] when the page is
-    /// not mapped with `access`, so the fault is the program's.
+    /// resume, when the page is mapped with that access: an uncommitted
+    /// page (newly reserved or discarded) gets its zero-filled frame here,
+    /// and a page that already has one faulted on a translation an earlier,
+    /// narrower state left on that processor. Fails with
+    /// [`NativeError::NotMapped`] when the page is not mapped with
+    /// `access`, so the fault is the program's.
     fn resolve_fault(&self, address: VirtAddr, access: PageFlags) -> Result<(), NativeError>;
 
     /// The first run of the page-aligned `range` mapped contiguously with
