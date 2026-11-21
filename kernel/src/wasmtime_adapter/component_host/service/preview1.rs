@@ -19,7 +19,8 @@ where
     pub(super) filesystem: Namespace<StorageImpl>,
     pub(super) clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>,
     pub(super) wall_clock_cap: Option<crate::SetWallClockCap>,
-    pub(super) cwd: Option<Preview1Cwd>,
+    /// The process's working directory, shared by every store of the process.
+    pub(super) cwd: SharedCwd,
     pub(super) arguments: Vec<String>,
     pub(super) environment: Vec<(String, String)>,
     pub(super) output_mode: OutputMode,
@@ -28,6 +29,10 @@ where
     pub(super) write_serial: crate::DebugSerialWriter,
     pub(super) imported_memory: Option<SharedMemory>,
     pub(super) current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
+    /// The process's pre-linked core-module template, built once per process
+    /// with its host imports and shared linear memory bound so every spawned
+    /// thread instantiates directly from it.
+    pub(super) thread_instance_pre: Option<Arc<wasmtime::InstancePre<Self>>>,
     pub(super) guest_instance: Option<wasmtime::Instance>,
     #[cfg(test)]
     pub(super) test_exports: Vec<(Arc<str>, wasmtime::Extern)>,
@@ -51,8 +56,10 @@ where
     /// asked for it (#132).
     pub(super) signal_interval: Option<crate::JoinHandle<()>>,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
-    pub(super) descriptors: Preview1DescriptorTable<Net>,
+    /// The process's descriptor table, shared by every store of the process.
+    pub(super) descriptors: SharedDescriptorTable<Net>,
     pub(super) asyncify: WasixAsyncifyState<Net>,
+    /// The process's child table, shared by every store of the process.
     pub(super) children: WasixChildren,
     pub(super) thread_id: u32,
     /// The threads of this store's process, shared by every store of it.
@@ -97,11 +104,12 @@ where
             core::num::NonZeroU64::new(instance.id().raw()).expect("live instance ID is nonzero"),
         );
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
-        let descriptors =
-            descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
+        let descriptors = SharedDescriptorTable::new(
+            descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority)),
+        );
         let clock = crate::KernelClock::new(cpu.clone(), runtime_state.clone());
         let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
-        let cwd = preview1_cwd_from_authority(&authority);
+        let cwd = SharedCwd::new(preview1_cwd_from_authority(&authority));
         let tty_state = WasixTtyState::from_authority(&authority);
         let process_signals = WasixProcessSignals::from_dispositions(&signal_dispositions);
         Self {
@@ -128,6 +136,7 @@ where
             write_serial,
             imported_memory,
             current_core_module,
+            thread_instance_pre: None,
             guest_instance: None,
             #[cfg(test)]
             test_exports: Vec::new(),
@@ -149,6 +158,85 @@ where
             requested_exit: None,
             exec_replacement: None,
         }
+    }
+
+    /// Builds a sibling thread's store within the same WASIX process.
+    ///
+    /// Process-owned tables (`descriptors`, `cwd`, `children`, `threads`,
+    /// `process_signals`, `signal_state`, `imported_memory`, and
+    /// `thread_instance_pre`) are shared by reference with the spawning store
+    /// rather than copied, while per-thread execution state (`thread_signals`,
+    /// `asyncify`, `guest_instance`, `active_signal_handlers`,
+    /// `requested_exit`, `exec_replacement`) starts fresh for the new thread.
+    pub(super) fn spawn_thread_store(&self, thread_signals: WasixSignalState) -> Self {
+        let authority = self.effective_authority();
+        let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
+        let instance = self.instance().clone();
+        let entropy =
+            crate::EntropyPool::derive(self.runtime_state.root_entropy(), instance.id().raw());
+        Self {
+            cpu: self.cpu.clone(),
+            timer: self.timer.clone(),
+            spawner: self.spawner.clone(),
+            runtime_state: self.runtime_state.clone(),
+            interrupts: self.interrupts.clone(),
+            activity: crate::InstanceActivity::new(
+                instance,
+                crate::store_kernel_heap_bytes(size_of::<Self>()),
+            ),
+            identity: self.identity,
+            parent_instance_id: self.parent_instance_id,
+            filesystem: self.filesystem.clone(),
+            clock: crate::KernelClock::new(self.cpu.clone(), self.runtime_state.clone()),
+            wall_clock_cap,
+            cwd: self.cwd.clone(),
+            arguments: self.arguments.clone(),
+            environment: self.environment.clone(),
+            output_mode: self.output_mode.clone(),
+            read_serial: self.read_serial,
+            serial_read_buffer: Vec::new(),
+            write_serial: self.write_serial,
+            imported_memory: self.imported_memory.clone(),
+            current_core_module: self.current_core_module.clone(),
+            thread_instance_pre: self.thread_instance_pre.clone(),
+            guest_instance: None,
+            #[cfg(test)]
+            test_exports: Vec::new(),
+            wasix_abi: self.wasix_abi,
+            entropy,
+            authority,
+            tty_state: self.tty_state,
+            process_signals: self.process_signals.clone(),
+            active_signal_handlers: helios_unix::SignalSet::EMPTY,
+            signal_state: self.signal_state.clone(),
+            thread_signals,
+            signal_interval: None,
+            signal_dispositions: self.signal_dispositions.clone(),
+            descriptors: self.descriptors.clone(),
+            asyncify: WasixAsyncifyState::new(),
+            children: self.children.clone(),
+            thread_id: 0,
+            threads: self.threads.clone(),
+            requested_exit: None,
+            exec_replacement: None,
+        }
+    }
+
+    /// Returns this store's [`ProcessAuthority`] synchronized with the
+    /// process's current shared working directory so `fork`, `spawn`, `exec`,
+    /// and `proc_snapshot` from any thread inherit the latest `chdir`.
+    pub(super) fn effective_authority(&self) -> ProcessAuthority {
+        let mut authority = self.authority.clone();
+        if let Some(cwd) = self.cwd.get()
+            && let Ok(cap) = authority.derive_directory_cap(
+                &cwd.descriptor.path,
+                &cwd.guest_name,
+                descriptor_flags_to_directory_authority(cwd.descriptor.flags),
+            )
+        {
+            authority.chdir(cap);
+        }
+        authority
     }
 
     pub(super) fn now_nanos(&self) -> u64 {
@@ -387,11 +475,6 @@ where
         )
     }
 
-    pub(super) fn with_process_signals(mut self, process_signals: WasixProcessSignals) -> Self {
-        self.process_signals = process_signals;
-        self
-    }
-
     pub(super) fn has_deliverable_catch(&self) -> bool {
         self.asyncify.is_idle()
             && self
@@ -476,31 +559,49 @@ where
         let filesystem = &mut self.filesystem;
         self.children
             .poll_signal_target(pid, |layer| filesystem.adopt_root_layer(layer))
-            .cloned()
     }
 
-    /// [`WasixChildren::poll_join`] on this store's children, with each
-    /// filesystem layer an exit hands back adopted into this store's
+    /// Non-blocking [`WasixChildren::try_join`] on this process's shared child
+    /// table, adopting any filesystem layer an observed exit hands back.
+    pub(super) fn try_child_join(&mut self, pid: Option<u32>) -> Poll<Option<WasixJoinedChild>> {
+        let filesystem = &mut self.filesystem;
+        self.children
+            .try_join(pid, |layer| filesystem.adopt_root_layer(layer))
+    }
+
+    /// [`WasixChildren::poll_join`] on this process's shared child table, with
+    /// each filesystem layer an exit hands back adopted into this store's
     /// namespace.
     pub(super) fn poll_child_join(
         &mut self,
         pid: Option<u32>,
         cx: &mut Context<'_>,
+        wait: &mut crate::NotifyWaiter,
     ) -> Poll<Option<WasixJoinedChild>> {
         let filesystem = &mut self.filesystem;
         self.children
-            .poll_join(pid, cx, |layer| filesystem.adopt_root_layer(layer))
+            .poll_join(pid, cx, wait, |layer| filesystem.adopt_root_layer(layer))
     }
 
     pub(super) async fn read_stdin(&mut self, fd: i32, max_bytes: u32) -> Bytes {
         if max_bytes == 0 {
             return Bytes::new();
         }
-        let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd) else {
+        let carried = self.descriptors.with_mut(|descriptors| {
+            let Some(Preview1Descriptor::Stdin { carry }) = descriptors.get_mut(fd) else {
+                return None;
+            };
+            if !carry.is_empty() {
+                Some(Some(take_preview1_carry(carry, max_bytes as usize)))
+            } else {
+                Some(None)
+            }
+        });
+        let Some(carried) = carried else {
             return Bytes::new();
         };
-        if !carry.is_empty() {
-            return take_preview1_carry(carry, max_bytes as usize);
+        if let Some(bytes) = carried {
+            return bytes;
         }
         match self.output_mode.stdin_route() {
             crate::ComponentInputRoute::Serial => loop {
@@ -508,12 +609,14 @@ where
                 (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
                 if !self.serial_read_buffer.is_empty() {
                     let bytes = Bytes::copy_from_slice(&self.serial_read_buffer);
-                    let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd)
-                    else {
-                        return Bytes::new();
-                    };
-                    *carry = bytes;
-                    return take_preview1_carry(carry, max_bytes as usize);
+                    return self.descriptors.with_mut(|descriptors| {
+                        let Some(Preview1Descriptor::Stdin { carry }) = descriptors.get_mut(fd)
+                        else {
+                            return Bytes::new();
+                        };
+                        *carry = bytes;
+                        take_preview1_carry(carry, max_bytes as usize)
+                    });
                 }
                 wait.await;
             },
@@ -533,14 +636,19 @@ where
     /// child's stdin is a byte channel that answers directly, and trace/closed
     /// input never delivers input at all.
     pub(super) fn probe_stdin(&mut self, fd: i32) -> P1Readiness {
-        match self.descriptors.get(fd) {
-            Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
-                return P1Readiness::Ready {
-                    bytes: carry.len() as u64,
-                };
-            }
-            Some(Preview1Descriptor::Stdin { .. }) => {}
-            _ => return P1Readiness::Pending,
+        let initial = self
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
+                    Some(P1Readiness::Ready {
+                        bytes: carry.len() as u64,
+                    })
+                }
+                Some(Preview1Descriptor::Stdin { .. }) => None,
+                _ => Some(P1Readiness::Pending),
+            });
+        if let Some(readiness) = initial {
+            return readiness;
         }
         // Resolve the mode to a plain value first so the console read below
         // does not overlap the borrow of `output_mode`.
@@ -563,18 +671,13 @@ where
         }
         let bytes = Bytes::copy_from_slice(&self.serial_read_buffer);
         let len = bytes.len() as u64;
-        let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd) else {
-            return P1Readiness::Pending;
-        };
-        *carry = bytes;
-        P1Readiness::Ready { bytes: len }
-    }
-
-    pub(super) async fn read_pipe(&mut self, fd: i32, max_bytes: usize) -> Result<Bytes, i32> {
-        let Some(Preview1Descriptor::PipeRead { reader }) = self.descriptors.get(fd) else {
-            return Err(p1::errno::BADF);
-        };
-        Ok(reader.read_limit(max_bytes).await.unwrap_or_default())
+        self.descriptors.with_mut(|descriptors| {
+            let Some(Preview1Descriptor::Stdin { carry }) = descriptors.get_mut(fd) else {
+                return P1Readiness::Pending;
+            };
+            *carry = bytes;
+            P1Readiness::Ready { bytes: len }
+        })
     }
 
     pub(super) async fn recv_socket_pair(
@@ -584,12 +687,14 @@ where
         nonblocking: bool,
         peek: bool,
     ) -> Result<Bytes, i32> {
-        let socket = match self.descriptors.get(fd) {
-            Some(Preview1Descriptor::Socket(socket)) if socket.is_pair() => socket.clone(),
-            Some(Preview1Descriptor::Socket(_)) => return Err(p1::errno::INVAL),
-            Some(_) => return Err(p1::errno::NOTSOCK),
-            None => return Err(p1::errno::BADF),
-        };
+        let socket = self
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                Some(Preview1Descriptor::Socket(socket)) if socket.is_pair() => Ok(socket.clone()),
+                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
+                Some(_) => Err(p1::errno::NOTSOCK),
+                None => Err(p1::errno::BADF),
+            })?;
         socket
             .recv_pair(max_bytes, nonblocking, peek)
             .await
@@ -599,11 +704,12 @@ where
             })
     }
 
-    pub(super) fn getcwd(&self) -> Result<&str, i32> {
-        self.cwd
-            .as_ref()
-            .map(|cwd| cwd.guest_name.as_str())
-            .ok_or(p1::errno::NOTCAPABLE)
+    pub(super) fn getcwd(&self) -> Result<String, i32> {
+        self.cwd.with(|cwd| {
+            cwd.as_ref()
+                .map(|cwd| cwd.guest_name.clone())
+                .ok_or(p1::errno::NOTCAPABLE)
+        })
     }
 
     pub(super) async fn chdir(&mut self, path: &str) -> i32 {
@@ -616,7 +722,7 @@ where
             Err(_) => return p1::errno::NOTCAPABLE,
         };
         self.authority.chdir(cap);
-        self.cwd = Some(cwd);
+        self.cwd.set(Some(cwd));
         p1::errno::SUCCESS
     }
 
@@ -638,10 +744,10 @@ where
             let (base, suffix) = self.resolve_absolute_guest_base(&guest_name)?;
             (guest_name, base, suffix)
         } else {
-            let cwd = self.cwd.as_ref().ok_or(p1::errno::NOTCAPABLE)?;
+            let cwd = self.cwd.get().ok_or(p1::errno::NOTCAPABLE)?;
             let guest_name = crate::resolve_child_path(&cwd.guest_name, path)
                 .map_err(p1_errno_from_component_path)?;
-            (guest_name, cwd.descriptor.clone(), path.to_owned())
+            (guest_name, cwd.descriptor, path.to_owned())
         };
         let source_path =
             crate::resolve_child_path(&base.path, &suffix).map_err(p1_errno_from_component_path)?;
@@ -692,40 +798,43 @@ where
         &self,
         guest_name: &str,
     ) -> Result<(FsDescriptor, String), i32> {
-        let mut best: Option<(&str, &FsDescriptor)> = None;
-        for entry in &self.descriptors.entries {
-            let Some(entry) = entry else {
-                continue;
-            };
-            let Preview1Descriptor::Preopen {
-                guest_name: preopen_guest,
-                descriptor,
-            } = &entry.descriptor
-            else {
-                continue;
-            };
-            if !guest_path_is_within_preopen(guest_name, preopen_guest) {
-                continue;
+        let mut best: Option<(String, FsDescriptor)> = self.descriptors.with(|descriptors| {
+            let mut best: Option<(&str, &FsDescriptor)> = None;
+            for entry in &descriptors.entries {
+                let Some(entry) = entry else {
+                    continue;
+                };
+                let Preview1Descriptor::Preopen {
+                    guest_name: preopen_guest,
+                    descriptor,
+                } = &entry.descriptor
+                else {
+                    continue;
+                };
+                if !guest_path_is_within_preopen(guest_name, preopen_guest) {
+                    continue;
+                }
+                if best.is_none_or(|(best_guest, _)| preopen_guest.len() > best_guest.len()) {
+                    best = Some((preopen_guest.as_str(), descriptor));
+                }
             }
-            if best.is_none_or(|(best_guest, _)| preopen_guest.len() > best_guest.len()) {
-                best = Some((preopen_guest.as_str(), descriptor));
-            }
-        }
+            best.map(|(preopen_guest, descriptor)| (preopen_guest.to_owned(), descriptor.clone()))
+        });
 
-        let cwd_descriptor;
-        if let Some(cwd) = self.cwd.as_ref()
+        if let Some(cwd) = self.cwd.get()
             && guest_path_is_within_preopen(guest_name, &cwd.guest_name)
-            && best.is_none_or(|(best_guest, _)| cwd.guest_name.len() > best_guest.len())
+            && best
+                .as_ref()
+                .is_none_or(|(best_guest, _)| cwd.guest_name.len() > best_guest.len())
         {
-            cwd_descriptor = cwd.descriptor.clone();
-            best = Some((cwd.guest_name.as_str(), &cwd_descriptor));
+            best = Some((cwd.guest_name, cwd.descriptor));
         }
 
         let Some((preopen_guest, descriptor)) = best else {
             return Err(p1::errno::NOTCAPABLE);
         };
-        let suffix = guest_path_suffix(guest_name, preopen_guest);
-        Ok((descriptor.clone(), suffix.to_owned()))
+        let suffix = guest_path_suffix(guest_name, &preopen_guest);
+        Ok((descriptor, suffix.to_owned()))
     }
 
     /// The descriptor `wasix-libc` (`<fcntl.h>`) passes for `AT_FDCWD`.
@@ -742,15 +851,17 @@ where
             return self.resolve_absolute_guest_base(&guest_name);
         }
         if fd == Self::WASIX_AT_FDCWD {
-            let cwd = self.cwd.as_ref().ok_or(p1::errno::BADF)?;
-            return Ok((cwd.descriptor.clone(), path.to_owned()));
+            let cwd = self.cwd.get().ok_or(p1::errno::BADF)?;
+            return Ok((cwd.descriptor, path.to_owned()));
         }
-        let base = match self.descriptors.get(fd) {
-            None => return Err(p1::errno::BADF),
-            descriptor => p1_directory_descriptor(descriptor)
-                .ok_or(p1::errno::NOTDIR)?
-                .clone(),
-        };
+        let base = self
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                None => Err(p1::errno::BADF),
+                descriptor => p1_directory_descriptor(descriptor)
+                    .ok_or(p1::errno::NOTDIR)
+                    .cloned(),
+            })?;
         Ok((base, path.to_owned()))
     }
 
@@ -762,10 +873,11 @@ where
         if self.wasix_abi {
             return self.resolve_wasix_path_base(fd, path);
         }
-        let Some(base) = p1_directory_descriptor(self.descriptors.get(fd)) else {
-            return Err(p1::errno::BADF);
-        };
-        Ok((base.clone(), path.to_owned()))
+        let base = self
+            .descriptors
+            .with(|descriptors| p1_directory_descriptor(descriptors.get(fd)).cloned())
+            .ok_or(p1::errno::BADF)?;
+        Ok((base, path.to_owned()))
     }
 
     pub(super) fn resolve_preview1_path(
@@ -787,12 +899,14 @@ where
         if self.wasix_abi {
             return self.resolve_wasix_path_base(fd, path);
         }
-        let base = match self.descriptors.get(fd) {
-            None => return Err(p1::errno::BADF),
-            descriptor => p1_directory_descriptor(descriptor)
-                .ok_or(p1::errno::NOTDIR)?
-                .clone(),
-        };
+        let base = self
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                None => Err(p1::errno::BADF),
+                descriptor => p1_directory_descriptor(descriptor)
+                    .ok_or(p1::errno::NOTDIR)
+                    .cloned(),
+            })?;
         Ok((base, path.to_owned()))
     }
 
@@ -2220,13 +2334,13 @@ where
     };
     let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
     let capacity = layout.byte_len;
-    let bytes = match caller.data().descriptors.get(fd) {
+    let bytes = match caller.data().descriptors.get_cloned(fd) {
         Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(fd, capacity).await,
-        Some(Preview1Descriptor::PipeRead { .. }) => {
-            caller.data_mut().read_pipe(fd, capacity as usize).await?
-        }
+        Some(Preview1Descriptor::PipeRead { reader }) => reader
+            .read_limit(capacity as usize)
+            .await
+            .unwrap_or_default(),
         Some(Preview1Descriptor::File(file)) => {
-            let file = file.clone();
             let namespace = p1_namespace(caller);
             match p1_read_open_file(&namespace, &file, capacity as usize).await {
                 Ok(bytes) => bytes,
@@ -2253,11 +2367,15 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::Preopen { guest_name, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(guest_name_len) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::Preopen { guest_name, .. }) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(guest_name.len())
+    }) else {
         return p1::errno::BADF;
     };
-    let len = match u32::try_from(guest_name.len()) {
+    let len = match u32::try_from(guest_name_len) {
         Ok(len) => len,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -2282,8 +2400,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let Some(Preview1Descriptor::Preopen { guest_name, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(guest_name) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::Preopen { guest_name, .. }) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(guest_name.clone())
+    }) else {
         return p1::errno::BADF;
     };
     let bytes = guest_name.as_bytes();
@@ -2312,21 +2434,24 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(descriptor) = caller.data().descriptors.get(fd) else {
+    let Some((filetype, fdflags, rights)) = caller.data().descriptors.with(|descriptors| {
+        let descriptor = descriptors.get(fd)?;
+        let filetype = match descriptor {
+            Preview1Descriptor::Stdin { .. } => 2,
+            Preview1Descriptor::Stdout | Preview1Descriptor::Stderr => 2,
+            Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => 2,
+            Preview1Descriptor::Event(_) | Preview1Descriptor::Epoll(_) => 2,
+            Preview1Descriptor::Preopen { .. } => 3,
+            Preview1Descriptor::File(file) => p1_filetype(file.node().kind),
+            Preview1Descriptor::NullDevice => 2,
+            Preview1Descriptor::Socket(_) => 6,
+        };
+        let fdflags = descriptors.fdflags(fd).unwrap_or(0);
+        let rights = p1_descriptor_rights(descriptor);
+        Some((filetype, fdflags, rights))
+    }) else {
         return p1::errno::BADF;
     };
-    let filetype = match descriptor {
-        Preview1Descriptor::Stdin { .. } => 2,
-        Preview1Descriptor::Stdout | Preview1Descriptor::Stderr => 2,
-        Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => 2,
-        Preview1Descriptor::Event(_) | Preview1Descriptor::Epoll(_) => 2,
-        Preview1Descriptor::Preopen { .. } => 3,
-        Preview1Descriptor::File(file) => p1_filetype(file.node().kind),
-        Preview1Descriptor::NullDevice => 2,
-        Preview1Descriptor::Socket(_) => 6,
-    };
-    let fdflags = caller.data().descriptors.fdflags(fd).unwrap_or(0);
-    let rights = p1_descriptor_rights(descriptor);
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -2347,19 +2472,22 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File(_) | Preview1Descriptor::NullDevice)
-            if p1_file_fdflags_supported(fdflags) =>
-        {
-            caller.data_mut().descriptors.set_fdflags(fd, fdflags)
-        }
-        Some(Preview1Descriptor::Socket(_)) if p1_socket_fdflags_supported(fdflags) => {
-            caller.data_mut().descriptors.set_fdflags(fd, fdflags)
-        }
-        Some(_) if fdflags == 0 => caller.data_mut().descriptors.set_fdflags(fd, fdflags),
-        Some(_) => p1::errno::INVAL,
-        None => p1::errno::BADF,
-    }
+    caller
+        .data()
+        .descriptors
+        .with_mut(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::File(_) | Preview1Descriptor::NullDevice)
+                if p1_file_fdflags_supported(fdflags) =>
+            {
+                descriptors.set_fdflags(fd, fdflags)
+            }
+            Some(Preview1Descriptor::Socket(_)) if p1_socket_fdflags_supported(fdflags) => {
+                descriptors.set_fdflags(fd, fdflags)
+            }
+            Some(_) if fdflags == 0 => descriptors.set_fdflags(fd, fdflags),
+            Some(_) => p1::errno::INVAL,
+            None => p1::errno::BADF,
+        })
 }
 
 pub(super) async fn p1_fd_fdstat_set_rights<CpuImpl, Net, StorageImpl>(
@@ -2374,49 +2502,58 @@ where
     StorageImpl: crate::Storage,
 {
     let requested = rights_base | rights_inheriting;
-    let Some(descriptor) = caller.data().descriptors.get(fd) else {
-        return p1::errno::BADF;
+    let file_to_tell = match caller.data().descriptors.with(|descriptors| {
+        let Some(descriptor) = descriptors.get(fd) else {
+            return Err(p1::errno::BADF);
+        };
+        let current = p1_descriptor_rights(descriptor);
+        if requested & !current != 0 {
+            return Err(p1::errno::NOTCAPABLE);
+        }
+        Ok(match descriptor {
+            Preview1Descriptor::File(file) => Some(file.clone()),
+            _ => None,
+        })
+    }) {
+        Ok(file) => file,
+        Err(errno) => return errno,
     };
-    let current = p1_descriptor_rights(descriptor);
-    if requested & !current != 0 {
-        return p1::errno::NOTCAPABLE;
-    }
     let lowered_flags = p1_descriptor_flags(requested, 0);
-    let file_offset = if let Preview1Descriptor::File(file) = descriptor {
-        let file = file.clone();
-        Some(p1_tell_open_file(&file).await)
-    } else {
-        None
+    let file_offset = match file_to_tell {
+        Some(file) => Some(p1_tell_open_file(&file).await),
+        None => None,
     };
-    let Some(entry) = caller.data_mut().descriptors.get_entry_mut(fd) else {
-        return p1::errno::BADF;
-    };
-    match &mut entry.descriptor {
-        Preview1Descriptor::Preopen { descriptor, .. } => {
-            descriptor.flags &= lowered_flags;
+    caller.data().descriptors.with_mut(|descriptors| {
+        let Some(entry) = descriptors.get_entry_mut(fd) else {
+            return p1::errno::BADF;
+        };
+        match &mut entry.descriptor {
+            Preview1Descriptor::Preopen { descriptor, .. } => {
+                descriptor.flags &= lowered_flags;
+            }
+            // Rights belong to the descriptor in preview1, and a node handle
+            // carries the rights it was opened with, so a file descriptor whose
+            // rights narrow becomes its own open of the same node, at the offset
+            // and with the status flags it had; its duplicates keep the rights
+            // and the description they shared.
+            Preview1Descriptor::File(file) => {
+                let Some(offset) = file_offset else {
+                    return p1::errno::BADF;
+                };
+                let mut node = file.node().clone();
+                node.flags &= lowered_flags;
+                let narrowed = OpenFile::new_at(node, offset);
+                let own = Preview1DescriptorEntry::new(
+                    Preview1Descriptor::File(narrowed),
+                    entry.close_on_exec,
+                );
+                own.set_fdflags(entry.fdflags());
+                *entry = own;
+            }
+            _ => {}
         }
-        // Rights belong to the descriptor in preview1, and a node handle
-        // carries the rights it was opened with, so a file descriptor whose
-        // rights narrow becomes its own open of the same node, at the offset
-        // and with the status flags it had; its duplicates keep the rights
-        // and the description they shared.
-        Preview1Descriptor::File(file) => {
-            let mut node = file.node().clone();
-            node.flags &= lowered_flags;
-            let narrowed = OpenFile::new_at(
-                node,
-                file_offset.expect("file descriptor remained a file across await"),
-            );
-            let own = Preview1DescriptorEntry::new(
-                Preview1Descriptor::File(narrowed),
-                entry.close_on_exec,
-            );
-            own.set_fdflags(entry.fdflags());
-            *entry = own;
-        }
-        _ => {}
-    }
-    p1::errno::SUCCESS
+        p1::errno::SUCCESS
+    })
 }
 
 pub(super) async fn p1_fd_filestat_get<CpuImpl, Net, StorageImpl>(
@@ -2430,17 +2567,19 @@ where
     StorageImpl: crate::Storage,
 {
     let stat = GuestAddress::wasm32(stat);
-    if let Some((identity, stat_value)) = caller
-        .data()
-        .descriptors
-        .get(fd)
-        .and_then(p1_synthetic_descriptor_stat)
-    {
-        return p1_write_filestat(caller, stat, identity, stat_value).await;
-    }
-    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
-    else {
-        return Ok(p1::errno::BADF);
+    let inspected = caller.data().descriptors.with(|descriptors| {
+        let descriptor = descriptors.get(fd)?;
+        if let Some(synthetic) = p1_synthetic_descriptor_stat(descriptor) {
+            return Some(Ok(synthetic));
+        }
+        p1_descriptor_path(Some(descriptor)).map(|path| Err(path.to_owned()))
+    });
+    let path = match inspected {
+        Some(Ok((identity, stat_value))) => {
+            return p1_write_filestat(caller, stat, identity, stat_value).await;
+        }
+        Some(Err(path)) => path,
+        None => return Ok(p1::errno::BADF),
     };
     let (identity, stat_value) = p1_stat_absolute_path(caller, &path, crate::Follow::No).await?;
     p1_write_filestat(caller, stat, identity, stat_value).await
@@ -2529,10 +2668,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
+    let Some(descriptor) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::File(file)) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(file.node().clone())
+    }) else {
         return p1::errno::BADF;
     };
-    let descriptor = file.node().clone();
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
     let file = match p1_grant(&descriptor) {
@@ -2556,7 +2699,11 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
+    let Some(descriptor) = caller
+        .data()
+        .descriptors
+        .with(|descriptors| p1_fs_descriptor(descriptors.get(fd)).cloned())
+    else {
         return p1::errno::BADF;
     };
     let target = match descriptor.grant_touch() {
@@ -2611,11 +2758,11 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    caller
-        .data()
-        .descriptors
-        .get(fd)
-        .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
+    caller.data().descriptors.with(|descriptors| {
+        descriptors
+            .get(fd)
+            .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
+    })
 }
 
 pub(super) async fn p1_fd_allocate<CpuImpl, Net, StorageImpl>(
@@ -2633,10 +2780,14 @@ where
         Some(end) => end,
         None => return p1::errno::OVERFLOW,
     };
-    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
+    let Some(descriptor) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::File(file)) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(file.node().clone())
+    }) else {
         return p1::errno::BADF;
     };
-    let descriptor = file.node().clone();
     let namespace = p1_namespace(caller);
     let current = match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
         Ok(metadata) => metadata.size,
@@ -2693,11 +2844,15 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(descriptor) = caller.data().descriptors.get(fd) else {
-        return p1::errno::BADF;
-    };
-    let Some(descriptor) = p1_fs_descriptor(Some(descriptor)).cloned() else {
-        return p1::errno::SUCCESS;
+    let descriptor = match caller.data().descriptors.with(|descriptors| {
+        let Some(descriptor) = descriptors.get(fd) else {
+            return Err(p1::errno::BADF);
+        };
+        Ok(p1_fs_descriptor(Some(descriptor)).cloned())
+    }) {
+        Ok(Some(descriptor)) => descriptor,
+        Ok(None) => return p1::errno::SUCCESS,
+        Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
     wasi_fs::sync(&namespace, &descriptor, data_only)
@@ -2722,10 +2877,14 @@ where
         return Ok(p1::errno::FAULT);
     };
     let layout = p1_read_iovs_with_byte_len(&memory, GuestAddress::wasm32(iovs), iovs_len).await?;
-    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
+    let Some(open) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::File(file)) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(file.clone())
+    }) else {
         return Ok(p1::errno::BADF);
     };
-    let open = file.clone();
     let namespace = p1_namespace(caller);
     let bytes = match p1_pread_open_file(&namespace, &open, offset, layout.byte_len as usize).await
     {
@@ -2810,11 +2969,13 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::File(file)) = caller.data().descriptors.get(fd) else {
-        return Err(P1Stop::Errno(p1::errno::BADF));
-    };
-    let open = file.clone();
-    let append = caller.data().descriptors.fdflags(fd)? & P1_FDFLAG_APPEND != 0;
+    let (open, append) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::File(file)) = descriptors.get(fd) else {
+            return Err(P1Stop::Errno(p1::errno::BADF));
+        };
+        let append = descriptors.fdflags(fd)? & P1_FDFLAG_APPEND != 0;
+        Ok((file.clone(), append))
+    })?;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
     p1_write_open_file(&namespace, &open, append, memory, layout, at, now_nanos).await
@@ -2917,7 +3078,11 @@ where
     StorageImpl: crate::Storage,
 {
     let (buf, bufused) = (GuestAddress::wasm32(buf), GuestAddress::wasm32(bufused));
-    let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
+    let Some(descriptor) = caller
+        .data()
+        .descriptors
+        .with(|descriptors| p1_fs_descriptor(descriptors.get(fd)).cloned())
+    else {
         return Ok(p1::errno::BADF);
     };
     let namespace = p1_namespace(caller);
@@ -3008,10 +3173,16 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let file = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File(file)) => file.clone(),
-        Some(_) => return Ok(p1::errno::SPIPE),
-        None => return Ok(p1::errno::BADF),
+    let file = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::File(file)) => Ok(file.clone()),
+            Some(_) => Err(p1::errno::SPIPE),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(file) => file,
+        Err(errno) => return Ok(errno),
     };
     let namespace = p1_namespace(caller);
     let next = match p1_seek_open_file(&namespace, &file, offset, whence).await {
@@ -3073,10 +3244,16 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let file = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File(file)) => file.clone(),
-        Some(_) => return Ok(p1::errno::SPIPE),
-        None => return Ok(p1::errno::BADF),
+    let file = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::File(file)) => Ok(file.clone()),
+            Some(_) => Err(p1::errno::SPIPE),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(file) => file,
+        Err(errno) => return Ok(errno),
     };
     let offset = p1_tell_open_file(&file).await;
     let Some(memory) = p1_async_memory(caller) else {
@@ -3768,7 +3945,7 @@ where
 
     let (monotonic_now, system_now) =
         (caller.data().now_nanos(), caller.data().system_time_nanos());
-    let max_subscriptions = p1_subscription_limit(caller.data().descriptors.limit);
+    let max_subscriptions = p1_subscription_limit(caller.data().descriptors.limit());
     let parsed = p1_read_subscriptions(
         &memory,
         GuestAddress::wasm32(subscriptions),
@@ -4376,16 +4553,20 @@ where
     if status != p1::errno::SUCCESS {
         return Err(status);
     }
-    let (listener, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
-            Some(UnixTcpSocket::Listening {
-                listener, family, ..
-            }) => (listener.id(), family),
-            _ => return Err(p1::errno::INVAL),
-        },
-        Some(_) => return Err(p1::errno::NOTSOCK),
-        None => return Err(p1::errno::BADF),
-    };
+    let (listener, family) =
+        caller
+            .data()
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+                    Some(UnixTcpSocket::Listening {
+                        listener, family, ..
+                    }) => Ok((listener.id(), family)),
+                    _ => Err(p1::errno::INVAL),
+                },
+                Some(_) => Err(p1::errno::NOTSOCK),
+                None => Err(p1::errno::BADF),
+            })?;
     let Some(service) = caller.data().runtime_state.network_service() else {
         return Err(p1::errno::NETDOWN);
     };
@@ -4420,14 +4601,17 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
-            Some(UnixTcpSocket::Connected { stream, .. }) => Ok(stream.id()),
-            _ => Err(p1::errno::INVAL),
-        },
-        Some(_) => Err(p1::errno::NOTSOCK),
-        None => Err(p1::errno::BADF),
-    }
+    caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+                Some(UnixTcpSocket::Connected { stream, .. }) => Ok(stream.id()),
+                _ => Err(p1::errno::INVAL),
+            },
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        })
 }
 
 pub(super) async fn p1_sock_recv<CpuImpl, Net, StorageImpl>(
@@ -4492,28 +4676,39 @@ where
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_iovs", iovs_started);
     let capacity = layout.byte_len;
     let fdflags = caller.data().descriptors.fdflags(fd)?;
-    if matches!(
-        caller.data().descriptors.get(fd),
-        Some(Preview1Descriptor::Socket(socket)) if socket.is_pair()
-    ) {
-        let bytes = caller
-            .data_mut()
-            .recv_socket_pair(
-                fd,
-                capacity as usize,
-                p1_fdflags_nonblocking(fdflags),
-                false,
-            )
-            .await?;
-        return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
+    enum RecvTarget<Stream> {
+        Pair,
+        Tcp(Stream),
     }
-    let stream = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
-            Some(UnixTcpSocket::Connected { stream, .. }) => stream.id(),
-            _ => return Ok(p1::errno::INVAL),
-        },
-        Some(_) => return Ok(p1::errno::NOTSOCK),
-        None => return Ok(p1::errno::BADF),
+    let target = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(socket)) if socket.is_pair() => Ok(RecvTarget::Pair),
+            Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+                Some(UnixTcpSocket::Connected { stream, .. }) => Ok(RecvTarget::Tcp(stream.id())),
+                _ => Err(p1::errno::INVAL),
+            },
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(target) => target,
+        Err(errno) => return Ok(errno),
+    };
+    let stream = match target {
+        RecvTarget::Pair => {
+            let bytes = caller
+                .data_mut()
+                .recv_socket_pair(
+                    fd,
+                    capacity as usize,
+                    p1_fdflags_nonblocking(fdflags),
+                    false,
+                )
+                .await?;
+            return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
+        }
+        RecvTarget::Tcp(stream) => stream,
     };
     let status = caller.data().require_tcp_authority();
     if status != p1::errno::SUCCESS {
@@ -4627,7 +4822,7 @@ where
     );
     let layout = p1_read_iovs_with_byte_len(&memory, si_data, si_data_len).await?;
     let mut gather = Preview1Gather::new(&memory, &layout)?;
-    let descriptor = caller.data().descriptors.get(fd).cloned();
+    let descriptor = caller.data().descriptors.get_cloned(fd);
     if let Some(Preview1Descriptor::Socket(socket)) = &descriptor
         && let Some(writer) = socket.pair_writer()
     {
@@ -4690,7 +4885,7 @@ where
     if how == 0 || how & !P1_SDFLAGS_SUPPORTED != 0 {
         return p1::errno::INVAL;
     }
-    let descriptor = caller.data().descriptors.get(fd).cloned();
+    let descriptor = caller.data().descriptors.get_cloned(fd);
     match descriptor {
         Some(Preview1Descriptor::Socket(socket)) => {
             if let Some(tcp) = socket.tcp_state() {
@@ -4891,7 +5086,11 @@ where
 {
     // Every sink takes the guest's bytes gathered, one bounded chunk at a
     // time.
-    if let Some(Preview1Descriptor::File(_)) = caller.data().descriptors.get(fd) {
+    if caller
+        .data()
+        .descriptors
+        .with(|descriptors| matches!(descriptors.get(fd), Some(Preview1Descriptor::File(_))))
+    {
         return p1_write_file(caller, fd, memory, layout, None).await;
     }
     // A descriptor whose sink is a bounded channel blocks the guest while
@@ -4936,7 +5135,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(fd) {
+    match caller.data().descriptors.get_cloned(fd) {
         Some(Preview1Descriptor::Stdout) => {
             p1_write_stdio(
                 caller,
@@ -4956,7 +5155,6 @@ where
             .await
         }
         Some(Preview1Descriptor::PipeWrite { writer }) => {
-            let writer = writer.clone();
             if nonblocking {
                 match writer.try_write(Bytes::copy_from_slice(bytes)) {
                     crate::TryWrite::Written => {}
@@ -5004,13 +5202,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(fd) {
+    match caller.data().descriptors.get_cloned(fd) {
         Some(Preview1Descriptor::Stdin { .. }) => {
             Ok(caller.data_mut().read_stdin(fd, capacity).await)
         }
-        Some(Preview1Descriptor::PipeRead { .. }) => {
-            caller.data_mut().read_pipe(fd, capacity as usize).await
-        }
+        Some(Preview1Descriptor::PipeRead { reader }) => Ok(reader
+            .read_limit(capacity as usize)
+            .await
+            .unwrap_or_default()),
         Some(Preview1Descriptor::Event(event)) => {
             if capacity < 8 {
                 return Err(p1::errno::INVAL);
@@ -5019,7 +5218,6 @@ where
         }
         Some(Preview1Descriptor::NullDevice) => Ok(Bytes::new()),
         Some(Preview1Descriptor::File(file)) => {
-            let file = file.clone();
             let namespace = p1_namespace(caller);
             p1_read_open_file(&namespace, &file, capacity as usize).await
         }

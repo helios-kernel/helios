@@ -1053,47 +1053,51 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(socket)) => {
-            if let Some(UnixUdpSocket::Bound {
-                local_address,
-                local_port,
-                ..
-            }) = socket.udp_state()
-            {
-                write_wasix_addr_port(
-                    caller,
-                    memory,
-                    GuestAddress::wasm32(ret_addr),
-                    local_address,
-                    local_port,
-                )
-            } else if let Some(
-                UnixTcpSocket::Bound {
+    let local = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(socket)) => {
+                if let Some(UnixUdpSocket::Bound {
                     local_address,
                     local_port,
                     ..
+                }) = socket.udp_state()
+                {
+                    Ok(Some((local_address, local_port)))
+                } else if let Some(
+                    UnixTcpSocket::Bound {
+                        local_address,
+                        local_port,
+                        ..
+                    }
+                    | UnixTcpSocket::Listening {
+                        local_address,
+                        local_port,
+                        ..
+                    },
+                ) = socket.tcp_state()
+                {
+                    Ok(Some((local_address, local_port)))
+                } else {
+                    Ok(None)
                 }
-                | UnixTcpSocket::Listening {
-                    local_address,
-                    local_port,
-                    ..
-                },
-            ) = socket.tcp_state()
-            {
-                write_wasix_addr_port(
-                    caller,
-                    memory,
-                    GuestAddress::wasm32(ret_addr),
-                    local_address,
-                    local_port,
-                )
-            } else {
-                write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr))
             }
-        }
-        Some(_) => p1::errno::NOTSOCK,
-        None => p1::errno::BADF,
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(local) => local,
+        Err(errno) => return errno,
+    };
+    match local {
+        Some((local_address, local_port)) => write_wasix_addr_port(
+            caller,
+            memory,
+            GuestAddress::wasm32(ret_addr),
+            local_address,
+            local_port,
+        ),
+        None => write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr)),
     }
 }
 
@@ -1110,27 +1114,37 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(socket)) => {
-            if let Some(UnixTcpSocket::Connected {
-                peer_address,
-                peer_port,
-                ..
-            }) = socket.tcp_state()
-            {
-                write_wasix_addr_port(
-                    caller,
-                    memory,
-                    GuestAddress::wasm32(ret_addr),
+    let peer = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(socket)) => {
+                if let Some(UnixTcpSocket::Connected {
                     peer_address,
                     peer_port,
-                )
-            } else {
-                write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr))
+                    ..
+                }) = socket.tcp_state()
+                {
+                    Ok(Some((peer_address, peer_port)))
+                } else {
+                    Ok(None)
+                }
             }
-        }
-        Some(_) => p1::errno::NOTSOCK,
-        None => p1::errno::BADF,
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(peer) => peer,
+        Err(errno) => return errno,
+    };
+    match peer {
+        Some((peer_address, peer_port)) => write_wasix_addr_port(
+            caller,
+            memory,
+            GuestAddress::wasm32(ret_addr),
+            peer_address,
+            peer_port,
+        ),
+        None => write_wasix_addr_port_unspec(caller, memory, GuestAddress::wasm32(ret_addr)),
     }
 }
 
@@ -1290,11 +1304,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(_)) => p1::errno::SUCCESS,
-        Some(_) => p1::errno::NOTSOCK,
-        None => p1::errno::BADF,
-    }
+    caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(_)) => p1::errno::SUCCESS,
+            Some(_) => p1::errno::NOTSOCK,
+            None => p1::errno::BADF,
+        })
 }
 
 pub(super) fn wasix_sock_recv_authority<Net: ComponentHostNetwork>(
@@ -1398,13 +1415,16 @@ where
         1 => true,
         _ => return p1::errno::INVAL,
     };
-    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
-        return match caller.data().descriptors.get(fd) {
+    caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(descriptor)) => {
+                wasix_socket_set_flag(descriptor, option, flag)
+            }
             Some(_) => p1::errno::NOTSOCK,
             None => p1::errno::BADF,
-        };
-    };
-    wasix_socket_set_flag(descriptor, option, flag)
+        })
 }
 
 pub(super) fn wasix_sock_get_opt_flag<CpuImpl, Net, StorageImpl>(
@@ -1418,13 +1438,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
-        return match caller.data().descriptors.get(fd) {
-            Some(_) => p1::errno::NOTSOCK,
-            None => p1::errno::BADF,
-        };
-    };
-    let flag = match wasix_socket_flag(descriptor, option) {
+    let flag = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(descriptor)) => wasix_socket_flag(descriptor, option),
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        }) {
         Ok(flag) => flag,
         Err(errno) => return errno,
     };
@@ -1452,13 +1473,16 @@ where
         Ok(time) => time,
         Err(errno) => return errno,
     };
-    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
-        return match caller.data().descriptors.get(fd) {
+    caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(descriptor)) => {
+                wasix_socket_set_time(descriptor, option, time)
+            }
             Some(_) => p1::errno::NOTSOCK,
             None => p1::errno::BADF,
-        };
-    };
-    wasix_socket_set_time(descriptor, option, time)
+        })
 }
 
 pub(super) fn wasix_sock_get_opt_time<CpuImpl, Net, StorageImpl>(
@@ -1472,13 +1496,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
-        return match caller.data().descriptors.get(fd) {
-            Some(_) => p1::errno::NOTSOCK,
-            None => p1::errno::BADF,
-        };
-    };
-    let time = match wasix_socket_time(descriptor, option) {
+    let time = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(descriptor)) => wasix_socket_time(descriptor, option),
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        }) {
         Ok(time) => time,
         Err(errno) => return errno,
     };
@@ -1503,13 +1528,18 @@ where
         Ok(size) => size,
         Err(_) => return p1::errno::INVAL,
     };
-    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
-        return match caller.data().descriptors.get(fd) {
-            Some(_) => p1::errno::NOTSOCK,
-            None => p1::errno::BADF,
-        };
+    let descriptor = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(descriptor)) => Ok(descriptor.clone()),
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(descriptor) => descriptor,
+        Err(errno) => return errno,
     };
-    let status = wasix_socket_set_size(descriptor, option, size);
+    let status = wasix_socket_set_size(&descriptor, option, size);
     if status != p1::errno::SUCCESS || option != WASIX_SOCK_OPTION_TTL {
         return status;
     }
@@ -1546,21 +1576,22 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
-        return match caller.data().descriptors.get(fd) {
-            Some(_) => p1::errno::NOTSOCK,
-            None => p1::errno::BADF,
-        };
-    };
-    let size = match option {
-        WASIX_SOCK_OPTION_TYPE => wasix_socket_type(descriptor.kind()) as u64,
-        WASIX_SOCK_OPTION_PROTO => descriptor
-            .protocol()
-            .map_or(0, |protocol| u64::from(protocol.number())),
-        _ => match wasix_socket_size(descriptor, option) {
-            Ok(size) => size,
-            Err(errno) => return errno,
-        },
+    let size = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(descriptor)) => match option {
+                WASIX_SOCK_OPTION_TYPE => Ok(wasix_socket_type(descriptor.kind()) as u64),
+                WASIX_SOCK_OPTION_PROTO => Ok(descriptor
+                    .protocol()
+                    .map_or(0, |protocol| u64::from(protocol.number()))),
+                _ => wasix_socket_size(descriptor, option),
+            },
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(size) => size,
+        Err(errno) => return errno,
     };
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1587,7 +1618,10 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let status = wasix_udp_socket_descriptor_status(caller.data().descriptors.get(fd));
+    let status = caller
+        .data()
+        .descriptors
+        .with(|descriptors| wasix_udp_socket_descriptor_status(descriptors.get(fd)));
     if status != p1::errno::SUCCESS {
         return status;
     }
@@ -1623,7 +1657,10 @@ where
     if status != p1::errno::SUCCESS {
         return Ok(status);
     }
-    let status = wasix_udp_socket_descriptor_status(caller.data().descriptors.get(fd));
+    let status = caller
+        .data()
+        .descriptors
+        .with(|descriptors| wasix_udp_socket_descriptor_status(descriptors.get(fd)));
     if status != p1::errno::SUCCESS {
         return Ok(status);
     }
@@ -1688,7 +1725,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let descriptor = caller.data().descriptors.get(fd).cloned();
+    let descriptor = caller.data().descriptors.get_cloned(fd);
     let authority = match wasix_sock_bind_authority(descriptor.as_ref()) {
         Ok(authority) => authority,
         Err(errno) => return errno,
@@ -1775,7 +1812,8 @@ where
     if backlog < 0 {
         return p1::errno::INVAL;
     }
-    let authority = match wasix_sock_listen_authority(caller.data().descriptors.get(fd)) {
+    let descriptor = caller.data().descriptors.get_cloned(fd);
+    let authority = match wasix_sock_listen_authority(descriptor.as_ref()) {
         Ok(authority) => authority,
         Err(errno) => return errno,
     };
@@ -1790,8 +1828,7 @@ where
         Ok(backlog) => backlog,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let Some(Preview1Descriptor::Socket(socket)) = caller.data().descriptors.get(fd).cloned()
-    else {
+    let Some(Preview1Descriptor::Socket(socket)) = descriptor else {
         return p1::errno::BADF;
     };
     let (local_address, local_port, hop_limit) = match socket.tcp_state() {
@@ -1899,12 +1936,13 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let authority = wasix_sock_listen_authority(caller.data().descriptors.get(fd))?;
+    let descriptor = caller.data().descriptors.get_cloned(fd);
+    let authority = wasix_sock_listen_authority(descriptor.as_ref())?;
     let status = caller.data().require_socket_authority(authority);
     if status != p1::errno::SUCCESS {
         return Err(status);
     }
-    let (listener, accept_timeout, family) = match caller.data().descriptors.get(fd) {
+    let (listener, accept_timeout, family) = match descriptor {
         Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
             Some(UnixTcpSocket::Listening {
                 listener,
@@ -2003,12 +2041,10 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let Some(Preview1Descriptor::Socket(socket)) = caller.data().descriptors.get(fd).cloned()
-    else {
-        return match caller.data().descriptors.get(fd) {
-            Some(_) => p1::errno::NOTSOCK,
-            None => p1::errno::BADF,
-        };
+    let socket = match caller.data().descriptors.get_cloned(fd) {
+        Some(Preview1Descriptor::Socket(socket)) => socket,
+        Some(_) => return p1::errno::NOTSOCK,
+        None => return p1::errno::BADF,
     };
     let Some(tcp) = socket.tcp_state() else {
         return p1::errno::NOTSOCK;
@@ -2148,7 +2184,7 @@ where
     );
     let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
     let capacity = layout.byte_len;
-    let descriptor = caller.data().descriptors.get(fd).cloned();
+    let descriptor = caller.data().descriptors.get_cloned(fd);
     let authority = match wasix_sock_recv_authority(descriptor.as_ref()) {
         Ok(authority) => authority,
         Err(errno) => return Ok(errno),
@@ -2322,7 +2358,7 @@ where
     let (iovs, ret_size) = (GuestAddress::wasm32(iovs), GuestAddress::wasm32(ret_size));
     let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
     let mut gather = Preview1Gather::new(&memory, &layout)?;
-    let descriptor = caller.data().descriptors.get(fd).cloned();
+    let descriptor = caller.data().descriptors.get_cloned(fd);
     let authority = match wasix_sock_send_authority(descriptor.as_ref()) {
         Ok(authority) => authority,
         Err(errno) => return Ok(errno),
@@ -2502,11 +2538,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let file = match caller.data().descriptors.get(in_fd) {
-        Some(Preview1Descriptor::File(file)) => file.node().clone(),
-        Some(_) => return Err(p1::errno::BADF),
-        None => return Err(p1::errno::BADF),
-    };
+    let file = caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(in_fd) {
+            Some(Preview1Descriptor::File(file)) => Ok(file.node().clone()),
+            Some(_) => Err(p1::errno::BADF),
+            None => Err(p1::errno::BADF),
+        })?;
     let offset = u64::try_from(offset).map_err(|_| p1::errno::INVAL)?;
     let count = u64::try_from(count).map_err(|_| p1::errno::INVAL)?;
     let count = usize::try_from(count).map_err(|_| p1::errno::OVERFLOW)?;
@@ -2515,7 +2554,7 @@ where
     // from the embedded node list.
     let bytes = wasix_read_send_file_range(caller, &file, offset, count).await?;
     let written = u64::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
-    match caller.data().descriptors.get(out_fd).cloned() {
+    match caller.data().descriptors.get_cloned(out_fd) {
         Some(Preview1Descriptor::Socket(socket)) => {
             if let Some(tcp) = socket.tcp_state() {
                 return match tcp {
@@ -4308,7 +4347,7 @@ mod tests {
                 );
 
                 // Socketpair: RECV_PEEK does not consume buffered bytes.
-                let writer = match caller.data().descriptors.get(pair_write) {
+                let writer = match caller.data().descriptors.get_cloned(pair_write) {
                     Some(Preview1Descriptor::Socket(socket)) => {
                         socket.pair_writer().expect("expected socketpair writer")
                     }
@@ -4825,7 +4864,7 @@ mod tests {
                 let buf_bytes = read_guest_bytes(caller, 232, 8);
                 assert_eq!(u64::from_le_bytes(buf_bytes.try_into().unwrap()), 2048);
 
-                let writer = match caller.data().descriptors.get(pair_write) {
+                let writer = match caller.data().descriptors.get_cloned(pair_write) {
                     Some(Preview1Descriptor::Socket(socket)) => {
                         socket.pair_writer().expect("socketpair writer")
                     }

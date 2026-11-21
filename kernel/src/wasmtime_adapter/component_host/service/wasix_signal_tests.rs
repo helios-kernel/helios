@@ -146,31 +146,8 @@ impl SignalHarness {
             .threads
             .admit(worker_mailbox.clone(), worker_exit.clone())
             .expect("live process admits worker thread");
-        let mut store_data = Preview1ProgramStore::new(
-            self.cpu,
-            self.timer.clone(),
-            self.spawner.clone(),
-            self.runtime_state.clone(),
-            self.interrupts.clone(),
-            instance,
-            parent.parent_instance_id,
-            parent.arguments.clone(),
-            parent.environment.clone(),
-            parent.authority.clone(),
-            OutputMode::Serial,
-            read_nothing,
-            crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
-            Some(memory),
-            Some(parent.filesystem.clone()),
-            Some(parent.descriptors.clone()),
-            parent.signal_state.clone(),
-            worker_mailbox.clone(),
-            parent.signal_dispositions.clone(),
-            None,
-            true,
-            parent.threads.clone(),
-        )
-        .with_process_signals(parent.process_signals.clone());
+        let mut store_data = parent.spawn_thread_store(worker_mailbox.clone());
+        let _ = (instance, memory);
         store_data.thread_id = tid;
         let mut store = wasmtime::Store::new(&self.engine, store_data);
         let registration = configure_preview1_program_store(&mut store);

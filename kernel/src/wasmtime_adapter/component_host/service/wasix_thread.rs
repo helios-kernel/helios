@@ -68,67 +68,27 @@ where
     // The new thread reads its start record itself; here it only has to
     // lie inside linear memory.
     memory.check_bounds(GuestAddress::wasm32(args), WASIX_THREAD_START_SIZE)?;
-    let Some(imported_memory) = caller.data().imported_memory.clone() else {
+    if caller.data().imported_memory.is_none() {
+        return Ok(p1::errno::NOTSUP);
+    }
+    let Some(instance_pre) = caller.data().thread_instance_pre.clone() else {
         return Ok(p1::errno::NOTSUP);
     };
-    let Some(compiled) = caller.data().current_core_module.clone() else {
-        return Ok(p1::errno::NOTSUP);
-    };
-    if !compiled
-        .module
+    if !instance_pre
+        .module()
         .exports()
         .any(|export| export.name() == "wasi_thread_start")
     {
         return Ok(p1::errno::NOTCAPABLE);
     }
 
-    let cpu = caller.data().cpu.clone();
-    let timer = caller.data().timer();
     let spawner = caller.data().spawner.clone();
-    let runtime_state = caller.data().runtime_state.clone();
-    let interrupts = caller.data().interrupts.clone();
-    let instance = caller.data().instance().clone();
-    let parent_instance_id = caller.data().parent_instance_id;
-    let arguments = caller.data().arguments.clone();
-    let environment = caller.data().environment.clone();
-    let authority = caller.data().authority.clone();
-    let output_mode = caller.data().output_mode.clone();
-    let read_serial = caller.data().read_serial;
-    let write_serial = caller.data().write_serial;
-    let filesystem = caller.data().filesystem.clone();
-    let descriptors = caller.data().descriptors.clone();
-    let signal_state = caller.data().signal_state.clone();
-    let process_signals = caller.data().process_signals.clone();
-    let wasix_abi = caller.data().wasix_abi;
     let threads = caller.data().threads.clone();
-    let engine = compiled.module.engine().clone();
-
-    let mut store_data = Preview1ProgramStore::new(
-        cpu,
-        timer,
-        spawner.clone(),
-        runtime_state,
-        interrupts,
-        instance,
-        parent_instance_id,
-        arguments,
-        environment,
-        authority,
-        output_mode,
-        read_serial,
-        write_serial,
-        Some(imported_memory.clone()),
-        Some(filesystem),
-        Some(descriptors),
-        signal_state,
-        // The thread's own mailbox, which the table below holds.
-        WasixSignalState::new(),
-        caller.data().signal_dispositions.clone(),
-        Some(compiled.clone()),
-        wasix_abi,
-        threads.clone(),
-    )
-    .with_process_signals(process_signals);
+    let engine = instance_pre.module().engine().clone();
+    // The thread's own mailbox, which the table below holds; every process-wide
+    // table (descriptors, cwd, children, signals, threads, InstancePre) is
+    // shared with the spawning store.
+    let mut store_data = caller.data().spawn_thread_store(WasixSignalState::new());
     // Admitting the thread, telling the guest its id and spawning its
     // task happen in one synchronous step, in the poll that found the
     // `ret_tid` slot present: an admitted thread whose task never started
@@ -151,25 +111,26 @@ where
             store_data.set_thread_id(tid);
             slot.copy_from_slice(&tid.to_le_bytes());
 
+            let thread_threads = threads.clone();
             let thread_exit = exit.clone();
             if let Err(error) = spawner.try_spawn_detached(async move {
-                let code =
-                    run_wasix_thread(engine, compiled, imported_memory, store_data, tid, args)
-                        .await;
-                // Published only now, with the thread's store, fiber stack
-                // and registry handle already dropped inside
-                // `run_wasix_thread`.
-                thread_exit.publish(code);
+                let code = run_wasix_thread(engine, instance_pre, store_data, tid, args).await;
+                // Published only now, with the thread's store, InstancePre,
+                // fiber stack and registry handle already dropped inside
+                // `run_wasix_thread`; `finish` also removes `tid` from the
+                // live table so finished detached threads never accumulate.
+                thread_threads.finish(tid, &thread_exit, code);
             }) {
                 tracing::warn!(
                     target: "helios_kernel::program",
                     %error,
                     "refused a wasix thread: the executor's instance share is full"
                 );
-                // The thread never ran. Leave no entry for `thread_join` to
-                // wait on, and publish its end for a process end that
-                // already took the entry out of the table.
-                threads.withdraw(tid);
+                // The thread never ran. Cancel its admission so `thread_join`
+                // sees `ESRCH` rather than an already-ended thread, and
+                // publish its end for a process end that already drained the
+                // table.
+                threads.cancel_admission(tid);
                 exit.publish(u32::from(p1::errno::NOMEM as u16));
                 return p1::errno::NOMEM;
             }
@@ -184,8 +145,7 @@ where
 /// after the process's end is recorded.
 pub(super) async fn run_wasix_thread<CpuImpl, Net, StorageImpl>(
     engine: wasmtime::Engine,
-    compiled: Arc<WasmtimeCompiledCoreModule>,
-    imported_memory: SharedMemory,
+    instance_pre: Arc<wasmtime::InstancePre<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>>,
     store_data: Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     tid: u32,
     args: u32,
@@ -197,16 +157,7 @@ where
 {
     let mut store = wasmtime::Store::new(&engine, store_data);
     let interrupts = configure_preview1_program_store(&mut store);
-    let end = match call_wasix_thread(
-        &mut store,
-        &interrupts,
-        &compiled,
-        imported_memory,
-        tid,
-        args,
-    )
-    .await
-    {
+    let end = match call_wasix_thread(&mut store, &interrupts, &instance_pre, tid, args).await {
         Ok(end) => end,
         // A thread that cannot be brought up fails its process, as the
         // same failure bringing up main's image does.
@@ -238,15 +189,14 @@ where
     }
 }
 
-/// Instantiates spawned thread `tid` in `store` and calls its
-/// `wasi_thread_start` through every asyncify unwind and rewind, and
-/// says what the call's end ends. Bringing the thread up fails the way
-/// bringing main's image up does.
+/// Instantiates spawned thread `tid` in `store` from the process's shared
+/// `InstancePre` and calls its `wasi_thread_start` through every asyncify
+/// unwind and rewind, and says what the call's end ends. Bringing the thread
+/// up fails the way bringing main's image up does.
 async fn call_wasix_thread<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    compiled: &WasmtimeCompiledCoreModule,
-    imported_memory: SharedMemory,
+    instance_pre: &wasmtime::InstancePre<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     tid: u32,
     args: u32,
 ) -> Result<
@@ -258,12 +208,9 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let mut linker = CoreLinker::new(store.engine());
-    add_preview1_program_imports(&mut linker)?;
-    define_imported_shared_memory(&mut linker, store, &compiled.module, imported_memory)?;
     let turns = store.data().guest_turns();
     let instance = match interrupts
-        .drive(turns.drive(linker.instantiate_async(&mut *store, &compiled.module)))
+        .drive(turns.drive(instance_pre.instantiate_async(&mut *store)))
         .await
     {
         Ok(instance) => instance,
@@ -370,13 +317,15 @@ where
         return p1::errno::INVAL;
     }
     let threads = caller.data().threads.clone();
-    let Some(exit) = threads.exit_of(tid) else {
-        return p1::errno::SRCH;
+    let exit = match threads.join_target(tid) {
+        helios_unix::ThreadJoinTarget::Running(exit) => exit,
+        helios_unix::ThreadJoinTarget::AlreadyEnded => return p1::errno::SUCCESS,
+        helios_unix::ThreadJoinTarget::Unknown => return p1::errno::SRCH,
     };
     // No borrow of the store and no lock is held across this wait: the
-    // exit cell is the thread's own, shared with the table.
+    // exit cell is the thread's own, shared with the table until the thread
+    // finishes and removes its entry.
     if exit.code().is_some() {
-        threads.withdraw(tid);
         return p1::errno::SUCCESS;
     }
     if caller.data().has_deliverable_catch() {
@@ -401,7 +350,6 @@ where
     if interrupted {
         return p1::errno::INTR;
     }
-    threads.withdraw(tid);
     p1::errno::SUCCESS
 }
 
@@ -1495,7 +1443,8 @@ mod tests {
     }
 
     /// A joiner armed before a thread ends is woken by the end and gets
-    /// its status; a thread's id leaves the table once it is withdrawn.
+    /// its status; finishing the thread removes its entry from the live table
+    /// while `join_target` still reports `AlreadyEnded`.
     #[test]
     fn a_join_returns_the_status_the_thread_published() {
         let threads = WasixProcessThreads::<()>::new();
@@ -1512,16 +1461,18 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let mut join = pin!(joined.wait());
         assert!(join.as_mut().poll(&mut cx).is_pending());
-        exit.publish(3);
+        threads.finish(tid, &exit, 3);
         assert!(wakes.wakes() >= 1, "the end wakes the joiner");
         assert_eq!(join.as_mut().poll(&mut cx), Poll::Ready(3));
         assert!(
             threads.live_mailbox(tid).is_none(),
             "an ended thread takes no signal"
         );
-
-        threads.withdraw(tid);
         assert!(threads.exit_of(tid).is_none());
+        assert!(matches!(
+            threads.join_target(tid),
+            helios_unix::ThreadJoinTarget::AlreadyEnded
+        ));
     }
 
     /// A futex word on the second page of a two-page memory, which swap

@@ -163,7 +163,7 @@ fn forked_child_shares_parent_channel_stdin_stream() {
     );
     let mut child = new_program_store::<ChannelForkAccess>(
         parent.fork_output_mode(),
-        Some(parent.descriptors.clone()),
+        Some(parent.descriptors.snapshot()),
     );
 
     assert!(matches!(
@@ -188,7 +188,7 @@ fn forked_child_inherits_serial_stdin_stream() {
     let parent = new_program_store::<SerialForkAccess>(OutputMode::Serial, None);
     let mut child = new_program_store::<SerialForkAccess>(
         parent.fork_output_mode(),
-        Some(parent.descriptors.clone()),
+        Some(parent.descriptors.snapshot()),
     );
     assert!(matches!(child.stdin_route(), ComponentInputRoute::Serial));
 

@@ -486,11 +486,23 @@ where
                 "core-shared-memory-define",
             );
 
+            super::emit_program_stage_marker(write_serial, "program:instantiate-core-pre-begin");
+            let instantiate_pre_profile =
+                start_program_kernel_profile(&profile_runtime_state, &run_cpu);
+            let instance_pre = Arc::new(
+                linker
+                    .instantiate_pre(&compiled.module)
+                    .map_err(map_program_runtime_error)?,
+            );
+            record_program_kernel_profile_sample(instantiate_pre_profile, "instantiate-core-pre");
+            super::emit_program_stage_marker(write_serial, "program:instantiate-core-pre-end");
+            store.data_mut().thread_instance_pre = Some(instance_pre.clone());
+
             super::emit_program_stage_marker(write_serial, "program:instantiate-core-begin");
             let instantiate_started = run_cpu.now().ticks();
             let turns = store.data().guest_turns();
             let instance = interrupts
-                .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
+                .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
                 .await;
             record_named_program_kernel_profile(
                 &profile_runtime_state,
@@ -747,11 +759,24 @@ where
         );
         timeline.record(&run_cpu, LaunchPhase::SharedMemory);
 
+        let instantiate_pre_profile =
+            start_program_kernel_profile(&profile_runtime_state, &run_cpu);
+        let instance_pre = Arc::new(
+            linker
+                .instantiate_pre(&compiled.module)
+                .map_err(map_program_runtime_error)?,
+        );
+        record_program_kernel_profile_sample(
+            instantiate_pre_profile,
+            "instantiate-core-pre-rewind",
+        );
+        store.data_mut().thread_instance_pre = Some(instance_pre.clone());
+
         super::emit_program_stage_marker(write_serial, "program:instantiate-core-begin");
         let instantiate_started = run_cpu.now().ticks();
         let turns = store.data().guest_turns();
         let instance = interrupts
-            .drive(turns.drive(linker.instantiate_async(&mut store, &compiled.module)))
+            .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
             .await;
         record_named_program_kernel_profile(
             &profile_runtime_state,
@@ -1716,10 +1741,10 @@ where
     Ok(WasixProcessSnapshot {
         memory: memory_bytes,
         memory_pages,
-        descriptors: store.data().descriptors.clone(),
+        descriptors: store.data().descriptors.snapshot(),
         filesystem: store.data().filesystem.root_layer(),
-        authority: store.data().authority.clone(),
-        cwd: store.data().cwd.clone(),
+        authority: store.data().effective_authority(),
+        cwd: store.data().cwd.get(),
         arguments: store.data().arguments.clone(),
         environment: store.data().environment.clone(),
         signal_dispositions: store.data().signal_dispositions.clone(),
@@ -1869,7 +1894,7 @@ where
     let restore = Box::new(CoreModuleRestore {
         memory: fork_memory,
         memory_spec,
-        descriptors: store.data().descriptors.clone(),
+        descriptors: store.data().descriptors.snapshot(),
         signal_dispositions: store.data().signal_dispositions.clone(),
         signal_callback: store.data().process_signals.callback(),
         rewind: WasixRewind {
@@ -1894,7 +1919,7 @@ where
         ProgramLaunch::new(
             argv,
             environment,
-            store.data().authority.clone(),
+            store.data().effective_authority(),
             Some(store.data().filesystem.clone()),
         ),
         output_mode,
