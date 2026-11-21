@@ -659,7 +659,9 @@ pub(crate) fn verify_user_isolation(isolation: UserIsolation) {
         .unwrap_or_else(|error| panic!("x86 isolation check could not create a space: {error}"));
     for (page, contents, flags) in [
         (code, &[RET][..], PageFlags::READ | PageFlags::EXECUTE),
-        (data, &[][..], PageFlags::READ | PageFlags::WRITE),
+        // Non-empty contents commit the data page's PTE up front so the ring-0
+        // probe tests a CR4.SMAP permission fault on a present translation.
+        (data, &[0][..], PageFlags::READ | PageFlags::WRITE),
     ] {
         space
             .map(VirtRange::new(page, PAGE_BYTES as usize), contents, flags)
