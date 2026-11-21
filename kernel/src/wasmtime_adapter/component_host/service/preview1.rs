@@ -28,11 +28,15 @@ where
     pub(super) write_serial: crate::DebugSerialWriter,
     pub(super) imported_memory: Option<SharedMemory>,
     pub(super) current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
+    pub(super) guest_instance: Option<wasmtime::Instance>,
+    #[cfg(test)]
+    pub(super) test_exports: Vec<(Arc<str>, wasmtime::Extern)>,
     pub(super) wasix_abi: bool,
     pub(super) entropy: crate::EntropyPool,
     pub(super) authority: ProcessAuthority,
     pub(super) tty_state: WasixTtyState,
-    pub(super) signal_callback: Option<String>,
+    pub(super) process_signals: WasixProcessSignals,
+    pub(super) active_signal_handlers: helios_unix::SignalSet,
     pub(super) signal_state: WasixSignalState,
     /// Signals raised on this store's thread alone (`thread_signal`),
     /// and the end of its process. Main's is its process table's
@@ -99,6 +103,7 @@ where
         let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
         let cwd = preview1_cwd_from_authority(&authority);
         let tty_state = WasixTtyState::from_authority(&authority);
+        let process_signals = WasixProcessSignals::from_dispositions(&signal_dispositions);
         Self {
             cpu,
             timer,
@@ -123,11 +128,15 @@ where
             write_serial,
             imported_memory,
             current_core_module,
+            guest_instance: None,
+            #[cfg(test)]
+            test_exports: Vec::new(),
             wasix_abi,
             entropy,
             authority,
             tty_state,
-            signal_callback: None,
+            process_signals,
+            active_signal_handlers: helios_unix::SignalSet::EMPTY,
             signal_state,
             thread_signals,
             signal_interval: None,
@@ -163,6 +172,19 @@ where
             helios_unix::ProcessMemoryIdentity::new(self.instance().id().raw()),
             GuestAddress::wasm32(address),
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn define_test_export(&mut self, name: &str, export: wasmtime::Extern) {
+        if let Some((_, slot)) = self
+            .test_exports
+            .iter_mut()
+            .find(|(existing, _)| existing.as_ref() == name)
+        {
+            *slot = export;
+            return;
+        }
+        self.test_exports.push((Arc::from(name), export));
     }
 
     pub(super) fn set_system_time_nanos(&mut self, nanos: u64) -> i32 {
@@ -356,9 +378,25 @@ where
     }
 
     /// The signals this store answers to: its own thread's, ahead of its
-    /// process's.
+    /// process's, resolved through the process image's shared dispositions.
     pub(super) fn signals(&self) -> WasixStoreSignals {
-        WasixStoreSignals::new(self.thread_signals.clone(), self.signal_state.clone())
+        WasixStoreSignals::with_dispositions(
+            self.thread_signals.clone(),
+            self.signal_state.clone(),
+            self.process_signals.clone(),
+        )
+    }
+
+    pub(super) fn with_process_signals(mut self, process_signals: WasixProcessSignals) -> Self {
+        self.process_signals = process_signals;
+        self
+    }
+
+    pub(super) fn has_deliverable_catch(&self) -> bool {
+        self.asyncify.is_idle()
+            && self
+                .signals()
+                .has_deliverable_catch(self.active_signal_handlers)
     }
 
     /// The interrupt callback for this store: where the end of the
@@ -373,7 +411,7 @@ where
     /// the host first meets them where it completes (see
     /// [`crate::component::TurnEpilogue::take_stop`]). The thread's end
     /// comes first, then a signal, then a kill.
-    fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
+    pub(super) fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
         if let Some(stop) = self.signals().owed_stop() {
             return Err(stop);
         }
@@ -430,6 +468,15 @@ where
         exit: WasixChildExit,
     ) {
         self.children.insert(pid, signal_state, exit);
+    }
+
+    /// Returns child `pid`'s signal mailbox if it is still running, recording
+    /// any already-arrived completion in place without reaping it.
+    pub(super) fn live_child_signal_target(&mut self, pid: u32) -> Option<WasixSignalState> {
+        let filesystem = &mut self.filesystem;
+        self.children
+            .poll_signal_target(pid, |layer| filesystem.adopt_root_layer(layer))
+            .cloned()
     }
 
     /// [`WasixChildren::poll_join`] on this store's children, with each
@@ -1214,10 +1261,10 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "sched_yield",
-            |_caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
                 Box::new(async move {
                     crate::yield_now().await;
-                    p1::errno::SUCCESS
+                    p1_finish_errno_call(&mut caller, p1::errno::SUCCESS).await
                 })
             },
         )
@@ -1239,16 +1286,15 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nwritten): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
-                        p1_fd_write(
-                            &mut caller,
-                            fd,
-                            iovs as u32,
-                            iovs_len as u32,
-                            nwritten as u32,
-                        )
-                        .await,
+                    let answer = p1_fd_write(
+                        &mut caller,
+                        fd,
+                        iovs as u32,
+                        iovs_len as u32,
+                        nwritten as u32,
                     )
+                    .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -1260,10 +1306,10 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nread): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
+                    let answer =
                         p1_fd_read(&mut caller, fd, iovs as u32, iovs_len as u32, nread as u32)
-                            .await,
-                    )
+                            .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -1811,27 +1857,27 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (subscriptions, events, nsubscriptions, nevents): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_reply(
-                        p1_poll_oneoff(
-                            &mut caller,
-                            subscriptions as u32,
-                            events as u32,
-                            nsubscriptions as u32,
-                            nevents as u32,
-                        )
-                        .await,
+                    let answer = p1_poll_oneoff(
+                        &mut caller,
+                        subscriptions as u32,
+                        events as u32,
+                        nsubscriptions as u32,
+                        nevents as u32,
                     )
+                    .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "proc_raise",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             signal: i32|
-             -> wasmtime::Result<i32> { p1_proc_raise(&mut caller, signal as u32) },
+             (signal,): (i32,)| {
+                Box::new(async move { p1_proc_raise(&mut caller, signal).await })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -3807,12 +3853,19 @@ where
         if !pass.ready.is_empty() {
             break pass.ready;
         }
+        if caller.data().has_deliverable_catch() {
+            return Ok(p1::errno::INTR);
+        }
 
         // Nothing is ready and no deadline has expired: sleep until one
-        // of the armed descriptors makes progress or the earliest
-        // deadline arrives.
+        // of the armed descriptors makes progress, a caught signal arrives,
+        // or the earliest deadline arrives.
         let timer = caller.data().timer();
-        p1_wait_step(&timer, &mut wait, pass.earliest).await;
+        let signals = caller.data().signals();
+        let active_handlers = caller.data().active_signal_handlers;
+        if p1_wait_step(&timer, &mut wait, pass.earliest, &signals, active_handlers).await {
+            return Ok(p1::errno::INTR);
+        }
     };
 
     // The wait above awaited, so the guest's pages are checked again here,
@@ -4051,19 +4104,234 @@ async fn p1_read_subscriptions(
     Ok(parsed)
 }
 
-pub(super) fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
-    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    signal: u32,
+pub(super) async fn p1_finish_async_call<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    answer: Result<i32, P1Stop>,
 ) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Ok(signal) = u8::try_from(signal) else {
+    let errno = p1_reply(answer)?;
+    wasix_deliver_pending_signals(caller).await?;
+    Ok(errno)
+}
+
+pub(super) async fn p1_finish_errno_call<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    errno: i32,
+) -> wasmtime::Result<i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    wasix_deliver_pending_signals(caller).await?;
+    Ok(errno)
+}
+
+pub(super) fn p1_caller_export<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    name: &str,
+) -> Option<wasmtime::Extern>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if let Some(export) = caller.get_export(name) {
+        return Some(export);
+    }
+    if let Some(instance) = caller.data().guest_instance {
+        return instance.get_export(&mut *caller, name);
+    }
+    #[cfg(test)]
+    {
+        caller
+            .data()
+            .test_exports
+            .iter()
+            .find(|(export_name, _)| export_name.as_ref() == name)
+            .map(|(_, export)| export.clone())
+    }
+    #[cfg(not(test))]
+    None
+}
+
+pub(super) fn p1_store_export<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    name: &str,
+) -> Option<wasmtime::Extern>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if let Some(instance) = store.data().guest_instance {
+        return instance.get_export(&mut *store, name);
+    }
+    #[cfg(test)]
+    {
+        store
+            .data()
+            .test_exports
+            .iter()
+            .find(|(export_name, _)| export_name.as_ref() == name)
+            .map(|(_, export)| export.clone())
+    }
+    #[cfg(not(test))]
+    None
+}
+
+fn missing_catch_fallback_stop(
+    signal: helios_unix::Signal,
+    thread_directed: bool,
+) -> Option<wasmtime::Error> {
+    match signal.default_action() {
+        helios_unix::DefaultSignalAction::Ignore | helios_unix::DefaultSignalAction::Continue => {
+            None
+        }
+        helios_unix::DefaultSignalAction::Terminate
+        | helios_unix::DefaultSignalAction::CoreDump
+        | helios_unix::DefaultSignalAction::Stop => {
+            if thread_directed {
+                Some(wasmtime::Error::new(WasixThreadSignalExit {
+                    signal: signal.raw(),
+                }))
+            } else {
+                Some(wasmtime::Error::new(Preview1SignalExit {
+                    signal: signal.raw(),
+                }))
+            }
+        }
+    }
+}
+
+/// Delivers pending signals at a host-call safe point when asyncify is idle,
+/// invoking the registered `callback_signal` export `(i32) -> ()` for caught
+/// signals and stopping the thread or process on fatal ones.
+pub(super) async fn wasix_deliver_pending_signals<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if !caller.data().asyncify.is_idle() {
+        if let Some(stop) = caller.data().signals().owed_stop() {
+            return Err(stop);
+        }
+        return Ok(());
+    }
+    while caller.data().asyncify.is_idle() {
+        let signals = caller.data().signals();
+        let active = caller.data().active_signal_handlers;
+        match signals.take_next_delivery(active) {
+            None => return Ok(()),
+            Some(WasixPendingDelivery::ThreadEnded) => {
+                return Err(wasmtime::Error::new(WasixThreadEnded));
+            }
+            Some(WasixPendingDelivery::TerminateThread(signal)) => {
+                return Err(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::TerminateProcess(signal)) => {
+                return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed,
+            }) => {
+                let handler = p1_caller_export(caller, &callback)
+                    .and_then(wasmtime::Extern::into_func)
+                    .and_then(|func| func.typed::<i32, ()>(&mut *caller).ok());
+                if let Some(handler) = handler {
+                    caller.data_mut().active_signal_handlers.insert(signal);
+                    let outcome = handler
+                        .call_async(&mut *caller, i32::from(signal.raw()))
+                        .await;
+                    caller.data_mut().active_signal_handlers.remove(signal);
+                    outcome?;
+                } else if let Some(stop) = missing_catch_fallback_stop(signal, thread_directed) {
+                    return Err(stop);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delivers pending signals on `store` after a top-level guest export returns
+/// cleanly with asyncify idle.
+pub(super) async fn wasix_deliver_pending_signals_on_store<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    while store.data().asyncify.is_idle() {
+        let signals = store.data().signals();
+        let active = store.data().active_signal_handlers;
+        match signals.take_next_delivery(active) {
+            None => return Ok(()),
+            Some(WasixPendingDelivery::ThreadEnded) => {
+                return Err(wasmtime::Error::new(WasixThreadEnded));
+            }
+            Some(WasixPendingDelivery::TerminateThread(signal)) => {
+                return Err(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::TerminateProcess(signal)) => {
+                return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed,
+            }) => {
+                let handler = p1_store_export(store, &callback)
+                    .and_then(wasmtime::Extern::into_func)
+                    .and_then(|func| func.typed::<i32, ()>(&mut *store).ok());
+                if let Some(handler) = handler {
+                    store.data_mut().active_signal_handlers.insert(signal);
+                    let turns = store.data().guest_turns();
+                    let outcome = interrupts
+                        .drive(
+                            turns.drive(handler.call_async(&mut *store, i32::from(signal.raw()))),
+                        )
+                        .await;
+                    store.data_mut().active_signal_handlers.remove(signal);
+                    outcome?;
+                } else if let Some(stop) = missing_catch_fallback_stop(signal, thread_directed) {
+                    return Err(stop);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    signal: i32,
+) -> wasmtime::Result<i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if !(0..=31).contains(&signal) {
         return Ok(p1::errno::INVAL);
-    };
-    Err(wasmtime::Error::new(Preview1SignalExit { signal }))
+    }
+    if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+        caller.data().signal_state.raise(signal);
+    }
+    wasix_deliver_pending_signals(caller).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) fn p1_errno_from_wasmtime_error(error: &wasmtime::Error) -> i32 {
@@ -5805,7 +6073,7 @@ mod tests {
         // The last host call is where the program is signalled; it
         // returns without suspending, and so does the export.
         let call = core::future::poll_fn(move |_| {
-            sender.raise(15);
+            sender.raise(helios_unix::Signal::SIGTERM);
             core::task::Poll::Ready(Ok(()))
         });
 
@@ -5861,7 +6129,7 @@ mod tests {
         let mut driven = core::pin::pin!(turns.drive(call));
 
         assert!(driven.as_mut().poll(&mut cx).is_pending());
-        signal_state.raise(9);
+        signal_state.raise(helios_unix::Signal::SIGKILL);
         assert_eq!(
             registry.request_kill(
                 instance.id(),
@@ -5922,7 +6190,7 @@ mod tests {
 
         assert!(caller_call.as_mut().poll(&mut caller_cx).is_pending());
         assert!(target_call.as_mut().poll(&mut target_cx).is_pending());
-        target_thread.raise(9);
+        target_thread.raise(helios_unix::Signal::SIGKILL);
 
         assert_eq!(
             caller_wakes.wakes.load(AtomicOrdering::Acquire),
@@ -5970,8 +6238,8 @@ mod tests {
         let process = WasixSignalState::new();
         let thread = WasixSignalState::new();
         let signals = WasixStoreSignals::new(thread.clone(), process.clone());
-        process.raise(15);
-        thread.raise(9);
+        process.raise(helios_unix::Signal::SIGTERM);
+        thread.raise(helios_unix::Signal::SIGKILL);
 
         let stop = signals.owed_stop().expect("a raised thread owes a stop");
         assert_eq!(
@@ -6010,7 +6278,7 @@ mod tests {
         let signal_state = WasixSignalState::new();
         let sender = signal_state.clone();
         let call = core::future::poll_fn(move |_| {
-            sender.raise(2);
+            sender.raise(helios_unix::Signal::SIGINT);
             assert_eq!(
                 registry.request_kill(
                     instance.id(),

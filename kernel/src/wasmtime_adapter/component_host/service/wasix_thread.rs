@@ -12,11 +12,28 @@ where
     let Ok(duration) = u64::try_from(duration) else {
         return p1::errno::INVAL;
     };
-    caller
-        .data()
-        .sleep_for(Duration::from_nanos(duration))
-        .await;
-    p1::errno::SUCCESS
+    if caller.data().has_deliverable_catch() {
+        return p1::errno::INTR;
+    }
+    if duration == 0 {
+        return p1::errno::SUCCESS;
+    }
+    let sleep = caller.data().sleep_for(Duration::from_nanos(duration));
+    let signals = caller.data().signals();
+    let active_handlers = caller.data().active_signal_handlers;
+    let catch_signal = signals.wait_for_catch_signal(active_handlers);
+    futures::pin_mut!(sleep);
+    futures::pin_mut!(catch_signal);
+    core::future::poll_fn(|cx| {
+        if catch_signal.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(p1::errno::INTR);
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(p1::errno::SUCCESS);
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 pub(super) fn wasix_thread_id<CpuImpl, Net, StorageImpl>(
@@ -81,6 +98,7 @@ where
     let filesystem = caller.data().filesystem.clone();
     let descriptors = caller.data().descriptors.clone();
     let signal_state = caller.data().signal_state.clone();
+    let process_signals = caller.data().process_signals.clone();
     let wasix_abi = caller.data().wasix_abi;
     let threads = caller.data().threads.clone();
     let engine = compiled.module.engine().clone();
@@ -109,7 +127,8 @@ where
         Some(compiled.clone()),
         wasix_abi,
         threads.clone(),
-    );
+    )
+    .with_process_signals(process_signals);
     // Admitting the thread, telling the guest its id and spawning its
     // task happen in one synchronous step, in the poll that found the
     // `ret_tid` slot present: an admitted thread whose task never started
@@ -253,6 +272,7 @@ where
         }
         Err(error) => return Err(map_program_runtime_error(error)),
     };
+    store.data_mut().guest_instance = Some(instance);
     let start = instance
         .get_typed_func::<(i32, i32), ()>(&mut *store, "wasi_thread_start")
         .map_err(|_| ProgramExecError {
@@ -266,18 +286,23 @@ where
         let result = interrupts
             .drive(turns.drive(start.call_async(&mut *store, (tid_i32, args_i32))))
             .await;
-        if result.as_ref().is_err_and(WasixThreadEnded::is) {
+        if result.is_err() {
+            store.data_mut().asyncify.phase = WasixAsyncifyPhase::Idle;
             break result;
         }
-        match handle_wasix_asyncify_completion(store, interrupts, &instance).await {
-            Ok(true) => continue,
-            Ok(false) => break result,
-            // The process ended while the thread was between an unwind
-            // and its rewind; the rewind's call met the end.
-            Err(_) if store.data().thread_signals.thread_ended() => {
-                return Ok(WasixThreadCallEnd::Thread(WasixThreadEnded::EXIT_CODE));
+        match handle_wasix_asyncify_completion(store, interrupts).await {
+            Ok(AsyncifyOutcome::Rewinding) => continue,
+            Ok(AsyncifyOutcome::Idle) => {
+                if let Err(stop) = wasix_deliver_pending_signals_on_store(store, interrupts).await {
+                    break Err(stop);
+                }
+                if !matches!(store.data().asyncify.phase, WasixAsyncifyPhase::Idle) {
+                    continue;
+                }
+                break Ok(());
             }
-            Err(error) => return Err(error),
+            Err(AsyncifyError::GuestStop(error)) => break Err(error),
+            Err(AsyncifyError::Exec(error)) => return Err(error),
         }
     };
     let requested_exit = store.data_mut().take_requested_exit();
@@ -358,7 +383,32 @@ where
     };
     // No borrow of the store and no lock is held across this wait: the
     // exit cell is the thread's own, shared with the table.
-    exit.wait().await;
+    if exit.code().is_some() {
+        threads.withdraw(tid);
+        return p1::errno::SUCCESS;
+    }
+    if caller.data().has_deliverable_catch() {
+        return p1::errno::INTR;
+    }
+    let signals = caller.data().signals();
+    let active_handlers = caller.data().active_signal_handlers;
+    let wait = exit.wait();
+    let catch_signal = signals.wait_for_catch_signal(active_handlers);
+    futures::pin_mut!(wait);
+    futures::pin_mut!(catch_signal);
+    let interrupted = core::future::poll_fn(|cx| {
+        if wait.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(false);
+        }
+        if catch_signal.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(true);
+        }
+        Poll::Pending
+    })
+    .await;
+    if interrupted {
+        return p1::errno::INTR;
+    }
     threads.withdraw(tid);
     p1::errno::SUCCESS
 }
@@ -387,7 +437,7 @@ where
     )
 }
 
-pub(super) fn wasix_thread_signal<CpuImpl, Net, StorageImpl>(
+pub(super) async fn wasix_thread_signal<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     tid: i32,
     signal: i32,
@@ -399,25 +449,34 @@ where
 {
     if !(0..=31).contains(&signal) {
         return Ok(p1::errno::INVAL);
-    };
-    let signal = signal as u8;
-    // A signal to the calling thread itself ends that thread alone, as
-    // one raised on its mailbox would.
-    if u32::try_from(tid).ok() == Some(caller.data().thread_id) {
-        return Err(wasmtime::Error::new(WasixThreadSignalExit { signal }));
-    }
-    // A spawned thread signalling main: main's end is its process's, so
-    // the process ends with the signal.
-    if tid == 0 {
-        return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
     }
     let Ok(tid) = u32::try_from(tid) else {
         return Ok(p1::errno::INVAL);
     };
+    if tid == caller.data().thread_id {
+        if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+            caller.data().thread_signals.raise(signal);
+        }
+        wasix_deliver_pending_signals(caller).await?;
+        return Ok(p1::errno::SUCCESS);
+    }
+    if tid == 0 {
+        if caller.data().thread_signals.thread_ended() {
+            return Ok(p1::errno::SRCH);
+        }
+        if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+            caller.data().threads.main_mailbox().raise(signal);
+        }
+        wasix_deliver_pending_signals(caller).await?;
+        return Ok(p1::errno::SUCCESS);
+    }
     let Some(mailbox) = caller.data().threads.live_mailbox(tid) else {
         return Ok(p1::errno::SRCH);
     };
-    mailbox.raise(u32::from(signal));
+    if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+        mailbox.raise(signal);
+    }
+    wasix_deliver_pending_signals(caller).await?;
     Ok(p1::errno::SUCCESS)
 }
 
@@ -457,8 +516,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let global = caller
-        .get_export(name)
+    let global = p1_caller_export(caller, name)
         .and_then(|export| export.into_global())
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
@@ -476,111 +534,126 @@ where
 pub(super) async fn wasix_call_asyncify_start_unwind<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     data: u32,
-) -> i32
+) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(function) = caller
-        .get_export("asyncify_start_unwind")
-        .and_then(|export| export.into_func())
+    let Some(function) =
+        p1_caller_export(caller, "asyncify_start_unwind").and_then(|export| export.into_func())
     else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
     let Ok(function) = function.typed::<i32, ()>(&mut *caller) else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
-    function
-        .call_async(&mut *caller, data as i32)
-        .await
-        .map_or(p1::errno::NOTSUP, |_| p1::errno::SUCCESS)
+    function.call_async(&mut *caller, data as i32).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) async fn wasix_call_asyncify_stop_rewind<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-) -> i32
+) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(function) = caller
-        .get_export("asyncify_stop_rewind")
-        .and_then(|export| export.into_func())
+    let Some(function) =
+        p1_caller_export(caller, "asyncify_stop_rewind").and_then(|export| export.into_func())
     else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
     let Ok(function) = function.typed::<(), ()>(&mut *caller) else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
-    function
-        .call_async(&mut *caller, ())
-        .await
-        .map_or(p1::errno::NOTSUP, |_| p1::errno::SUCCESS)
+    function.call_async(&mut *caller, ()).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) async fn wasix_stack_checkpoint<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     snapshot: u32,
     ret_value: u32,
-) -> Result<i32, P1Stop>
+) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
     let ret_value_address = GuestAddress::wasm32(ret_value);
-    if let Some(value) = caller.data_mut().asyncify.rewind_value.take() {
-        if wasix_call_asyncify_stop_rewind(caller).await != p1::errno::SUCCESS {
-            return Ok(p1::errno::NOTSUP);
+    if let Some(value) = caller.data().asyncify.rewind_value {
+        let stop = wasix_call_asyncify_stop_rewind(caller).await;
+        caller.data_mut().asyncify.rewind_value = None;
+        if stop? != p1::errno::SUCCESS {
+            return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
         }
         let Some(memory) = p1_async_memory(caller) else {
-            return Ok(p1::errno::FAULT);
+            return p1_finish_errno_call(caller, p1::errno::FAULT).await;
         };
-        memory.write_u64(ret_value_address, value).await?;
-        return Ok(p1::errno::SUCCESS);
+        let write = memory
+            .write_u64(ret_value_address, value)
+            .await
+            .map(|()| p1::errno::SUCCESS)
+            .map_err(P1Stop::from);
+        return p1_finish_async_call(caller, write).await;
     }
 
     let Some(memory) = p1_async_memory(caller) else {
-        return Ok(p1::errno::FAULT);
+        return p1_finish_errno_call(caller, p1::errno::FAULT).await;
     };
     let Ok((stack_lower, stack_upper, stack_pointer)) = wasix_stack_bounds_from_caller(caller)
     else {
-        return Ok(p1::errno::NOTSUP);
+        return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
     };
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
-        return Ok(p1::errno::INVAL);
+        return p1_finish_errno_call(caller, p1::errno::INVAL).await;
     }
     let memory_stack_len = match usize::try_from(stack_upper - stack_pointer) {
         Ok(len) => len,
-        Err(_) => return Ok(p1::errno::OVERFLOW),
+        Err(_) => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
     };
-    let memory_stack = memory
+    let memory_stack = match memory
         .read_bytes(GuestAddress::wasm32(stack_pointer), memory_stack_len)
-        .await?;
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => return p1_finish_async_call(caller, Err(error.into())).await,
+    };
     let unwind_stack_begin = match stack_lower.checked_add(WASIX_ASYNCIFY_DATA_SIZE) {
         Some(begin) if begin <= stack_pointer => begin,
-        _ => return Ok(p1::errno::OVERFLOW),
+        _ => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
     };
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    memory
-        .write_u32(stack_lower_address, unwind_stack_begin)
-        .await?;
-    memory
-        .write_u32(stack_lower_address.offset(4), stack_pointer)
-        .await?;
-    memory.write_u64(ret_value_address, 0).await?;
-    caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Capturing {
-        snapshot,
-        ret_value,
-        stack_lower,
-        stack_upper,
-        unwind_stack_begin,
-        memory_stack,
-        stack_pointer,
-    };
-    Ok(wasix_call_asyncify_start_unwind(caller, stack_lower).await)
+    let setup = async {
+        memory
+            .write_u32(stack_lower_address, unwind_stack_begin)
+            .await?;
+        memory
+            .write_u32(stack_lower_address.offset(4), stack_pointer)
+            .await?;
+        memory.write_u64(ret_value_address, 0).await
+    }
+    .await;
+    if let Err(error) = setup {
+        return p1_finish_async_call(caller, Err(error.into())).await;
+    }
+    let status = wasix_call_asyncify_start_unwind(caller, stack_lower).await?;
+    if status == p1::errno::SUCCESS {
+        caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Capturing {
+            snapshot,
+            ret_value,
+            stack_lower,
+            stack_upper,
+            unwind_stack_begin,
+            memory_stack,
+            stack_pointer,
+        };
+        Ok(p1::errno::SUCCESS)
+    } else {
+        p1_finish_errno_call(caller, status).await
+    }
 }
 
 pub(super) async fn wasix_stack_restore<CpuImpl, Net, StorageImpl>(
@@ -638,17 +711,17 @@ where
         .write_u32(stack_lower_address.offset(4), stack_pointer)
         .await
         .map_err(wasix_stack_restore_trap)?;
-    caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Restoring {
-        hash: (u128::from(hash_upper) << 64) | u128::from(hash_lower),
-        value: if value == 0 { 1 } else { value },
-        stack_lower,
-    };
-    if wasix_call_asyncify_start_unwind(caller, stack_lower).await != p1::errno::SUCCESS {
+    if wasix_call_asyncify_start_unwind(caller, stack_lower).await? != p1::errno::SUCCESS {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::UnwindExportInvalid,
         }));
     }
+    caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Restoring {
+        hash: (u128::from(hash_upper) << 64) | u128::from(hash_lower),
+        value: if value == 0 { 1 } else { value },
+        stack_lower,
+    };
     Ok(())
 }
 
@@ -692,21 +765,61 @@ where
         return Ok(p1::errno::INVAL);
     }
 
-    match timeout {
-        Some(0) => {}
+    if !registration.is_released() && caller.data().has_deliverable_catch() {
+        return Ok(p1::errno::INTR);
+    }
+
+    let interrupted = match timeout {
+        Some(0) => false,
         Some(timeout_nanos) => {
             let sleep = caller.data().sleep_for(Duration::from_nanos(timeout_nanos));
+            let signals = caller.data().signals();
+            let active_handlers = caller.data().active_signal_handlers;
+            let catch_signal = signals.wait_for_catch_signal(active_handlers);
             let wake = registration.released();
             futures::pin_mut!(wake);
             futures::pin_mut!(sleep);
-            futures::future::select(wake, sleep).await;
+            futures::pin_mut!(catch_signal);
+            core::future::poll_fn(|cx| {
+                if wake.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                if catch_signal.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                if sleep.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                Poll::Pending
+            })
+            .await
         }
-        None => registration.released().await,
-    }
+        None => {
+            let signals = caller.data().signals();
+            let active_handlers = caller.data().active_signal_handlers;
+            let catch_signal = signals.wait_for_catch_signal(active_handlers);
+            let wake = registration.released();
+            futures::pin_mut!(wake);
+            futures::pin_mut!(catch_signal);
+            core::future::poll_fn(|cx| {
+                if wake.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                if catch_signal.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                Poll::Pending
+            })
+            .await
+        }
+    };
     // A wake that released this wait counted it, so the wait reports it
-    // even when the timeout ended it first.
+    // even when the timeout or a caught signal arrived alongside it.
     let woken = registration.is_released();
     drop(registration);
+    if interrupted && !woken {
+        return Ok(p1::errno::INTR);
+    }
     memory
         .write_u8(GuestAddress::wasm32(ret_woken), u8::from(woken))
         .await?;
@@ -1008,14 +1121,14 @@ mod tests {
         let process = WasixSignalState::new();
         let thread = WasixSignalState::new();
         let signals = WasixStoreSignals::new(thread.clone(), process.clone());
-        thread.raise(15);
+        thread.raise(helios_unix::Signal::SIGTERM);
         thread.end_thread();
 
         for _ in 0..2 {
             let stop = signals.owed_stop().expect("an ended thread owes a stop");
             assert!(WasixThreadEnded::is(&stop));
         }
-        assert_eq!(thread.take_pending(), Some(15));
+        assert_eq!(thread.take_pending(), Some(helios_unix::Signal::SIGTERM));
     }
 
     /// A spawned thread that exits ends its whole process: the status is

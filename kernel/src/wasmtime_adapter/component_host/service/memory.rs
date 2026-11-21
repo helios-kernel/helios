@@ -135,18 +135,17 @@ impl Preview1AsyncMemory {
         }
     }
 
-    /// The linear memory `instance` exports, or the shared memory its
+    /// The linear memory `store`'s guest exports, or the shared memory its
     /// store imported when it exports none.
-    pub(super) fn of_instance<CpuImpl, Net, StorageImpl>(
+    pub(super) fn of_store<CpuImpl, Net, StorageImpl>(
         store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-        instance: &wasmtime::Instance,
     ) -> Result<Self, ProgramExecError>
     where
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
         StorageImpl: crate::Storage,
     {
-        p1_memory_from_instance(store, instance)
+        p1_memory_from_store(store)
             .map(Self::new)
             .ok_or(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
@@ -578,9 +577,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    if let Some(memory) = caller
-        .get_export("memory")
-        .and_then(|export| export.into_memory())
+    if let Some(memory) = p1_caller_export(caller, "memory").and_then(|export| export.into_memory())
     {
         let data = memory.data(&mut *caller);
         return Some(Preview1Memory {
@@ -596,16 +593,15 @@ where
     })
 }
 
-pub(super) fn p1_memory_from_instance<CpuImpl, Net, StorageImpl>(
+pub(super) fn p1_memory_from_store<CpuImpl, Net, StorageImpl>(
     store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    instance: &wasmtime::Instance,
 ) -> Option<Preview1Memory>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    if let Some(memory) = instance.get_memory(&mut *store, "memory") {
+    if let Some(memory) = p1_store_export(store, "memory").and_then(|export| export.into_memory()) {
         let data = memory.data(&mut *store);
         return Some(Preview1Memory {
             base: data.as_ptr() as usize,

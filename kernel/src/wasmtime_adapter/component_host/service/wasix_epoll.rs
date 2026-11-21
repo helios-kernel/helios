@@ -40,7 +40,7 @@ where
                     // A page of the guest's that could not be read back is
                     // memory it has lost: it traps rather than reading an
                     // errno out of memory that is not there.
-                    wasix_epoll_wait(
+                    let errno = wasix_epoll_wait(
                         &mut caller,
                         epfd,
                         events as u32,
@@ -49,7 +49,8 @@ where
                         ret_nevents as u32,
                     )
                     .await
-                    .map_err(wasmtime::Error::new)
+                    .map_err(wasmtime::Error::new)?;
+                    p1_finish_errno_call(&mut caller, errno).await
                 })
             },
         )
@@ -188,8 +189,15 @@ where
                 Some(Duration::from_nanos(deadline - now))
             }
         };
+        if caller.data().has_deliverable_catch() {
+            return Ok(p1::errno::INTR);
+        }
         let timer = caller.data().timer();
-        p1_wait_step(&timer, &mut wait, remaining).await;
+        let signals = caller.data().signals();
+        let active_handlers = caller.data().active_signal_handlers;
+        if p1_wait_step(&timer, &mut wait, remaining, &signals, active_handlers).await {
+            return Ok(p1::errno::INTR);
+        }
     };
 
     let returned = match u32::try_from(ready.len()) {

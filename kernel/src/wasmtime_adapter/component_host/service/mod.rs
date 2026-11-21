@@ -54,6 +54,8 @@ use wasix_proc::*;
 mod wasix_thread;
 use wasix_thread::*;
 mod wasix_net;
+#[cfg(test)]
+mod wasix_signal_tests;
 use wasix_net::*;
 mod wasix_epoll;
 use wasix_epoll::*;
