@@ -557,6 +557,30 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         .await
     }
 
+    /// A handle on inode `number` of subvolume `tree`, `None` when no such
+    /// inode exists in the running transaction. For a caller that resolves a
+    /// persisted inode identity without walking from the root, such as a FUSE
+    /// or NFS export lookup.
+    pub async fn inode(&self, tree: u64, number: u64) -> Result<Option<InodeHandle>, WriteError> {
+        if !super::is_subvolume(tree) {
+            return Ok(None);
+        }
+        match self
+            .load_handle(FileId {
+                tree,
+                inode: number,
+            })
+            .await
+        {
+            Ok(handle) => Ok(Some(handle)),
+            Err(
+                WriteError::Read(Error::MissingInode { .. })
+                | WriteError::Read(Error::MissingRoot { .. }),
+            ) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn metadata(&self, handle: &InodeHandle) -> Result<Metadata, WriteError> {
         self.checked(handle).await
     }
