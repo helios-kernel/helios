@@ -62,6 +62,7 @@ const SYS_IOCTL: u64 = 16;
 const SYS_SOCKET: u64 = 41;
 const SYS_SENDTO: u64 = 44;
 const SYS_RECVFROM: u64 = 45;
+const SYS_RECVMSG: u64 = 47;
 const SYS_BIND: u64 = 49;
 const SYS_GETSOCKNAME: u64 = 51;
 const SYS_SETSOCKOPT: u64 = 54;
@@ -71,7 +72,10 @@ const SYS_EPOLL_CREATE1: u64 = 291;
 const SYS_EPOLL_PWAIT: u64 = 281;
 
 const EPERM: u64 = 1;
+const EAGAIN: u64 = 11;
 const ENODEV: u64 = 19;
+const EOPNOTSUPP: u64 = 95;
+const ETIMEDOUT: u64 = 110;
 
 fn drive<F: Future>(future: F) -> F::Output {
     let waker = Waker::noop();
@@ -318,7 +322,7 @@ impl Network<MockNet> for MockPlatform {
         &self,
         _socket: u64,
         max_bytes: u32,
-        _timeout_nanos: u64,
+        timeout_nanos: u64,
         peek: bool,
     ) -> Result<Option<PacketFrameData>, u64> {
         let mut st = self.state.lock().unwrap();
@@ -327,13 +331,17 @@ impl Network<MockNet> for MockPlatform {
         } else {
             st.rx_frames.pop_front()
         };
-        Ok(frame.map(|mut f| {
-            let max = max_bytes as usize;
-            if f.bytes.len() > max {
-                f.bytes = f.bytes.slice(..max);
+        match frame {
+            Some(mut f) => {
+                let max = max_bytes as usize;
+                if f.bytes.len() > max {
+                    f.bytes = f.bytes.slice(..max);
+                }
+                Ok(Some(f))
             }
-            f
-        }))
+            None if timeout_nanos > 0 => Err(ETIMEDOUT),
+            None => Ok(None),
+        }
     }
 
     async fn packet_readiness(&self, _socket: u64) -> Result<SocketReady, u64> {
@@ -1284,4 +1292,278 @@ fn af_packet_raw_dgram_epoll_and_authority() {
         ),
         -(EPERM as i64)
     );
+}
+
+#[test]
+fn recvmsg_truncation_flags_rcvtimeo_eagain_and_fail_fast_mutations() {
+    let mut process = new_process(Credentials::root());
+    let mut mem = FlatMemory::new(64 * 1024);
+    let mut plat = MockPlatform::new(true);
+
+    // 1. Truncated recvmsg(..., 0) on AF_NETLINK sets MSG_TRUNC in msg_flags.
+    let nl_fd = call(
+        &mut process,
+        &mut mem,
+        &mut plat,
+        SYS_SOCKET,
+        [AF_NETLINK as u64, SOCK_RAW, NETLINK_ROUTE as u64, 0, 0, 0],
+    ) as u64;
+    let req = build_nlmsg(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0u8; 16]);
+    mem.write(0x1000, &req).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SENDTO,
+            [nl_fd, 0x1000, req.len() as u64, 0, 0, 0]
+        ),
+        req.len() as i64
+    );
+    // Prepare iovec of 8 bytes (much smaller than RTM_GETLINK dump) and msghdr.
+    let mut iov = [0u8; 16];
+    iov[0..8].copy_from_slice(&0x2000u64.to_le_bytes());
+    iov[8..16].copy_from_slice(&8u64.to_le_bytes());
+    mem.write(0x1800, &iov).unwrap();
+    let mut msg = [0u8; 56];
+    msg[16..24].copy_from_slice(&0x1800u64.to_le_bytes());
+    msg[24..32].copy_from_slice(&1u64.to_le_bytes());
+    mem.write(0x1900, &msg).unwrap();
+    let got = call(
+        &mut process,
+        &mut mem,
+        &mut plat,
+        SYS_RECVMSG,
+        [nl_fd, 0x1900, 0, 0, 0, 0],
+    );
+    assert_eq!(got, 8);
+    let mut out_flags = [0u8; 4];
+    mem.read(0x1900 + 48, &mut out_flags).unwrap();
+    assert_ne!(u32::from_le_bytes(out_flags) & (MSG_TRUNC as u32), 0);
+
+    // 2. Truncated recvmsg(..., 0) on AF_PACKET sets MSG_TRUNC in msg_flags.
+    let pkt_fd = call(
+        &mut process,
+        &mut mem,
+        &mut plat,
+        SYS_SOCKET,
+        [
+            AF_PACKET as u64,
+            SOCK_DGRAM,
+            u64::from(ETH_P_IP.to_be()),
+            0,
+            0,
+            0,
+        ],
+    ) as u64;
+    let payload = b"0123456789abcdef0123456789";
+    mem.write(0x3000, payload).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SENDTO,
+            [pkt_fd, 0x3000, payload.len() as u64, 0, 0, 0]
+        ),
+        payload.len() as i64
+    );
+    mem.write(0x1900, &msg).unwrap();
+    let got = call(
+        &mut process,
+        &mut mem,
+        &mut plat,
+        SYS_RECVMSG,
+        [pkt_fd, 0x1900, 0, 0, 0, 0],
+    );
+    assert_eq!(got, 8);
+    mem.read(0x1900 + 48, &mut out_flags).unwrap();
+    assert_ne!(u32::from_le_bytes(out_flags) & (MSG_TRUNC as u32), 0);
+
+    // 3. Blocking AF_PACKET recvfrom with SO_RCVTIMEO returns -EAGAIN on timeout.
+    let mut tv = [0u8; 16];
+    tv[0..8].copy_from_slice(&1i64.to_le_bytes()); // 1 second
+    mem.write(0x3200, &tv).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SETSOCKOPT,
+            [pkt_fd, 1, 20, 0x3200, 16, 0]
+        ),
+        0
+    );
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_RECVFROM,
+            [pkt_fd, 0x3300, 64, 0, 0, 0]
+        ),
+        -(EAGAIN as i64)
+    );
+
+    // 4. SO_BINDTODEVICE unbind resets AF_PACKET ifindex to 0, non-packet rejects binding,
+    //    and non-zero PACKET_AUXDATA fails fast with EOPNOTSUPP.
+    mem.write(0x3400, b"eth0\0").unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SETSOCKOPT,
+            [pkt_fd, 1, 25, 0x3400, 5, 0]
+        ),
+        0
+    );
+    assert_eq!(plat.state.lock().unwrap().bound_packet, Some((ETH_P_IP, 2)));
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SETSOCKOPT,
+            [pkt_fd, 1, 25, 0, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(plat.state.lock().unwrap().bound_packet, Some((ETH_P_IP, 0)));
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SETSOCKOPT,
+            [nl_fd, 1, 25, 0x3400, 5, 0]
+        ),
+        -(EOPNOTSUPP as i64)
+    );
+    mem.write(0x3420, &1i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SETSOCKOPT,
+            [pkt_fd, 263, 8, 0x3420, 4, 0]
+        ),
+        -(EOPNOTSUPP as i64)
+    );
+
+    // 5. SIOCSIFADDR replaces primary address so SIOCSIFNETMASK updates the new address.
+    let mut req = [0u8; 40];
+    req[..4].copy_from_slice(b"eth0");
+    req[16..18].copy_from_slice(&AF_INET.to_ne_bytes());
+    req[20..24].copy_from_slice(&[192, 168, 10, 5]);
+    mem.write(0x3500, &req).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [nl_fd, SIOCSIFADDR, 0x3500, 0, 0, 0]
+        ),
+        0
+    );
+    req[20..24].copy_from_slice(&[192, 168, 20, 6]);
+    mem.write(0x3500, &req).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [nl_fd, SIOCSIFADDR, 0x3500, 0, 0, 0]
+        ),
+        0
+    );
+    req[20..24].copy_from_slice(&[255, 255, 0, 0]);
+    mem.write(0x3500, &req).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [nl_fd, SIOCSIFNETMASK, 0x3500, 0, 0, 0]
+        ),
+        0
+    );
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [nl_fd, SIOCGIFADDR, 0x3500, 0, 0, 0]
+        ),
+        0
+    );
+    mem.read(0x3500, &mut req).unwrap();
+    assert_eq!(&req[20..24], &[192, 168, 20, 6]);
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [nl_fd, SIOCGIFNETMASK, 0x3500, 0, 0, 0]
+        ),
+        0
+    );
+    mem.read(0x3500, &mut req).unwrap();
+    assert_eq!(&req[20..24], &[255, 255, 0, 0]);
+
+    // 6. Unsupported link/MTU mutations fail fast with EOPNOTSUPP.
+    req.fill(0);
+    req[..4].copy_from_slice(b"eth0");
+    req[16..18].copy_from_slice(&0i16.to_ne_bytes()); // clearing IFF_UP
+    mem.write(0x3500, &req).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [nl_fd, SIOCSIFFLAGS, 0x3500, 0, 0, 0]
+        ),
+        -(EOPNOTSUPP as i64)
+    );
+    req[16..20].copy_from_slice(&1400i32.to_ne_bytes());
+    mem.write(0x3500, &req).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [nl_fd, SIOCSIFMTU, 0x3500, 0, 0, 0]
+        ),
+        -(EOPNOTSUPP as i64)
+    );
+    let mut link_body = vec![0u8; 16];
+    link_body[4..8].copy_from_slice(&2i32.to_ne_bytes());
+    append_rta(&mut link_body, 4, &1400u32.to_ne_bytes()); // IFLA_MTU = 1400
+    let req = build_nlmsg(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 9, &link_body);
+    mem.write(0x1000, &req).unwrap();
+    call(
+        &mut process,
+        &mut mem,
+        &mut plat,
+        SYS_SENDTO,
+        [nl_fd, 0x1000, req.len() as u64, 0, 0, 0],
+    );
+    let got = call(
+        &mut process,
+        &mut mem,
+        &mut plat,
+        SYS_RECVFROM,
+        [nl_fd, 0x2000, 4096, 0, 0, 0],
+    );
+    let mut ack = vec![0u8; got as usize];
+    mem.read(0x2000, &mut ack).unwrap();
+    assert_eq!(nlmsg_error_code(&ack), -(EOPNOTSUPP as i32));
 }

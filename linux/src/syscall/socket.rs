@@ -1629,17 +1629,12 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
     let waitall = flags & MSG_WAITALL != 0 && !nonblocking && !peek;
 
     if sock.is_netlink() {
-        let (data, reported) = netlink::recv(sock, max_len, flags)?;
-        let full_len = if flags & MSG_TRUNC != 0 {
-            reported
-        } else {
-            data.len()
-        };
-        let truncated = full_len > data.len();
+        let (data, orig_len) = netlink::recv(sock, max_len, flags)?;
+        let truncated = orig_len > data.len();
         return Ok(RecvResult {
             data: Bytes::from(data),
             peer: Some(RecvPeer::Netlink { pid: 0, groups: 0 }),
-            full_len,
+            full_len: orig_len,
             truncated,
         });
     }
@@ -1651,17 +1646,12 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
             nonblocking,
             timeout_bound,
         );
-        let (data, reported, sll) = packet::recv(sock, max_len, flags, timeout, net).await?;
-        let full_len = if flags & MSG_TRUNC != 0 {
-            reported
-        } else {
-            data.len()
-        };
-        let truncated = full_len > data.len();
+        let (data, orig_len, sll) = packet::recv(sock, max_len, flags, timeout, net).await?;
+        let truncated = orig_len > data.len();
         return Ok(RecvResult {
             data: Bytes::from(data),
             peer: Some(RecvPeer::Packet(sll)),
-            full_len,
+            full_len: orig_len,
             truncated,
         });
     }
@@ -2663,36 +2653,50 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             }
         }
         (SOL_SOCKET, SO_BINDTODEVICE) => {
-            if optlen == 0 {
-                return 0;
-            }
-            let len = (optlen as usize).min(16);
-            let mut name = vec![0u8; len];
-            if memory.read(optval, &mut name).is_err() {
-                return errno(EFAULT);
-            }
-            let nul = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-            if nul == 0 {
-                return 0;
-            }
-            match netlink::lookup_ifindex(&name[..nul]) {
-                Ok(ifindex) => {
+            let unbind = if optlen == 0 {
+                true
+            } else {
+                let len = (optlen as usize).min(16);
+                let mut name = vec![0u8; len];
+                if memory.read(optval, &mut name).is_err() {
+                    return errno(EFAULT);
+                }
+                let nul = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                if nul == 0 {
+                    true
+                } else {
+                    let ifindex = match netlink::lookup_ifindex(&name[..nul]) {
+                        Ok(idx) => idx,
+                        Err(err) => return errno(err),
+                    };
                     if let Some(pkt) = sock.packet_state() {
                         if let Err(err) = net.packet_bind(pkt.handle.id(), pkt.protocol, ifindex) {
                             return errno(err);
                         }
                         let _ = sock.with_packet_mut(|p| p.ifindex = ifindex);
+                        return 0;
                     }
-                    0
+                    return errno(EOPNOTSUPP);
                 }
-                Err(err) => errno(err),
+            };
+            if unbind {
+                if let Some(pkt) = sock.packet_state() {
+                    if let Err(err) = net.packet_bind(pkt.handle.id(), pkt.protocol, 0) {
+                        return errno(err);
+                    }
+                    let _ = sock.with_packet_mut(|p| p.ifindex = 0);
+                }
+                0
+            } else {
+                0
             }
         }
         (SOL_PACKET, PACKET_AUXDATA) if sock.is_packet() => {
-            if let Err(err) = read_opt_i32(memory, optval, optlen) {
-                return errno(err);
-            }
-            0
+            let val = match read_opt_i32(memory, optval, optlen) {
+                Ok(v) => v,
+                Err(err) => return errno(err),
+            };
+            if val == 0 { 0 } else { errno(EOPNOTSUPP) }
         }
         (SOL_SOCKET, SO_RCVBUF)
         | (SOL_SOCKET, SO_SNDBUF)

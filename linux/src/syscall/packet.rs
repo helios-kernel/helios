@@ -5,7 +5,7 @@ use helios_unix::{Socket, SocketKind, SocketNetwork};
 
 use super::netlink::{ARPHRD_ETHER, ARPHRD_LOOPBACK, IFINDEX_ETH0, IFINDEX_LO};
 use super::socket::{
-    EAGAIN, EMSGSIZE, ENODEV, ETIMEDOUT, MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC, Network, SocketReady,
+    EAGAIN, EMSGSIZE, ENODEV, ETIMEDOUT, MSG_DONTWAIT, MSG_PEEK, Network, SocketReady,
 };
 use super::{EFAULT, EINVAL, UserMemory};
 
@@ -255,8 +255,7 @@ pub(crate) async fn recv<N: SocketNetwork, Net: Network<N>>(
         .await
     {
         Ok(Some(frame)) => frame,
-        Ok(None) => return Err(if nonblocking { EAGAIN } else { ETIMEDOUT }),
-        Err(ETIMEDOUT) if nonblocking => return Err(EAGAIN),
+        Ok(None) | Err(ETIMEDOUT) => return Err(EAGAIN),
         Err(err) => return Err(err),
     };
 
@@ -301,12 +300,7 @@ pub(crate) async fn recv<N: SocketNetwork, Net: Network<N>>(
             (raw[..copy_len].to_vec(), received.original_len)
         }
     };
-    let reported = if flags & MSG_TRUNC != 0 {
-        full_len
-    } else {
-        payload.len()
-    };
-    Ok((payload, reported, sll))
+    Ok((payload, full_len, sll))
 }
 
 /// Non-destructive readiness of an `AF_PACKET` socket.

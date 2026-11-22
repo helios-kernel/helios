@@ -8,7 +8,7 @@ use helios_unix::{Socket, SocketNetwork};
 
 use super::socket::{
     AF_INET, AF_INET6, AF_UNSPEC, EAGAIN, ENODEV, EOPNOTSUPP, Ipv4InterfaceAddress, Ipv4RouteEntry,
-    MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC, Network, SocketContext, SocketReady,
+    MSG_DONTWAIT, MSG_PEEK, Network, SocketContext, SocketReady,
 };
 use super::{EFAULT, EINVAL, EPERM, UserMemory};
 
@@ -268,12 +268,7 @@ pub(crate) fn recv<N: SocketNetwork>(
             let orig_len = full.len();
             let copy_len = orig_len.min(max_len);
             let out = full[..copy_len].to_vec();
-            let reported = if flags & MSG_TRUNC != 0 {
-                orig_len
-            } else {
-                copy_len
-            };
-            Ok((out, reported))
+            Ok((out, orig_len))
         }
         None => {
             if sock.is_nonblocking() || flags & MSG_DONTWAIT != 0 {
@@ -350,7 +345,18 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
             require_admin(ctx, net)?;
             let mut req = [0u8; IFREQ_LEN];
             memory.read(arg, &mut req).map_err(|_| EFAULT)?;
-            let _ = lookup_ifindex(&req[0..16])?;
+            let ifindex = lookup_ifindex(&req[0..16])?;
+            let requested = u32::from(u16::from_ne_bytes([req[16], req[17]]));
+            let current = if ifindex == IFINDEX_LO {
+                LO_FLAGS
+            } else {
+                ETH0_FLAGS
+            };
+            // Bringing an already-up interface up is idempotent; taking an
+            // interface down or toggling unsupported link flags fails fast.
+            if (requested & IFF_UP) == 0 || (requested & !current) != 0 {
+                return Err(EOPNOTSUPP);
+            }
             Ok(Some(0))
         }
         SIOCGIFMTU => {
@@ -370,10 +376,18 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
             require_admin(ctx, net)?;
             let mut req = [0u8; IFREQ_LEN];
             memory.read(arg, &mut req).map_err(|_| EFAULT)?;
-            let _ = lookup_ifindex(&req[0..16])?;
+            let ifindex = lookup_ifindex(&req[0..16])?;
             let mtu = i32::from_ne_bytes([req[16], req[17], req[18], req[19]]);
             if !(68..=65_536).contains(&mtu) {
                 return Err(EINVAL);
+            }
+            let current_mtu = if ifindex == IFINDEX_LO {
+                LO_MTU as i32
+            } else {
+                ETH0_MTU as i32
+            };
+            if mtu != current_mtu {
+                return Err(EOPNOTSUPP);
             }
             Ok(Some(0))
         }
@@ -429,6 +443,12 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
             }
             let addr = read_sockaddr_in_slice(&req[16..32])?;
             let prefix = default_ipv4_prefix(addr);
+            // Replace the existing primary IPv4 address (matching Linux
+            // `SIOCSIFADDR`) so a subsequent `SIOCSIFNETMASK` updates the
+            // address just installed rather than an older primary entry.
+            if let Some(previous) = net.list_ipv4_addresses().await?.first().copied() {
+                net.remove_ipv4_address(previous).await?;
+            }
             net.add_ipv4_address(Ipv4InterfaceAddress {
                 address: addr,
                 prefix,
@@ -468,7 +488,11 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
             if ifindex != IFINDEX_ETH0 {
                 return Err(EOPNOTSUPP);
             }
-            let _ = read_sockaddr_in_slice(&req[16..32])?;
+            let brd = read_sockaddr_in_slice(&req[16..32])?;
+            let primary = primary_ipv4_for(IFINDEX_ETH0, net).await?;
+            if brd != broadcast_ipv4(primary.address, primary.prefix) {
+                return Err(EOPNOTSUPP);
+            }
             Ok(Some(0))
         }
         SIOCGIFCONF => {
@@ -613,7 +637,7 @@ async fn handle_rtnetlink_message<N: SocketNetwork, Net: Network<N>>(
             } else if let Err(err) = net.check_net_admin() {
                 Err(err)
             } else {
-                resolve_link_query(payload).map(|_| ())
+                validate_link_mutation(payload, net).await
             };
             match result {
                 Ok(()) => {
@@ -753,6 +777,52 @@ async fn handle_rtnetlink_message<N: SocketNetwork, Net: Network<N>>(
         }
     }
     out
+}
+
+async fn validate_link_mutation<N: SocketNetwork, Net: Network<N>>(
+    payload: &[u8],
+    net: &Net,
+) -> Result<(), u64> {
+    let ifindex = resolve_link_query(payload)?;
+    let ifi_flags = u32::from_ne_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let ifi_change = u32::from_ne_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    let (current_flags, current_mtu) = if ifindex == IFINDEX_LO {
+        (LO_FLAGS, LO_MTU)
+    } else {
+        (ETH0_FLAGS, ETH0_MTU)
+    };
+    if (ifi_change & IFF_UP) != 0 && (ifi_flags & IFF_UP) == 0 {
+        return Err(EOPNOTSUPP);
+    }
+    if (ifi_change & !current_flags & ifi_flags) != 0 {
+        return Err(EOPNOTSUPP);
+    }
+    for (rta_type, rta_val) in parse_rtattrs(&payload[16..]) {
+        match rta_type {
+            IFLA_IFNAME => {}
+            IFLA_MTU => {
+                if rta_val.len() < 4 {
+                    return Err(EINVAL);
+                }
+                let mtu = u32::from_ne_bytes([rta_val[0], rta_val[1], rta_val[2], rta_val[3]]);
+                if mtu != current_mtu {
+                    return Err(EOPNOTSUPP);
+                }
+            }
+            IFLA_ADDRESS => {
+                let current_mac = if ifindex == IFINDEX_LO {
+                    [0u8; 6]
+                } else {
+                    net.interface_mac().await.unwrap_or([0; 6])
+                };
+                if rta_val != current_mac.as_slice() {
+                    return Err(EOPNOTSUPP);
+                }
+            }
+            _ => return Err(EOPNOTSUPP),
+        }
+    }
+    Ok(())
 }
 
 fn resolve_link_query(payload: &[u8]) -> Result<u32, u64> {

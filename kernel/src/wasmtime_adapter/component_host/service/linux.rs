@@ -1482,7 +1482,10 @@ where
             .runtime_state
             .network_service()
             .ok_or(syscall::ENETDOWN)?;
-        let ready = service.packet_readiness(socket);
+        let ready = service
+            .packet_readiness(socket)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
         Ok(syscall::SocketReady {
             readable: ready.readable,
             writable: ready.writable,

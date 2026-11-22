@@ -810,8 +810,8 @@ where
         NetworkService::packet_receive(self, socket, max_bytes, timeout_nanos, peek).await
     }
 
-    fn packet_readiness(&self, socket: u64) -> SocketReadiness {
-        NetworkService::packet_readiness(self, socket)
+    async fn packet_readiness(&self, socket: u64) -> Result<SocketReadiness, UdpError> {
+        NetworkService::packet_readiness(self, socket).await
     }
 
     fn packet_close(&self, socket: u64) {

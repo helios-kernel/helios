@@ -124,7 +124,7 @@ impl PacketTapRegistry {
     ///
     /// Returns `true` if at least one tap accepted a copy.
     pub(super) fn tap_rx_frame(&self, ifindex: u32, frame: &[u8]) -> bool {
-        if self.active_count.load(AtomicOrdering::Relaxed) == 0 || frame.len() < ETH_HEADER_LEN {
+        if self.active_count.load(AtomicOrdering::Acquire) == 0 || frame.len() < ETH_HEADER_LEN {
             return false;
         }
         let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
@@ -330,8 +330,9 @@ where
         }
     }
 
-    pub fn packet_readiness(&self, socket: u64) -> SocketReadiness {
-        self.inner.packet_taps.readiness(socket)
+    pub async fn packet_readiness(&self, socket: u64) -> Result<SocketReadiness, UdpError> {
+        self.drive_udp().await?;
+        Ok(self.inner.packet_taps.readiness(socket))
     }
 
     pub fn packet_close(&self, socket: u64) {
@@ -395,5 +396,448 @@ mod tests {
         registry.close(tap_ip);
         registry.close(tap_tx_only);
         assert!(!registry.tap_rx_frame(IFINDEX_ETH0, &ipv4_frame));
+    }
+
+    #[cfg(feature = "linux")]
+    #[test]
+    fn linux_rtnetlink_ioctls_and_wasix_admin_share_one_network_service() {
+        use core::future::Future;
+        use core::num::NonZeroU32;
+        use core::ops::ControlFlow;
+        use core::task::{Context, Poll, Waker};
+        use helios_hal::vmm::PageFlags;
+        use helios_linux::abi::Abi;
+        use helios_linux::syscall::{
+            AF_NETLINK, Call, Clock, Credentials, Denied, Descriptors, IpAddr,
+            Ipv4InterfaceAddress, Ipv4RouteEntry, MapError, MemoryFault, MemoryTotals,
+            NETLINK_ROUTE, Network, Process, Region, Resources, SpawnError, SpawnedThread, Start,
+            Stdio, Stream, SyscallOutcome, System, Thread, UserMemory, UtsField, VirtualMemory,
+            WriteError, dispatch,
+        };
+
+        use crate::test_support::{
+            ManualClockCpu, RecordingNetworkInterface, single_node_pool, test_profile_sink,
+            test_root_entropy, test_timer, test_uptime_clock,
+        };
+        use crate::{Ipv4Address, Ipv4Cidr, Ipv4Route, NetworkAdminBackend, NetworkPortId};
+
+        fn drive<F: Future>(future: F) -> F::Output {
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            let mut future = core::pin::pin!(future);
+            for _ in 0..128 {
+                if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                    return value;
+                }
+            }
+            panic!("test future did not complete")
+        }
+
+        type TestService = NetworkService<ManualClockCpu, RecordingNetworkInterface>;
+
+        struct KernelTestResources;
+        impl Resources for KernelTestResources {
+            type File = core::convert::Infallible;
+            type Network = crate::UnixNetwork<TestService>;
+            type Data = u64;
+        }
+
+        struct KernelTestPlatform {
+            service: TestService,
+        }
+
+        impl Stdio for KernelTestPlatform {
+            async fn write(&mut self, _: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
+                Ok(bytes.len())
+            }
+            async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+                Ok(Bytes::new())
+            }
+        }
+
+        impl Clock for KernelTestPlatform {
+            fn now_nanos(&self) -> u64 {
+                0
+            }
+            async fn sleep_until(&self, _: u64) {}
+        }
+
+        impl System for KernelTestPlatform {
+            fn realtime_nanos(&self) -> u64 {
+                0
+            }
+            fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+                Err(Denied)
+            }
+            fn cpu_nanos(&self) -> u64 {
+                0
+            }
+            fn process_cpu_nanos(&self) -> u64 {
+                0
+            }
+            fn processor_count(&self) -> u32 {
+                1
+            }
+            fn fill_random(&mut self, out: &mut [u8]) {
+                out.fill(0x5a);
+            }
+            fn memory(&self) -> MemoryTotals {
+                MemoryTotals {
+                    total_bytes: 1024 * 1024,
+                    free_bytes: 512 * 1024,
+                }
+            }
+            fn process_count(&self) -> u32 {
+                1
+            }
+            fn kernel_version(&self) -> &str {
+                "#1 Helios test"
+            }
+            fn hostname(&self) -> UtsField {
+                UtsField::from_bytes(b"helios").unwrap()
+            }
+            fn domainname(&self) -> UtsField {
+                UtsField::from_bytes(b"(none)").unwrap()
+            }
+            fn set_hostname(&mut self, _: UtsField) -> Result<(), Denied> {
+                Err(Denied)
+            }
+            fn set_domainname(&mut self, _: UtsField) -> Result<(), Denied> {
+                Err(Denied)
+            }
+        }
+
+        impl Network<crate::UnixNetwork<TestService>> for KernelTestPlatform {
+            fn to_ip(&self, address: crate::NetworkIpAddress) -> IpAddr {
+                match address {
+                    crate::NetworkIpAddress::Ipv4(ip) => IpAddr::V4(ip.octets()),
+                    crate::NetworkIpAddress::Ipv6(ip) => IpAddr::V6(ip.octets()),
+                }
+            }
+
+            fn encode_ip(&self, ip: IpAddr) -> crate::NetworkIpAddress {
+                match ip {
+                    IpAddr::V4(octets) => crate::NetworkIpAddress::Ipv4(Ipv4Address::new(octets)),
+                    IpAddr::V6(octets) => {
+                        crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new(octets))
+                    }
+                }
+            }
+
+            async fn interface_mac(&self) -> Result<[u8; 6], u64> {
+                Ok(self
+                    .service
+                    .mac_address(NetworkPortId::new(0))
+                    .await
+                    .unwrap()
+                    .octets())
+            }
+
+            async fn list_ipv4_addresses(&self) -> Result<Vec<Ipv4InterfaceAddress>, u64> {
+                Ok(self
+                    .service
+                    .list_addresses(NetworkPortId::new(0))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|cidr| Ipv4InterfaceAddress {
+                        address: cidr.address().octets(),
+                        prefix: cidr.prefix_len(),
+                    })
+                    .collect())
+            }
+
+            async fn add_ipv4_address(&self, address: Ipv4InterfaceAddress) -> Result<(), u64> {
+                self.service
+                    .add_address(
+                        NetworkPortId::new(0),
+                        Ipv4Cidr::new(Ipv4Address::new(address.address), address.prefix),
+                    )
+                    .await
+                    .map_err(|_| 22u64)
+            }
+
+            async fn remove_ipv4_address(&self, address: Ipv4InterfaceAddress) -> Result<(), u64> {
+                self.service
+                    .remove_address(
+                        NetworkPortId::new(0),
+                        Ipv4Cidr::new(Ipv4Address::new(address.address), address.prefix),
+                    )
+                    .await
+                    .map_err(|_| 22u64)
+            }
+
+            async fn list_ipv4_routes(&self) -> Result<Vec<Ipv4RouteEntry>, u64> {
+                Ok(self
+                    .service
+                    .list_routes(NetworkPortId::new(0))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|route| {
+                        let gw = route.gateway().octets();
+                        Ipv4RouteEntry {
+                            destination: route.destination().address().octets(),
+                            prefix: route.destination().prefix_len(),
+                            gateway: if gw == [0, 0, 0, 0] { None } else { Some(gw) },
+                        }
+                    })
+                    .collect())
+            }
+
+            async fn add_ipv4_route(&self, route: Ipv4RouteEntry) -> Result<(), u64> {
+                self.service
+                    .add_route(
+                        NetworkPortId::new(0),
+                        Ipv4Route::new(
+                            Ipv4Cidr::new(Ipv4Address::new(route.destination), route.prefix),
+                            Ipv4Address::new(route.gateway.unwrap_or([0, 0, 0, 0])),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| 22u64)
+            }
+
+            async fn remove_ipv4_route(&self, route: Ipv4RouteEntry) -> Result<(), u64> {
+                self.service
+                    .remove_route(
+                        NetworkPortId::new(0),
+                        Ipv4Route::new(
+                            Ipv4Cidr::new(Ipv4Address::new(route.destination), route.prefix),
+                            Ipv4Address::new(route.gateway.unwrap_or([0, 0, 0, 0])),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| 22u64)
+            }
+
+            fn check_net_admin(&self) -> Result<(), u64> {
+                Ok(())
+            }
+        }
+
+        struct FlatMemory(Vec<u8>);
+        impl UserMemory for FlatMemory {
+            fn read(&self, address: u64, into: &mut [u8]) -> Result<(), MemoryFault> {
+                let start = usize::try_from(address).map_err(|_| MemoryFault)?;
+                let end = start.checked_add(into.len()).ok_or(MemoryFault)?;
+                into.copy_from_slice(self.0.get(start..end).ok_or(MemoryFault)?);
+                Ok(())
+            }
+            fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+                let start = usize::try_from(address).map_err(|_| MemoryFault)?;
+                let end = start.checked_add(length).ok_or(MemoryFault)?;
+                if end <= self.0.len() {
+                    Ok(())
+                } else {
+                    Err(MemoryFault)
+                }
+            }
+            fn write(&mut self, address: u64, from: &[u8]) -> Result<(), MemoryFault> {
+                let start = usize::try_from(address).map_err(|_| MemoryFault)?;
+                let end = start.checked_add(from.len()).ok_or(MemoryFault)?;
+                self.0
+                    .get_mut(start..end)
+                    .ok_or(MemoryFault)?
+                    .copy_from_slice(from);
+                Ok(())
+            }
+            fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+                let mut raw = [0; 4];
+                self.read(address, &mut raw)?;
+                Ok(u32::from_le_bytes(raw))
+            }
+            fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+                self.write(address, &value.to_le_bytes())
+            }
+            fn atomic_compare_exchange_u32(
+                &mut self,
+                address: u64,
+                expected: u32,
+                desired: u32,
+            ) -> Result<Result<u32, u32>, MemoryFault> {
+                let cur = self.atomic_load_u32(address)?;
+                if cur == expected {
+                    self.atomic_store_u32(address, desired)?;
+                    Ok(Ok(cur))
+                } else {
+                    Ok(Err(cur))
+                }
+            }
+        }
+        impl VirtualMemory for FlatMemory {
+            fn lowest_address(&self) -> u64 {
+                0x1000
+            }
+            fn map_anywhere(&mut self, _: u64, _: u64, _: PageFlags) -> Result<u64, MapError> {
+                Err(MapError::OutOfMemory)
+            }
+            fn map_at(&mut self, _: u64, _: u64, _: PageFlags) -> Result<(), MapError> {
+                Err(MapError::OutOfMemory)
+            }
+            fn unmap(&mut self, _: u64, _: u64) {}
+            fn protect(&mut self, _: u64, _: u64, _: PageFlags) -> Result<(), MapError> {
+                Ok(())
+            }
+            fn discard(&mut self, _: u64, _: u64) {}
+            fn remap(&mut self, _: u64, _: u64, _: u64, _: u64) -> Result<(), MapError> {
+                Err(MapError::OutOfMemory)
+            }
+            fn region(&self, _: u64, _: u64) -> Option<Region> {
+                None
+            }
+            fn free_range(&self, _: u64, _: u64) -> Option<u64> {
+                None
+            }
+        }
+
+        struct NoThread;
+        impl Thread<KernelTestResources> for NoThread {
+            fn thread_pointer(&self) -> u64 {
+                0
+            }
+            fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+                Ok(())
+            }
+            fn stack_pointer(&self) -> u64 {
+                0
+            }
+            fn spawn_thread(
+                &mut self,
+                _: Process<KernelTestResources>,
+                _: SpawnedThread,
+            ) -> Result<(), SpawnError> {
+                Err(SpawnError::Busy)
+            }
+        }
+
+        let device = RecordingNetworkInterface::new(1);
+        let clock = ManualClockCpu::new();
+        let service = NetworkService::new(
+            clock.clone(),
+            single_node_pool(1),
+            test_profile_sink(),
+            test_uptime_clock(),
+            test_timer(clock),
+            device.clone(),
+            test_root_entropy(),
+        );
+        let mut platform = KernelTestPlatform {
+            service: service.clone(),
+        };
+        let mut mem = FlatMemory(alloc::vec![0u8; 32 * 1024]);
+        let start = Start {
+            credentials: Credentials::root(),
+            ..Start::default()
+        };
+        let mut process = Process::with_descriptors(
+            Abi::X86_64,
+            NonZeroU32::new(1).unwrap(),
+            0x10_0000,
+            Descriptors::<KernelTestResources>::new(),
+            start,
+        );
+
+        let mut run_call = |mem: &mut FlatMemory, number: u64, arguments: [u64; 6]| -> i64 {
+            let mut thread = NoThread;
+            match drive(dispatch(
+                &mut process,
+                Call { number, arguments },
+                mem,
+                &mut thread,
+                &mut platform,
+            )) {
+                ControlFlow::Continue(SyscallOutcome::Return(v)) => v as i64,
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        };
+
+        // Open NETLINK_ROUTE socket (SYS_SOCKET = 41, SOCK_RAW = 3).
+        let fd = run_call(
+            &mut mem,
+            41,
+            [AF_NETLINK as u64, 3, NETLINK_ROUTE as u64, 0, 0, 0],
+        ) as u64;
+
+        // 1. Linux RTM_NEWADDR adds 10.42.0.9/24 on eth0 (index 2).
+        let mut nl_addr = Vec::new();
+        let body_len = 8 + 8; // ifaddrmsg (8) + IFA_LOCAL rta (8)
+        nl_addr.extend_from_slice(&((16 + body_len) as u32).to_ne_bytes());
+        nl_addr.extend_from_slice(&20u16.to_ne_bytes()); // RTM_NEWADDR
+        nl_addr.extend_from_slice(&0x0005u16.to_ne_bytes()); // NLM_F_REQUEST | NLM_F_ACK
+        nl_addr.extend_from_slice(&1u32.to_ne_bytes());
+        nl_addr.extend_from_slice(&0u32.to_ne_bytes());
+        nl_addr.extend_from_slice(&[2, 24, 0, 0]); // AF_INET, /24
+        nl_addr.extend_from_slice(&2u32.to_ne_bytes()); // ifindex 2
+        nl_addr.extend_from_slice(&8u16.to_ne_bytes()); // rta_len = 8
+        nl_addr.extend_from_slice(&2u16.to_ne_bytes()); // IFA_LOCAL
+        nl_addr.extend_from_slice(&[10, 42, 0, 9]);
+        mem.write(0x1000, &nl_addr).unwrap();
+        assert_eq!(
+            run_call(&mut mem, 44, [fd, 0x1000, nl_addr.len() as u64, 0, 0, 0]),
+            nl_addr.len() as i64
+        );
+        assert!(run_call(&mut mem, 45, [fd, 0x2000, 256, 0, 0, 0]) >= 20);
+
+        // 2. Linux RTM_NEWROUTE adds default route via 10.42.0.1.
+        let mut nl_rt = Vec::new();
+        let rt_body_len = 12 + 8 + 8; // rtmsg (12) + RTA_GATEWAY (8) + RTA_OIF (8)
+        nl_rt.extend_from_slice(&((16 + rt_body_len) as u32).to_ne_bytes());
+        nl_rt.extend_from_slice(&24u16.to_ne_bytes()); // RTM_NEWROUTE
+        nl_rt.extend_from_slice(&0x0005u16.to_ne_bytes());
+        nl_rt.extend_from_slice(&2u32.to_ne_bytes());
+        nl_rt.extend_from_slice(&0u32.to_ne_bytes());
+        nl_rt.extend_from_slice(&[2, 0, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0]);
+        nl_rt.extend_from_slice(&8u16.to_ne_bytes());
+        nl_rt.extend_from_slice(&5u16.to_ne_bytes()); // RTA_GATEWAY
+        nl_rt.extend_from_slice(&[10, 42, 0, 1]);
+        nl_rt.extend_from_slice(&8u16.to_ne_bytes());
+        nl_rt.extend_from_slice(&4u16.to_ne_bytes()); // RTA_OIF
+        nl_rt.extend_from_slice(&2u32.to_ne_bytes());
+        mem.write(0x1000, &nl_rt).unwrap();
+        assert_eq!(
+            run_call(&mut mem, 44, [fd, 0x1000, nl_rt.len() as u64, 0, 0, 0]),
+            nl_rt.len() as i64
+        );
+        assert!(run_call(&mut mem, 45, [fd, 0x2000, 256, 0, 0, 0]) >= 20);
+
+        // 3. Verify WASIX's shared NetworkAdminBackend sees both mutations on the same NetworkService.
+        let wasix_addrs = drive(service.list_addresses(NetworkPortId::new(0))).unwrap();
+        assert!(wasix_addrs.contains(&Ipv4Cidr::new(Ipv4Address::new([10, 42, 0, 9]), 24)));
+        let wasix_routes = drive(service.list_routes(NetworkPortId::new(0))).unwrap();
+        assert!(wasix_routes.iter().any(|r| {
+            r.destination() == Ipv4Cidr::new(Ipv4Address::new([0, 0, 0, 0]), 0)
+                && r.gateway() == Ipv4Address::new([10, 42, 0, 1])
+        }));
+
+        // 4. Reverse direction: WASIX add_address is immediately visible to Linux RTM_GETADDR.
+        drive(service.add_address(
+            NetworkPortId::new(0),
+            Ipv4Cidr::new(Ipv4Address::new([192, 168, 77, 5]), 24),
+        ))
+        .unwrap();
+        let mut get_addr = Vec::new();
+        get_addr.extend_from_slice(&24u32.to_ne_bytes());
+        get_addr.extend_from_slice(&22u16.to_ne_bytes()); // RTM_GETADDR
+        get_addr.extend_from_slice(&0x0301u16.to_ne_bytes()); // NLM_F_REQUEST | NLM_F_DUMP
+        get_addr.extend_from_slice(&3u32.to_ne_bytes());
+        get_addr.extend_from_slice(&0u32.to_ne_bytes());
+        get_addr.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
+        mem.write(0x1000, &get_addr).unwrap();
+        assert_eq!(
+            run_call(&mut mem, 44, [fd, 0x1000, get_addr.len() as u64, 0, 0, 0]),
+            get_addr.len() as i64
+        );
+        let got = run_call(&mut mem, 45, [fd, 0x2000, 4096, 0, 0, 0]) as usize;
+        let mut dump = alloc::vec![0u8; got];
+        mem.read(0x2000, &mut dump).unwrap();
+        assert!(dump.windows(4).any(|w| w == [192, 168, 77, 5]));
+
+        // 5. packet_readiness drives the device RX ring and surfaces incoming frames.
+        let tap = service.packet_open(ETH_P_ALL).unwrap();
+        assert!(!drive(service.packet_readiness(tap)).unwrap().readable);
+        device.deliver_on(0, &sample_ethernet_frame(0x0800, b"dhcp-offer"));
+        assert!(drive(service.packet_readiness(tap)).unwrap().readable);
+        service.packet_close(tap);
     }
 }

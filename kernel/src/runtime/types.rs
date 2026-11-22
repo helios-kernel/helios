@@ -1214,10 +1214,14 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Non-destructive readiness of an `AF_PACKET` tap.
-    fn packet_readiness(&self, socket: u64) -> SocketReadiness {
+    /// Non-destructive readiness of an `AF_PACKET` tap, driving the device RX
+    /// ring before probing so `epoll_wait`/`poll` observe freshly arrived frames.
+    fn packet_readiness(
+        &self,
+        socket: u64,
+    ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
         let _ = socket;
-        SocketReadiness::default()
+        async { Ok(SocketReadiness::default()) }
     }
 
     /// Retires an `AF_PACKET` tap. Synchronous because `Drop` calls it.
