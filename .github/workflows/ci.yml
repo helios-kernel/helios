@@ -214,6 +214,7 @@ jobs:
               - '.github/ci-lanes.json'
               - '.github/workflows/ci.yml'
               - '.github/actions/checkout-wasmtime/**'
+              - '.github/actions/ci-root-key/**'
             # What gVisor's syscall suite measures and the suite itself:
             # the Linux ABI and the libraries beneath it, the kernel's
             # Linux process host, the native-execution contract and each
@@ -351,7 +352,7 @@ jobs:
       - name: Install host dependencies
         uses: ./helios/.github/actions/install-apt-packages
         with:
-          packages: libudev-dev cmake ninja-build
+          packages: cmake ninja-build
       # Each program's wasm, kept with the files its build read (#1022): a
       # program none of whose inputs changed is taken from the cache
       # instead of built. The key carries the run id so that each
@@ -383,7 +384,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: helios
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          shared-key: check-host-checks
+          save-if: "false"
       # Pinned `wasi-sdk-34` used by `helios-cli wasm-build` to cross-compile
       # BoringSSL for `programs/http-client`; restored read-only on PRs and
       # populated on `dev` pushes.
@@ -591,9 +593,18 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # CI signs every boot payload with one key, so every image embeds the
+      # same public key and the cache below can hold the kernel image of
+      # inputs that did not change (#1023).
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       # An entry is addressed by its input, the `helios-cli` that compiled
       # it, the target level and the hint, so a restored cache can only
-      # answer a precompile it is exact for. The key carries the run id so
+      # answer a precompile it is exact for. The same directory holds the
+      # kernel images the job linked, each addressed by what the build is
+      # and checked against every file it read, so a job whose kernel
+      # inputs did not change links none (#1023). The key carries the run id so
       # that each default-branch run saves its own cache, and the prefix
       # restores the newest earlier one. The job's prebuilds each use a
       # subset of the entries and each hit or store sets an entry's
@@ -950,6 +961,10 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
@@ -1190,7 +1205,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1209,6 +1224,7 @@ jobs:
           # first confirmed on this runner.
           grep -Fqx 'memory:0' linux-smoke.out
           grep -Fqx 'pthreads:0' linux-smoke.out
+          grep -Fqx 'signals:0' linux-smoke.out
           # The system-information suite (#1035) runs as a process with no
           # wall-clock right and no scheduling or resource privilege, the
           # same modes build-fixtures.sh asserts on this Linux runner.
@@ -1567,6 +1583,10 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
@@ -1874,7 +1894,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1893,6 +1913,7 @@ jobs:
           # first confirmed on this runner.
           grep -Fqx 'memory:0' linux-smoke.out
           grep -Fqx 'pthreads:0' linux-smoke.out
+          grep -Fqx 'signals:0' linux-smoke.out
           # The system-information suite (#1035) runs as a process with no
           # wall-clock right and no scheduling or resource privilege, the
           # same modes build-fixtures.sh asserts on this Linux runner.
@@ -2713,6 +2734,10 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
@@ -2882,6 +2907,10 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Record the job start
         run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
       - name: Restore the precompiled cwasm cache
@@ -3427,6 +3456,10 @@ jobs:
             --results "$RESULTS/native-${{ matrix.arch }}-${{ matrix.shard }}.jsonl"
       - uses: ./helios/.github/actions/checkout-wasmtime
         if: steps.cases.outputs.count != '0'
+      - uses: ./helios/.github/actions/ci-root-key
+        if: steps.cases.outputs.count != '0'
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - name: Restore the precompiled cwasm cache
         if: steps.cases.outputs.count != '0'
         uses: ./helios/.github/actions/shared-cache

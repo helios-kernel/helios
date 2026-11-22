@@ -6,21 +6,25 @@ use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 use core::sync::atomic::AtomicU64;
 use core::task::{Context, Poll};
+use helios_hal::native::{UserContext, UserFault};
 use helios_hal::vmm::PageFlags;
 use helios_sync::{Notify, NotifyWaiter, RawMutex};
 use helios_unix::{
     ChildTermination, DescriptorSlots, FileDescriptor, FileDescriptorEntry, FutexTable, NoNetwork,
-    ProcessIdentity, ProcessMemoryIdentity, SocketNetwork,
+    ProcessIdentity, ProcessMemoryIdentity, Signal, SignalSet, SocketNetwork,
 };
 
 mod futex;
 mod io;
 mod memory;
+mod signal;
 mod system;
 mod thread;
 
 pub use crate::abi::{Abi, Operation};
+pub use crate::signal_frame::SignalFrameError;
 pub use io::Clock;
+pub use signal::{ProcessSignals, SignalDelivery, SyscallRestart, ThreadSignalSlot};
 pub use system::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_KILL,
     CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_BROADCAST, CAP_NET_RAW, CAP_SETGID, CAP_SETUID,
@@ -192,15 +196,36 @@ pub enum SpawnError {
     InvalidTls,
 }
 
-/// The calling thread's execution context: its thread pointer (`arch_prctl`)
-/// and spawning a sibling thread sharing this process (`clone` / `clone3`).
+/// The calling thread's execution context: its thread pointer (`arch_prctl`),
+/// user stack pointer (`sigaltstack`), and spawning a sibling thread sharing
+/// this process (`clone` / `clone3`).
 pub trait Thread<R: Resources = NoBacking> {
     fn thread_pointer(&self) -> u64;
     /// Refused for an address outside the user range.
     fn set_thread_pointer(&mut self, address: u64) -> Result<(), Denied>;
+    /// Current user stack pointer, used by `sigaltstack` to report `SS_ONSTACK`
+    /// and refuse changes while executing on the alternate stack.
+    fn stack_pointer(&self) -> u64 {
+        0
+    }
     /// Duplicates the calling thread's user context with `state` and starts
     /// `child` on its own task with syscall result `0`.
     fn spawn_thread(&mut self, child: Process<R>, state: SpawnedThread) -> Result<(), SpawnError>;
+}
+
+/// Outcome of a non-exiting system call returned by [`dispatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyscallOutcome {
+    /// Normal return value to write into the ABI's result register.
+    Return(u64),
+    /// Interrupted syscall eligible for `SA_RESTART` (Linux `-ERESTARTSYS`).
+    RestartSys,
+    /// Interrupted syscall that returns `-EINTR` if any handler runs and
+    /// restarts only if no handler runs (Linux `-ERESTARTNOHAND`).
+    RestartNoHand,
+    /// `rt_sigreturn`: the driver must restore the thread context from the
+    /// user signal frame and must not overwrite the restored result register.
+    SigReturn,
 }
 
 /// How an `exit` or `exit_group` system call ends execution.
@@ -268,9 +293,11 @@ pub struct Call {
 
 // Linux uapi/asm-generic/errno-base.h and errno.h.
 const EPERM: u64 = 1;
+const ESRCH: u64 = 3;
 const EINTR: u64 = 4;
 const EIO: u64 = 5;
 const EBADF: u64 = 9;
+const EAGAIN: u64 = 11;
 const ENOMEM: u64 = 12;
 const EACCES: u64 = 13;
 const EFAULT: u64 = 14;
@@ -332,12 +359,15 @@ struct ProcessShared<R: Resources> {
     abi: Abi,
     identity: ProcessIdentity,
     memory_id: ProcessMemoryIdentity,
+    pids: PidNamespace,
     futex: FutexTable,
     descriptors: spin::Mutex<Descriptors<R>>,
     stdin_lock: RawMutex,
     stdin_carry: spin::Mutex<Bytes>,
+    credentials: Arc<spin::Mutex<Credentials>>,
     attributes: spin::Mutex<system::Attributes>,
     program_break: spin::Mutex<memory::ProgramBreak>,
+    signals: Arc<ProcessSignals>,
     threads: Arc<GroupLifecycle>,
 }
 
@@ -356,11 +386,12 @@ impl core::ops::Deref for GroupLifecycle {
 /// Each thread task exclusively owns its `Process<R>` handle while
 /// dispatching a syscall. Shared process structures synchronize internally
 /// with bounded non-awaiting critical sections (`descriptors`, `attributes`,
-/// `program_break`, `threads`, `futex`) or an async mutex (`stdin_carry`);
-/// no spin lock is ever held across an `.await`.
+/// `credentials`, `program_break`, `signals`, `threads`, `futex`) or an async
+/// mutex (`stdin_carry`); no spin lock is ever held across an `.await`.
 pub struct Process<R: Resources> {
     shared: Arc<ProcessShared<R>>,
     tid: NonZeroU32,
+    signals: Arc<ThreadSignalSlot>,
     clear_child_tid: u64,
     robust_list: Arc<AtomicU64>,
     exited: bool,
@@ -394,6 +425,7 @@ impl<R: Resources> Process<R> {
             .pids
             .clone()
             .unwrap_or_else(|| PidNamespace::standalone(id));
+        let credentials = Arc::new(spin::Mutex::new(start.credentials.clone()));
         let memory_id = ProcessMemoryIdentity::new(start.memory_id.unwrap_or(u64::from(id.get())));
         let mut initial_stdin_carry = Bytes::new();
         for slot in descriptors.entries.iter_mut().flatten() {
@@ -405,8 +437,16 @@ impl<R: Resources> Process<R> {
             }
         }
         let robust_list = Arc::new(AtomicU64::new(0));
+        let process_signals = ProcessSignals::new(id);
+        let thread_signals = process_signals.register_thread(id, SignalSet::EMPTY);
+        pids.register_process(id, process_signals.clone(), credentials.clone());
+        pids.register_thread(id, thread_signals.clone(), credentials.clone());
         let lifecycle = Arc::new(GroupLifecycle {
-            threads: spin::Mutex::new(thread::ThreadGroup::new(id, pids, robust_list.clone())),
+            threads: spin::Mutex::new(thread::ThreadGroup::new(
+                id,
+                pids.clone(),
+                robust_list.clone(),
+            )),
             changed: Notify::new(),
         });
         Self {
@@ -414,19 +454,97 @@ impl<R: Resources> Process<R> {
                 abi,
                 identity: ProcessIdentity::new(id.into()),
                 memory_id,
+                pids,
                 futex,
                 descriptors: spin::Mutex::new(descriptors),
                 stdin_lock: RawMutex::new(),
                 stdin_carry: spin::Mutex::new(initial_stdin_carry),
+                credentials,
                 attributes: spin::Mutex::new(system::Attributes::new(start, open_files)),
                 program_break: spin::Mutex::new(memory::ProgramBreak::new(program_break)),
+                signals: process_signals,
                 threads: lifecycle,
             }),
             tid: id,
+            signals: thread_signals,
             clear_child_tid: 0,
             robust_list,
             exited: false,
         }
+    }
+
+    /// Process-wide signal and interval-timer state shared across all threads
+    /// of this thread group.
+    pub fn process_signals(&self) -> Arc<ProcessSignals> {
+        self.shared.signals.clone()
+    }
+
+    /// Per-thread signal mask, private pending queue, and alternate stack.
+    pub fn thread_signals(&self) -> &Arc<ThreadSignalSlot> {
+        &self.signals
+    }
+
+    /// Forwards an external signal (such as a parent WASIX signal or owner
+    /// kill) into this Linux process's signal state.
+    pub fn raise_external_signal(&self, signal: Signal) {
+        self.shared.signals.raise_external(signal);
+    }
+
+    /// Advances `ITIMER_VIRTUAL` (`user_ns`) and `ITIMER_PROF` (`total_ns`).
+    pub fn account_cpu_timers(&self, user_ns: u64, total_ns: u64) {
+        self.shared.signals.account_cpu_timers(user_ns, total_ns);
+    }
+
+    /// Whether this process is currently stopped (`SIGSTOP`/`SIGTSTP`/etc.).
+    pub fn is_stopped(&self) -> bool {
+        self.shared.signals.is_stopped()
+    }
+
+    /// Delivers pending unmasked signals on return to user mode.
+    pub fn deliver_pending_signals<C: UserContext, M: UserMemory>(
+        &self,
+        context: &mut C,
+        memory: &mut M,
+        restart: Option<SyscallRestart>,
+        sigreturn_trampoline: u64,
+    ) -> SignalDelivery {
+        signal::deliver_pending_signals(
+            self.shared.abi,
+            &self.signals,
+            context,
+            memory,
+            restart,
+            sigreturn_trampoline,
+        )
+    }
+
+    /// Delivers a synchronous hardware fault signal with Linux
+    /// `force_sig_fault` semantics.
+    pub fn deliver_fault_signal<C: UserContext, M: UserMemory>(
+        &self,
+        fault: UserFault,
+        context: &mut C,
+        memory: &mut M,
+        sigreturn_trampoline: u64,
+    ) -> SignalDelivery {
+        signal::deliver_fault_signal(
+            self.shared.abi,
+            &self.signals,
+            fault,
+            context,
+            memory,
+            sigreturn_trampoline,
+        )
+    }
+
+    /// Restores user registers, extended state, signal mask, and alternate
+    /// stack from the signal frame on `rt_sigreturn`.
+    pub fn restore_signal_frame<C: UserContext, M: UserMemory>(
+        &self,
+        context: &mut C,
+        memory: &M,
+    ) -> Result<(), SignalFrameError> {
+        signal::restore_from_sigreturn(self.shared.abi, &self.signals, context, memory)
     }
 
     /// The thread-group ID (`getpid`).
@@ -470,6 +588,9 @@ impl<R: Resources> Process<R> {
     pub fn terminate_group(&mut self, termination: ChildTermination) {
         let tid = (!self.exited).then_some(self.tid);
         self.exited = true;
+        if let Some(tid) = tid {
+            self.shared.signals.unregister_thread(tid);
+        }
         let broadcast = self.shared.threads.lock().terminate_group(tid, termination);
         if broadcast {
             self.shared.threads.changed.notify_all();
@@ -481,6 +602,7 @@ impl<R: Resources> Process<R> {
             return;
         }
         self.exited = true;
+        self.shared.signals.unregister_thread(self.tid);
         let (broadcast, all_exited) = self.shared.threads.lock().finish(self.tid, exit);
         if broadcast || all_exited {
             self.shared.threads.changed.notify_all();
@@ -492,6 +614,7 @@ impl<R: Resources> Drop for Process<R> {
     fn drop(&mut self) {
         if !self.exited {
             self.exited = true;
+            self.shared.signals.unregister_thread(self.tid);
             let all_exited = self.shared.threads.lock().withdraw(self.tid);
             if all_exited {
                 self.shared.threads.changed.notify_all();
@@ -512,10 +635,10 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
     memory: &mut M,
     thread: &mut T,
     output: &mut O,
-) -> ControlFlow<Exit, u64> {
+) -> ControlFlow<Exit, SyscallOutcome> {
     let abi = process.shared.abi;
     let arguments = call.arguments;
-    let result = match abi.operation(call.number) {
+    let outcome = match abi.operation(call.number) {
         operation @ (Operation::Exit | Operation::ExitGroup) => {
             futex::exit_thread(process, memory);
             let status = arguments[0] as u8;
@@ -527,41 +650,121 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
             process.finish_syscall_exit(exit);
             return ControlFlow::Break(exit);
         }
-        Operation::Read => read::<R, _, _>(process, arguments, memory, output).await,
-        Operation::Close => process
-            .shared
-            .descriptors
-            .lock()
-            .close(arguments[0] as u32 as i32)
-            .map_or_else(io::descriptor_errno, |_| 0),
-        operation @ (Operation::Pipe | Operation::Pipe2) => io::pipe::<R, _>(
-            &mut process.shared.descriptors.lock(),
+        Operation::RtSigreturn => SyscallOutcome::SigReturn,
+        Operation::RtSigaction => SyscallOutcome::Return(signal::rt_sigaction(
+            &process.shared.signals,
             arguments,
             memory,
-            operation == Operation::Pipe2,
-        ),
-        operation @ (Operation::Dup | Operation::Dup2 | Operation::Dup3 | Operation::Fcntl) => {
-            io::duplicate::<R>(&mut process.shared.descriptors.lock(), operation, arguments)
+        )),
+        Operation::RtSigprocmask => {
+            SyscallOutcome::Return(signal::rt_sigprocmask(&process.signals, arguments, memory))
         }
-        operation @ (Operation::Eventfd | Operation::Eventfd2) => io::event::<R>(
-            &mut process.shared.descriptors.lock(),
+        Operation::RtSigpending => {
+            SyscallOutcome::Return(signal::rt_sigpending(&process.signals, arguments, memory))
+        }
+        Operation::RtSigsuspend => signal::rt_sigsuspend(&process.signals, arguments, memory).await,
+        Operation::RtSigtimedwait => {
+            signal::rt_sigtimedwait(&process.signals, arguments, memory, output).await
+        }
+        Operation::Sigaltstack => SyscallOutcome::Return(signal::sigaltstack(
+            abi,
+            &process.signals,
+            thread.stack_pointer(),
             arguments,
-            operation == Operation::Eventfd2,
-        ),
-        operation @ (Operation::EpollCreate | Operation::EpollCreate1) => io::epoll_create::<R>(
-            &mut process.shared.descriptors.lock(),
+            memory,
+        )),
+        Operation::Kill => {
+            let creds = process.shared.credentials.lock().clone();
+            SyscallOutcome::Return(signal::kill(
+                &process.shared.pids,
+                process.pid(),
+                process.shared.signals.pgid(),
+                &creds,
+                arguments,
+            ))
+        }
+        Operation::Tkill => {
+            let creds = process.shared.credentials.lock().clone();
+            SyscallOutcome::Return(signal::tkill(
+                &process.shared.pids,
+                process.pid(),
+                &creds,
+                arguments,
+            ))
+        }
+        Operation::Tgkill => {
+            let creds = process.shared.credentials.lock().clone();
+            SyscallOutcome::Return(signal::tgkill(
+                &process.shared.pids,
+                process.pid(),
+                &creds,
+                arguments,
+            ))
+        }
+        Operation::Pause => signal::pause(&process.signals).await,
+        Operation::Alarm => {
+            SyscallOutcome::Return(signal::alarm(&process.shared.signals, arguments, output))
+        }
+        Operation::Getitimer => SyscallOutcome::Return(signal::getitimer(
+            &process.shared.signals,
             arguments,
-            operation == Operation::EpollCreate1,
+            memory,
+            output,
+        )),
+        Operation::Setitimer => SyscallOutcome::Return(signal::setitimer(
+            &process.shared.signals,
+            arguments,
+            memory,
+            output,
+        )),
+        Operation::Read => read::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Close => SyscallOutcome::Return(
+            process
+                .shared
+                .descriptors
+                .lock()
+                .close(arguments[0] as u32 as i32)
+                .map_or_else(io::descriptor_errno, |_| 0),
         ),
-        Operation::EpollCtl => io::epoll_ctl::<R, _>(
+        operation @ (Operation::Pipe | Operation::Pipe2) => {
+            SyscallOutcome::Return(io::pipe::<R, _>(
+                &mut process.shared.descriptors.lock(),
+                arguments,
+                memory,
+                operation == Operation::Pipe2,
+            ))
+        }
+        operation @ (Operation::Dup | Operation::Dup2 | Operation::Dup3 | Operation::Fcntl) => {
+            SyscallOutcome::Return(io::duplicate::<R>(
+                &mut process.shared.descriptors.lock(),
+                operation,
+                arguments,
+            ))
+        }
+        operation @ (Operation::Eventfd | Operation::Eventfd2) => {
+            SyscallOutcome::Return(io::event::<R>(
+                &mut process.shared.descriptors.lock(),
+                arguments,
+                operation == Operation::Eventfd2,
+            ))
+        }
+        operation @ (Operation::EpollCreate | Operation::EpollCreate1) => {
+            SyscallOutcome::Return(io::epoll_create::<R>(
+                &mut process.shared.descriptors.lock(),
+                arguments,
+                operation == Operation::EpollCreate1,
+            ))
+        }
+        Operation::EpollCtl => SyscallOutcome::Return(io::epoll_ctl::<R, _>(
             abi,
             &mut process.shared.descriptors.lock(),
             arguments,
             memory,
-        ),
+        )),
         operation @ (Operation::EpollWait | Operation::EpollPwait) => {
             io::epoll_wait::<R, _, _>(
                 abi,
+                &process.signals,
                 &process.shared.descriptors,
                 arguments,
                 memory,
@@ -570,156 +773,172 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
             )
             .await
         }
+        Operation::Ppoll => {
+            io::ppoll::<R, _, _>(
+                &process.signals,
+                &process.shared.descriptors,
+                arguments,
+                memory,
+                output,
+            )
+            .await
+        }
         Operation::Mmap => {
             let _mm = process.shared.program_break.lock();
-            memory::mmap(abi, arguments, memory)
+            SyscallOutcome::Return(memory::mmap(abi, arguments, memory))
         }
         Operation::Munmap => {
             let _mm = process.shared.program_break.lock();
-            memory::munmap(abi, arguments, memory)
+            SyscallOutcome::Return(memory::munmap(abi, arguments, memory))
         }
         Operation::Mprotect => {
             let _mm = process.shared.program_break.lock();
-            memory::mprotect(abi, arguments, memory)
+            SyscallOutcome::Return(memory::mprotect(abi, arguments, memory))
         }
         Operation::Mremap => {
             let _mm = process.shared.program_break.lock();
-            memory::mremap(abi, arguments, memory)
+            SyscallOutcome::Return(memory::mremap(abi, arguments, memory))
         }
         Operation::Madvise => {
             let _mm = process.shared.program_break.lock();
-            memory::madvise(arguments, memory)
+            SyscallOutcome::Return(memory::madvise(arguments, memory))
         }
-        Operation::Brk => process
-            .shared
-            .program_break
-            .lock()
-            .set(abi, arguments[0], memory),
-        Operation::SchedYield => thread::sched_yield().await,
-        Operation::SchedGetaffinity => {
-            thread::sched_getaffinity(process, arguments, memory, output)
+        Operation::Brk => SyscallOutcome::Return(process.shared.program_break.lock().set(
+            abi,
+            arguments[0],
+            memory,
+        )),
+        Operation::SchedYield => SyscallOutcome::Return(thread::sched_yield().await),
+        Operation::SchedGetaffinity => SyscallOutcome::Return(thread::sched_getaffinity(
+            process, arguments, memory, output,
+        )),
+        Operation::Nanosleep => SyscallOutcome::Return(
+            thread::nanosleep(&process.signals, arguments, memory, output).await,
+        ),
+        Operation::ClockNanosleep => SyscallOutcome::Return(
+            thread::clock_nanosleep(&process.signals, arguments, memory, output).await,
+        ),
+        Operation::Clone => {
+            SyscallOutcome::Return(thread::clone(process, arguments, memory, thread))
         }
-        Operation::Nanosleep => thread::nanosleep(arguments, memory, output).await,
-        Operation::ClockNanosleep => thread::clock_nanosleep(arguments, memory, output).await,
-        Operation::Clone => thread::clone(process, arguments, memory, thread),
-        Operation::Clone3 => thread::clone3(process, arguments, memory, thread),
+        Operation::Clone3 => {
+            SyscallOutcome::Return(thread::clone3(process, arguments, memory, thread))
+        }
         Operation::Futex => futex::futex(process, arguments, memory, output).await,
-        Operation::SetRobustList => futex::set_robust_list(process, arguments),
-        Operation::GetRobustList => futex::get_robust_list(process, arguments, memory),
-        Operation::Getpid => process.shared.identity.id().get(),
-        Operation::Gettid => u64::from(process.tid.get()),
+        Operation::SetRobustList => {
+            SyscallOutcome::Return(futex::set_robust_list(process, arguments))
+        }
+        Operation::GetRobustList => {
+            SyscallOutcome::Return(futex::get_robust_list(process, arguments, memory))
+        }
+        Operation::Getpid => SyscallOutcome::Return(process.shared.identity.id().get()),
+        Operation::Gettid => SyscallOutcome::Return(u64::from(process.tid.get())),
         Operation::SetTidAddress => {
             process.clear_child_tid = arguments[0];
-            u64::from(process.tid.get())
+            SyscallOutcome::Return(u64::from(process.tid.get()))
         }
-        Operation::ArchPrctl => arch_prctl(abi, arguments, memory, thread),
-        Operation::Writev => {
-            writev::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
+        Operation::ArchPrctl => SyscallOutcome::Return(arch_prctl(abi, arguments, memory, thread)),
+        Operation::Writev => writev::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Ioctl => SyscallOutcome::Return(
+            match process
+                .shared
+                .descriptors
+                .lock()
+                .get_entry(arguments[0] as u32 as i32)
+            {
+                Some(_) => errno(ENOTTY),
+                None => errno(EBADF),
+            },
+        ),
+        Operation::Write => write::<R, _, _>(process, arguments, memory, output).await,
+        Operation::ClockGettime => {
+            SyscallOutcome::Return(system::clock_gettime(arguments, memory, output))
         }
-        Operation::Ioctl => match process
-            .shared
-            .descriptors
-            .lock()
-            .get_entry(arguments[0] as u32 as i32)
-        {
-            Some(_) => errno(ENOTTY),
-            None => errno(EBADF),
-        },
-        Operation::Write => {
-            write::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
-        }
-        Operation::ClockGettime => system::clock_gettime(arguments, memory, output),
-        Operation::ClockGetres => system::clock_getres(arguments, memory),
+        Operation::ClockGetres => SyscallOutcome::Return(system::clock_getres(arguments, memory)),
         Operation::ClockSettime => {
             let has_cap = process
                 .shared
-                .attributes
-                .lock()
                 .credentials
+                .lock()
                 .capabilities
                 .has_effective(CAP_SYS_TIME);
-            system::clock_settime(arguments, has_cap, memory, output)
+            SyscallOutcome::Return(system::clock_settime(arguments, has_cap, memory, output))
         }
-        Operation::Gettimeofday => system::gettimeofday(arguments, memory, output),
-        Operation::Time => system::time(arguments, memory, output),
-        Operation::Getrandom => system::getrandom(arguments, memory, output).await,
-        Operation::Uname => system::uname(abi, arguments, memory, output),
+        Operation::Gettimeofday => {
+            SyscallOutcome::Return(system::gettimeofday(arguments, memory, output))
+        }
+        Operation::Time => SyscallOutcome::Return(system::time(arguments, memory, output)),
+        Operation::Getrandom => {
+            SyscallOutcome::Return(system::getrandom(arguments, memory, output).await)
+        }
+        Operation::Uname => SyscallOutcome::Return(system::uname(abi, arguments, memory, output)),
         operation @ (Operation::Sethostname | Operation::Setdomainname) => {
             let has_cap = process
                 .shared
-                .attributes
-                .lock()
                 .credentials
+                .lock()
                 .capabilities
                 .has_effective(CAP_SYS_ADMIN);
-            system::set_uts_name(operation, has_cap, arguments, memory, output)
+            SyscallOutcome::Return(system::set_uts_name(
+                operation, has_cap, arguments, memory, output,
+            ))
         }
-        Operation::Sysinfo => system::sysinfo(arguments, memory, output),
+        Operation::Sysinfo => SyscallOutcome::Return(system::sysinfo(arguments, memory, output)),
         operation @ (Operation::Getuid
         | Operation::Geteuid
         | Operation::Getgid
-        | Operation::Getegid) => process.shared.attributes.lock().credentials.id(operation),
-        Operation::Getgroups => process
-            .shared
-            .attributes
-            .lock()
-            .credentials
-            .getgroups(arguments, memory),
+        | Operation::Getegid) => {
+            SyscallOutcome::Return(process.shared.credentials.lock().id(operation))
+        }
+        Operation::Getgroups => SyscallOutcome::Return(
+            process
+                .shared
+                .credentials
+                .lock()
+                .getgroups(arguments, memory),
+        ),
         Operation::Getresuid | Operation::Getresgid => {
-            let credentials = process.shared.attributes.lock().credentials.clone();
-            credentials.resolve(abi.operation(call.number), arguments, memory)
+            let credentials = process.shared.credentials.lock().clone();
+            SyscallOutcome::Return(credentials.resolve(
+                abi.operation(call.number),
+                arguments,
+                memory,
+            ))
         }
-        Operation::Setuid => process
-            .shared
-            .attributes
-            .lock()
-            .credentials
-            .setuid(arguments),
-        Operation::Setgid => process
-            .shared
-            .attributes
-            .lock()
-            .credentials
-            .setgid(arguments),
-        Operation::Setreuid => process
-            .shared
-            .attributes
-            .lock()
-            .credentials
-            .setreuid(arguments),
-        Operation::Setregid => process
-            .shared
-            .attributes
-            .lock()
-            .credentials
-            .setregid(arguments),
-        Operation::Setresuid => process
-            .shared
-            .attributes
-            .lock()
-            .credentials
-            .setresuid(arguments),
-        Operation::Setresgid => process
-            .shared
-            .attributes
-            .lock()
-            .credentials
-            .setresgid(arguments),
-        Operation::Setgroups => process
-            .shared
-            .attributes
-            .lock()
-            .credentials
-            .setgroups(arguments, memory),
+        Operation::Setuid => {
+            SyscallOutcome::Return(process.shared.credentials.lock().setuid(arguments))
+        }
+        Operation::Setgid => {
+            SyscallOutcome::Return(process.shared.credentials.lock().setgid(arguments))
+        }
+        Operation::Setreuid => {
+            SyscallOutcome::Return(process.shared.credentials.lock().setreuid(arguments))
+        }
+        Operation::Setregid => {
+            SyscallOutcome::Return(process.shared.credentials.lock().setregid(arguments))
+        }
+        Operation::Setresuid => {
+            SyscallOutcome::Return(process.shared.credentials.lock().setresuid(arguments))
+        }
+        Operation::Setresgid => {
+            SyscallOutcome::Return(process.shared.credentials.lock().setresgid(arguments))
+        }
+        Operation::Setgroups => SyscallOutcome::Return(
+            process
+                .shared
+                .credentials
+                .lock()
+                .setgroups(arguments, memory),
+        ),
         operation @ (Operation::Prlimit64 | Operation::Getrlimit | Operation::Setrlimit) => {
-            process.rlimit(operation, arguments, memory)
+            SyscallOutcome::Return(process.rlimit(operation, arguments, memory))
         }
-        Operation::Umask => process.umask(arguments),
-        Operation::Getpriority => process.getpriority(arguments),
-        Operation::Setpriority => process.setpriority(arguments),
-        Operation::Unknown => errno(ENOSYS),
+        Operation::Umask => SyscallOutcome::Return(process.umask(arguments)),
+        Operation::Getpriority => SyscallOutcome::Return(process.getpriority(arguments)),
+        Operation::Setpriority => SyscallOutcome::Return(process.setpriority(arguments)),
+        Operation::Unknown => SyscallOutcome::Return(errno(ENOSYS)),
     };
-    ControlFlow::Continue(result)
+    ControlFlow::Continue(outcome)
 }
 
 async fn read<R: Resources, M: UserMemory, O: Stdio>(
@@ -727,7 +946,7 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
     args: [u64; 6],
     memory: &mut M,
     output: &mut O,
-) -> u64 {
+) -> SyscallOutcome {
     let Some(entry) = process
         .shared
         .descriptors
@@ -735,21 +954,35 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
         .get_entry(args[0] as u32 as i32)
         .cloned()
     else {
-        return errno(EBADF);
+        return SyscallOutcome::Return(errno(EBADF));
     };
     if matches!(entry.descriptor, Descriptor::<R>::Stdin { .. }) {
         let limit = args[2].min(MAX_RW_COUNT) as usize;
         if limit == 0 {
-            return 0;
+            return SyscallOutcome::Return(0);
         }
         if memory.check_writable(args[1], limit).is_err() {
-            return errno(EFAULT);
+            return SyscallOutcome::Return(errno(EFAULT));
         }
-        let stdin_guard = process.shared.stdin_lock.lock().await;
+        let stdin_guard = match process
+            .signals
+            .interruptible(process.shared.stdin_lock.lock())
+            .await
+        {
+            signal::WaitOutcome::Ready(guard) => guard,
+            signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+        };
         if process.shared.stdin_carry.lock().is_empty() {
-            match output.read_input(limit).await {
-                Ok(bytes) => *process.shared.stdin_carry.lock() = bytes,
-                Err(Denied) => return errno(EACCES),
+            match process
+                .signals
+                .interruptible(output.read_input(limit))
+                .await
+            {
+                signal::WaitOutcome::Ready(Ok(bytes)) => *process.shared.stdin_carry.lock() = bytes,
+                signal::WaitOutcome::Ready(Err(Denied)) => {
+                    return SyscallOutcome::Return(errno(EACCES));
+                }
+                signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
             }
         }
         let bytes = {
@@ -759,32 +992,38 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
         };
         drop(stdin_guard);
         if memory.write(args[1], &bytes).is_err() {
-            return errno(EFAULT);
+            return SyscallOutcome::Return(errno(EFAULT));
         }
-        return bytes.len() as u64;
+        return SyscallOutcome::Return(bytes.len() as u64);
     }
-    io::read_resource::<R, M>(&entry, args, memory).await
+    io::read_resource::<R, M>(&process.signals, &entry, args, memory).await
 }
 
 async fn write<R: Resources, M: UserMemory, O: Stdio>(
-    descriptors: &spin::Mutex<Descriptors<R>>,
+    process: &Process<R>,
     args: [u64; 6],
     memory: &M,
     output: &mut O,
-) -> u64 {
+) -> SyscallOutcome {
     // Linux takes fd as an unsigned int, discarding the register's upper bits.
-    let Some(entry) = descriptors.lock().get_entry(args[0] as u32 as i32).cloned() else {
-        return errno(EBADF);
+    let Some(entry) = process
+        .shared
+        .descriptors
+        .lock()
+        .get_entry(args[0] as u32 as i32)
+        .cloned()
+    else {
+        return SyscallOutcome::Return(errno(EBADF));
     };
     let stream = match &entry.descriptor {
         Descriptor::<R>::Stdout => Stream::Stdout,
         Descriptor::<R>::Stderr => Stream::Stderr,
-        _ => return io::write_resource::<R, M>(&entry, args, memory).await,
+        _ => return io::write_resource::<R, M>(&process.signals, &entry, args, memory).await,
     };
     // Linux MAX_RW_COUNT is INT_MAX rounded down to PAGE_SIZE (x86-64: 4096).
     let count = args[2].min(MAX_RW_COUNT);
     if args[1].checked_add(count).is_none() {
-        return errno(EFAULT);
+        return SyscallOutcome::Return(errno(EFAULT));
     }
     // One page bounds kernel stack use independently of the guest's count.
     let mut buffer = [0; 4096];
@@ -796,7 +1035,7 @@ async fn write<R: Resources, M: UserMemory, O: Stdio>(
         let page_remaining = buffer.len() - (address as usize & (buffer.len() - 1));
         let size = (count - written).min(page_remaining as u64) as usize;
         if memory.read(address, &mut buffer[..size]).is_err() {
-            return if written == 0 { errno(EFAULT) } else { written };
+            return SyscallOutcome::Return(if written == 0 { errno(EFAULT) } else { written });
         }
         match output.write(stream, &buffer[..size]).await {
             Ok(n) => {
@@ -807,7 +1046,7 @@ async fn write<R: Resources, M: UserMemory, O: Stdio>(
                 }
             }
             Err(error) => {
-                return if written != 0 {
+                return SyscallOutcome::Return(if written != 0 {
                     written
                 } else {
                     errno(match error {
@@ -815,11 +1054,11 @@ async fn write<R: Resources, M: UserMemory, O: Stdio>(
                         WriteError::Io => EIO,
                         WriteError::Denied => EACCES,
                     })
-                };
+                });
             }
         }
     }
-    written
+    SyscallOutcome::Return(written)
 }
 
 fn arch_prctl<R: Resources, M: UserMemory, T: Thread<R>>(
@@ -847,28 +1086,30 @@ fn arch_prctl<R: Resources, M: UserMemory, T: Thread<R>>(
 }
 
 async fn writev<R: Resources, M: UserMemory, O: Stdio>(
-    descriptors: &spin::Mutex<Descriptors<R>>,
+    process: &Process<R>,
     args: [u64; 6],
     memory: &M,
     output: &mut O,
-) -> u64 {
-    if descriptors
+) -> SyscallOutcome {
+    if process
+        .shared
+        .descriptors
         .lock()
         .get_entry(args[0] as u32 as i32)
         .is_none()
     {
-        return errno(EBADF);
+        return SyscallOutcome::Return(errno(EBADF));
     }
     let count = args[2] as u32;
     // Linux UIO_MAXIOV; negative int values also fail this unsigned comparison.
     if count > 1024 {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
     if count == 0 {
-        return 0;
+        return SyscallOutcome::Return(0);
     }
     if args[1].checked_add(u64::from(count) * 16).is_none() {
-        return errno(EFAULT);
+        return SyscallOutcome::Return(errno(EFAULT));
     }
     let mut vector = [0; 16];
     // Import/validate all lengths before emitting bytes, as Linux import_iovec
@@ -878,11 +1119,11 @@ async fn writev<R: Resources, M: UserMemory, O: Stdio>(
             .read(args[1] + u64::from(index) * 16, &mut vector)
             .is_err()
         {
-            return errno(EFAULT);
+            return SyscallOutcome::Return(errno(EFAULT));
         }
         let length = u64::from_le_bytes(vector[8..].try_into().unwrap());
         if length > i64::MAX as u64 {
-            return errno(EINVAL);
+            return SyscallOutcome::Return(errno(EINVAL));
         }
     }
     let mut done = 0;
@@ -894,29 +1135,33 @@ async fn writev<R: Resources, M: UserMemory, O: Stdio>(
             .read(args[1] + u64::from(index) * 16, &mut vector)
             .is_err()
         {
-            return if done == 0 { errno(EFAULT) } else { done };
+            return SyscallOutcome::Return(if done == 0 { errno(EFAULT) } else { done });
         }
         let base = u64::from_le_bytes(vector[..8].try_into().unwrap());
         let length = u64::from_le_bytes(vector[8..].try_into().unwrap()).min(MAX_RW_COUNT - done);
         if length == 0 {
             continue;
         }
-        let result = write::<R, _, _>(
-            descriptors,
-            [args[0], base, length, 0, 0, 0],
-            memory,
-            output,
-        )
-        .await;
-        if (result as i64) < 0 {
-            return if done == 0 { result } else { done };
-        }
-        done += result;
-        if result < length {
-            break;
+        match write::<R, _, _>(process, [args[0], base, length, 0, 0, 0], memory, output).await {
+            SyscallOutcome::Return(result) => {
+                if (result as i64) < 0 {
+                    return SyscallOutcome::Return(if done == 0 { result } else { done });
+                }
+                done += result;
+                if result < length {
+                    break;
+                }
+            }
+            interrupted => {
+                return if done == 0 {
+                    interrupted
+                } else {
+                    SyscallOutcome::Return(done)
+                };
+            }
         }
     }
-    done
+    SyscallOutcome::Return(done)
 }
 
 #[cfg(test)]

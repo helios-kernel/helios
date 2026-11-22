@@ -18,8 +18,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use arm_sysregs::el1::registers::SctlrEl1;
 use helios_hal::hv::RegisterId;
 use helios_hal::native::{
-    FaultKind, InstructionSet, NativeError, NativeExecution, Stop, UserContext, UserFault,
-    UserSpace,
+    Aarch64FpSimd, ExtendedState, FaultKind, InstructionSet, NativeError, NativeExecution, Stop,
+    UserContext, UserFault, UserSpace,
 };
 use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_kernel::{
@@ -425,6 +425,24 @@ unsafe impl UserContext for Aarch64Context {
             return Err(NativeError::Address);
         }
         self.switch.tpidr = address.raw() as u64;
+        Ok(())
+    }
+
+    fn extended_state(&self) -> ExtendedState {
+        ExtendedState::Aarch64FpSimd(alloc::boxed::Box::new(Aarch64FpSimd {
+            vregs: self.switch.q,
+            fpsr: self.switch.fpsr as u32,
+            fpcr: self.switch.fpcr as u32,
+        }))
+    }
+
+    fn set_extended_state(&mut self, state: &ExtendedState) -> Result<(), NativeError> {
+        let ExtendedState::Aarch64FpSimd(fp) = state else {
+            return Err(NativeError::Register);
+        };
+        self.switch.q = fp.vregs;
+        self.switch.fpsr = u64::from(fp.fpsr);
+        self.switch.fpcr = u64::from(fp.fpcr);
         Ok(())
     }
 
