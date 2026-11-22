@@ -1540,6 +1540,80 @@ mod authority_tests {
         caller.grant_process_rights(ProcessAuthorityRights::SPAWN);
         require_compile_authority(&caller).expect("a SPAWN holder may start a compile");
     }
+
+    #[test]
+    fn resolve_https_enforces_dns_authority_and_converts_records_in_both_worlds() {
+        fn poll_ready<F: core::future::Future>(future: F) -> F::Output {
+            let waker = core::task::Waker::noop();
+            let mut cx = core::task::Context::from_waker(waker);
+            match core::pin::pin!(future).poll(&mut cx) {
+                core::task::Poll::Ready(output) => output,
+                core::task::Poll::Pending => panic!("ready test future unexpectedly parked"),
+            }
+        }
+
+        let mut without_dns = ProcessAuthority::empty();
+        without_dns.grant_network_rights(NetworkAuthorityRights::TCP | NetworkAuthorityRights::UDP);
+        assert!(without_dns.derive_dns_cap().is_err());
+
+        let denied = poll_ready(super::execute_net_resolve_https(
+            without_dns.derive_dns_cap().is_ok(),
+            Some(crate::test_support::TestNetworkService::new()),
+            "example.com",
+            443,
+            5_000_000_000,
+        ))
+        .expect_err("TCP+UDP without DNS authority must be denied");
+        let program_denied = super::convert_program_net_resolve_https_error(denied);
+        assert!(matches!(
+            program_denied.kind,
+            program_wit::net::DnsErrorKind::PermissionDenied
+        ));
+
+        let mut with_dns = ProcessAuthority::empty();
+        with_dns.grant_network_rights(NetworkAuthorityRights::DNS);
+        assert!(with_dns.derive_dns_cap().is_ok());
+
+        let absent = poll_ready(super::execute_net_resolve_https(
+            with_dns.derive_dns_cap().is_ok(),
+            Some(crate::test_support::TestNetworkService::new()),
+            "example.com",
+            443,
+            5_000_000_000,
+        ))
+        .expect("DNS authority should permit resolve-https");
+        assert_eq!(absent, None);
+
+        let unavailable = poll_ready(super::execute_net_resolve_https::<
+            crate::test_support::TestNetworkService,
+        >(
+            with_dns.derive_dns_cap().is_ok(),
+            None,
+            "example.com",
+            443,
+            5_000_000_000,
+        ))
+        .expect_err("missing network service must fail cleanly");
+        let debugger_unavailable = super::convert_net_resolve_https_error(unavailable);
+        assert!(matches!(
+            debugger_unavailable.kind,
+            super::debugger_wit::net::DnsErrorKind::Unavailable
+        ));
+
+        let sample = crate::HttpsRecord {
+            alpn: alloc::vec!["h3".into(), "h2".into()],
+            port: Some(8443),
+            ttl_nanos: 120_000_000_000,
+        };
+        let dbg = super::convert_https_record(sample.clone());
+        let prog = super::convert_program_https_record(sample);
+        assert_eq!(
+            (dbg.alpn, dbg.port, dbg.ttl),
+            (prog.alpn, prog.port, prog.ttl)
+        );
+        assert_eq!(dbg.port, Some(8443));
+        assert_eq!(dbg.ttl, 120_000_000_000);
+    }
 }
 
 async fn read_program_source<T, CpuImpl, Net, StorageImpl>(
@@ -2382,6 +2456,32 @@ fn dns_network_rights() -> NetworkAuthorityRights {
     NetworkAuthorityRights::DNS
 }
 
+#[derive(Debug)]
+enum NetResolveHttpsError {
+    MissingDnsAuthority,
+    ServiceUnavailable,
+    Lookup(crate::DnsError),
+}
+
+async fn execute_net_resolve_https<Net: ComponentHostNetwork>(
+    has_dns_authority: bool,
+    service: Option<Net>,
+    host: &str,
+    port: u16,
+    timeout: u64,
+) -> Result<Option<crate::HttpsRecord>, NetResolveHttpsError> {
+    if !has_dns_authority {
+        return Err(NetResolveHttpsError::MissingDnsAuthority);
+    }
+    let Some(service) = service else {
+        return Err(NetResolveHttpsError::ServiceUnavailable);
+    };
+    service
+        .dns_resolve_https(host, port, timeout)
+        .await
+        .map_err(NetResolveHttpsError::Lookup)
+}
+
 fn tcp_connect_network_rights() -> NetworkAuthorityRights {
     NetworkAuthorityRights::TCP | NetworkAuthorityRights::DNS
 }
@@ -2543,6 +2643,27 @@ where
                         }
                         Err(error) => Err(convert_udp_error(error)),
                     };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "resolve-https",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (host, port, timeout): (String, u16, u64)| {
+            Box::pin(async move {
+                let (has_authority, service) = accessor.with(|mut access| {
+                    let store = access.get();
+                    Ok::<_, wasmtime::Error>((
+                        store.process_authority().derive_dns_cap().is_ok(),
+                        store.runtime_state.network_service(),
+                    ))
+                })?;
+                let response =
+                    execute_net_resolve_https(has_authority, service, &host, port, timeout)
+                        .await
+                        .map(|record| record.map(convert_https_record))
+                        .map_err(convert_net_resolve_https_error);
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -2847,6 +2968,27 @@ where
                         }
                         Err(error) => Err(convert_program_udp_error(error)),
                     };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "resolve-https",
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
+         (host, port, timeout): (String, u16, u64)| {
+            Box::pin(async move {
+                let (has_authority, service) = accessor.with(|mut access| {
+                    let store = access.get();
+                    Ok::<_, wasmtime::Error>((
+                        store.process_authority().derive_dns_cap().is_ok(),
+                        store.runtime_state.network_service(),
+                    ))
+                })?;
+                let response =
+                    execute_net_resolve_https(has_authority, service, &host, port, timeout)
+                        .await
+                        .map(|record| record.map(convert_program_https_record))
+                        .map_err(convert_program_net_resolve_https_error);
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -3550,6 +3692,72 @@ fn convert_program_ping_error(error: crate::PingError) -> program_wit::net::Ping
             crate::PingErrorKind::Internal => program_wit::net::PingErrorKind::Internal,
         },
         detail: error.detail.as_str().to_owned(),
+    }
+}
+
+fn convert_https_record(record: crate::HttpsRecord) -> debugger_wit::net::HttpsRecord {
+    debugger_wit::net::HttpsRecord {
+        alpn: record.alpn,
+        port: record.port,
+        ttl: record.ttl_nanos,
+    }
+}
+
+fn convert_program_https_record(record: crate::HttpsRecord) -> program_wit::net::HttpsRecord {
+    program_wit::net::HttpsRecord {
+        alpn: record.alpn,
+        port: record.port,
+        ttl: record.ttl_nanos,
+    }
+}
+
+fn convert_net_resolve_https_error(error: NetResolveHttpsError) -> debugger_wit::net::DnsError {
+    match error {
+        NetResolveHttpsError::MissingDnsAuthority => debugger_wit::net::DnsError {
+            kind: debugger_wit::net::DnsErrorKind::PermissionDenied,
+            detail: "network authority is missing DNS rights".to_owned(),
+        },
+        NetResolveHttpsError::ServiceUnavailable => debugger_wit::net::DnsError {
+            kind: debugger_wit::net::DnsErrorKind::Unavailable,
+            detail: "network service is unavailable on this machine".to_owned(),
+        },
+        NetResolveHttpsError::Lookup(error) => debugger_wit::net::DnsError {
+            kind: match error.kind {
+                crate::DnsErrorKind::UnresolvedHost => {
+                    debugger_wit::net::DnsErrorKind::UnresolvedHost
+                }
+                crate::DnsErrorKind::Timeout => debugger_wit::net::DnsErrorKind::Timeout,
+                crate::DnsErrorKind::Unavailable => debugger_wit::net::DnsErrorKind::Unavailable,
+                crate::DnsErrorKind::Internal => debugger_wit::net::DnsErrorKind::Internal,
+            },
+            detail: error.detail.as_str().to_owned(),
+        },
+    }
+}
+
+fn convert_program_net_resolve_https_error(
+    error: NetResolveHttpsError,
+) -> program_wit::net::DnsError {
+    match error {
+        NetResolveHttpsError::MissingDnsAuthority => program_wit::net::DnsError {
+            kind: program_wit::net::DnsErrorKind::PermissionDenied,
+            detail: "network authority is missing DNS rights".to_owned(),
+        },
+        NetResolveHttpsError::ServiceUnavailable => program_wit::net::DnsError {
+            kind: program_wit::net::DnsErrorKind::Unavailable,
+            detail: "network service is unavailable on this machine".to_owned(),
+        },
+        NetResolveHttpsError::Lookup(error) => program_wit::net::DnsError {
+            kind: match error.kind {
+                crate::DnsErrorKind::UnresolvedHost => {
+                    program_wit::net::DnsErrorKind::UnresolvedHost
+                }
+                crate::DnsErrorKind::Timeout => program_wit::net::DnsErrorKind::Timeout,
+                crate::DnsErrorKind::Unavailable => program_wit::net::DnsErrorKind::Unavailable,
+                crate::DnsErrorKind::Internal => program_wit::net::DnsErrorKind::Internal,
+            },
+            detail: error.detail.as_str().to_owned(),
+        },
     }
 }
 

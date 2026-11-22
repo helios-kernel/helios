@@ -1295,6 +1295,18 @@ mod network {
             )]))
         }
 
+        fn dns_resolve_https(
+            &self,
+            _: &str,
+            _: u16,
+            _: u64,
+        ) -> impl core::future::Future<
+            Output = Result<Option<crate::HttpsRecord>, crate::DnsError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(None))
+        }
+
         fn tcp_connect(
             &self,
             _: &str,
