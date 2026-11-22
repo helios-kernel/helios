@@ -6,6 +6,7 @@
 //! transaction commits on `fsync`, `fsyncdir` and unmount, and when its dirty
 //! metadata reaches Linux's bound.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
@@ -14,14 +15,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, TimeOrNow};
+use fuser::{Errno, FileAttr, FileHandle, FileType, Generation, INodeNo, TimeOrNow};
 use futures_lite::future::block_on;
 use helios_btrfs::write::{
     Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, Special, WriteOptions,
     Writer, XattrMode,
 };
 use helios_btrfs::{
-    DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
+    DirBound, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
 };
 use helios_hal::fs::RenameMode;
 
@@ -66,6 +67,7 @@ pub enum Node<'a> {
 }
 
 /// The caller a creation is made for.
+#[derive(Clone, Copy)]
 pub struct Owner {
     pub uid: u32,
     pub gid: u32,
@@ -80,9 +82,26 @@ pub struct Statfs {
     pub block_size: u32,
 }
 
+/// State of an open directory stream (`FUSE_OPENDIR` .. `FUSE_RELEASEDIR`),
+/// following Linux's `btrfs_opendir` and `btrfs_real_readdir`
+/// (`fs/btrfs/inode.c`, commit `9b378f6ad48c`, refreshed on rewind as
+/// commit `fd968e683bd9`).
+#[derive(Clone, Copy)]
+struct OpenDir {
+    bound: DirBound,
+    /// Whether this stream has already served a `readdir`. Linux FUSE handles
+    /// `lseek(dirfd, 0, SEEK_SET)` (`rewinddir(3)`) in the VFS without sending
+    /// a request, so a `readdir` at offset `0` once `started` is true signals
+    /// a rewind and refreshes `bound`, while the initial `readdir(0)` keeps
+    /// the bound captured at `opendir`.
+    started: bool,
+}
+
 pub struct State {
     writer: Writer<Device, RandomUuids>,
     inodes: Inodes,
+    open_dirs: HashMap<u64, OpenDir>,
+    next_dir_handle: u64,
     concurrency: NonZeroUsize,
     read_only: bool,
 }
@@ -112,6 +131,8 @@ impl State {
         Ok(Self {
             writer,
             inodes: Inodes::new(identity, root.metadata().generation, handle),
+            open_dirs: HashMap::new(),
+            next_dir_handle: 1,
             concurrency,
             read_only,
         })
@@ -338,16 +359,69 @@ impl State {
         Ok(data)
     }
 
-    /// Hands the entries of directory `ino` after cookie `offset` to `emit`
-    /// until it returns true, meaning its reply is full.
+    /// Opens a directory stream and records its upper `DIR_INDEX` bound as of
+    /// open time (`btrfs_opendir` in Linux `fs/btrfs/inode.c`, commit
+    /// `9b378f6ad48c`).
+    pub async fn opendir(&mut self, ino: INodeNo) -> Result<FileHandle, Errno> {
+        let snapshot = self.snapshot()?;
+        let directory = self.open_inode(&snapshot, ino).await?;
+        let bound = snapshot
+            .dir_bound(&directory)
+            .await
+            .map_err(|error| read_errno(&error))?;
+        let handle = self.next_dir_handle;
+        self.next_dir_handle += 1;
+        self.open_dirs.insert(
+            handle,
+            OpenDir {
+                bound,
+                started: false,
+            },
+        );
+        Ok(FileHandle(handle))
+    }
+
+    /// Releases a directory stream opened by [`Self::opendir`].
+    pub fn releasedir(&mut self, fh: FileHandle) {
+        self.open_dirs.remove(&fh.0);
+    }
+
+    /// Hands the entries of directory `ino` after cookie `offset` up to the
+    /// open stream's upper `DIR_INDEX` bound to `emit` until it returns true,
+    /// meaning its reply is full.
     pub async fn readdir(
         &mut self,
         ino: INodeNo,
+        fh: FileHandle,
         offset: u64,
         mut emit: impl FnMut(INodeNo, u64, FileType, &OsStr) -> bool,
     ) -> Result<(), Errno> {
         let snapshot = self.snapshot()?;
         let directory = self.open_inode(&snapshot, ino).await?;
+        let open = *self.open_dirs.get(&fh.0).ok_or(Errno::EBADF)?;
+        let bound = if offset == 0 && open.started {
+            // Refresh the upper `DIR_INDEX` bound on rewind (`rewinddir(3)` ->
+            // `lseek(dirfd, 0, SEEK_SET)` in the Linux VFS, which FUSE does not
+            // forward to the daemon), matching Linux `fs/btrfs/inode.c`, commit
+            // `fd968e683bd9`.
+            let refreshed = snapshot
+                .dir_bound(&directory)
+                .await
+                .map_err(|error| read_errno(&error))?;
+            self.open_dirs
+                .get_mut(&fh.0)
+                .expect("open directory handle checked above")
+                .bound = refreshed;
+            refreshed
+        } else {
+            if !open.started {
+                self.open_dirs
+                    .get_mut(&fh.0)
+                    .expect("open directory handle checked above")
+                    .started = true;
+            }
+            open.bound
+        };
         // The format stores neither `.` nor `..`; the kernel reports both.
         // The parent is not recorded, so `..` carries the directory's own number.
         for (cookie, name) in [(1, "."), (2, "..")] {
@@ -361,6 +435,7 @@ impl State {
             .read_dir(
                 &directory,
                 DirPosition(offset.saturating_sub(DOT_COOKIES)),
+                bound,
                 |entry| {
                     let identity = match entry.target {
                         EntryTarget::Inode(number) => Identity { tree, number },
@@ -770,5 +845,173 @@ fn attr(ino: INodeNo, metadata: &Metadata, snapshot: &Snapshot) -> FileAttr {
         rdev: metadata.rdev.encode(),
         blksize: snapshot.superblock().sectorsize(),
         flags: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{OsStr, OsString};
+    use std::num::NonZeroUsize;
+
+    use ferrosys::btrfs::{FormatOptions, format_to};
+    use ferrosys::{Metadata as FormatMetadata, Timestamp as FormatTime, TreeBuilder};
+    use fuser::{Errno, FileHandle, INodeNo};
+    use futures_lite::future::block_on;
+    use helios_btrfs::Timestamp;
+    use helios_hal::fs::RenameMode;
+
+    use super::super::device::Device;
+    use super::{Node, Owner, State};
+
+    const WHEN: Timestamp = Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 0,
+    };
+
+    fn test_state() -> (tempfile::NamedTempFile, State) {
+        let time = FormatTime::from_secs(1_700_000_000);
+        let mut named = tempfile::NamedTempFile::new().expect("temp image");
+        // ferrosys' default single-device geometry needs at least 109 MiB.
+        let size = 128 << 20;
+        named.as_file_mut().set_len(size).expect("set_len");
+        let tree = TreeBuilder::new().root(FormatMetadata::new(0o755, time));
+        format_to(
+            named.as_file_mut(),
+            tree,
+            size,
+            FormatOptions::new([0x44; 16], time),
+        )
+        .expect("format btrfs");
+        let device = Device::open_for_test(named.path()).expect("open test device");
+        let state = State::open(device, NonZeroUsize::new(1).unwrap(), false).expect("open state");
+        (named, state)
+    }
+
+    fn list_names(state: &mut State, ino: INodeNo, fh: FileHandle) -> Vec<OsString> {
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let mut batch = Vec::new();
+            block_on(state.readdir(ino, fh, offset, |_, cookie, _, name| {
+                if batch.len() == 2 {
+                    return true;
+                }
+                batch.push((cookie, name.to_os_string()));
+                false
+            }))
+            .expect("readdir");
+            let Some((last_cookie, _)) = batch.last() else {
+                break;
+            };
+            offset = *last_cookie;
+            names.extend(batch.into_iter().map(|(_, name)| name));
+        }
+        names
+    }
+
+    #[test]
+    fn opendir_keeps_open_bound_on_first_readdir_and_refreshes_on_rewind() {
+        let (_image, mut state) = test_state();
+        let owner = Owner {
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+        let (dir_attr, _) = block_on(state.create(
+            INodeNo::ROOT,
+            OsStr::new("work"),
+            Node::Directory,
+            0o755,
+            owner,
+            WHEN,
+        ))
+        .expect("mkdir work");
+        let dir = dir_attr.ino;
+        for name in ["文件", "ファイル", "파일"] {
+            block_on(state.create(dir, OsStr::new(name), Node::File, 0o644, owner, WHEN))
+                .expect("create initial cjk");
+        }
+
+        // Open `work`, then add an entry before the first `readdir(0)`. The
+        // open-time bound hides the entry added after `opendir`.
+        let fh = block_on(state.opendir(dir)).expect("opendir");
+        block_on(state.create(
+            dir,
+            OsStr::new("after-open"),
+            Node::File,
+            0o644,
+            owner,
+            WHEN,
+        ))
+        .expect("create after-open");
+        let first_pass = list_names(&mut state, dir, fh);
+        assert!(
+            !first_pass.iter().any(|name| name == "after-open"),
+            "first readdir(0) must keep opendir's bound: {first_pass:?}"
+        );
+
+        // A second `readdir(0)` on the same handle (`rewinddir(3)`) refreshes
+        // the bound and makes `after-open` visible.
+        let rewound = list_names(&mut state, dir, fh);
+        assert!(
+            rewound.iter().any(|name| name == "after-open"),
+            "rewound readdir(0) must see entries added since opendir: {rewound:?}"
+        );
+
+        // Renaming every yielded entry (`entry -> TEMPFILE -> entry`) while
+        // paging through `work` terminates in bounded entries.
+        let mut offset = 0;
+        let mut seen = Vec::new();
+        let safety_cap = 20;
+        loop {
+            let mut batch = Vec::new();
+            block_on(state.readdir(dir, fh, offset, |_, cookie, _, name| {
+                if batch.len() == 2 {
+                    return true;
+                }
+                batch.push((cookie, name.to_os_string()));
+                false
+            }))
+            .expect("readdir page");
+            let Some((last_cookie, _)) = batch.last() else {
+                break;
+            };
+            offset = *last_cookie;
+            for (_, name) in batch {
+                if name == "." || name == ".." {
+                    continue;
+                }
+                block_on(state.rename(
+                    dir,
+                    &name,
+                    dir,
+                    OsStr::new("TEMPFILE"),
+                    RenameMode::Replace,
+                    WHEN,
+                ))
+                .expect("rename to TEMPFILE");
+                block_on(state.rename(
+                    dir,
+                    OsStr::new("TEMPFILE"),
+                    dir,
+                    &name,
+                    RenameMode::Replace,
+                    WHEN,
+                ))
+                .expect("rename back");
+                seen.push(name);
+                assert!(
+                    seen.len() <= safety_cap,
+                    "fuse-btrfs readdir looped past safety cap ({safety_cap})"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 4, "expected 4 entries, got {seen:?}");
+
+        state.releasedir(fh);
+        assert_eq!(
+            block_on(state.readdir(dir, fh, 0, |_, _, _, _| false)),
+            Err(Errno::EBADF)
+        );
     }
 }

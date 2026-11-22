@@ -1883,10 +1883,10 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
         limit: crate::HostDirLimit,
     ) -> Result<alloc::vec::Vec<crate::HostDirEntry>, crate::HostFsError> {
         let path = Self::fs_path(path)?;
-        use helios_hal::fs::FileSystem as _;
-        let entries = self
-            .inner
-            .read_dir(path, helios_hal::fs::DirCookie::START, limit.max_entries)
+        use helios_hal::fs::{DirStream as _, FileSystem as _};
+        let dir = self.inner.open_dir(path).await.map_err(Self::host_error)?;
+        let entries = dir
+            .read(helios_hal::fs::DirCookie::START, limit.max_entries)
             .await
             .map_err(Self::host_error)?;
         Ok(entries

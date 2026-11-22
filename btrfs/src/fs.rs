@@ -285,6 +285,34 @@ impl DirPosition {
     pub const START: Self = Self(0);
 }
 
+/// An upper `DIR_INDEX` bound for a directory listing.
+///
+/// Capturing the directory's highest `DIR_INDEX` when opening a stream via
+/// [`Filesystem::dir_bound`] follows Linux's `btrfs_opendir` and
+/// `btrfs_real_readdir` (`fs/btrfs/inode.c`, commit `9b378f6ad48c`): entries
+/// inserted or renamed to higher indices while the stream is open are skipped
+/// so iteration always terminates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirBound(Option<DirPosition>);
+
+impl DirBound {
+    /// No entries existed when the stream opened; listings yield nothing.
+    pub const EMPTY: Self = Self(None);
+
+    /// Lists every entry present in the view, without an upper bound.
+    pub const UNBOUNDED: Self = Self(Some(DirPosition(u64::MAX)));
+
+    /// Bounds a listing at `position`, inclusive.
+    pub const fn at(position: DirPosition) -> Self {
+        Self(Some(position))
+    }
+
+    /// The inclusive upper position, or `None` for [`DirBound::EMPTY`].
+    pub const fn position(self) -> Option<DirPosition> {
+        self.0
+    }
+}
+
 /// One entry of a directory listing. `.` and `..` are not stored by the
 /// format and are not listed.
 #[derive(Clone, Copy, Debug)]
@@ -514,27 +542,67 @@ impl<S: BlockSource> Filesystem<S> {
         }
     }
 
-    /// Lists directory `dir` from `from`, handing each entry to `visit`.
+    /// The highest `DIR_INDEX` currently in directory `dir`, or
+    /// [`DirBound::EMPTY`] when `dir` holds no entries.
+    ///
+    /// Follows Linux's `btrfs_opendir` / `btrfs_get_dir_last_index`
+    /// (`fs/btrfs/inode.c`, commit `9b378f6ad48c`): callers opening a
+    /// directory stream capture this bound and pass it to
+    /// [`Filesystem::read_dir`] so entries inserted or renamed to higher
+    /// indices during iteration do not repeat indefinitely.
+    pub async fn dir_bound(&self, dir: &Inode) -> Result<DirBound, Error> {
+        let nodes = dir.snapshot.nodes(&self.volume);
+        dir.expect_kind(FileKind::Directory)?;
+        let cursor = Cursor::floor(
+            &nodes,
+            dir.root,
+            Key::new(dir.number, item_type::DIR_INDEX, u64::MAX),
+        )
+        .await?;
+        match cursor.key() {
+            Some(key) if key.is(dir.number, item_type::DIR_INDEX) => {
+                Ok(DirBound::at(DirPosition(key.offset)))
+            }
+            _ => Ok(DirBound::EMPTY),
+        }
+    }
+
+    /// Lists directory `dir` from `from` up to `bound` (inclusive), handing
+    /// each entry to `visit`.
+    ///
+    /// Pass the [`DirBound`] captured by [`Filesystem::dir_bound`] when the
+    /// directory stream opened so entries inserted or renamed to higher
+    /// `DIR_INDEX` offsets during iteration are not visited (`btrfs_opendir`
+    /// and `btrfs_real_readdir` in Linux `fs/btrfs/inode.c`, commit
+    /// `9b378f6ad48c`), or [`DirBound::UNBOUNDED`] for a one-shot listing of
+    /// an immutable view.
     ///
     /// `visit` returns [`ControlFlow::Continue`] to take the entry and go
     /// on, or [`ControlFlow::Break`] to stop without taking it. Returns the
     /// position to resume from when `visit` stopped the listing, `None`
-    /// once every entry has been visited.
+    /// once every entry up to `bound` has been visited.
     pub async fn read_dir<F>(
         &self,
         dir: &Inode,
         from: DirPosition,
+        bound: DirBound,
         mut visit: F,
     ) -> Result<Option<DirPosition>, Error>
     where
         F: FnMut(DirEntry<'_>) -> ControlFlow<()>,
     {
-        let nodes = dir.snapshot.nodes(&self.volume);
         dir.expect_kind(FileKind::Directory)?;
+        let Some(last) = bound.0 else {
+            return Ok(None);
+        };
+        if from > last {
+            return Ok(None);
+        }
+        let nodes = dir.snapshot.nodes(&self.volume);
         let start = Key::new(dir.number, item_type::DIR_INDEX, from.0);
         let mut cursor = Cursor::ceiling(&nodes, dir.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
-            if !key.is(dir.number, item_type::DIR_INDEX) {
+            if !key.is(dir.number, item_type::DIR_INDEX) || key.offset > last.0 {
                 break;
             }
             let record = dir_index_record(item).map_err(|defect| Error::Item {
