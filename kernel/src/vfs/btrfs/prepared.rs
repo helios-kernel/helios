@@ -70,6 +70,7 @@ pub(super) async fn prepare<Device: BlockDevice<Buffer = BlockPages>>(
             now,
             Operation::Open {
                 flags: OpenFlags::empty(),
+                attributes: None,
             },
         )
         .await?

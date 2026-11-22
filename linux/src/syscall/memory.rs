@@ -133,6 +133,7 @@ async fn flush_one_range<R: Resources, M: UserMemory, F: fs::Filesystem<R>>(
     len: u64,
     file: &R::File,
     file_offset: u64,
+    creds: &Credentials,
     memory: &M,
     fs: &mut F,
 ) {
@@ -149,7 +150,12 @@ async fn flush_one_range<R: Resources, M: UserMemory, F: fs::Filesystem<R>>(
         let step = (valid_len - done).min(buf.len() as u64) as usize;
         if memory.read(start + done, &mut buf[..step]).is_ok() {
             let _ = fs
-                .write_at(file, WritePosition::At(file_offset + done), &buf[..step])
+                .write_at(
+                    file,
+                    WritePosition::At(file_offset + done),
+                    &buf[..step],
+                    creds,
+                )
                 .await;
         }
         done += step as u64;
@@ -228,8 +234,9 @@ async fn flush_shared_range<R: Resources, M: UserMemory, F: fs::Filesystem<R>>(
     fs: &mut F,
 ) {
     let segments = snapshot_overlapping(process, start, end, true);
+    let creds = process.shared.credentials.lock().clone();
     for (seg_start, seg_len, file, file_off) in segments {
-        flush_one_range(seg_start, seg_len, &file, file_off, memory, fs).await;
+        flush_one_range(seg_start, seg_len, &file, file_off, &creds, memory, fs).await;
     }
 }
 
@@ -252,8 +259,9 @@ pub(super) async fn flush_file_shared_mappings<
             .map(|m| (m.start, m.len, m.file.clone(), m.file_offset))
             .collect()
     };
+    let creds = process.shared.credentials.lock().clone();
     for (seg_start, seg_len, f, file_off) in segments {
-        flush_one_range(seg_start, seg_len, &f, file_off, memory, fs).await;
+        flush_one_range(seg_start, seg_len, &f, file_off, &creds, memory, fs).await;
     }
 }
 
@@ -271,8 +279,9 @@ pub(super) async fn flush_all_shared_mappings<R: Resources, M: UserMemory, F: fs
             .map(|m| (m.start, m.len, m.file.clone(), m.file_offset))
             .collect()
     };
+    let creds = process.shared.credentials.lock().clone();
     for (seg_start, seg_len, f, file_off) in segments {
-        flush_one_range(seg_start, seg_len, &f, file_off, memory, fs).await;
+        flush_one_range(seg_start, seg_len, &f, file_off, &creds, memory, fs).await;
     }
 }
 
@@ -612,8 +621,9 @@ pub(super) async fn msync<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
     }
 
     let segments = snapshot_overlapping(process, start, clamped_end, true);
+    let creds = process.shared.credentials.lock().clone();
     for (seg_start, seg_len, file, file_off) in segments {
-        flush_one_range(seg_start, seg_len, &file, file_off, memory, fs).await;
+        flush_one_range(seg_start, seg_len, &file, file_off, &creds, memory, fs).await;
         if flags & MS_SYNC != 0
             && let Err(error) = fs.sync(&file, false).await
         {

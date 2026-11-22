@@ -2528,10 +2528,11 @@ pub(crate) async fn sendfile<
                 }
             },
             Descriptor::<R>::File(out_open) => {
+                let creds = process.shared.credentials.lock().clone();
                 let landed = {
                     let mut out_pos = out_open.lock_position().await;
                     let pos = WritePosition::At(out_pos.get());
-                    match output.write_at(out_open.node(), pos, &chunk).await {
+                    match output.write_at(out_open.node(), pos, &chunk, &creds).await {
                         Ok(landed) => {
                             out_pos.set(landed.offset.saturating_add(landed.len as u64));
                             landed
