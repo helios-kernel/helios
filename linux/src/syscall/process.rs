@@ -393,10 +393,11 @@ pub(super) fn validate_process_clone_flags(
 }
 
 /// `fork()` (x86-64 syscall 57).
-pub(super) async fn fork<R: Resources, M: UserMemory, T: Thread<R>>(
+pub(super) async fn fork<R: Resources, M: UserMemory, T: Thread<R>, F: super::fs::Filesystem<R>>(
     process: &Process<R>,
     memory: &mut M,
     thread: &mut T,
+    fs: &mut F,
 ) -> u64 {
     clone_process(
         process,
@@ -410,15 +411,22 @@ pub(super) async fn fork<R: Resources, M: UserMemory, T: Thread<R>>(
         Some(Signal::SIGCHLD),
         memory,
         thread,
+        fs,
     )
     .await
 }
 
 /// `vfork()` (x86-64 syscall 58).
-pub(super) async fn vfork<R: Resources, M: UserMemory, T: Thread<R>>(
+pub(super) async fn vfork<
+    R: Resources,
+    M: UserMemory,
+    T: Thread<R>,
+    F: super::fs::Filesystem<R>,
+>(
     process: &Process<R>,
     memory: &mut M,
     thread: &mut T,
+    fs: &mut F,
 ) -> u64 {
     clone_process(
         process,
@@ -432,18 +440,25 @@ pub(super) async fn vfork<R: Resources, M: UserMemory, T: Thread<R>>(
         Some(Signal::SIGCHLD),
         memory,
         thread,
+        fs,
     )
     .await
 }
 
 /// Creates a new child process (`fork`, `vfork`, or `clone`/`clone3` without
 /// `CLONE_THREAD`) inside the parent's container [`PidNamespace`].
-pub(super) async fn clone_process<R: Resources, M: UserMemory, T: Thread<R>>(
+pub(super) async fn clone_process<
+    R: Resources,
+    M: UserMemory,
+    T: Thread<R>,
+    F: super::fs::Filesystem<R>,
+>(
     process: &Process<R>,
     parsed: ParsedClone,
     exit_signal: Option<Signal>,
     memory: &mut M,
     thread: &mut T,
+    fs: &mut F,
 ) -> u64 {
     let tls = if parsed.flags & CLONE_SETTLS != 0 {
         if parsed.tls >= process.shared.abi.task_size() {
@@ -504,6 +519,12 @@ pub(super) async fn clone_process<R: Resources, M: UserMemory, T: Thread<R>>(
     }
 
     let share_vm = parsed.flags & CLONE_VM != 0;
+    if !share_vm {
+        // Flush any dirty writable `MAP_SHARED` pages before `clone_cow` marks
+        // them shared so neither parent nor child loses pre-fork writes while
+        // untouched CoW pages are skipped on subsequent flushes.
+        super::memory::flush_all_shared_mappings(process, memory, fs).await;
+    }
     let vfork_done = (parsed.flags & CLONE_VFORK != 0).then(VforkDone::new);
 
     let child_descriptors = if parsed.flags & CLONE_FILES != 0 {
@@ -534,15 +555,13 @@ pub(super) async fn clone_process<R: Resources, M: UserMemory, T: Thread<R>>(
     let child_creds = Arc::new(spin::Mutex::new(process.shared.credentials.lock().clone()));
     let child_attrs = process.shared.attributes.lock().clone();
     let child_stdin_carry = process.shared.stdin_carry.lock().clone();
+    let share_sighand = parsed.flags & CLONE_SIGHAND != 0;
     let clear_sighand = parsed.flags & CLONE_CLEAR_SIGHAND != 0;
-    let child_signals = if parsed.flags & CLONE_SIGHAND != 0 {
-        process.shared.signals.clone()
-    } else {
+    let child_signals =
         process
             .shared
             .signals
-            .clone_for_fork(child_pid, clear_sighand)
-    };
+            .clone_for_fork(child_pid, share_sighand, clear_sighand);
     child_signals.set_pgid(pgid.get());
     let child_thread_signals =
         child_signals.register_thread(child_pid, process.signals.current_mask());

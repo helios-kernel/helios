@@ -142,6 +142,11 @@ pub trait UserMemory {
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault>;
+    /// Whether the page containing `address` is still shared copy-on-write
+    /// with another address space (untouched since `fork(2)`).
+    fn is_page_shared(&self, _address: u64) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -754,6 +759,24 @@ impl<R: Resources> Process<R> {
         self.shared.cwd.clone()
     }
 
+    /// If a non-leader thread called `execve`, transitions its thread ID to
+    /// the thread-group leader (`tid == pid`), matching Linux `de_thread`.
+    fn normalize_exec_leader(&mut self) {
+        let pid = self.pid();
+        if self.tid != pid {
+            let old_mask = self.signals.current_mask();
+            self.shared.signals.unregister_thread(self.tid);
+            self.shared.pids.release_tid(self.tid);
+            self.tid = pid;
+            self.signals = self.shared.signals.register_thread(pid, old_mask);
+            self.shared.pids.register_thread(
+                pid,
+                self.signals.clone(),
+                self.shared.credentials.clone(),
+            );
+        }
+    }
+
     /// Commits an in-place Linux-to-Linux `execve`/`execveat`:
     /// - detaches from any `vfork`/`CLONE_VM`/`CLONE_FILES` parent state,
     /// - closes `FD_CLOEXEC` descriptors,
@@ -782,20 +805,7 @@ impl<R: Resources> Process<R> {
 
         self.shared.signals.reset_for_exec();
         self.signals.reset_for_exec();
-        // If a non-leader thread called `execve`, its thread ID becomes the
-        // thread-group leader (`tid == pid`), matching Linux `de_thread`.
-        if self.tid != pid {
-            let old_mask = self.signals.current_mask();
-            self.shared.signals.unregister_thread(self.tid);
-            self.shared.pids.release_tid(self.tid);
-            self.tid = pid;
-            self.signals = self.shared.signals.register_thread(pid, old_mask);
-            self.shared.pids.register_thread(
-                pid,
-                self.signals.clone(),
-                self.shared.credentials.clone(),
-            );
-        }
+        self.normalize_exec_leader();
 
         self.shared.pids.mark_execed(pid);
         self.signal_vfork_done();
@@ -866,6 +876,7 @@ impl<R: Resources> Process<R> {
         }
         self.shared.signals.reset_for_exec();
         self.signals.reset_for_exec();
+        self.normalize_exec_leader();
         let ignored = self.shared.signals.ignored_signals();
         self.shared.pids.mark_execed(pid);
         self.signal_vfork_done();
@@ -1282,13 +1293,17 @@ pub async fn dispatch<
             thread::clock_nanosleep(&process.signals, arguments, memory, output).await,
         ),
         Operation::Clone => {
-            SyscallOutcome::Return(thread::clone(process, arguments, memory, thread).await)
+            SyscallOutcome::Return(thread::clone(process, arguments, memory, thread, output).await)
         }
         Operation::Clone3 => {
-            SyscallOutcome::Return(thread::clone3(process, arguments, memory, thread).await)
+            SyscallOutcome::Return(thread::clone3(process, arguments, memory, thread, output).await)
         }
-        Operation::Fork => SyscallOutcome::Return(process::fork(process, memory, thread).await),
-        Operation::Vfork => SyscallOutcome::Return(process::vfork(process, memory, thread).await),
+        Operation::Fork => {
+            SyscallOutcome::Return(process::fork(process, memory, thread, output).await)
+        }
+        Operation::Vfork => {
+            SyscallOutcome::Return(process::vfork(process, memory, thread, output).await)
+        }
         Operation::Execve => process::execve(arguments, memory, thread).await,
         Operation::Execveat => process::execveat(arguments, memory, thread).await,
         Operation::Wait4 => process::wait4(process, arguments, memory).await,

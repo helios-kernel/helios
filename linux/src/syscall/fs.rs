@@ -667,6 +667,11 @@ fn is_dev_null_path<R: Resources, F: Filesystem<R>>(
     path: &str,
     fs: &F,
 ) -> bool {
+    // Reject any `..` traversal so paths like `/nonexistent/../dev/null`
+    // never bypass directory existence checks.
+    if path.split('/').any(|comp| comp == "..") {
+        return false;
+    }
     let base_dir = base.and_then(|file| fs.file_path(file)).unwrap_or(cwd);
     let mut segments: Vec<&str> = if path.starts_with('/') {
         Vec::new()
@@ -674,12 +679,8 @@ fn is_dev_null_path<R: Resources, F: Filesystem<R>>(
         base_dir.split('/').filter(|s| !s.is_empty()).collect()
     };
     for comp in path.split('/').filter(|s| !s.is_empty()) {
-        match comp {
-            "." => {}
-            ".." => {
-                segments.pop();
-            }
-            other => segments.push(other),
+        if comp != "." {
+            segments.push(comp);
         }
     }
     segments.as_slice() == ["dev", "null"]

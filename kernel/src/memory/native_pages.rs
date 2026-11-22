@@ -815,6 +815,17 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             }),
         })
     }
+
+    fn is_page_shared(&self, address: VirtAddr) -> bool {
+        let base = address.page_floor().raw() as u64;
+        self.shared
+            .state
+            .lock()
+            .pages
+            .frames
+            .get(&base)
+            .is_some_and(FrameRef::is_shared)
+    }
 }
 
 impl<Tables> Drop for NativeSpace<Tables> {
@@ -1829,6 +1840,9 @@ mod tests {
             crate::memory::user_heap_stats().allocated_bytes,
             baseline + PAGE as usize
         );
+        assert!(parent.is_page_shared(VirtAddr::new(0x10_000)));
+        assert!(child.is_page_shared(VirtAddr::new(0x10_000)));
+        assert!(!parent.is_page_shared(VirtAddr::new(0x11_000)));
         // Parent's hardware PTE lost WRITE and was shot down.
         assert_eq!(
             parent_tables.pte(0x10_000),
@@ -1852,6 +1866,8 @@ mod tests {
             crate::memory::user_heap_stats().allocated_bytes,
             baseline + 2 * PAGE as usize
         );
+        assert!(!child.is_page_shared(VirtAddr::new(0x10_000)));
+        assert!(parent.is_page_shared(VirtAddr::new(0x10_000)));
         child.write(VirtAddr::new(0x10_000), b"child-val").unwrap();
 
         let mut parent_bytes = [0u8; 9];
@@ -1875,6 +1891,7 @@ mod tests {
             baseline + 2 * PAGE as usize
         );
         assert_eq!(parent_tables.pte(0x10_000), Some((orig_phys, rw)));
+        assert!(!parent.is_page_shared(VirtAddr::new(0x10_000)));
 
         drop(child);
         drop(parent);

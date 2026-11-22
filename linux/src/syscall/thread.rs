@@ -961,11 +961,17 @@ fn validate_thread_flag_combinations(flags: u64) -> Result<(), u64> {
 }
 
 /// `clone` (`kernel/fork.c` `SYSCALL_DEFINE5(clone)`).
-pub(super) async fn clone<R: Resources, M: UserMemory, T: Thread<R>>(
+pub(super) async fn clone<
+    R: Resources,
+    M: UserMemory,
+    T: Thread<R>,
+    F: super::fs::Filesystem<R>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
     thread: &mut T,
+    fs: &mut F,
 ) -> u64 {
     let decoded = process.shared.abi.clone_registers(args);
     let raw_flags = u64::from(decoded.flags as u32);
@@ -989,17 +995,23 @@ pub(super) async fn clone<R: Resources, M: UserMemory, T: Thread<R>>(
             Ok(sig) => sig,
             Err(err) => return errno(err),
         };
-        super::process::clone_process(process, parsed, exit_signal, memory, thread).await
+        super::process::clone_process(process, parsed, exit_signal, memory, thread, fs).await
     }
 }
 
 /// `clone3(uargs, size)` (`kernel/fork.c` `SYSCALL_DEFINE2(clone3)` and
 /// `copy_clone_args_from_user`).
-pub(super) async fn clone3<R: Resources, M: UserMemory, T: Thread<R>>(
+pub(super) async fn clone3<
+    R: Resources,
+    M: UserMemory,
+    T: Thread<R>,
+    F: super::fs::Filesystem<R>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
     thread: &mut T,
+    fs: &mut F,
 ) -> u64 {
     let [uargs, size, ..] = args;
     if size > PAGE_BYTES {
@@ -1077,7 +1089,7 @@ pub(super) async fn clone3<R: Resources, M: UserMemory, T: Thread<R>>(
             Ok(sig) => sig,
             Err(err) => return errno(err),
         };
-        super::process::clone_process(process, parsed, exit_sig, memory, thread).await
+        super::process::clone_process(process, parsed, exit_sig, memory, thread, fs).await
     }
 }
 

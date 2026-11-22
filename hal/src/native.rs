@@ -390,6 +390,12 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     fn clone_cow(&self) -> Result<Self, NativeError>
     where
         Self: Sized;
+
+    /// Whether the committed page containing `address` is currently shared
+    /// copy-on-write with another address space (untouched since `clone_cow`).
+    fn is_page_shared(&self, _address: VirtAddr) -> bool {
+        false
+    }
 }
 
 /// A run of pages mapped with one access, as [`UserSpace::mapping`]

@@ -298,10 +298,15 @@ struct IntervalTimers {
 }
 
 /// Process-wide signal state shared by all threads in a Linux thread group.
+///
+/// The disposition table (`actions`) is separately reference-counted so
+/// `clone(CLONE_SIGHAND)` without `CLONE_THREAD` shares only dispositions
+/// while keeping distinct `tgid`, pending mailboxes, stop state, and timers,
+/// and unshares the table on `execve` (`fs/exec.c` `unshare_sighand`).
 pub struct ProcessSignals {
     tgid: NonZeroU32,
     pgid: AtomicU32,
-    actions: Mutex<ActionsState>,
+    actions: Mutex<Arc<Mutex<ActionsState>>>,
     shared_pending: Mutex<PendingQueue>,
     shared_bits: AtomicU64,
     threads: Mutex<Vec<Arc<ThreadSignalSlot>>>,
@@ -316,7 +321,7 @@ impl ProcessSignals {
         Arc::new(Self {
             tgid,
             pgid: AtomicU32::new(tgid.get()),
-            actions: Mutex::new(ActionsState::new()),
+            actions: Mutex::new(Arc::new(Mutex::new(ActionsState::new()))),
             shared_pending: Mutex::new(PendingQueue::new()),
             shared_bits: AtomicU64::new(0),
             threads: Mutex::new(Vec::new()),
@@ -325,6 +330,10 @@ impl ProcessSignals {
             timers: Mutex::new(IntervalTimers::default()),
             real_timer_notify: Notify::new(),
         })
+    }
+
+    fn actions_handle(&self) -> Arc<Mutex<ActionsState>> {
+        self.actions.lock().clone()
     }
 
     pub const fn tgid(&self) -> NonZeroU32 {
@@ -340,13 +349,23 @@ impl ProcessSignals {
     }
 
     /// Creates a child process's signal state for `fork`/`clone`: inherits
-    /// `pgid` and signal dispositions (unless `clear_sighand`), starts with
-    /// empty pending queues and disarmed interval timers (`kernel/fork.c`).
-    pub(super) fn clone_for_fork(&self, child_tgid: NonZeroU32, clear_sighand: bool) -> Arc<Self> {
-        let actions = if clear_sighand {
-            ActionsState::new()
+    /// `pgid` and signal dispositions (sharing the table when `share_sighand`
+    /// is set, or resetting to defaults when `clear_sighand` is set), while
+    /// always giving the child its own `tgid`, empty pending queues, stop
+    /// state, and disarmed interval timers (`kernel/fork.c`).
+    pub(super) fn clone_for_fork(
+        &self,
+        child_tgid: NonZeroU32,
+        share_sighand: bool,
+        clear_sighand: bool,
+    ) -> Arc<Self> {
+        let actions = if share_sighand {
+            self.actions_handle()
+        } else if clear_sighand {
+            Arc::new(Mutex::new(ActionsState::new()))
         } else {
-            self.actions.lock().clone_state()
+            let snapshot = self.actions_handle().lock().clone_state();
+            Arc::new(Mutex::new(snapshot))
         };
         Arc::new(Self {
             tgid: child_tgid,
@@ -362,11 +381,22 @@ impl ProcessSignals {
         })
     }
 
-    /// Applies POSIX `execve` signal-disposition reset: caught handlers reset
-    /// to `SIG_DFL`, `SIG_IGN` dispositions stay ignored, and CPU interval
-    /// timers disarm (`kernel/signal.c` `flush_signal_handlers`).
+    /// Applies POSIX `execve` signal-disposition reset: unshares the
+    /// disposition table if shared via `CLONE_SIGHAND` (`fs/exec.c`
+    /// `unshare_sighand`), resets caught handlers to `SIG_DFL` while keeping
+    /// `SIG_IGN` dispositions ignored (`kernel/signal.c`
+    /// `flush_signal_handlers`), and disarms CPU interval timers.
     pub fn reset_for_exec(&self) {
-        self.actions.lock().reset_for_exec();
+        {
+            let mut slot = self.actions.lock();
+            if Arc::strong_count(&slot) > 1 {
+                let mut unshared = slot.lock().clone_state();
+                unshared.reset_for_exec();
+                *slot = Arc::new(Mutex::new(unshared));
+            } else {
+                slot.lock().reset_for_exec();
+            }
+        }
         self.stopped.store(false, Ordering::Release);
         {
             let mut timers = self.timers.lock();
@@ -380,18 +410,18 @@ impl ProcessSignals {
     /// Signals currently set to `SIG_IGN` (carried across `execve` into a
     /// WASIX/Wasm replacement image).
     pub fn ignored_signals(&self) -> Vec<Signal> {
-        self.actions.lock().ignored_signals()
+        self.actions_handle().lock().ignored_signals()
     }
 
     /// Whether exiting children should be auto-reaped without becoming zombies
     /// (`SIGCHLD` ignored or `SA_NOCLDWAIT`).
     pub(super) fn sigchld_auto_reap(&self) -> bool {
-        self.actions.lock().sigchld_auto_reap()
+        self.actions_handle().lock().sigchld_auto_reap()
     }
 
     /// Whether child stop/continue notifications are suppressed (`SA_NOCLDSTOP`).
     pub(super) fn sigchld_nocldstop(&self) -> bool {
-        self.actions.lock().sigchld_nocldstop()
+        self.actions_handle().lock().sigchld_nocldstop()
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -532,7 +562,7 @@ impl ProcessSignals {
         let signal = info.signo;
         let resumed = self.apply_stop_continue_side_effects(signal);
 
-        let is_ignored = self.actions.lock().is_ignored(signal);
+        let is_ignored = self.actions_handle().lock().is_ignored(signal);
         let to_wake = {
             let mut pending = self.shared_pending.lock();
             let threads = self.threads.lock();
@@ -590,7 +620,7 @@ impl ProcessSignals {
         let signal = info.signo;
         let resumed = self.apply_stop_continue_side_effects(signal);
 
-        let is_ignored = self.actions.lock().is_ignored(signal);
+        let is_ignored = self.actions_handle().lock().is_ignored(signal);
         let waiting_for =
             SignalSet::from_bits(target.sigtimedwait_set.load(Ordering::Acquire)).contains(signal);
         let masked = target.current_mask().contains(signal);
@@ -736,7 +766,7 @@ impl ThreadSignalSlot {
         // interrupt a blocking syscall.
         let mut remaining = unmasked;
         while let Some(signal) = remaining.take_first() {
-            let ignored = self.process.actions.lock().is_ignored(signal);
+            let ignored = self.process.actions_handle().lock().is_ignored(signal);
             if ignored && !signal.is_uncatchable() {
                 let single = SignalSet::EMPTY.with(signal);
                 let _ = self.take_private_matching(single);
@@ -909,7 +939,8 @@ pub fn deliver_pending_signals<C: UserContext, M: UserMemory>(
         };
 
         let resolved = {
-            let mut actions = thread.process.actions.lock();
+            let actions_arc = thread.process.actions_handle();
+            let mut actions = actions_arc.lock();
             let resolved = actions.resolved(info.signo);
             if let ResolvedSignal::Catch(handler) = resolved
                 && handler.flags & SA_RESETHAND != 0
@@ -1028,7 +1059,8 @@ pub fn deliver_fault_signal<C: UserContext, M: UserMemory>(
     let active_mask = thread.current_mask();
 
     let action = {
-        let mut actions = thread.process.actions.lock();
+        let actions_arc = thread.process.actions_handle();
+        let mut actions = actions_arc.lock();
         if active_mask.contains(signal) {
             actions.reset_to_default(signal);
             None
@@ -1158,8 +1190,9 @@ pub(super) fn rt_sigaction<M: UserMemory>(
         None
     };
 
+    let actions_arc = signals.actions_handle();
     let (old_bytes, became_ignored) = {
-        let mut actions = signals.actions.lock();
+        let mut actions = actions_arc.lock();
         let old = actions.read_raw(signal);
         let ignored = new_bytes.is_some_and(|buf| actions.set_raw(signal, &buf));
         (old, ignored)
@@ -1169,7 +1202,7 @@ pub(super) fn rt_sigaction<M: UserMemory>(
         // Writing oldact failed; on Linux the read/write order checks oldact
         // before mutating, so restore if we changed it.
         if new_bytes.is_some() {
-            signals.actions.lock().set_raw(signal, &old_bytes);
+            actions_arc.lock().set_raw(signal, &old_bytes);
         }
         return errno(EFAULT);
     }
@@ -1376,7 +1409,8 @@ pub(super) async fn rt_sigtimedwait<M: UserMemory, C: Clock>(
 }
 
 fn has_non_ignored_signal(process: &ProcessSignals, mut set: SignalSet) -> bool {
-    let actions = process.actions.lock();
+    let actions_arc = process.actions_handle();
+    let actions = actions_arc.lock();
     while let Some(signal) = set.take_first() {
         if signal.is_uncatchable() || !actions.is_ignored(signal) {
             return true;

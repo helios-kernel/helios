@@ -346,6 +346,10 @@ impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
             .atomic_compare_exchange_u32(VirtAddr::new(address as usize), expected, desired)
             .map_err(|_| MemoryFault)
     }
+
+    fn is_page_shared(&self, address: u64) -> bool {
+        self.space.is_page_shared(VirtAddr::new(address as usize))
+    }
 }
 
 fn page_range(address: u64, length: u64) -> VirtRange {
@@ -3604,8 +3608,8 @@ where
                     argv,
                     env,
                 } => {
-                    let thread_signals = exec_proc.thread_signals().clone();
                     let (surviving_slots, ignored) = exec_proc.commit_wasm_exec();
+                    let thread_signals = exec_proc.thread_signals().clone();
                     let descriptors = Preview1DescriptorTable::from_slots(surviving_slots);
                     let signal_dispositions: Vec<WasixSignalDisposition> = ignored
                         .into_iter()
