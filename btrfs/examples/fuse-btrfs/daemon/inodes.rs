@@ -35,7 +35,7 @@ pub struct Inodes {
 }
 
 impl Inodes {
-    pub fn new(root: Identity, generation: u64, handle: InodeHandle) -> Self {
+    pub fn new(root: Identity, generation: u64, handle: Option<InodeHandle>) -> Self {
         let mut inodes = Self {
             by_identity: HashMap::new(),
             entries: HashMap::new(),
@@ -47,12 +47,20 @@ impl Inodes {
             Entry {
                 identity: root,
                 generation: Some(generation),
-                handle: Some(handle),
+                handle,
                 // The kernel never forgets the root.
                 lookups: 1,
             },
         );
         inodes
+    }
+
+    /// Attaches the writer's root [`InodeHandle`] after upgrading a read-only
+    /// mount to a writable [`helios_btrfs::write::Writer`].
+    pub fn set_root_handle(&mut self, handle: InodeHandle) {
+        if let Some(entry) = self.entries.get_mut(&INodeNo::ROOT.0) {
+            entry.handle = Some(handle);
+        }
     }
 
     fn entry(&self, ino: INodeNo) -> Result<&Entry, Errno> {

@@ -3,22 +3,25 @@
 //! As Linux's btrfs, a change is visible at once and durable at commit. Each
 //! mutation joins the writer's running transaction, and reads go through the
 //! writer's view of it, so the next request sees every reply's change. The
-//! transaction commits on `fsync`, `fsyncdir` and unmount, and when its dirty
-//! metadata reaches Linux's bound.
+//! transaction commits on `fsync`, `fsyncdir`, `remount,ro` and unmount, and
+//! when its dirty metadata reaches Linux's bound.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, TimeOrNow};
+use fuser::{
+    Errno, FileAttr, FileHandle, FileType, Generation, INodeNo, OpenAccMode, OpenFlags, TimeOrNow,
+};
 use futures_lite::future::block_on;
 use helios_btrfs::write::{
-    Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, WriteOptions, Writer,
-    XattrMode,
+    Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, WriteError,
+    WriteOptions, Writer, XattrMode,
 };
 use helios_btrfs::{
     DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
@@ -26,7 +29,7 @@ use helios_btrfs::{
 use helios_hal::fs::RenameMode;
 
 use super::OpenError;
-use super::device::Device;
+use super::device::{Claim, Device};
 use super::errno::{read_errno, write_errno};
 use super::inodes::{Identity, Inodes};
 
@@ -45,6 +48,25 @@ const DOT_COOKIES: u64 = 2;
 const PERMISSION_BITS: u32 = 0o7777;
 
 type Snapshot = Filesystem<Arc<Device>>;
+
+/// Shared synchronization handle between the FUSE event loop and the control
+/// socket thread.
+pub struct SharedState {
+    pub state: Mutex<State>,
+    /// Signalled whenever the last open writable file handle is released or
+    /// the filesystem is destroyed, so a `remount,ro` waiting on an in-flight
+    /// async `FUSE_RELEASE` wakes immediately.
+    pub writable_released: Condvar,
+}
+
+impl SharedState {
+    pub fn new(state: State) -> Self {
+        Self {
+            state: Mutex::new(state),
+            writable_released: Condvar::new(),
+        }
+    }
+}
 
 /// The attributes a `setattr` request changes; `None` leaves one alone.
 #[derive(Default)]
@@ -79,19 +101,54 @@ pub struct Statfs {
     pub block_size: u32,
 }
 
+enum Storage {
+    ReadOnly(Snapshot),
+    Writable(Writer<Device, RandomUuids>),
+}
+
 pub struct State {
-    writer: Writer<Device, RandomUuids>,
+    storage: Storage,
+    claim: Claim,
+    device_path: PathBuf,
     inodes: Inodes,
     concurrency: NonZeroUsize,
     read_only: bool,
+    destroyed: bool,
+    next_fh: u64,
+    writable_handles: HashSet<u64>,
 }
 
 impl State {
     pub fn open(
-        device: Device,
+        claim: Claim,
+        device_path: PathBuf,
         concurrency: NonZeroUsize,
         read_only: bool,
     ) -> Result<Self, OpenError> {
+        if !read_only {
+            return Self::open_writable(claim, device_path, concurrency, false);
+        }
+        if claim.is_writable() {
+            match Self::open_writable(claim.clone(), device_path.clone(), concurrency, true) {
+                Ok(state) => return Ok(state),
+                Err(OpenError::Write(
+                    WriteError::UnsupportedCompatRo { .. } | WriteError::QuotaTreePresent,
+                )) => {}
+                Err(OpenError::Device(error))
+                    if matches!(error.raw_os_error(), Some(libc::EROFS | libc::EACCES)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Self::open_read_only(claim, device_path, concurrency)
+    }
+
+    fn open_writable(
+        claim: Claim,
+        device_path: PathBuf,
+        concurrency: NonZeroUsize,
+        read_only: bool,
+    ) -> Result<Self, OpenError> {
+        let device = Device::open_read_write(&device_path, claim.clone())?;
         let mut writer = block_on(Writer::mount(device, RandomUuids, concurrency))?;
         let snapshot = writer.snapshot()?;
         let root = block_on(snapshot.root())?;
@@ -104,11 +161,151 @@ impl State {
             number: root.number(),
         };
         Ok(Self {
-            writer,
-            inodes: Inodes::new(identity, root.metadata().generation, handle),
+            storage: Storage::Writable(writer),
+            claim,
+            device_path,
+            inodes: Inodes::new(identity, root.metadata().generation, Some(handle)),
             concurrency,
             read_only,
+            destroyed: false,
+            next_fh: 1,
+            writable_handles: HashSet::new(),
         })
+    }
+
+    fn open_read_only(
+        claim: Claim,
+        device_path: PathBuf,
+        concurrency: NonZeroUsize,
+    ) -> Result<Self, OpenError> {
+        let device = Device::open_read_only(&device_path, claim.clone())?;
+        let fs = block_on(Filesystem::mount(Arc::new(device)))?;
+        let root = block_on(fs.root())?;
+        let identity = Identity {
+            tree: root.tree(),
+            number: root.number(),
+        };
+        Ok(Self {
+            storage: Storage::ReadOnly(fs),
+            claim,
+            device_path,
+            inodes: Inodes::new(identity, root.metadata().generation, None),
+            concurrency,
+            read_only: true,
+            destroyed: false,
+            next_fh: 1,
+            writable_handles: HashSet::new(),
+        })
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn is_destroyed(&self) -> bool {
+        self.destroyed
+    }
+
+    pub fn has_open_writable(&self) -> bool {
+        !self.writable_handles.is_empty()
+    }
+
+    /// Records a file open. Writable opens (`O_WRONLY` or `O_RDWR`) fail with
+    /// `EROFS` on a read-only mount and receive a tracked handle so
+    /// `remount,ro` can reject active writers with `EBUSY`.
+    pub fn open_file(&mut self, flags: OpenFlags) -> Result<FileHandle, Errno> {
+        if matches!(
+            flags.acc_mode(),
+            OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
+        ) {
+            self.writable()?;
+            let id = self.next_fh;
+            self.next_fh += 1;
+            self.writable_handles.insert(id);
+            Ok(FileHandle(id))
+        } else {
+            Ok(FileHandle(0))
+        }
+    }
+
+    /// Releases a file handle. Returns `true` if this released the last open
+    /// writable handle.
+    pub fn release_file(&mut self, fh: FileHandle) -> bool {
+        fh.0 != 0 && self.writable_handles.remove(&fh.0) && self.writable_handles.is_empty()
+    }
+
+    /// Transitions the daemon to read-only after verifying no writable file
+    /// handles remain open and committing any running transaction.
+    pub async fn remount_read_only(&mut self) -> Result<(), Errno> {
+        if self.destroyed {
+            return Err(Errno::ENODEV);
+        }
+        if !self.writable_handles.is_empty() {
+            return Err(Errno::EBUSY);
+        }
+        self.sync().await?;
+        self.read_only = true;
+        Ok(())
+    }
+
+    /// Transitions the daemon to read-write, checking `BLKROGET` (matching
+    /// Linux's `reconfigure_super` `bdev_read_only` -> `EACCES` check) and
+    /// upgrading a read-only [`Filesystem`] mount to a [`Writer`] when needed.
+    pub async fn remount_read_write(&mut self) -> Result<(), Errno> {
+        if self.destroyed {
+            return Err(Errno::ENODEV);
+        }
+        match self.claim.is_block_device_read_only() {
+            Ok(true) => return Err(Errno::EACCES),
+            Ok(false) => {}
+            Err(error) => return Err(Errno::from(error)),
+        }
+        match &mut self.storage {
+            Storage::Writable(writer) => {
+                writer.snapshot().map_err(|error| write_errno(&error))?;
+            }
+            Storage::ReadOnly(_) => {
+                let device = Device::open_read_write(&self.device_path, self.claim.clone())
+                    .map_err(|error| {
+                        if matches!(error.raw_os_error(), Some(libc::EROFS | libc::EACCES)) {
+                            Errno::EACCES
+                        } else {
+                            Errno::from(error)
+                        }
+                    })?;
+                let mut writer = Writer::mount(device, RandomUuids, self.concurrency)
+                    .await
+                    .map_err(|error| write_errno(&error))?;
+                let root_handle = {
+                    let transaction = writer.join().await.map_err(|error| write_errno(&error))?;
+                    transaction
+                        .root()
+                        .await
+                        .map_err(|error| write_errno(&error))?
+                };
+                self.inodes.set_root_handle(root_handle);
+                self.storage = Storage::Writable(writer);
+            }
+        }
+        self.read_only = false;
+        Ok(())
+    }
+
+    /// Restores `read_only = true` when a `remount,rw` succeeded in the daemon
+    /// but the subsequent kernel `mount -i -o remount,rw` failed.
+    pub fn rollback_read_only(&mut self) -> Result<(), Errno> {
+        if self.destroyed {
+            return Err(Errno::ENODEV);
+        }
+        self.read_only = true;
+        Ok(())
+    }
+
+    /// Commits any pending transaction during unmount and marks the state
+    /// destroyed so late control-socket requests fail with `ENODEV`.
+    pub async fn destroy(&mut self) -> Result<(), Errno> {
+        self.destroyed = true;
+        self.sync().await
     }
 
     pub fn forget(&mut self, ino: INodeNo, count: u64) {
@@ -116,14 +313,27 @@ impl State {
     }
 
     fn snapshot(&self) -> Result<Snapshot, Errno> {
-        self.writer.snapshot().map_err(|error| write_errno(&error))
+        match &self.storage {
+            Storage::Writable(writer) => writer.snapshot().map_err(|error| write_errno(&error)),
+            Storage::ReadOnly(fs) => Ok(fs.clone()),
+        }
     }
 
     fn writable(&self) -> Result<(), Errno> {
-        if self.read_only {
+        if self.read_only || matches!(self.storage, Storage::ReadOnly(_)) {
             return Err(Errno::EROFS);
         }
         Ok(())
+    }
+
+    fn writable_writer(&mut self) -> Result<&mut Writer<Device, RandomUuids>, Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        match &mut self.storage {
+            Storage::Writable(writer) => Ok(writer),
+            Storage::ReadOnly(_) => Err(Errno::EROFS),
+        }
     }
 
     /// The inode `ino` names in `snapshot`; `ESTALE` once it was deleted or
@@ -144,11 +354,10 @@ impl State {
     /// The writer's handle for the entry `name` of directory `parent`.
     async fn handle_of(&mut self, parent: INodeNo, name: &[u8]) -> Result<InodeHandle, Errno> {
         let parent = self.inodes.handle(parent)?;
-        let transaction = self
-            .writer
-            .join()
-            .await
-            .map_err(|error| write_errno(&error))?;
+        let Storage::Writable(writer) = &mut self.storage else {
+            return Err(Errno::EROFS);
+        };
+        let transaction = writer.join().await.map_err(|error| write_errno(&error))?;
         transaction
             .lookup(&parent, name)
             .await
@@ -156,20 +365,24 @@ impl State {
             .ok_or(Errno::ENOENT)
     }
 
-    /// Makes every change so far durable: `fsync`, `fsyncdir` and unmount.
-    /// A failure poisons the writer, and the device keeps the previous
-    /// generation.
+    /// Makes every change so far durable: `fsync`, `fsyncdir`, `remount,ro`
+    /// and unmount. A failure poisons the writer, and the device keeps the
+    /// previous generation.
     pub async fn sync(&mut self) -> Result<(), Errno> {
-        self.writer
-            .commit()
-            .await
-            .map_err(|error| write_errno(&error))
+        match &mut self.storage {
+            Storage::Writable(writer) => writer.commit().await.map_err(|error| write_errno(&error)),
+            Storage::ReadOnly(_) => Ok(()),
+        }
     }
 
     /// Ends a mutation: commits once the running transaction's dirty
     /// metadata reaches Linux's bound.
     async fn settle(&mut self) -> Result<(), Errno> {
-        if self.writer.dirty().metadata_bytes >= DEFAULT_DIRTY_METADATA_LIMIT {
+        let dirty = match &self.storage {
+            Storage::Writable(writer) => writer.dirty().metadata_bytes,
+            Storage::ReadOnly(_) => 0,
+        };
+        if dirty >= DEFAULT_DIRTY_METADATA_LIMIT {
             self.sync().await?;
         }
         Ok(())
@@ -214,10 +427,15 @@ impl State {
             number: child.number(),
         };
         let generation = child.metadata().generation;
-        let handle = if self.inodes.has_handle(identity, generation) {
-            None
-        } else {
-            Some(self.handle_of(parent, name).await?)
+        let handle = match &self.storage {
+            Storage::ReadOnly(_) => None,
+            Storage::Writable(_) => {
+                if self.inodes.has_handle(identity, generation) {
+                    None
+                } else {
+                    Some(self.handle_of(parent, name).await?)
+                }
+            }
         };
         let ino = self.inodes.record(identity, generation, handle);
         Ok((
@@ -260,7 +478,7 @@ impl State {
         let file = self.inodes.handle(ino)?;
         let concurrency = self.concurrency;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -393,7 +611,7 @@ impl State {
         let file = self.inodes.handle(ino)?;
         let concurrency = self.concurrency;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -419,7 +637,7 @@ impl State {
         let name = entry_name(name)?;
         let parent = self.inodes.handle(parent)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -460,7 +678,7 @@ impl State {
         let parent = self.inodes.handle(parent)?;
         let (identity, _) = self.inodes.identity(ino)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -492,7 +710,7 @@ impl State {
         let name = entry_name(name)?;
         let parent = self.inodes.handle(parent)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -539,7 +757,7 @@ impl State {
         let parent = self.inodes.handle(parent)?;
         let new_parent = self.inodes.handle(new_parent)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -564,12 +782,22 @@ impl State {
     /// The space as the running transaction leaves it: a change is counted
     /// as soon as it is visible, not once it commits.
     pub fn statfs(&self) -> Result<Statfs, Errno> {
-        let block_size = self.snapshot()?.superblock().sectorsize();
-        let usage = self.writer.usage().map_err(|error| write_errno(&error))?;
+        let snapshot = self.snapshot()?;
+        let block_size = snapshot.superblock().sectorsize();
         let size = u64::from(block_size);
+        let (total_bytes, used_bytes) = match &self.storage {
+            Storage::Writable(writer) => {
+                let usage = writer.usage().map_err(|error| write_errno(&error))?;
+                (usage.total_bytes, usage.used_bytes)
+            }
+            Storage::ReadOnly(fs) => {
+                let sb = fs.superblock();
+                (sb.total_bytes(), sb.bytes_used())
+            }
+        };
         Ok(Statfs {
-            blocks: usage.total_bytes / size,
-            free: usage.total_bytes.saturating_sub(usage.used_bytes) / size,
+            blocks: total_bytes / size,
+            free: total_bytes.saturating_sub(used_bytes) / size,
             block_size,
         })
     }
@@ -585,12 +813,26 @@ impl State {
         // Linux's FUSE client (`fs/fuse/xattr.c` in torvalds/linux) uses a
         // catch-all `.prefix = ""` handler, so non-ACL `getxattr` requests
         // reach the daemon for namespace and bare-prefix validation.
+        if let Storage::ReadOnly(fs) = &self.storage {
+            let snapshot = fs.clone();
+            let inode = self.open_inode(&snapshot, ino).await?;
+            let mut value = vec![0; size as usize];
+            let length = snapshot
+                .xattr(&inode, name.as_bytes(), &mut value)
+                .await
+                .map_err(|error| read_errno(&error))?
+                .ok_or(Errno::NO_XATTR)?;
+            if size != 0 && length > value.len() {
+                return Err(Errno::ERANGE);
+            }
+            value.truncate(length.min(value.len()));
+            return Ok((length, value));
+        }
         let file = self.inodes.handle(ino)?;
-        let transaction = self
-            .writer
-            .join()
-            .await
-            .map_err(|error| write_errno(&error))?;
+        let Storage::Writable(writer) = &mut self.storage else {
+            return Err(Errno::EROFS);
+        };
+        let transaction = writer.join().await.map_err(|error| write_errno(&error))?;
         let mut value = vec![0; size as usize];
         let length = transaction
             .xattr(&file, name.as_bytes(), &mut value)
@@ -618,7 +860,7 @@ impl State {
         self.writable()?;
         let file = self.inodes.handle(ino)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -638,7 +880,7 @@ impl State {
         self.writable()?;
         let file = self.inodes.handle(ino)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;

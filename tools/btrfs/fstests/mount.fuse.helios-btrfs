@@ -5,8 +5,10 @@
 # its mount up, or fails with mount(8)'s exit codes once it exits without
 # doing so.
 #
-# Optional environment: HELIOS_FUSE_BTRFS_LOG, a file the daemon appends its
-# diagnostics to.
+# Optional environment:
+#   HELIOS_FUSE_BTRFS_LOG     file the daemon appends its diagnostics to
+#   HELIOS_FUSE_BTRFS_RUN_DIR directory for per-mount control sockets (default
+#                             /run/helios-fuse-btrfs)
 set -euo pipefail
 
 # Longest the daemon may take to mount, or to release its device if killed on
@@ -54,12 +56,16 @@ shift 2
 
 # The arguments mount(8) adds to a helper: -o options, and the flags for
 # mtab handling, verbosity and the type, none of which concern the daemon.
-options=()
+option_string=
 while (($#)); do
     case "$1" in
         -o)
             (($# >= 2)) || fail_usage "-o needs its options"
-            options=(-o "$2")
+            if [[ -n "$option_string" ]]; then
+                option_string+=",$2"
+            else
+                option_string=$2
+            fi
             shift 2
             ;;
         -t)
@@ -70,6 +76,28 @@ while (($#)); do
         *) fail_usage "unexpected argument $1" ;;
     esac
 done
+
+options=()
+if [[ -n "$option_string" ]]; then
+    options=(-o "$option_string")
+fi
+
+# In-place remounts coordinate synchronously with the running daemon via its
+# control socket instead of spawning a second daemon against the held device.
+if [[ ",$option_string," == *,remount,* ]]; then
+    status=
+    rc=0
+    status=$("$HELIOS_FUSE_BTRFS" "$device" "$mountpoint" "${options[@]}" \
+        2>>"${HELIOS_FUSE_BTRFS_LOG:-/dev/null}" </dev/null) || rc=$?
+    if ((rc == 0)); then
+        exit 0
+    fi
+    if [[ "$status" =~ ^failed\ ([0-9]+)\ (.*)$ ]]; then
+        echo "${BASH_REMATCH[2]}" >&2
+        exit "${BASH_REMATCH[1]}"
+    fi
+    fail_mount "fuse-btrfs remount of $mountpoint exited $rc"
+fi
 
 # The daemon writes one line to stdout before closing it: `mounted` once its
 # mount serves, or `failed <code> <message>` if startup failed before then.

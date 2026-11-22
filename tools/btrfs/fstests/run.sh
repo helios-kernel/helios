@@ -35,6 +35,7 @@ mounts=/mnt/helios-fstests
 
 export HELIOS_FUSE_BTRFS
 export HELIOS_FUSE_BTRFS_LOG=$results/fuse-btrfs.log
+export HELIOS_FUSE_BTRFS_RUN_DIR=$work/run
 export HELIOS_FSTESTS_DIR=$fstests
 export HELIOS_FSTESTS_RESULTS=$results/fstests
 export HELIOS_FSTESTS_TEST_DIR=$mounts/test
@@ -57,6 +58,7 @@ cleanup() {
         losetup --detach "$loop"
     done
     rm -f /sbin/mount.fuse.helios-btrfs /sbin/umount.fuse
+    rm -rf "$HELIOS_FUSE_BTRFS_RUN_DIR"
     chmod -R a+rX "$results"
 }
 
@@ -75,7 +77,7 @@ make_loop() {
 # removes the one this installs, so it must not replace one already there.
 [[ ! -e /sbin/umount.fuse ]] || die "/sbin/umount.fuse already exists; this installs its own and removes it afterwards"
 
-mkdir -p "$results" "$HELIOS_FSTESTS_RESULTS" \
+mkdir -p "$results" "$HELIOS_FSTESTS_RESULTS" "$HELIOS_FUSE_BTRFS_RUN_DIR" \
     "$HELIOS_FSTESTS_TEST_DIR" "$HELIOS_FSTESTS_SCRATCH_MNT" "$HELIOS_CRASH_MNT"
 trap cleanup EXIT
 

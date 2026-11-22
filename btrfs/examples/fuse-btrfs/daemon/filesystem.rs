@@ -1,8 +1,9 @@
 //! The kernel-facing half: FUSE requests onto [`State`].
 //!
 //! fuser hands requests to a `Sync` filesystem by shared reference, so the
-//! state sits behind a mutex. The session runs one event-loop thread, so the
-//! lock is never contended; it holds the writer's exclusive ownership.
+//! state sits behind a mutex shared with the control socket thread. The FUSE
+//! session runs one event-loop thread, so the lock is only briefly contended
+//! during an explicit `remount` request.
 //!
 //! Operations the writer has no API for answer the errno of a filesystem that
 //! lacks the feature, and nothing else:
@@ -18,19 +19,20 @@
 //! `getlk`, `setlk`, `lseek` and `copy_file_range`.
 
 use std::ffi::OsStr;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
     BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, InitFlags, KernelConfig,
-    LockOwner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    WriteFlags,
 };
 use futures_lite::future::block_on;
 use helios_btrfs::Timestamp;
 use helios_hal::fs::RenameMode;
 
-use super::state::{Node, Owner, Setattr, State, target_bytes, timestamp};
+use super::state::{Node, Owner, Setattr, SharedState, State, target_bytes, timestamp};
 
 /// Attributes and entries are never cached: every change is made through this
 /// daemon, and the kernel revalidating on each use keeps a reply the same as
@@ -41,18 +43,17 @@ const TTL: Duration = Duration::ZERO;
 const NAME_MAX: u32 = 255;
 
 pub struct Daemon {
-    state: Mutex<State>,
+    shared: Arc<SharedState>,
 }
 
 impl Daemon {
-    pub fn new(state: State) -> Self {
-        Self {
-            state: Mutex::new(state),
-        }
+    pub fn new(shared: Arc<SharedState>) -> Self {
+        Self { shared }
     }
 
     fn run<R>(&self, request: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self
+            .shared
             .state
             .lock()
             .expect("an earlier request panicked while holding the filesystem");
@@ -208,6 +209,13 @@ impl Filesystem for Daemon {
         );
     }
 
+    fn open(&self, _req: &Request, _ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        match self.run(|state| state.open_file(flags)) {
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
     fn create(
         &self,
         req: &Request,
@@ -215,19 +223,38 @@ impl Filesystem for Daemon {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let owner = caller(req, umask);
         let permissions = permissions(mode);
         match self.run(|state| {
-            block_on(state.create(parent, name, Node::File, permissions, owner, now()))
+            let (attr, generation) =
+                block_on(state.create(parent, name, Node::File, permissions, owner, now()))?;
+            let fh = state.open_file(OpenFlags(flags))?;
+            Ok((attr, generation, fh))
         }) {
-            Ok((attr, generation)) => {
-                reply.created(&TTL, &attr, generation, FileHandle(0), FopenFlags::empty())
+            Ok((attr, generation, fh)) => {
+                reply.created(&TTL, &attr, generation, fh, FopenFlags::empty())
             }
             Err(errno) => reply.error(errno),
         }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if self.run(|state| state.release_file(fh)) {
+            self.shared.writable_released.notify_all();
+        }
+        reply.ok();
     }
 
     fn link(
@@ -293,7 +320,7 @@ impl Filesystem for Daemon {
         _fh: FileHandle,
         offset: u64,
         size: u32,
-        _flags: fuser::OpenFlags,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
@@ -311,7 +338,7 @@ impl Filesystem for Daemon {
         offset: u64,
         data: &[u8],
         _write_flags: WriteFlags,
-        _flags: fuser::OpenFlags,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
@@ -361,16 +388,18 @@ impl Filesystem for Daemon {
     /// The unmount: what the running transaction holds becomes durable
     /// before the daemon lets the device go.
     fn destroy(&mut self) {
-        let state = self
+        let mut state = self
+            .shared
             .state
-            .get_mut()
+            .lock()
             .expect("an earlier request panicked while holding the filesystem");
-        if let Err(errno) = block_on(state.sync()) {
+        if let Err(errno) = block_on(state.destroy()) {
             tracing::error!(
                 ?errno,
                 "the unmount commit failed; the device keeps the last one"
             );
         }
+        self.shared.writable_released.notify_all();
     }
 
     fn readdir(
