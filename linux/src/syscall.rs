@@ -25,6 +25,7 @@ mod netlink;
 mod packet;
 pub mod permissions;
 mod poll;
+mod process;
 mod signal;
 mod socket;
 mod system;
@@ -40,6 +41,9 @@ pub use fs::{
 pub use io::Clock;
 pub use netlink::{AF_NETLINK, NETLINK_ROUTE};
 pub use packet::AF_PACKET;
+pub use process::{
+    AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, ExecError, ExecSpec, SpawnedProcess, VforkDone,
+};
 pub use signal::{ProcessSignals, SignalDelivery, SyscallRestart, ThreadSignalSlot};
 pub use socket::{
     ConnectProgress, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EALREADY, ECONNABORTED,
@@ -140,6 +144,11 @@ pub trait UserMemory {
         expected: u32,
         desired: u32,
     ) -> Result<Result<u32, u32>, MemoryFault>;
+    /// Whether the page containing `address` is still shared copy-on-write
+    /// with another address space (untouched since `fork(2)`).
+    fn is_page_shared(&self, _address: u64) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -236,6 +245,23 @@ pub trait Thread<R: Resources = NoBacking> {
     /// Duplicates the calling thread's user context with `state` and starts
     /// `child` on its own task with syscall result `0`.
     fn spawn_thread(&mut self, child: Process<R>, state: SpawnedThread) -> Result<(), SpawnError>;
+
+    /// Duplicates the calling process (`fork`, `vfork`, or `clone`/`clone3`
+    /// without `CLONE_THREAD`) and starts the child process with syscall
+    /// result `0`.
+    fn spawn_process(&mut self, _process: SpawnedProcess<R>) -> Result<(), SpawnError> {
+        Err(SpawnError::Busy)
+    }
+
+    /// Loads and validates the target executable for `execve`/`execveat`,
+    /// stashing the prepared image on the host so returning
+    /// [`SyscallOutcome::Exec`] replaces the process atomically.
+    fn prepare_exec(
+        &mut self,
+        _spec: ExecSpec,
+    ) -> impl Future<Output = Result<(), ExecError>> + Send {
+        async { Err(ExecError::NoEntry) }
+    }
 }
 
 /// Outcome of a non-exiting system call returned by [`dispatch`].
@@ -251,6 +277,9 @@ pub enum SyscallOutcome {
     /// `rt_sigreturn`: the driver must restore the thread context from the
     /// user signal frame and must not overwrite the restored result register.
     SigReturn,
+    /// `execve` / `execveat`: the host prepared the replacement image via
+    /// [`Thread::prepare_exec`] and must now commit the exec transition.
+    Exec,
 }
 
 /// How an `exit` or `exit_group` system call ends execution.
@@ -427,16 +456,17 @@ struct ProcessShared<R: Resources> {
     memory_id: ProcessMemoryIdentity,
     pids: PidNamespace,
     futex: FutexTable,
-    descriptors: spin::Mutex<Descriptors<R>>,
-    cwd: spin::Mutex<String>,
-    shared_mappings: spin::Mutex<Vec<memory::SharedFileMapping<R::File>>>,
+    descriptors: Arc<spin::Mutex<Descriptors<R>>>,
+    cwd: Arc<spin::Mutex<String>>,
+    shared_mappings: Arc<spin::Mutex<Vec<memory::SharedFileMapping<R::File>>>>,
     stdin_lock: RawMutex,
     stdin_carry: spin::Mutex<Bytes>,
     credentials: Arc<spin::Mutex<Credentials>>,
     attributes: spin::Mutex<system::Attributes>,
-    program_break: spin::Mutex<memory::ProgramBreak>,
+    program_break: Arc<spin::Mutex<memory::ProgramBreak>>,
     signals: Arc<ProcessSignals>,
     threads: Arc<GroupLifecycle>,
+    vfork_done: spin::Mutex<Option<Arc<VforkDone>>>,
 }
 
 impl core::ops::Deref for GroupLifecycle {
@@ -530,16 +560,17 @@ impl<R: Resources> Process<R> {
                 memory_id,
                 pids,
                 futex,
-                descriptors: spin::Mutex::new(descriptors),
-                cwd: spin::Mutex::new(initial_cwd),
-                shared_mappings: spin::Mutex::new(Vec::new()),
+                descriptors: Arc::new(spin::Mutex::new(descriptors)),
+                cwd: Arc::new(spin::Mutex::new(initial_cwd)),
+                shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
                 stdin_lock: RawMutex::new(),
                 stdin_carry: spin::Mutex::new(initial_stdin_carry),
                 credentials,
                 attributes: spin::Mutex::new(system::Attributes::new(start, open_files)),
-                program_break: spin::Mutex::new(memory::ProgramBreak::new(program_break)),
+                program_break: Arc::new(spin::Mutex::new(memory::ProgramBreak::new(program_break))),
                 signals: process_signals,
                 threads: lifecycle,
+                vfork_done: spin::Mutex::new(None),
             }),
             tid: id,
             signals: thread_signals,
@@ -668,6 +699,195 @@ impl<R: Resources> Process<R> {
         self.shared.threads.changed.poll_notified(cx, waiter)
     }
 
+    /// Records that this process stopped on `signal` (`SIGSTOP`/`SIGTSTP`/etc.)
+    /// so its parent's `wait4`/`waitid` (`WUNTRACED`/`WSTOPPED`) observes it.
+    pub fn mark_stopped(&self, signal: Signal) {
+        self.shared.pids.mark_stopped(self.pid(), signal);
+    }
+
+    /// Signals a waiting `vfork`/`CLONE_VFORK` parent (if any) that this child
+    /// has completed `execve` or exited.
+    pub fn signal_vfork_done(&self) {
+        if let Some(done) = self.shared.vfork_done.lock().take() {
+            done.complete();
+        }
+    }
+
+    /// Transitions this process into exited/zombie state inside its container's
+    /// [`PidNamespace`], waking any parent blocked in `wait4`/`waitid` and
+    /// raising its exit signal (`SIGCHLD`), and unblocks any `vfork` parent.
+    pub fn mark_exited(&self, termination: ChildTermination) {
+        self.signal_vfork_done();
+        self.shared.pids.mark_exited(self.pid(), termination);
+    }
+
+    /// Closes every descriptor marked `FD_CLOEXEC`, leaving all other open
+    /// descriptors intact.
+    pub fn close_on_exec(&self) {
+        let mut table = self.shared.descriptors.lock();
+        let len = table.entries.len();
+        for index in 0..len {
+            if table.entries[index]
+                .as_ref()
+                .is_some_and(|entry| entry.close_on_exec)
+            {
+                let _ = table.close(index as i32);
+            }
+        }
+    }
+
+    /// Signals currently set to `SIG_IGN` (carried into a WASIX/Wasm image on
+    /// `execve`).
+    pub fn ignored_signals(&self) -> alloc::vec::Vec<Signal> {
+        self.shared.signals.ignored_signals()
+    }
+
+    /// Returns a cloned copy of the open file entry at `fd` (used by
+    /// `execveat` to resolve `dirfd` / `AT_EMPTY_PATH`).
+    pub fn descriptor_entry(&self, fd: i32) -> Option<Entry<R>> {
+        self.shared.descriptors.lock().get_entry(fd).cloned()
+    }
+
+    /// Shared handle to this process's descriptor table (for host `execveat`
+    /// `dirfd` lookup without holding a borrow on `Process`).
+    pub fn descriptors_handle(&self) -> Arc<spin::Mutex<Descriptors<R>>> {
+        self.shared.descriptors.clone()
+    }
+
+    /// Shared handle to this process's current working directory (for host
+    /// `execve`/`execveat` relative path resolution without holding a borrow on
+    /// `Process`).
+    pub fn cwd_handle(&self) -> Arc<spin::Mutex<String>> {
+        self.shared.cwd.clone()
+    }
+
+    /// If a non-leader thread called `execve`, transitions its thread ID to
+    /// the thread-group leader (`tid == pid`), matching Linux `de_thread`.
+    fn normalize_exec_leader(&mut self) {
+        let pid = self.pid();
+        if self.tid != pid {
+            let old_mask = self.signals.current_mask();
+            self.shared.signals.unregister_thread(self.tid);
+            self.shared.pids.release_tid(self.tid);
+            self.tid = pid;
+            self.signals = self.shared.signals.register_thread(pid, old_mask);
+            self.shared.pids.register_thread(
+                pid,
+                self.signals.clone(),
+                self.shared.credentials.clone(),
+            );
+        }
+    }
+
+    /// Commits an in-place Linux-to-Linux `execve`/`execveat`:
+    /// - detaches from any `vfork`/`CLONE_VM`/`CLONE_FILES` parent state,
+    /// - closes `FD_CLOEXEC` descriptors,
+    /// - resets caught signal handlers to `SIG_DFL` while preserving `SIG_IGN`
+    ///   and the calling thread's signal mask,
+    /// - marks `has_execed` in [`PidNamespace`] and wakes any `vfork` parent,
+    /// - resets the thread group to a single thread (`tid == pid`) with
+    ///   `new_program_break`.
+    pub fn commit_linux_exec(&mut self, new_program_break: u64) {
+        let pid = self.pid();
+        let mut surviving = self.shared.descriptors.lock().clone();
+        let len = surviving.entries.len();
+        for index in 0..len {
+            if surviving.entries[index]
+                .as_ref()
+                .is_some_and(|entry| entry.close_on_exec)
+            {
+                let _ = surviving.close(index as i32);
+            }
+        }
+        // Clear `FD_CLOEXEC` in-place when we were the sole owner of the table
+        // so closed descriptors drop immediately before the new image starts.
+        if Arc::strong_count(&self.shared.descriptors) == 1 {
+            *self.shared.descriptors.lock() = surviving.clone();
+        }
+
+        self.shared.signals.reset_for_exec();
+        self.signals.reset_for_exec();
+        self.normalize_exec_leader();
+
+        self.shared.pids.mark_execed(pid);
+        self.signal_vfork_done();
+
+        let robust_list = Arc::new(AtomicU64::new(0));
+        let lifecycle = Arc::new(GroupLifecycle {
+            threads: spin::Mutex::new(thread::ThreadGroup::new(
+                pid,
+                self.shared.pids.clone(),
+                robust_list.clone(),
+            )),
+            changed: Notify::new(),
+        });
+        let fresh_memory_id = helios_unix::ProcessMemoryIdentity::new(
+            self.shared
+                .memory_id
+                .raw()
+                .wrapping_add(0x9e37_79b9_7f4a_7c15),
+        );
+        let new_shared = Arc::new(ProcessShared {
+            abi: self.shared.abi,
+            identity: self.shared.identity,
+            memory_id: fresh_memory_id,
+            pids: self.shared.pids.clone(),
+            futex: self.shared.futex.clone(),
+            descriptors: Arc::new(spin::Mutex::new(surviving)),
+            cwd: Arc::new(spin::Mutex::new(self.shared.cwd.lock().clone())),
+            shared_mappings: Arc::new(spin::Mutex::new(Vec::new())),
+            stdin_lock: RawMutex::new(),
+            stdin_carry: spin::Mutex::new(self.shared.stdin_carry.lock().clone()),
+            credentials: self.shared.credentials.clone(),
+            attributes: spin::Mutex::new(self.shared.attributes.lock().clone()),
+            program_break: Arc::new(spin::Mutex::new(memory::ProgramBreak::new(
+                new_program_break,
+            ))),
+            signals: self.shared.signals.clone(),
+            threads: lifecycle,
+            vfork_done: spin::Mutex::new(None),
+        });
+        // Mark the old thread handle withdrawn from the old lifecycle without
+        // unregistering the process from `PidNamespace`.
+        self.shared = new_shared;
+        self.clear_child_tid = 0;
+        self.robust_list = robust_list;
+        self.exited = false;
+    }
+
+    /// Commits a Linux-to-Wasm/WASIX `execve`/`execveat`, returning the
+    /// surviving post-`FD_CLOEXEC` descriptor table and preserved `SIG_IGN`
+    /// signals while keeping the process registered in [`PidNamespace`] until
+    /// the Wasm program finishes and calls [`PidNamespace::mark_exited`].
+    pub fn commit_wasm_exec(&mut self) -> (Descriptors<R>, alloc::vec::Vec<Signal>) {
+        let pid = self.pid();
+        let mut surviving = self.shared.descriptors.lock().clone();
+        let len = surviving.entries.len();
+        for index in 0..len {
+            if surviving.entries[index]
+                .as_ref()
+                .is_some_and(|entry| entry.close_on_exec)
+            {
+                let _ = surviving.close(index as i32);
+            }
+        }
+        if Arc::strong_count(&self.shared.descriptors) == 1 {
+            // Release the Linux table's descriptor references immediately so
+            // pipe EOFs depend solely on the Wasm image's table.
+            *self.shared.descriptors.lock() = DescriptorSlots::from_entries(alloc::vec::Vec::new());
+        }
+        self.shared.signals.reset_for_exec();
+        self.signals.reset_for_exec();
+        self.normalize_exec_leader();
+        let ignored = self.shared.signals.ignored_signals();
+        self.shared.pids.mark_execed(pid);
+        self.signal_vfork_done();
+        // Suppress `Process::drop` withdrawal so `PidNamespace` keeps this
+        // process live while the Wasm image runs.
+        self.exited = true;
+        (surviving, ignored)
+    }
+
     /// Condemns the entire thread group from this thread (for a fatal signal,
     /// unhandled fault or owner kill) and withdraws this thread from the live
     /// set.
@@ -681,6 +901,9 @@ impl<R: Resources> Process<R> {
         if broadcast {
             self.shared.threads.changed.notify_all();
         }
+        if self.shared.threads.lock().all_exited() {
+            self.signal_vfork_done();
+        }
     }
 
     fn finish_syscall_exit(&mut self, exit: Exit) {
@@ -693,6 +916,9 @@ impl<R: Resources> Process<R> {
         if broadcast || all_exited {
             self.shared.threads.changed.notify_all();
         }
+        if all_exited {
+            self.signal_vfork_done();
+        }
     }
 }
 
@@ -704,6 +930,7 @@ impl<R: Resources> Drop for Process<R> {
             let all_exited = self.shared.threads.lock().withdraw(self.tid);
             if all_exited {
                 self.shared.threads.changed.notify_all();
+                self.signal_vfork_done();
             }
         }
     }
@@ -1134,11 +1361,21 @@ pub async fn dispatch<
             thread::clock_nanosleep(&process.signals, arguments, memory, output).await,
         ),
         Operation::Clone => {
-            SyscallOutcome::Return(thread::clone(process, arguments, memory, thread))
+            SyscallOutcome::Return(thread::clone(process, arguments, memory, thread, output).await)
         }
         Operation::Clone3 => {
-            SyscallOutcome::Return(thread::clone3(process, arguments, memory, thread))
+            SyscallOutcome::Return(thread::clone3(process, arguments, memory, thread, output).await)
         }
+        Operation::Fork => {
+            SyscallOutcome::Return(process::fork(process, memory, thread, output).await)
+        }
+        Operation::Vfork => {
+            SyscallOutcome::Return(process::vfork(process, memory, thread, output).await)
+        }
+        Operation::Execve => process::execve(arguments, memory, thread).await,
+        Operation::Execveat => process::execveat(arguments, memory, thread).await,
+        Operation::Wait4 => process::wait4(process, arguments, memory).await,
+        Operation::Waitid => process::waitid(process, arguments, memory).await,
         Operation::Futex => futex::futex(process, arguments, memory, output).await,
         Operation::SetRobustList => {
             SyscallOutcome::Return(futex::set_robust_list(process, arguments))
@@ -1147,6 +1384,12 @@ pub async fn dispatch<
             SyscallOutcome::Return(futex::get_robust_list(process, arguments, memory))
         }
         Operation::Getpid => SyscallOutcome::Return(process.shared.identity.id().get()),
+        Operation::Getppid => SyscallOutcome::Return(process::getppid(process)),
+        Operation::Getpgid => SyscallOutcome::Return(process::getpgid(process, arguments)),
+        Operation::Setpgid => SyscallOutcome::Return(process::setpgid(process, arguments)),
+        Operation::Getpgrp => SyscallOutcome::Return(process::getpgrp(process)),
+        Operation::Getsid => SyscallOutcome::Return(process::getsid(process, arguments)),
+        Operation::Setsid => SyscallOutcome::Return(process::setsid(process)),
         Operation::Gettid => SyscallOutcome::Return(u64::from(process.tid.get())),
         Operation::SetTidAddress => {
             process.clear_child_tid = arguments[0];

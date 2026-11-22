@@ -881,6 +881,48 @@ fn entry_file<R: Resources>(entry: &Entry<R>) -> Option<OpenFile<R::File>> {
     }
 }
 
+fn is_dev_null_path<R: Resources, F: Filesystem<R>>(
+    base: Option<&R::File>,
+    cwd: &str,
+    path: &str,
+    fs: &F,
+) -> bool {
+    // Reject any `..` traversal so paths like `/nonexistent/../dev/null`
+    // never bypass directory existence checks.
+    if path.split('/').any(|comp| comp == "..") {
+        return false;
+    }
+    let base_dir = base.and_then(|file| fs.file_path(file)).unwrap_or(cwd);
+    let mut segments: Vec<&str> = if path.starts_with('/') {
+        Vec::new()
+    } else {
+        base_dir.split('/').filter(|s| !s.is_empty()).collect()
+    };
+    for comp in path.split('/').filter(|s| !s.is_empty()) {
+        if comp != "." {
+            segments.push(comp);
+        }
+    }
+    segments.as_slice() == ["dev", "null"]
+}
+
+fn synthetic_dev_null_stat() -> FileStat {
+    FileStat {
+        dev: 1,
+        ino: 1,
+        kind: NodeKind::CharacterDevice,
+        permissions: 0o666,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev: (1 << 8) | 3, // Linux major 1, minor 3 (`/dev/null`).
+        size: 0,
+        access_nanos: 0,
+        modified_nanos: 0,
+        status_nanos: 0,
+    }
+}
+
 fn process_creds<R: Resources>(process: &Process<R>) -> Credentials {
     process.shared.credentials.lock().clone()
 }
@@ -970,12 +1012,23 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     };
     let cwd = process.shared.cwd.lock().clone();
     let creds = process_creds(process);
-    let opened = match fs.open(base.as_ref(), &cwd, &path, request, &creds).await {
-        Ok(file) => file,
+    let cloexec = flags & O_CLOEXEC != 0;
+    let descriptor = match fs.open(base.as_ref(), &cwd, &path, request, &creds).await {
+        Ok(file) => FileDescriptor::File(OpenFile::new(file)),
+        Err(FsOpError::Fs(FsError::NoEntry))
+            if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+        {
+            if path.ends_with('/') || request.directory {
+                return errno(ENOTDIR);
+            }
+            if request.create && request.exclusive {
+                return errno(EEXIST);
+            }
+            FileDescriptor::NullDevice
+        }
         Err(error) => return fs_errno(error),
     };
-    let cloexec = flags & O_CLOEXEC != 0;
-    let entry = Entry::<R>::new(FileDescriptor::File(OpenFile::new(opened)), cloexec);
+    let entry = Entry::<R>::new(descriptor, cloexec);
     let mut fdflags = linux_to_fdflags(abi, flags);
     if path_only {
         fdflags = FDFLAG_PATH;
@@ -1160,6 +1213,14 @@ pub(super) async fn newfstatat<R: Resources, M: UserMemory, F: Filesystem<R>, T:
             .await
         {
             Ok((stat, _)) => stat,
+            Err(FsOpError::Fs(FsError::NoEntry))
+                if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+            {
+                if path.ends_with('/') {
+                    return errno(ENOTDIR);
+                }
+                synthetic_dev_null_stat()
+            }
             Err(error) => return fs_errno(error),
         }
     };
@@ -1241,6 +1302,14 @@ pub(super) async fn statx<R: Resources, M: UserMemory, F: Filesystem<R>, T: tty:
             .await
         {
             Ok((stat, _)) => stat,
+            Err(FsOpError::Fs(FsError::NoEntry))
+                if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+            {
+                if path.ends_with('/') {
+                    return errno(ENOTDIR);
+                }
+                synthetic_dev_null_stat()
+            }
             Err(error) => return fs_errno(error),
         }
     };
@@ -1299,6 +1368,17 @@ pub(super) async fn faccessat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         .await
     {
         Ok(()) => 0,
+        Err(FsOpError::Fs(FsError::NoEntry))
+            if is_dev_null_path(base.as_ref(), &cwd, &path, fs) =>
+        {
+            if path.ends_with('/') {
+                errno(ENOTDIR)
+            } else if mode & 1 != 0 {
+                errno(EACCES)
+            } else {
+                0
+            }
+        }
         Err(error) => fs_errno(error),
     }
 }

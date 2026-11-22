@@ -147,8 +147,15 @@ async fn flush_one_range<R: Resources, M: UserMemory, F: fs::Filesystem<R>>(
     let mut buf = [0u8; 4096];
     let mut done = 0u64;
     while done < valid_len {
-        let step = (valid_len - done).min(buf.len() as u64) as usize;
-        if memory.read(start + done, &mut buf[..step]).is_ok() {
+        let addr = start + done;
+        let page_base = addr & !4095;
+        let into_page = (addr - page_base) as usize;
+        let page_rem = (4096 - into_page) as u64;
+        let step = (valid_len - done).min(page_rem) as usize;
+        // Skip copy-on-write shared pages untouched since `fork(2)` so an
+        // exiting or execing child never clobbers post-fork writes to the
+        // backing file with its stale pre-fork snapshot.
+        if !memory.is_page_shared(page_base) && memory.read(addr, &mut buf[..step]).is_ok() {
             let _ = fs
                 .write_at(
                     file,
@@ -1063,6 +1070,7 @@ async fn mremap_to<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
 }
 
 /// The program break: where it started and where the process last set it.
+#[derive(Clone)]
 pub(super) struct ProgramBreak {
     start: u64,
     current: u64,

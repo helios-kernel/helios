@@ -37,7 +37,7 @@ use crate::{
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use helios_hal::fs::{FsError, Landed, NodeKind, RenameMode, WritePosition};
+use helios_hal::fs::{FileSystem, FsError, Landed, NodeKind, RenameMode, WritePosition};
 use helios_hal::native::{
     FaultKind, NativeError, NativeExecution, NativeUnavailable, Stop, UserContext, UserFault,
     UserSpace,
@@ -47,12 +47,13 @@ use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_linux::abi::{self, Abi};
 use helios_linux::elf::{self, Image};
 use helios_linux::syscall::{
-    self, AccessCheck, Call, Denied, DirListEntry, EpollData, Exit, FileAccess, FileStat,
-    Filesystem, LinkOptions, MapError, MemoryFault, MemoryTotals, OpenRequest, Process,
-    ProcessSignals, READY_ERR, READY_HUP, READY_IN, READY_OUT, Region, Resource, Resources,
-    SignalDelivery, SpawnError, SpawnedThread, Start, StdinTryRead, Stdio, Stream, SyscallOutcome,
-    SyscallRestart, System, Termios, TermiosAction, Thread, TimeUpdate, Tty, TtyError, TtyStream,
-    UserMemory, VirtualMemory, Winsize, WriteError,
+    self, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, AccessCheck, Call, Denied, Descriptors, DirListEntry,
+    EpollData, ExecError, ExecSpec, Exit, FileAccess, FileStat, Filesystem, LinkOptions, MapError,
+    MemoryFault, MemoryTotals, OpenRequest, Process, ProcessSignals, READY_ERR, READY_HUP,
+    READY_IN, READY_OUT, Region, Resource, Resources, SignalDelivery, SpawnError, SpawnedProcess,
+    SpawnedThread, Start, StdinTryRead, Stdio, Stream, SyscallOutcome, SyscallRestart, System,
+    Termios, TermiosAction, Thread, TimeUpdate, Tty, TtyError, TtyStream, UserMemory,
+    VirtualMemory, Winsize, WriteError,
 };
 use helios_sync::{TryRead, TryWrite};
 
@@ -145,6 +146,7 @@ impl LinuxGrants {
 /// Process-wide terminal state aligned with [`WasixTtyState`]: whether each
 /// standard stream is attached to a terminal, plus the active `termios` and
 /// window size.
+#[derive(Clone)]
 struct LinuxTtyState {
     stdin_tty: bool,
     stdout_tty: bool,
@@ -344,6 +346,10 @@ impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
             .atomic_compare_exchange_u32(VirtAddr::new(address as usize), expected, desired)
             .map_err(|_| MemoryFault)
     }
+
+    fn is_page_shared(&self, address: u64) -> bool {
+        self.space.is_page_shared(VirtAddr::new(address as usize))
+    }
 }
 
 fn page_range(address: u64, length: u64) -> VirtRange {
@@ -426,6 +432,97 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
     }
 }
 
+/// Wasm/WASIX execution handles forwarded from the program service so a Linux
+/// process can `execve`/`execveat` into a Wasm module or component.
+pub(super) struct LinuxWasmRuntime<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    pub(super) filesystem: Option<Namespace<StorageImpl>>,
+    pub(super) progress: helios_hal::watchdog::ProgressCounter,
+    pub(super) engine: crate::wasmtime_adapter::WasmtimeEngine,
+    pub(super) runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
+    pub(super) preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    pub(super) shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
+    pub(super) core_module_instance_pre_cache:
+        CoreModuleInstancePreCache<CpuImpl, Net, StorageImpl>,
+}
+
+impl<CpuImpl, Net, StorageImpl> Clone for LinuxWasmRuntime<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn clone(&self) -> Self {
+        Self {
+            filesystem: self.filesystem.clone(),
+            progress: self.progress.clone(),
+            engine: self.engine.clone(),
+            runtime: self.runtime.clone(),
+            preview1_core_linker: self.preview1_core_linker.clone(),
+            shared_memory_pool: self.shared_memory_pool.clone(),
+            core_module_instance_pre_cache: self.core_module_instance_pre_cache.clone(),
+        }
+    }
+}
+
+/// Runtime handles forwarded from the program service into a Linux process so
+/// `fork` can register child instances and `execve`/`execveat` can replace the
+/// image with either a Linux ELF or a Wasm/WASIX program.
+pub(super) struct LinuxExecRuntime<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    pub(super) exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+    pub(super) wasm: Option<LinuxWasmRuntime<CpuImpl, Net, StorageImpl>>,
+}
+
+impl<CpuImpl, Net, StorageImpl> Clone for LinuxExecRuntime<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn clone(&self) -> Self {
+        Self {
+            exec_context: self.exec_context.clone(),
+            wasm: self.wasm.clone(),
+        }
+    }
+}
+
+/// Validated replacement image prepared by `ContextThread::prepare_exec`
+/// before committing the point-of-no-return `execve`/`execveat` transition.
+enum PreparedExec<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Linux {
+        executable: LinuxExecutable,
+        argv: Vec<String>,
+        env: Vec<String>,
+    },
+    Wasm {
+        executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
+        argv: ProgramArgv,
+        env: Vec<(String, String)>,
+    },
+}
+
+/// A prepared `execve`/`execveat` payload handed from the calling thread to
+/// the process lifecycle driver.
+type ExecHandoff<CpuImpl, Net, StorageImpl> = (
+    Box<PreparedExec<CpuImpl, Net, StorageImpl>>,
+    Process<LinuxResources<Net>>,
+);
+
 /// Process-wide host state shared across every thread task of one Linux
 /// process.
 struct LinuxShared<CpuImpl, Net, StorageImpl, Space>
@@ -438,15 +535,13 @@ where
     timer: crate::Timer<CpuImpl>,
     spawner: crate::InstanceSpawner<CpuImpl>,
     runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
+    exec_runtime: LinuxExecRuntime<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
     output_mode: OutputMode,
     launched_instance: crate::RegisteredInstance,
     signal_state: WasixSignalState,
     container: Arc<crate::LinuxContainer<StorageImpl>>,
-    /// Keeps this process's container-local PID reserved until every thread
-    /// task has exited and dropped `LinuxShared`.
-    _process_guard: crate::ContainerProcessGuard,
     grants: LinuxGrants,
     /// Process-wide terminal state (`termios`, window size, stream TTY flags).
     /// Never held across `.await`.
@@ -474,6 +569,10 @@ where
     /// First host-level failure (user memory exhaustion or instance kill)
     /// observed on any thread of the process.
     fatal_error: spin::Mutex<Option<ProgramExecError>>,
+    /// Prepared `execve`/`execveat` handoff submitted by any thread of the
+    /// process; first caller wins, condemns sibling threads, and the process
+    /// driver commits the replacement once every thread task has drained.
+    exec_handoff: spin::Mutex<Option<ExecHandoff<CpuImpl, Net, StorageImpl>>>,
     /// Detached thread tasks still executing or dropping their process/space
     /// handles.
     running_tasks: AtomicUsize,
@@ -2625,7 +2724,234 @@ fn linux_errno_from_control_error(error: NetworkControlError) -> u64 {
     }
 }
 
-/// Calling thread's context view for `arch_prctl` and `clone` / `clone3`.
+/// Parses a `#!` script header (`fs/binfmt_script.c`): returns
+/// `(interpreter, optional_argument)` from the first line (up to 256 bytes).
+fn parse_shebang(bytes: &[u8]) -> Option<(String, Option<String>)> {
+    if !bytes.starts_with(b"#!") {
+        return None;
+    }
+    let line = bytes[2..].split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let line = &line[..line.len().min(256)];
+    let trimmed = core::str::from_utf8(line)
+        .ok()?
+        .trim_matches([' ', '\t', '\r']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut split = trimmed.splitn(2, [' ', '\t']);
+    let interp = split.next()?.to_owned();
+    let arg = split
+        .next()
+        .map(|s| s.trim_matches([' ', '\t']))
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    Some((interp, arg))
+}
+
+fn map_fs_error_to_exec(error: helios_hal::fs::FsError) -> ExecError {
+    use helios_hal::fs::FsError;
+    match error {
+        FsError::NoEntry => ExecError::NoEntry,
+        FsError::NotPermitted => ExecError::Access,
+        FsError::NotDirectory => ExecError::NotDir,
+        FsError::IsDirectory => ExecError::IsDir,
+        FsError::Loop => ExecError::Loop,
+        FsError::NameTooLong => ExecError::NameTooLong,
+        FsError::NoSpace => ExecError::OutOfMemory,
+        _ => ExecError::Io,
+    }
+}
+
+fn map_program_error_to_exec(error: &ProgramExecError) -> ExecError {
+    match error.kind {
+        ProgramExecErrorKind::NotFound => ExecError::NoEntry,
+        ProgramExecErrorKind::PermissionDenied => ExecError::Access,
+        ProgramExecErrorKind::InvalidPath => ExecError::NoEntry,
+        ProgramExecErrorKind::InvalidBinary | ProgramExecErrorKind::InvalidHint => {
+            ExecError::InvalidFormat
+        }
+        ProgramExecErrorKind::OutOfMemory => ExecError::OutOfMemory,
+        _ => ExecError::Io,
+    }
+}
+
+fn resolve_exec_spec_base<Net: ComponentHostNetwork>(
+    spec: &ExecSpec,
+    cwd: &Arc<spin::Mutex<String>>,
+    descriptors: &Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+) -> Result<(String, String), ExecError> {
+    const AT_FDCWD: i32 = -100;
+    if spec.path.starts_with('/') {
+        return Ok((String::from("/"), spec.path.clone()));
+    }
+    if spec.dirfd == AT_FDCWD {
+        if spec.path.is_empty() {
+            return Err(ExecError::NoEntry);
+        }
+        return Ok((cwd.lock().clone(), spec.path.clone()));
+    }
+    let entry = descriptors
+        .lock()
+        .get_entry(spec.dirfd)
+        .cloned()
+        .ok_or(ExecError::BadFd)?;
+    let desc = match &entry.descriptor {
+        helios_unix::FileDescriptor::File(open) => open.node(),
+        helios_unix::FileDescriptor::Preopen { descriptor, .. } => descriptor,
+        _ => {
+            return Err(if spec.path.is_empty() && spec.flags & AT_EMPTY_PATH != 0 {
+                ExecError::Access
+            } else {
+                ExecError::NotDir
+            });
+        }
+    };
+    if spec.path.is_empty() {
+        if spec.flags & AT_EMPTY_PATH == 0 {
+            return Err(ExecError::NoEntry);
+        }
+        if desc.kind == crate::ComponentFsNodeKind::Directory {
+            return Err(ExecError::Access);
+        }
+        return Ok((String::from("/"), desc.path.clone()));
+    }
+    if desc.kind != crate::ComponentFsNodeKind::Directory {
+        return Err(ExecError::NotDir);
+    }
+    Ok((desc.path.clone(), spec.path.clone()))
+}
+
+async fn prepare_exec_in_container<CpuImpl, Net, StorageImpl>(
+    shared: &LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    cwd: &Arc<spin::Mutex<String>>,
+    descriptors: &Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+    spec: ExecSpec,
+) -> Result<PreparedExec<CpuImpl, Net, StorageImpl>, ExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    const MAX_SHEBANG_DEPTH: usize = 4;
+    let (mut base_dir, mut raw_path) = resolve_exec_spec_base(&spec, cwd, descriptors)?;
+    let mut argv = spec.argv;
+    let envp = spec.envp;
+    let mut nofollow = spec.flags & AT_SYMLINK_NOFOLLOW != 0;
+
+    for depth in 0..=MAX_SHEBANG_DEPTH {
+        let fs = shared.container.filesystem();
+        let (resolved, trailing_slash) = fs
+            .walk_path(&base_dir, &raw_path, !nofollow)
+            .await
+            .map_err(map_fs_error_to_exec)?;
+        let meta = resolved
+            .fs()
+            .stat(resolved.fs_path())
+            .await
+            .map_err(map_fs_error_to_exec)?;
+        if nofollow {
+            nofollow = false;
+            if meta.kind == NodeKind::Symlink {
+                return Err(ExecError::Loop);
+            }
+        }
+        if meta.kind == NodeKind::Directory {
+            return Err(ExecError::Access);
+        }
+        if trailing_slash {
+            return Err(ExecError::NotDir);
+        }
+        let current_path = resolved.container_path().to_owned();
+
+        let contents = fs
+            .read_executable(&current_path)
+            .await
+            .map_err(map_fs_error_to_exec)?;
+
+        let raw_slice = match &contents {
+            FileContents::Boot(boot) => boot.as_slice(),
+            FileContents::Written(written) => written.as_ref(),
+        };
+        if let Some((interp, opt_arg)) = parse_shebang(raw_slice) {
+            if depth == MAX_SHEBANG_DEPTH {
+                return Err(ExecError::Loop);
+            }
+            let mut next_argv = Vec::with_capacity(argv.len() + 2);
+            next_argv.push(interp.clone());
+            if let Some(arg) = opt_arg {
+                next_argv.push(arg);
+            }
+            next_argv.push(current_path);
+            if argv.len() > 1 {
+                next_argv.extend(argv.into_iter().skip(1));
+            }
+            argv = next_argv;
+            base_dir = String::from("/");
+            raw_path = interp;
+            continue;
+        }
+
+        let source = ProgramSource::from_file(contents);
+        match source {
+            ProgramSource::LinuxElf(bytes) => {
+                let executable = LinuxExecutable::load(&shared.cpu, bytes)
+                    .map_err(|error| map_program_error_to_exec(&error))?;
+                if argv.is_empty() {
+                    argv.push(current_path);
+                }
+                return Ok(PreparedExec::Linux {
+                    executable,
+                    argv,
+                    env: envp,
+                });
+            }
+            other => {
+                if shared.exec_runtime.wasm.is_none() {
+                    return Err(ExecError::InvalidFormat);
+                }
+                let Some(program_service) = shared.runtime_state.program_service() else {
+                    return Err(ExecError::InvalidFormat);
+                };
+                let exec_auth = shared
+                    .container
+                    .authority()
+                    .derive_exec_authority()
+                    .map_err(|_| ExecError::Access)?;
+                let compile = CompileAuthority::from(&exec_auth);
+                let program_argv = ProgramArgv::from_caller(&current_path, argv);
+                let timeline = phases::Timeline::disabled();
+                let executable = program_service
+                    .load_executable(
+                        &compile,
+                        &shared.exec_runtime.exec_context,
+                        program_argv.program_name(),
+                        &other,
+                        None,
+                        &timeline,
+                    )
+                    .await
+                    .map_err(|error| map_program_error_to_exec(&error))?;
+                let parsed_env: Vec<(String, String)> = envp
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry
+                            .split_once('=')
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    })
+                    .collect();
+                return Ok(PreparedExec::Wasm {
+                    executable,
+                    argv: program_argv,
+                    env: parsed_env,
+                });
+            }
+        }
+    }
+    Err(ExecError::Loop)
+}
+
+/// Calling thread's context view for `arch_prctl`, `clone` / `clone3`, `fork`,
+/// `vfork`, `execve`, and `execveat`.
 struct ContextThread<'a, CpuImpl, Net, StorageImpl, Context: UserContext>
 where
     CpuImpl: Cpu + Clone,
@@ -2634,10 +2960,13 @@ where
 {
     context: &'a mut Context,
     shared: &'a Arc<LinuxShared<CpuImpl, Net, StorageImpl, Context::Space>>,
+    cwd: Arc<spin::Mutex<String>>,
+    descriptors: Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+    prepared_exec: &'a mut Option<Box<PreparedExec<CpuImpl, Net, StorageImpl>>>,
 }
 
-impl<CpuImpl, Net, StorageImpl, Context: UserContext> Thread<LinuxResources<Net>>
-    for ContextThread<'_, CpuImpl, Net, StorageImpl, Context>
+impl<CpuImpl, Net, StorageImpl> Thread<LinuxResources<Net>>
+    for ContextThread<'_, CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Context>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -2682,12 +3011,23 @@ where
             .set_register(self.shared.registers.result, 0)
             .expect("the ABI names registers of this instruction set");
         let child_platform = LinuxThreadPlatform::new(self.shared.clone(), child.tid());
-        self.shared.running_tasks.fetch_add(1, Ordering::SeqCst);
-        let guard = TaskDrainGuard(self.shared.clone());
-        self.shared
-            .spawner
+        let shared = self.shared.clone();
+        let spawner = shared.spawner.clone();
+        shared.running_tasks.fetch_add(1, Ordering::SeqCst);
+        let guard = TaskDrainGuard(shared.clone());
+        spawner
             .try_spawn_detached(async move {
-                drive_linux_thread(child_context, child, child_platform).await;
+                if let ThreadRunEnd::Exec(prepared, exec_proc) =
+                    drive_linux_thread(child_context, child, child_platform).await
+                {
+                    let observer = exec_proc.observer();
+                    let mut slot = shared.exec_handoff.lock();
+                    if slot.is_none() {
+                        *slot = Some((prepared, exec_proc));
+                        drop(slot);
+                        observer.terminate_group(helios_unix::ChildTermination::Exited(0));
+                    }
+                }
                 drop(guard);
             })
             .map_err(|error| {
@@ -2700,6 +3040,169 @@ where
                 SpawnError::Busy
             })
     }
+
+    fn spawn_process(
+        &mut self,
+        spawned: SpawnedProcess<LinuxResources<Net>>,
+    ) -> Result<(), SpawnError> {
+        let mut child_context = self
+            .context
+            .try_clone()
+            .map_err(|_| SpawnError::OutOfMemory)?;
+        if let Some(tls) = spawned.tls {
+            child_context
+                .set_thread_pointer(VirtAddr::new(tls as usize))
+                .map_err(|_| SpawnError::InvalidTls)?;
+        }
+        if let Some(stack) = spawned.stack {
+            child_context
+                .set_register(self.shared.abi.stack_pointer_register(), stack)
+                .expect("the ABI names registers of this instruction set");
+        }
+        child_context
+            .set_register(self.shared.registers.result, 0)
+            .expect("the ABI names registers of this instruction set");
+
+        let child_space = if spawned.share_vm {
+            self.shared.space.clone()
+        } else {
+            Arc::new(
+                self.shared
+                    .space
+                    .clone_cow()
+                    .map_err(|_| SpawnError::OutOfMemory)?,
+            )
+        };
+        if let Some(addr) = spawned.child_tid_addr {
+            let pid_val = spawned.child.pid().get();
+            if addr & 3 == 0 {
+                let _ = child_space.atomic_store_u32(VirtAddr::new(addr as usize), pid_val);
+            } else {
+                let _ = child_space.write(VirtAddr::new(addr as usize), &pid_val.to_le_bytes());
+            }
+        }
+
+        let exec_context = &self.shared.exec_runtime.exec_context;
+        let started_at = exec_context
+            .runtime_state
+            .uptime_nanos(exec_context.cpu.now().ticks());
+        let child_name = alloc::format!("linux-pid-{}", spawned.child.pid().get());
+        let child_instance = exec_context
+            .instance_registry
+            .register(child_name, started_at);
+        let child_spawner = exec_context
+            .spawner
+            .instance_spawner(crate::TaskFunding::Instance, &child_instance);
+        let child_signal_state = WasixSignalState::new();
+        let child_shared = Arc::new(LinuxShared {
+            cpu: self.shared.cpu.clone(),
+            timer: self.shared.timer.clone(),
+            spawner: child_spawner.clone(),
+            runtime_state: self.shared.runtime_state.clone(),
+            exec_runtime: self.shared.exec_runtime.clone(),
+            read_serial: self.shared.read_serial,
+            write_serial: self.shared.write_serial,
+            output_mode: self.shared.output_mode.clone(),
+            launched_instance: child_instance,
+            signal_state: child_signal_state,
+            container: self.shared.container.clone(),
+            grants: LinuxGrants::derive(self.shared.container.authority()),
+            tty: spin::Mutex::new(self.shared.tty.lock().clone()),
+            serial_peek: spin::Mutex::new(Vec::new()),
+            clock: spin::Mutex::new(crate::KernelClock::new(
+                self.shared.cpu.clone(),
+                self.shared.runtime_state.clone(),
+            )),
+            abi: self.shared.abi,
+            registers: self.shared.registers,
+            user: self.shared.user,
+            stack_top: self.shared.stack_top,
+            stack_base: self.shared.stack_base,
+            image_end: self.shared.image_end,
+            sigreturn_trampoline: self.shared.sigreturn_trampoline,
+            space: child_space,
+            process_cpu_ticks: AtomicU64::new(0),
+            fatal_error: spin::Mutex::new(None),
+            exec_handoff: spin::Mutex::new(None),
+            running_tasks: AtomicUsize::new(0),
+            tasks_drained: helios_sync::Notify::new(),
+        });
+
+        let child_proc = spawned.child;
+        let child_pid = child_proc.pid();
+        let container = self.shared.container.clone();
+        child_spawner
+            .try_spawn_detached(async move {
+                let mut guard = ChildExitSafetyGuard {
+                    pids: container.pid_namespace().clone(),
+                    pid: child_pid,
+                    completed: false,
+                };
+                let outcome = Box::pin(drive_linux_process_lifecycle(
+                    child_context,
+                    child_proc,
+                    child_shared,
+                    None,
+                    phases::Timeline::disabled(),
+                ))
+                .await;
+                let termination = match outcome {
+                    Ok(exit) => exit.termination,
+                    Err(_) => helios_unix::ChildTermination::Killed,
+                };
+                guard.completed = true;
+                container
+                    .pid_namespace()
+                    .mark_exited(child_pid, termination);
+            })
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "helios_kernel::linux",
+                    instance = ?self.shared.launched_instance.id(),
+                    %error,
+                    "refused a forked Linux child: the executor's instance share is full"
+                );
+                SpawnError::Busy
+            })
+    }
+
+    async fn prepare_exec(&mut self, spec: ExecSpec) -> Result<(), ExecError> {
+        let prepared =
+            prepare_exec_in_container(self.shared, &self.cwd, &self.descriptors, spec).await?;
+        *self.prepared_exec = Some(Box::new(prepared));
+        Ok(())
+    }
+}
+
+/// Safety net ensuring a forked child process transitions to exited state even
+/// if its executor task is cancelled before normal completion.
+struct ChildExitSafetyGuard {
+    pids: syscall::PidNamespace,
+    pid: NonZeroU32,
+    completed: bool,
+}
+
+impl Drop for ChildExitSafetyGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.pids
+                .mark_exited(self.pid, helios_unix::ChildTermination::Killed);
+        }
+    }
+}
+
+/// What ended a thread's execution loop.
+enum ThreadRunEnd<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    Exited,
+    Exec(
+        Box<PreparedExec<CpuImpl, Net, StorageImpl>>,
+        Process<LinuxResources<Net>>,
+    ),
 }
 
 /// What ended a system call a thread was suspended in.
@@ -2824,7 +3327,11 @@ where
         restart,
         shared.sigreturn_trampoline,
     ) {
-        SignalDelivery::None | SignalDelivery::Delivered | SignalDelivery::Stopped => false,
+        SignalDelivery::None | SignalDelivery::Delivered => false,
+        SignalDelivery::Stopped(signal) => {
+            process.mark_stopped(signal);
+            false
+        }
         SignalDelivery::Terminated { signal, .. } => {
             // No core dump file is produced (`RLIMIT_CORE` default is 0), so
             // `WCOREDUMP` stays false as on Linux.
@@ -2895,22 +3402,28 @@ where
             ));
             true
         }
-        SignalDelivery::None | SignalDelivery::Stopped => false,
+        SignalDelivery::None | SignalDelivery::Stopped(_) => false,
     }
 }
 
 /// Drives one Linux thread (`main` or a `clone`-spawned worker) until that
 /// thread exits (`exit`), condemns the group (`exit_group`, unhandled fault,
-/// OOM), or observes condemnation from a sibling, signal or kill.
-async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
-    mut context: Context,
+/// OOM), commits an `execve`/`execveat` replacement, or observes condemnation
+/// from a sibling, signal or kill.
+async fn drive_linux_thread<CpuImpl, Net, StorageImpl>(
+    mut context: <CpuImpl::Native as NativeExecution>::Context,
     mut process: Process<LinuxResources<Net>>,
-    mut platform: LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Context::Space>,
-) where
+    mut platform: LinuxThreadPlatform<
+        CpuImpl,
+        Net,
+        StorageImpl,
+        <CpuImpl::Native as NativeExecution>::Space,
+    >,
+) -> ThreadRunEnd<CpuImpl, Net, StorageImpl>
+where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
-    Context: UserContext,
 {
     let shared = platform.shared.clone();
     let observer = process.observer();
@@ -2965,6 +3478,7 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                     break;
                 }
                 let syscall_began = shared.cpu.now().ticks();
+                let mut prepared_exec = None;
                 let ended = {
                     let mut memory = LinuxMemory {
                         space: &*shared.space,
@@ -2976,6 +3490,9 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                     let mut thread = ContextThread {
                         context: &mut context,
                         shared: &shared,
+                        cwd: process.cwd_handle(),
+                        descriptors: process.descriptors_handle(),
+                        prepared_exec: &mut prepared_exec,
                     };
                     let mut call = core::pin::pin!(syscall::dispatch(
                         &mut process,
@@ -3057,6 +3574,17 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
                             ));
                             break;
                         }
+                    }
+                    CallEnd::Done(ControlFlow::Continue(SyscallOutcome::Exec)) => {
+                        let memory = LinuxMemory {
+                            space: &*shared.space,
+                            user: shared.user,
+                            stack_growth: None,
+                        };
+                        process.flush_shared_mappings(&memory, &mut platform).await;
+                        let prepared = prepared_exec
+                            .expect("SyscallOutcome::Exec follows Thread::prepare_exec");
+                        return ThreadRunEnd::Exec(prepared, process);
                     }
                     CallEnd::Done(ControlFlow::Break(_)) => break,
                     CallEnd::Stopped => {}
@@ -3167,6 +3695,7 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
         stack_growth: None,
     };
     process.flush_shared_mappings(&memory, &mut platform).await;
+    ThreadRunEnd::Exited
 }
 
 /// Drives a process's `ITIMER_REAL` (`alarm` / `setitimer`) asynchronously
@@ -3255,36 +3784,24 @@ fn map_sigreturn_trampoline<Space: UserSpace>(
     }
 }
 
-/// Runs a Linux process inside `container` to its end: maps `executable`,
-/// builds its initial stack from `argv` and `env`, allocates its container-local
-/// PID (starting at 1), drives `main` and every thread spawned via
-/// `clone` / `clone3`, and returns once every thread task has exited and
-/// released the process's resources.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_linux_process<CpuImpl, Net, StorageImpl>(
-    exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
-    argv: ProgramArgv,
-    env: Vec<(String, String)>,
-    container: Arc<crate::LinuxContainer<StorageImpl>>,
-    credentials: Option<syscall::Credentials>,
-    descriptors: Option<Preview1DescriptorTable<Net>>,
-    signal_state: WasixSignalState,
-    spawner: crate::InstanceSpawner<CpuImpl>,
-    launched_instance: crate::RegisteredInstance,
-    output_mode: OutputMode,
-    executable: LinuxExecutable,
-    timeline: &phases::Timeline,
-) -> Result<ChildExit, ProgramExecError>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let instance_id = launched_instance.id();
-    timeline.set_instance(instance_id);
-    timeline.record(&exec_context.cpu, LaunchPhase::TaskBegin);
-    let cpu = exec_context.cpu.clone();
-    let native = cpu.native().map_err(native_unavailable)?;
+struct MappedLinuxImage<Native: NativeExecution> {
+    space: Arc<Native::Space>,
+    context: Native::Context,
+    user: VirtRange,
+    stack_top: u64,
+    stack_base: usize,
+    image_end: usize,
+    sigreturn_trampoline: u64,
+    program_break: u64,
+}
+
+fn map_linux_image<Native: NativeExecution>(
+    native: &Native,
+    entropy: &crate::RootEntropy,
+    executable: &LinuxExecutable,
+    argv: &[String],
+    environment: &[String],
+) -> Result<MappedLinuxImage<Native>, ProgramExecError> {
     let image =
         Image::parse(&executable.image, executable.abi, user_end(native)).map_err(image_error)?;
     let space = Arc::new(native.create_space().map_err(native_error)?);
@@ -3306,24 +3823,14 @@ where
             .map_err(native_error)?;
     }
 
-    let argv = argv.into_vec();
-    let environment: Vec<String> = env
-        .into_iter()
-        .map(|(name, value)| {
-            let mut variable = String::with_capacity(name.len() + 1 + value.len());
-            variable.push_str(&name);
-            variable.push('=');
-            variable.push_str(&value);
-            variable
-        })
-        .collect();
     let arguments: Vec<&[u8]> = argv.iter().map(String::as_bytes).collect();
     let variables: Vec<&[u8]> = environment.iter().map(String::as_bytes).collect();
     let mut random = [0; 16];
-    exec_context.runtime_state.root_entropy().fill(&mut random);
+    entropy.fill(&mut random);
     let user = native.user_range();
     let (top, sigreturn_trampoline) =
         map_sigreturn_trampoline(&*space, user, executable.abi).map_err(native_error)?;
+    let executable_name = arguments.first().copied().unwrap_or(b"");
     let stack = helios_linux::stack::build(
         &helios_linux::stack::Startup {
             entry: image.entry(),
@@ -3332,9 +3839,7 @@ where
             random,
             arguments: &arguments,
             environment: &variables,
-            // The name the program was invoked under; the resolved path
-            // does not travel with a launch.
-            executable: arguments[0],
+            executable: executable_name,
         },
         top,
     )
@@ -3355,6 +3860,343 @@ where
             VirtAddr::new(stack.pointer as usize),
         )
         .map_err(native_error)?;
+    Ok(MappedLinuxImage {
+        space,
+        context,
+        user,
+        stack_top: top,
+        stack_base: stack.base as usize,
+        image_end,
+        sigreturn_trampoline,
+        program_break: image.program_break(PhysFrame::SIZE as u64),
+    })
+}
+
+/// Drives a Linux process (either a root launch or a forked child) across its
+/// initial image and any subsequent `execve`/`execveat` replacements — whether
+/// Linux ELF or Wasm/WASIX — until the process terminates.
+async fn drive_linux_process_lifecycle<CpuImpl, Net, StorageImpl>(
+    mut context: <CpuImpl::Native as NativeExecution>::Context,
+    mut process: Process<LinuxResources<Net>>,
+    mut shared: Arc<
+        LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
+    >,
+    root_guard: Option<crate::ContainerProcessGuard>,
+    timeline: phases::Timeline,
+) -> Result<ChildExit, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let _root_guard = root_guard;
+    loop {
+        let cpu = shared.cpu.clone();
+        let pid = process.pid();
+        let observer = process.observer();
+        let proc_signals = process.process_signals();
+        let main_platform = LinuxThreadPlatform::new(shared.clone(), pid);
+        let real_timer_driver = drive_real_timer(
+            cpu.clone(),
+            shared.timer.clone(),
+            shared.runtime_state.clone(),
+            proc_signals.clone(),
+            observer.clone(),
+        );
+        let mut main_exec: Option<ExecHandoff<CpuImpl, Net, StorageImpl>> = None;
+        let main_and_siblings = async {
+            match drive_linux_thread(context, process, main_platform).await {
+                ThreadRunEnd::Exec(prepared, exec_proc) => {
+                    // Condemn any sibling threads so they drain before the
+                    // address space is replaced.
+                    observer.terminate_group(helios_unix::ChildTermination::Exited(0));
+                    main_exec = Some((prepared, exec_proc));
+                    return;
+                }
+                ThreadRunEnd::Exited => {}
+            }
+
+            // Wait for every live sibling thread to exit, still honouring
+            // external signals and instance kills while `main` is already gone.
+            loop {
+                let mut group_wait = observer.waiter();
+                let mut signal_wait = shared.signal_state.wait_state();
+                let mut kill_wait = shared.launched_instance.arm_kill_wait();
+                if let Some(reason) = shared.launched_instance.pending_kill() {
+                    match reason {
+                        crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                            observer.terminate_group(helios_unix::ChildTermination::Killed);
+                        }
+                        crate::KillReason::OutOfMemory
+                        | crate::KillReason::SupervisorRestart
+                        | crate::KillReason::StoreFailed => {
+                            shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
+                                crate::InstanceKilled { reason },
+                            )));
+                            observer.terminate_group(helios_unix::ChildTermination::Killed);
+                        }
+                    }
+                } else if !observer.group_ended() {
+                    forward_external_signals(&proc_signals, &shared.signal_state);
+                }
+                if observer.all_threads_exited() {
+                    break;
+                }
+                core::future::poll_fn(|cx| {
+                    let group_changed = observer.poll_changed(cx, &mut group_wait).is_ready();
+                    let signalled = shared
+                        .signal_state
+                        .poll_changed(cx, &mut signal_wait)
+                        .is_ready();
+                    let killed = shared
+                        .launched_instance
+                        .poll_kill_wait(cx, &mut kill_wait)
+                        .is_ready();
+                    if group_changed || signalled || killed {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+        };
+        futures::future::join(main_and_siblings, real_timer_driver).await;
+
+        // Wait for every detached thread task to drop its `Process` and
+        // `Arc<Space>` before committing exec or reporting `ChildExit`.
+        shared.wait_tasks_drained().await;
+
+        let exec_request = main_exec.or_else(|| shared.exec_handoff.lock().take());
+        if let Some((prepared, mut exec_proc)) = exec_request {
+            match *prepared {
+                PreparedExec::Linux {
+                    executable,
+                    argv,
+                    env,
+                } => {
+                    let native = cpu.native().map_err(native_unavailable)?;
+                    let mapped = map_linux_image(
+                        native,
+                        shared.runtime_state.root_entropy(),
+                        &executable,
+                        &argv,
+                        &env,
+                    )?;
+                    exec_proc.commit_linux_exec(mapped.program_break);
+                    let next_shared = Arc::new(LinuxShared {
+                        cpu: shared.cpu.clone(),
+                        timer: shared.timer.clone(),
+                        spawner: shared.spawner.clone(),
+                        runtime_state: shared.runtime_state.clone(),
+                        exec_runtime: shared.exec_runtime.clone(),
+                        read_serial: shared.read_serial,
+                        write_serial: shared.write_serial,
+                        output_mode: shared.output_mode.clone(),
+                        launched_instance: shared.launched_instance.clone(),
+                        signal_state: shared.signal_state.clone(),
+                        container: shared.container.clone(),
+                        grants: LinuxGrants::derive(shared.container.authority()),
+                        tty: spin::Mutex::new(shared.tty.lock().clone()),
+                        serial_peek: spin::Mutex::new(core::mem::take(
+                            &mut *shared.serial_peek.lock(),
+                        )),
+                        clock: spin::Mutex::new(crate::KernelClock::new(
+                            shared.cpu.clone(),
+                            shared.runtime_state.clone(),
+                        )),
+                        abi: executable.abi,
+                        registers: executable.abi.system_call_registers(),
+                        user: mapped.user,
+                        stack_top: mapped.stack_top,
+                        stack_base: mapped.stack_base,
+                        image_end: mapped.image_end,
+                        sigreturn_trampoline: mapped.sigreturn_trampoline,
+                        space: mapped.space,
+                        process_cpu_ticks: AtomicU64::new(
+                            shared.process_cpu_ticks.load(Ordering::Relaxed),
+                        ),
+                        fatal_error: spin::Mutex::new(None),
+                        exec_handoff: spin::Mutex::new(None),
+                        running_tasks: AtomicUsize::new(0),
+                        tasks_drained: helios_sync::Notify::new(),
+                    });
+                    // Drop the old `LinuxShared` and old address space before
+                    // starting the replacement image.
+                    drop(observer);
+                    drop(proc_signals);
+                    shared = next_shared;
+                    context = mapped.context;
+                    process = exec_proc;
+                    continue;
+                }
+                PreparedExec::Wasm {
+                    executable,
+                    argv,
+                    env,
+                } => {
+                    let (surviving_slots, ignored) = exec_proc.commit_wasm_exec();
+                    let thread_signals = exec_proc.thread_signals().clone();
+                    let descriptors = Preview1DescriptorTable::from_slots(surviving_slots);
+                    let signal_dispositions: Vec<WasixSignalDisposition> = ignored
+                        .into_iter()
+                        .map(|sig| WasixSignalDisposition {
+                            signal: sig.raw(),
+                            action: WasixSignalDispositionAction::Ignore,
+                        })
+                        .collect();
+                    let exec_runtime = shared.exec_runtime.clone();
+                    let spawner = shared.spawner.clone();
+                    let launched_instance = shared.launched_instance.clone();
+                    let output_mode = shared.output_mode.clone();
+                    let external_signal_state = shared.signal_state.clone();
+                    let authority = shared.container.authority().clone();
+                    // Reclaim the entire old Linux address space before
+                    // instantiating the replacement Wasm image.
+                    drop(observer);
+                    drop(proc_signals);
+                    drop(exec_proc);
+                    drop(shared);
+
+                    let wasm_runtime = exec_runtime
+                        .wasm
+                        .expect("PreparedExec::Wasm requires a Wasm runtime");
+                    let wasm_signal_state = WasixSignalState::new();
+                    let wasm_run = Box::pin(run_program_executable(
+                        exec_runtime.exec_context,
+                        argv,
+                        env,
+                        authority,
+                        wasm_runtime.filesystem,
+                        Some(descriptors),
+                        wasm_signal_state.clone(),
+                        signal_dispositions,
+                        None,
+                        spawner,
+                        wasm_runtime.progress,
+                        executable,
+                        &wasm_runtime.engine,
+                        &wasm_runtime.runtime,
+                        wasm_runtime.preview1_core_linker,
+                        wasm_runtime.shared_memory_pool,
+                        wasm_runtime.core_module_instance_pre_cache,
+                        launched_instance,
+                        output_mode,
+                        timeline,
+                    ));
+                    // Bridge container Linux signals (`kill(pid, sig)` /
+                    // `kill(-pgid, sig)`) and parent external signals into the
+                    // replacement Wasm/WASIX process while it runs.
+                    let mut wasm_run = wasm_run;
+                    let mut linux_sig_wait = thread_signals.signal_waiter();
+                    let mut ext_sig_wait = external_signal_state.wait_state();
+                    let outcome = core::future::poll_fn(|cx| {
+                        while let Some(sig) = thread_signals.take_pending_signal() {
+                            wasm_signal_state.raise(sig);
+                        }
+                        while let Some(sig) = external_signal_state.take_pending() {
+                            wasm_signal_state.raise(sig);
+                        }
+                        if let Poll::Ready(result) = wasm_run.as_mut().poll(cx) {
+                            return Poll::Ready(result);
+                        }
+                        if thread_signals
+                            .poll_signal_waiter(cx, &mut linux_sig_wait)
+                            .is_ready()
+                        {
+                            while let Some(sig) = thread_signals.take_pending_signal() {
+                                wasm_signal_state.raise(sig);
+                            }
+                            linux_sig_wait = thread_signals.signal_waiter();
+                            let _ = thread_signals.poll_signal_waiter(cx, &mut linux_sig_wait);
+                        }
+                        if external_signal_state
+                            .poll_changed(cx, &mut ext_sig_wait)
+                            .is_ready()
+                        {
+                            while let Some(sig) = external_signal_state.take_pending() {
+                                wasm_signal_state.raise(sig);
+                            }
+                            ext_sig_wait = external_signal_state.wait_state();
+                            let _ = external_signal_state.poll_changed(cx, &mut ext_sig_wait);
+                        }
+                        Poll::Pending
+                    })
+                    .await;
+                    return outcome;
+                }
+            }
+        }
+
+        timeline.record(&cpu, LaunchPhase::GuestEnd);
+        let instance_id = shared.launched_instance.id();
+        let fatal = shared.take_fatal();
+        let termination = observer.termination();
+        drop(observer);
+        drop(proc_signals);
+        drop(shared);
+
+        return match fatal {
+            Some(error) => Err(error),
+            None => Ok(ChildExit {
+                instance_id,
+                termination,
+                filesystem: None,
+            }),
+        };
+    }
+}
+
+/// Runs a Linux process inside `container` to its end: maps `executable`,
+/// builds its initial stack from `argv` and `env`, allocates its container-local
+/// PID (starting at 1), drives `main`, every thread spawned via `clone`/`clone3`,
+/// forked children, and `execve`/`execveat` replacements (Linux ELF or Wasm),
+/// and returns once the process has exited and released its resources.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_linux_process<CpuImpl, Net, StorageImpl>(
+    exec_runtime: LinuxExecRuntime<CpuImpl, Net, StorageImpl>,
+    argv: ProgramArgv,
+    env: Vec<(String, String)>,
+    container: Arc<crate::LinuxContainer<StorageImpl>>,
+    credentials: Option<syscall::Credentials>,
+    descriptors: Option<Preview1DescriptorTable<Net>>,
+    signal_state: WasixSignalState,
+    spawner: crate::InstanceSpawner<CpuImpl>,
+    launched_instance: crate::RegisteredInstance,
+    output_mode: OutputMode,
+    executable: LinuxExecutable,
+    timeline: &phases::Timeline,
+) -> Result<ChildExit, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let exec_context = exec_runtime.exec_context.clone();
+    let instance_id = launched_instance.id();
+    timeline.set_instance(instance_id);
+    timeline.record(&exec_context.cpu, LaunchPhase::TaskBegin);
+    let cpu = exec_context.cpu.clone();
+    let native = cpu.native().map_err(native_unavailable)?;
+
+    let argv = argv.into_vec();
+    let environment: Vec<String> = env
+        .into_iter()
+        .map(|(name, value)| {
+            let mut variable = String::with_capacity(name.len() + 1 + value.len());
+            variable.push_str(&name);
+            variable.push('=');
+            variable.push_str(&value);
+            variable
+        })
+        .collect();
+    let mapped = map_linux_image(
+        native,
+        exec_context.runtime_state.root_entropy(),
+        &executable,
+        &argv,
+        &environment,
+    )?;
 
     let process_guard = container.allocate_process().map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::OutOfMemory,
@@ -3376,7 +4218,7 @@ where
     let process = Process::<LinuxResources<Net>>::with_descriptors(
         executable.abi,
         pid,
-        image.program_break(PhysFrame::SIZE as u64),
+        mapped.program_break,
         table,
         Start {
             credentials,
@@ -3388,8 +4230,6 @@ where
             ..Start::default()
         },
     );
-    let observer = process.observer();
-    let proc_signals = process.process_signals();
     let grants = LinuxGrants::derive(container.authority());
     let tty = LinuxTtyState::new(container.authority(), &output_mode, instance_id);
     let shared = Arc::new(LinuxShared {
@@ -3399,11 +4239,11 @@ where
         runtime_state: exec_context.runtime_state.clone(),
         read_serial: exec_context.read_serial,
         write_serial: exec_context.write_serial,
+        exec_runtime,
         output_mode,
         launched_instance,
         signal_state,
         container,
-        _process_guard: process_guard,
         grants,
         tty: spin::Mutex::new(tty),
         serial_peek: spin::Mutex::new(Vec::new()),
@@ -3413,99 +4253,28 @@ where
         )),
         abi: executable.abi,
         registers: executable.abi.system_call_registers(),
-        user,
-        stack_top: top,
-        stack_base: stack.base as usize,
-        image_end,
-        sigreturn_trampoline,
-        space,
+        user: mapped.user,
+        stack_top: mapped.stack_top,
+        stack_base: mapped.stack_base,
+        image_end: mapped.image_end,
+        sigreturn_trampoline: mapped.sigreturn_trampoline,
+        space: mapped.space,
         process_cpu_ticks: AtomicU64::new(0),
         fatal_error: spin::Mutex::new(None),
+        exec_handoff: spin::Mutex::new(None),
         running_tasks: AtomicUsize::new(0),
         tasks_drained: helios_sync::Notify::new(),
     });
-    let main_platform = LinuxThreadPlatform::new(shared.clone(), pid);
 
     timeline.record(&cpu, LaunchPhase::GuestBegin);
-    let real_timer_driver = drive_real_timer(
-        cpu.clone(),
-        shared.timer.clone(),
-        shared.runtime_state.clone(),
-        proc_signals.clone(),
-        observer.clone(),
-    );
-    let main_and_siblings = async {
-        // `drive_linux_thread` consumes `main`'s `Process` and `Context`, so if
-        // `main` calls `SYS_exit` (`pthread_exit`) while worker threads
-        // continue, `main`'s thread handle withdraws immediately without
-        // holding the group open.
-        drive_linux_thread(context, process, main_platform).await;
-
-        // Wait for every live sibling thread to exit, still honouring external
-        // signals and instance kills while `main` is already gone.
-        loop {
-            let mut group_wait = observer.waiter();
-            let mut signal_wait = shared.signal_state.wait_state();
-            let mut kill_wait = shared.launched_instance.arm_kill_wait();
-            if let Some(reason) = shared.launched_instance.pending_kill() {
-                match reason {
-                    crate::KillReason::Operator | crate::KillReason::RequesterGone => {
-                        observer.terminate_group(helios_unix::ChildTermination::Killed);
-                    }
-                    crate::KillReason::OutOfMemory
-                    | crate::KillReason::SupervisorRestart
-                    | crate::KillReason::StoreFailed => {
-                        shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
-                            crate::InstanceKilled { reason },
-                        )));
-                        observer.terminate_group(helios_unix::ChildTermination::Killed);
-                    }
-                }
-            } else if !observer.group_ended() {
-                forward_external_signals(&proc_signals, &shared.signal_state);
-            }
-            if observer.all_threads_exited() {
-                break;
-            }
-            core::future::poll_fn(|cx| {
-                let group_changed = observer.poll_changed(cx, &mut group_wait).is_ready();
-                let signalled = shared
-                    .signal_state
-                    .poll_changed(cx, &mut signal_wait)
-                    .is_ready();
-                let killed = shared
-                    .launched_instance
-                    .poll_kill_wait(cx, &mut kill_wait)
-                    .is_ready();
-                if group_changed || signalled || killed {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
-        }
-    };
-    futures::future::join(main_and_siblings, real_timer_driver).await;
-
-    // Wait for every detached thread task to drop its `Process` (descriptor
-    // table) and `Arc<Space>` before reporting `ChildExit` to the parent.
-    shared.wait_tasks_drained().await;
-    timeline.record(&cpu, LaunchPhase::GuestEnd);
-
-    let fatal = shared.take_fatal();
-    let termination = observer.termination();
-    drop(observer);
-    drop(shared);
-
-    match fatal {
-        Some(error) => Err(error),
-        None => Ok(ChildExit {
-            instance_id,
-            termination,
-            filesystem: None,
-        }),
-    }
+    drive_linux_process_lifecycle(
+        mapped.context,
+        process,
+        shared,
+        Some(process_guard),
+        timeline.clone(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -3543,6 +4312,9 @@ mod tests {
         fn invalidate(&self, _: u64, _: u64) {}
         fn physical(&self, frame: NonNull<u8>) -> u64 {
             frame.as_ptr() as u64
+        }
+        fn new_empty(&self) -> Result<Self, NativeError> {
+            Ok(DummyTables)
         }
     }
 

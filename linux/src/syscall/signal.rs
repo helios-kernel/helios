@@ -46,8 +46,9 @@ use super::{
 };
 use crate::abi::Abi;
 use crate::signal_frame::{
-    self, FrameDeliveryInput, SA_NODEFER, SA_RESETHAND, SA_RESTART, SIGINFO_SIZE, SS_AUTODISARM,
-    SS_DISABLE, SS_ONSTACK, STACK_T_SIZE, SigAltStack, SigInfo, SignalFrameError,
+    self, FrameDeliveryInput, SA_NOCLDSTOP, SA_NOCLDWAIT, SA_NODEFER, SA_RESETHAND, SA_RESTART,
+    SIGINFO_SIZE, SS_AUTODISARM, SS_DISABLE, SS_ONSTACK, STACK_T_SIZE, SigAltStack, SigInfo,
+    SignalFrameError,
 };
 
 // Linux UAPI constants (`include/uapi/asm-generic/signal-defs.h`,
@@ -166,6 +167,46 @@ impl ActionsState {
         self.meta[index] = ActionMeta::default();
         let _ = self.dispositions.set(signal, SignalDisposition::Default);
     }
+
+    fn clone_state(&self) -> Self {
+        Self {
+            dispositions: self.dispositions.clone(),
+            meta: self.meta,
+        }
+    }
+
+    fn reset_for_exec(&mut self) {
+        for raw in 1..=Signal::MAX {
+            let sig = Signal::new(raw).expect("1..=64 is valid");
+            if matches!(self.dispositions.get(sig), SignalDisposition::Catch(_)) {
+                self.reset_to_default(sig);
+            }
+        }
+    }
+
+    fn ignored_signals(&self) -> Vec<Signal> {
+        let mut out = Vec::new();
+        for raw in 1..=Signal::MAX {
+            let sig = Signal::new(raw).expect("1..=64 is valid");
+            if matches!(self.dispositions.get(sig), SignalDisposition::Ignore) {
+                out.push(sig);
+            }
+        }
+        out
+    }
+
+    fn sigchld_auto_reap(&self) -> bool {
+        let index = (Signal::SIGCHLD.raw() - 1) as usize;
+        matches!(
+            self.dispositions.get(Signal::SIGCHLD),
+            SignalDisposition::Ignore
+        ) || (self.meta[index].flags & SA_NOCLDWAIT != 0)
+    }
+
+    fn sigchld_nocldstop(&self) -> bool {
+        let index = (Signal::SIGCHLD.raw() - 1) as usize;
+        self.meta[index].flags & SA_NOCLDSTOP != 0
+    }
 }
 
 /// Standard coalesced signals (`1..=31`) plus queued FIFO real-time signals
@@ -257,10 +298,15 @@ struct IntervalTimers {
 }
 
 /// Process-wide signal state shared by all threads in a Linux thread group.
+///
+/// The disposition table (`actions`) is separately reference-counted so
+/// `clone(CLONE_SIGHAND)` without `CLONE_THREAD` shares only dispositions
+/// while keeping distinct `tgid`, pending mailboxes, stop state, and timers,
+/// and unshares the table on `execve` (`fs/exec.c` `unshare_sighand`).
 pub struct ProcessSignals {
     tgid: NonZeroU32,
     pgid: AtomicU32,
-    actions: Mutex<ActionsState>,
+    actions: Mutex<Arc<Mutex<ActionsState>>>,
     shared_pending: Mutex<PendingQueue>,
     shared_bits: AtomicU64,
     threads: Mutex<Vec<Arc<ThreadSignalSlot>>>,
@@ -275,7 +321,7 @@ impl ProcessSignals {
         Arc::new(Self {
             tgid,
             pgid: AtomicU32::new(tgid.get()),
-            actions: Mutex::new(ActionsState::new()),
+            actions: Mutex::new(Arc::new(Mutex::new(ActionsState::new()))),
             shared_pending: Mutex::new(PendingQueue::new()),
             shared_bits: AtomicU64::new(0),
             threads: Mutex::new(Vec::new()),
@@ -286,12 +332,96 @@ impl ProcessSignals {
         })
     }
 
+    fn actions_handle(&self) -> Arc<Mutex<ActionsState>> {
+        self.actions.lock().clone()
+    }
+
     pub const fn tgid(&self) -> NonZeroU32 {
         self.tgid
     }
 
     pub fn pgid(&self) -> u32 {
         self.pgid.load(Ordering::Acquire)
+    }
+
+    pub fn set_pgid(&self, pgid: u32) {
+        self.pgid.store(pgid, Ordering::Release);
+    }
+
+    /// Creates a child process's signal state for `fork`/`clone`: inherits
+    /// `pgid` and signal dispositions (sharing the table when `share_sighand`
+    /// is set, or resetting to defaults when `clear_sighand` is set), while
+    /// always giving the child its own `tgid`, empty pending queues, stop
+    /// state, and disarmed interval timers (`kernel/fork.c`).
+    pub(super) fn clone_for_fork(
+        &self,
+        child_tgid: NonZeroU32,
+        share_sighand: bool,
+        clear_sighand: bool,
+    ) -> Arc<Self> {
+        let actions = if share_sighand {
+            self.actions_handle()
+        } else if clear_sighand {
+            Arc::new(Mutex::new(ActionsState::new()))
+        } else {
+            let snapshot = self.actions_handle().lock().clone_state();
+            Arc::new(Mutex::new(snapshot))
+        };
+        Arc::new(Self {
+            tgid: child_tgid,
+            pgid: AtomicU32::new(self.pgid()),
+            actions: Mutex::new(actions),
+            shared_pending: Mutex::new(PendingQueue::new()),
+            shared_bits: AtomicU64::new(0),
+            threads: Mutex::new(Vec::new()),
+            stopped: AtomicBool::new(false),
+            stop_notify: Notify::new(),
+            timers: Mutex::new(IntervalTimers::default()),
+            real_timer_notify: Notify::new(),
+        })
+    }
+
+    /// Applies POSIX `execve` signal-disposition reset: unshares the
+    /// disposition table if shared via `CLONE_SIGHAND` (`fs/exec.c`
+    /// `unshare_sighand`), resets caught handlers to `SIG_DFL` while keeping
+    /// `SIG_IGN` dispositions ignored (`kernel/signal.c`
+    /// `flush_signal_handlers`), and disarms CPU interval timers.
+    pub fn reset_for_exec(&self) {
+        {
+            let mut slot = self.actions.lock();
+            if Arc::strong_count(&slot) > 1 {
+                let mut unshared = slot.lock().clone_state();
+                unshared.reset_for_exec();
+                *slot = Arc::new(Mutex::new(unshared));
+            } else {
+                slot.lock().reset_for_exec();
+            }
+        }
+        self.stopped.store(false, Ordering::Release);
+        {
+            let mut timers = self.timers.lock();
+            timers.virtual_remaining_ns = 0;
+            timers.virtual_interval_ns = 0;
+            timers.prof_remaining_ns = 0;
+            timers.prof_interval_ns = 0;
+        }
+    }
+
+    /// Signals currently set to `SIG_IGN` (carried across `execve` into a
+    /// WASIX/Wasm replacement image).
+    pub fn ignored_signals(&self) -> Vec<Signal> {
+        self.actions_handle().lock().ignored_signals()
+    }
+
+    /// Whether exiting children should be auto-reaped without becoming zombies
+    /// (`SIGCHLD` ignored or `SA_NOCLDWAIT`).
+    pub(super) fn sigchld_auto_reap(&self) -> bool {
+        self.actions_handle().lock().sigchld_auto_reap()
+    }
+
+    /// Whether child stop/continue notifications are suppressed (`SA_NOCLDSTOP`).
+    pub(super) fn sigchld_nocldstop(&self) -> bool {
+        self.actions_handle().lock().sigchld_nocldstop()
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -421,17 +551,18 @@ impl ProcessSignals {
     /// Enqueues an externally raised signal (for example from a parent WASIX
     /// process or owner kill) into this process's shared signal mailbox.
     pub fn raise_external(&self, signal: Signal) {
-        self.raise_process(SigInfo::from_kill(signal, 0, 0));
+        let _ = self.raise_process(SigInfo::from_kill(signal, 0, 0));
     }
 
     /// Enqueues a process-directed signal (`kill`, interval timers, external
     /// signals) and wakes an eligible thread (`kernel/signal.c`
-    /// `__send_signal_locked` / `complete_signal`).
-    pub fn raise_process(&self, info: SigInfo) {
+    /// `__send_signal_locked` / `complete_signal`). Returns `true` when
+    /// `SIGCONT` resumed a stopped process.
+    pub fn raise_process(&self, info: SigInfo) -> bool {
         let signal = info.signo;
-        self.apply_stop_continue_side_effects(signal);
+        let resumed = self.apply_stop_continue_side_effects(signal);
 
-        let is_ignored = self.actions.lock().is_ignored(signal);
+        let is_ignored = self.actions_handle().lock().is_ignored(signal);
         let to_wake = {
             let mut pending = self.shared_pending.lock();
             let threads = self.threads.lock();
@@ -444,7 +575,7 @@ impl ProcessSignals {
                             .contains(signal)
                 });
                 if !any_blocked_or_waiting {
-                    return;
+                    return resumed;
                 }
             }
             pending.push(info);
@@ -480,19 +611,21 @@ impl ProcessSignals {
         for slot in to_wake {
             slot.wake_notify.notify_all();
         }
+        resumed
     }
 
     /// Enqueues a thread-directed signal (`tkill`, `tgkill`, `SIGPIPE`).
-    pub fn raise_thread(&self, target: &ThreadSignalSlot, info: SigInfo) {
+    /// Returns `true` when `SIGCONT` resumed a stopped process.
+    pub fn raise_thread(&self, target: &ThreadSignalSlot, info: SigInfo) -> bool {
         let signal = info.signo;
-        self.apply_stop_continue_side_effects(signal);
+        let resumed = self.apply_stop_continue_side_effects(signal);
 
-        let is_ignored = self.actions.lock().is_ignored(signal);
+        let is_ignored = self.actions_handle().lock().is_ignored(signal);
         let waiting_for =
             SignalSet::from_bits(target.sigtimedwait_set.load(Ordering::Acquire)).contains(signal);
         let masked = target.current_mask().contains(signal);
         if is_ignored && !signal.is_uncatchable() && !masked && !waiting_for {
-            return;
+            return resumed;
         }
         {
             let mut pending = target.private_pending.lock();
@@ -511,21 +644,26 @@ impl ProcessSignals {
         } else if waiting_for || (!masked && !is_ignored) {
             target.wake_notify.notify_all();
         }
+        resumed
     }
 
-    fn apply_stop_continue_side_effects(&self, signal: Signal) {
+    fn apply_stop_continue_side_effects(&self, signal: Signal) -> bool {
         if signal == Signal::SIGCONT {
-            self.stopped.store(false, Ordering::Release);
+            let was_stopped = self.stopped.swap(false, Ordering::AcqRel);
             self.discard_pending_everywhere(Signal::SIGSTOP);
             self.discard_pending_everywhere(Signal::SIGTSTP);
             self.discard_pending_everywhere(Signal::SIGTTIN);
             self.discard_pending_everywhere(Signal::SIGTTOU);
             self.stop_notify.notify_all();
+            was_stopped
         } else if matches!(
             signal,
             Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU
         ) {
             self.discard_pending_everywhere(Signal::SIGCONT);
+            false
+        } else {
+            false
         }
     }
 
@@ -628,7 +766,7 @@ impl ThreadSignalSlot {
         // interrupt a blocking syscall.
         let mut remaining = unmasked;
         while let Some(signal) = remaining.take_first() {
-            let ignored = self.process.actions.lock().is_ignored(signal);
+            let ignored = self.process.actions_handle().lock().is_ignored(signal);
             if ignored && !signal.is_uncatchable() {
                 let single = SignalSet::EMPTY.with(signal);
                 let _ = self.take_private_matching(single);
@@ -678,6 +816,36 @@ impl ThreadSignalSlot {
         taken
     }
 
+    pub(super) fn clone_altstack(&self) -> SigAltStack {
+        *self.altstack.lock()
+    }
+
+    pub(super) fn set_altstack(&self, alt: SigAltStack) {
+        *self.altstack.lock() = alt;
+    }
+
+    pub(super) fn reset_for_exec(&self) {
+        *self.altstack.lock() = SigAltStack::disabled();
+        *self.saved_mask.lock() = None;
+    }
+
+    /// Takes the next pending signal matching `wanted` (used by the kernel to
+    /// forward container signals into a Wasm/WASIX replacement image).
+    pub fn take_pending_signal(&self) -> Option<Signal> {
+        self.take_any_matching(SignalSet::EMPTY.complement())
+            .map(|info| info.signo)
+    }
+
+    /// Arms a wakeup waiter on this thread's signal mailbox.
+    pub fn signal_waiter(&self) -> NotifyWaiter {
+        self.wake_notify.waiter()
+    }
+
+    /// Polls this thread's signal wakeup waiter.
+    pub fn poll_signal_waiter(&self, cx: &mut Context<'_>, waiter: &mut NotifyWaiter) -> Poll<()> {
+        self.wake_notify.poll_notified(cx, waiter)
+    }
+
     fn take_any_matching(&self, wanted: SignalSet) -> Option<SigInfo> {
         // Thread-private signals take precedence over process-shared signals
         // (`kernel/signal.c` `dequeue_signal`).
@@ -715,7 +883,7 @@ pub enum SignalDelivery {
     Delivered,
     /// A default stop signal (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`) stopped
     /// the process; the thread should park until `SIGCONT` or `SIGKILL`.
-    Stopped,
+    Stopped(Signal),
     /// A fatal signal ended the thread group.
     Terminated { signal: Signal, core_dumped: bool },
 }
@@ -771,7 +939,8 @@ pub fn deliver_pending_signals<C: UserContext, M: UserMemory>(
         };
 
         let resolved = {
-            let mut actions = thread.process.actions.lock();
+            let actions_arc = thread.process.actions_handle();
+            let mut actions = actions_arc.lock();
             let resolved = actions.resolved(info.signo);
             if let ResolvedSignal::Catch(handler) = resolved
                 && handler.flags & SA_RESETHAND != 0
@@ -810,7 +979,7 @@ pub fn deliver_pending_signals<C: UserContext, M: UserMemory>(
                 {
                     rollback_syscall(abi, context, orig_reg);
                 }
-                return SignalDelivery::Stopped;
+                return SignalDelivery::Stopped(info.signo);
             }
             ResolvedSignal::Catch(action) => {
                 match restart {
@@ -890,7 +1059,8 @@ pub fn deliver_fault_signal<C: UserContext, M: UserMemory>(
     let active_mask = thread.current_mask();
 
     let action = {
-        let mut actions = thread.process.actions.lock();
+        let actions_arc = thread.process.actions_handle();
+        let mut actions = actions_arc.lock();
         if active_mask.contains(signal) {
             actions.reset_to_default(signal);
             None
@@ -1020,8 +1190,9 @@ pub(super) fn rt_sigaction<M: UserMemory>(
         None
     };
 
+    let actions_arc = signals.actions_handle();
     let (old_bytes, became_ignored) = {
-        let mut actions = signals.actions.lock();
+        let mut actions = actions_arc.lock();
         let old = actions.read_raw(signal);
         let ignored = new_bytes.is_some_and(|buf| actions.set_raw(signal, &buf));
         (old, ignored)
@@ -1031,7 +1202,7 @@ pub(super) fn rt_sigaction<M: UserMemory>(
         // Writing oldact failed; on Linux the read/write order checks oldact
         // before mutating, so restore if we changed it.
         if new_bytes.is_some() {
-            signals.actions.lock().set_raw(signal, &old_bytes);
+            actions_arc.lock().set_raw(signal, &old_bytes);
         }
         return errno(EFAULT);
     }
@@ -1238,7 +1409,8 @@ pub(super) async fn rt_sigtimedwait<M: UserMemory, C: Clock>(
 }
 
 fn has_non_ignored_signal(process: &ProcessSignals, mut set: SignalSet) -> bool {
-    let actions = process.actions.lock();
+    let actions_arc = process.actions_handle();
+    let actions = actions_arc.lock();
     while let Some(signal) = set.take_first() {
         if signal.is_uncatchable() || !actions.is_ignored(signal) {
             return true;
@@ -1311,6 +1483,7 @@ pub(super) fn sigaltstack<M: UserMemory>(
 /// Checks whether `sender` may signal `target` inside the container
 /// (`kernel/signal.c` `check_kill_permission`).
 fn can_signal(
+    pids: &PidNamespace,
     sender_tgid: NonZeroU32,
     sender: &Credentials,
     target_tgid: NonZeroU32,
@@ -1332,9 +1505,9 @@ fn can_signal(
     {
         return true;
     }
-    // `SIGCONT` is allowed within the same session (every process in one
-    // container shares the initial session).
     signal == Some(Signal::SIGCONT)
+        && pids.sid(sender_tgid.get()).is_some()
+        && pids.sid(sender_tgid.get()) == pids.sid(target_tgid.get())
 }
 
 fn decode_optional_signal(raw: i32) -> Result<Option<Signal>, u64> {
@@ -1370,6 +1543,7 @@ pub(super) fn kill(
         };
         let target_creds = target_creds.lock().clone();
         if !can_signal(
+            pids,
             caller_tgid,
             caller_creds,
             target_signals.tgid(),
@@ -1378,12 +1552,14 @@ pub(super) fn kill(
         ) {
             return errno(EPERM);
         }
-        if let Some(sig) = signal {
-            target_signals.raise_process(SigInfo::from_kill(
+        if let Some(sig) = signal
+            && target_signals.raise_process(SigInfo::from_kill(
                 sig,
                 caller_tgid.get(),
                 caller_creds.user.real,
-            ));
+            ))
+        {
+            pids.mark_continued(target_signals.tgid());
         }
         return 0;
     }
@@ -1407,6 +1583,7 @@ pub(super) fn kill(
     for (target_signals, target_creds) in targets {
         let creds = target_creds.lock().clone();
         if !can_signal(
+            pids,
             caller_tgid,
             caller_creds,
             target_signals.tgid(),
@@ -1416,12 +1593,14 @@ pub(super) fn kill(
             continue;
         }
         delivered_any = true;
-        if let Some(sig) = signal {
-            target_signals.raise_process(SigInfo::from_kill(
+        if let Some(sig) = signal
+            && target_signals.raise_process(SigInfo::from_kill(
                 sig,
                 caller_tgid.get(),
                 caller_creds.user.real,
-            ));
+            ))
+        {
+            pids.mark_continued(target_signals.tgid());
         }
     }
     if delivered_any { 0 } else { errno(EPERM) }
@@ -1446,14 +1625,16 @@ pub(super) fn tkill(
         return errno(ESRCH);
     };
     let creds = target_creds.lock().clone();
-    if !can_signal(caller_tgid, caller_creds, target_tgid, &creds, signal) {
+    if !can_signal(pids, caller_tgid, caller_creds, target_tgid, &creds, signal) {
         return errno(EPERM);
     }
-    if let Some(sig) = signal {
-        target_slot.process.raise_thread(
+    if let Some(sig) = signal
+        && target_slot.process.raise_thread(
             &target_slot,
             SigInfo::from_tkill(sig, caller_tgid.get(), caller_creds.user.real),
-        );
+        )
+    {
+        pids.mark_continued(target_tgid);
     }
     0
 }
@@ -1481,14 +1662,16 @@ pub(super) fn tgkill(
         return errno(ESRCH);
     }
     let creds = target_creds.lock().clone();
-    if !can_signal(caller_tgid, caller_creds, target_tgid, &creds, signal) {
+    if !can_signal(pids, caller_tgid, caller_creds, target_tgid, &creds, signal) {
         return errno(EPERM);
     }
-    if let Some(sig) = signal {
-        target_slot.process.raise_thread(
+    if let Some(sig) = signal
+        && target_slot.process.raise_thread(
             &target_slot,
             SigInfo::from_tkill(sig, caller_tgid.get(), caller_creds.user.real),
-        );
+        )
+    {
+        pids.mark_continued(target_tgid);
     }
     0
 }

@@ -1556,6 +1556,15 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
         self.slots
     }
 
+    /// Reconstructs a preview1 descriptor table from shared `helios-unix`
+    /// slots when a Linux process executes a Wasm/WASIX image (`execve`).
+    #[cfg(feature = "linux")]
+    pub(super) fn from_slots(
+        slots: helios_unix::DescriptorSlots<Preview1DescriptorEntry<Net>>,
+    ) -> Self {
+        Self { slots }
+    }
+
     pub(super) fn clone_for_exec(&self) -> Self {
         let mut table = Self::from_entries(
             self.slots

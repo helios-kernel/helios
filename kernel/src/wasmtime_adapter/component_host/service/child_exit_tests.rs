@@ -983,6 +983,9 @@ mod linux_tests {
         fn free_range(&self, hint: VirtAddr, _: usize) -> Option<VirtAddr> {
             Some(hint)
         }
+        fn clone_cow(&self) -> Result<Self, NativeError> {
+            Ok(MockSpace)
+        }
     }
 
     struct MockContext {
@@ -1247,7 +1250,10 @@ mod linux_tests {
             exec_context.runtime_state.root_namespace(),
         ));
         let mut fut = core::pin::pin!(run_linux_process(
-            exec_context,
+            LinuxExecRuntime {
+                exec_context,
+                wasm: None,
+            },
             argv,
             Vec::new(),
             container,
@@ -1439,6 +1445,11 @@ mod linux_tests {
         }
         fn free_range(&self, hint: VirtAddr, _: usize) -> Option<VirtAddr> {
             Some(hint)
+        }
+        fn clone_cow(&self) -> Result<Self, NativeError> {
+            Ok(ScriptedSpace {
+                memory: self.memory.clone(),
+            })
         }
     }
 
@@ -1694,7 +1705,10 @@ mod linux_tests {
         Box::pin(async move {
             let _executor = executor;
             run_linux_process(
-                exec_context,
+                LinuxExecRuntime {
+                    exec_context,
+                    wasm: None,
+                },
                 argv,
                 Vec::new(),
                 container,
