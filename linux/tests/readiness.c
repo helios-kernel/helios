@@ -132,10 +132,15 @@ static void check_select_and_pselect6(void) {
     CHECK(FD_ISSET(pfds[0], &rfds));
     CHECK(FD_ISSET(pfds[1], &wfds));
 
-    /* Closed fd in fd_set -> EBADF; negative nfds -> EINVAL */
+    /* Closed fd in fd_set -> EBADF; negative nfds -> EINVAL.
+     * Use an fd that was opened and closed so it stays below Linux's
+     * `fdt->max_fds` clamp in `core_sys_select`. */
+    int closed_fd = (int)SYS(SYS_dup, pfds[0]);
+    CHECK(closed_fd >= 0);
+    CHECK(SYS(SYS_close, closed_fd) == 0);
     FD_ZERO(&rfds);
-    FD_SET(997, &rfds);
-    CHECK(SYS(SYS_pselect6, 998, &rfds, NULL, NULL, &zero, NULL) == -EBADF);
+    FD_SET(closed_fd, &rfds);
+    CHECK(SYS(SYS_pselect6, closed_fd + 1, &rfds, NULL, NULL, &zero, NULL) == -EBADF);
     CHECK(SYS(SYS_pselect6, -1L, NULL, NULL, NULL, &zero, NULL) == -EINVAL);
 
     /* Close write end -> EOF makes read end ready in readfds */
@@ -221,7 +226,7 @@ static void check_stdin_epoll_and_nonblock(void) {
 
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "hold-open") == 0) {
-        struct timespec pause = { .tv_sec = 0, .tv_nsec = 200 * 1000 * 1000 };
+        struct timespec pause = { .tv_sec = 1, .tv_nsec = 0 };
         (void)nanosleep(&pause, NULL);
         return 0;
     }
@@ -229,15 +234,18 @@ int main(int argc, char **argv) {
     int stdin_quiet = argc >= 2 && strcmp(argv[1], "stdin-quiet") == 0;
     int stdin_epoll = argc >= 2 && strcmp(argv[1], "stdin-epoll") == 0;
 
-    check_poll_and_ppoll();
-    check_select_and_pselect6();
-    check_regular_file_readiness();
-    check_thread_blocking();
+    /* Run stdin checks before the sleep-bearing tests so the pipeline writer
+     * (`hold-open`) is guaranteed to still have its write end open even under
+     * slow TCG emulation. */
     if (stdin_quiet) {
         check_stdin_epoll_and_nonblock();
     } else if (stdin_epoll) {
         check_stdin_epoll_only();
     }
+    check_poll_and_ppoll();
+    check_select_and_pselect6();
+    check_regular_file_readiness();
+    check_thread_blocking();
 
     puts("readiness: ok");
     return 0;
