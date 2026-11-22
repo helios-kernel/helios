@@ -108,6 +108,9 @@ const SIOCGIFMTU: u32 = 0x8921;
 const SIOCSIFMTU: u32 = 0x8922;
 const SIOCGIFHWADDR: u32 = 0x8927;
 const SIOCGIFINDEX: u32 = 0x8933;
+const SIOCGIFTXQLEN: u32 = 0x8942;
+
+const DEFAULT_TXQLEN: i32 = 1000;
 
 const IFREQ_LEN: usize = 40;
 const IFCONF_LEN: usize = 16;
@@ -325,6 +328,14 @@ pub(crate) async fn socket_ioctl<N: SocketNetwork, M: UserMemory, Net: Network<N
             memory.read(arg, &mut req).map_err(|_| EFAULT)?;
             let ifindex = lookup_ifindex(&req[0..16])?;
             req[16..20].copy_from_slice(&(ifindex as i32).to_ne_bytes());
+            memory.write(arg, &req).map_err(|_| EFAULT)?;
+            Ok(Some(0))
+        }
+        SIOCGIFTXQLEN => {
+            let mut req = [0u8; IFREQ_LEN];
+            memory.read(arg, &mut req).map_err(|_| EFAULT)?;
+            let _ifindex = lookup_ifindex(&req[0..16])?;
+            req[16..20].copy_from_slice(&DEFAULT_TXQLEN.to_ne_bytes());
             memory.write(arg, &req).map_err(|_| EFAULT)?;
             Ok(Some(0))
         }

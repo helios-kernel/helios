@@ -341,6 +341,14 @@ enum SocketBody<Net: SocketNetwork> {
     },
     Netlink(Mutex<NetlinkSocket>),
     Packet(Mutex<PacketSocket<Net>>),
+    UnixUnbound {
+        options: Mutex<SocketOptions>,
+    },
+    RawIp {
+        family: SocketFamily,
+        protocol: i32,
+        options: Mutex<SocketOptions>,
+    },
 }
 
 struct SharedSocket<Net: SocketNetwork> {
@@ -503,6 +511,53 @@ impl<Net: SocketNetwork> Socket<Net> {
         }))
     }
 
+    /// An unbound Unix-domain socket (e.g. `socket(AF_UNIX, SOCK_DGRAM, 0)`,
+    /// used by `if_nametoindex` / `SIOCGIF*` ioctls).
+    pub fn unix_unbound(kind: SocketKind) -> Self {
+        Self(Arc::new(SharedSocket {
+            kind,
+            protocol: None,
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
+            body: SocketBody::UnixUnbound {
+                options: Mutex::new(SocketOptions::for_network::<Net>()),
+            },
+        }))
+    }
+
+    /// Whether this socket is an unbound `AF_UNIX` socket.
+    pub fn is_unix_unbound(&self) -> bool {
+        matches!(self.0.body, SocketBody::UnixUnbound { .. })
+    }
+
+    /// A raw IP control socket (`socket(AF_INET|AF_INET6, SOCK_RAW, proto)`),
+    /// used by `udhcpc` and similar tools for `SIOCGIF*` interface queries.
+    pub fn raw_ip(family: SocketFamily, protocol: i32) -> Self {
+        Self(Arc::new(SharedSocket {
+            kind: SocketKind::Raw,
+            protocol: None,
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
+            body: SocketBody::RawIp {
+                family,
+                protocol,
+                options: Mutex::new(SocketOptions::for_network::<Net>()),
+            },
+        }))
+    }
+
+    /// Raw IP protocol number if this is a `RawIp` socket.
+    pub fn raw_ip_protocol(&self) -> Option<i32> {
+        match self.0.body {
+            SocketBody::RawIp { protocol, .. } => Some(protocol),
+            _ => None,
+        }
+    }
+
     /// Two connected ends of a socket pair.
     pub fn pair(kind: SocketKind) -> (Self, Self) {
         let (left_writer, right_reader) = byte_channel();
@@ -654,7 +709,11 @@ impl<Net: SocketNetwork> Socket<Net> {
         match &self.0.body {
             SocketBody::Tcp(tcp) => Some(tcp.lock().family()),
             SocketBody::Udp(udp) => Some(udp.lock().family()),
-            SocketBody::Pair { .. } | SocketBody::Netlink(_) | SocketBody::Packet(_) => None,
+            SocketBody::RawIp { family, .. } => Some(*family),
+            SocketBody::Pair { .. }
+            | SocketBody::Netlink(_)
+            | SocketBody::Packet(_)
+            | SocketBody::UnixUnbound { .. } => None,
         }
     }
 
@@ -796,7 +855,9 @@ impl<Net: SocketNetwork> Socket<Net> {
         match &self.0.body {
             SocketBody::Tcp(tcp) => *tcp.lock().options(),
             SocketBody::Udp(udp) => *udp.lock().options(),
-            SocketBody::Pair { options, .. } => *options.lock(),
+            SocketBody::Pair { options, .. }
+            | SocketBody::UnixUnbound { options }
+            | SocketBody::RawIp { options, .. } => *options.lock(),
             SocketBody::Netlink(nl) => nl.lock().options,
             SocketBody::Packet(pkt) => pkt.lock().options,
         }
@@ -806,7 +867,9 @@ impl<Net: SocketNetwork> Socket<Net> {
         match &self.0.body {
             SocketBody::Tcp(tcp) => f(tcp.lock().options_mut()),
             SocketBody::Udp(udp) => f(udp.lock().options_mut()),
-            SocketBody::Pair { options, .. } => f(&mut options.lock()),
+            SocketBody::Pair { options, .. }
+            | SocketBody::UnixUnbound { options }
+            | SocketBody::RawIp { options, .. } => f(&mut options.lock()),
             SocketBody::Netlink(nl) => f(&mut nl.lock().options),
             SocketBody::Packet(pkt) => f(&mut pkt.lock().options),
         }
@@ -838,7 +901,10 @@ impl<Net: SocketNetwork> Socket<Net> {
                 UdpSocket::Bound { socket, .. } => Some(SocketHandle::UdpSocket(socket.id())),
                 UdpSocket::Unbound { .. } => None,
             },
-            SocketBody::Pair { .. } | SocketBody::Netlink(_) => None,
+            SocketBody::Pair { .. }
+            | SocketBody::Netlink(_)
+            | SocketBody::UnixUnbound { .. }
+            | SocketBody::RawIp { .. } => None,
             SocketBody::Packet(pkt) => Some(SocketHandle::PacketSocket(pkt.lock().handle.id())),
         }
     }

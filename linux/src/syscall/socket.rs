@@ -760,8 +760,28 @@ pub(crate) fn socket<R: Resources, Net: Network<R::Network>>(
                     }
                     Socket::<R::Network>::udp(family)
                 }
+                SOCK_RAW => {
+                    if !ctx.cap_net_raw {
+                        return errno(EPERM);
+                    }
+                    if !(0..=255).contains(&protocol) {
+                        return errno(EPROTONOSUPPORT);
+                    }
+                    Socket::<R::Network>::raw_ip(family, protocol)
+                }
                 _ => return errno(EINVAL),
             }
+        }
+        AF_UNIX => {
+            if protocol != 0 {
+                return errno(EPROTONOSUPPORT);
+            }
+            let kind = match sock_type {
+                SOCK_STREAM => SocketKind::Stream,
+                SOCK_DGRAM => SocketKind::Datagram,
+                _ => return errno(EPROTOTYPE),
+            };
+            Socket::<R::Network>::unix_unbound(kind)
         }
         AF_NETLINK => {
             if sock_type != SOCK_RAW && sock_type != SOCK_DGRAM {
@@ -1301,7 +1321,7 @@ pub(crate) async fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Net
         Ok(sock) => sock,
         Err(err) => return errno(err),
     };
-    if sock.is_pair() {
+    if sock.is_pair() || sock.is_unix_unbound() {
         return match write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &AF_UNIX.to_le_bytes()) {
             Ok(()) => 0,
             Err(err) => errno(err),

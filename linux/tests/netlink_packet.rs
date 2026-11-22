@@ -1570,3 +1570,96 @@ fn recvmsg_truncation_flags_rcvtimeo_eagain_and_fail_fast_mutations() {
     mem.read(0x2000, &mut ack).unwrap();
     assert_eq!(nlmsg_error_code(&ack), -(EOPNOTSUPP as i32));
 }
+
+#[test]
+fn unix_dgram_and_inet_raw_sockets_support_interface_ioctls_and_cap_net_raw() {
+    const AF_UNIX: u64 = 1;
+    const SOCK_DGRAM: u64 = 2;
+    const SOCK_RAW: u64 = 3;
+    const IPPROTO_RAW: u64 = 255;
+    const SIOCGIFTXQLEN: u64 = 0x8942;
+
+    let mut process = new_process(Credentials::root());
+    let mut mem = FlatMemory::new(64 * 1024);
+    let mut plat = MockPlatform::new(true);
+
+    // 1. musl if_nametoindex opens AF_UNIX SOCK_DGRAM and calls SIOCGIFINDEX / SIOCGIFTXQLEN.
+    let unix_fd = call(
+        &mut process,
+        &mut mem,
+        &mut plat,
+        SYS_SOCKET,
+        [AF_UNIX, SOCK_DGRAM, 0, 0, 0, 0],
+    );
+    assert!(unix_fd >= 0);
+    let unix_fd = unix_fd as u64;
+
+    let mut req = [0u8; 40];
+    req[0..4].copy_from_slice(b"eth0");
+    mem.write(0x100, &req).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [unix_fd, SIOCGIFINDEX, 0x100, 0, 0, 0]
+        ),
+        0
+    );
+    mem.read(0x100, &mut req).unwrap();
+    assert_eq!(i32::from_ne_bytes(req[16..20].try_into().unwrap()), 2);
+
+    req[16..20].fill(0);
+    mem.write(0x100, &req).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [unix_fd, SIOCGIFTXQLEN, 0x100, 0, 0, 0]
+        ),
+        0
+    );
+    mem.read(0x100, &mut req).unwrap();
+    assert_eq!(i32::from_ne_bytes(req[16..20].try_into().unwrap()), 1000);
+
+    // 2. BusyBox udhcpc opens AF_INET SOCK_RAW IPPROTO_RAW for SIOCGIFINDEX / SIOCGIFHWADDR.
+    //    Requires CAP_NET_RAW: rejected with EPERM without it.
+    let mut unpriv = new_process(creds_without(CAP_NET_RAW));
+    assert_eq!(
+        call(
+            &mut unpriv,
+            &mut mem,
+            &mut plat,
+            SYS_SOCKET,
+            [AF_INET as u64, SOCK_RAW, IPPROTO_RAW, 0, 0, 0]
+        ),
+        -(EPERM as i64)
+    );
+
+    let raw_fd = call(
+        &mut process,
+        &mut mem,
+        &mut plat,
+        SYS_SOCKET,
+        [AF_INET as u64, SOCK_RAW, IPPROTO_RAW, 0, 0, 0],
+    );
+    assert!(raw_fd >= 0);
+    let raw_fd = raw_fd as u64;
+    req[16..20].fill(0);
+    mem.write(0x100, &req).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_IOCTL,
+            [raw_fd, SIOCGIFHWADDR, 0x100, 0, 0, 0]
+        ),
+        0
+    );
+    mem.read(0x100, &mut req).unwrap();
+    assert_eq!(&req[18..24], &[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+}
