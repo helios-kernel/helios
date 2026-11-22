@@ -18,6 +18,10 @@ pub(crate) struct File<'a> {
     pub(crate) root: TreeRoot,
     pub(crate) number: u64,
     pub(crate) metadata: &'a Metadata,
+    /// The running transaction's dirty pages of the file, which a read sees
+    /// in place of its extents.
+    #[cfg(feature = "write")]
+    pub(crate) dirty: Option<&'a crate::delalloc::DirtyFile>,
 }
 
 impl File<'_> {
@@ -41,7 +45,7 @@ impl<'a, S: BlockSource, N: NodeSource> Reader<'a, S, N> {
         }
     }
     /// Every EXTENT_DATA item of the file, in file-offset order.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(all(test, feature = "write"), feature = "test-support"))]
     pub(crate) async fn extents(
         &self,
         file: File<'_>,
@@ -104,7 +108,8 @@ impl<'a, S: BlockSource, N: NodeSource> Reader<'a, S, N> {
         Ok(found)
     }
 
-    /// The file bytes at `offset`, through the inode's extents.
+    /// The file bytes at `offset`: its dirty pages where it has them, as a
+    /// read finds them in the page cache, and its extents elsewhere.
     pub(crate) async fn read(
         &self,
         file: File<'_>,
@@ -117,7 +122,42 @@ impl<'a, S: BlockSource, N: NodeSource> Reader<'a, S, N> {
         }
         let len = (size - offset).min(buf.len() as u64) as usize;
         let buf = &mut buf[..len];
-        let end = offset + len as u64;
+        #[cfg(feature = "write")]
+        if let Some(dirty) = file.dirty {
+            let end = offset + len as u64;
+            let sector = u64::from(self.volume.superblock().sectorsize());
+            let pages: Vec<_> = dirty.pages(offset - offset % sector..end).collect();
+            let mut position = offset;
+            for (page_offset, page) in pages {
+                let from = page_offset.max(offset);
+                if from > position {
+                    self.read_extents(
+                        file,
+                        position,
+                        &mut buf[(position - offset) as usize..(from - offset) as usize],
+                    )
+                    .await?;
+                }
+                let to = (page_offset + sector).min(end);
+                buf[(from - offset) as usize..(to - offset) as usize].copy_from_slice(
+                    &page[(from - page_offset) as usize..(to - page_offset) as usize],
+                );
+                position = to;
+            }
+            if position < end {
+                self.read_extents(file, position, &mut buf[(position - offset) as usize..])
+                    .await?;
+            }
+            return Ok(len);
+        }
+        self.read_extents(file, offset, buf).await?;
+        Ok(len)
+    }
+
+    /// Fills `buf` with the file bytes at `offset` its extents hold; the
+    /// caller bounds `buf` by the file size.
+    async fn read_extents(&self, file: File<'_>, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+        let end = offset + buf.len() as u64;
         let first_extent = Key::new(file.number, item_type::EXTENT_DATA, 0);
         let mut cursor = Cursor::floor(
             self.nodes,
@@ -168,7 +208,7 @@ impl<'a, S: BlockSource, N: NodeSource> Reader<'a, S, N> {
         }
         // Past the last extent the file reads as zeroes up to its size.
         buf[(position - offset) as usize..].fill(0);
-        Ok(len)
+        Ok(())
     }
 
     /// Copies the bytes of `extent` from `from`, relative to its start,
