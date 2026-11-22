@@ -291,8 +291,8 @@ jobs:
             (if ($lanes | index("linux-syscalls-full")) then "full"
              elif ($lanes | index("linux-syscalls")) then "listed"
              else "none" end) as $mode
-            | [{arch: "x86_64", runner: "ubuntu-24.04", vm_arch: "x86-64", accel: "kvm", shards: 8},
-               {arch: "aarch64", runner: "ubuntu-24.04-arm", vm_arch: "aarch64", accel: "tcg", shards: 16}] as $arches
+            | [{arch: "x86_64", runner: "ubuntu-24.04", vm_arch: "x86-64", accel: "kvm", shards: 16},
+               {arch: "aarch64", runner: "ubuntu-24.04-arm", vm_arch: "aarch64", accel: "tcg", shards: 32}] as $arches
             | {mode: $mode,
                build: (if $mode == "none" then [] else $arches | map(del(.shards)) end),
                shards: (if $mode == "none" then []
@@ -3448,7 +3448,7 @@ jobs:
     needs: [changes, kernel-profile, wasm-release, linux-syscalls-build]
     if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.linux-syscalls-build.result == 'success' && needs.wasm-release.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 40 || 15 }}
+    timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 60 || 15 }}
     permissions:
       contents: read
       actions: read
