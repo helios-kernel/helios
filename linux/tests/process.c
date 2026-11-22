@@ -552,8 +552,10 @@ static void test_pgid_sid_setsid(void) {
     CHECK(getsid(0) > 0);
     CHECK(SYS(SYS_getpgid, -1) == -ESRCH);
     CHECK(SYS(SYS_getsid, -1) == -ESRCH);
-    CHECK(SYS(SYS_setpgid, -1, 0) == -ESRCH);
+    /* Linux kernel/sys.c defaults pgid = pid before checking pgid < 0. */
+    CHECK(SYS(SYS_setpgid, -1, 0) == -EINVAL);
     CHECK(SYS(SYS_setpgid, 0, -1) == -EINVAL);
+    CHECK(SYS(SYS_setpgid, -1, 1) == -ESRCH);
 
     /* Child 1: moves into its own process group, verifies setsid() -> EPERM
      * when already a process group leader, and parent waits by P_PGID. */

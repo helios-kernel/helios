@@ -1051,8 +1051,14 @@ pub(super) fn getpgrp<R: Resources>(process: &Process<R>) -> u64 {
 
 /// `setpgid(pid, pgid)` (`kernel/sys.c`).
 pub(super) fn setpgid<R: Resources>(process: &Process<R>, args: [u64; 6]) -> u64 {
-    let pid = args[0] as u32 as i32;
-    let pgid = args[1] as u32 as i32;
+    let raw_pid = args[0] as u32 as i32;
+    let raw_pgid = args[1] as u32 as i32;
+    let pid = if raw_pid == 0 {
+        process.pid().get() as i32
+    } else {
+        raw_pid
+    };
+    let pgid = if raw_pgid == 0 { pid } else { raw_pgid };
     if pgid < 0 {
         return errno(EINVAL);
     }
