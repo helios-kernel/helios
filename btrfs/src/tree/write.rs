@@ -150,6 +150,8 @@ pub enum WriteError {
 
     #[error("file offset or inode byte accounting overflows")]
     FileOverflow,
+    #[error("fallocate range length must be nonzero")]
+    FallocateRange,
     #[error("file extent {key} is not a regular or preallocated mapping")]
     NotRegularExtent { key: Key },
     #[error("file range {start}..{end} must be nonempty and aligned to sector size {sector}")]

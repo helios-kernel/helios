@@ -3,7 +3,8 @@
 use std::sync::Mutex;
 
 use helios_btrfs::write::{
-    Attributes, CloneRange, Compressor, DEFAULT_MAX_INLINE, Name, WriteError, Writer, Zstd,
+    AllocateMode, Attributes, CloneRange, Compressor, DEFAULT_MAX_INLINE, Name, WriteError, Writer,
+    Zstd,
 };
 use helios_btrfs::{BlockSink, BlockSource, READ_ALIGNMENT, Timestamp};
 use helios_hal::fs::RenameMode;
@@ -1980,6 +1981,230 @@ fn inline_extent_limits_pass_btrfs_check() {
     for args in [&[][..], &["--nodesize", "4096"][..]] {
         let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, args);
         let shared = exercise_inline_limits(image);
+        assert_btrfs_check(&shared.0);
+    }
+}
+
+/// Exercises preallocation (`Allocate`, `KeepSize`), `PunchHole`, and
+/// `ZeroRange` across compressed, reflinked, preallocated and inline extents,
+/// verifying read-back bytes and extent kinds.
+fn exercise_fallocate(image: SparseImage) -> std::sync::Arc<WritableImage> {
+    use helios_btrfs::ExtentKind;
+    let shared = std::sync::Arc::new(WritableImage(Mutex::new(image)));
+    let compressor = Compressor::Zstd(Box::new(Zstd::new(3).unwrap()));
+    block_on(async {
+        let mut writer = Writer::mount(
+            SharedImage(shared.clone()),
+            no_uuid as fn() -> [u8; 16],
+            std::thread::available_parallelism().unwrap(),
+            compressor,
+            MOUNTED,
+        )
+        .await
+        .unwrap();
+        let when = |sec: i64| Timestamp {
+            seconds: 1_700_000_100 + sec,
+            nanoseconds: 0,
+        };
+        let attrs = Attributes {
+            permissions: 0o644,
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let dir = tx
+            .create_directory(
+                Name {
+                    parent: &root,
+                    bytes: "空间-領域-공간".as_bytes(),
+                },
+                Attributes {
+                    permissions: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    umask: 0,
+                },
+                when(1),
+            )
+            .await
+            .unwrap();
+        let name = |bytes| Name {
+            parent: &dir,
+            bytes,
+        };
+
+        // 1. Compressed file, reflinked to two siblings, then punched & zeroed.
+        let compressed = tx
+            .create_file(name(b"compressed"), attrs, when(1))
+            .await
+            .unwrap();
+        let mut payload = vec![0x42_u8; 65536];
+        for (i, chunk) in payload.as_chunks_mut::<4096>().0.iter_mut().enumerate() {
+            chunk[0] = (i as u8).wrapping_add(1);
+            chunk[4095] = (i as u8).wrapping_add(0x90);
+        }
+        tx.write_file(&compressed, 0, &payload, when(2))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let dir = tx
+            .lookup(&root, "空间-領域-공간".as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        let name = |bytes| Name {
+            parent: &dir,
+            bytes,
+        };
+        let compressed = tx.lookup(&dir, b"compressed").await.unwrap().unwrap();
+        let clone_a = tx
+            .create_file(name(b"clone-a"), attrs, when(3))
+            .await
+            .unwrap();
+        let clone_b = tx
+            .create_file(name(b"clone-b"), attrs, when(3))
+            .await
+            .unwrap();
+        for dst in [&clone_a, &clone_b] {
+            tx.clone_range(
+                CloneRange {
+                    source: &compressed,
+                    destination: dst,
+                    source_offset: 0,
+                    destination_offset: 0,
+                    length: payload.len() as u64,
+                },
+                when(4),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Punch holes through compressed + reflinked extents (aligned and unaligned).
+        tx.fallocate(&compressed, 8192, 16384, AllocateMode::PunchHole, when(5))
+            .await
+            .unwrap();
+        tx.fallocate(&clone_a, 5000, 21000, AllocateMode::PunchHole, when(6))
+            .await
+            .unwrap();
+        // Zero range through compressed + reflinked extent + extend past EOF.
+        tx.fallocate(&clone_b, 10000, 20000, AllocateMode::ZeroRange, when(7))
+            .await
+            .unwrap();
+        tx.fallocate(
+            &clone_b,
+            65536,
+            16384,
+            AllocateMode::ZeroRangeKeepSize,
+            when(8),
+        )
+        .await
+        .unwrap();
+
+        // 2. Preallocate (mode 0 + KeepSize), reflink the PREALLOC extent, write & punch it.
+        let prealloc = tx
+            .create_file(name(b"prealloc"), attrs, when(9))
+            .await
+            .unwrap();
+        tx.fallocate(&prealloc, 4096, 24576, AllocateMode::Allocate, when(10))
+            .await
+            .unwrap();
+        tx.fallocate(&prealloc, 28672, 8192, AllocateMode::KeepSize, when(11))
+            .await
+            .unwrap();
+        let prealloc_clone = tx
+            .create_file(name(b"prealloc-clone"), attrs, when(12))
+            .await
+            .unwrap();
+        tx.clone_range(
+            CloneRange {
+                source: &prealloc,
+                destination: &prealloc_clone,
+                source_offset: 4096,
+                destination_offset: 0,
+                length: 24576,
+            },
+            when(13),
+        )
+        .await
+        .unwrap();
+        tx.write_file(&prealloc, 8192, &[0xCC; 4096], when(14))
+            .await
+            .unwrap();
+        tx.fallocate(
+            &prealloc_clone,
+            4096,
+            8192,
+            AllocateMode::PunchHole,
+            when(15),
+        )
+        .await
+        .unwrap();
+
+        tx.commit().await.unwrap();
+
+        let view = writer.snapshot().unwrap();
+        let mut expected_compressed = payload.clone();
+        expected_compressed[8192..24576].fill(0);
+        let mut expected_a = payload.clone();
+        expected_a[5000..26000].fill(0);
+        let mut expected_b = payload.clone();
+        expected_b[10000..30000].fill(0);
+        let mut expected_prealloc = vec![0; 28672];
+        expected_prealloc[8192..12288].fill(0xCC);
+        let expected_prealloc_clone = vec![0; 24576];
+
+        for (file_name, expected) in [
+            ("compressed", expected_compressed),
+            ("clone-a", expected_a),
+            ("clone-b", expected_b),
+            ("prealloc", expected_prealloc),
+            ("prealloc-clone", expected_prealloc_clone),
+        ] {
+            let path = format!("/空间-領域-공간/{file_name}");
+            let inode = view.resolve(path.as_bytes()).await.unwrap();
+            assert_eq!(inode.metadata().size, expected.len() as u64, "{file_name}");
+            let mut actual = vec![0; expected.len()];
+            assert_eq!(
+                view.read(&inode, 0, &mut actual).await.unwrap(),
+                expected.len(),
+                "{file_name}"
+            );
+            assert_eq!(actual, expected, "{file_name}");
+        }
+
+        let pre_inode = view
+            .resolve("/空间-領域-공간/prealloc".as_bytes())
+            .await
+            .unwrap();
+        let pre_extents = view.file_extents(&pre_inode).await.unwrap();
+        assert!(
+            pre_extents.iter().any(|e| e.kind == ExtentKind::Prealloc),
+            "expected PREALLOC extents on prealloc: {pre_extents:?}"
+        );
+    });
+    shared
+}
+
+#[test]
+fn public_writer_fallocate_compressed_and_reflinked() {
+    let _ = exercise_fallocate(base_image());
+}
+
+#[test]
+#[ignore = "needs mkfs.btrfs and btrfs check from btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn fallocate_compressed_and_reflinked_pass_btrfs_check() {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("seed.txt"), b"seed\n").unwrap();
+    for args in [&[][..], &["-O", "^no-holes,^block-group-tree"][..]] {
+        let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, args);
+        let shared = exercise_fallocate(image);
         assert_btrfs_check(&shared.0);
     }
 }

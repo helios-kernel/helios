@@ -665,7 +665,7 @@ where
                 let offset = command.u64(attr::FILE_OFFSET)?;
                 let size = command.u64(attr::SIZE)?;
                 let target = resolve_in_subvol(tx, target_tree, path).await?;
-                let meta = tx.inode_metadata(target).await?;
+                let (_, meta) = tx.inode_item(target.tree, target.inode).await?;
                 if let Some(end) = offset.checked_add(size)
                     && end > meta.size
                 {

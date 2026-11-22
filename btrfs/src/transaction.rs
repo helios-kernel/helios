@@ -10,6 +10,7 @@ pub(crate) mod chunks;
 pub(crate) mod dedupe;
 pub(crate) mod devices;
 mod extents;
+pub(crate) mod fallocate;
 pub(crate) mod file;
 pub(crate) mod namespace;
 pub(crate) mod orphan;
@@ -28,6 +29,7 @@ use futures::future;
 use self::namespace::Name;
 use self::orphan::OpenInodes;
 use self::reflink::FileId;
+use crate::EntryTarget;
 use crate::accounting::{Accounting, Allocation};
 use crate::commit::CommitImage;
 use crate::compress::policy::Compressor;
@@ -43,7 +45,6 @@ use crate::space::Space;
 use crate::tree::TreeRoot;
 use crate::tree::write::{Trees, WriteError};
 use crate::volume::{Mapping, Volume};
-use crate::{EntryTarget, Metadata};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -316,12 +317,8 @@ impl<S: BlockSink> Transaction<S> {
         Ok(())
     }
 
-    pub(crate) async fn inode_metadata(&self, file: FileId) -> Result<Metadata, WriteError> {
-        let (_, mut metadata) = self.inode_item(file.tree, file.inode).await?;
-        metadata.nbytes = metadata
-            .nbytes
-            .saturating_add(self.delalloc.file_bytes(file.tree, file.inode));
-        Ok(metadata)
+    pub(crate) fn unbacked_delalloc_bytes(&self, file: FileId) -> u64 {
+        self.delalloc.unbacked_file_bytes(file.tree, file.inode)
     }
 
     pub(crate) async fn lookup_file(&self, name: Name<'_>) -> Result<Option<FileId>, WriteError> {
