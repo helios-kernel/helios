@@ -22,7 +22,7 @@ done
 # memory calls; the rest are the system-information suite, one program per
 # call group, each checking its calls' results and errors against Linux's
 # behaviour.
-for program in hello-libc args memory clock random identity limits machine priority pthreads; do
+for program in hello-libc args memory clock random identity limits machine priority pthreads container; do
     zig cc -target "$arch-linux-musl" -static -no-pie -s -O2 -Wl,--build-id=none \
         -Ilinux/tests "linux/tests/$program.c" -o "$out/linux/$program"
 done
@@ -50,4 +50,5 @@ if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     "$out/linux/random"
     "$out/linux/identity"
     "$out/linux/machine"
+    "$out/linux/container"
 fi

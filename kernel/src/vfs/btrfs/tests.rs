@@ -994,6 +994,31 @@ fn a_node_created_without_an_identity_inherits_from_its_parent() {
         assert_eq!(made("하위"), (mode & 0o2777, uid, gid), "{name}");
         assert_eq!(made("链接"), (0o777, uid, gid), "{name}");
     }
+
+    // Re-mounting through `BtrfsFs` exposes the same stored Unix owner and mode bits.
+    let cache = cache_over(&disk, 256, 1);
+    let mounted = mount(&cache);
+    for (name, mode, uid, gid) in directories {
+        assert_eq!(
+            block_on(mounted.unix_attributes(path(name))).expect("dir unix attrs"),
+            crate::UnixAttributes {
+                permissions: u32::from(mode) & 0o7777,
+                uid,
+                gid,
+            },
+            "{name}"
+        );
+        let file = alloc::format!("{name}/ファイル");
+        assert_eq!(
+            block_on(mounted.unix_attributes(path(&file))).expect("file unix attrs"),
+            crate::UnixAttributes {
+                permissions: u32::from(mode) & 0o666,
+                uid,
+                gid,
+            },
+            "{name}"
+        );
+    }
 }
 
 #[test]

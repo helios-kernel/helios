@@ -353,6 +353,17 @@ impl DnsError {
     }
 }
 
+/// Usable RFC 9460 Type 65 (`HTTPS`) service parameters resolved for an origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpsRecord {
+    /// ALPN protocol identifiers from `SvcParamKey` 1, in wire order.
+    pub alpn: Vec<String>,
+    /// Alternative port from `SvcParamKey` 3, when overridden.
+    pub port: Option<u16>,
+    /// Minimum TTL across the answer chain, in nanoseconds.
+    pub ttl_nanos: u64,
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum TcpErrorKind {
     #[error("host could not be resolved")]
@@ -875,6 +886,13 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         host: &'a str,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a;
+
+    fn dns_resolve_https<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Option<HttpsRecord>, DnsError>> + Send + 'a;
 
     fn tcp_connect<'a>(
         &'a self,

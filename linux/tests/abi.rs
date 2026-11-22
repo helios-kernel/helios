@@ -168,6 +168,8 @@ struct Sink {
     cpu_nanos: u64,
     entropy: u8,
     processes: u32,
+    hostname: helios_linux::syscall::UtsField,
+    domainname: helios_linux::syscall::UtsField,
 }
 impl System for Sink {
     fn realtime_nanos(&self) -> u64 {
@@ -201,6 +203,20 @@ impl System for Sink {
     }
     fn kernel_version(&self) -> &str {
         "Helios test build"
+    }
+    fn hostname(&self) -> helios_linux::syscall::UtsField {
+        self.hostname
+    }
+    fn domainname(&self) -> helios_linux::syscall::UtsField {
+        self.domainname
+    }
+    fn set_hostname(&mut self, name: helios_linux::syscall::UtsField) -> Result<(), Denied> {
+        self.hostname = name;
+        Ok(())
+    }
+    fn set_domainname(&mut self, name: helios_linux::syscall::UtsField) -> Result<(), Denied> {
+        self.domainname = name;
+        Ok(())
     }
 }
 impl Stdio for Sink {

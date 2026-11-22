@@ -265,6 +265,10 @@ pub enum ProgramExecErrorDetail {
     LinuxImageInvalid(LinuxImageRefusal),
     #[error("user memory for a native process is exhausted")]
     NativeMemoryExhausted,
+    #[error("the Linux subsystem is not enabled in this kernel")]
+    LinuxSubsystemUnavailable,
+    #[error("{0}")]
+    ContainerRefused(RuntimeMessage),
 }
 
 /// Why a Linux executable was refused before any of it was mapped.
@@ -396,6 +400,8 @@ impl ProgramExecErrorDetail {
                 "the Linux executable is not a static image this kernel loads"
             }
             Self::NativeMemoryExhausted => "user memory for a native process is exhausted",
+            Self::LinuxSubsystemUnavailable => "the Linux subsystem is not enabled in this kernel",
+            Self::ContainerRefused(message) => message.as_str(),
         }
     }
 }

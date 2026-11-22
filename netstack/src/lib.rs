@@ -43,8 +43,9 @@ pub use dhcp::{
     DhcpServerMessage, DhcpState, DhcpTransmit, MAX_DHCP_DNS_SERVERS, next_transaction_id,
 };
 pub use dns::{
-    DNS_MAX_ADDRESS_RECORDS, DNS_MAX_CNAME_CHAIN, DNS_PORT, DnsMessage, DnsQuery,
-    DnsQuestionWriter, DnsRecordType, DnsResponse,
+    DNS_MAX_ADDRESS_RECORDS, DNS_MAX_ALPN_IDS, DNS_MAX_CNAME_CHAIN, DNS_PORT, DnsHttpsOutcome,
+    DnsHttpsRecord, DnsMessage, DnsQuery, DnsQuestionWriter, DnsRcode, DnsRecordType, DnsResponse,
+    DnsWireName, HTTPS_DEFAULT_PORT,
 };
 pub use hash::{
     DestinationPortHashes, FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES,

@@ -65,6 +65,112 @@ pub trait System {
 
     /// What `uname` reports as the kernel's build, up to 64 bytes.
     fn kernel_version(&self) -> &str;
+
+    /// Container's UTS hostname (`uname().nodename`), up to 64 bytes.
+    fn hostname(&self) -> UtsField {
+        UtsField::UNSET
+    }
+
+    /// Container's UTS domain name (`uname().domainname`), up to 64 bytes.
+    fn domainname(&self) -> UtsField {
+        UtsField::UNSET
+    }
+
+    /// Updates this container's UTS hostname (`sethostname`).
+    fn set_hostname(&mut self, _name: UtsField) -> Result<(), Denied> {
+        Err(Denied)
+    }
+
+    /// Updates this container's UTS domain name (`setdomainname`).
+    fn set_domainname(&mut self, _name: UtsField) -> Result<(), Denied> {
+        Err(Denied)
+    }
+}
+
+/// Maximum length of a `struct new_utsname` string field (`__NEW_UTS_LEN` in
+/// `include/uapi/linux/utsname.h`), excluding the trailing NUL byte.
+pub const UTS_FIELD_MAX: usize = 64;
+
+/// Why a UTS hostname or domain name is invalid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum UtsNameError {
+    #[error("UTS name exceeds {UTS_FIELD_MAX} bytes")]
+    TooLong,
+    #[error("UTS name contains a NUL byte")]
+    InteriorNul,
+}
+
+/// A stack-stored UTS hostname or domain name (`__NEW_UTS_LEN` bytes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct UtsField {
+    bytes: [u8; UTS_FIELD_MAX],
+    len: u8,
+}
+
+impl UtsField {
+    /// Linux's default before any hostname or domain name is set (`"(none)"`,
+    /// `init/Kconfig` `CONFIG_DEFAULT_HOSTNAME` and `include/linux/uts.h`).
+    pub const UNSET: Self = {
+        let mut bytes = [0u8; UTS_FIELD_MAX];
+        let unset = UNSET_NAME.as_bytes();
+        let mut i = 0;
+        while i < unset.len() {
+            bytes[i] = unset[i];
+            i += 1;
+        }
+        Self {
+            bytes,
+            len: unset.len() as u8,
+        }
+    };
+
+    /// Builds a UTS field from raw bytes (as `sethostname` / `setdomainname`
+    /// receive, up to [`UTS_FIELD_MAX`] bytes).
+    pub fn from_bytes(input: &[u8]) -> Result<Self, UtsNameError> {
+        if input.len() > UTS_FIELD_MAX {
+            return Err(UtsNameError::TooLong);
+        }
+        let mut bytes = [0u8; UTS_FIELD_MAX];
+        bytes[..input.len()].copy_from_slice(input);
+        Ok(Self {
+            bytes,
+            len: input.len() as u8,
+        })
+    }
+
+    /// Builds a UTS field from a configured name string. Empty becomes
+    /// [`Self::UNSET`].
+    pub fn from_configured(name: &str) -> Result<Self, UtsNameError> {
+        if name.is_empty() {
+            return Ok(Self::UNSET);
+        }
+        if name.as_bytes().contains(&0) {
+            return Err(UtsNameError::InteriorNul);
+        }
+        Self::from_bytes(name.as_bytes())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl Default for UtsField {
+    fn default() -> Self {
+        Self::UNSET
+    }
+}
+
+impl core::fmt::Debug for UtsField {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match core::str::from_utf8(self.as_bytes()) {
+            Ok(text) => formatter.debug_tuple("UtsField").field(&text).finish(),
+            Err(_) => formatter
+                .debug_tuple("UtsField")
+                .field(&self.as_bytes())
+                .finish(),
+        }
+    }
 }
 
 /// The machine's memory as `sysinfo` reports it.
@@ -179,14 +285,181 @@ pub struct Ids {
     pub saved: u32,
 }
 
-/// The user and group IDs a process reports. They are values the program
-/// reads and nothing more: no call here, and no later call, treats one as
-/// permission to reach a resource.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Linux capability bit positions (`include/uapi/linux/capability.h`, Linux
+/// v6.12). Capabilities apply inside a container and only narrow the
+/// container's `ProcessAuthority`, never widen it.
+pub const CAP_CHOWN: u32 = 0;
+pub const CAP_DAC_OVERRIDE: u32 = 1;
+pub const CAP_DAC_READ_SEARCH: u32 = 2;
+pub const CAP_FOWNER: u32 = 3;
+pub const CAP_FSETID: u32 = 4;
+pub const CAP_KILL: u32 = 5;
+pub const CAP_SETGID: u32 = 6;
+pub const CAP_SETUID: u32 = 7;
+pub const CAP_NET_BIND_SERVICE: u32 = 10;
+pub const CAP_NET_BROADCAST: u32 = 11;
+pub const CAP_NET_ADMIN: u32 = 12;
+pub const CAP_NET_RAW: u32 = 13;
+pub const CAP_SYS_CHROOT: u32 = 18;
+pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_SYS_NICE: u32 = 23;
+pub const CAP_SYS_RESOURCE: u32 = 24;
+pub const CAP_SYS_TIME: u32 = 25;
+const CAP_LAST_CAP: u32 = 40;
+const CAP_FULL_SET: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+
+/// Process Linux capability sets (`include/linux/cred.h`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinuxCapabilities {
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
+    pub bounding: u64,
+    pub ambient: u64,
+}
+
+impl LinuxCapabilities {
+    /// Capabilities a process starts with for effective UID `euid`
+    /// (`kernel/cred.c` `init_cred` / `security/commoncap.c`).
+    pub const fn for_uid(euid: u32) -> Self {
+        if euid == 0 {
+            Self {
+                effective: CAP_FULL_SET,
+                permitted: CAP_FULL_SET,
+                inheritable: 0,
+                bounding: CAP_FULL_SET,
+                ambient: 0,
+            }
+        } else {
+            Self {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+                bounding: CAP_FULL_SET,
+                ambient: 0,
+            }
+        }
+    }
+
+    pub const fn has_effective(self, cap: u32) -> bool {
+        cap <= CAP_LAST_CAP && (self.effective & (1u64 << cap)) != 0
+    }
+
+    /// `security/commoncap.c` `cap_emulate_setxuid`: drops capabilities when
+    /// transitioning from UID 0 to all non-zero UIDs, and adjusts the
+    /// effective set on `euid` transitions between 0 and non-zero.
+    fn emulate_setxuid(&mut self, old: Ids, new: Ids) {
+        let had_root = old.real == 0 || old.effective == 0 || old.saved == 0;
+        let all_nonzero = new.real != 0 && new.effective != 0 && new.saved != 0;
+        if had_root && all_nonzero {
+            self.permitted = 0;
+            self.effective = 0;
+            self.ambient = 0;
+        }
+        if old.effective == 0 && new.effective != 0 {
+            self.effective = 0;
+        } else if old.effective != 0 && new.effective == 0 {
+            self.effective = self.permitted;
+        }
+    }
+}
+
+impl Default for LinuxCapabilities {
+    fn default() -> Self {
+        Self::for_uid(0)
+    }
+}
+
+/// The user/group IDs and Linux capabilities of a process inside its container.
+/// Linux's permission model only narrows the container's `ProcessAuthority`,
+/// never widens it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credentials {
     pub user: Ids,
     pub group: Ids,
     pub supplementary_groups: Vec<u32>,
+    pub capabilities: LinuxCapabilities,
+}
+
+impl Default for Credentials {
+    fn default() -> Self {
+        Self::root()
+    }
+}
+
+/// Maximum number of supplementary groups a process may hold
+/// (`include/uapi/linux/limits.h` `NGROUPS_MAX`).
+pub const NGROUPS_MAX: usize = 65_536;
+
+/// Why a configured [`Credentials`] value was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CredentialsError {
+    #[error("invalid user ID (u32::MAX is reserved by Linux)")]
+    InvalidUid,
+    #[error("invalid group ID (u32::MAX is reserved by Linux)")]
+    InvalidGid,
+    #[error("supplementary group list contains invalid group ID (u32::MAX is reserved by Linux)")]
+    InvalidSupplementaryGid,
+    #[error("supplementary group count {count} exceeds Linux NGROUPS_MAX ({NGROUPS_MAX})")]
+    TooManySupplementaryGroups { count: usize },
+}
+
+impl Credentials {
+    /// Root credentials (`uid 0`, `gid 0`, full Linux capability set bounded by
+    /// the container's `ProcessAuthority`).
+    pub fn root() -> Self {
+        Self::for_ids(0, 0, Vec::new())
+    }
+
+    /// Validates and builds credentials with real/effective/saved UID = `uid`,
+    /// GID = `gid`, `supplementary_groups`, and capabilities derived from `uid`.
+    ///
+    /// Refuses Linux's reserved `u32::MAX` sentinel and lists exceeding
+    /// [`NGROUPS_MAX`].
+    pub fn try_for_ids(
+        uid: u32,
+        gid: u32,
+        supplementary_groups: Vec<u32>,
+    ) -> Result<Self, CredentialsError> {
+        if uid == u32::MAX {
+            return Err(CredentialsError::InvalidUid);
+        }
+        if gid == u32::MAX {
+            return Err(CredentialsError::InvalidGid);
+        }
+        if supplementary_groups.len() > NGROUPS_MAX {
+            return Err(CredentialsError::TooManySupplementaryGroups {
+                count: supplementary_groups.len(),
+            });
+        }
+        if supplementary_groups.contains(&u32::MAX) {
+            return Err(CredentialsError::InvalidSupplementaryGid);
+        }
+        Ok(Self {
+            user: Ids {
+                real: uid,
+                effective: uid,
+                saved: uid,
+            },
+            group: Ids {
+                real: gid,
+                effective: gid,
+                saved: gid,
+            },
+            supplementary_groups,
+            capabilities: LinuxCapabilities::for_uid(uid),
+        })
+    }
+
+    /// Credentials with real/effective/saved UID = `uid`, GID = `gid`,
+    /// `supplementary_groups`, and capabilities derived from `uid`.
+    ///
+    /// Panics if `uid`, `gid`, or `supplementary_groups` violates Linux's
+    /// credential invariants; untrusted input must use [`Self::try_for_ids`].
+    pub fn for_ids(uid: u32, gid: u32, supplementary_groups: Vec<u32>) -> Self {
+        Self::try_for_ids(uid, gid, supplementary_groups)
+            .expect("trusted credentials satisfy Linux ID invariants")
+    }
 }
 
 /// What a process starts with that its launcher decides.
@@ -201,6 +474,12 @@ pub struct Start {
     pub open_files_ceiling: u64,
     /// Shared futex wait table for this process's address space.
     pub futex: helios_unix::FutexTable,
+    /// Container-local PID namespace shared by processes and threads in one
+    /// container. When `None`, the process uses a private standalone namespace.
+    pub pids: Option<super::PidNamespace>,
+    /// Distinct process-memory identity for futex scoping; when `None`,
+    /// derived from the process ID.
+    pub memory_id: Option<u64>,
 }
 
 impl Default for Start {
@@ -210,6 +489,8 @@ impl Default for Start {
             memory_bytes: 0,
             open_files_ceiling: NR_OPEN_DEFAULT,
             futex: helios_unix::FutexTable::new(),
+            pids: None,
+            memory_id: None,
         }
     }
 }
@@ -409,6 +690,7 @@ pub(super) fn clock_getres<M: UserMemory>(args: [u64; 6], memory: &mut M) -> u64
 
 pub(super) fn clock_settime<M: UserMemory, O: System>(
     args: [u64; 6],
+    has_cap_sys_time: bool,
     memory: &mut M,
     output: &mut O,
 ) -> u64 {
@@ -430,6 +712,11 @@ pub(super) fn clock_settime<M: UserMemory, O: System>(
     const SETTOD_SECONDS_MAX: i64 = (i64::MAX / NANOS_PER_SECOND as i64) - 30 * 365 * 24 * 3600;
     if seconds < 0 || nanoseconds >= NANOS_PER_SECOND || seconds >= SETTOD_SECONDS_MAX {
         return errno(EINVAL);
+    }
+    // Linux narrows inside the container first (`CAP_SYS_TIME`), then the
+    // container's `ProcessAuthority` (`SetWallClockCap`) bounds even uid 0.
+    if !has_cap_sys_time {
+        return errno(EPERM);
     }
     let nanos = seconds as u64 * NANOS_PER_SECOND + nanoseconds;
     match output.set_realtime_nanos(nanos) {
@@ -540,26 +827,60 @@ pub(super) fn uname<M: UserMemory, O: System>(
     // `__NEW_UTS_LEN + 1` bytes, zero padded. Both ABIs' `uname` is
     // `newuname`. `UTS_MACHINE` is x86_64 and, on a little-endian arm64
     // kernel (arch/arm64/Makefile), aarch64.
-    const FIELD: usize = 65;
+    const FIELD: usize = UTS_FIELD_MAX + 1;
     let machine = match abi {
         Abi::X86_64 => "x86_64",
         Abi::Aarch64 => "aarch64",
     };
-    let fields = [
-        "Linux",
-        UNSET_NAME,
-        RELEASE,
-        output.kernel_version(),
-        machine,
-        UNSET_NAME,
+    let hostname = output.hostname();
+    let domainname = output.domainname();
+    let fields: [&[u8]; 6] = [
+        b"Linux",
+        hostname.as_bytes(),
+        RELEASE.as_bytes(),
+        output.kernel_version().as_bytes(),
+        machine.as_bytes(),
+        domainname.as_bytes(),
     ];
     let mut bytes = [0; FIELD * 6];
     for (slot, value) in bytes.as_chunks_mut::<FIELD>().0.iter_mut().zip(fields) {
         // The last byte stays zero to terminate the string.
         let length = value.len().min(FIELD - 1);
-        slot[..length].copy_from_slice(&value.as_bytes()[..length]);
+        slot[..length].copy_from_slice(&value[..length]);
     }
     write_result(memory, args[0], &bytes)
+}
+
+/// `sethostname` and `setdomainname` (`kernel/sys.c`).
+pub(super) fn set_uts_name<M: UserMemory, O: System>(
+    operation: Operation,
+    has_cap_sys_admin: bool,
+    args: [u64; 6],
+    memory: &M,
+    output: &mut O,
+) -> u64 {
+    if !has_cap_sys_admin {
+        return errno(EPERM);
+    }
+    let len = args[1] as u32 as i32;
+    if !(0..=UTS_FIELD_MAX as i32).contains(&len) {
+        return errno(EINVAL);
+    }
+    let mut buf = [0u8; UTS_FIELD_MAX];
+    let len = len as usize;
+    if len > 0 && memory.read(args[0], &mut buf[..len]).is_err() {
+        return errno(EFAULT);
+    }
+    let field = UtsField::from_bytes(&buf[..len]).expect("len <= UTS_FIELD_MAX");
+    let result = match operation {
+        Operation::Sethostname => output.set_hostname(field),
+        Operation::Setdomainname => output.set_domainname(field),
+        _ => unreachable!("not a UTS setter"),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(Denied) => errno(EPERM),
+    }
 }
 
 pub(super) fn sysinfo<M: UserMemory, O: Clock + System>(
@@ -642,6 +963,180 @@ impl Credentials {
             }
         }
         count as u64
+    }
+
+    /// `kernel/sys.c` `__sys_setuid`.
+    pub(super) fn setuid(&mut self, args: [u64; 6]) -> u64 {
+        let uid = args[0] as u32;
+        if uid == u32::MAX {
+            return errno(EINVAL);
+        }
+        let old = self.user;
+        let mut new = old;
+        if self.capabilities.has_effective(CAP_SETUID) {
+            new.real = uid;
+            new.saved = uid;
+        } else if uid != old.real && uid != old.saved {
+            return errno(EPERM);
+        }
+        new.effective = uid;
+        self.user = new;
+        self.capabilities.emulate_setxuid(old, new);
+        0
+    }
+
+    /// `kernel/sys.c` `__sys_setgid`.
+    pub(super) fn setgid(&mut self, args: [u64; 6]) -> u64 {
+        let gid = args[0] as u32;
+        if gid == u32::MAX {
+            return errno(EINVAL);
+        }
+        let old = self.group;
+        let mut new = old;
+        if self.capabilities.has_effective(CAP_SETGID) {
+            new.real = gid;
+            new.saved = gid;
+        } else if gid != old.real && gid != old.saved {
+            return errno(EPERM);
+        }
+        new.effective = gid;
+        self.group = new;
+        0
+    }
+
+    /// `kernel/sys.c` `__sys_setreuid`.
+    pub(super) fn setreuid(&mut self, args: [u64; 6]) -> u64 {
+        let ruid = args[0] as u32;
+        let euid = args[1] as u32;
+        let old = self.user;
+        let mut new = old;
+        let privileged = self.capabilities.has_effective(CAP_SETUID);
+        if ruid != u32::MAX {
+            if !privileged && ruid != old.real && ruid != old.effective {
+                return errno(EPERM);
+            }
+            new.real = ruid;
+        }
+        if euid != u32::MAX {
+            if !privileged && euid != old.real && euid != old.effective && euid != old.saved {
+                return errno(EPERM);
+            }
+            new.effective = euid;
+        }
+        if ruid != u32::MAX || (euid != u32::MAX && euid != old.real) {
+            new.saved = new.effective;
+        }
+        self.user = new;
+        self.capabilities.emulate_setxuid(old, new);
+        0
+    }
+
+    /// `kernel/sys.c` `__sys_setregid`.
+    pub(super) fn setregid(&mut self, args: [u64; 6]) -> u64 {
+        let rgid = args[0] as u32;
+        let egid = args[1] as u32;
+        let old = self.group;
+        let mut new = old;
+        let privileged = self.capabilities.has_effective(CAP_SETGID);
+        if rgid != u32::MAX {
+            if !privileged && rgid != old.real && rgid != old.effective {
+                return errno(EPERM);
+            }
+            new.real = rgid;
+        }
+        if egid != u32::MAX {
+            if !privileged && egid != old.real && egid != old.effective && egid != old.saved {
+                return errno(EPERM);
+            }
+            new.effective = egid;
+        }
+        if rgid != u32::MAX || (egid != u32::MAX && egid != old.real) {
+            new.saved = new.effective;
+        }
+        self.group = new;
+        0
+    }
+
+    /// `kernel/sys.c` `__sys_setresuid`.
+    pub(super) fn setresuid(&mut self, args: [u64; 6]) -> u64 {
+        let ruid = args[0] as u32;
+        let euid = args[1] as u32;
+        let suid = args[2] as u32;
+        let old = self.user;
+        let is_known = |id| id == old.real || id == old.effective || id == old.saved;
+        let needs_cap = (ruid != u32::MAX && !is_known(ruid))
+            || (euid != u32::MAX && !is_known(euid))
+            || (suid != u32::MAX && !is_known(suid));
+        if needs_cap && !self.capabilities.has_effective(CAP_SETUID) {
+            return errno(EPERM);
+        }
+        let new = Ids {
+            real: if ruid == u32::MAX { old.real } else { ruid },
+            effective: if euid == u32::MAX {
+                old.effective
+            } else {
+                euid
+            },
+            saved: if suid == u32::MAX { old.saved } else { suid },
+        };
+        self.user = new;
+        self.capabilities.emulate_setxuid(old, new);
+        0
+    }
+
+    /// `kernel/sys.c` `__sys_setresgid`.
+    pub(super) fn setresgid(&mut self, args: [u64; 6]) -> u64 {
+        let rgid = args[0] as u32;
+        let egid = args[1] as u32;
+        let sgid = args[2] as u32;
+        let old = self.group;
+        let is_known = |id| id == old.real || id == old.effective || id == old.saved;
+        let needs_cap = (rgid != u32::MAX && !is_known(rgid))
+            || (egid != u32::MAX && !is_known(egid))
+            || (sgid != u32::MAX && !is_known(sgid));
+        if needs_cap && !self.capabilities.has_effective(CAP_SETGID) {
+            return errno(EPERM);
+        }
+        self.group = Ids {
+            real: if rgid == u32::MAX { old.real } else { rgid },
+            effective: if egid == u32::MAX {
+                old.effective
+            } else {
+                egid
+            },
+            saved: if sgid == u32::MAX { old.saved } else { sgid },
+        };
+        0
+    }
+
+    /// `kernel/groups.c` `setgroups`.
+    pub(super) fn setgroups<M: UserMemory>(&mut self, args: [u64; 6], memory: &M) -> u64 {
+        if !self.capabilities.has_effective(CAP_SETGID) {
+            return errno(EPERM);
+        }
+        let size = args[0] as u32 as i32;
+        if size < 0 || size as usize > NGROUPS_MAX {
+            return errno(EINVAL);
+        }
+        let count = size as usize;
+        if count == 0 {
+            self.supplementary_groups.clear();
+            return 0;
+        }
+        let mut raw = alloc::vec![0u8; count * 4];
+        if memory.read(args[1], &mut raw).is_err() {
+            return errno(EFAULT);
+        }
+        let mut groups = Vec::with_capacity(count);
+        for &chunk in raw.as_chunks::<4>().0 {
+            let gid = u32::from_le_bytes(chunk);
+            if gid == u32::MAX {
+                return errno(EINVAL);
+            }
+            groups.push(gid);
+        }
+        self.supplementary_groups = groups;
+        0
     }
 }
 
