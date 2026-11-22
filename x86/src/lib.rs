@@ -16,6 +16,7 @@ mod hotplug;
 mod input;
 mod ioapic;
 mod iommu;
+mod isolation;
 mod memory_type;
 mod mtrr;
 #[cfg(feature = "native-users")]
@@ -212,6 +213,7 @@ fn x86_kernel_main() -> ! {
     // secondary processor programs the same table on its own way in.
     memory_type::program_page_attribute_table();
     let xcr0 = extended_state::enable_on_bootstrap_processor();
+    let user_isolation = isolation::UserIsolation::enable_on_bootstrap_processor();
     assert!(
         boot::base_revision_supported(),
         "Limine bootloader does not support the required base protocol revision"
@@ -286,6 +288,7 @@ fn x86_kernel_main() -> ! {
         wakeup_page,
         debug_state.clone(),
         xcr0,
+        user_isolation,
         pool,
     );
     smp::activate_runtime(boot.bootstrap_runtime());
@@ -371,6 +374,10 @@ fn x86_kernel_main() -> ! {
     } else {
         tracing::info!("{measured_boot_discovery}");
     }
+    // Once the logger is up, so the bootstrap processor's result is in the
+    // log beside every secondary's; still before any user code can run.
+    #[cfg(feature = "native-users")]
+    native::verify_user_isolation(user_isolation);
     let (xsave_standard_bytes, xsave_max_bytes) = extended_state::xsave_sizes();
     let supervisor_state = extended_state::supervisor_state_support();
     tracing::info!(
@@ -1030,8 +1037,9 @@ impl Cpu for X86Cpu {
     #[cfg(not(feature = "native-users"))]
     type Native = core::convert::Infallible;
     #[cfg(feature = "native-users")]
-    fn native(&self) -> Option<&Self::Native> {
-        Some(&native::X86Native)
+    fn native(&self) -> Result<&Self::Native, helios_hal::native::NativeUnavailable> {
+        self.state.user_isolation().require()?;
+        Ok(&native::X86Native)
     }
     // The local APIC timer runs in periodic mode at the scheduler tick;
     // `set_deadline` only starts it.
@@ -1287,6 +1295,9 @@ extern "C" fn secondary_start_rust(
     // configured it before it woke anyone, and configuring it again is
     // destructive rather than idempotent. See `serial_uart_init`.
     extended_state::enable_on_secondary_processor(boot.xcr0());
+    // SMEP and SMAP before this processor can run anything a user page
+    // could hold.
+    boot.user_isolation().enable_on_secondary_processor();
     // The same page-attribute table the bootstrap processor runs with,
     // before this processor can touch a write-combined mapping.
     memory_type::program_page_attribute_table();
@@ -1310,6 +1321,8 @@ extern "C" fn secondary_start_rust(
     smp::current_runtime().attach_local_apic();
     exceptions::install_for_current_processor();
     exceptions::verify_page_fault_returns();
+    #[cfg(feature = "native-users")]
+    native::verify_user_isolation(boot.user_isolation());
 
     let debug_state = boot.platform().debug_state();
     let console = serial_console(debug_state.clone());

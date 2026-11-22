@@ -62,28 +62,11 @@ fn held<K: Kind, R: Right>(descriptor: &FsDescriptor) -> Granted<'_, K, R> {
         .expect("the descriptor holds the right the operation demands")
 }
 
-fn open(
-    namespace: &TestNamespace,
-    base: &FsDescriptor,
+fn create_file<S: crate::Storage>(
+    namespace: &Namespace<S>,
     path: &str,
-    open_flags: fs_types::OpenFlags,
-    flags: FsDescriptorFlags,
-) -> Result<FsDescriptor, fs_types::ErrorCode> {
-    block_on(async {
-        open_at(
-            namespace,
-            base.grant()?,
-            fs_types::PathFlags::empty(),
-            path,
-            open_flags,
-            flags,
-            1,
-        )
-        .await
-    })
-}
-
-fn create_file(namespace: &TestNamespace, path: &str, bytes: &[u8]) -> FsDescriptor {
+    bytes: &[u8],
+) -> FsDescriptor {
     let descriptor = open(
         namespace,
         &root(),
@@ -103,10 +86,34 @@ fn create_file(namespace: &TestNamespace, path: &str, bytes: &[u8]) -> FsDescrip
     descriptor
 }
 
-fn read_all(namespace: &TestNamespace, descriptor: &FsDescriptor) -> alloc::vec::Vec<u8> {
+fn read_all<S: crate::Storage>(
+    namespace: &Namespace<S>,
+    descriptor: &FsDescriptor,
+) -> alloc::vec::Vec<u8> {
     block_on(read(namespace, held(descriptor), 0, 64))
         .expect("read must succeed")
         .to_vec()
+}
+
+fn open<S: crate::Storage>(
+    namespace: &Namespace<S>,
+    base: &FsDescriptor,
+    path: &str,
+    open_flags: fs_types::OpenFlags,
+    flags: FsDescriptorFlags,
+) -> Result<FsDescriptor, fs_types::ErrorCode> {
+    block_on(async {
+        open_at(
+            namespace,
+            base.grant()?,
+            fs_types::PathFlags::empty(),
+            path,
+            open_flags,
+            flags,
+            1,
+        )
+        .await
+    })
 }
 
 fn mount_memory(namespace: &TestNamespace, point: &str) {
@@ -114,8 +121,20 @@ fn mount_memory(namespace: &TestNamespace, point: &str) {
     let cap = crate::ProcessAuthority::root()
         .derive_mount_cap(point)
         .expect("root may mount anywhere");
-    block_on(namespace.mount(&cap, fs, FileSystemRights::READ | FileSystemRights::WRITE))
-        .expect("mount must succeed");
+    block_on(namespace.mount(
+        &cap,
+        fs,
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
+    ))
+    .expect("mount must succeed");
+}
+
+/// A shared mount granting `rights`.
+fn granted(rights: FileSystemRights) -> crate::MountGrant {
+    crate::MountGrant {
+        rights,
+        sharing: crate::MountSharing::Shared,
+    }
 }
 
 #[test]
@@ -964,8 +983,12 @@ fn mount_unreachable_host(namespace: &TestNamespace, point: &str) {
     let cap = crate::ProcessAuthority::root()
         .derive_mount_cap(point)
         .expect("root may mount anywhere");
-    block_on(namespace.mount(&cap, fs, FileSystemRights::READ | FileSystemRights::WRITE))
-        .expect("mount must succeed");
+    block_on(namespace.mount(
+        &cap,
+        fs,
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
+    ))
+    .expect("mount must succeed");
 }
 
 /// A directory descriptor at `path` that holds exactly `flags`.
@@ -1157,6 +1180,7 @@ fn set_times_at_needs_write_or_mutate_on_the_base() {
         set_times_at(
             &namespace,
             readonly_root().grant()?,
+            fs_types::PathFlags::empty(),
             "tmp",
             Some(11),
             Some(17),
@@ -1175,6 +1199,7 @@ fn set_times_at_needs_write_or_mutate_on_the_base() {
         block_on(set_times_at(
             &namespace,
             held(&base),
+            fs_types::PathFlags::empty(),
             "tmp",
             Some(times.0),
             Some(times.1),
@@ -1188,11 +1213,29 @@ fn set_times_at_needs_write_or_mutate_on_the_base() {
     mount_unreachable_host(&namespace, "/mnt");
     let (rw, ro) = host_bases();
     let reached = block_on(async {
-        set_times_at(&namespace, rw.grant()?, "file", Some(1), Some(2), 3).await
+        set_times_at(
+            &namespace,
+            rw.grant()?,
+            fs_types::PathFlags::empty(),
+            "file",
+            Some(1),
+            Some(2),
+            3,
+        )
+        .await
     });
     assert!(matches!(reached, Err(fs_types::ErrorCode::Unsupported)));
     let refused = block_on(async {
-        set_times_at(&namespace, ro.grant()?, "file", Some(1), Some(2), 3).await
+        set_times_at(
+            &namespace,
+            ro.grant()?,
+            fs_types::PathFlags::empty(),
+            "file",
+            Some(1),
+            Some(2),
+            3,
+        )
+        .await
     });
     assert!(matches!(refused, Err(fs_types::ErrorCode::ReadOnly)));
 }
@@ -1666,7 +1709,8 @@ fn a_create_lands_on_the_mount_that_owns_the_new_entry() {
     let cap = crate::ProcessAuthority::root()
         .derive_mount_cap("/mnt")
         .expect("root may mount anywhere");
-    block_on(namespace.mount(&cap, fs, FileSystemRights::READ)).expect("mount must succeed");
+    block_on(namespace.mount(&cap, fs, granted(FileSystemRights::READ)))
+        .expect("mount must succeed");
 
     let created = open(
         &namespace,
@@ -1725,5 +1769,1172 @@ fn file_stream_fills_destinations_without_moving_source_bytes() {
         assert_eq!(reads.skipped.load(Ordering::Relaxed), bytes.len());
         assert_eq!(reads.moved.load(Ordering::Relaxed), 0);
         assert_eq!(read_all(&namespace, &descriptor), expected.as_bytes());
+    }
+}
+
+#[derive(Clone)]
+struct MemoryHostFileSystem {
+    inner: MemoryFs,
+    domain: AuthorityDomain,
+}
+
+impl MemoryHostFileSystem {
+    fn new(device: helios_hal::fs::DeviceId) -> Self {
+        Self {
+            inner: MemoryFs::new(device),
+            domain: AuthorityDomain::HOST_SHARE_9P,
+        }
+    }
+
+    fn host_error(error: helios_hal::fs::FsError) -> crate::HostFsError {
+        use helios_hal::fs::FsError;
+        use helios_hal::io::IoError;
+        let io = match error {
+            FsError::NoEntry => IoError::NotFound,
+            FsError::Exists => IoError::AlreadyExists,
+            FsError::NotDirectory => IoError::NotDirectory,
+            FsError::IsDirectory => IoError::IsDirectory,
+            FsError::NotEmpty => IoError::DirectoryNotEmpty,
+            FsError::ReadOnly => IoError::ReadOnly,
+            FsError::NotPermitted => IoError::PermissionDenied,
+            FsError::Unsupported | FsError::Invalid | FsError::Loop | FsError::CrossDevice => {
+                IoError::Unsupported
+            }
+            FsError::NoSpace => return crate::HostFsError::Protocol("no space"),
+            FsError::NameTooLong => {
+                return crate::HostFsError::NameTooLong {
+                    len: 256,
+                    max_len: 255,
+                };
+            }
+            FsError::Overflow | FsError::IllegalByteSequence | FsError::Busy | FsError::Io => {
+                IoError::DeviceFault
+            }
+        };
+        crate::HostFsError::Transport(io)
+    }
+
+    fn fs_path(path: &str) -> Result<helios_hal::fs::FsPath<'_>, crate::HostFsError> {
+        let trimmed = path.strip_prefix('/').unwrap_or(path);
+        helios_hal::fs::FsPath::new(trimmed)
+            .ok_or(crate::HostFsError::Protocol("invalid host path"))
+    }
+
+    fn host_metadata(
+        &self,
+        path: helios_hal::fs::FsPath<'_>,
+        metadata: helios_hal::fs::Metadata,
+    ) -> Result<crate::HostMetadata, crate::HostFsError> {
+        let unix = self.inner.unix_metadata(path).map_err(Self::host_error)?;
+        let kind_bits = match metadata.kind {
+            NodeKind::Directory => 0o040_000,
+            NodeKind::File => 0o100_000,
+            NodeKind::Symlink => 0o120_000,
+            NodeKind::CharacterDevice => 0o020_000,
+            NodeKind::BlockDevice => 0o060_000,
+            NodeKind::Fifo => 0o010_000,
+            NodeKind::Socket => 0o140_000,
+        };
+        let qid_type = match metadata.kind {
+            NodeKind::Directory => 0x80,
+            NodeKind::Symlink => 0x02,
+            _ => 0x00,
+        };
+        Ok(crate::HostMetadata {
+            identity: crate::ObjectIdentity::new(self.domain, metadata.id.inode),
+            qid_path: metadata.id.inode,
+            qid_type,
+            mode: kind_bits | unix.attributes.permissions,
+            uid: unix.attributes.uid,
+            gid: unix.attributes.gid,
+            rdev: u64::from(unix.rdev.encode()),
+            size: metadata.size,
+            link_count: metadata.link_count,
+            access_nanos: metadata.access_nanos,
+            modified_nanos: metadata.modified_nanos,
+            status_nanos: metadata.status_nanos,
+        })
+    }
+}
+
+impl crate::HostFileSystem for MemoryHostFileSystem {
+    type Write = core::convert::Infallible;
+
+    fn cache_stats(&self) -> Option<crate::HostFsCacheStats> {
+        None
+    }
+
+    async fn after_machine_restore(&self, _restore: crate::HostShareRestore) {}
+
+    async fn prepare_snapshot(&self) {}
+
+    fn snapshot_finished(&self) {}
+
+    async fn stat_path(&self, path: &str) -> Result<crate::HostMetadata, crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        use helios_hal::fs::FileSystem as _;
+        let metadata = self.inner.stat(path).await.map_err(Self::host_error)?;
+        self.host_metadata(path, metadata)
+    }
+
+    async fn read_dir(
+        &self,
+        path: &str,
+        limit: crate::HostDirLimit,
+    ) -> Result<alloc::vec::Vec<crate::HostDirEntry>, crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        use helios_hal::fs::{DirStream as _, FileSystem as _};
+        let dir = self.inner.open_dir(path).await.map_err(Self::host_error)?;
+        let entries = dir
+            .read(helios_hal::fs::DirCookie::START, limit.max_entries)
+            .await
+            .map_err(Self::host_error)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| crate::HostDirEntry {
+                name: entry.name,
+                kind: Some(entry.kind),
+            })
+            .collect())
+    }
+
+    async fn read_file(&self, path: &str) -> Result<alloc::vec::Vec<u8>, crate::HostFsError> {
+        self.read_file_range(path, 0, u32::MAX).await
+    }
+
+    async fn read_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<alloc::vec::Vec<u8>, crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        use helios_hal::fs::FileSystem as _;
+        let bytes = self
+            .inner
+            .read_at(path, offset, max_bytes as usize)
+            .await
+            .map_err(Self::host_error)?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn prepare_write(
+        &self,
+        _path: &str,
+        _position: WritePosition,
+        _len: usize,
+    ) -> Result<Self::Write, crate::HostFsError> {
+        Err(crate::HostFsError::Transport(
+            helios_hal::io::IoError::Unsupported,
+        ))
+    }
+
+    async fn sync_file(&self, path: &str) -> Result<(), crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        use helios_hal::fs::FileSystem as _;
+        self.inner.sync(path).await.map_err(Self::host_error)
+    }
+
+    async fn truncate_file(&self, path: &str) -> Result<(), crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        use helios_hal::fs::FileSystem as _;
+        self.inner
+            .open(path, helios_hal::fs::OpenFlags::TRUNCATE, 1)
+            .await
+            .map(|_| ())
+            .map_err(Self::host_error)
+    }
+
+    async fn set_file_size(&self, path: &str, size: u64) -> Result<(), crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        use helios_hal::fs::FileSystem as _;
+        self.inner
+            .set_size(path, size, 1)
+            .await
+            .map_err(Self::host_error)
+    }
+
+    async fn set_times(
+        &self,
+        path: &str,
+        access_nanos: Option<u64>,
+        modified_nanos: Option<u64>,
+    ) -> Result<(), crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        use helios_hal::fs::FileSystem as _;
+        self.inner
+            .set_times(path, access_nanos, modified_nanos, 99)
+            .await
+            .map_err(Self::host_error)
+    }
+
+    async fn create_file(
+        &self,
+        path: &str,
+        creation: crate::HostCreation,
+    ) -> Result<(), crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        let parent_uid = path
+            .split_last()
+            .and_then(|(parent, _)| self.inner.unix_metadata(parent).ok())
+            .map_or(0, |meta| meta.attributes.uid);
+        self.inner
+            .create_file_with(
+                path,
+                crate::UnixAttributes {
+                    permissions: creation.permissions,
+                    uid: parent_uid,
+                    gid: creation.gid,
+                },
+                1,
+            )
+            .map(|_| ())
+            .map_err(Self::host_error)
+    }
+
+    async fn create_directory(
+        &self,
+        path: &str,
+        creation: crate::HostCreation,
+    ) -> Result<(), crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        let parent_uid = path
+            .split_last()
+            .and_then(|(parent, _)| self.inner.unix_metadata(parent).ok())
+            .map_or(0, |meta| meta.attributes.uid);
+        self.inner
+            .create_directory_with(
+                path,
+                crate::UnixAttributes {
+                    permissions: creation.permissions,
+                    uid: parent_uid,
+                    gid: creation.gid,
+                },
+                1,
+            )
+            .map_err(Self::host_error)
+    }
+
+    async fn remove(&self, path: &str, directory: bool) -> Result<(), crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        use helios_hal::fs::FileSystem as _;
+        if directory {
+            self.inner
+                .remove_directory(path, 1)
+                .await
+                .map_err(Self::host_error)
+        } else {
+            self.inner.unlink(path, 1).await.map_err(Self::host_error)
+        }
+    }
+
+    async fn rename(&self, source: &str, destination: &str) -> Result<(), crate::HostFsError> {
+        let source = Self::fs_path(source)?;
+        let destination = Self::fs_path(destination)?;
+        use helios_hal::fs::FileSystem as _;
+        self.inner
+            .rename(source, destination, helios_hal::fs::RenameMode::Replace, 1)
+            .await
+            .map_err(Self::host_error)
+    }
+
+    async fn hard_link(&self, source: &str, destination: &str) -> Result<(), crate::HostFsError> {
+        let source = Self::fs_path(source)?;
+        let destination = Self::fs_path(destination)?;
+        use helios_hal::fs::FileSystem as _;
+        self.inner
+            .link(source, destination, 1)
+            .await
+            .map_err(Self::host_error)
+    }
+
+    async fn symlink(
+        &self,
+        target: &str,
+        link_path: &str,
+        gid: u32,
+    ) -> Result<(), crate::HostFsError> {
+        let link_path = Self::fs_path(link_path)?;
+        let parent_uid = link_path
+            .split_last()
+            .and_then(|(parent, _)| self.inner.unix_metadata(parent).ok())
+            .map_or(0, |meta| meta.attributes.uid);
+        self.inner
+            .symlink_with(
+                target,
+                link_path,
+                crate::UnixAttributes {
+                    permissions: 0o777,
+                    uid: parent_uid,
+                    gid,
+                },
+                1,
+            )
+            .map_err(Self::host_error)
+    }
+
+    async fn read_link(&self, path: &str) -> Result<String, crate::HostFsError> {
+        let path = Self::fs_path(path)?;
+        use helios_hal::fs::FileSystem as _;
+        self.inner.read_link(path).await.map_err(Self::host_error)
+    }
+}
+
+#[derive(Clone)]
+struct MemoryHostStorage;
+
+impl crate::Storage for MemoryHostStorage {
+    type HostShare = MemoryHostFileSystem;
+    type Disk = crate::NoDisks;
+}
+
+fn memory_host_store_data() -> (
+    crate::wasmtime_adapter::component_host::StoreData<
+        crate::test_support::TestCpu,
+        crate::test_support::TestNetworkService,
+        MemoryHostStorage,
+    >,
+    MemoryHostFileSystem,
+) {
+    use crate::wasmtime_adapter::component_host::service::test_store::DiscardPort;
+    use crate::wasmtime_adapter::component_host::{HostRuntimeState, StoreData};
+    use crate::{Executor, InstanceRegistry, ProcessAuthority, TaskFunding};
+    use helios_hal::cpu::{Cpu as _, ProcessorId};
+    use helios_hal::watchdog::ProgressCounter;
+    use triomphe::Arc;
+
+    fn read_nothing(_: &mut alloc::vec::Vec<u8>, _: u32) {}
+
+    let cpu = crate::test_support::TestCpu::with_entropy(0x5a);
+    let runtime_state: HostRuntimeState<
+        crate::test_support::TestCpu,
+        crate::test_support::TestNetworkService,
+        MemoryHostStorage,
+    > = crate::RuntimeState::new(
+        cpu.timebase(),
+        1,
+        0,
+        crate::BootPayload::for_tests(),
+        crate::isa::GuestIsa::for_build_target(cpu.native_feature_probe()),
+    );
+    runtime_state.install_root_entropy(Arc::new(
+        crate::RootEntropy::from_platform(&cpu, None, None, crate::MachineGeneration::new(None))
+            .expect("the fixture CPU has an entropy source"),
+    ));
+    let namespace = runtime_state.root_namespace();
+    let cap = ProcessAuthority::root()
+        .derive_mount_cap("/host")
+        .expect("root may mount /host");
+    let host_fs = MemoryHostFileSystem::new(namespace.table().allocate_device());
+    block_on(namespace.mount(
+        &cap,
+        MountedFs::Host(HostShare::new(host_fs.clone())),
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
+    ))
+    .expect("host mount must succeed");
+
+    let executor = Executor::new(
+        ProgressCounter::new(),
+        crate::test_support::single_node_pool(1),
+        ProcessorId::new(0),
+    );
+    let registry = InstanceRegistry::new();
+    let instance = registry.register("fs-host-store", 0);
+    let store = StoreData::new(
+        wasmtime::component::ResourceTable::new(),
+        cpu,
+        executor.timer(cpu),
+        executor
+            .spawner(cpu)
+            .instance_spawner(TaskFunding::Instance, &instance),
+        runtime_state.clone(),
+        registry,
+        instance,
+        None,
+        runtime_state.root_namespace().descend(),
+        alloc::vec::Vec::new(),
+        alloc::vec::Vec::new(),
+        ProcessAuthority::empty(),
+        crate::component::ComponentOutputMode::Serial,
+        read_nothing,
+        crate::DebugSerialWriter::of::<DiscardPort>(),
+    );
+    (store, host_fs)
+}
+
+#[test]
+fn open_at_refuses_create_directory_before_host_mutation() {
+    use crate::wasmtime_adapter::component_host::service::test_store;
+
+    let namespace = namespace_with_host();
+    let (rw, _) = host_bases();
+    let refused = open(
+        &namespace,
+        &rw,
+        "newdir",
+        fs_types::OpenFlags::CREATE | fs_types::OpenFlags::DIRECTORY,
+        FsDescriptorFlags::READ,
+    );
+    assert!(matches!(refused, Err(fs_types::ErrorCode::Invalid)));
+
+    let mut store = test_store::store_data_with(|_| {});
+    mount_unreachable_host(store.filesystem(), "/mnt");
+    let p3_base = store
+        .table
+        .push(directory_holding("/mnt/a", root().flags))
+        .expect("p3 base must fit");
+    let p3_prepared = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<()>>::prepare_open_at(
+        &mut &mut store,
+        p3_base,
+        fs_types::PathFlags::empty(),
+        "newdir",
+        fs_types::OpenFlags::CREATE | fs_types::OpenFlags::DIRECTORY,
+        fs_types::DescriptorFlags::READ,
+    )
+    .expect("prepare_open_at must not trap");
+    assert!(matches!(
+        block_on(super::fs::execute_open(p3_prepared)),
+        Err(fs_types::ErrorCode::Invalid)
+    ));
+}
+
+#[test]
+fn p3_open_at_validates_all_open_flags_on_embedded_and_host_share() {
+    use helios_hal::fs::FileSystem as _;
+
+    let (mut store, host_fs) = memory_host_store_data();
+    // Seed an existing file and directory on both embedded root (`/`) and host share (`/host`).
+    block_on(host_fs.inner.open(
+        MemoryHostFileSystem::fs_path("existing.txt").unwrap(),
+        helios_hal::fs::OpenFlags::CREATE,
+        1,
+    ))
+    .expect("host file created");
+    block_on(async {
+        let write = host_fs
+            .inner
+            .prepare_write(
+                MemoryHostFileSystem::fs_path("existing.txt").unwrap(),
+                WritePosition::At(0),
+                7,
+                2,
+            )
+            .await
+            .expect("prepare host write");
+        use helios_hal::fs::{FilledWrite as _, PreparedWrite as _};
+        let filled = write.fill(|at, dst| dst.copy_from_slice(&b"payload"[at..at + dst.len()]));
+        filled.submit().await.expect("submit host write");
+        host_fs
+            .inner
+            .create_directory(MemoryHostFileSystem::fs_path("subdir").unwrap(), 1)
+            .await
+            .expect("host subdir");
+    });
+
+    let root_ns = store.filesystem().clone();
+    block_on(create_directory_at(&root_ns, held(&root()), "emb", 1)).expect("emb dir");
+    block_on(create_directory_at(
+        &root_ns,
+        held(&root()),
+        "emb/subdir",
+        1,
+    ))
+    .expect("emb subdir");
+    let emb_file = create_file(&root_ns, "emb/existing.txt", b"payload");
+    assert_eq!(read_all(&root_ns, &emb_file), b"payload");
+
+    for base_path in ["/emb", "/host"] {
+        // CREATE | EXCLUSIVE on existing file -> Exist.
+        let base_p3 = store
+            .table
+            .push(directory_holding(base_path, root().flags))
+            .expect("base fits");
+        let p3_excl = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<()>>::prepare_open_at(
+            &mut &mut store,
+            base_p3,
+            fs_types::PathFlags::empty(),
+            "existing.txt",
+            fs_types::OpenFlags::CREATE | fs_types::OpenFlags::EXCLUSIVE,
+            fs_types::DescriptorFlags::READ,
+        )
+        .expect("prepare");
+        assert!(matches!(
+            block_on(super::fs::execute_open(p3_excl)),
+            Err(fs_types::ErrorCode::Exist)
+        ));
+
+        // DIRECTORY on a regular file -> NotDirectory.
+        let base_p3 = store
+            .table
+            .push(directory_holding(base_path, root().flags))
+            .expect("base fits");
+        let p3_dir_on_file = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<
+            (),
+        >>::prepare_open_at(
+            &mut &mut store,
+            base_p3,
+            fs_types::PathFlags::empty(),
+            "existing.txt",
+            fs_types::OpenFlags::DIRECTORY,
+            fs_types::DescriptorFlags::READ,
+        )
+        .expect("prepare");
+        assert!(matches!(
+            block_on(super::fs::execute_open(p3_dir_on_file)),
+            Err(fs_types::ErrorCode::NotDirectory)
+        ));
+
+        // DIRECTORY on a directory succeeds; without DIRECTORY -> IsDirectory.
+        let base_p3 = store
+            .table
+            .push(directory_holding(base_path, root().flags))
+            .expect("base fits");
+        let p3_dir = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<()>>::prepare_open_at(
+            &mut &mut store,
+            base_p3,
+            fs_types::PathFlags::empty(),
+            "subdir",
+            fs_types::OpenFlags::DIRECTORY,
+            fs_types::DescriptorFlags::READ,
+        )
+        .expect("prepare");
+        assert_eq!(
+            block_on(super::fs::execute_open(p3_dir))
+                .expect("dir opens")
+                .kind,
+            FsNodeKind::Directory
+        );
+
+        let base_p3 = store
+            .table
+            .push(directory_holding(base_path, root().flags))
+            .expect("base fits");
+        let p3_no_dir = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<()>>::prepare_open_at(
+            &mut &mut store,
+            base_p3,
+            fs_types::PathFlags::empty(),
+            "subdir",
+            fs_types::OpenFlags::empty(),
+            fs_types::DescriptorFlags::READ,
+        )
+        .expect("prepare");
+        assert!(matches!(
+            block_on(super::fs::execute_open(p3_no_dir)),
+            Err(fs_types::ErrorCode::IsDirectory)
+        ));
+
+        // CREATE | DIRECTORY on missing path -> Invalid and creates nothing.
+        let base_p3 = store
+            .table
+            .push(directory_holding(base_path, root().flags))
+            .expect("base fits");
+        let p3_create_dir = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<()>>::prepare_open_at(
+            &mut &mut store,
+            base_p3,
+            fs_types::PathFlags::empty(),
+            "never-created",
+            fs_types::OpenFlags::CREATE | fs_types::OpenFlags::DIRECTORY,
+            fs_types::DescriptorFlags::READ,
+        )
+        .expect("prepare");
+        assert!(matches!(
+            block_on(super::fs::execute_open(p3_create_dir)),
+            Err(fs_types::ErrorCode::Invalid)
+        ));
+        assert!(matches!(
+            block_on(stat_path(
+                store.filesystem(),
+                &alloc::format!("{base_path}/never-created"),
+                Follow::No
+            )),
+            Err(fs_types::ErrorCode::NoEntry)
+        ));
+
+        // TRUNCATE on regular file truncates to 0; on directory -> IsDirectory.
+        let base_p3 = store
+            .table
+            .push(directory_holding(base_path, root().flags))
+            .expect("base fits");
+        let p3_trunc_dir = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<
+            (),
+        >>::prepare_open_at(
+            &mut &mut store,
+            base_p3,
+            fs_types::PathFlags::empty(),
+            "subdir",
+            fs_types::OpenFlags::DIRECTORY | fs_types::OpenFlags::TRUNCATE,
+            fs_types::DescriptorFlags::READ,
+        )
+        .expect("prepare");
+        assert!(matches!(
+            block_on(super::fs::execute_open(p3_trunc_dir)),
+            Err(fs_types::ErrorCode::IsDirectory)
+        ));
+
+        let base_p3 = store
+            .table
+            .push(directory_holding(base_path, root().flags))
+            .expect("base fits");
+        let p3_trunc = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<()>>::prepare_open_at(
+            &mut &mut store,
+            base_p3,
+            fs_types::PathFlags::empty(),
+            "existing.txt",
+            fs_types::OpenFlags::TRUNCATE,
+            fs_types::DescriptorFlags::READ,
+        )
+        .expect("prepare");
+        let truncated = block_on(super::fs::execute_open(p3_trunc)).expect("truncate succeeds");
+        assert_eq!(
+            block_on(read(store.filesystem(), held(&truncated), 0, 64))
+                .expect("read truncated")
+                .len(),
+            0
+        );
+    }
+}
+
+#[test]
+fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_set_times() {
+    use helios_hal::fs::{FileSystem as _, FilledWrite as _, PreparedWrite as _};
+
+    let (mut store, host_fs) = memory_host_store_data();
+    // Seed /host with target file, subdir, and symlinks to each.
+    block_on(async {
+        host_fs
+            .inner
+            .open(
+                MemoryHostFileSystem::fs_path("target").unwrap(),
+                helios_hal::fs::OpenFlags::CREATE,
+                10,
+            )
+            .await
+            .unwrap();
+        let write = host_fs
+            .inner
+            .prepare_write(
+                MemoryHostFileSystem::fs_path("target").unwrap(),
+                WritePosition::At(0),
+                4,
+                10,
+            )
+            .await
+            .unwrap();
+        write
+            .fill(|at, dst| dst.copy_from_slice(&b"host"[at..at + dst.len()]))
+            .submit()
+            .await
+            .unwrap();
+        host_fs
+            .inner
+            .create_directory(MemoryHostFileSystem::fs_path("dir").unwrap(), 10)
+            .await
+            .unwrap();
+        host_fs
+            .inner
+            .symlink(
+                "target",
+                MemoryHostFileSystem::fs_path("file-link").unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+        host_fs
+            .inner
+            .symlink(
+                "dir",
+                MemoryHostFileSystem::fs_path("dir-link").unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+    });
+
+    // Seed /emb with target file, subdir, and symlinks to each.
+    let ns = store.filesystem().clone();
+    block_on(create_directory_at(&ns, held(&root()), "emb", 10)).unwrap();
+    block_on(create_directory_at(&ns, held(&root()), "emb/dir", 10)).unwrap();
+    create_file(&ns, "emb/target", b"emb!");
+    block_on(symlink_at(
+        &ns,
+        held(&directory_holding("/emb", root().flags)),
+        "target",
+        "file-link",
+        10,
+    ))
+    .unwrap();
+    block_on(symlink_at(
+        &ns,
+        held(&directory_holding("/emb", root().flags)),
+        "dir",
+        "dir-link",
+        10,
+    ))
+    .unwrap();
+
+    for (base_path, expected_bytes) in [("/emb", b"emb!".as_slice()), ("/host", b"host".as_slice())]
+    {
+        let base = directory_holding(base_path, root().flags);
+
+        // stat-at without SYMLINK_FOLLOW reports SymbolicLink; with it reports RegularFile / Directory.
+        let link_stat = super::descriptor_stat(
+            &block_on(stat_at(
+                store.filesystem(),
+                held(&base),
+                fs_types::PathFlags::empty(),
+                "file-link",
+            ))
+            .expect("lstat symlink"),
+        );
+        assert!(matches!(
+            link_stat.type_,
+            fs_types::DescriptorType::SymbolicLink
+        ));
+
+        let target_stat = super::descriptor_stat(
+            &block_on(stat_at(
+                store.filesystem(),
+                held(&base),
+                fs_types::PathFlags::SYMLINK_FOLLOW,
+                "file-link",
+            ))
+            .expect("stat symlink target"),
+        );
+        assert!(matches!(
+            target_stat.type_,
+            fs_types::DescriptorType::RegularFile
+        ));
+        assert_eq!(target_stat.size, expected_bytes.len() as u64);
+
+        let dir_stat = super::descriptor_stat(
+            &block_on(stat_at(
+                store.filesystem(),
+                held(&base),
+                fs_types::PathFlags::SYMLINK_FOLLOW,
+                "dir-link",
+            ))
+            .expect("stat dir symlink target"),
+        );
+        assert!(matches!(
+            dir_stat.type_,
+            fs_types::DescriptorType::Directory
+        ));
+
+        // open-at without SYMLINK_FOLLOW refuses the symlink with Loop (and CREATE|EXCLUSIVE with Exist).
+        let nofollow_err = block_on(open_at(
+            store.filesystem(),
+            held(&base),
+            fs_types::PathFlags::empty(),
+            "file-link",
+            fs_types::OpenFlags::empty(),
+            FsDescriptorFlags::READ,
+            1,
+        ))
+        .err()
+        .expect("open-at without symlink-follow must refuse symlink");
+        assert!(matches!(nofollow_err, fs_types::ErrorCode::Loop));
+
+        let excl_err = block_on(open_at(
+            store.filesystem(),
+            held(&base),
+            fs_types::PathFlags::empty(),
+            "file-link",
+            fs_types::OpenFlags::CREATE | fs_types::OpenFlags::EXCLUSIVE,
+            FsDescriptorFlags::READ,
+            1,
+        ))
+        .err()
+        .expect("create|exclusive on existing symlink must return Exist");
+        assert!(matches!(excl_err, fs_types::ErrorCode::Exist));
+
+        // open-at with SYMLINK_FOLLOW opens the target file or directory.
+        let opened_file = block_on(open_at(
+            store.filesystem(),
+            held(&base),
+            fs_types::PathFlags::SYMLINK_FOLLOW,
+            "file-link",
+            fs_types::OpenFlags::empty(),
+            FsDescriptorFlags::READ,
+            1,
+        ))
+        .expect("open-at with symlink-follow opens target file");
+        assert_eq!(opened_file.kind, FsNodeKind::File);
+        assert_eq!(
+            block_on(read(store.filesystem(), held(&opened_file), 0, 16))
+                .unwrap()
+                .as_ref(),
+            expected_bytes
+        );
+
+        let opened_dir = block_on(open_at(
+            store.filesystem(),
+            held(&base),
+            fs_types::PathFlags::SYMLINK_FOLLOW,
+            "dir-link",
+            fs_types::OpenFlags::DIRECTORY,
+            FsDescriptorFlags::READ,
+            1,
+        ))
+        .expect("open-at with symlink-follow opens target dir");
+        assert_eq!(opened_dir.kind, FsNodeKind::Directory);
+
+        // set-times-at without SYMLINK_FOLLOW updates the link itself; with SYMLINK_FOLLOW updates target.
+        let base_p3 = store.table.push(base.clone()).expect("base fits");
+        let p3_nofollow = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<
+            (),
+        >>::prepare_set_times_at(
+            &mut &mut store,
+            base_p3,
+            fs_types::PathFlags::empty(),
+            "file-link",
+            fs_types::NewTimestamp::Timestamp(fs_types::Instant {
+                seconds: 1,
+                nanoseconds: 111,
+            }),
+            fs_types::NewTimestamp::Timestamp(fs_types::Instant {
+                seconds: 2,
+                nanoseconds: 222,
+            }),
+        )
+        .expect("prepare")
+        .expect("prepared");
+        block_on(p3_nofollow.execute()).expect("p3 set-times-at nofollow succeeds");
+
+        let link_meta = block_on(stat_at(
+            store.filesystem(),
+            held(&base),
+            fs_types::PathFlags::empty(),
+            "file-link",
+        ))
+        .unwrap();
+        assert_eq!(link_meta.access_nanos, 1_000_000_111);
+        assert_eq!(link_meta.modified_nanos, 2_000_000_222);
+
+        let target_before = block_on(stat_at(
+            store.filesystem(),
+            held(&base),
+            fs_types::PathFlags::empty(),
+            "target",
+        ))
+        .unwrap();
+        assert_ne!(target_before.modified_nanos, 2_000_000_222);
+
+        let base_p3 = store.table.push(base.clone()).expect("base fits");
+        let p3_follow = <wasmtime::component::HasSelf<_> as fs_types::HostDescriptorWithStore<()>>::prepare_set_times_at(
+            &mut &mut store,
+            base_p3,
+            fs_types::PathFlags::SYMLINK_FOLLOW,
+            "file-link",
+            fs_types::NewTimestamp::Timestamp(fs_types::Instant {
+                seconds: 3,
+                nanoseconds: 333,
+            }),
+            fs_types::NewTimestamp::Timestamp(fs_types::Instant {
+                seconds: 4,
+                nanoseconds: 444,
+            }),
+        )
+        .expect("prepare")
+        .expect("prepared");
+        block_on(p3_follow.execute()).expect("p3 set-times-at follow succeeds");
+
+        let target_after = block_on(stat_at(
+            store.filesystem(),
+            held(&base),
+            fs_types::PathFlags::empty(),
+            "target",
+        ))
+        .unwrap();
+        assert_eq!(target_after.access_nanos, 3_000_000_333);
+        assert_eq!(target_after.modified_nanos, 4_000_000_444);
+
+        let link_after = block_on(stat_at(
+            store.filesystem(),
+            held(&base),
+            fs_types::PathFlags::empty(),
+            "file-link",
+        ))
+        .unwrap();
+        assert_eq!(link_after.access_nanos, 1_000_000_111);
+        assert_eq!(link_after.modified_nanos, 2_000_000_222);
+    }
+}
+
+#[test]
+fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() {
+    use bytes::Bytes;
+    use core::num::NonZeroUsize;
+    use ferrosys::btrfs::{FormatOptions, format_to};
+    use ferrosys::{Metadata as BtrfsSeedMeta, Timestamp as BtrfsStamp, TreeBuilder};
+    use helios_hal::fs::{DeviceId, FsPath};
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    use crate::io::{MemoryDisk, cache_over};
+    use crate::vfs::{BtrfsFs, BtrfsWriteOptions};
+    use crate::{BOOT_DEVICE, EmbeddedBootFs, MountTable, ProcessAuthority, UnixAttributes};
+
+    #[derive(Clone)]
+    struct AllMountsStorage;
+    impl crate::Storage for AllMountsStorage {
+        type HostShare = MemoryHostFileSystem;
+        type Disk = MemoryDisk;
+    }
+
+    struct RawBytes(alloc::vec::Vec<u8>);
+    impl helios_btrfs::BlockSource for RawBytes {
+        fn size_bytes(&self) -> u64 {
+            self.0.len() as u64
+        }
+        async fn read_at(&self, offset: u64, out: &mut [u8]) -> helios_hal::io::IoResult<()> {
+            let start = offset as usize;
+            out.copy_from_slice(&self.0[start..start + out.len()]);
+            Ok(())
+        }
+    }
+
+    const BTRFS_BYTES: usize = 128 << 20;
+    const PARENTS: [(&str, u16, u32, u32); 3] = [
+        ("sgid", 0o2775, 1000, 100),
+        ("sticky", 0o1777, 0, 0),
+        ("locked", 0o0000, 999, 999),
+    ];
+
+    let stamp = BtrfsStamp::from_secs(1_700_000_000);
+    let mut btrfs_tree = TreeBuilder::new().root(BtrfsSeedMeta::new(0o755, stamp));
+    for (name, mode, uid, gid) in PARENTS {
+        btrfs_tree = btrfs_tree.directory(
+            alloc::format!("/{name}"),
+            BtrfsSeedMeta::new(mode, stamp).owned_by(uid, gid),
+        );
+    }
+    let mut image = tempfile::tempfile().expect("image file");
+    image.set_len(BTRFS_BYTES as u64).unwrap();
+    format_to(
+        &mut image,
+        btrfs_tree,
+        BTRFS_BYTES as u64,
+        FormatOptions::new([0x71; 16], stamp),
+    )
+    .unwrap();
+    image.seek(SeekFrom::Start(0)).unwrap();
+    let mut raw_btrfs = alloc::vec::Vec::new();
+    image.read_to_end(&mut raw_btrfs).unwrap();
+    let btrfs_disk = MemoryDisk::holding_writable("wasi-btrfs", &raw_btrfs);
+    let btrfs_cache = cache_over(&btrfs_disk, 256, 1);
+
+    let namespace: Namespace<AllMountsStorage> = Namespace::new(MountTable::new(
+        crate::BootFs::new(EmbeddedBootFs::empty(), BOOT_DEVICE),
+        1,
+    ));
+    let MountedFs::Root(root_fs) = namespace.resolve("/").unwrap().fs() else {
+        unreachable!("the root of a namespace is a RootFs");
+    };
+    let root_upper = root_fs.upper().clone();
+    let mem_fs = MemoryFs::new(namespace.table().allocate_device());
+    let host_fs = MemoryHostFileSystem::new(namespace.table().allocate_device());
+
+    for fs in [&root_upper, &mem_fs, &host_fs.inner] {
+        for (name, mode, uid, gid) in PARENTS {
+            fs.create_directory_with(
+                FsPath::new(name).unwrap(),
+                UnixAttributes {
+                    permissions: u32::from(mode),
+                    uid,
+                    gid,
+                },
+                10,
+            )
+            .unwrap();
+        }
+    }
+    // Seed a `0000` file with an ACL on `/mem` to verify WASI ignores both:
+    // the mount's rights alone grant or refuse access.
+    mem_fs
+        .create_file_with(
+            FsPath::new("locked/secret").unwrap(),
+            UnixAttributes {
+                permissions: 0o0000,
+                uid: 999,
+                gid: 999,
+            },
+            10,
+        )
+        .unwrap();
+    mem_fs
+        .set_xattr(
+            FsPath::new("locked/secret").unwrap(),
+            "system.posix_acl_access",
+            Bytes::from_static(&[2, 0, 0, 0]),
+            crate::XattrSetMode::Create,
+            10,
+        )
+        .unwrap();
+
+    let authority = ProcessAuthority::root();
+    block_on(namespace.mount(
+        &authority.derive_mount_cap("/mem").unwrap(),
+        MountedFs::Memory(mem_fs.clone()),
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
+    ))
+    .unwrap();
+    block_on(namespace.mount(
+        &authority.derive_mount_cap("/host").unwrap(),
+        MountedFs::Host(HostShare::new(host_fs.clone())),
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
+    ))
+    .unwrap();
+
+    let timer = crate::test_support::test_timer(crate::test_support::TestCpu::without_entropy());
+    block_on(async {
+        let (btrfs_fs, btrfs_service) = BtrfsFs::mount_writable(
+            btrfs_cache.disk(0),
+            || DeviceId::new(220),
+            BtrfsWriteOptions {
+                entropy: crate::test_support::test_root_entropy(),
+                concurrency: NonZeroUsize::new(1).unwrap(),
+                compress: None,
+                commit: None,
+                max_inline: None,
+                now: 1_700_000_000_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+        namespace
+            .mount(
+                &authority.derive_mount_cap("/btrfs").unwrap(),
+                MountedFs::Btrfs(btrfs_fs.clone()),
+                granted(FileSystemRights::READ | FileSystemRights::WRITE),
+            )
+            .await
+            .unwrap();
+
+        let client = async {
+            // Even with mode 0000, uid 999 and an ACL, WASI opens and writes
+            // the file on a read-write mount.
+            let secret = open_at(
+                &namespace,
+                held(&root()),
+                fs_types::PathFlags::empty(),
+                "mem/locked/secret",
+                fs_types::OpenFlags::empty(),
+                FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+                20,
+            )
+            .await
+            .expect("WASI ignores stored Unix mode and ACLs");
+            super::write(
+                &namespace,
+                held(&secret),
+                WritePosition::At(0),
+                b"granted-by-mount",
+                21,
+            )
+            .await
+            .expect("WASI writes through mount rights");
+            assert_eq!(
+                read(&namespace, held(&secret), 0, 64)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"granted-by-mount"
+            );
+            drop(secret);
+
+            // Create a regular file, a directory and a symlink through WASI
+            // under each parent across every writable filesystem.
+            for prefix in ["", "mem/", "host/", "btrfs/"] {
+                for (parent, ..) in PARENTS {
+                    let base = alloc::format!("{prefix}{parent}");
+                    open_at(
+                        &namespace,
+                        held(&root()),
+                        fs_types::PathFlags::empty(),
+                        &alloc::format!("{base}/file"),
+                        fs_types::OpenFlags::CREATE | fs_types::OpenFlags::EXCLUSIVE,
+                        FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+                        30,
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("WASI create file in {base}: {err:?}"));
+                    create_directory_at(
+                        &namespace,
+                        held(&root()),
+                        &alloc::format!("{base}/dir"),
+                        30,
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("WASI create dir in {base}: {err:?}"));
+                    symlink_at(
+                        &namespace,
+                        held(&root()),
+                        "file",
+                        &alloc::format!("{base}/link"),
+                        30,
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("WASI symlink in {base}: {err:?}"));
+                }
+            }
+            namespace
+                .unmount(&authority.derive_unmount_cap("/btrfs").unwrap())
+                .await
+                .unwrap();
+            btrfs_fs.unmount().await;
+            drop(btrfs_fs);
+        };
+        futures::future::join(client, btrfs_service.run(timer)).await;
+    });
+
+    for (label, fs) in [
+        ("root", &root_upper),
+        ("memory", &mem_fs),
+        ("host", &host_fs.inner),
+    ] {
+        for (parent, mode, uid, gid) in PARENTS {
+            let mode = u32::from(mode);
+            let check = |leaf: &str, expected: u32| {
+                let path = alloc::format!("{parent}/{leaf}");
+                assert_eq!(
+                    fs.unix_metadata(FsPath::new(&path).unwrap())
+                        .unwrap()
+                        .attributes,
+                    UnixAttributes {
+                        permissions: expected,
+                        uid,
+                        gid,
+                    },
+                    "{label}:{path}"
+                );
+            };
+            check("file", mode & 0o666);
+            check("dir", mode & 0o2777);
+            check("link", 0o777);
+        }
+    }
+
+    let btrfs_view = block_on(helios_btrfs::Filesystem::mount(RawBytes(
+        btrfs_disk.bytes_at(0, BTRFS_BYTES),
+    )))
+    .unwrap();
+    for (parent, mode, uid, gid) in PARENTS {
+        let mode = u32::from(mode);
+        let dir_inode =
+            block_on(btrfs_view.resolve(alloc::format!("/{parent}").as_bytes())).unwrap();
+        for (leaf, expected) in [
+            ("file", mode & 0o666),
+            ("dir", mode & 0o2777),
+            ("link", 0o777),
+        ] {
+            let inode = block_on(btrfs_view.lookup(&dir_inode, leaf.as_bytes()))
+                .unwrap()
+                .unwrap();
+            let meta = *inode.metadata();
+            assert_eq!(
+                (meta.permissions, meta.uid, meta.gid),
+                (expected, uid, gid),
+                "btrfs:{parent}/{leaf}"
+            );
+        }
     }
 }

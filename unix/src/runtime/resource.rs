@@ -1,25 +1,27 @@
-use crate::{Epoll, EventFd, OpenFile};
+use crate::{Epoll, EventFd, OpenFile, Socket, SocketNetwork};
 use alloc::string::String;
 use alloc::sync::Arc;
 use bytes::Bytes;
 use core::sync::atomic::{AtomicU16, Ordering};
 use helios_sync::{ByteReader, ByteWriter};
-/// ABI-independent descriptor resources. File and socket adapters provide the
-/// platform's backing objects; UNIX object ownership is common to every ABI.
+/// ABI-independent descriptor resources. The file adapter provides the
+/// platform's backing file object and `Net` the network its sockets live
+/// on; UNIX object ownership, sockets included, is common to every ABI.
 ///
 /// One entry is one descriptor slot. Cloning it is POSIX duplication: the
-/// clone shares the open description, its status flags and, for a file, the
-/// [`OpenFile`] that holds the node and the offset, and only `close_on_exec`
-/// belongs to the slot.
+/// clone shares the open description, its status flags, for a file the
+/// [`OpenFile`] that holds the node and the offset, and for a socket the
+/// [`Socket`] that holds its state, options, endpoint and socket-pair carry
+/// buffer; only `close_on_exec` belongs to the slot.
 #[derive(Clone)]
-pub struct FileDescriptorEntry<File: Clone, Socket: Clone, Data: Clone> {
-    pub descriptor: FileDescriptor<File, Socket, Data>,
+pub struct FileDescriptorEntry<File: Clone, Net: SocketNetwork, Data: Clone> {
+    pub descriptor: FileDescriptor<File, Net, Data>,
     pub close_on_exec: bool,
     fdflags: Arc<AtomicU16>,
 }
 
 #[derive(Clone)]
-pub enum FileDescriptor<File: Clone, Socket: Clone, Data: Clone> {
+pub enum FileDescriptor<File: Clone, Net: SocketNetwork, Data: Clone> {
     Stdin {
         carry: Bytes,
     },
@@ -38,13 +40,13 @@ pub enum FileDescriptor<File: Clone, Socket: Clone, Data: Clone> {
     },
     File(OpenFile<File>),
     NullDevice,
-    Socket(Socket),
+    Socket(Socket<Net>),
     Epoll(Epoll<Data>),
 }
 
-impl<File: Clone, Socket: Clone, Data: Clone> FileDescriptorEntry<File, Socket, Data> {
+impl<File: Clone, Net: SocketNetwork, Data: Clone> FileDescriptorEntry<File, Net, Data> {
     /// A slot for a new open description, with no status flags set.
-    pub fn new(descriptor: FileDescriptor<File, Socket, Data>, close_on_exec: bool) -> Self {
+    pub fn new(descriptor: FileDescriptor<File, Net, Data>, close_on_exec: bool) -> Self {
         Self {
             descriptor,
             close_on_exec,
@@ -64,12 +66,12 @@ impl<File: Clone, Socket: Clone, Data: Clone> FileDescriptorEntry<File, Socket, 
 #[cfg(test)]
 mod tests {
     use super::{FileDescriptor, FileDescriptorEntry};
-    use crate::OpenFile;
+    use crate::{NoNetwork, OpenFile};
     use core::convert::Infallible;
 
     #[test]
     fn duplicate_shares_the_file_offset() {
-        let entry = FileDescriptorEntry::<&str, Infallible, u64>::new(
+        let entry = FileDescriptorEntry::<&str, NoNetwork, u64>::new(
             FileDescriptor::File(OpenFile::new("node")),
             false,
         );
@@ -79,14 +81,21 @@ mod tests {
         else {
             unreachable!("both slots hold the file");
         };
-        copy.set_offset(5);
-        assert_eq!(file.offset(), 5);
+        copy.try_lock_position()
+            .expect("the position lock is free")
+            .set(5);
+        assert_eq!(
+            file.try_lock_position()
+                .expect("the position lock is free")
+                .get(),
+            5
+        );
         assert!(file.same_description(copy));
     }
 
     #[test]
     fn duplicate_shares_status_flags_but_not_close_on_exec() {
-        let entry = FileDescriptorEntry::<Infallible, Infallible, u64>::new(
+        let entry = FileDescriptorEntry::<Infallible, NoNetwork, u64>::new(
             FileDescriptor::NullDevice,
             false,
         );
@@ -95,5 +104,24 @@ mod tests {
         duplicate.close_on_exec = true;
         assert_eq!(entry.fdflags(), 8);
         assert!(!entry.close_on_exec);
+    }
+
+    #[test]
+    fn duplicate_shares_socket_description() {
+        use crate::{Socket, SocketFamily, SocketTime};
+
+        let entry = FileDescriptorEntry::<Infallible, NoNetwork, u64>::new(
+            FileDescriptor::Socket(Socket::tcp(SocketFamily::Ipv4)),
+            false,
+        );
+        let duplicate = entry.clone();
+        let (FileDescriptor::Socket(sock), FileDescriptor::Socket(dup_sock)) =
+            (&entry.descriptor, &duplicate.descriptor)
+        else {
+            unreachable!("both slots hold the socket");
+        };
+        dup_sock.set_time(SocketTime::ReceiveTimeout, Some(42));
+        assert_eq!(sock.options().time(SocketTime::ReceiveTimeout), Some(42));
+        assert!(sock.same_description(dup_sock));
     }
 }

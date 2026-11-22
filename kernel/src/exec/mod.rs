@@ -34,8 +34,8 @@ pub use compaction::{
 #[cfg(test)]
 pub(crate) use executor::executor_test_guard;
 pub use executor::{
-    Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, PinnedTasks,
-    READY_BATCH_TASKS, Spawner, TaskCapacityError, TaskFunding,
+    Executor, ExecutorRunStats, InstanceSpawner, JoinHandle, LocalJoinHandle, PinnedSpawnError,
+    PinnedTasks, READY_BATCH_TASKS, Spawner, TaskCapacityError, TaskFunding,
 };
 pub(crate) use executor::{TaskHome, task_arena_bytes};
 pub use freeze::{FreezeError, FrozenMachine};

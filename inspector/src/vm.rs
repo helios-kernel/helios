@@ -572,6 +572,8 @@ pub(crate) enum VmSessionError {
     #[error("{0}")]
     AotBench(#[from] AotBenchError),
     #[error("{0}")]
+    LinuxSuite(#[from] crate::linux_suite::LinuxSuiteError),
+    #[error("{0}")]
     RawProfile(#[from] RawProfileCollectError),
     #[error("{0}")]
     ProfileOutput(#[from] ProfileOutputError),
@@ -2078,6 +2080,12 @@ enum VmSessionCommand {
     /// Only an instrumented kernel (`--profile-generate`) carries one; any
     /// other says so rather than handing back an empty profile.
     Profile(ProfileCommand),
+    /// Run Linux conformance-suite cases, each in its own guest process
+    /// under a bound, and record how each ended.
+    ///
+    /// Boot it with `--kernel-feature linux` and the binaries exported
+    /// through `--shared-dir`; `tools/gvisor-syscalls` drives it in CI.
+    LinuxSuite(crate::linux_suite::LinuxSuiteCommand),
     /// Print the guest kernel artifact this checkout would boot, and
     /// stop there.
     ///
@@ -2427,6 +2435,7 @@ enum ResolvedVmSessionCommand {
     Screendump(ScreendumpCommand),
     Input(InputCommand),
     Profile(ProfileCommand),
+    LinuxSuite(crate::linux_suite::LinuxSuiteCommand),
 }
 
 impl ResolvedVmSessionCommand {
@@ -2441,9 +2450,11 @@ impl ResolvedVmSessionCommand {
             Self::Balloon(_) => Some("balloon"),
             Self::Screendump(_) => Some("screendump"),
             Self::Input(_) => Some("input"),
-            Self::Session(_) | Self::AotBench(_) | Self::WorkloadBench(_) | Self::Profile(_) => {
-                None
-            }
+            Self::Session(_)
+            | Self::AotBench(_)
+            | Self::WorkloadBench(_)
+            | Self::Profile(_)
+            | Self::LinuxSuite(_) => None,
         }
     }
 
@@ -2454,7 +2465,11 @@ impl ResolvedVmSessionCommand {
     /// it before QEMU is torn down (`vcpu_state`), and every lane has to
     /// be able to leave that capture behind.
     fn needs_qmp(&self) -> bool {
-        self.qmp_action().is_some() || matches!(self, Self::AotBench(_) | Self::WorkloadBench(_))
+        self.qmp_action().is_some()
+            || matches!(
+                self,
+                Self::AotBench(_) | Self::WorkloadBench(_) | Self::LinuxSuite(_)
+            )
     }
 }
 
@@ -3735,6 +3750,9 @@ fn connect_and_run(
             let socket = qmp_socket.ok_or(VmSessionError::NeedsQmp { action: "input" })?;
             run_input(client, input, &socket)
         }
+        Some(ResolvedVmSessionCommand::LinuxSuite(suite)) => crate::run_interruptible(async move {
+            Ok::<_, VmSessionError>(crate::linux_suite::run(&client, &suite, &vcpus).await?)
+        }),
         Some(ResolvedVmSessionCommand::Profile(profile)) => {
             crate::run_interruptible(async move { Ok(raw_profile::run(&client, &profile).await?) })
         }
@@ -6815,6 +6833,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Screendump(command) => Self::Screendump(command),
             VmSessionCommand::Input(command) => Self::Input(command),
             VmSessionCommand::Profile(command) => Self::Profile(command),
+            VmSessionCommand::LinuxSuite(command) => Self::LinuxSuite(command),
             VmSessionCommand::Build
             | VmSessionCommand::KernelPath
             | VmSessionCommand::BootfsPath

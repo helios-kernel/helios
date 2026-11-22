@@ -34,7 +34,8 @@ pub(crate) struct DataChange<R> {
 
 #[cfg(feature = "write")]
 pub(crate) struct DataWrite<'a> {
-    pub(crate) bytes: &'a [u8],
+    /// The extent's bytes, as whole sectors laid end to end.
+    pub(crate) pieces: &'a [&'a [u8]],
     pub(crate) reference: DataReference,
     pub(crate) checksummed: bool,
 }
@@ -103,19 +104,22 @@ impl Accounting {
         concurrency: core::num::NonZeroUsize,
     ) -> Result<Key, WriteError> {
         let DataWrite {
-            bytes,
+            pieces,
             reference,
             checksummed,
         } = data;
+        let length = pieces.iter().map(|piece| piece.len() as u64).sum();
         let key = self
-            .allocate_data(volume, trees, space, bytes.len() as u64, reference)
+            .allocate_data(volume, trees, space, length, reference)
             .await?;
         if checksummed {
             self.checksums
-                .set(volume, trees, space, key.objectid, bytes)
+                .set(volume, trees, space, key.objectid, pieces)
                 .await?;
         }
-        volume.stage(key.objectid, bytes, concurrency).await?;
+        volume
+            .stage_pieces(key.objectid, pieces, concurrency)
+            .await?;
         Ok(key)
     }
 
@@ -131,11 +135,57 @@ impl Accounting {
     ) -> Result<Key, WriteError> {
         let address = space.reserve_data(length)?;
         let key = Key::new(address, item_type::EXTENT_ITEM, length);
+        self.insert_data(volume, trees, space, key, reference)
+            .await?;
+        Ok(key)
+    }
+
+    /// Takes the data extent `key` names, which is already on disk but in no
+    /// extent item, and registers its first file mapping: Linux's
+    /// `btrfs_alloc_logged_file_extent`, which log replay calls for an extent
+    /// the log references and the extent tree does not yet hold.
+    pub(crate) async fn adopt_data<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        key: Key,
+        reference: DataReference,
+    ) -> Result<(), WriteError> {
+        space.reserve_data_at(key.objectid, key.offset)?;
+        self.insert_data(volume, trees, space, key, reference).await
+    }
+
+    /// Inserts the extent item of a data extent this transaction reserved,
+    /// with its one reference, as `alloc_reserved_file_extent` does.
+    async fn insert_data<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        key: Key,
+        reference: DataReference,
+    ) -> Result<(), WriteError> {
         let extent = DataExtent::new(trees.generation(), reference);
         self.root = trees
             .apply(volume, self.root, key, Some(&extent.encode()), space)
             .await?;
-        Ok(key)
+        Ok(())
+    }
+
+    /// Replaces the checksums of `logical`'s sectors with `digests`, one per
+    /// sector: what log replay copies from the log's checksum items.
+    pub(crate) async fn store_checksums<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        logical: u64,
+        digests: &[u8],
+    ) -> Result<(), WriteError> {
+        self.checksums
+            .store(volume, trees, space, logical, digests)
+            .await
     }
 
     /// Change a counted data reference. The signed delta represents file extent

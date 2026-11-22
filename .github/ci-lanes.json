@@ -43,7 +43,21 @@
     ]
   },
   "lint-host": {
-    "command": "just clippy-host && just clippy-programs",
+    "command": "just clippy-host",
+    "helios-cli": "debug",
+    "rust-cache": true,
+    "surfaces": [
+      "kernel",
+      "unix",
+      "btrfs_src",
+      "venus",
+      "hosted",
+      "host_tools",
+      "programs"
+    ]
+  },
+  "lint-programs": {
+    "command": "just clippy-programs",
     "helios-cli": "debug",
     "rust-cache": true,
     "surfaces": [
@@ -162,6 +176,17 @@
       "btrfs"
     ],
     "exclusive": true
+  },
+  "linux-syscalls": {
+    "surfaces": ["linux_abi"],
+    "exclusive": true,
+    "guest-wasm": "release"
+  },
+  "linux-syscalls-full": {
+    "heavy": true,
+    "surfaces": ["linux_abi"],
+    "exclusive": true,
+    "guest-wasm": "release"
   },
   "test-btrfs-fuzz": {
     "surfaces": [

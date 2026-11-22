@@ -852,6 +852,12 @@ impl TcpReceiveQueue {
         }
         bytes
     }
+
+    fn iter(&self) -> impl Iterator<Item = &BytesMut> {
+        self.inline
+            .iter()
+            .chain(self.overflow.iter().flat_map(VecDeque::iter))
+    }
 }
 
 #[cfg(test)]
@@ -2396,6 +2402,46 @@ where
 
         self.complete_receive_drain(previous_window, now_nanos);
         Some(written_total)
+    }
+
+    /// Copies queued receive bytes into `sink` without consuming them.
+    ///
+    /// Skips `skip_bytes` already delivered into `sink` on an earlier pass
+    /// before a guest page fault paused the copy.
+    pub fn peek_into<S>(&self, mut skip_bytes: usize, sink: &mut S) -> Option<usize>
+    where
+        S: TcpReceiveBuffer,
+    {
+        if sink.remaining_capacity() == 0 {
+            return (self.receive_queued_bytes > skip_bytes).then_some(0);
+        }
+        let queue = self.receive_queue.as_ref()?;
+        let mut written_total = 0usize;
+        for segment in queue.iter() {
+            if skip_bytes >= segment.len() {
+                skip_bytes -= segment.len();
+                continue;
+            }
+            let slice = &segment.as_ref()[skip_bytes..];
+            skip_bytes = 0;
+            let remaining_before = sink.remaining_capacity();
+            let written = sink.write_from(slice);
+            assert!(
+                written <= slice.len(),
+                "TCP receive sink wrote more bytes than the source segment"
+            );
+            assert!(
+                written != 0 || remaining_before == 0 || slice.is_empty(),
+                "TCP receive sink made no progress with available capacity"
+            );
+            written_total = written_total
+                .checked_add(written)
+                .expect("TCP receive sink byte count overflowed");
+            if written < slice.len() || sink.remaining_capacity() == 0 {
+                break;
+            }
+        }
+        (written_total != 0).then_some(written_total)
     }
 
     fn receive_merge_len(&self, first_len: usize, max_bytes: usize) -> usize {

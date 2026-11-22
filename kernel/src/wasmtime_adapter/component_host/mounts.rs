@@ -21,7 +21,9 @@ use helios_hal::fs::BlockSerial;
 use wasmtime::component::{Accessor, HasSelf, Linker};
 
 use super::{StoreData, debugger_bindings, program_bindings};
-use crate::{ComponentHostNetwork, ErofsError, MountError, MountRequestError, MountSource};
+use crate::{
+    ComponentHostNetwork, ErofsError, MountError, MountRequestError, MountSharing, MountSource,
+};
 
 /// The kind of refusal the guest sees, and the detail it reads.
 fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
@@ -54,7 +56,8 @@ fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
         }
         | MountRequestError::CompressionOption(_)
         | MountRequestError::CompressionUnsupported
-        | MountRequestError::CommitUnsupported => RefusalKind::InvalidOption,
+        | MountRequestError::CommitUnsupported
+        | MountRequestError::MaxInlineUnsupported => RefusalKind::InvalidOption,
         MountRequestError::Btrfs { .. } => RefusalKind::InvalidFilesystem,
         MountRequestError::Mount(MountError::InvalidPoint(_) | MountError::RootKind) => {
             RefusalKind::InvalidPoint
@@ -171,7 +174,12 @@ macro_rules! impl_mount_bindings {
                                 compress,
                                 commit: request
                                     .commit
-                                    .map(crate::vfs::CommitPolicy::from_commit_option),
+                                    .map(|seconds| {
+                                        crate::vfs::CommitPolicy::machine_default()
+                                            .with_commit_option(seconds)
+                                    }),
+                                max_inline: request.max_inline,
+                                now: store.now_nanos(),
                             },
                             store.spawner().launch_spawner().clone(),
                             store.timer(),
@@ -183,10 +191,16 @@ macro_rules! impl_mount_bindings {
                                 &authority,
                                 &namespace,
                                 attached,
-                                source,
-                                &request.path,
-                                request.read_only,
-                                write,
+                                crate::MountRequest {
+                                    source,
+                                    point: &request.path,
+                                    read_only: request.read_only,
+                                    sharing: match request.sharing {
+                                        wit::MountSharing::Private => MountSharing::Private,
+                                        wit::MountSharing::Shared => MountSharing::Shared,
+                                    },
+                                    write,
+                                },
                             )
                             .await
                         }

@@ -36,13 +36,21 @@ use core::future::Future;
 
 use bytes::Bytes;
 use helios_hal::fs::{
-    DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeKind,
-    OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition, WriteProgress,
+    DirCookie, DirEntry, DirStream, FileSystem, FsError, FsPath, FsResult, Landed, Metadata,
+    NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 
 use super::memory::UpperView;
-use super::{FileContents, MemoryFs, read_all};
+use super::{FileContents, MemoryFs, UnixAttributes, read_all};
 use crate::BootFs;
+
+/// The Unix attributes the boot image's directories hold; its files and
+/// links take [`UnixAttributes::inherited`] from this.
+pub(super) const BOOT_UNIX: UnixAttributes = UnixAttributes {
+    permissions: 0o755,
+    uid: 0,
+    gid: 0,
+};
 
 /// A namespace's root: its own writable tree over the shared boot image.
 #[derive(Clone)]
@@ -79,6 +87,16 @@ impl RootFs {
 
     pub fn lower(&self) -> &BootFs {
         &self.lower
+    }
+
+    /// The Unix attributes of the object at `path`, from whichever layer
+    /// serves it.
+    pub fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<UnixAttributes> {
+        let found = self.find(path)?;
+        match found.layer {
+            Layer::Upper => Ok(self.upper.unix_metadata(path)?.attributes),
+            Layer::Lower => Ok(BOOT_UNIX.inherited(found.metadata.kind)),
+        }
     }
 
     /// The whole of the file at `path`, typed by the layer that served it:
@@ -130,8 +148,13 @@ impl RootFs {
                 return Err(FsError::NotDirectory);
             }
             if found.layer == Layer::Lower {
-                self.upper
-                    .copy_up(prefix, NodeKind::Directory, Bytes::new(), &found.metadata)?;
+                self.upper.copy_up(
+                    prefix,
+                    NodeKind::Directory,
+                    BOOT_UNIX,
+                    Bytes::new(),
+                    &found.metadata,
+                )?;
             }
         }
         Ok(())
@@ -150,8 +173,7 @@ impl RootFs {
             NodeKind::File => self.lower.file_contents(path)?.to_bytes(),
             NodeKind::Symlink => Bytes::from(self.lower.link_target(path)?),
             NodeKind::Directory => Bytes::new(),
-            // The boot image holds none, and the upper tree cannot hold a
-            // report-only node.
+            // The boot image holds none of these kinds.
             NodeKind::CharacterDevice
             | NodeKind::BlockDevice
             | NodeKind::Fifo
@@ -160,8 +182,13 @@ impl RootFs {
         if let Some((parent, _)) = path.split_last() {
             self.copy_up_directories(parent)?;
         }
-        self.upper
-            .copy_up(path, found.metadata.kind, contents, &found.metadata)?;
+        self.upper.copy_up(
+            path,
+            found.metadata.kind,
+            BOOT_UNIX.inherited(found.metadata.kind),
+            contents,
+            &found.metadata,
+        )?;
         self.find(path)
     }
 
@@ -203,14 +230,12 @@ impl RootFs {
     ) -> FsResult<Vec<DirEntry>> {
         let mut entries = Vec::new();
         let mut cookie = cookie;
+        let lower_dir = self.lower.open_dir(path).await?;
         // Boot entries the upper tree shadows or hides are skipped, so one
         // pass may come back short of `max_entries` without being the
         // last.
         while entries.len() < max_entries {
-            let batch = self
-                .lower
-                .read_dir(path, cookie, max_entries - entries.len())
-                .await?;
+            let batch = lower_dir.read(cookie, max_entries - entries.len()).await?;
             let complete = batch.len() < max_entries - entries.len();
             for mut entry in batch {
                 cookie = entry.next;
@@ -288,8 +313,64 @@ impl PreparedWrite for RootWrite {
     }
 }
 
+/// An open directory stream over a [`RootFs`].
+pub struct RootDir {
+    fs: RootFs,
+    path: OwnedFsPath,
+}
+
+impl DirStream for RootDir {
+    async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+        self.fs
+            .read_dir_at(self.path.as_path(), cookie, max_entries)
+            .await
+    }
+
+    async fn rewind(&mut self) -> FsResult<()> {
+        Ok(())
+    }
+}
+
+impl RootFs {
+    async fn read_dir_at(
+        &self,
+        path: FsPath<'_>,
+        cookie: DirCookie,
+        max_entries: usize,
+    ) -> FsResult<Vec<DirEntry>> {
+        let found = self.find(path)?;
+        if found.metadata.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let in_upper = found.layer == Layer::Upper;
+        let merges = !found.upper.opaque && found.upper.beneath;
+        if cookie.raw() & LOWER_COOKIE != 0 || !in_upper {
+            if !merges {
+                // The directory turned opaque since the listing began.
+                return Ok(Vec::new());
+            }
+            let lower_cookie = DirCookie::new(cookie.raw() & !LOWER_COOKIE);
+            return self.read_lower(path, lower_cookie, max_entries).await;
+        }
+        let mut entries = self.upper.read_dir_at(path, cookie, max_entries)?;
+        if merges && entries.len() < max_entries {
+            match self
+                .read_lower(path, DirCookie::START, max_entries - entries.len())
+                .await
+            {
+                Ok(lower) => entries.extend(lower),
+                // An upper directory the boot image does not have.
+                Err(FsError::NoEntry) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(entries)
+    }
+}
+
 impl FileSystem for RootFs {
     type Write = RootWrite;
+    type Dir = RootDir;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.find(path).map(|found| found.metadata)
@@ -346,39 +427,15 @@ impl FileSystem for RootFs {
             .await
     }
 
-    async fn read_dir(
-        &self,
-        path: FsPath<'_>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> FsResult<Vec<DirEntry>> {
+    async fn open_dir(&self, path: FsPath<'_>) -> FsResult<RootDir> {
         let found = self.find(path)?;
         if found.metadata.kind != NodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        let in_upper = found.layer == Layer::Upper;
-        let merges = !found.upper.opaque && found.upper.beneath;
-        if cookie.raw() & LOWER_COOKIE != 0 || !in_upper {
-            if !merges {
-                // The directory turned opaque since the listing began.
-                return Ok(Vec::new());
-            }
-            let lower_cookie = DirCookie::new(cookie.raw() & !LOWER_COOKIE);
-            return self.read_lower(path, lower_cookie, max_entries).await;
-        }
-        let mut entries = self.upper.read_dir(path, cookie, max_entries).await?;
-        if merges && entries.len() < max_entries {
-            match self
-                .read_lower(path, DirCookie::START, max_entries - entries.len())
-                .await
-            {
-                Ok(lower) => entries.extend(lower),
-                // An upper directory the boot image does not have.
-                Err(FsError::NoEntry) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(entries)
+        Ok(RootDir {
+            fs: self.clone(),
+            path: OwnedFsPath::from(path),
+        })
     }
 
     async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -396,7 +453,11 @@ impl FileSystem for RootFs {
         }
         // The upper tree refuses a directory of its own that holds a name;
         // the boot entries still showing are this layer's to count.
-        if !self.read_dir(path, DirCookie::START, 1).await?.is_empty() {
+        if !self
+            .read_dir_at(path, DirCookie::START, 1)
+            .await?
+            .is_empty()
+        {
             return Err(FsError::NotEmpty);
         }
         let whiteout = self.lower_beneath(path, &found);
@@ -504,7 +565,8 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FsError, FsPath, OpenFlags, RenameMode, WritePosition,
+        DeviceId, DirCookie, DirStream, FileSystem, FsError, FsPath, OpenFlags, RenameMode,
+        WritePosition,
     };
 
     use super::RootFs;
@@ -532,11 +594,11 @@ mod tests {
     }
 
     fn listing(fs: &RootFs, directory: &str, batch: usize) -> Vec<String> {
+        let dir = block_on(fs.open_dir(path(directory))).expect("opens directory");
         let mut names = Vec::new();
         let mut cookie = DirCookie::START;
         loop {
-            let entries =
-                block_on(fs.read_dir(path(directory), cookie, batch)).expect("directory lists");
+            let entries = block_on(dir.read(cookie, batch)).expect("directory lists");
             let complete = entries.len() < batch;
             for entry in entries {
                 cookie = entry.next;

@@ -17,10 +17,14 @@
 //!   commit, and syncs that arrive during a commit share the next.
 //! - **The task commits on its own** when the commit interval has passed
 //!   since the running transaction first changed, when the dirty metadata
-//!   reaches the policy's bound, and when the queue closes at unmount. The
-//!   policy is read afresh on every change an operator makes.
-//! - **A failed commit ends the service.** Its sync waiters, and every later
-//!   request, fail; the device keeps the previous complete generation.
+//!   reaches the policy's bound, and when the queue closes at unmount. It
+//!   writes the dirty data back into extents, without a commit, when that
+//!   reaches the policy's data bound. The policy is read afresh on every
+//!   change an operator makes.
+//! - **A failed commit or writeback ends the service.** Its sync waiters,
+//!   and every later request, fail; the device keeps the previous complete
+//!   generation. A writeback that failed would fail again in the commit, so
+//!   the mount stops taking writes it cannot make durable.
 
 use alloc::string::String;
 use alloc::sync::Arc as SharedArc;
@@ -33,16 +37,17 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use futures::channel::oneshot;
 use futures::future::{Either, select};
 use helios_btrfs::write::{
-    Attributes, ChunkError, Compressor, InodeHandle, Name, RootUuids, SpaceError, WriteError,
-    WriteTransaction, Writer,
+    Attributes, ChunkError, InodeHandle, Name, RootUuids, SpaceError, WriteError, WriteTransaction,
+    Writer,
 };
 use helios_btrfs::{BlockSink, Error, FileKind, Timestamp};
 use helios_hal::cpu::{Cpu, Instant};
 use helios_hal::fs::{
-    BlockDevice, FsError, FsResult, Landed, OpenFlags, RenameMode, WritePosition,
+    BlockDevice, FsError, FsResult, Landed, NodeKind, OpenFlags, RenameMode, WritePosition,
 };
 use triomphe::Arc;
 
+use super::super::UnixAttributes;
 use super::{Image, LivePolicy, Snapshot};
 use crate::component::{ProviderReceiver, ProviderSender, provider_channel};
 use crate::{BlockPages, ProgressSignal, RootEntropyHandle, Timer};
@@ -217,7 +222,6 @@ pub struct BtrfsService<Device: BlockDevice<Buffer = BlockPages>> {
     pub(super) receiver: ProviderReceiver<Request>,
     pub(super) published: Arc<spin::Mutex<Snapshot<Device>>>,
     pub(super) concurrency: NonZeroUsize,
-    pub(super) compressor: Compressor,
     pub(super) policy: Arc<LivePolicy>,
     /// Last, so the end is reported only once everything above has gone.
     pub(super) _exit: ExitGuard,
@@ -246,6 +250,9 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
             let mark = self.policy.changed.mark();
             let policy = self.policy.load();
             let dirty = self.writer.dirty();
+            if dirty.is_clean() {
+                dirty_since = None;
+            }
             let deadline = dirty_since.map(|since| {
                 since.saturating_add(timer.cpu().timebase().duration_to_ticks(policy.interval))
             });
@@ -254,6 +261,12 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                     || deadline.is_some_and(|deadline| deadline <= timer.now()))
             {
                 if !self.commit(Vec::new(), &mut dirty_since).await {
+                    return;
+                }
+                continue;
+            }
+            if dirty.data_bytes != 0 && dirty.data_bytes >= policy.dirty_data_limit {
+                if !self.writeback().await {
                     return;
                 }
                 continue;
@@ -284,9 +297,13 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                     let Some(syncs) = self.apply_batch(first).await else {
                         return;
                     };
-                    if dirty_since.is_none() && !self.writer.dirty().is_clean() {
+                    if self.writer.dirty().is_clean() {
+                        dirty_since = None;
+                    } else if dirty_since.is_none() {
                         dirty_since = Some(timer.now());
                     }
+                    // The dirty data bound is judged at the top of the loop,
+                    // once no commit has written the data back here.
                     let dirty = self.writer.dirty();
                     if (!syncs.is_empty()
                         || dirty.metadata_bytes >= self.policy.load().dirty_metadata_limit)
@@ -325,6 +342,8 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
         };
         let mut replies = Vec::with_capacity(requests.len());
         let mut syncs = Vec::new();
+        // An operator's change applies from the next batch.
+        transaction.set_max_inline(self.policy.max_inline());
         for request in requests {
             if request.reply.is_canceled() {
                 continue;
@@ -335,8 +354,6 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                 &request.path,
                 request.when,
                 request.operation,
-                concurrency,
-                &mut self.compressor,
             )
             .await;
             match result {
@@ -352,6 +369,25 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
             let _ = reply.send(result);
         }
         Some(syncs)
+    }
+
+    /// Writes the dirty data back into extents and publishes the result,
+    /// which releases the pages the previous view held. Returns false once
+    /// the writeback failed, which ends the service.
+    async fn writeback(&mut self) -> bool {
+        match self.writer.writeback().await {
+            Ok(()) => {
+                *self.published.lock() = self
+                    .writer
+                    .snapshot()
+                    .expect("a writer that just wrote back is not poisoned");
+                true
+            }
+            Err(error) => {
+                tracing::error!(%error, "btrfs writeback failed; the mount takes no more writes");
+                false
+            }
+        }
     }
 
     /// Commits the running transaction and answers `syncs`. Returns false
@@ -408,7 +444,30 @@ async fn parent<'a, S: BlockSink, U: RootUuids>(
     Ok((inode(transaction, directory).await?, name.as_bytes()))
 }
 
-fn timestamp(nanos: u64) -> Timestamp {
+/// The attributes a node of `kind` made in `parent` takes. A request
+/// reaching the writer carries no creator identity, so the node inherits
+/// from its directory ([`UnixAttributes::inherited`]).
+async fn inherited<S: BlockSink, U: RootUuids>(
+    transaction: &WriteTransaction<'_, S, U>,
+    parent: &InodeHandle,
+    kind: NodeKind,
+) -> FsResult<Attributes> {
+    let directory = transaction.metadata(parent).await.map_err(fs_error)?;
+    let node = UnixAttributes {
+        permissions: directory.permissions,
+        uid: directory.uid,
+        gid: directory.gid,
+    }
+    .inherited(kind);
+    Ok(Attributes {
+        permissions: node.permissions,
+        uid: node.uid,
+        gid: node.gid,
+        umask: 0,
+    })
+}
+
+pub(super) fn timestamp(nanos: u64) -> Timestamp {
     Timestamp {
         seconds: (nanos / 1_000_000_000) as i64,
         nanoseconds: (nanos % 1_000_000_000) as u32,
@@ -420,8 +479,6 @@ async fn apply<S: BlockSink, U: RootUuids>(
     path: &str,
     now: u64,
     operation: Operation,
-    concurrency: NonZeroUsize,
-    compressor: &mut Compressor,
 ) -> FsResult<Response> {
     let when = timestamp(now);
     match operation {
@@ -439,7 +496,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .checked_add(bytes.len() as u64)
                 .ok_or(FsError::Overflow)?;
             let written = transaction
-                .write_file_with_policy(&inode, offset, &bytes, when, concurrency, compressor)
+                .write_file(&inode, offset, &bytes, when)
                 .await
                 .map_err(fs_error)?;
             // A device with no more free sectors stores a prefix, which the
@@ -469,17 +526,14 @@ async fn apply<S: BlockSink, U: RootUuids>(
                         return Err(FsError::NotDirectory);
                     }
                     let (parent, bytes) = parent(transaction, path).await?;
+                    let attributes = inherited(transaction, &parent, NodeKind::File).await?;
                     transaction
                         .create_file(
                             Name {
                                 parent: &parent,
                                 bytes,
                             },
-                            Attributes {
-                                permissions: 0o644,
-                                uid: 0,
-                                gid: 0,
-                            },
+                            attributes,
                             when,
                         )
                         .await
@@ -488,12 +542,15 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 Err(error) => return Err(error),
             };
             let metadata = transaction.metadata(&file).await.map_err(fs_error)?;
+            if let Some(refusal) = super::node_kind(metadata.kind)?.open_refusal() {
+                return Err(refusal);
+            }
             if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != FileKind::Directory {
                 return Err(FsError::NotDirectory);
             }
             if flags.contains(OpenFlags::TRUNCATE) {
                 transaction
-                    .truncate_file(&file, 0, when, concurrency)
+                    .truncate_file(&file, 0, when)
                     .await
                     .map_err(fs_error)?;
             }
@@ -509,28 +566,17 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 parent: &parent,
                 bytes,
             };
-            // The VFS has no ownership/mode input yet; use its existing new-node
-            // defaults, with the inode type supplied by the operation.
-            let attributes = Attributes {
-                permissions: 0o755,
-                uid: 0,
-                gid: 0,
-            };
             match operation {
                 Operation::Symlink { target } => {
+                    let attributes = inherited(transaction, &parent, NodeKind::Symlink).await?;
                     transaction
-                        .symlink(
-                            name,
-                            target.as_bytes(),
-                            Attributes {
-                                permissions: 0o777,
-                                ..attributes
-                            },
-                            when,
-                        )
+                        .symlink(name, target.as_bytes(), attributes, when)
                         .await
                 }
-                _ => transaction.create_directory(name, attributes, when).await,
+                _ => {
+                    let attributes = inherited(transaction, &parent, NodeKind::Directory).await?;
+                    transaction.create_directory(name, attributes, when).await
+                }
             }
             .map_err(fs_error)?;
         }
@@ -592,7 +638,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
         Operation::Truncate { size } => {
             let file = inode(transaction, path).await?;
             transaction
-                .truncate_file(&file, size, when, concurrency)
+                .truncate_file(&file, size, when)
                 .await
                 .map_err(fs_error)?;
         }
@@ -618,9 +664,7 @@ pub(super) fn fs_error(error: WriteError) -> FsError {
         WriteError::Exists { .. } => FsError::Exists,
         WriteError::NotEmpty { .. } => FsError::NotEmpty,
         WriteError::ReadOnlySubvolume { .. } => FsError::ReadOnly,
-        WriteError::InodeFlags { .. } | WriteError::SetId { .. } | WriteError::DirectoryLink => {
-            FsError::NotPermitted
-        }
+        WriteError::InodeFlags { .. } | WriteError::DirectoryLink => FsError::NotPermitted,
         WriteError::CrossSubvolume => FsError::CrossDevice,
         WriteError::InvalidName | WriteError::DirectoryCycle | WriteError::SymlinkTarget { .. } => {
             FsError::Invalid

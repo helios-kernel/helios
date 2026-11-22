@@ -32,7 +32,9 @@ mod venus;
 
 use helios_api::bindings::wasi::clocks::monotonic_clock;
 use helios_api::gpu::{BlobMemory, BlobUsage, CapsetInfo, Completion, Context, Gpu, GpuError};
-use helios_api::programs::{Child, DeviceClass, SpawnError, SpawnRequest, device_grant};
+use helios_api::programs::{
+    Child, ChildTermination, DeviceClass, SpawnError, SpawnRequest, device_grant,
+};
 use helios_api::sync::{SignalSource, wait_all};
 use helios_api::wit_bindgen::StreamReader;
 use thiserror::Error;
@@ -96,8 +98,8 @@ enum GpuTestError {
     NoGuestPages,
     #[error("the second instance could not be started: {0:?}")]
     Spawn(SpawnError),
-    #[error("the second instance exited {code} without retiring its fence")]
-    Child { code: u32 },
+    #[error("the second instance {termination} without retiring its fence")]
+    Child { termination: ChildTermination },
 }
 
 /// What this run was asked to do.
@@ -389,8 +391,12 @@ async fn second_instance() -> Result<(), GpuTestError> {
     let status = child.wait().await.map_err(GpuTestError::Spawn)?;
     let output = String::from_utf8_lossy(&output);
     print!("{output}");
-    if status.code != 0 || !output.lines().any(|line| line == CHILD_DONE) {
-        return Err(GpuTestError::Child { code: status.code });
+    if status.termination != ChildTermination::Exited(0)
+        || !output.lines().any(|line| line == CHILD_DONE)
+    {
+        return Err(GpuTestError::Child {
+            termination: status.termination,
+        });
     }
     println!("gpu-test:instances=2");
     Ok(())

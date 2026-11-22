@@ -1,5 +1,8 @@
 extern crate std;
 
+#[cfg(feature = "write")]
+mod xattr;
+
 use alloc::collections::BTreeMap;
 #[cfg(feature = "write")]
 use alloc::string::String;
@@ -19,9 +22,11 @@ use helios_hal::fs::RenameMode;
 use helios_hal::io::{IoError, IoResult};
 
 use super::Filesystem;
+#[cfg(feature = "write")]
+use crate::compress::policy::Compressor;
 use crate::source::BlockSource;
 #[cfg(feature = "write")]
-use crate::transaction::file::WriteOptions;
+use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::tree::edit::{Header, Leaf};
 use crate::tree::write::{MetadataAllocator, Trees, WriteError};
 use crate::tree::{Expected, Node, TreeRoot};
@@ -90,13 +95,30 @@ impl super::writer::RootUuids for FixtureUuids {
     }
 }
 
-/// A writer over `source`, committing one block write at a time.
+/// A writer over `source`, committing one block write at a time and storing
+/// data uncompressed.
 #[cfg(feature = "write")]
 pub(super) async fn mount_writer<S: crate::source::BlockSink>(
     source: S,
 ) -> Result<super::writer::Writer<S, FixtureUuids>, WriteError> {
-    super::writer::Writer::mount(source, FixtureUuids, NonZeroUsize::MIN).await
+    mount_compressing_writer(source, Compressor::Plain).await
 }
+
+/// [`mount_writer`] for a mount that compresses with `compressor`.
+#[cfg(feature = "write")]
+pub(super) async fn mount_compressing_writer<S: crate::source::BlockSink>(
+    source: S,
+    compressor: Compressor,
+) -> Result<super::writer::Writer<S, FixtureUuids>, WriteError> {
+    super::writer::Writer::mount(source, FixtureUuids, NonZeroUsize::MIN, compressor, MOUNTED).await
+}
+
+/// When a fixture's writer mounts: the time a log replay stamps.
+#[cfg(feature = "write")]
+pub(super) const MOUNTED: crate::Timestamp = crate::Timestamp {
+    seconds: 1_700_000_500,
+    nanoseconds: 250,
+};
 
 /// The committed allocation state of `fs`'s generation, loaded from disk.
 #[cfg(feature = "write")]
@@ -125,6 +147,7 @@ async fn change_root_mode_with_retirements<S: crate::source::BlockSink>(
         fs.snapshot.clone(),
         retirements,
         &allocation_of(fs).await,
+        false,
     )
     .await?;
     let root = edit_root_mode(fs, &mut transaction).await?;
@@ -132,6 +155,7 @@ async fn change_root_mode_with_retirements<S: crate::source::BlockSink>(
         .commit(
             retirements,
             || panic!("formatted fixture already has valid UUIDs"),
+            &mut Compressor::Plain,
             std::thread::available_parallelism().unwrap(),
         )
         .await?;
@@ -273,19 +297,24 @@ fn assert_reflink_image(path: &std::path::Path, expected: &BTreeMap<&str, Vec<u8
 async fn exercise_reflink_matrix(
     mut verify: impl FnMut(&std::path::Path, &BTreeMap<&str, Vec<u8>>),
 ) {
-    use crate::compress::write::{Lzo, Plain, Zlib, Zstd};
-    use miniz_oxide::deflate::CompressionLevel;
     for no_holes in [true, false] {
-        exercise_reflink(no_holes, Plain, &mut verify).await;
-        exercise_reflink(
-            no_holes,
-            Zlib::new(CompressionLevel::DefaultLevel),
-            &mut verify,
-        )
-        .await;
-        exercise_reflink(no_holes, Lzo::new(), &mut verify).await;
-        exercise_reflink(no_holes, Zstd::new(3).unwrap(), &mut verify).await;
+        for compressor in compressors() {
+            exercise_reflink(no_holes, compressor, &mut verify).await;
+        }
     }
+}
+
+/// A mount's compression for each algorithm, and none.
+#[cfg(feature = "write")]
+fn compressors() -> [Compressor; 4] {
+    use crate::compress::write::{Lzo, Zlib, Zstd};
+    use miniz_oxide::deflate::CompressionLevel;
+    [
+        Compressor::Plain,
+        Compressor::Zlib(Zlib::new(CompressionLevel::DefaultLevel)),
+        Compressor::Lzo(Lzo::new()),
+        Compressor::Zstd(alloc::boxed::Box::new(Zstd::new(3).unwrap())),
+    ]
 }
 
 #[cfg(feature = "write")]
@@ -334,9 +363,9 @@ async fn disk_allocation<S: BlockSource>(
 }
 
 #[cfg(feature = "write")]
-async fn exercise_reflink<E: crate::compress::write::Encoder>(
+async fn exercise_reflink(
     no_holes: bool,
-    mut encoder: E,
+    compressor: Compressor,
     mut verify: impl FnMut(&std::path::Path, &BTreeMap<&str, Vec<u8>>),
 ) {
     use crate::transaction::namespace::Name;
@@ -447,7 +476,9 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
     drop(external);
     drop(formatted);
     expected.insert("prealloc", vec![0; 32768]);
-    let mut writer = mount_writer(Disk(named.reopen().unwrap())).await.unwrap();
+    let mut writer = mount_compressing_writer(Disk(named.reopen().unwrap()), compressor)
+        .await
+        .unwrap();
     let base = writer.snapshot().unwrap();
     let root = base.root().await.unwrap();
     let mut ids = BTreeMap::new();
@@ -461,7 +492,6 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
             },
         );
     }
-    let concurrency = std::thread::available_parallelism().unwrap();
     let when = crate::Timestamp {
         seconds: 1_700_000_100,
         nanoseconds: 123,
@@ -479,24 +509,16 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
             continue;
         }
         let id = ids[name];
-        tx.edits()
-            .write_file(
-                id.tree,
-                id.inode,
-                0,
-                bytes,
-                WriteOptions {
-                    when,
-                    concurrency,
-                    encoder: &mut encoder,
-                },
-            )
+        let (edits, compressor, _, max_inline) = tx.split();
+        edits
+            .write_file(id, 0, bytes, when, compressor, max_inline)
             .await
             .unwrap();
     }
     let tail = ids["tail"];
-    tx.edits()
-        .truncate_file(tail.tree, tail.inode, 17, when, concurrency)
+    let (edits, compressor, _, max_inline) = tx.split();
+    edits
+        .truncate_file(tail.tree, tail.inode, 17, when, compressor, max_inline)
         .await
         .unwrap();
     expected.get_mut("tail").unwrap().truncate(17);
@@ -510,7 +532,7 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
     let old_tail = initial.resolve(b"/tail").await.unwrap();
     let tail_allocation = disk_allocation(&initial, &old_tail, 0).await;
     let mut tx = writer.join().await.unwrap();
-    let edits = tx.edits();
+    let (edits, compressor, concurrency, max_inline) = tx.split();
     for (source_offset, destination_offset, length, expected_error) in [
         (0, 4096, 8192, WriteError::CloneOverlap),
         (1, 65536, 4096, WriteError::CloneAlignment),
@@ -528,7 +550,9 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
                     length,
                 },
                 when,
+                compressor,
                 concurrency,
+                max_inline,
             )
             .await
             .unwrap_err();
@@ -562,7 +586,9 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
                     length: length as u64,
                 },
                 when,
+                compressor,
                 concurrency,
+                max_inline,
             )
             .await
             .unwrap();
@@ -600,14 +626,9 @@ async fn exercise_reflink<E: crate::compress::write::Encoder>(
         ("clone", 1, vec![0x31; 31]),
     ] {
         let id = ids[name];
-        tx.edits()
-            .write_file(
-                id.tree,
-                id.inode,
-                offset as u64,
-                &bytes,
-                WriteOptions::plain(when, concurrency),
-            )
+        let (edits, compressor, _, max_inline) = tx.split();
+        edits
+            .write_file(id, offset as u64, &bytes, when, compressor, max_inline)
             .await
             .unwrap();
         expected.get_mut(name).unwrap()[offset..offset + bytes.len()].copy_from_slice(&bytes);
@@ -684,7 +705,6 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
     let root = base.root().await.unwrap();
     let tree = root.tree();
     let root_number = root.number();
-    let concurrency = std::thread::available_parallelism().unwrap();
     let when = crate::Timestamp {
         seconds: 1_700_000_100,
         nanoseconds: 123,
@@ -698,6 +718,8 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
         mode,
         uid: 1000,
         gid: 1000,
+        rdev: 0,
+        umask: 0,
     };
     let mut tx = writer.join().await.unwrap();
     let edits = tx.edits();
@@ -732,21 +754,26 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
     let content = vec![0x37; 12307];
     edits
         .write_file(
-            tree,
-            file,
+            crate::transaction::reflink::FileId { tree, inode: file },
             0,
             &content,
-            WriteOptions::plain(when, concurrency),
+            when,
+            &mut Compressor::Plain,
+            DEFAULT_MAX_INLINE,
         )
         .await
         .unwrap();
     edits
         .write_file(
-            tree,
-            target,
+            crate::transaction::reflink::FileId {
+                tree,
+                inode: target,
+            },
             0,
             b"replaced",
-            WriteOptions::plain(when, concurrency),
+            when,
+            &mut Compressor::Plain,
+            DEFAULT_MAX_INLINE,
         )
         .await
         .unwrap();
@@ -866,7 +893,6 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
     let old = writer.snapshot().unwrap();
     let parent = old.root().await.unwrap();
     let tree = parent.tree();
-    let concurrency = std::thread::available_parallelism().unwrap();
     let when = crate::Timestamp {
         seconds: 1_700_000_100,
         nanoseconds: 123,
@@ -886,6 +912,8 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
                     mode: 0o040755,
                     uid: 1000,
                     gid: 1000,
+                    rdev: 0,
+                    umask: 0,
                 },
                 when,
             )
@@ -905,6 +933,8 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
                 mode: 0o100640,
                 uid: 1000,
                 gid: 1000,
+                rdev: 0,
+                umask: 0,
             },
             when,
         )
@@ -913,11 +943,12 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
     let content: Vec<_> = (0..12307).map(|index| (index % 251) as u8).collect();
     edits
         .write_file(
-            tree,
-            inode,
+            crate::transaction::reflink::FileId { tree, inode },
             0,
             &content,
-            WriteOptions::plain(when, concurrency),
+            when,
+            &mut Compressor::Plain,
+            DEFAULT_MAX_INLINE,
         )
         .await
         .unwrap();
@@ -1122,11 +1153,7 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
 #[test]
 fn file_writes_preserve_partial_sectors_and_transaction_visibility() {
     for no_holes in [true, false] {
-        block_on(exercise_file_writes(
-            no_holes,
-            crate::compress::write::Plain,
-            |_, _| {},
-        ));
+        block_on(exercise_file_writes(no_holes, Compressor::Plain, |_, _| {}));
     }
 }
 
@@ -1137,7 +1164,7 @@ fn file_writes_pass_btrfs_check() {
     for no_holes in [true, false] {
         block_on(exercise_file_writes(
             no_holes,
-            crate::compress::write::Plain,
+            Compressor::Plain,
             assert_file_image,
         ));
     }
@@ -1158,17 +1185,13 @@ fn compressed_file_writes_pass_btrfs_check_and_restore() {
 
 #[cfg(feature = "write")]
 async fn exercise_compressed_writes(mut verify: impl FnMut(&std::path::Path, &[u8])) {
-    use crate::compress::write::{Lzo, Zlib, Zstd};
-    use miniz_oxide::deflate::CompressionLevel;
     for no_holes in [true, false] {
-        exercise_file_writes(
-            no_holes,
-            Zlib::new(CompressionLevel::DefaultLevel),
-            &mut verify,
-        )
-        .await;
-        exercise_file_writes(no_holes, Lzo::new(), &mut verify).await;
-        exercise_file_writes(no_holes, Zstd::new(3).unwrap(), &mut verify).await;
+        for compressor in compressors()
+            .into_iter()
+            .filter(|compressor| compressor.algorithm().is_some())
+        {
+            exercise_file_writes(no_holes, compressor, &mut verify).await;
+        }
     }
 }
 
@@ -1195,11 +1218,12 @@ fn assert_file_image(path: &std::path::Path, expected: &[u8]) {
 }
 
 #[cfg(feature = "write")]
-async fn exercise_file_writes<E: crate::compress::write::Encoder>(
+async fn exercise_file_writes(
     no_holes: bool,
-    mut encoder: E,
+    compressor: Compressor,
     mut verify: impl FnMut(&std::path::Path, &[u8]),
 ) {
+    let algorithm = compressor.algorithm();
     let timestamp = Timestamp::from_secs(1_700_000_000);
     let named = tempfile::NamedTempFile::new().unwrap();
     let tree = TreeBuilder::new()
@@ -1222,11 +1246,12 @@ async fn exercise_file_writes<E: crate::compress::write::Encoder>(
         options,
     ));
     verify(named.path(), &[]);
-    let mut writer = mount_writer(Disk(named.reopen().unwrap())).await.unwrap();
+    let mut writer = mount_compressing_writer(Disk(named.reopen().unwrap()), compressor)
+        .await
+        .unwrap();
     let initial = writer.snapshot().unwrap();
     let initial_inode = initial.resolve(b"/data.bin").await.unwrap();
     let mut expected = Vec::new();
-    let concurrency = std::thread::available_parallelism().unwrap();
     let when = crate::Timestamp {
         seconds: 1_700_000_100,
         nanoseconds: 123,
@@ -1261,19 +1286,19 @@ async fn exercise_file_writes<E: crate::compress::write::Encoder>(
             (0, vec![0x71; 13]),
             (262144, incompressible.clone()),
         ] {
-            let edits = transaction.edits();
+            let (edits, compressor, _, max_inline) = transaction.split();
             assert_eq!(
                 edits
                     .write_file(
-                        inode.tree(),
-                        inode.number(),
+                        crate::transaction::reflink::FileId {
+                            tree: inode.tree(),
+                            inode: inode.number(),
+                        },
                         offset as u64,
                         &bytes,
-                        WriteOptions {
-                            when,
-                            concurrency,
-                            encoder: &mut encoder
-                        }
+                        when,
+                        compressor,
+                        max_inline,
                     )
                     .await
                     .unwrap(),
@@ -1295,7 +1320,7 @@ async fn exercise_file_writes<E: crate::compress::write::Encoder>(
         verify(named.path(), &expected);
         let current = writer.snapshot().unwrap();
         let current_inode = current.resolve(b"/data.bin").await.unwrap();
-        if let Some(algorithm) = E::ALGORITHM {
+        if let Some(algorithm) = algorithm {
             let mut cursor = crate::tree::Cursor::ceiling(
                 &current.volume,
                 current_inode.root,
@@ -1371,9 +1396,16 @@ async fn exercise_file_writes<E: crate::compress::write::Encoder>(
         let inode = previous.resolve(b"/data.bin").await.unwrap();
         let old = expected.clone();
         let mut transaction = writer.join().await.unwrap();
-        let edits = transaction.edits();
+        let (edits, compressor, _, max_inline) = transaction.split();
         edits
-            .truncate_file(inode.tree(), inode.number(), size as u64, when, concurrency)
+            .truncate_file(
+                inode.tree(),
+                inode.number(),
+                size as u64,
+                when,
+                compressor,
+                max_inline,
+            )
             .await
             .unwrap();
         expected.resize(size, 0);
@@ -1724,12 +1756,12 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
         seconds: 1_700_000_100,
         nanoseconds: 123,
     };
-    let concurrency = std::thread::available_parallelism().unwrap();
     let name = |parent, bytes| Name { parent, bytes };
     let attributes = || Attributes {
         permissions: 0o644,
         uid: 1000,
         gid: 1000,
+        umask: 0,
     };
     macro_rules! refused {
         ($tx:ident, $operation:expr) => {{
@@ -1743,11 +1775,8 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
     }
     for label in ["immutable", "append"] {
         let file = &ids[label];
-        refused!(
-            tx,
-            tx.write_file(file, 0, b"replace", WriteOptions::plain(when, concurrency))
-        );
-        refused!(tx, tx.truncate_file(file, 0, when, concurrency));
+        refused!(tx, tx.write_file(file, 0, b"replace", when));
+        refused!(tx, tx.truncate_file(file, 0, when));
         refused!(tx, tx.set_times(file, Some(when), None, when));
         refused!(tx, tx.set_permissions(file, 0o600, when));
         refused!(tx, tx.set_owner(file, Some(1), Some(2), when));
@@ -1775,19 +1804,13 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
                     destination_offset: 0,
                     length: initial.len() as u64
                 },
-                when,
-                concurrency
+                when
             )
         );
     }
     refused!(
         tx,
-        tx.write_file(
-            &ids["immutable"],
-            initial.len() as u64,
-            b"more",
-            WriteOptions::plain(when, concurrency)
-        )
+        tx.write_file(&ids["immutable"], initial.len() as u64, b"more", when)
     );
     let immutable_dir = &ids["immutable-dir"];
     refused!(
@@ -1824,14 +1847,9 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
     );
     verify(named.path());
     let mut tx = writer.join().await.unwrap();
-    tx.write_file(
-        &ids["append"],
-        initial.len() as u64,
-        b" added",
-        WriteOptions::plain(when, concurrency),
-    )
-    .await
-    .unwrap();
+    tx.write_file(&ids["append"], initial.len() as u64, b" added", when)
+        .await
+        .unwrap();
     let _ = tx
         .create_file(name(append_dir, b"new"), attributes(), when)
         .await
@@ -1853,7 +1871,6 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
             length: initial.len() as u64,
         },
         when,
-        concurrency,
     )
     .await
     .unwrap();
@@ -1950,7 +1967,6 @@ fn a_policy_compresses_only_inodes_that_linux_would_compress() {
     use zerocopy::IntoBytes;
 
     block_on(async {
-        let concurrency = std::thread::available_parallelism().unwrap();
         let when = crate::Timestamp {
             seconds: 1_700_000_100,
             nanoseconds: 0,
@@ -1985,8 +2001,10 @@ fn a_policy_compresses_only_inodes_that_linux_would_compress() {
             ),
         ] {
             let (_, image) = filesystem_image();
-            let mut writer = mount_writer(Disk(image)).await.unwrap();
-            let mut compressor = Compressor::new(policy).unwrap();
+            let mut writer =
+                mount_compressing_writer(Disk(image), Compressor::new(policy).unwrap())
+                    .await
+                    .unwrap();
             let base = writer.snapshot().unwrap();
             let mut tx = writer.join().await.unwrap();
             let root = tx.root().await.unwrap();
@@ -2007,6 +2025,7 @@ fn a_policy_compresses_only_inodes_that_linux_would_compress() {
                             permissions: 0o644,
                             uid: 0,
                             gid: 0,
+                            umask: 0,
                         },
                         when,
                     )
@@ -2039,9 +2058,7 @@ fn a_policy_compresses_only_inodes_that_linux_would_compress() {
             }
             for (_, file) in &files {
                 assert_eq!(
-                    tx.write_file_with_policy(file, 0, &data, when, concurrency, &mut compressor)
-                        .await
-                        .unwrap(),
+                    tx.write_file(file, 0, &data, when).await.unwrap(),
                     data.len()
                 );
             }
@@ -2156,7 +2173,6 @@ fn reflink_from_readonly_subvolume_preserves_source() {
             seconds: 1_700_000_100,
             nanoseconds: 0,
         };
-        let concurrency = std::thread::available_parallelism().unwrap();
         let mut tx = writer.join().await.unwrap();
         tx.clone_range(
             CloneRange {
@@ -2167,7 +2183,6 @@ fn reflink_from_readonly_subvolume_preserves_source() {
                 length: contents.len() as u64,
             },
             when,
-            concurrency,
         )
         .await
         .unwrap();
@@ -2183,14 +2198,9 @@ fn reflink_from_readonly_subvolume_preserves_source() {
         assert_eq!(output, contents);
         let replacement = vec![0x82; contents.len()];
         let mut tx = writer.join().await.unwrap();
-        tx.write_file(
-            &destination_id,
-            0,
-            &replacement,
-            WriteOptions::plain(when, concurrency),
-        )
-        .await
-        .unwrap();
+        tx.write_file(&destination_id, 0, &replacement, when)
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
         let current = writer.snapshot().unwrap();
         current
@@ -2255,12 +2265,12 @@ fn owned_mutations_preserve_readonly_subvolumes() {
             permissions: 0o644,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
         let when = crate::Timestamp {
             seconds: 1_700_000_100,
             nanoseconds: 0,
         };
-        let concurrency = std::thread::available_parallelism().unwrap();
         macro_rules! refused {
             ($tx:ident, $operation:expr) => {{
                 let mut $tx = writer.join().await.unwrap();
@@ -2268,16 +2278,8 @@ fn owned_mutations_preserve_readonly_subvolumes() {
                 assert_eq!(writer.snapshot().unwrap().snapshot, base.snapshot);
             }};
         }
-        refused!(
-            tx,
-            tx.write_file(
-                &file,
-                0,
-                b"replacement",
-                WriteOptions::plain(when, concurrency)
-            )
-        );
-        refused!(tx, tx.truncate_file(&file, 0, when, concurrency));
+        refused!(tx, tx.write_file(&file, 0, b"replacement", when));
+        refused!(tx, tx.truncate_file(&file, 0, when));
         refused!(tx, tx.set_times(&file, Some(when), Some(when), when));
         refused!(tx, tx.create_file(name(b"new"), attributes(), when));
         refused!(tx, tx.hard_link(name(b"alias"), &file, when));
@@ -2297,8 +2299,7 @@ fn owned_mutations_preserve_readonly_subvolumes() {
                     destination_offset: 4096,
                     length: contents.len() as u64,
                 },
-                when,
-                concurrency
+                when
             )
         );
         let tx = writer.join().await.unwrap();
@@ -2336,6 +2337,7 @@ fn handles_reject_foreign_mounts_and_outlive_their_handle_and_commit() {
             permissions: 0o644,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
         assert!(matches!(
             tx.metadata(&foreign).await,
@@ -2372,16 +2374,10 @@ fn handles_reject_foreign_mounts_and_outlive_their_handle_and_commit() {
             tx.create_file(name, attributes(), when).await,
             Err(WriteError::Exists { .. })
         ));
-        let concurrency = std::thread::available_parallelism().unwrap();
         assert_eq!(
-            tx.write_file(
-                &created,
-                0,
-                "写入-書き込み-쓰기".as_bytes(),
-                WriteOptions::plain(when, concurrency)
-            )
-            .await
-            .unwrap(),
+            tx.write_file(&created, 0, "写入-書き込み-쓰기".as_bytes(), when)
+                .await
+                .unwrap(),
             "写入-書き込み-쓰기".len()
         );
         tx.commit().await.unwrap();
@@ -2406,7 +2402,6 @@ fn handles_follow_commits_but_reject_reused_inode_numbers() {
             seconds: 1_700_000_100,
             nanoseconds: 0,
         };
-        let concurrency = std::thread::available_parallelism().unwrap();
         let mut tx = writer.join().await.unwrap();
         let root = tx.root().await.unwrap();
         let name = Name {
@@ -2417,15 +2412,13 @@ fn handles_follow_commits_but_reject_reused_inode_numbers() {
             permissions: 0o644,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
         let original = tx.create_file(name, attributes(), when).await.unwrap();
         tx.commit().await.unwrap();
         let mut tx = writer.join().await.unwrap();
         let old_generation = tx.metadata(&original).await.unwrap().generation;
-        let _ = tx
-            .write_file(&original, 0, b"old", WriteOptions::plain(when, concurrency))
-            .await
-            .unwrap();
+        let _ = tx.write_file(&original, 0, b"old", when).await.unwrap();
         tx.commit().await.unwrap();
         let mut tx = writer.join().await.unwrap();
         assert_eq!(
@@ -2470,13 +2463,7 @@ fn handles_follow_commits_but_reject_reused_inode_numbers() {
             Err(WriteError::StaleHandle { .. })
         ));
         assert!(matches!(
-            tx.write_file(
-                &original,
-                0,
-                b"wrong file",
-                WriteOptions::plain(when, concurrency)
-            )
-            .await,
+            tx.write_file(&original, 0, b"wrong file", when).await,
             Err(WriteError::StaleHandle { .. })
         ));
         let current = writer.snapshot().unwrap();
@@ -2499,7 +2486,6 @@ fn owned_mutations_commit_as_one_generation() {
             seconds: 1_700_000_100,
             nanoseconds: 123,
         };
-        let concurrency = std::thread::available_parallelism().unwrap();
         let mut tx = writer.join().await.unwrap();
         let root_handle = tx.root().await.unwrap();
         let name = |bytes| Name {
@@ -2510,6 +2496,7 @@ fn owned_mutations_commit_as_one_generation() {
             permissions: 0o644,
             uid: 1000,
             gid: 1000,
+            umask: 0,
         };
 
         let source = tx
@@ -2528,14 +2515,9 @@ fn owned_mutations_commit_as_one_generation() {
         assert!(replacement.number() > removed.number());
         tx.unlink_name(name(b"temporary"), when).await.unwrap();
         let bytes = vec![0x53; 16384];
-        let count = tx
-            .write_file(&source, 0, &bytes, WriteOptions::plain(when, concurrency))
-            .await
-            .unwrap();
+        let count = tx.write_file(&source, 0, &bytes, when).await.unwrap();
         assert_eq!(count, bytes.len());
-        tx.truncate_file(&source, 8192, when, concurrency)
-            .await
-            .unwrap();
+        tx.truncate_file(&source, 8192, when).await.unwrap();
         let destination = tx
             .create_file(name(b"clone"), attributes(), when)
             .await
@@ -2549,7 +2531,6 @@ fn owned_mutations_commit_as_one_generation() {
                 length: 8192,
             },
             when,
-            concurrency,
         )
         .await
         .unwrap();
@@ -2714,7 +2695,6 @@ fn exercise_operation_rollback(mut verify: impl FnMut(&std::path::Path)) {
                 seconds: 1_700_000_100,
                 nanoseconds: 123,
             };
-            let concurrency = std::thread::available_parallelism().unwrap();
             let name = Name {
                 parent: &root_handle,
                 bytes: b"pending",
@@ -2723,45 +2703,45 @@ fn exercise_operation_rollback(mut verify: impl FnMut(&std::path::Path)) {
                 permissions: 0o644,
                 uid: 1000,
                 gid: 1000,
+                umask: 0,
             };
             let mut tx = writer.join().await.unwrap();
             let _ = tx.create_file(name, attributes(), when).await.unwrap();
             if private {
-                tx.write_file(&file, 0, &contents, WriteOptions::plain(when, concurrency))
-                    .await
-                    .unwrap();
+                tx.write_file(&file, 0, &contents, when).await.unwrap();
+                // The contents get an extent allocated in this transaction.
+                writer.writeback().await.unwrap();
             }
+            let payload = vec![0x71; contents.len().max(8192)];
+            let mut tx = writer.join().await.unwrap();
+            tx.write_file(&file, 0, &payload, when).await.unwrap();
             stage_action.store(action, Ordering::SeqCst);
             entered.store(0, Ordering::SeqCst);
-            let payload = vec![0x71; contents.len().max(8192)];
-            // Fail after bytes reach storage, covering both inline promotion
-            // and replacement of an extent allocated earlier in this batch.
+            // Fail writeback after bytes reach storage, covering both the
+            // promoted inline data and the replacement of an extent
+            // allocated earlier in this transaction.
             if action == 1 {
-                assert!(
-                    tx.write_file(&file, 0, &payload, WriteOptions::plain(when, concurrency))
-                        .await
-                        .is_err()
-                );
+                assert!(writer.writeback().await.is_err());
             } else {
-                let mut write = core::pin::pin!(tx.write_file(
-                    &file,
-                    0,
-                    &payload,
-                    WriteOptions::plain(when, concurrency)
-                ));
-                assert!(poll_once(write.as_mut()).await.is_none());
+                let mut writeback = core::pin::pin!(writer.writeback());
+                assert!(poll_once(writeback.as_mut()).await.is_none());
             }
             assert!(entered.load(Ordering::SeqCst) > 0);
+            // The data stays dirty and visible, as the write left it.
+            assert_eq!(
+                writer.dirty().data_bytes,
+                (payload.len() as u64).next_multiple_of(4096)
+            );
+            let mut tx = writer.join().await.unwrap();
             assert!(tx.lookup(&root_handle, b"pending").await.unwrap().is_some());
-            let mut output = vec![0; contents.len()];
+            let mut output = vec![0; payload.len()];
             tx.read_file(&file, 0, &mut output).await.unwrap();
-            assert_eq!(output, contents);
+            assert_eq!(output, payload);
             stage_action.store(0, Ordering::SeqCst);
-            // A succeeding replacement must release the held private extent,
+            // A succeeding writeback must release the held private extent,
             // while leaving allocation and free-space accounting consistent.
-            tx.write_file(&file, 0, &contents, WriteOptions::plain(when, concurrency))
-                .await
-                .unwrap();
+            tx.write_file(&file, 0, &contents, when).await.unwrap();
+            let mut output = vec![0; contents.len()];
             // The earlier creation survived, and the same transaction remains
             // usable after either an I/O error or cancellation mid-mutation.
             tx.create_file(
@@ -3053,6 +3033,7 @@ fn old_inodes_read_their_own_extent_and_checksum_generation() {
             fs.snapshot.clone(),
             &mut retirements,
             &allocation_of(&fs).await,
+            false,
         )
         .await
         .unwrap();
@@ -3089,7 +3070,7 @@ fn old_inodes_read_their_own_extent_and_checksum_generation() {
                 &mut transaction.trees,
                 &mut transaction.space,
                 crate::accounting::DataWrite {
-                    bytes: &after,
+                    pieces: &[&after],
                     reference,
                     checksummed: true,
                 },
@@ -3137,6 +3118,7 @@ fn old_inodes_read_their_own_extent_and_checksum_generation() {
             .commit(
                 &mut retirements,
                 || panic!("valid fixture UUID"),
+                &mut Compressor::Plain,
                 concurrency,
             )
             .await
@@ -3228,6 +3210,7 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
                 current.snapshot.clone(),
                 &mut retirements,
                 &allocation_of(&current).await,
+                false,
             )
             .await
             .unwrap();
@@ -3253,6 +3236,7 @@ fn old_inode_clones_pin_retired_blocks_across_multiple_commits() {
             current.snapshot.clone(),
             &mut retirements,
             &allocation_of(&current).await,
+            false,
         )
         .await
         .unwrap();
@@ -3280,18 +3264,21 @@ fn noise(length: usize, seed: u8) -> Vec<u8> {
 #[test]
 fn carried_allocation_state_equals_a_reload_after_every_commit() {
     use super::writer::{Attributes, CloneRange, Name, Writer};
-    use crate::compress::write::{Plain, Zstd};
-    use core::num::NonZeroUsize;
+    use crate::compress::write::Zstd;
 
     // Extent-tree groups and a separate block-group tree, with and without
     // the free-space tree.
     for (separate, free_tree) in [(true, true), (false, true), (false, false)] {
         block_on(async {
             let (_, image) = filesystem_image_with_features(separate, free_tree);
-            let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
-                .await
-                .unwrap();
-            let concurrency = NonZeroUsize::MIN;
+            // Compressing, so the repetitive text below lands in zstd
+            // extents and the noise in plain ones.
+            let mut writer = mount_compressing_writer(
+                Disk(image.try_clone().unwrap()),
+                Compressor::Zstd(alloc::boxed::Box::new(Zstd::new(3).unwrap())),
+            )
+            .await
+            .unwrap();
             let when = crate::Timestamp {
                 seconds: 1_700_000_100,
                 nanoseconds: 0,
@@ -3300,6 +3287,7 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                 permissions: 0o644,
                 uid: 0,
                 gid: 0,
+                umask: 0,
             };
             let check = |writer: &Writer<Disk, FixtureUuids>, step: &'static str| {
                 let image = image.try_clone().unwrap();
@@ -3338,14 +3326,9 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                 .create_file(name(b"a.bin"), attributes, when)
                 .await
                 .unwrap();
-            tx.write_file(
-                &first,
-                0,
-                &noise(300_000, 1),
-                WriteOptions::plain(when, concurrency),
-            )
-            .await
-            .unwrap();
+            tx.write_file(&first, 0, &noise(300_000, 1), when)
+                .await
+                .unwrap();
             tx.commit().await.unwrap();
             check(&writer, "create").await;
 
@@ -3360,14 +3343,9 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                 .unwrap()
                 .unwrap();
             let first = tx.lookup(&directory, b"a.bin").await.unwrap().unwrap();
-            tx.write_file(
-                &first,
-                100_000,
-                &noise(80_000, 2),
-                WriteOptions::plain(when, concurrency),
-            )
-            .await
-            .unwrap();
+            tx.write_file(&first, 100_000, &noise(80_000, 2), when)
+                .await
+                .unwrap();
             tx.commit().await.unwrap();
             check(&writer, "overwrite").await;
 
@@ -3390,18 +3368,7 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                 .await
                 .unwrap();
             let text = "btrfs 写入 書き込み 쓰기 ".repeat(10_000).into_bytes();
-            tx.write_file(
-                &compressed,
-                0,
-                &text,
-                WriteOptions {
-                    when,
-                    concurrency,
-                    encoder: Zstd::new(3).unwrap(),
-                },
-            )
-            .await
-            .unwrap();
+            tx.write_file(&compressed, 0, &text, when).await.unwrap();
             tx.commit().await.unwrap();
             check(&writer, "compressed write").await;
 
@@ -3433,7 +3400,6 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                     length: 131_072,
                 },
                 when,
-                concurrency,
             )
             .await
             .unwrap();
@@ -3467,9 +3433,7 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                 .unwrap()
                 .unwrap();
             let clone = tx.lookup(&directory, b"clone.bin").await.unwrap().unwrap();
-            tx.truncate_file(&clone, 4096, when, concurrency)
-                .await
-                .unwrap();
+            tx.truncate_file(&clone, 4096, when).await.unwrap();
             tx.unlink_name(
                 Name {
                     parent: &directory,
@@ -3497,18 +3461,9 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                 )
                 .await
                 .unwrap();
-            tx.write_file(
-                &doomed,
-                0,
-                &noise(50_000, 3),
-                WriteOptions {
-                    when,
-                    concurrency,
-                    encoder: Plain,
-                },
-            )
-            .await
-            .unwrap();
+            tx.write_file(&doomed, 0, &noise(50_000, 3), when)
+                .await
+                .unwrap();
             check(&writer, "uncommitted").await;
             drop(reader);
         });
@@ -3716,7 +3671,6 @@ fn data_chunks_are_allocated_after_the_mkfs_group_fills() {
             let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
                 .await
                 .unwrap();
-            let concurrency = NonZeroUsize::MIN;
             let when = crate::Timestamp {
                 seconds: 1_700_000_100,
                 nanoseconds: 0,
@@ -3725,6 +3679,7 @@ fn data_chunks_are_allocated_after_the_mkfs_group_fills() {
                 permissions: 0o644,
                 uid: 0,
                 gid: 0,
+                umask: 0,
             };
             // Several times the one data group a fresh image has.
             const MIB: usize = 1 << 20;
@@ -3753,12 +3708,7 @@ fn data_chunks_are_allocated_after_the_mkfs_group_fills() {
                 .unwrap();
             for (index, piece) in content.chunks(MIB).enumerate() {
                 let written = tx
-                    .write_file(
-                        &file,
-                        (index * MIB) as u64,
-                        piece,
-                        WriteOptions::plain(when, concurrency),
-                    )
+                    .write_file(&file, (index * MIB) as u64, piece, when)
                     .await
                     .unwrap();
                 assert_eq!(written, MIB);
@@ -3766,9 +3716,19 @@ fn data_chunks_are_allocated_after_the_mkfs_group_fills() {
             tx.commit().await.unwrap();
 
             let after = assert_device_layout(&image).await;
+            // Writeback finds no range of the mkfs group long enough for the
+            // run and allocates it in a new chunk, as `find_free_extent`
+            // does once it allocates one; the mkfs group, still unused,
+            // then leaves.
+            let after_bytes: u64 = after
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.2 & 1 != 0)
+                .map(|chunk| chunk.1)
+                .sum();
             assert!(
-                count_kind(&after, 1) > count_kind(&before, 1),
-                "a data chunk was allocated"
+                after_bytes > data_bytes && after_bytes >= content.len() as u64,
+                "a data chunk was allocated: {data_bytes} then {after_bytes} bytes"
             );
             assert_eq!(count_kind(&after, 4), count_kind(&before, 4));
             // The carried state still equals a reload.
@@ -3899,6 +3859,7 @@ fn a_system_chunk_lands_in_the_bootstrap_array_and_survives_remount() {
                     permissions: 0o600,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when,
             )
@@ -3969,7 +3930,6 @@ fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sec
         let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
             .await
             .unwrap();
-        let concurrency = NonZeroUsize::MIN;
         let when = crate::Timestamp {
             seconds: 1_700_000_100,
             nanoseconds: 0,
@@ -3978,6 +3938,7 @@ fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sec
             permissions: 0o644,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
         const PIECE: usize = 64 << 10;
         let mut tx = writer.join().await.unwrap();
@@ -4004,41 +3965,6 @@ fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sec
             )
             .await
             .unwrap();
-        // Alternate 64 KiB pieces of two files until the device has nothing
-        // left for either: the data groups fill, chunks follow, and the last
-        // chunk shrinks to the hole that is left.
-        let mut offset = 0;
-        let mut kept_content = vec![];
-        'fill: for index in 0_u32.. {
-            for file in [&kept, &freed] {
-                let piece = noise(PIECE, index as u8);
-                match tx
-                    .write_file(file, offset, &piece, WriteOptions::plain(when, concurrency))
-                    .await
-                {
-                    Ok(PIECE) => {
-                        if std::ptr::eq(file, &kept) {
-                            kept_content.extend_from_slice(&piece);
-                        }
-                    }
-                    Ok(_) | Err(WriteError::Space(SpaceError::Exhausted { .. })) => break 'fill,
-                    Err(error) => panic!("unexpected write failure: {error}"),
-                }
-            }
-            offset += PIECE as u64;
-        }
-        assert!(tx.edits().space.largest_free(DATA) < PIECE as u64);
-        // Free every second piece: the free ranges are now 64 KiB holes and
-        // the device has no room for another chunk.
-        tx.truncate_file(&freed, 0, when, concurrency)
-            .await
-            .unwrap();
-        assert_eq!(tx.edits().space.largest_free(DATA), PIECE as u64);
-        let holes = tx.edits().space.totals(DATA).1 / PIECE as u64;
-        assert!(holes > 100, "the test needs many holes, has {holes}");
-
-        // A 128 KiB write exceeds every range, so each window shrinks to one
-        // hole and the write still succeeds.
         let large = tx
             .create_file(
                 Name {
@@ -4050,19 +3976,53 @@ fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sec
             )
             .await
             .unwrap();
+        // Alternate 64 KiB pieces of two files, each written back on its own
+        // so their extents interleave, until the device has nothing left for
+        // either: the data groups fill, chunks follow, and the last write is
+        // short or refused.
+        let mut offset = 0;
+        let mut kept_content = vec![];
+        'fill: for index in 0_u32.. {
+            for file in [&kept, &freed] {
+                let piece = noise(PIECE, index as u8);
+                let mut tx = writer.join().await.unwrap();
+                let written = tx.write_file(file, offset, &piece, when).await;
+                writer.writeback().await.unwrap();
+                match written {
+                    Ok(PIECE) => {
+                        if std::ptr::eq(file, &kept) {
+                            kept_content.extend_from_slice(&piece);
+                        }
+                    }
+                    Ok(_) | Err(WriteError::Space(SpaceError::Exhausted { .. })) => break 'fill,
+                    Err(error) => panic!("unexpected write failure: {error}"),
+                }
+            }
+            offset += PIECE as u64;
+        }
+        let mut tx = writer.join().await.unwrap();
+        assert!(tx.edits().space.largest_free(DATA) < PIECE as u64);
+        // Free every second piece: once that commits, the free ranges are
+        // 64 KiB holes and the device has no room for another chunk.
+        tx.truncate_file(&freed, 0, when).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = writer.join().await.unwrap();
+        assert_eq!(tx.edits().space.largest_free(DATA), PIECE as u64);
+        let holes = tx.edits().space.totals(DATA).1 / PIECE as u64;
+        assert!(holes > 100, "the test needs many holes, has {holes}");
+
+        // Writing a 128 KiB run back exceeds every range, so each extent
+        // shrinks to one hole and the write still lands.
         let mut large_content = vec![];
         let mut stored = 0;
         let remainder = loop {
             let piece = noise(2 * PIECE, (large_content.len() / PIECE / 2) as u8);
+            let mut tx = writer.join().await.unwrap();
             let written = tx
-                .write_file(
-                    &large,
-                    stored,
-                    &piece,
-                    WriteOptions::plain(when, concurrency),
-                )
+                .write_file(&large, stored, &piece, when)
                 .await
                 .unwrap_or(0);
+            writer.writeback().await.unwrap();
             large_content.extend_from_slice(&piece[..written]);
             stored += written as u64;
             if written < piece.len() {
@@ -4073,15 +4033,9 @@ fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sec
         // none left; both leave no free sector to report.
         assert!(remainder < 2 * PIECE);
         assert!(large_content.len() >= 2 * PIECE * 10);
+        let mut tx = writer.join().await.unwrap();
         assert!(tx.edits().space.largest_free(DATA) < 4096);
-        let refused = tx
-            .write_file(
-                &large,
-                stored,
-                &[0x5a; 4096],
-                WriteOptions::plain(when, concurrency),
-            )
-            .await;
+        let refused = tx.write_file(&large, stored, &[0x5a; 4096], when).await;
         assert!(
             matches!(
                 refused,
@@ -4090,6 +4044,15 @@ fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sec
             "{refused:?}"
         );
         tx.commit().await.unwrap();
+        let fragments = {
+            let view = writer.snapshot().unwrap();
+            let inode = view.resolve("/断片-断片-단편".as_bytes()).await.unwrap();
+            view.file_extents(&inode).await.unwrap()
+        };
+        assert!(
+            fragments.iter().all(|extent| extent.len <= PIECE as u64),
+            "every extent fits a hole: {fragments:?}"
+        );
 
         assert_device_layout(&image).await;
         let fresh = Filesystem::mount(Disk(image.try_clone().unwrap()))
@@ -4133,6 +4096,7 @@ async fn touch(writer: &mut super::writer::Writer<Disk, FixtureUuids>, name: &st
             permissions: 0o600,
             uid: 0,
             gid: 0,
+            umask: 0,
         },
         when,
     )
@@ -4153,7 +4117,6 @@ fn unused_block_groups_leave_after_their_extents_are_free_and_no_reader_pins_the
         let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
             .await
             .unwrap();
-        let concurrency = NonZeroUsize::MIN;
         let when = crate::Timestamp {
             seconds: 1_700_000_100,
             nanoseconds: 0,
@@ -4181,22 +4144,22 @@ fn unused_block_groups_leave_after_their_extents_are_free_and_no_reader_pins_the
                     permissions: 0o644,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when,
             )
             .await
             .unwrap();
+        // Each piece written back on its own fills the mkfs group first, so
+        // the file spans it and a chunk allocated after it.
         for (index, piece) in content.chunks(MIB).enumerate() {
-            tx.write_file(
-                &file,
-                (index * MIB) as u64,
-                piece,
-                WriteOptions::plain(when, concurrency),
-            )
-            .await
-            .unwrap();
+            let mut tx = writer.join().await.unwrap();
+            tx.write_file(&file, (index * MIB) as u64, piece, when)
+                .await
+                .unwrap();
+            writer.writeback().await.unwrap();
         }
-        tx.commit().await.unwrap();
+        writer.commit().await.unwrap();
         let full = assert_device_layout(&image).await;
         assert!(count_kind(&full, 1) > count_kind(&before, 1));
 
@@ -4303,12 +4266,14 @@ fn empty_transaction_does_not_publish() {
             fs.snapshot.clone(),
             &mut retirements,
             &allocation_of(&fs).await,
+            false,
         )
         .await
         .unwrap()
         .commit(
             &mut retirements,
             || panic!("no new UUID required"),
+            &mut Compressor::Plain,
             core::num::NonZeroUsize::MIN,
         )
         .await
@@ -4438,6 +4403,7 @@ fn transaction_publishes_roots_and_preserves_previous_generation() {
                     fs.snapshot.clone(),
                     &mut crate::retirement::Retirements::default(),
                     &allocation_of(&fs).await,
+                    false,
                 )
                 .await,
                 Err(WriteError::StaleSnapshot)
@@ -4766,7 +4732,7 @@ fn data_staging_writes_all_copies_without_publishing_roots() {
                 &mut trees,
                 &mut space,
                 crate::accounting::DataWrite {
-                    bytes: &bytes,
+                    pieces: &[&bytes],
                     reference,
                     checksummed: true,
                 },
@@ -5235,7 +5201,7 @@ fn checksum_deletion_splits_items_preserves_neighbors_and_crosses_holes() {
                 &mut trees,
                 &mut space,
                 start + sector,
-                &replacement,
+                &[&replacement],
             )
             .await
             .unwrap();
@@ -5350,7 +5316,7 @@ fn checksum_writes_span_full_leaf_items() {
         let bytes = vec![0x37; sector * sectors];
         let start = 16 << 20;
         checksums
-            .set(&fs.volume, &mut trees, &mut space, start, &bytes)
+            .set(&fs.volume, &mut trees, &mut space, start, &[&bytes])
             .await
             .unwrap();
         assert!(checksums.root.level > 0);
@@ -6406,6 +6372,7 @@ fn running_attributes() -> super::writer::Attributes {
         permissions: 0o644,
         uid: 1000,
         gid: 1000,
+        umask: 0,
     }
 }
 
@@ -6424,7 +6391,6 @@ async fn write_running(
     contents: &[u8],
 ) {
     use super::writer::Name;
-    let concurrency = std::thread::available_parallelism().unwrap();
     let mut tx = writer.join().await.unwrap();
     let root = tx.root().await.unwrap();
     let file = tx
@@ -6439,14 +6405,9 @@ async fn write_running(
         .await
         .unwrap();
     assert_eq!(
-        tx.write_file(
-            &file,
-            0,
-            contents,
-            WriteOptions::plain(RUNNING_WHEN, concurrency)
-        )
-        .await
-        .unwrap(),
+        tx.write_file(&file, 0, contents, RUNNING_WHEN)
+            .await
+            .unwrap(),
         contents.len()
     );
 }
@@ -6521,17 +6482,20 @@ fn a_view_keeps_released_private_data_from_reuse_until_it_is_dropped() {
     block_on(async {
         let (_, image) = filesystem_image();
         let mut writer = mount_writer(Disk(image)).await.unwrap();
+        // Each write is written back, so the data has a private extent.
+        async fn write(writer: &mut Writer<Disk, FixtureUuids>, name: &[u8], contents: &[u8]) {
+            write_running(writer, name, contents).await;
+            writer.writeback().await.unwrap();
+            assert_eq!(writer.dirty().data_bytes, 0);
+        }
         let first = noise(64 << 10, 1);
-        write_running(&mut writer, "第一-最初-첫째".as_bytes(), &first).await;
+        write(&mut writer, "第一-最初-첫째".as_bytes(), &first).await;
         let view = writer.snapshot().unwrap();
         async fn truncate(writer: &mut Writer<Disk, FixtureUuids>, name: &[u8]) -> u64 {
-            let concurrency = std::thread::available_parallelism().unwrap();
             let mut tx = writer.join().await.unwrap();
             let root = tx.root().await.unwrap();
             let file = tx.lookup(&root, name).await.unwrap().unwrap();
-            tx.truncate_file(&file, 0, RUNNING_WHEN, concurrency)
-                .await
-                .unwrap();
+            tx.truncate_file(&file, 0, RUNNING_WHEN).await.unwrap();
             tx.edits().space.held_data_bytes()
         }
         // Truncating frees the extent this transaction wrote; first-fit would
@@ -6541,7 +6505,7 @@ fn a_view_keeps_released_private_data_from_reuse_until_it_is_dropped() {
             first.len() as u64
         );
         let second = noise(64 << 10, 2);
-        write_running(&mut writer, "第二-二番目-둘째".as_bytes(), &second).await;
+        write(&mut writer, "第二-二番目-둘째".as_bytes(), &second).await;
         assert_eq!(read_whole(&view, "第一-最初-첫째".as_bytes()).await, first);
         drop(view);
         {
@@ -6556,13 +6520,13 @@ fn a_view_keeps_released_private_data_from_reuse_until_it_is_dropped() {
         // A view still alive at the commit keeps the range through the reader
         // pin of the generation its transaction started from.
         let third = noise(64 << 10, 3);
-        write_running(&mut writer, "第三-三番目-셋째".as_bytes(), &third).await;
+        write(&mut writer, "第三-三番目-셋째".as_bytes(), &third).await;
         let view = writer.snapshot().unwrap();
         truncate(&mut writer, "第三-三番目-셋째".as_bytes()).await;
         writer.commit().await.unwrap();
         for seed in 4..8 {
             let name = alloc::format!("后来-後で-나중-{seed}");
-            write_running(&mut writer, name.as_bytes(), &noise(64 << 10, seed)).await;
+            write(&mut writer, name.as_bytes(), &noise(64 << 10, seed)).await;
         }
         assert_eq!(
             read_whole(&view, "第三-三番目-셋째".as_bytes()).await,
@@ -6584,6 +6548,381 @@ fn a_view_keeps_released_private_data_from_reuse_until_it_is_dropped() {
             third
         );
     });
+}
+
+/// The largest write the preview1 component adapter issues, so CPython's
+/// writes reach the kernel at this size whatever it asked to write.
+#[cfg(feature = "write")]
+const ADAPTER_ROUND: usize = 4096;
+
+/// A fresh image at a path `verify` can inspect, with `NO_HOLES` set per
+/// `no_holes` and a writer over it that compresses with `compressor`.
+#[cfg(feature = "write")]
+async fn named_writer_with(
+    no_holes: bool,
+    compressor: Compressor,
+) -> (
+    tempfile::NamedTempFile,
+    super::writer::Writer<Disk, FixtureUuids>,
+) {
+    let stamp = Timestamp::from_secs(1_700_000_000);
+    let named = tempfile::NamedTempFile::new().unwrap();
+    let mut options = FormatOptions::new([0x53; 16], stamp);
+    if !no_holes {
+        options.plan.incompat_flags = options
+            .plan
+            .incompat_flags
+            .without(ferrosys::btrfs::ondisk::IncompatFlags::NO_HOLES);
+        options.plan.compat_ro_flags = options
+            .plan
+            .compat_ro_flags
+            .without(ferrosys::btrfs::ondisk::CompatRoFlags::BLOCK_GROUP_TREE);
+    }
+    let (_, image) = filesystem_image_options(
+        TreeBuilder::new().root(Metadata::new(0o755, stamp)),
+        named.reopen().unwrap(),
+        options,
+    );
+    let writer = mount_compressing_writer(Disk(image), compressor)
+        .await
+        .unwrap();
+    (named, writer)
+}
+
+#[cfg(feature = "write")]
+async fn named_writer(
+    compressor: Compressor,
+) -> (
+    tempfile::NamedTempFile,
+    super::writer::Writer<Disk, FixtureUuids>,
+) {
+    named_writer_with(true, compressor).await
+}
+
+/// Writes of any size become extents at Linux's sizes at writeback: one
+/// extent for an uncompressed run, a compressed extent per 128 KiB window,
+/// and for data that does not compress one uncompressed extent per 512 KiB
+/// chunk the compressing path hands back.
+#[cfg(feature = "write")]
+#[test]
+fn writeback_forms_extents_at_linux_sizes() {
+    block_on(exercise_writeback_extents(|_, _| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn writeback_extents_pass_btrfs_check_and_restore() {
+    block_on(exercise_writeback_extents(assert_reflink_image));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_writeback_extents(
+    mut verify: impl FnMut(&std::path::Path, &BTreeMap<&str, Vec<u8>>),
+) {
+    use super::writer::Name;
+    use crate::compress::write::Zstd;
+    use crate::fs::ExtentKind;
+    const WINDOW: u64 = 128 << 10;
+    let text: Vec<u8> = "延迟分配 遅延割り当て 지연 할당 delayed allocation\n"
+        .repeat(60_000)
+        // A tail window of 52 KiB, which still saves a sector; a 4 KiB one
+        // could not, and would be stored plain, as Linux stores it.
+        .into_bytes()[..(3 << 20) + 50_000]
+        .to_vec();
+    let random = noise(1 << 20, 9);
+    let names = ["文本-テキスト-텍스트", "噪声-ノイズ-잡음"];
+    for compressor in [
+        Compressor::Plain,
+        Compressor::Zstd(alloc::boxed::Box::new(Zstd::new(3).unwrap())),
+    ] {
+        let algorithm = compressor.algorithm();
+        let (named, mut writer) = named_writer(compressor).await;
+        let mut expected = BTreeMap::new();
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        for (file_index, (name, contents)) in names.into_iter().zip([&text, &random]).enumerate() {
+            let file = tx
+                .create_file(
+                    Name {
+                        parent: &root,
+                        bytes: name.as_bytes(),
+                    },
+                    running_attributes(),
+                    RUNNING_WHEN,
+                )
+                .await
+                .unwrap();
+            let mut rounds: Vec<_> = contents.chunks(ADAPTER_ROUND).enumerate().collect();
+            // Write the second file's 4 KiB chunks in reverse order so out-of-order
+            // dirty pages must merge into one contiguous run before writeback.
+            if file_index != 0 {
+                rounds.reverse();
+            }
+            for (index, round) in rounds {
+                let offset = (index * ADAPTER_ROUND) as u64;
+                let written = tx.write_file(&file, offset, round, RUNNING_WHEN).await;
+                assert_eq!(written.unwrap(), round.len());
+            }
+            expected.insert(name, contents.clone());
+        }
+        // Dirty, not yet allocated: reads and `nbytes` (`st_blocks`) see the
+        // data, and no extent exists yet.
+        let view = writer.snapshot().unwrap();
+        for (name, contents) in &expected {
+            assert_eq!(read_whole(&view, name.as_bytes()).await, *contents);
+            let inode = view.resolve(name.as_bytes()).await.unwrap();
+            assert_eq!(
+                inode.metadata().nbytes,
+                (contents.len() as u64).next_multiple_of(4096)
+            );
+            assert!(view.file_extents(&inode).await.unwrap().is_empty());
+        }
+        writer.commit().await.unwrap();
+        verify(named.path(), &expected);
+        let current = writer.snapshot().unwrap();
+        let mut layout = Vec::new();
+        for name in names {
+            assert_eq!(read_whole(&current, name.as_bytes()).await, expected[name]);
+            let inode = current.resolve(name.as_bytes()).await.unwrap();
+            let extents = current.file_extents(&inode).await.unwrap();
+            assert!(
+                extents
+                    .iter()
+                    .all(|extent| extent.kind == ExtentKind::Regular)
+            );
+            layout.push(
+                extents
+                    .iter()
+                    .map(|extent| (extent.len, extent.compression))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let text_bytes = (text.len() as u64).next_multiple_of(4096);
+        match algorithm {
+            None => {
+                assert_eq!(layout[0], [(text_bytes, None)]);
+                assert_eq!(layout[1], [(1 << 20, None)]);
+            }
+            Some(algorithm) => {
+                assert_eq!(layout[0].len() as u64, text_bytes.div_ceil(WINDOW));
+                let (last, windows) = layout[0].split_last().unwrap();
+                assert!(
+                    windows
+                        .iter()
+                        .all(|&extent| extent == (WINDOW, Some(algorithm)))
+                );
+                assert_eq!(
+                    *last,
+                    (text_bytes - WINDOW * windows.len() as u64, Some(algorithm))
+                );
+                assert_eq!(layout[1], [(512 << 10, None), (512 << 10, None)]);
+            }
+        }
+    }
+}
+
+/// Reads, overwrites, truncation, reflinks and unlinks in the running
+/// transaction see the dirty data before writeback, and the commit keeps
+/// what they made of it.
+#[cfg(feature = "write")]
+#[test]
+fn dirty_data_is_seen_by_every_operation() {
+    block_on(exercise_dirty_operations(|_, _| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn dirty_operations_pass_btrfs_check_and_restore() {
+    block_on(exercise_dirty_operations(assert_reflink_image));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_dirty_operations(
+    mut verify: impl FnMut(&std::path::Path, &BTreeMap<&str, Vec<u8>>),
+) {
+    use super::writer::{CloneRange, Name};
+    use crate::compress::write::Zstd;
+
+    for no_holes in [true, false] {
+        for compressor in [
+            Compressor::Plain,
+            Compressor::Zstd(alloc::boxed::Box::new(Zstd::new(3).unwrap())),
+        ] {
+            let (named, mut writer) = named_writer_with(no_holes, compressor).await;
+            let (source_name, clone_name, doomed_name) =
+                ("源-ソース-원본", "克隆-クローン-복제", "删除-削除-삭제");
+            let mut tx = writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let mut create = async |name: &str| {
+                tx.create_file(
+                    Name {
+                        parent: &root,
+                        bytes: name.as_bytes(),
+                    },
+                    running_attributes(),
+                    RUNNING_WHEN,
+                )
+                .await
+                .unwrap()
+            };
+            let (source, clone, doomed) = (
+                create(source_name).await,
+                create(clone_name).await,
+                create(doomed_name).await,
+            );
+            let mut written: Vec<u8> = "可压缩前缀 圧縮可能 압축 가능 compressible\n"
+                .repeat(600)
+                .into_bytes();
+            written.truncate(20_000);
+            for (index, round) in written.chunks(ADAPTER_ROUND).enumerate() {
+                tx.write_file(&source, (index * ADAPTER_ROUND) as u64, round, RUNNING_WHEN)
+                    .await
+                    .unwrap();
+            }
+            macro_rules! reads {
+                ($file:expr, $expected:expr) => {{
+                    let expected: &[u8] = $expected;
+                    let mut output = vec![0xee; expected.len() + 7];
+                    assert_eq!(
+                        tx.read_file($file, 0, &mut output).await.unwrap(),
+                        expected.len()
+                    );
+                    assert_eq!(&output[..expected.len()], expected);
+                }};
+            }
+            reads!(&source, &written);
+            // Cross-sector partial overwrite and full-sector overwrite.
+            let patch = "覆盖-上書き-덮어쓰기".as_bytes();
+            tx.write_file(&source, 4090, patch, RUNNING_WHEN)
+                .await
+                .unwrap();
+            written[4090..4090 + patch.len()].copy_from_slice(patch);
+            let whole_sector = vec![0x6b; 4096];
+            tx.write_file(&source, 8192, &whole_sector, RUNNING_WHEN)
+                .await
+                .unwrap();
+            written[8192..12_288].copy_from_slice(&whole_sector);
+            reads!(&source, &written);
+
+            // Shrinking drops the pages past the end and zeroes the last one's
+            // tail, which growing again reads back as zeroes.
+            tx.truncate_file(&source, 9000, RUNNING_WHEN).await.unwrap();
+            written.truncate(9000);
+            reads!(&source, &written);
+            tx.truncate_file(&source, 16_384, RUNNING_WHEN)
+                .await
+                .unwrap();
+            written.resize(16_384, 0);
+            reads!(&source, &written);
+
+            // Same-inode clone from a dirty source range writes the source
+            // range back, keeps `8192..12288` dirty, and preserves `nbytes`.
+            tx.clone_range(
+                CloneRange {
+                    source: &source,
+                    destination: &source,
+                    source_offset: 0,
+                    destination_offset: 16_384,
+                    length: 8192,
+                },
+                RUNNING_WHEN,
+            )
+            .await
+            .unwrap();
+            let first_two = written[..8192].to_vec();
+            written.extend_from_slice(&first_two);
+            reads!(&source, &written);
+
+            let dirty_pages = |tx: &mut super::writer::WriteTransaction<'_, Disk, FixtureUuids>,
+                               file: &super::writer::InodeHandle| {
+                tx.edits()
+                    .delalloc
+                    .file(file.tree(), file.number())
+                    .map(|dirty| {
+                        dirty
+                            .pages(0..u64::MAX)
+                            .map(|(offset, _)| offset)
+                            .collect::<Vec<_>>()
+                    })
+            };
+            assert_eq!(
+                dirty_pages(&mut tx, &source),
+                Some(vec![8192]),
+                "the cloned source range was written back while sector 8192 stayed dirty"
+            );
+
+            // Cloning over the middle of a dirty destination replaces only the
+            // cloned range and leaves the surrounding dirty pages intact.
+            let mut clone_bytes = noise(16_384, 11);
+            for (index, round) in clone_bytes.chunks(ADAPTER_ROUND).enumerate() {
+                tx.write_file(&clone, (index * ADAPTER_ROUND) as u64, round, RUNNING_WHEN)
+                    .await
+                    .unwrap();
+            }
+            tx.clone_range(
+                CloneRange {
+                    source: &source,
+                    destination: &clone,
+                    source_offset: 0,
+                    destination_offset: 4096,
+                    length: 8192,
+                },
+                RUNNING_WHEN,
+            )
+            .await
+            .unwrap();
+            clone_bytes[4096..12_288].copy_from_slice(&written[..8192]);
+            reads!(&clone, &clone_bytes);
+            assert_eq!(
+                dirty_pages(&mut tx, &clone),
+                Some(vec![0, 12_288]),
+                "destination dirty pages outside the cloned range survive"
+            );
+
+            // Unlinking drops the inode's dirty pages, and the space they reserved.
+            tx.write_file(&doomed, 0, &noise(10_000, 5), RUNNING_WHEN)
+                .await
+                .unwrap();
+            let before = tx.edits().dirty_data_bytes();
+            tx.unlink_name(
+                Name {
+                    parent: &root,
+                    bytes: doomed_name.as_bytes(),
+                },
+                RUNNING_WHEN,
+            )
+            .await
+            .unwrap();
+            assert_eq!(before - tx.edits().dirty_data_bytes(), 3 * 4096);
+            tx.commit().await.unwrap();
+
+            let expected = BTreeMap::from([
+                (source_name, written.clone()),
+                (clone_name, clone_bytes.clone()),
+            ]);
+            verify(named.path(), &expected);
+            let fresh = Filesystem::mount(Disk(named.reopen().unwrap()))
+                .await
+                .unwrap();
+            assert_reflink_contents(&fresh, &expected).await;
+            let current = writer.snapshot().unwrap();
+            let source_inode = current.resolve(source_name.as_bytes()).await.unwrap();
+            let clone_inode = current.resolve(clone_name.as_bytes()).await.unwrap();
+            assert_eq!(
+                disk_allocation(&current, &source_inode, 16_384).await,
+                disk_allocation(&current, &source_inode, 0).await,
+                "same-inode clone shares the source's extent"
+            );
+            assert_eq!(
+                disk_allocation(&current, &clone_inode, 4096).await,
+                disk_allocation(&current, &source_inode, 0).await,
+                "cross-inode clone shares the source's extent"
+            );
+            assert!(fresh.resolve(doomed_name.as_bytes()).await.is_err());
+        }
+    }
 }
 
 /// A commit that fails poisons the writer: the changes it carried were
@@ -6659,8 +6998,7 @@ fn a_full_device_refuses_mutations_and_the_writer_keeps_committing() {
         let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
             .await
             .unwrap();
-        let concurrency = NonZeroUsize::MIN;
-        let options = || WriteOptions::plain(RUNNING_WHEN, concurrency);
+        let options = || RUNNING_WHEN;
         const MIB: usize = 1 << 20;
 
         // Data takes every chunk the device can still make.
@@ -6692,10 +7030,11 @@ fn a_full_device_refuses_mutations_and_the_writer_keeps_committing() {
         }
         tx.commit().await.unwrap();
 
-        // Small files go inline, into metadata, until it has no room left.
+        // Small files go inline, into metadata, until it has no room left:
+        // 62 copies of 33 bytes stay within Linux's default `max_inline`.
         let contents = |index: usize| {
             alloc::format!("{index:05} 文件 ファイル 파일 ")
-                .repeat(64)
+                .repeat(62)
                 .into_bytes()
         };
         let name = |index: usize| alloc::format!("小-小さい-작은-{index:05}");
@@ -6842,14 +7181,9 @@ fn usage_counts_the_running_transaction() {
             )
             .await
             .unwrap();
-        tx.write_file(
-            &file,
-            0,
-            &noise(LENGTH, 7),
-            WriteOptions::plain(RUNNING_WHEN, NonZeroUsize::MIN),
-        )
-        .await
-        .unwrap();
+        tx.write_file(&file, 0, &noise(LENGTH, 7), RUNNING_WHEN)
+            .await
+            .unwrap();
         let running = writer.usage().unwrap();
         assert_eq!(running.total_bytes, before.total_bytes);
         assert!(
@@ -6871,7 +7205,7 @@ const CJK_NAMES: [&str; 4] = ["plain", "中文文件", "日本語のファイル
 
 #[cfg(feature = "write")]
 #[test]
-fn chmod_and_chown_update_the_inode_and_refuse_set_id_on_files() {
+fn chmod_and_chown_update_the_inode_and_store_set_id_as_linux_does() {
     block_on(exercise_mode_and_owner(|_| {}));
 }
 
@@ -6890,8 +7224,7 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
     let stamp = Timestamp::from_secs(1_700_000_000);
     // Owned by root, as `Metadata::new` makes it.
     let image = |mode: u16| Metadata::new(mode, stamp);
-    // Set-id bits as a Linux-made image carries them: the writer cannot
-    // create these, so ferrosys lays them out.
+    // Set-id bits as a Linux-made image carries them, laid out by ferrosys.
     let mut tree = TreeBuilder::new().root(Metadata::new(0o755, stamp));
     for name in CJK_NAMES {
         tree = tree
@@ -6977,6 +7310,7 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
                     permissions: 0o644,
                     uid: 1000,
                     gid: 1000,
+                    umask: 0,
                 },
                 stamp_of(1_700_000_050),
             )
@@ -7003,52 +7337,54 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
         assert_eq!((metadata.uid, metadata.gid), (1000, 1000), "{name}");
         assert_eq!(metadata.ctime, when, "{name}");
 
-        // The refusals leave the inode and the transaction as they were.
-        let settled = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
-        for bits in [0o4755, 0o2755, 0o6755, 0o4000, 0o2000] {
-            assert!(
-                matches!(
-                    tx.set_permissions(&file, bits, when).await,
-                    Err(WriteError::SetId { permissions }) if permissions == bits
-                ),
+        // chmod stores the set-id bits on a file as Linux's btrfs does; what
+        // they mean is the mount's to decide.
+        for bits in [0o4755, 0o2755, 0o6755, 0o4000, 0o2000, 0o2644, 0o7777] {
+            tx.set_permissions(&file, bits, when).await.unwrap();
+            assert_eq!(
+                tx.metadata(&file).await.unwrap().permissions,
+                bits,
                 "{name} {bits:#o}"
             );
         }
+        // A file type in the permission bits is still refused, and leaves
+        // the inode as it was.
+        let settled = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
         assert!(matches!(
             tx.set_permissions(&file, 0o100_644, when).await,
             Err(WriteError::InvalidPermissions { .. })
         ));
         let unchanged = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
         assert_eq!(settled.as_bytes(), unchanged.as_bytes(), "{name}");
-        let setuid = |permissions| Attributes {
+        tx.set_permissions(&file, 0o600, when).await.unwrap();
+        let attributes = |permissions| Attributes {
             permissions,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
-        assert!(matches!(
-            tx.create_file(at!(format!("new-{name}")), setuid(0o4755), when)
-                .await,
-            Err(WriteError::SetId { .. })
-        ));
-        assert!(matches!(
-            tx.create_file(at!(format!("new-{name}")), setuid(0o2755), when)
-                .await,
-            Err(WriteError::SetId { .. })
-        ));
-        assert!(matches!(
-            tx.symlink(at!(format!("new-{name}")), b"target", setuid(0o2777), when)
-                .await,
-            Err(WriteError::SetId { .. })
-        ));
-        assert!(
-            tx.lookup(&root, format!("new-{name}").as_bytes())
+        // A creation stores them too, on every kind.
+        for (prefix, bits) in [("suid", 0o4755), ("sgid", 0o2755), ("both", 0o6711)] {
+            let created = tx
+                .create_file(at!(format!("new-{prefix}-{name}")), attributes(bits), when)
                 .await
-                .unwrap()
-                .is_none()
-        );
-        // A directory takes S_ISGID, and its S_ISUID means nothing.
+                .unwrap();
+            let metadata = tx.metadata(&created).await.unwrap();
+            assert_eq!(metadata.kind, crate::FileKind::Regular, "{name}");
+            assert_eq!(metadata.permissions, bits, "{name} {bits:#o}");
+        }
+        let link = tx
+            .symlink(
+                at!(format!("link-{name}")),
+                b"target",
+                attributes(0o2777),
+                when,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx.metadata(&link).await.unwrap().permissions, 0o2777);
         let directory = tx
-            .create_directory(at!(format!("new-{name}")), setuid(0o2755), when)
+            .create_directory(at!(format!("new-{name}")), attributes(0o2755), when)
             .await
             .unwrap();
         assert_eq!(tx.metadata(&directory).await.unwrap().permissions, 0o2755);
@@ -7073,6 +7409,11 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
         let file = read(format!("/{name}")).await;
         assert_eq!((file.permissions, file.uid, file.gid), (0o600, 1000, 1000));
         assert_eq!(file.kind, crate::FileKind::Regular);
+        for (prefix, bits) in [("suid", 0o4755), ("sgid", 0o2755), ("both", 0o6711)] {
+            let created = read(format!("/new-{prefix}-{name}")).await;
+            assert_eq!(created.permissions, bits, "{name} {bits:#o}");
+        }
+        assert_eq!(read(format!("/new-{name}")).await.permissions, 0o4755);
     }
     // The base view still shows the image as it was made.
     let original = *base
@@ -7086,9 +7427,577 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
 }
 
 #[cfg(feature = "write")]
+#[test]
+fn special_nodes_are_created_kept_and_removed_as_mknod_makes_them() {
+    block_on(exercise_special_nodes(|_| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn special_nodes_pass_btrfs_check() {
+    block_on(exercise_special_nodes(assert_btrfs_check));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_special_nodes(mut verify: impl FnMut(&std::path::Path)) {
+    use super::writer::{Attributes, Name, Special};
+    use crate::{DeviceNumber, FileKind};
+    use alloc::format;
+    let stamp = Timestamp::from_secs(1_700_000_000);
+    let named = tempfile::NamedTempFile::new().unwrap();
+    drop(filesystem_image_tree_file(
+        true,
+        true,
+        TreeBuilder::new().root(Metadata::new(0o755, stamp)),
+        named.reopen().unwrap(),
+    ));
+    let mut writer = mount_writer(Disk(named.reopen().unwrap())).await.unwrap();
+    let when = stamp_of(1_700_000_100);
+    // /dev/null, /dev/sda and a number wide enough to use the minor's high
+    // bits, which `stat` and the inode item encode differently.
+    let null = DeviceNumber::new(1, 3).unwrap();
+    let disk = DeviceNumber::new(8, 0).unwrap();
+    let wide = DeviceNumber::new(4095, 0xf_ffff).unwrap();
+    assert!(DeviceNumber::new(4096, 0).is_none());
+    assert!(DeviceNumber::new(0, 1 << 20).is_none());
+    let kinds = [
+        ("chr", Special::CharDevice(null), FileKind::CharDevice, null),
+        (
+            "blk",
+            Special::BlockDevice(disk),
+            FileKind::BlockDevice,
+            disk,
+        ),
+        (
+            "wide",
+            Special::CharDevice(wide),
+            FileKind::CharDevice,
+            wide,
+        ),
+        (
+            "fifo",
+            Special::Fifo,
+            FileKind::Fifo,
+            DeviceNumber::default(),
+        ),
+        (
+            "sock",
+            Special::Socket,
+            FileKind::Socket,
+            DeviceNumber::default(),
+        ),
+    ];
+    let mut tx = writer.join().await.unwrap();
+    let root = tx.root().await.unwrap();
+    for name in CJK_NAMES {
+        for (prefix, special, kind, device) in kinds {
+            let node = tx
+                .create_special(
+                    Name {
+                        parent: &root,
+                        bytes: format!("{prefix}-{name}").as_bytes(),
+                    },
+                    special,
+                    Attributes {
+                        permissions: 0o6640,
+                        uid: 1000,
+                        gid: 6,
+                        umask: 0,
+                    },
+                    when,
+                )
+                .await
+                .unwrap();
+            let metadata = tx.metadata(&node).await.unwrap();
+            assert_eq!(metadata.kind, kind, "{prefix}-{name}");
+            assert_eq!(metadata.rdev, device, "{prefix}-{name}");
+            assert_eq!(metadata.permissions, 0o6640, "{prefix}-{name}");
+            assert_eq!((metadata.uid, metadata.gid), (1000, 6), "{prefix}-{name}");
+            assert_eq!((metadata.size, metadata.nbytes), (0, 0), "{prefix}-{name}");
+        }
+    }
+    tx.commit().await.unwrap();
+
+    // Unrelated changes leave the nodes as they were made, and a removal
+    // takes one away.
+    let mut tx = writer.join().await.unwrap();
+    let root = tx.root().await.unwrap();
+    for name in CJK_NAMES {
+        let chr = tx.lookup(&root, format!("chr-{name}").as_bytes()).await;
+        let chr = chr.unwrap().unwrap();
+        tx.set_owner(&chr, Some(0), Some(0), when).await.unwrap();
+        // chown drops the set-id bits of a non-directory.
+        assert_eq!(tx.metadata(&chr).await.unwrap().permissions, 0o640);
+        assert_eq!(tx.metadata(&chr).await.unwrap().rdev, null);
+        tx.unlink_name(
+            Name {
+                parent: &root,
+                bytes: format!("sock-{name}").as_bytes(),
+            },
+            when,
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let view = writer.snapshot().unwrap();
+    for name in CJK_NAMES {
+        for (prefix, _, kind, device) in kinds {
+            let path = format!("/{prefix}-{name}");
+            let resolved = view.resolve(path.as_bytes()).await;
+            if prefix == "sock" {
+                assert!(resolved.is_err(), "{path}");
+                continue;
+            }
+            let metadata = *resolved.unwrap().metadata();
+            assert_eq!((metadata.kind, metadata.rdev), (kind, device), "{path}");
+        }
+    }
+    drop((view, writer));
+    verify(named.path());
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn device_numbers_encode_as_linux_encodes_them() {
+    use crate::DeviceNumber;
+    // `new_encode_dev` and `MKDEV` in include/linux/kdev_t.h.
+    for (major, minor, encoded, inode) in [
+        (1, 3, 0x103, (1 << 20) | 3),
+        (8, 0, 0x800, 8 << 20),
+        (259, 0x1_2345, 0x1231_0345, (259 << 20) | 0x1_2345),
+        (4095, 0xf_ffff, 0xffff_ffff, u32::MAX),
+    ] {
+        let number = DeviceNumber::new(major, minor).unwrap();
+        assert_eq!(number.encode(), encoded, "{major}:{minor}");
+        assert_eq!(DeviceNumber::decode(encoded), number, "{major}:{minor}");
+        assert_eq!(number.inode_item(), u64::from(inode), "{major}:{minor}");
+        assert_eq!(DeviceNumber::from_inode_item(u64::from(inode)), number);
+    }
+}
+
+#[cfg(feature = "write")]
 fn stamp_of(seconds: i64) -> crate::Timestamp {
     crate::Timestamp {
         seconds,
         nanoseconds: 0,
     }
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn write_after_metadata_flush_reclaims_unused_data_group_still_allocates_data() {
+    use super::writer::{Attributes, Name};
+    use crate::space::DATA;
+    use crate::transaction::file::DEFAULT_MAX_INLINE;
+    use crate::transaction::reflink::FileId;
+    use ferrosys::btrfs::Profile;
+
+    block_on(async {
+        let (_, image) = profile_image(Profile::Dup, Profile::Single);
+        let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        let when = stamp_of(1_700_000_000);
+        let attrs = Attributes {
+            permissions: 0o644,
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+
+        // Fill the mkfs data group completely so no bytes remain in it.
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let anchor = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "锚-アンカー-앵커".as_bytes(),
+                },
+                attrs,
+                when,
+            )
+            .await
+            .unwrap();
+        let initial_free = tx.edits().data_budget() as usize;
+        assert!(initial_free > 0);
+        let filler = vec![0x3c; initial_free];
+        assert_eq!(
+            tx.write_file(&anchor, 0, &filler, when).await.unwrap(),
+            initial_free
+        );
+        tx.commit().await.unwrap();
+
+        // Publish an empty second data group: the next commit will delete it
+        // via remove_unused_groups, shrinking data_budget back to zero.
+        let mut tx = writer.join().await.unwrap();
+        assert_eq!(tx.edits().data_budget(), 0);
+        tx.edits().allocate_chunk(DATA).await.unwrap();
+        tx.commit().await.unwrap();
+
+        // Start a transaction with the target file holding a 1-byte inline
+        // extent so a 4 MiB write at offset 4096 requires more metadata units
+        // than Units::CREATE, ensuring the write triggers the metadata flush.
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let target = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "重分配-再割当-재할당".as_bytes(),
+                },
+                attrs,
+                when,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx.write_file(&target, 0, b"x", when).await.unwrap(), 1);
+
+        let payload = vec![0x5a; 4 << 20];
+        let start_gen = tx.edits().trees.generation();
+        assert!(tx.edits().data_budget() >= payload.len() as u64);
+
+        let target_id = FileId {
+            tree: target.tree(),
+            inode: target.number(),
+        };
+        let mut index = 0usize;
+        loop {
+            let units = tx
+                .edits()
+                .write_units(target_id, 4096, payload.len() as u64, DEFAULT_MAX_INLINE)
+                .await
+                .unwrap();
+            if !tx.edits().reserves(units) {
+                break;
+            }
+            let name = std::format!("f-{index}");
+            tx.create_file(
+                Name {
+                    parent: &root,
+                    bytes: name.as_bytes(),
+                },
+                attrs,
+                when,
+            )
+            .await
+            .unwrap();
+            index += 1;
+            assert!(
+                tx.edits().trees.generation() == start_gen,
+                "setup create_file must not flush before write_file does"
+            );
+        }
+        assert!(tx.edits().data_budget() >= payload.len() as u64);
+
+        // write_file must survive the metadata-flush commit deleting the empty
+        // data group by re-reserving data space on the restarted transaction.
+        let written = tx.write_file(&target, 4096, &payload, when).await.unwrap();
+        assert_eq!(written, payload.len());
+        assert!(
+            tx.edits().trees.generation() > start_gen,
+            "write_file must have triggered the metadata-flush commit"
+        );
+        tx.commit().await.unwrap();
+
+        let fresh = Filesystem::mount(Disk(image)).await.unwrap();
+        let read_target = fresh
+            .resolve("/重分配-再割当-재할당".as_bytes())
+            .await
+            .unwrap();
+        let mut out = vec![0u8; payload.len()];
+        assert_eq!(
+            fresh.read(&read_target, 4096, &mut out).await.unwrap(),
+            out.len()
+        );
+        assert_eq!(out, payload);
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn large_extent_checksum_items_stay_within_linux_max_csum_items() {
+    use super::writer::{Attributes, Name};
+    use crate::checksums::max_csum_items;
+    use crate::ondisk::{item_type, objectid};
+    use crate::tree::Cursor;
+    use ferrosys::btrfs::Profile;
+
+    block_on(async {
+        // 512 MiB Single-data image allocates a ~51 MiB data chunk so a 20 MiB
+        // uncompressed write forms one contiguous extent (> 4057 sectors).
+        let timestamp = Timestamp::from_secs(1_700_000_000);
+        let mut options = FormatOptions::new([0x53; 16], timestamp);
+        options.chunk_tree_uuid = [0x71; 16];
+        options.device_uuid = [0x29; 16];
+        options.plan.metadata_profile = Profile::Dup;
+        options.plan.data_profile = Profile::Single;
+        let mut image = tempfile::tempfile().unwrap();
+        let disk_size = 512 << 20;
+        image.set_len(disk_size).unwrap();
+        format_to(
+            &mut image,
+            TreeBuilder::new().root(Metadata::new(0o755, timestamp)),
+            disk_size,
+            options,
+        )
+        .unwrap();
+
+        let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        let when = stamp_of(1_700_000_000);
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let file = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "校验-チェックサム-체크섬".as_bytes(),
+                },
+                Attributes {
+                    permissions: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    umask: 0,
+                },
+                when,
+            )
+            .await
+            .unwrap();
+        let payload = vec![0xa5; 20 << 20];
+        assert_eq!(
+            tx.write_file(&file, 0, &payload, when).await.unwrap(),
+            payload.len()
+        );
+        tx.commit().await.unwrap();
+
+        let fresh = Filesystem::mount(Disk(image)).await.unwrap();
+        let superblock = fresh.superblock();
+        let limit = max_csum_items(superblock);
+        let digest = superblock.csum_type().size();
+        let mut max_seen = 0usize;
+        let mut total_sectors = 0usize;
+        let mut cursor = Cursor::ceiling(
+            &fresh.volume,
+            fresh.snapshot.csum_tree,
+            Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, 0),
+        )
+        .await
+        .unwrap();
+        while let Some(key) = cursor.key() {
+            if !key.is(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM) {
+                break;
+            }
+            let bytes = cursor.item().unwrap();
+            assert_eq!(bytes.len() % digest, 0);
+            let entries = bytes.len() / digest;
+            assert!(
+                entries <= limit,
+                "EXTENT_CSUM item at {} has {entries} entries, exceeding Linux __MAX_CSUM_ITEMS ({limit})",
+                key.offset
+            );
+            max_seen = max_seen.max(entries);
+            total_sectors += entries;
+            cursor.advance(&fresh.volume).await.unwrap();
+        }
+        assert_eq!(
+            max_seen, limit,
+            "20 MiB extent must split at Linux __MAX_CSUM_ITEMS"
+        );
+        assert!(total_sectors >= payload.len() / superblock.sectorsize() as usize);
+
+        let read_file = fresh
+            .resolve("/校验-チェックサム-체크섬".as_bytes())
+            .await
+            .unwrap();
+        let mut out = vec![0u8; payload.len()];
+        assert_eq!(
+            fresh.read(&read_file, 0, &mut out).await.unwrap(),
+            out.len()
+        );
+        assert_eq!(out, payload);
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn parent_resolves_directories_subvolumes_and_renamed_parents() {
+    use ferrosys::btrfs::SubvolumeRequest;
+
+    block_on(async {
+        let timestamp = Timestamp::from_secs(1_700_000_000);
+        let dir_meta = Metadata::new(0o755, timestamp);
+        let tree = TreeBuilder::new()
+            .root(dir_meta)
+            .directory("/sub", dir_meta);
+        let options = FormatOptions::new([0x53; 16], timestamp)
+            .subvolume(SubvolumeRequest::new(b"/sub".to_vec(), [0x51; 16]));
+        let (_, image) = filesystem_image_options(tree, tempfile::tempfile().unwrap(), options);
+        let mut writer = mount_writer(Disk(image)).await.unwrap();
+        let when = stamp_of(1_700_000_010);
+        let attrs = super::writer::Attributes {
+            permissions: 0o755,
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+
+        let (top_id, child_id, file_id) = {
+            let mut tx = writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let top = tx
+                .create_directory(
+                    super::writer::Name {
+                        parent: &root,
+                        bytes: b"top",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            let other = tx
+                .create_directory(
+                    super::writer::Name {
+                        parent: &root,
+                        bytes: b"other",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            let child = tx
+                .create_directory(
+                    super::writer::Name {
+                        parent: &top,
+                        bytes: b"child",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            let file = tx
+                .create_file(
+                    super::writer::Name {
+                        parent: &child,
+                        bytes: b"leaf",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            // Move `child` under `other` to verify `parent()` tracks renames.
+            tx.rename(
+                super::writer::Name {
+                    parent: &top,
+                    bytes: b"child",
+                },
+                super::writer::Name {
+                    parent: &other,
+                    bytes: b"moved",
+                },
+                RenameMode::Replace,
+                when,
+            )
+            .await
+            .unwrap();
+            let ids = (
+                (other.tree(), other.number()),
+                (child.tree(), child.number()),
+                (file.tree(), file.number()),
+            );
+            tx.commit().await.unwrap();
+            ids
+        };
+
+        let snapshot = writer.snapshot().unwrap();
+        let root = snapshot.root().await.unwrap();
+        assert!(snapshot.parent(&root).await.unwrap().is_none());
+
+        let child = snapshot.inode(child_id.0, child_id.1).await.unwrap();
+        let parent = snapshot.parent(&child).await.unwrap().unwrap();
+        assert_eq!((parent.tree(), parent.number()), top_id);
+        let grandparent = snapshot.parent(&parent).await.unwrap().unwrap();
+        assert_eq!(
+            (grandparent.tree(), grandparent.number()),
+            (root.tree(), root.number())
+        );
+
+        let sub = snapshot.lookup(&root, b"sub").await.unwrap().unwrap();
+        let sub_parent = snapshot.parent(&sub).await.unwrap().unwrap();
+        assert_eq!(
+            (sub_parent.tree(), sub_parent.number()),
+            (root.tree(), root.number())
+        );
+
+        let file = snapshot.inode(file_id.0, file_id.1).await.unwrap();
+        assert!(matches!(
+            snapshot.parent(&file).await,
+            Err(crate::Error::WrongKind {
+                expected: crate::FileKind::Directory,
+                found: crate::FileKind::Regular,
+                ..
+            })
+        ));
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn transaction_inode_reloads_handle_by_identity_after_remount() {
+    block_on(async {
+        let (_, image) = filesystem_image();
+        let backing = image.try_clone().unwrap();
+        let when = stamp_of(1_700_000_020);
+        let attrs = super::writer::Attributes {
+            permissions: 0o644,
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+        let (tree, number) = {
+            let mut writer = mount_writer(Disk(image)).await.unwrap();
+            let mut tx = writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let file = tx
+                .create_file(
+                    super::writer::Name {
+                        parent: &root,
+                        bytes: b"persisted",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            let id = (file.tree(), file.number());
+            tx.commit().await.unwrap();
+            id
+        };
+
+        let mut reopened = mount_writer(Disk(backing)).await.unwrap();
+        let mut tx = reopened.join().await.unwrap();
+        assert!(
+            tx.inode(crate::ondisk::objectid::EXTENT_TREE, number)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(tx.inode(tree, number + 100).await.unwrap().is_none());
+        let handle = tx.inode(tree, number).await.unwrap().unwrap();
+        tx.write_file(&handle, 0, b"reopened", when).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let snapshot = reopened.snapshot().unwrap();
+        let inode = snapshot.inode(tree, number).await.unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(snapshot.read(&inode, 0, &mut buf).await.unwrap(), 8);
+        assert_eq!(&buf, b"reopened");
+    });
 }

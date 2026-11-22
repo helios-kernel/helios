@@ -31,15 +31,16 @@ use bytes::Bytes;
 use helios_hal::cpu::{Cpu, HardwarePerfCounterDelta, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
-    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DestinationPortHashes,
-    DhcpAction, DhcpClient, DhcpDestination, DhcpDnsServers, DhcpLease, DhcpPacket, DhcpTransmit,
-    DnsQuery, DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame, EthernetProtocol,
-    FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark,
-    IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address,
-    Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache,
-    NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable,
-    RxChecksumOffload, RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError,
-    StackEvent, StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_MAX_CNAME_CHAIN, DNS_PORT,
+    DestinationPortHashes, DhcpAction, DhcpClient, DhcpDestination, DhcpDnsServers, DhcpLease,
+    DhcpPacket, DhcpTransmit, DnsHttpsOutcome, DnsQuery, DnsQuestionWriter, DnsRecordType,
+    DnsResponse, DnsWireName, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
+    IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
+    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
+    IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
+    NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
+    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
+    StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
     TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
     UdpSocketBinding, UdpSocketError, flow_hash, next_transaction_id,
@@ -48,7 +49,7 @@ use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
 use crate::SocketReadiness;
 use crate::{
-    ComponentNetworkService, DnsError, DnsErrorKind, Ipv4Address as KernelIpv4Address,
+    ComponentNetworkService, DnsError, DnsErrorKind, HttpsRecord, Ipv4Address as KernelIpv4Address,
     Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MacAddress, NetworkAdminBackend,
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
     PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
@@ -534,6 +535,25 @@ impl NetworkControlPlane {
             .copied()
             .map(map_ipv4_cidr)
             .collect()
+    }
+
+    fn owns_ip_address(&self, address: NetworkIpAddress) -> bool {
+        match address {
+            NetworkIpAddress::Ipv4(address) => {
+                let target = map_kernel_ipv4_address(address);
+                self.ipv4_addresses
+                    .load_full()
+                    .entries
+                    .iter()
+                    .any(|cidr| cidr.address() == target)
+            }
+            NetworkIpAddress::Ipv6(address) => self
+                .ipv6_addresses
+                .load_full()
+                .entries
+                .iter()
+                .any(|entry| entry.cidr().address() == address),
+        }
     }
 }
 
@@ -1552,6 +1572,11 @@ where
         self.inner.device.mac_address()
     }
 
+    /// Whether the stack currently owns `address` as a configured local address.
+    pub fn owns_ip_address(&self, address: NetworkIpAddress) -> bool {
+        self.inner.control.owns_ip_address(address)
+    }
+
     pub async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
         self.inner.control.list_ipv4_addresses().into_iter().next()
     }
@@ -1892,6 +1917,47 @@ pub(crate) mod fixture {
             segments
         }
     }
+
+    impl<C, I> NetworkService<C, I>
+    where
+        C: Cpu + Clone,
+        I: helios_netstack::NetworkInterface,
+    {
+        /// Installs static test IPv4/IPv6 interface addresses and an optional
+        /// reachable neighbor entry, then publishes and syncs them across shards.
+        pub(crate) fn configure_test_addresses(
+            &self,
+            ipv4: &[helios_netstack::Ipv4Cidr],
+            ipv6: &[helios_netstack::Ipv6Cidr],
+            neighbor: Option<(helios_netstack::IpAddress, [u8; 6])>,
+        ) {
+            {
+                let mut shard = self.inner.state.shard_at(DEFAULT_SHARD_IDX).lock();
+                for &cidr in ipv4 {
+                    shard
+                        .stack
+                        .add_ipv4_address(cidr)
+                        .expect("test IPv4 address should be accepted");
+                }
+                for &cidr in ipv6 {
+                    shard
+                        .stack
+                        .add_ipv6_address(cidr)
+                        .expect("test IPv6 address should be accepted");
+                }
+                if let Some((ip, mac)) = neighbor {
+                    shard.stack.learn_neighbor(helios_netstack::NeighborEntry {
+                        ip,
+                        mac,
+                        state: helios_netstack::NeighborState::Reachable,
+                        updated_at: StackInstant::from_nanos(0),
+                    });
+                }
+                self.inner.control.publish_from_shard(&shard);
+            }
+            self.synchronize_control_plane();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2182,7 +2248,11 @@ mod tests {
     /// for the whole set.
     fn bind_udp(shard: &mut NetworkShard, slot: usize, local_port: u16) -> UdpSocketId {
         shard
-            .install_udp_bind(slot, local_port)
+            .install_udp_bind(
+                slot,
+                NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                local_port,
+            )
             .expect("test UDP socket should bind");
         UdpSocketId(ReplicaHandle::new(slot).get())
     }
@@ -3513,7 +3583,11 @@ mod tests {
                         .stack
                         .add_ipv4_address(Ipv4Cidr::new(local, 24))
                         .expect("test address should be accepted");
-                    shard.install_udp_bind(slot, 49_153)
+                    shard.install_udp_bind(
+                        slot,
+                        NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+                        49_153,
+                    )
                 },
                 NetworkShard::remove_udp_replica,
             )
@@ -6479,7 +6553,11 @@ mod tests {
                         state: NeighborState::Reachable,
                         updated_at: StackInstant::from_nanos(0),
                     });
-                    shard.install_udp_bind(slot, 49_153)
+                    shard.install_udp_bind(
+                        slot,
+                        NetworkIpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+                        49_153,
+                    )
                 },
                 NetworkShard::remove_udp_replica,
             )
@@ -7084,6 +7162,317 @@ mod tests {
                 sorted.sort_unstable();
                 assert_eq!(sorted, (0..pair_count).collect::<Vec<_>>());
             }
+        }
+    }
+
+    fn configure_ipv4_dns_service() -> (
+        super::NetworkService<TestCpu, RecordingNetworkInterface>,
+        RecordingNetworkInterface,
+        Ipv4Address,
+        Ipv4Address,
+    ) {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let resolver = Ipv4Address::new([192, 0, 2, 53]);
+        let device = RecordingNetworkInterface::accepting_transmissions(1);
+        let service = test_network_service_on(device.clone());
+        service.inner.state.with_mut(|shard| {
+            shard
+                .stack
+                .add_ipv4_address(Ipv4Cidr::new(local, 24))
+                .expect("test IPv4 configuration should succeed");
+            let _ = shard.dns_servers.try_push(resolver);
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv4(resolver),
+                mac: [0x02, 0, 0, 0, 0, 53],
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            service.inner.control.publish_from_shard(shard);
+        });
+        service.synchronize_control_plane();
+        (service, device, local, resolver)
+    }
+
+    fn decode_transmitted_udp_dns(frame: &[u8]) -> Option<(u16, u16, &[u8])> {
+        let ethernet = EthernetFrame::parse(frame)?;
+        if ethernet.protocol != EthernetProtocol::Ipv4 {
+            return None;
+        }
+        let ipv4 = Ipv4Packet::parse(ethernet.payload)?;
+        if ipv4.protocol != IpProtocol::Udp {
+            return None;
+        }
+        let udp = UdpPacket::parse(ipv4.payload)?;
+        if udp.destination_port != super::DNS_PORT || udp.payload.len() < 12 {
+            return None;
+        }
+        let id = u16::from_be_bytes([udp.payload[0], udp.payload[1]]);
+        Some((udp.source_port, id, udp.payload))
+    }
+
+    fn encode_https_reply_payload(
+        query_id: u16,
+        qname: &str,
+        flags: u16,
+        records: &[(&str, u16, u32, Vec<u8>)],
+    ) -> Vec<u8> {
+        let push_labels = |out: &mut Vec<u8>, domain: &str| {
+            if domain == "." {
+                out.push(0);
+                return;
+            }
+            for label in domain.split('.') {
+                out.push(label.len() as u8);
+                out.extend_from_slice(label.as_bytes());
+            }
+            out.push(0);
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&query_id.to_be_bytes());
+        out.extend_from_slice(&flags.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&(records.len() as u16).to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        push_labels(&mut out, qname);
+        out.extend_from_slice(&65u16.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        for (owner, rtype, ttl, rdata) in records {
+            push_labels(&mut out, owner);
+            out.extend_from_slice(&rtype.to_be_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&ttl.to_be_bytes());
+            out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            out.extend_from_slice(rdata);
+        }
+        out
+    }
+
+    #[test]
+    fn dns_resolve_https_short_circuits_ip_literals_and_rejects_malformed_names() {
+        let service = test_network_service();
+        assert_eq!(
+            block_on(service.dns_resolve_https("192.0.2.1", 443, SECOND)).expect("IPv4 literal"),
+            None
+        );
+        assert_eq!(
+            block_on(service.dns_resolve_https("2001:db8::1", 443, SECOND)).expect("IPv6 literal"),
+            None
+        );
+        assert_eq!(
+            block_on(service.dns_resolve_https("[2001:db8::1]", 8443, SECOND))
+                .expect("bracketed IPv6 literal"),
+            None
+        );
+        let err = block_on(service.dns_resolve_https("", 443, SECOND))
+            .expect_err("empty hostname must fail query construction");
+        assert_eq!(err.kind, crate::DnsErrorKind::UnresolvedHost);
+    }
+
+    #[test]
+    fn dns_resolve_https_queries_prefixed_qname_chases_alias_and_handles_rcodes() {
+        let (service, device, local, resolver) = configure_ipv4_dns_service();
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        // 1. Non-443 port sends `_8443._https.example.com` Type 65 and decodes ServiceMode.
+        {
+            let mut fut = core::pin::pin!(service.dns_resolve_https("example.com", 8443, SECOND));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (client_port, query_id, dns_wire) = tx
+                .iter()
+                .rev()
+                .find_map(|frame| decode_transmitted_udp_dns(frame))
+                .expect("expected outbound UDP DNS query");
+            let expected_qname =
+                super::DnsWireName::https_qname("example.com", 8443).expect("valid qname");
+            assert_eq!(
+                &dns_wire[12..12 + expected_qname.as_wire().len()],
+                expected_qname.as_wire()
+            );
+
+            // ServiceMode: priority 1, target `.`, alpn=["h3"], port=8443, TTL 120s.
+            let rdata = alloc::vec![
+                0, 1, 0, // priority=1, target="."
+                0, 1, 0, 3, 2, b'h', b'3', // alpn=["h3"]
+                0, 3, 0, 2, 0x20, 0xfb, // port=8443
+            ];
+            let reply = encode_https_reply_payload(
+                query_id,
+                "_8443._https.example.com",
+                0x8180,
+                &[("_8443._https.example.com", 65, 120, rdata)],
+            );
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let core::task::Poll::Ready(Ok(Some(record))) = fut.as_mut().poll(&mut cx) else {
+                panic!("expected Ready(Ok(Some(HttpsRecord)))");
+            };
+            assert_eq!(record.alpn, alloc::vec![alloc::string::String::from("h3")]);
+            assert_eq!(record.port, Some(8443));
+            assert_eq!(record.ttl_nanos, 120 * SECOND);
+        }
+
+        // 2. External AliasMode hop re-queries target and clamps TTL to minimum across hops.
+        {
+            let before = device.transmitted_frames().len();
+            let mut fut = core::pin::pin!(service.dns_resolve_https("alias.test", 443, SECOND));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (client_port, first_id, _) = decode_transmitted_udp_dns(&tx[before])
+                .expect("expected first AliasMode hop query");
+
+            let mut alias_rdata = alloc::vec![0, 0];
+            alias_rdata.extend_from_slice(
+                super::DnsWireName::from_host("real.test")
+                    .expect("valid host")
+                    .as_wire(),
+            );
+            let first_reply = encode_https_reply_payload(
+                first_id,
+                "alias.test",
+                0x8180,
+                &[("alias.test", 65, 45, alias_rdata)],
+            );
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &first_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let before_second = device.transmitted_frames().len();
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (_, second_id, second_wire) = decode_transmitted_udp_dns(&tx[before_second])
+                .expect("expected follow-up query for real.test");
+            let real_wire = super::DnsWireName::from_host("real.test").unwrap();
+            assert_eq!(
+                &second_wire[12..12 + real_wire.as_wire().len()],
+                real_wire.as_wire()
+            );
+
+            let service_rdata = alloc::vec![0, 1, 0, 0, 1, 0, 3, 2, b'h', b'3'];
+            let second_reply = encode_https_reply_payload(
+                second_id,
+                "real.test",
+                0x8180,
+                &[("real.test", 65, 300, service_rdata)],
+            );
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &second_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let core::task::Poll::Ready(Ok(Some(record))) = fut.as_mut().poll(&mut cx) else {
+                panic!("expected Ready(Ok(Some(HttpsRecord))) after AliasMode hop");
+            };
+            assert_eq!(record.alpn, alloc::vec![alloc::string::String::from("h3")]);
+            assert_eq!(record.ttl_nanos, 45 * SECOND);
+        }
+
+        // 3. NXDOMAIN -> Ok(None), SERVFAIL -> Err(DnsError).
+        for (rcode_flags, expect_none) in [(0x8183u16, true), (0x8182u16, false)] {
+            let before = device.transmitted_frames().len();
+            let mut fut = core::pin::pin!(service.dns_resolve_https("missing.test", 443, SECOND));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (client_port, query_id, _) =
+                decode_transmitted_udp_dns(&tx[before]).expect("expected query");
+            let reply = encode_https_reply_payload(query_id, "missing.test", rcode_flags, &[]);
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let core::task::Poll::Ready(outcome) = fut.as_mut().poll(&mut cx) else {
+                panic!("expected Ready after DNS response");
+            };
+            if expect_none {
+                assert_eq!(outcome.expect("NXDOMAIN must return Ok(None)"), None);
+            } else {
+                let err = outcome.expect_err("SERVFAIL must surface a DnsError");
+                assert_eq!(err.detail, crate::NetworkErrorDetail::DnsLookupFailed);
+            }
+        }
+    }
+
+    #[test]
+    fn dns_resolve_https_enforces_combined_cross_packet_and_in_packet_hop_budget() {
+        let (service, device, local, resolver) = configure_ipv4_dns_service();
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        // 1 external AliasMode hop + `DNS_MAX_CNAME_CHAIN` in-packet CNAME hops
+        // totals `DNS_MAX_CNAME_CHAIN + 1` hops and must resolve to `Ok(None)`.
+        for (in_packet_cnames, expect_some) in [
+            (super::DNS_MAX_CNAME_CHAIN, false),
+            (super::DNS_MAX_CNAME_CHAIN - 1, true),
+        ] {
+            let before = device.transmitted_frames().len();
+            let mut fut = core::pin::pin!(service.dns_resolve_https("start.test", 443, SECOND));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (client_port, first_id, _) = tx[before..]
+                .iter()
+                .rev()
+                .find_map(|frame| decode_transmitted_udp_dns(frame))
+                .expect("expected initial query");
+
+            let mut alias_rdata = alloc::vec![0, 0];
+            alias_rdata.extend_from_slice(
+                super::DnsWireName::from_host("hop1.test")
+                    .expect("valid host")
+                    .as_wire(),
+            );
+            let first_reply = encode_https_reply_payload(
+                first_id,
+                "start.test",
+                0x8180,
+                &[("start.test", 65, 120, alias_rdata)],
+            );
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &first_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let before_second = device.transmitted_frames().len();
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (_, second_id, _) = tx[before_second..]
+                .iter()
+                .rev()
+                .find_map(|frame| decode_transmitted_udp_dns(frame))
+                .expect("expected follow-up query");
+
+            let names: alloc::vec::Vec<alloc::string::String> = (1..=in_packet_cnames + 1)
+                .map(|idx| alloc::format!("hop{idx}.test"))
+                .collect();
+            let mut records = alloc::vec::Vec::new();
+            for pair in names.windows(2) {
+                records.push((
+                    pair[0].as_str(),
+                    5u16,
+                    120u32,
+                    super::DnsWireName::from_host(&pair[1])
+                        .expect("valid host")
+                        .as_wire()
+                        .to_vec(),
+                ));
+            }
+            records.push((
+                names[in_packet_cnames].as_str(),
+                65u16,
+                120u32,
+                alloc::vec![0, 1, 0, 0, 1, 0, 3, 2, b'h', b'3'],
+            ));
+            let second_reply = encode_https_reply_payload(second_id, "hop1.test", 0x8180, &records);
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &second_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let core::task::Poll::Ready(outcome) = fut.as_mut().poll(&mut cx) else {
+                panic!("expected Ready after second DNS response");
+            };
+            let record = outcome.expect("chain budget check must not fail with DnsError");
+            assert_eq!(record.is_some(), expect_some);
         }
     }
 }

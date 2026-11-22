@@ -687,10 +687,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    // The sender whose room this call was last woken for: a call that
-    // then queues nothing passes its turn on.
     let fence = completion.as_ref().map(|completion| completion.fence);
-    let mut woken: Option<Gpu3dSender> = None;
     loop {
         let step = accessor.with(|mut access| -> wasmtime::Result<SubmitStep> {
             let data = access.get();
@@ -755,16 +752,8 @@ where
                     .unwrap_or(Err(Gpu3dServiceError::SessionEnded))
                     .map_err(to_wit_error));
             }
-            SubmitStep::Full(sender) => {
-                sender.submit_room().await;
-                woken = Some(sender);
-            }
-            SubmitStep::Refused(error) => {
-                if let Some(sender) = woken {
-                    sender.pass_submit_room();
-                }
-                return Ok(Err(error));
-            }
+            SubmitStep::Full(sender) => sender.submit_room().await,
+            SubmitStep::Refused(error) => return Ok(Err(error)),
         }
     }
 }

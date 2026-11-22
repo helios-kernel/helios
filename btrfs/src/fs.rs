@@ -11,9 +11,12 @@ use core::ops::ControlFlow;
 
 use crate::chunk::ChunkMap;
 use crate::csum::name_hash;
+#[cfg(feature = "write")]
+use crate::delalloc::Delalloc;
 use crate::error::{Error, FileKind, ItemDefect};
 use crate::items::{
     DirRecord, EntryTarget, Metadata, RecordKind, RootRecord, dir_index_record, dir_records,
+    root_backref_dirid,
 };
 use crate::key::Key;
 use crate::ondisk::{NAME_MAX, SYMLINK_MAX, item_type, objectid};
@@ -77,6 +80,8 @@ pub(crate) struct Running {
     /// The private data extents this view reaches. The writer keeps them
     /// from reuse while the view lives.
     data: rpds::RedBlackTreeMapSync<u64, u64>,
+    /// The dirty file data not yet written back, which reads see first.
+    dirty: Delalloc,
     /// The generation the transaction started from: blocks it retired stay
     /// pinned while this view can still read them.
     base: Arc<Snapshot>,
@@ -89,6 +94,7 @@ impl core::fmt::Debug for Running {
             .debug_struct("Running")
             .field("base", &self.base.mapping.superblock.generation())
             .field("private_data_extents", &self.data.size())
+            .field("dirty_bytes", &self.dirty.bytes())
             .finish_non_exhaustive()
     }
 }
@@ -134,6 +140,7 @@ impl Snapshot {
         checksums: TreeRoot,
         trees: &crate::tree::write::Trees,
         data: rpds::RedBlackTreeMapSync<u64, u64>,
+        dirty: &Delalloc,
     ) -> Result<Arc<Self>, crate::tree::write::WriteError> {
         Ok(Arc::new(Self {
             mapping,
@@ -147,6 +154,7 @@ impl Snapshot {
                 trees: trees.clone(),
                 roots: roots.clone(),
                 data,
+                dirty: dirty.clone(),
                 base: base.clone(),
             }),
         }))
@@ -207,7 +215,7 @@ impl<S: BlockSource> crate::tree::NodeSource for Nodes<'_, S> {
 }
 
 /// How a file extent item stores its range.
-#[cfg(feature = "test-support")]
+#[cfg(any(all(test, feature = "write"), feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtentKind {
     /// The bytes are in the item itself.
@@ -220,7 +228,7 @@ pub enum ExtentKind {
 
 /// One file extent item, as returned by [`Filesystem::file_extents`]: a test
 /// inspection API.
-#[cfg(feature = "test-support")]
+#[cfg(any(all(test, feature = "write"), feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExtentInfo {
     /// File offset of the range the item covers.
@@ -230,6 +238,9 @@ pub struct ExtentInfo {
     pub kind: ExtentKind,
     /// The item's compression type; `None` for stored plain.
     pub compression: Option<crate::Compression>,
+    /// The bytes the range occupies as stored: an inline item's data, or a
+    /// regular or preallocated extent's `disk_num_bytes` (zero for a hole).
+    pub stored: u64,
 }
 
 /// An inode, as of the commit it was read from.
@@ -282,6 +293,34 @@ impl DirPosition {
     pub const START: Self = Self(0);
 }
 
+/// An upper `DIR_INDEX` bound for a directory listing.
+///
+/// Capturing the directory's highest `DIR_INDEX` when opening a stream via
+/// [`Filesystem::dir_bound`] follows Linux's `btrfs_opendir` and
+/// `btrfs_real_readdir` (`fs/btrfs/inode.c`, commit `9b378f6ad48c`): entries
+/// inserted or renamed to higher indices while the stream is open are skipped
+/// so iteration always terminates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirBound(Option<DirPosition>);
+
+impl DirBound {
+    /// No entries existed when the stream opened; listings yield nothing.
+    pub const EMPTY: Self = Self(None);
+
+    /// Lists every entry present in the view, without an upper bound.
+    pub const UNBOUNDED: Self = Self(Some(DirPosition(u64::MAX)));
+
+    /// Bounds a listing at `position`, inclusive.
+    pub const fn at(position: DirPosition) -> Self {
+        Self(Some(position))
+    }
+
+    /// The inclusive upper position, or `None` for [`DirBound::EMPTY`].
+    pub const fn position(self) -> Option<DirPosition> {
+        self.0
+    }
+}
+
 /// One entry of a directory listing. `.` and `..` are not stored by the
 /// format and are not listed.
 #[derive(Clone, Copy, Debug)]
@@ -300,10 +339,27 @@ impl<S: BlockSource> Filesystem<S> {
     /// does not implement, reads the chunk tree through the bootstrap
     /// chunks the superblock carries and checks the two agree, and finds
     /// the checksum tree and the default subvolume.
+    ///
+    /// A filesystem whose fsynced state is still in a log tree is refused
+    /// with [`Error::LogReplayRequired`]: its committed trees do not hold
+    /// that state, and only a writable mount replays the log.
     pub async fn mount(source: S) -> Result<Self, Error> {
         let selected = superblock::select(&source).await?;
+        selected.superblock.check_supported()?;
+        Self::open(source, selected).await
+    }
+
+    /// Mounts the last committed generation of `source`, whether or not a log
+    /// tree is pending behind it: what a writable mount replays the log into.
+    #[cfg(feature = "write")]
+    pub(crate) async fn mount_committed(source: S) -> Result<Self, Error> {
+        let selected = superblock::select(&source).await?;
+        selected.superblock.check_features()?;
+        Self::open(source, selected).await
+    }
+
+    async fn open(source: S, selected: superblock::SelectedSuperblock) -> Result<Self, Error> {
         let superblock = selected.superblock;
-        superblock.check_supported()?;
         let bootstrap = ChunkMap::from_sys_chunk_array(&superblock, &selected.bytes)?;
         let chunk_root = superblock.chunk_tree();
         let root_tree = TreeRoot {
@@ -372,10 +428,7 @@ impl<S: BlockSource> Filesystem<S> {
             Cursor::ceiling(&nodes, self.snapshot.root_tree, Key::new(0, 0, 0)).await?;
         let mut previous: Option<(u64, u64)> = None;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
-            if key.item_type == item_type::ROOT_ITEM
-                && (key.objectid == objectid::FS_TREE
-                    || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&key.objectid))
-            {
+            if key.item_type == item_type::ROOT_ITEM && is_subvolume(key.objectid) {
                 let record = RootRecord::parse(key, item, self.volume.superblock().sectorsize())
                     .map_err(|defect| Error::Item {
                         tree: self.snapshot.root_tree.tree,
@@ -419,9 +472,56 @@ impl<S: BlockSource> Filesystem<S> {
     /// that holds an inode's identity across views and needs its current
     /// state, such as a network or FUSE server.
     pub async fn inode(&self, tree: u64, number: u64) -> Result<Inode, Error> {
+        if !is_subvolume(tree) {
+            return Err(Error::MissingRoot { tree });
+        }
         let nodes = self.snapshot.nodes(&self.volume);
         let record = self.snapshot.find_root(&nodes, tree).await?;
         self.load_inode(record.root, number, &self.snapshot).await
+    }
+
+    /// The parent directory of `dir`, or `None` when `dir` is the mount's root
+    /// directory or has no parent reference.
+    pub async fn parent(&self, dir: &Inode) -> Result<Option<Inode>, Error> {
+        dir.expect_kind(FileKind::Directory)?;
+        let default_root = dir.snapshot.default_subvolume;
+        if dir.root.tree == default_root.root.tree && dir.number == default_root.root_dirid {
+            return Ok(None);
+        }
+        let nodes = dir.snapshot.nodes(&self.volume);
+        let key = Key::new(dir.number, item_type::INODE_REF, 0);
+        let cursor = Cursor::ceiling(&nodes, dir.root, key).await?;
+        let Some(found) = cursor
+            .key()
+            .filter(|k| k.is(dir.number, item_type::INODE_REF))
+        else {
+            return Ok(None);
+        };
+        if found.offset != dir.number {
+            return self
+                .load_inode(dir.root, found.offset, &dir.snapshot)
+                .await
+                .map(Some);
+        }
+        // A subvolume root's `INODE_REF` points to itself; its parent lives in
+        // the root tree's `ROOT_BACKREF` item.
+        let backref_key = Key::new(dir.root.tree, item_type::ROOT_BACKREF, 0);
+        let cursor = Cursor::ceiling(&nodes, dir.snapshot.root_tree, backref_key).await?;
+        let (Some(found), Some(item)) = (cursor.key(), cursor.item()) else {
+            return Ok(None);
+        };
+        if !found.is(dir.root.tree, item_type::ROOT_BACKREF) {
+            return Ok(None);
+        }
+        let parent_inode = root_backref_dirid(item).map_err(|defect| Error::Item {
+            tree: dir.snapshot.root_tree.tree,
+            key: found,
+            defect,
+        })?;
+        let record = dir.snapshot.find_root(&nodes, found.offset).await?;
+        self.load_inode(record.root, parent_inode, &dir.snapshot)
+            .await
+            .map(Some)
     }
 
     async fn load_inode(
@@ -445,11 +545,21 @@ impl<S: BlockSource> Filesystem<S> {
                 inode: number,
             });
         }
-        let metadata = Metadata::parse(item).map_err(|defect| Error::Item {
+        #[cfg_attr(
+            not(feature = "write"),
+            expect(unused_mut, reason = "only writable views hold delalloc bytes")
+        )]
+        let mut metadata = Metadata::parse(item).map_err(|defect| Error::Item {
             tree: root.tree,
             key,
             defect,
         })?;
+        #[cfg(feature = "write")]
+        if let Some(running) = &snapshot.running {
+            metadata.nbytes = metadata
+                .nbytes
+                .saturating_add(running.dirty.file_bytes(root.tree, number));
+        }
         Ok(Inode {
             snapshot: snapshot.clone(),
             root,
@@ -494,27 +604,67 @@ impl<S: BlockSource> Filesystem<S> {
         }
     }
 
-    /// Lists directory `dir` from `from`, handing each entry to `visit`.
+    /// The highest `DIR_INDEX` currently in directory `dir`, or
+    /// [`DirBound::EMPTY`] when `dir` holds no entries.
+    ///
+    /// Follows Linux's `btrfs_opendir` / `btrfs_get_dir_last_index`
+    /// (`fs/btrfs/inode.c`, commit `9b378f6ad48c`): callers opening a
+    /// directory stream capture this bound and pass it to
+    /// [`Filesystem::read_dir`] so entries inserted or renamed to higher
+    /// indices during iteration do not repeat indefinitely.
+    pub async fn dir_bound(&self, dir: &Inode) -> Result<DirBound, Error> {
+        let nodes = dir.snapshot.nodes(&self.volume);
+        dir.expect_kind(FileKind::Directory)?;
+        let cursor = Cursor::floor(
+            &nodes,
+            dir.root,
+            Key::new(dir.number, item_type::DIR_INDEX, u64::MAX),
+        )
+        .await?;
+        match cursor.key() {
+            Some(key) if key.is(dir.number, item_type::DIR_INDEX) => {
+                Ok(DirBound::at(DirPosition(key.offset)))
+            }
+            _ => Ok(DirBound::EMPTY),
+        }
+    }
+
+    /// Lists directory `dir` from `from` up to `bound` (inclusive), handing
+    /// each entry to `visit`.
+    ///
+    /// Pass the [`DirBound`] captured by [`Filesystem::dir_bound`] when the
+    /// directory stream opened so entries inserted or renamed to higher
+    /// `DIR_INDEX` offsets during iteration are not visited (`btrfs_opendir`
+    /// and `btrfs_real_readdir` in Linux `fs/btrfs/inode.c`, commit
+    /// `9b378f6ad48c`), or [`DirBound::UNBOUNDED`] for a one-shot listing of
+    /// an immutable view.
     ///
     /// `visit` returns [`ControlFlow::Continue`] to take the entry and go
     /// on, or [`ControlFlow::Break`] to stop without taking it. Returns the
     /// position to resume from when `visit` stopped the listing, `None`
-    /// once every entry has been visited.
+    /// once every entry up to `bound` has been visited.
     pub async fn read_dir<F>(
         &self,
         dir: &Inode,
         from: DirPosition,
+        bound: DirBound,
         mut visit: F,
     ) -> Result<Option<DirPosition>, Error>
     where
         F: FnMut(DirEntry<'_>) -> ControlFlow<()>,
     {
-        let nodes = dir.snapshot.nodes(&self.volume);
         dir.expect_kind(FileKind::Directory)?;
+        let Some(last) = bound.0 else {
+            return Ok(None);
+        };
+        if from > last {
+            return Ok(None);
+        }
+        let nodes = dir.snapshot.nodes(&self.volume);
         let start = Key::new(dir.number, item_type::DIR_INDEX, from.0);
         let mut cursor = Cursor::ceiling(&nodes, dir.root, start).await?;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
-            if !key.is(dir.number, item_type::DIR_INDEX) {
+            if !key.is(dir.number, item_type::DIR_INDEX) || key.offset > last.0 {
                 break;
             }
             let record = dir_index_record(item).map_err(|defect| Error::Item {
@@ -547,7 +697,7 @@ impl<S: BlockSource> Filesystem<S> {
     ///
     /// A test inspection API: it exposes the on-disk layout (extent kind and
     /// compression) that reads deliberately hide.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(all(test, feature = "write"), feature = "test-support"))]
     pub async fn file_extents(&self, file: &Inode) -> Result<Vec<ExtentInfo>, Error> {
         file.expect_kind(FileKind::Regular)?;
         let nodes = file.snapshot.nodes(&self.volume);
@@ -556,6 +706,8 @@ impl<S: BlockSource> Filesystem<S> {
                 root: file.root,
                 number: file.number,
                 metadata: &file.metadata,
+                #[cfg(feature = "write")]
+                dirty: None,
             })
             .await
     }
@@ -707,6 +859,12 @@ impl<S: BlockSource> Filesystem<S> {
                     root: inode.root,
                     number: inode.number,
                     metadata: &inode.metadata,
+                    #[cfg(feature = "write")]
+                    dirty: inode
+                        .snapshot
+                        .running
+                        .as_ref()
+                        .and_then(|running| running.dirty.file(inode.root.tree, inode.number)),
                 },
                 offset,
                 buf,
@@ -815,9 +973,7 @@ async fn default_subvolume<S: BlockSource>(
         Some(record) => record.location.objectid,
         None => objectid::FS_TREE,
     };
-    let is_subvolume =
-        tree == objectid::FS_TREE || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&tree);
-    if !is_subvolume {
+    if !is_subvolume(tree) {
         return Err(Error::Item {
             tree: objectid::ROOT_TREE,
             key,
@@ -827,7 +983,16 @@ async fn default_subvolume<S: BlockSource>(
     Ok(tree)
 }
 
+/// Whether `tree` is a subvolume tree id (`FS_TREE` or a free objectid).
+pub(crate) fn is_subvolume(tree: u64) -> bool {
+    tree == objectid::FS_TREE || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&tree)
+}
+
+#[cfg(all(test, feature = "write"))]
+mod inline_tests;
 #[cfg(all(test, feature = "write"))]
 mod rename_tests;
+#[cfg(all(test, feature = "write"))]
+mod replay_tests;
 #[cfg(all(test, feature = "write"))]
 mod write_tests;

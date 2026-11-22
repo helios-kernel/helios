@@ -1209,6 +1209,7 @@ impl NetworkShard {
         let slot = udp_sockets.insert(UdpSocketState {
             stack_socket,
             binding,
+            bound_local_address: None,
         });
         assert_eq!(
             slot, INTERNAL_DHCP_SOCKET_INDEX,

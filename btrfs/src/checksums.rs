@@ -8,9 +8,19 @@ use crate::Key;
 use crate::ondisk::{RawHeader, RawItem, item_type, objectid};
 use crate::source::BlockSource;
 use crate::space::Space;
+use crate::superblock::Superblock;
 use crate::tree::TreeRoot;
 use crate::tree::write::{Trees, WriteError};
 use crate::volume::Volume;
+
+/// Linux's `__MAX_CSUM_ITEMS` (`fs/btrfs/file-item.h`): the most checksum
+/// entries one `EXTENT_CSUM` item may hold, which `btrfs check` enforces
+/// (`check/main.c`).
+pub(crate) fn max_csum_items(superblock: &Superblock) -> usize {
+    let leaf_data = superblock.nodesize() as usize - size_of::<RawHeader>();
+    let item_space = leaf_data - 2 * size_of::<RawItem>();
+    (item_space / superblock.csum_type().size()) - 1
+}
 
 #[derive(Clone)]
 pub(crate) struct Checksums {
@@ -26,26 +36,46 @@ impl Checksums {
         trees: &mut Trees,
         space: &mut Space,
         logical: u64,
-        data: &[u8],
+        pieces: &[&[u8]],
     ) -> Result<(), WriteError> {
         let sector = volume.superblock().sectorsize() as usize;
         let algorithm = volume.superblock().csum_type();
-        let end = logical
-            .checked_add(data.len() as u64)
-            .ok_or(WriteError::Checksum { key: key(logical) })?;
-        self.remove(volume, trees, space, logical..end).await?;
-        let per_item = (volume.superblock().nodesize() as usize
-            - size_of::<RawHeader>()
-            - size_of::<RawItem>())
-            / algorithm.size();
-        for (index, chunk) in data.chunks(per_item * sector).enumerate() {
-            let mut bytes = Vec::with_capacity(chunk.len() / sector * algorithm.size());
-            for sector in chunk.chunks_exact(sector) {
-                bytes.extend_from_slice(algorithm.digest(sector).as_bytes());
+        let length: usize = pieces.iter().map(|piece| piece.len()).sum();
+        let mut digests = Vec::with_capacity(length / sector * algorithm.size());
+        for piece in pieces {
+            for sector in piece.chunks_exact(sector) {
+                digests.extend_from_slice(algorithm.digest(sector).as_bytes());
             }
-            let start = logical + (index * per_item * sector) as u64;
+        }
+        self.store(volume, trees, space, logical, &digests).await
+    }
+
+    /// Replaces the checksums of the sectors from `logical` with `digests`,
+    /// one digest per sector, splitting them into items that fit a leaf.
+    pub(crate) async fn store<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        logical: u64,
+        digests: &[u8],
+    ) -> Result<(), WriteError> {
+        let sector = u64::from(volume.superblock().sectorsize());
+        let digest = volume.superblock().csum_type().size();
+        let invalid = || WriteError::Checksum { key: key(logical) };
+        if digests.is_empty() || !digests.len().is_multiple_of(digest) {
+            return Err(invalid());
+        }
+        let end = ((digests.len() / digest) as u64)
+            .checked_mul(sector)
+            .and_then(|length| logical.checked_add(length))
+            .ok_or_else(invalid)?;
+        self.remove(volume, trees, space, logical..end).await?;
+        let per_item = max_csum_items(volume.superblock());
+        for (index, chunk) in digests.chunks(per_item * digest).enumerate() {
+            let start = logical + (index * per_item) as u64 * sector;
             self.root = trees
-                .apply(volume, self.root, key(start), Some(&bytes), space)
+                .apply(volume, self.root, key(start), Some(chunk), space)
                 .await?;
         }
         Ok(())

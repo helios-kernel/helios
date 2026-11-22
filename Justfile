@@ -93,21 +93,26 @@ clippy-host:
         --exclude helios-gpu-test --exclude helios-http-client \
         --exclude helios-init --exclude helios-input-test \
         --exclude helios-oob-load --exclude helios-perf \
-        --exclude helios-ping --exclude helios-procbench \
+        --exclude helios-ping --exclude helios-pride-flag --exclude helios-procbench \
         --exclude helios-sched-tasks --exclude helios-surface-test \
+        --exclude helios-webgpu-provider \
         -- -D warnings
 
 # Clippy each guest program on its own, denying warnings.
 clippy-programs:
     #!/usr/bin/env bash
     set -euo pipefail
+    # `helios-venus` generates its protocol module from the pinned
+    # venus-protocol inputs when `helios-gpu-test` or `helios-webgpu-provider`
+    # builds.
+    {{ cli }} venus-protocol-fetch
     # One program per invocation: they select mutually exclusive
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
     for package in helios-audio-test helios-compositor helios-cpu helios-date helios-debugger helios-display-test helios-gpu-test \
         helios-http-client \
-        helios-init helios-input-test helios-oob-load helios-perf helios-ping \
-        helios-procbench helios-sched-tasks helios-surface-test; do
+        helios-init helios-input-test helios-oob-load helios-perf helios-ping helios-pride-flag \
+        helios-procbench helios-sched-tasks helios-surface-test helios-webgpu-provider; do
         cargo clippy -p "${package}" --all-targets -- -D warnings
     done
 
@@ -128,7 +133,12 @@ test-kernel run_ignored="default":
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run {{ kernel_unit_packages }} --lib --run-ignored "{{ run_ignored }}"
+    # The Linux process host is behind a feature the run above leaves off.
+    cargo nextest run -p helios-kernel --lib --features linux --run-ignored "{{ run_ignored }}"
     cargo nextest run -p helios-kernel --test hal_layering
+    # The x86 user address space's page-table code, the code the x86
+    # kernel runs, over host memory and real threads.
+    cargo nextest run -p helios-x86-vmm
     # The hosted backend boots the same kernel on the host OS; its tests
     # cover the memory-policy density checks and the OOM killer, and
     # `embedded_debugger_is_provisioned` reads the prebuild payload above.
@@ -148,7 +158,9 @@ warm-test-kernel:
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo nextest run --no-run {{ kernel_unit_packages }} --lib
+    cargo nextest run --no-run -p helios-kernel --lib --features linux
     cargo nextest run --no-run -p helios-kernel --test hal_layering
+    cargo nextest run --no-run -p helios-x86-vmm
     HELIOS_BOOTFS="${out_dir}/helios-bootfs" cargo nextest run --no-run -p helios-hosted
 
 test-libraries:
@@ -181,6 +193,8 @@ test-libraries:
     # `driver` feature.
     {{ cli }} venus-protocol-fetch
     cargo nextest run -p helios-venus -p helios-venus-gen --features helios-venus/driver
+    # The HTTP client plugin's host unit, HTTP/2, and HTTP/3 tests.
+    cargo nextest run -p helios-http-client
     # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
     # tables the fetch below hash-verifies.
     just acpi-tables-fetch
@@ -220,8 +234,16 @@ warm-test-host-tools:
 
 # Mount the images `mkfs.btrfs --rootdir` builds, one per checksum type and
 # node size. Needs btrfs-progs on PATH; CI's test-libraries lane installs it.
+# The log replay of images Linux leaves pending runs in
+# `test-btrfs-log-replay`, which needs those images.
 test-btrfs-mkfs:
-    cargo nextest run -p helios-btrfs --features write --run-ignored ignored-only
+    cargo nextest run -p helios-btrfs --features write --run-ignored ignored-only -E 'not test(/^log_replay::/)'
+
+# Replay the images `tools/btrfs/fstests/log-replay.sh` makes from Linux's
+# own btrfs into `images` (run.sh calls it in test-btrfs-fstests), and hold
+# each replay to Linux's. Needs btrfs-progs on PATH.
+test-btrfs-log-replay images:
+    HELIOS_BTRFS_LOG_IMAGES="{{ images }}" cargo nextest run -p helios-btrfs --features write --test images --run-ignored ignored-only -E 'test(/^log_replay::/)'
 # Fetch the ACPI tables `acpi/tests/qemu-tables.sha256` pins — QEMU's own
 # expected tables for its q35 machine, from its `tests/data/acpi` at the
 # v9.2.0 commit — into `target/acpi-tables` (or `$HELIOS_ACPI_TABLES_DIR`).

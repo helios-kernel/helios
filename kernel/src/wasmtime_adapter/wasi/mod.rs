@@ -5,11 +5,51 @@ pub(crate) use rights::*;
 #[cfg(test)]
 mod fs_tests;
 pub(in crate::wasmtime_adapter) mod net;
-pub(crate) use net::*;
 mod stream;
 pub(crate) use stream::*;
 mod host_env;
 pub(crate) use host_env::*;
+
+/// Defines `add_to_linker` and, for tests, `LINKED_INTERFACES` from one
+/// table, so the list of interfaces the linker serves is the list the code
+/// links and cannot drift from it.
+///
+/// By default each entry is linked only when `imports.has(name, "0.3")`;
+/// `when <cond>` overrides that predicate (for example when `wasi:http/client`
+/// also requires `wasi:http/types`).
+macro_rules! linked_interfaces {
+    (
+        $linker:ident, $imports:ident;
+        $($name:literal $(when $cond:expr)? => $link:expr;)+
+    ) => {
+        #[cfg(test)]
+        pub(crate) const LINKED_INTERFACES: &[&str] = &[$($name),+];
+
+        pub(crate) fn add_to_linker<CpuImpl, Net, StorageImpl>(
+            $linker: &mut wasmtime::component::Linker<StoreData<CpuImpl, Net, StorageImpl>>,
+            $imports: &WasiImportSet,
+        ) -> Result<()>
+        where
+            CpuImpl: Cpu + Clone,
+            Net: ComponentHostNetwork,
+            StorageImpl: crate::Storage,
+        {
+            $(
+                if linked_interfaces!(@cond $imports, $name $(, $cond)?) {
+                    $link?;
+                }
+            )+
+            Ok(())
+        }
+    };
+    (@cond $imports:ident, $name:literal) => {
+        $imports.has($name, "0.3")
+    };
+    (@cond $imports:ident, $name:literal, $cond:expr) => {
+        $cond
+    };
+}
+
 pub(crate) mod http;
 pub(crate) use http::*;
 
@@ -18,10 +58,7 @@ pub(crate) use http::*;
 pub use crate::FsDescriptor;
 pub use host_env::{TerminalInput, TerminalOutput};
 pub use http::{WasiRequest, WasiResponse};
-pub use net::{
-    P2IncomingDatagramStream, P2Network, P2OutgoingDatagramStream, P2ResolveAddressStream,
-    TcpSocket, UdpSocket,
-};
+pub use net::{TcpSocket, UdpSocket};
 
 extern crate alloc;
 
@@ -72,18 +109,6 @@ const DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT: u32 = 9;
 pub(crate) const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("guest requested wasi preview2 exit code {code}")]
-pub(crate) struct Preview2GuestExit {
-    code: u32,
-}
-
-impl Preview2GuestExit {
-    pub(crate) const fn new(code: u32) -> Self {
-        Self { code }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("guest requested wasi preview3 exit code {code}")]
 struct Preview3GuestExit {
     code: u32,
@@ -105,8 +130,6 @@ pub(crate) enum WasiAdapterTrap {
     FileReadOffsetOverflow,
     #[error("file write offset does not fit into usize")]
     FileWriteOffsetOverflow,
-    #[error("udp send exceeded the permit returned by check-send")]
-    UdpSendPermitExceeded,
 }
 
 pub(crate) struct WasiImportSet {
@@ -150,12 +173,7 @@ impl WasiImportSet {
 /// rather than the wasi stdin stream, which stays empty; the terminal
 /// resource describes the attachment, not that stream.
 pub(crate) fn stdin_is_terminal(mode: &ComponentOutputMode) -> bool {
-    match mode {
-        ComponentOutputMode::Serial => true,
-        ComponentOutputMode::Trace
-        | ComponentOutputMode::Child { .. }
-        | ComponentOutputMode::RoutedChild { .. } => false,
-    }
+    matches!(mode.stdin_route(), crate::ComponentInputRoute::Serial)
 }
 
 /// Whether the requested output stream is attached to the interactive serial
@@ -186,7 +204,6 @@ pub(crate) fn output_is_terminal(
 }
 
 pub(crate) mod preview1;
-pub(crate) mod preview2;
 pub(crate) mod preview3;
 
 pub(crate) mod bindings;
@@ -262,19 +279,19 @@ mod tests {
     use futures_lite::future::block_on;
 
     use super::net::{
-        AcceptedConnection, ListenAdoption, OwnedTcpListener, PendingListen, TcpConnection,
-        UdpSend, UdpSendBinding, read_socket, write_socket,
+        OwnedTcpListener, TcpConnection, TcpSocket, UdpSend, UdpSendBinding, UdpSocket,
+        WasiTcpIpAddress, WasiTcpSocketAddress, WasiTcpSocketFamily, WasiUdpSocketAddress,
+        WasiUdpSocketError, WasiUdpSocketFamily, format_p3_tcp_socket_address,
+        format_p3_udp_socket_address, has_wasi_network_rights, map_p3_dns_error, map_p3_tcp_error,
+        map_p3_udp_family, map_p3_udp_socket_error, parse_p3_tcp_socket_address,
+        parse_p3_udp_socket_address, read_socket, send_on, wasi_tcp_bind_rights,
+        wasi_udp_bind_rights, write_socket,
     };
     use super::{
         DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
         DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
-        DEFAULT_WASI_TCP_LISTEN_BACKLOG, P2ResolveAddressStream, TcpSocket, UdpSocket,
-        WasiTcpIpAddress, WasiTcpSocketAddress, WasiTcpSocketFamily, WasiUdpSocketAddress,
-        WasiUdpSocketError, WasiUdpSocketFamily, format_p3_tcp_socket_address,
-        format_p3_udp_socket_address, has_wasi_network_rights, http, ip_name_lookup,
-        map_p3_dns_error, map_p3_tcp_error, map_p3_udp_family, map_p3_udp_socket_error,
-        parse_p3_tcp_socket_address, parse_p3_udp_socket_address, preview3, socket_types,
-        stdin_is_terminal, wasi_tcp_bind_rights, wasi_udp_bind_rights,
+        DEFAULT_WASI_TCP_LISTEN_BACKLOG, http, ip_name_lookup, preview3, socket_types,
+        stdin_is_terminal,
     };
     use triomphe::Arc;
 
@@ -424,13 +441,27 @@ mod tests {
 
         let (routed_stdout_tx, _routed_stdout_rx) = crate::byte_channel();
         let routed = ComponentOutputMode::RoutedChild {
-            stdin_rx,
+            stdin: crate::ComponentInputRoute::Child(stdin_rx),
             stdout: ComponentOutputRoute::Child(routed_stdout_tx),
             stderr: ComponentOutputRoute::Serial,
         };
         assert!(!stdin_is_terminal(&routed));
         assert!(!output_is_terminal(&routed, Stdout));
         assert!(output_is_terminal(&routed, Stderr));
+
+        let serial_stdin = ComponentOutputMode::RoutedChild {
+            stdin: crate::ComponentInputRoute::Serial,
+            stdout: ComponentOutputRoute::Discard,
+            stderr: ComponentOutputRoute::Discard,
+        };
+        assert!(stdin_is_terminal(&serial_stdin));
+
+        let closed_stdin = ComponentOutputMode::RoutedChild {
+            stdin: crate::ComponentInputRoute::Closed,
+            stdout: ComponentOutputRoute::Discard,
+            stderr: ComponentOutputRoute::Discard,
+        };
+        assert!(!stdin_is_terminal(&closed_stdin));
     }
 
     #[test]
@@ -532,173 +563,6 @@ mod tests {
                 "wasi:sockets/types.udp-socket.set-unicast-hop-limit",
             ],
             "Preview3",
-        );
-    }
-
-    #[test]
-    fn preview2_linked_interfaces_exist_in_wasmtime_wit() {
-        let wit_interfaces =
-            wit_interface_names(crate::wasmtime_adapter::wasi::preview2::PREVIEW2_WIT_PACKAGES);
-        for interface in crate::wasmtime_adapter::wasi::preview2::PREVIEW2_LINKED_INTERFACES {
-            assert!(
-                wit_interfaces.contains(interface),
-                "Preview2 adapter maps {interface}, but Wasmtime WIT does not declare it"
-            );
-        }
-    }
-
-    /// The linker serves every interface Wasmtime's preview2 WIT declares
-    /// except `wasi:cli/run`, which a component exports and the kernel calls.
-    #[test]
-    fn preview2_linked_interfaces_cover_the_wasmtime_wit() {
-        let served =
-            wit_interface_names(crate::wasmtime_adapter::wasi::preview2::PREVIEW2_WIT_PACKAGES)
-                .into_iter()
-                .filter(|interface| *interface != "wasi:cli/run")
-                .collect::<alloc::vec::Vec<_>>();
-        assert_interface_set_eq(
-            crate::wasmtime_adapter::wasi::preview2::PREVIEW2_LINKED_INTERFACES,
-            &served,
-            "Preview2",
-        );
-    }
-
-    #[test]
-    fn preview2_linked_functions_cover_required_subsystems() {
-        assert_function_set_eq(
-            &wit_function_names(
-                crate::wasmtime_adapter::wasi::preview2::PREVIEW2_WIT_PACKAGES,
-                crate::wasmtime_adapter::wasi::preview2::PREVIEW2_LINKED_INTERFACES,
-            ),
-            &[
-                "wasi:cli/environment.get-arguments",
-                "wasi:cli/environment.get-environment",
-                "wasi:cli/environment.initial-cwd",
-                "wasi:cli/exit.exit",
-                "wasi:cli/exit.exit-with-code",
-                "wasi:cli/stderr.get-stderr",
-                "wasi:cli/stdin.get-stdin",
-                "wasi:cli/stdout.get-stdout",
-                "wasi:cli/terminal-stderr.get-terminal-stderr",
-                "wasi:cli/terminal-stdin.get-terminal-stdin",
-                "wasi:cli/terminal-stdout.get-terminal-stdout",
-                "wasi:clocks/monotonic-clock.now",
-                "wasi:clocks/monotonic-clock.resolution",
-                "wasi:clocks/monotonic-clock.subscribe-duration",
-                "wasi:clocks/monotonic-clock.subscribe-instant",
-                "wasi:clocks/timezone.display",
-                "wasi:clocks/timezone.utc-offset",
-                "wasi:clocks/wall-clock.now",
-                "wasi:clocks/wall-clock.resolution",
-                "wasi:filesystem/preopens.get-directories",
-                "wasi:filesystem/types.descriptor.advise",
-                "wasi:filesystem/types.descriptor.append-via-stream",
-                "wasi:filesystem/types.descriptor.create-directory-at",
-                "wasi:filesystem/types.descriptor.get-flags",
-                "wasi:filesystem/types.descriptor.get-type",
-                "wasi:filesystem/types.descriptor.is-same-object",
-                "wasi:filesystem/types.descriptor.link-at",
-                "wasi:filesystem/types.descriptor.metadata-hash",
-                "wasi:filesystem/types.descriptor.metadata-hash-at",
-                "wasi:filesystem/types.descriptor.open-at",
-                "wasi:filesystem/types.descriptor.read",
-                "wasi:filesystem/types.descriptor.read-directory",
-                "wasi:filesystem/types.descriptor.read-via-stream",
-                "wasi:filesystem/types.descriptor.readlink-at",
-                "wasi:filesystem/types.descriptor.remove-directory-at",
-                "wasi:filesystem/types.descriptor.rename-at",
-                "wasi:filesystem/types.descriptor.set-size",
-                "wasi:filesystem/types.descriptor.set-times",
-                "wasi:filesystem/types.descriptor.set-times-at",
-                "wasi:filesystem/types.descriptor.stat",
-                "wasi:filesystem/types.descriptor.stat-at",
-                "wasi:filesystem/types.descriptor.symlink-at",
-                "wasi:filesystem/types.descriptor.sync",
-                "wasi:filesystem/types.descriptor.sync-data",
-                "wasi:filesystem/types.descriptor.unlink-file-at",
-                "wasi:filesystem/types.descriptor.write",
-                "wasi:filesystem/types.descriptor.write-via-stream",
-                "wasi:filesystem/types.directory-entry-stream.read-directory-entry",
-                "wasi:filesystem/types.filesystem-error-code",
-                "wasi:io/error.error.to-debug-string",
-                "wasi:io/poll.poll",
-                "wasi:io/poll.pollable.block",
-                "wasi:io/poll.pollable.ready",
-                "wasi:io/streams.input-stream.blocking-read",
-                "wasi:io/streams.input-stream.blocking-skip",
-                "wasi:io/streams.input-stream.read",
-                "wasi:io/streams.input-stream.skip",
-                "wasi:io/streams.input-stream.subscribe",
-                "wasi:io/streams.output-stream.blocking-flush",
-                "wasi:io/streams.output-stream.blocking-splice",
-                "wasi:io/streams.output-stream.blocking-write-and-flush",
-                "wasi:io/streams.output-stream.blocking-write-zeroes-and-flush",
-                "wasi:io/streams.output-stream.check-write",
-                "wasi:io/streams.output-stream.flush",
-                "wasi:io/streams.output-stream.splice",
-                "wasi:io/streams.output-stream.subscribe",
-                "wasi:io/streams.output-stream.write",
-                "wasi:io/streams.output-stream.write-zeroes",
-                "wasi:random/insecure-seed.insecure-seed",
-                "wasi:random/insecure.get-insecure-random-bytes",
-                "wasi:random/insecure.get-insecure-random-u64",
-                "wasi:random/random.get-random-bytes",
-                "wasi:random/random.get-random-u64",
-                "wasi:sockets/instance-network.instance-network",
-                "wasi:sockets/ip-name-lookup.resolve-address-stream.resolve-next-address",
-                "wasi:sockets/ip-name-lookup.resolve-address-stream.subscribe",
-                "wasi:sockets/ip-name-lookup.resolve-addresses",
-                "wasi:sockets/network.network-error-code",
-                "wasi:sockets/tcp-create-socket.create-tcp-socket",
-                "wasi:sockets/tcp.tcp-socket.accept",
-                "wasi:sockets/tcp.tcp-socket.address-family",
-                "wasi:sockets/tcp.tcp-socket.finish-bind",
-                "wasi:sockets/tcp.tcp-socket.finish-connect",
-                "wasi:sockets/tcp.tcp-socket.finish-listen",
-                "wasi:sockets/tcp.tcp-socket.hop-limit",
-                "wasi:sockets/tcp.tcp-socket.is-listening",
-                "wasi:sockets/tcp.tcp-socket.keep-alive-count",
-                "wasi:sockets/tcp.tcp-socket.keep-alive-enabled",
-                "wasi:sockets/tcp.tcp-socket.keep-alive-idle-time",
-                "wasi:sockets/tcp.tcp-socket.keep-alive-interval",
-                "wasi:sockets/tcp.tcp-socket.local-address",
-                "wasi:sockets/tcp.tcp-socket.receive-buffer-size",
-                "wasi:sockets/tcp.tcp-socket.remote-address",
-                "wasi:sockets/tcp.tcp-socket.send-buffer-size",
-                "wasi:sockets/tcp.tcp-socket.set-hop-limit",
-                "wasi:sockets/tcp.tcp-socket.set-keep-alive-count",
-                "wasi:sockets/tcp.tcp-socket.set-keep-alive-enabled",
-                "wasi:sockets/tcp.tcp-socket.set-keep-alive-idle-time",
-                "wasi:sockets/tcp.tcp-socket.set-keep-alive-interval",
-                "wasi:sockets/tcp.tcp-socket.set-listen-backlog-size",
-                "wasi:sockets/tcp.tcp-socket.set-receive-buffer-size",
-                "wasi:sockets/tcp.tcp-socket.set-send-buffer-size",
-                "wasi:sockets/tcp.tcp-socket.shutdown",
-                "wasi:sockets/tcp.tcp-socket.start-bind",
-                "wasi:sockets/tcp.tcp-socket.start-connect",
-                "wasi:sockets/tcp.tcp-socket.start-listen",
-                "wasi:sockets/tcp.tcp-socket.subscribe",
-                "wasi:sockets/udp-create-socket.create-udp-socket",
-                "wasi:sockets/udp.incoming-datagram-stream.receive",
-                "wasi:sockets/udp.incoming-datagram-stream.subscribe",
-                "wasi:sockets/udp.outgoing-datagram-stream.check-send",
-                "wasi:sockets/udp.outgoing-datagram-stream.send",
-                "wasi:sockets/udp.outgoing-datagram-stream.subscribe",
-                "wasi:sockets/udp.udp-socket.address-family",
-                "wasi:sockets/udp.udp-socket.finish-bind",
-                "wasi:sockets/udp.udp-socket.local-address",
-                "wasi:sockets/udp.udp-socket.receive-buffer-size",
-                "wasi:sockets/udp.udp-socket.remote-address",
-                "wasi:sockets/udp.udp-socket.send-buffer-size",
-                "wasi:sockets/udp.udp-socket.set-receive-buffer-size",
-                "wasi:sockets/udp.udp-socket.set-send-buffer-size",
-                "wasi:sockets/udp.udp-socket.set-unicast-hop-limit",
-                "wasi:sockets/udp.udp-socket.start-bind",
-                "wasi:sockets/udp.udp-socket.stream",
-                "wasi:sockets/udp.udp-socket.subscribe",
-                "wasi:sockets/udp.udp-socket.unicast-hop-limit",
-            ],
-            "Preview2",
         );
     }
 
@@ -876,12 +740,6 @@ mod tests {
                 "system-clock" => "wasi:clocks/system-clock",
                 "wall-clock" => "wasi:clocks/wall-clock",
                 "timezone" => "wasi:clocks/timezone",
-                _ => return None,
-            },
-            "wasi:io" => match name {
-                "error" => "wasi:io/error",
-                "poll" => "wasi:io/poll",
-                "streams" => "wasi:io/streams",
                 _ => return None,
             },
             "wasi:filesystem" => match name {
@@ -1095,21 +953,6 @@ mod tests {
     }
 
     #[test]
-    fn p2_resolve_stream_yields_both_address_families_in_resolver_order() {
-        let (mut stream, completion) = P2ResolveAddressStream::pending();
-        let v4 = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([93, 184, 215, 14]));
-        let v6 = crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
-            0x26, 0x06, 0x28, 0x00, 0x02, 0x1f, 0xcb, 0x07, 0x68, 0x20, 0x80, 0xda, 0x00, 0xaf,
-            0x6b, 0x08,
-        ]));
-        completion.complete(Ok(vec![v4, v6]));
-
-        assert_eq!(stream.next_address().unwrap(), Some(v4));
-        assert_eq!(stream.next_address().unwrap(), Some(v6));
-        assert_eq!(stream.next_address().unwrap(), None);
-    }
-
-    #[test]
     fn p3_ip_address_formatting_preserves_the_address_family() {
         use crate::wasmtime_adapter::wasi::net::format_p3_ip_address;
 
@@ -1131,54 +974,22 @@ mod tests {
     }
 
     #[test]
-    fn p2_resolve_stream_yields_addresses_after_background_completion() {
-        let (mut stream, completion) = P2ResolveAddressStream::pending();
-        assert!(!stream.is_ready());
-        assert!(matches!(
-            stream
-                .next_address()
-                .expect_err("pending stream has no address"),
-            crate::DnsError {
-                kind: crate::DnsErrorKind::Unavailable,
-                ..
-            }
-        ));
-
-        let address = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 1]));
-        completion.complete(Ok(vec![address]));
-        assert!(stream.is_ready());
-        assert_eq!(stream.next_address().unwrap(), Some(address));
-        assert_eq!(stream.next_address().unwrap(), None);
-    }
-
-    /// The pollable a guest parks on resolves once the lookup task answers,
-    /// and a lookup that already answered resolves it at once.
-    #[test]
-    fn p2_resolve_stream_wakes_a_waiter_when_the_lookup_answers() {
-        let (mut stream, completion) = P2ResolveAddressStream::pending();
-        let address = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 7]));
-
-        {
-            let mut waiting = core::pin::pin!(stream.wait_ready());
-            let waker = futures::task::noop_waker();
-            let mut context = core::task::Context::from_waker(&waker);
-            assert!(waiting.as_mut().poll(&mut context).is_pending());
-
-            completion.complete(Ok(vec![address]));
-            assert!(waiting.as_mut().poll(&mut context).is_ready());
-        }
-        assert_eq!(stream.next_address().unwrap(), Some(address));
-
-        block_on(stream.wait_ready());
-    }
-
-    #[test]
     fn udp_socket_send_uses_typed_address_path() {
         let service = TestNetworkService::new();
         let retirement = TestSocketRetirement::new(service.clone());
         let mut socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
 
-        block_on(socket.send_datagram(&service, b"hello", Some(udp4([192, 0, 2, 4], 53)), 0))
+        let UdpSend { target, binding } = socket
+            .start_send(5, Some(udp4([192, 0, 2, 4], 53)))
+            .expect("an unbound socket admits a send to a valid target");
+        let UdpSendBinding::Unbound(bind) = binding else {
+            panic!("an unbound socket binds implicitly on its first send");
+        };
+        let (guard, outcome) = block_on(bind.run(&service));
+        let binding = socket
+            .finish_implicit_bind(guard, outcome)
+            .expect("the test service binds");
+        block_on(send_on(&service, &binding, target, b"hello", 0))
             .expect("UDP send should use typed backend address");
     }
 
@@ -1317,399 +1128,6 @@ mod tests {
         );
     }
 
-    /// The reply a connected socket would read back, as the peer's
-    /// segment header. `acked_len` is how many bytes this side sent —
-    /// the acknowledgement may not outrun it.
-    fn peer_data_segment(acked_len: u32) -> helios_netstack::TcpHeader {
-        use crate::network::EstablishedTcpFixture;
-        use helios_netstack::TcpFlags;
-        helios_netstack::TcpHeader {
-            source_port: EstablishedTcpFixture::PEER_PORT,
-            destination_port: EstablishedTcpFixture::LOCAL_PORT,
-            // The handshake consumed one sequence number on each side;
-            // the peer's next payload rides on `PEER_SEQUENCE + 1`, and
-            // its acknowledgement covers this side's SYN plus what the
-            // test sent.
-            sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1,
-            acknowledgement: EstablishedTcpFixture::LOCAL_SEQUENCE + 1 + acked_len,
-            flags: TcpFlags::ACK.union(TcpFlags::PSH),
-            window_size: u16::MAX,
-        }
-    }
-
-    /// The `wasi:io` streams on a connected TCP socket run the whole
-    /// exchange on the task that polls them (#354).
-    ///
-    /// Both halves prove it the same way: nothing between the stream and
-    /// the socket can run a task — the types hold no spawner — so the
-    /// write's segment reaching the device's transmit ring and the read
-    /// answering from the receive queue happen inside this test's own
-    /// `block_on`. The bridge they replaced needed two detached tasks for
-    /// the same round trip.
-    #[test]
-    fn p2_tcp_socket_streams_run_the_exchange_on_the_calling_task() {
-        use crate::network::EstablishedTcpFixture;
-        use wasmtime_wasi_io::poll::Pollable;
-        use wasmtime_wasi_io::streams::{InputStream, OutputStream};
-
-        let device = crate::test_support::RecordingNetworkInterface::accepting_transmissions(1);
-        let fixture = EstablishedTcpFixture::with_interface(device.clone());
-        let retirement = crate::SocketRetirementQueue::new();
-        let connection = connection(
-            retirement.sender(),
-            crate::NetworkHandle::into_raw(fixture.stream()),
-        );
-        let service = fixture.service();
-        let mut input = super::net::TcpSocketInputStream::new(connection.clone(), service.clone());
-        let mut output = super::net::TcpSocketOutputStream::new(connection, service);
-
-        // `write` is queue, segment, submit and doorbell on this poll —
-        // the frame on the device's ring is the proof.
-        block_on(output.ready());
-        assert!(
-            output
-                .check_write()
-                .expect("a fresh connection has send room")
-                > 0,
-            "the permit must cover at least one byte"
-        );
-        output
-            .write(Bytes::from_static(b"ping"))
-            .expect("the write queues onto the send path");
-        let wire = device.transmitted_frames();
-        assert!(
-            wire.iter()
-                .any(|frame| frame.windows(4).any(|window| window == b"ping")),
-            "the write's payload reached the wire inside the write call"
-        );
-
-        // `read` drains the socket's queue synchronously: the reply the
-        // stack already accepted comes back from the same call.
-        fixture.deliver(peer_data_segment(4), b"pong");
-        let bytes = input.read(4).expect("the queued reply reads back");
-        assert_eq!(&bytes[..], b"pong");
-    }
-
-    /// A segment landing between `ready`'s queue probe and its park
-    /// still wakes the reader — the arm-before-test rule.
-    ///
-    /// The first `poll` finds an empty queue and parks on the shard's
-    /// wait with the signal already armed; `deliver_rx` then puts the
-    /// reply on the device's ring and raises the completion event — the
-    /// arrive-between-test-and-park window, reproduced exactly. The next
-    /// poll must resolve: sleeping through it is the defect §4 exists to
-    /// prevent.
-    #[test]
-    fn p2_tcp_input_stream_wakes_when_a_segment_arrives_between_probe_and_park() {
-        use crate::network::EstablishedTcpFixture;
-        use futures_lite::future::poll_once;
-        use wasmtime_wasi_io::poll::Pollable;
-        use wasmtime_wasi_io::streams::InputStream;
-
-        let fixture = EstablishedTcpFixture::new();
-        let retirement = crate::SocketRetirementQueue::new();
-        let connection = connection(
-            retirement.sender(),
-            crate::NetworkHandle::into_raw(fixture.stream()),
-        );
-        let mut input = super::net::TcpSocketInputStream::new(connection, fixture.service());
-
-        let mut ready = input.ready();
-        assert!(
-            block_on(poll_once(ready.as_mut())).is_none(),
-            "an empty receive queue parks the readiness wait"
-        );
-        fixture.deliver_rx(peer_data_segment(0), b"pong");
-        assert!(
-            block_on(poll_once(ready.as_mut())).is_some(),
-            "the segment that arrived between probe and park resolves the wait"
-        );
-        drop(ready);
-        let bytes = input.read(4).expect("the parked reader's reply reads back");
-        assert_eq!(&bytes[..], b"pong");
-    }
-
-    /// `shutdown(Send)` makes the output stream permanently ready, and
-    /// the accessors that follow report `closed`.
-    ///
-    /// The flag and the stack's FIN are both exercised: the readiness
-    /// wait resolves on the flag, and the send probe reports the socket
-    /// the shutdown left behind — a `FinWait1` connection cannot send
-    /// (#358 review: a zero-room answer conflated this with a full
-    /// queue, and the wait never resolved).
-    #[test]
-    fn p2_tcp_output_stream_reports_closed_after_send_shutdown() {
-        use crate::network::EstablishedTcpFixture;
-        use futures_lite::future::poll_once;
-        use wasmtime_wasi_io::poll::Pollable;
-        use wasmtime_wasi_io::streams::{OutputStream, StreamError};
-
-        let fixture = EstablishedTcpFixture::new();
-        let service = fixture.service();
-        let retirement = crate::SocketRetirementQueue::new();
-        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        let connection = connection(
-            retirement.sender(),
-            crate::NetworkHandle::into_raw(fixture.stream()),
-        );
-        socket.connection = Some(connection.clone());
-        let mut output = super::net::TcpSocketOutputStream::new(connection, service.clone());
-
-        socket
-            .shutdown_send()
-            .expect("a connected socket shuts its send side");
-        block_on(service.tcp_shutdown_send(fixture.stream())).expect("the shutdown queues the FIN");
-        assert!(
-            matches!(
-                service.tcp_send_room(fixture.stream()),
-                Ok(crate::TcpWriteProgress::Closed(_))
-            ),
-            "the send probe reports the close, not a full queue"
-        );
-
-        assert!(
-            block_on(poll_once(output.ready().as_mut())).is_some(),
-            "a shut-down send side resolves the readiness wait"
-        );
-        assert!(
-            matches!(output.check_write(), Err(StreamError::Closed)),
-            "check-write reports the closed send side"
-        );
-        assert!(
-            matches!(
-                output.write(Bytes::from_static(b"ping")),
-                Err(StreamError::Closed)
-            ),
-            "write reports the closed send side"
-        );
-    }
-
-    /// The peer's reset ends the send side the same way: `ready`
-    /// resolves and `check_write`/`write` answer `closed`.
-    #[test]
-    fn p2_tcp_output_stream_reports_closed_after_peer_reset() {
-        use crate::network::EstablishedTcpFixture;
-        use futures_lite::future::poll_once;
-        use helios_netstack::TcpFlags;
-        use wasmtime_wasi_io::poll::Pollable;
-        use wasmtime_wasi_io::streams::{OutputStream, StreamError};
-
-        let fixture = EstablishedTcpFixture::new();
-        let retirement = crate::SocketRetirementQueue::new();
-        let connection = connection(
-            retirement.sender(),
-            crate::NetworkHandle::into_raw(fixture.stream()),
-        );
-        let mut output = super::net::TcpSocketOutputStream::new(connection, fixture.service());
-
-        fixture.deliver(
-            helios_netstack::TcpHeader {
-                source_port: EstablishedTcpFixture::PEER_PORT,
-                destination_port: EstablishedTcpFixture::LOCAL_PORT,
-                sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1,
-                acknowledgement: EstablishedTcpFixture::LOCAL_SEQUENCE + 1,
-                flags: TcpFlags::RST.union(TcpFlags::ACK),
-                window_size: 0,
-            },
-            &[],
-        );
-
-        assert!(
-            block_on(poll_once(output.ready().as_mut())).is_some(),
-            "a reset send side resolves the readiness wait"
-        );
-        assert!(
-            matches!(output.check_write(), Err(StreamError::Closed)),
-            "check-write reports the reset send side as closed"
-        );
-        assert!(
-            matches!(
-                output.write(Bytes::from_static(b"ping")),
-                Err(StreamError::Closed)
-            ),
-            "write reports the reset send side as closed"
-        );
-    }
-
-    /// A `ready` parked behind a full send queue is woken by the peer's
-    /// ACK — the send half of the arm-before-test rule.
-    ///
-    /// The queue is filled through the service directly so `pending`
-    /// stays empty and the wait is `tcp_write_ready`'s own loop: probe,
-    /// arm, park. The ACK then arrives the way the device delivers one
-    /// — ring plus completion event — and the armed wait resolves.
-    #[test]
-    fn p2_tcp_output_stream_wakes_when_an_ack_arrives_between_probe_and_park() {
-        use crate::network::EstablishedTcpFixture;
-        use futures_lite::future::poll_once;
-        use helios_netstack::TcpFlags;
-        use wasmtime_wasi_io::poll::Pollable;
-        use wasmtime_wasi_io::streams::OutputStream;
-
-        let fixture = EstablishedTcpFixture::new();
-        let service = fixture.service();
-        let retirement = crate::SocketRetirementQueue::new();
-        let connection = connection(
-            retirement.sender(),
-            crate::NetworkHandle::into_raw(fixture.stream()),
-        );
-        let mut output = super::net::TcpSocketOutputStream::new(connection, service.clone());
-
-        // The peer advertised a 64 KiB window and never ACKs, so enough
-        // queued bytes fill it and then the send queue behind it.
-        let mut fill = Bytes::from(vec![0xAB; 2 * 1024 * 1024]);
-        let mut fill_send_queue = || loop {
-            service
-                .tcp_try_write(fixture.stream(), &mut fill)
-                .expect("the fill write queues");
-            match service
-                .tcp_send_room(fixture.stream())
-                .expect("the probe answers")
-            {
-                crate::TcpWriteProgress::Pending => break,
-                crate::TcpWriteProgress::Room(_) => {}
-                crate::TcpWriteProgress::Closed(_) => {
-                    panic!("a live connection cannot report a closed send side")
-                }
-            }
-            assert!(
-                !fill.is_empty(),
-                "the send queue must fill before the fill buffer runs out"
-            );
-        };
-        fill_send_queue();
-        // How far the send sequence actually ran is what the peer may
-        // acknowledge — the window, the congestion window, the pacing
-        // rate and the socket's own segmentation decide it, so read it
-        // off the wire: the refused device's ring kept the segments
-        // staged, and `drive` reports them. The sender paces, so time
-        // passes between drives until a drive sends nothing: the
-        // windows are full. A millisecond a step stays far inside the
-        // first retransmission timeout, so nothing on the wire is a
-        // resend.
-        let mut sent = EstablishedTcpFixture::LOCAL_SEQUENCE.wrapping_add(1);
-        loop {
-            let staged = fixture.drive();
-            if staged.iter().all(|segment| segment.payload_len == 0) {
-                break;
-            }
-            sent = staged
-                .iter()
-                .map(|segment| segment.payload_len as u32)
-                .fold(sent, u32::wrapping_add);
-            fixture.advance(1_000_000);
-        }
-        // What left the queue for the wire made room behind it; fill
-        // that too, so the queue is full while nothing more may leave.
-        fill_send_queue();
-        assert_ne!(
-            sent,
-            EstablishedTcpFixture::LOCAL_SEQUENCE.wrapping_add(1),
-            "the fill's drive put data on the wire"
-        );
-
-        let mut ready = output.ready();
-        assert!(
-            block_on(poll_once(ready.as_mut())).is_none(),
-            "a full send queue parks the readiness wait"
-        );
-        // A full ACK reopens the window; the drive the woken wait runs
-        // then moves queued bytes into flight and frees the queue.
-        fixture.deliver_rx(
-            helios_netstack::TcpHeader {
-                source_port: EstablishedTcpFixture::PEER_PORT,
-                destination_port: EstablishedTcpFixture::LOCAL_PORT,
-                sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1,
-                acknowledgement: sent,
-                flags: TcpFlags::ACK,
-                window_size: u16::MAX,
-            },
-            &[],
-        );
-        assert!(
-            block_on(poll_once(ready.as_mut())).is_some(),
-            "the ACK that arrived after the park resolves the wait"
-        );
-        drop(ready);
-        assert!(
-            output
-                .check_write()
-                .expect("the freed send queue reports room")
-                > 0,
-            "the drained queue reopens the write permit"
-        );
-    }
-
-    /// A device fault inside `ready`'s drive is not reproducible by
-    /// `read`'s non-parking probe, so the stream keeps it and the next
-    /// `read` reports it — `last-operation-failed`, not an empty read
-    /// that would spin a `poll` loop forever.
-    #[test]
-    fn p2_tcp_input_stream_reports_the_failure_ready_saw() {
-        use wasmtime_wasi_io::poll::Pollable;
-        use wasmtime_wasi_io::streams::{InputStream, StreamError};
-
-        let service = TestNetworkService::new();
-        service.fail_drives();
-        let retirement = crate::SocketRetirementQueue::new();
-        let mut input =
-            super::net::TcpSocketInputStream::new(connection(retirement.sender(), 7), service);
-
-        // `ready` resolves — the pollable must, so the accessor can
-        // report what happened — and records the failure it saw.
-        block_on(input.ready());
-        assert!(
-            matches!(input.read(4), Err(StreamError::LastOperationFailed(_))),
-            "the read reports the drive failure"
-        );
-    }
-
-    /// The output half of the same contract: a parked `pending` batch
-    /// whose completion fails is kept, and the failure is what
-    /// `check_write`/`flush`/`write` then report — not a silently
-    /// dropped batch behind a fresh permit.
-    #[test]
-    fn p2_tcp_output_stream_keeps_the_batch_whose_write_failed() {
-        use wasmtime_wasi_io::poll::Pollable;
-        use wasmtime_wasi_io::streams::{OutputStream, StreamError};
-
-        let service = TestNetworkService::new();
-        let retirement = crate::SocketRetirementQueue::new();
-        let mut output = super::net::TcpSocketOutputStream::new(
-            connection(retirement.sender(), 7),
-            service.clone(),
-        );
-
-        // With the drive broken the send queue reads as full, so the
-        // write parks its batch in `pending`.
-        service.fail_drives();
-        output
-            .write(Bytes::from_static(b"ping"))
-            .expect("the write parks the batch it cannot queue");
-        block_on(output.ready());
-        assert!(
-            matches!(
-                output.check_write(),
-                Err(StreamError::LastOperationFailed(_))
-            ),
-            "check-write reports the failed batch write"
-        );
-        assert!(
-            matches!(output.flush(), Err(StreamError::LastOperationFailed(_))),
-            "flush reports the failed batch write"
-        );
-
-        // The batch survived: once the drive heals, `ready` retries it
-        // and the service takes the bytes it was never allowed to drop.
-        service.heal_drives();
-        block_on(output.ready());
-        assert_eq!(
-            service.bytes_written(),
-            4,
-            "the parked batch is retried, not dropped"
-        );
-    }
-
     /// A `wasi:sockets` socket's kernel listener dies with the socket.
     ///
     /// Nothing retired it before: the resource destructor deleted the
@@ -1751,9 +1169,8 @@ mod tests {
     /// oneshot the socket keeps; the socket takes the answer in on its
     /// next accessor. A socket dropped before that holds a listener in
     /// the shards with nothing pointing at it, which is the same leak by
-    /// a narrower door. Both resting places are covered: the answer
-    /// still in the channel, and the answer settled into
-    /// `listen_result` but never finished.
+    /// a narrower door: the answer still in the channel is retired with
+    /// the socket.
     #[test]
     fn a_wasi_tcp_socket_retires_a_listener_it_never_adopted() {
         let (service, closed) = crate::test_support::recording_listener_network_service();
@@ -1770,10 +1187,7 @@ mod tests {
 
         let mut unsettled = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
         let (answer, receiver) = futures::channel::oneshot::channel();
-        unsettled.pending_listen = Some(PendingListen {
-            answer: receiver,
-            adoption: ListenAdoption::Finish,
-        });
+        unsettled.pending_listen = Some(receiver);
         assert!(answer.send(Ok(listener(42))).is_ok());
         drop(unsettled);
         assert_eq!(
@@ -1781,95 +1195,8 @@ mod tests {
             1,
             "a listener still in the listen task's answer is retired"
         );
+        assert_eq!(closed.count(), 1);
         assert_eq!(closed.last(), 42);
-
-        let mut settled = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        settled.listen_result = Some(Ok(listener(43)));
-        drop(settled);
-        assert_eq!(
-            retirement.drain(),
-            1,
-            "a listener still sitting in the listen result is retired"
-        );
-        assert_eq!(closed.count(), 2);
-        assert_eq!(closed.last(), 43);
-    }
-
-    /// The answer a completed accept parks, as the accept task builds
-    /// it.
-    fn accepted_connection(
-        retire: crate::SocketRetirementSender,
-        stream: u64,
-    ) -> AcceptedConnection {
-        AcceptedConnection::new(
-            retire,
-            WasiTcpSocketFamily::Ipv4,
-            tcp4([127, 0, 0, 1], 8080),
-            crate::TcpAccepted {
-                stream,
-                address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
-                port: 4040,
-            },
-        )
-    }
-
-    /// A connection that was accepted but never adopted is retired too.
-    ///
-    /// The accept completes on a detached task and parks its answer in
-    /// `accept_result`; the accept path turns it into a guest resource
-    /// the next time the guest asks. While that answer was a bare
-    /// stream id, a socket dropped in the window between the two left a
-    /// connected stream in its shard with nothing pointing at it, which
-    /// is #184's leak through a narrower door (#225). The parked value
-    /// owns its stream, so it dies with the listening socket.
-    #[test]
-    fn a_wasi_tcp_socket_retires_a_connection_it_never_adopted() {
-        let (service, closed) = crate::test_support::recording_network_service();
-        let retirement = TestSocketRetirement::new(service);
-        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        socket.accept_result = Some(Ok(accepted_connection(retirement.sender(), 43)));
-
-        drop(socket);
-        assert_eq!(
-            retirement.drain(),
-            1,
-            "a connection still sitting in the accept result is retired"
-        );
-        assert_eq!(closed.count(), 1);
-        assert_eq!(closed.last(), 43);
-    }
-
-    /// A connection accepted after the socket died is retired too.
-    ///
-    /// The detached accept task holds only the sending end of the
-    /// socket's oneshot. When the socket died first, the send fails and
-    /// hands the answer back to the task, and dropping it — it owns its
-    /// stream — retires the connection nobody will ever adopt.
-    #[test]
-    fn a_wasi_tcp_socket_retires_a_connection_accepted_after_it_died() {
-        let (service, closed) = crate::test_support::recording_network_service();
-        let retirement = TestSocketRetirement::new(service);
-        let mut socket = TcpSocket::new(retirement.sender(), WasiTcpSocketFamily::Ipv4);
-        let (answer, receiver) = futures::channel::oneshot::channel();
-        socket.pending_accept = Some(receiver);
-
-        drop(socket);
-        assert!(
-            !retirement.queued(),
-            "the accept has not produced a connection yet"
-        );
-
-        let undelivered = answer
-            .send(Ok(accepted_connection(retirement.sender(), 43)))
-            .expect_err("a socket that died cannot take the answer");
-        drop(undelivered);
-        assert_eq!(
-            retirement.drain(),
-            1,
-            "the answer the socket could not take retires the connection it carried"
-        );
-        assert_eq!(closed.count(), 1);
-        assert_eq!(closed.last(), 43);
     }
 
     /// A `wasi:sockets` datagram socket's kernel socket dies with the
@@ -1899,28 +1226,6 @@ mod tests {
         );
         assert_eq!(closed.count(), 1);
         assert_eq!(closed.last(), 9, "the retired socket is the one bound");
-    }
-
-    /// A bind the guest started and never finished is retired too. The
-    /// kernel socket is allocated by `start-bind`, and a program is
-    /// free to exit before `finish-bind` promotes it.
-    #[test]
-    fn a_wasi_udp_socket_retires_a_bind_that_never_finished() {
-        let (service, closed) = crate::test_support::recording_udp_network_service();
-        let retirement = TestSocketRetirement::new(service.clone());
-        let mut socket = UdpSocket::new(retirement.sender(), WasiUdpSocketFamily::Ipv4);
-        block_on(socket.start_bind_p2(&service, udp4([0, 0, 0, 0], 5353)))
-            .expect("the test service always binds");
-
-        assert!(!retirement.queued());
-        drop(socket);
-        assert_eq!(
-            retirement.drain(),
-            1,
-            "a pending bind holds a kernel socket and must retire it"
-        );
-        assert_eq!(closed.count(), 1);
-        assert_eq!(closed.last(), 9);
     }
 
     /// A binding a p3 send or receive took with the socket released
@@ -2031,50 +1336,6 @@ mod tests {
         assert_eq!(socket.keep_alive_idle_time().unwrap(), 11);
         assert_eq!(socket.keep_alive_interval().unwrap(), 13);
         assert_eq!(socket.keep_alive_count().unwrap(), 3);
-    }
-
-    #[test]
-    fn tcp_socket_shutdown_directions_are_idempotent_local_state() {
-        let service = TestNetworkService::new();
-        let retirement = TestSocketRetirement::new(service.clone());
-        let (mut socket, _) = TcpSocket::accepted(
-            retirement.sender(),
-            WasiTcpSocketFamily::Ipv4,
-            AcceptedConnection {
-                connection: TcpConnection::new(retirement.sender(), 7),
-                local_address: tcp4([127, 0, 0, 1], 8080),
-                remote_address: tcp4([127, 0, 0, 1], 4040),
-            },
-        );
-
-        socket
-            .shutdown_receive()
-            .expect("connected receive shutdown must be accepted");
-        socket
-            .shutdown_receive()
-            .expect("receive shutdown must be idempotent");
-        assert_eq!(
-            block_on(read_socket(socket.connection(), service.clone(), 8))
-                .expect("receive shutdown read must succeed"),
-            None
-        );
-
-        let connection = socket
-            .shutdown_send()
-            .expect("connected send shutdown must be accepted");
-        assert_eq!(connection.stream(), 7);
-        let connection = socket
-            .shutdown_send()
-            .expect("send shutdown must be idempotent");
-        assert_eq!(connection.stream(), 7);
-        assert!(matches!(
-            block_on(write_socket(
-                socket.connection(),
-                service,
-                Bytes::from_static(b"x")
-            )),
-            Err(socket_types::ErrorCode::InvalidState)
-        ));
     }
 
     /// A second p3 `connect` while one is running answers

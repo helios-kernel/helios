@@ -288,23 +288,38 @@ impl<S: BlockSink> Transaction<S> {
         Ok(())
     }
 
-    /// The window a data write of up to `length` bytes can use: `length` when a
-    /// range holds it, else the largest sector multiple that fits
-    /// (`find_free_extent` with `min_alloc_size` of one sector). Only a device
-    /// with no free sector fails.
-    pub(super) async fn fit_data_window(&mut self, length: u64) -> Result<u64, WriteError> {
+    /// The length of the next data extent writeback allocates for `length`
+    /// bytes, as `btrfs_reserve_extent` (`fs/btrfs/extent-tree.c`) settles
+    /// it with a `min_alloc_size` of one sector: `length` when a free range
+    /// holds it, after a data chunk when none does; otherwise half of it,
+    /// at most the largest free range and at least one sector, rounded down
+    /// to a sector, until a range holds it. Only a device with no free
+    /// sector fails, which the data reservation of the dirty data rules out.
+    pub(super) async fn extent_length(&mut self, length: u64) -> Result<u64, WriteError> {
         self.ensure_data(length).await?;
         let sector = u64::from(self.volume.superblock().sectorsize());
         let largest = self.space.largest_free(DATA);
-        let fit = length.min(largest - largest % sector);
-        if fit == 0 {
+        if largest < sector {
             return Err(SpaceError::Exhausted {
                 bytes: sector,
                 flags: DATA,
             }
             .into());
         }
+        let mut fit = length;
+        while fit > largest {
+            fit = ((fit >> 1).min(largest) / sector * sector).max(sector);
+        }
         Ok(fit)
+    }
+
+    /// Adds a data chunk, as the data space flush's `ALLOC_CHUNK_FORCE`.
+    /// Answers false once the device has no room for one.
+    pub(crate) async fn grow_data(&mut self) -> Result<bool, WriteError> {
+        match self.allocate_chunk(DATA).await {
+            Err(WriteError::Chunk(ChunkError::NoDeviceSpace { .. })) => Ok(false),
+            result => result.map(|()| true),
+        }
     }
 
     async fn allocate_chunk_if_room(&mut self, kind: u64) -> Result<(), WriteError> {

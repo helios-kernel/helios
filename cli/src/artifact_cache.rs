@@ -118,28 +118,30 @@ pub enum CacheError {
         #[source]
         source: walkdir::Error,
     },
-    #[error("failed to run `cargo metadata` for {manifest}: {source}")]
-    SpawnMetadata {
+    #[error("failed to run `cargo build --unit-graph` for {manifest}: {source}")]
+    SpawnUnitGraph {
         manifest: String,
         #[source]
         source: io::Error,
     },
-    #[error("`cargo metadata` for {manifest} failed with status {status}: {stderr}")]
-    MetadataFailed {
+    #[error("`cargo build --unit-graph` for {manifest} failed with status {status}: {stderr}")]
+    UnitGraphFailed {
         manifest: String,
         status: ExitStatus,
         stderr: String,
     },
-    #[error("the `cargo metadata` output for {manifest} is not the expected JSON: {source}")]
-    DecodeMetadata {
+    #[error(
+        "the `cargo build --unit-graph` output for {manifest} is not the expected JSON: {source}"
+    )]
+    DecodeUnitGraph {
         manifest: String,
         #[source]
         source: serde_json::Error,
     },
     #[error(
-        "`cargo metadata` for {manifest} resolved no root package, or a package it names is missing"
+        "`cargo build --unit-graph` for {manifest} emitted an invalid path package id: {pkg_id}"
     )]
-    MetadataShape { manifest: String },
+    UnitGraphPackageId { manifest: String, pkg_id: String },
     #[error("{path} is not the TOML cargo reads: {source}")]
     DecodeToml {
         path: String,
@@ -784,12 +786,13 @@ pub enum FeatureSet {
     All,
 }
 
-/// The directories of the workspace path packages the program with
-/// `manifest_path` depends on for `target_triple`, itself included.
+/// The directories of the path packages the program with `manifest_path`
+/// actually compiles for `target_triple`, itself included.
 ///
-/// A path package is one `cargo metadata` gives no `source`. The
-/// dependencies are the program's whole closure in the resolve graph,
-/// build-dependencies included and dev-dependencies left out.
+/// Resolved via `cargo build -Z unstable-options --unit-graph` so only
+/// dependencies reachable under the manifest's active features and target
+/// are included: build-dependencies and proc-macros are included, while
+/// dev-dependencies and disabled optional dependencies are excluded.
 pub fn package_directories(
     cargo: &Path,
     manifest_path: &Path,
@@ -797,23 +800,29 @@ pub fn package_directories(
     features: FeatureSet,
 ) -> Result<Vec<PathBuf>, CacheError> {
     let manifest = manifest_path.display().to_string();
-    let mut metadata = Command::new(cargo);
-    metadata
-        .args(["metadata", "--format-version", "1", "--filter-platform"])
-        .arg(target_triple)
-        .arg("--manifest-path")
-        .arg(manifest_path);
+    let mut unit_graph = Command::new(cargo);
+    unit_graph
+        .args([
+            "build",
+            "-Z",
+            "unstable-options",
+            "--unit-graph",
+            "--manifest-path",
+        ])
+        .arg(manifest_path)
+        .arg("--target")
+        .arg(target_triple);
     if features == FeatureSet::All {
-        metadata.arg("--all-features");
+        unit_graph.arg("--all-features");
     }
-    let output = metadata
+    let output = unit_graph
         .output()
-        .map_err(|source| CacheError::SpawnMetadata {
+        .map_err(|source| CacheError::SpawnUnitGraph {
             manifest: manifest.clone(),
             source,
         })?;
     if !output.status.success() {
-        return Err(CacheError::MetadataFailed {
+        return Err(CacheError::UnitGraphFailed {
             manifest,
             status: output.status,
             stderr: String::from_utf8_lossy(&output.stderr)
@@ -821,88 +830,65 @@ pub fn package_directories(
                 .to_owned(),
         });
     }
-    let metadata: Metadata =
-        serde_json::from_slice(&output.stdout).map_err(|source| CacheError::DecodeMetadata {
+    let graph: UnitGraph =
+        serde_json::from_slice(&output.stdout).map_err(|source| CacheError::DecodeUnitGraph {
             manifest: manifest.clone(),
             source,
         })?;
-    let shape = || CacheError::MetadataShape {
-        manifest: manifest.clone(),
-    };
-    let resolve = metadata.resolve.ok_or_else(shape)?;
-    let nodes = resolve
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut closure = BTreeSet::new();
-    let mut pending = vec![resolve.root.as_deref().ok_or_else(shape)?];
-    while let Some(id) = pending.pop() {
-        if !closure.insert(id) {
-            continue;
-        }
-        let node = nodes.get(id).ok_or_else(shape)?;
-        for dependency in &node.deps {
-            let only_dev = !dependency.dep_kinds.is_empty()
-                && dependency
-                    .dep_kinds
-                    .iter()
-                    .all(|kind| kind.kind.as_deref() == Some("dev"));
-            if !only_dev {
-                pending.push(&dependency.pkg);
-            }
-        }
-    }
     let mut directories = BTreeSet::new();
-    for package in &metadata.packages {
-        if package.source.is_none()
-            && closure.contains(package.id.as_str())
-            && let Some(directory) = package.manifest_path.parent()
+    for unit in &graph.units {
+        if let Some(directory) =
+            path_from_unit_pkg_id(&unit.pkg_id).ok_or_else(|| CacheError::UnitGraphPackageId {
+                manifest: manifest.clone(),
+                pkg_id: unit.pkg_id.clone(),
+            })?
         {
-            directories.insert(directory.to_path_buf());
+            directories.insert(directory);
         }
     }
     Ok(directories.into_iter().collect())
 }
 
-/// The parts of `cargo metadata --format-version 1` the closure needs.
+/// Decodes the local package directory from a Cargo `unit-graph` `pkg_id`
+/// (`path+file://<url-path>#...`), returning `Ok(None)` for non-path packages.
+fn path_from_unit_pkg_id(pkg_id: &str) -> Option<Option<PathBuf>> {
+    let Some(rest) = pkg_id.strip_prefix("path+file://") else {
+        return Some(None);
+    };
+    let encoded_path = rest.split('#').next().unwrap_or(rest);
+    let mut decoded = Vec::with_capacity(encoded_path.len());
+    let bytes = encoded_path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = char::from(*bytes.get(index + 1)?).to_digit(16)?;
+            let lo = char::from(*bytes.get(index + 2)?).to_digit(16)?;
+            decoded.push(((hi << 4) | lo) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let path = String::from_utf8(decoded).ok()?;
+    #[cfg(windows)]
+    let path = if path.as_bytes().get(2) == Some(&b':') && path.starts_with('/') {
+        &path[1..]
+    } else {
+        path.as_str()
+    };
+    Some(Some(PathBuf::from(path)))
+}
+
+/// The parts of `cargo build -Z unstable-options --unit-graph` the cache needs.
 #[derive(Deserialize)]
-struct Metadata {
-    packages: Vec<MetadataPackage>,
-    resolve: Option<MetadataResolve>,
+struct UnitGraph {
+    units: Vec<Unit>,
 }
 
 #[derive(Deserialize)]
-struct MetadataPackage {
-    id: String,
-    manifest_path: PathBuf,
-    /// Absent for a path package.
-    source: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct MetadataResolve {
-    /// The package whose manifest was named.
-    root: Option<String>,
-    nodes: Vec<MetadataNode>,
-}
-
-#[derive(Deserialize)]
-struct MetadataNode {
-    id: String,
-    deps: Vec<MetadataDependency>,
-}
-
-#[derive(Deserialize)]
-struct MetadataDependency {
-    pkg: String,
-    dep_kinds: Vec<MetadataDependencyKind>,
-}
-
-#[derive(Deserialize)]
-struct MetadataDependencyKind {
-    /// `null` for a normal dependency, else `"dev"` or `"build"`.
-    kind: Option<String>,
+struct Unit {
+    pkg_id: String,
 }
 
 /// The dependencies of the first rule of a make-style dep-info file.
@@ -1440,7 +1426,7 @@ mod tests {
         let directories = package_directories(
             Path::new(&cargo),
             &workspace.join("program/Cargo.toml"),
-            "wasm32-wasip2",
+            "wasm32-wasip3",
             FeatureSet::Default,
         )
         .expect("the closure resolves");
@@ -1703,5 +1689,136 @@ source = "git+https://example.org/acpi?branch=helios#0123abcd"
             relative_path(Path::new("/w/helios"), Path::new("/w/helios/api/lib.rs")),
             PathBuf::from("api/lib.rs")
         );
+    }
+
+    #[test]
+    fn path_from_unit_pkg_id_decodes_percent_escapes_and_ignores_registry_ids() {
+        assert_eq!(
+            path_from_unit_pkg_id("path+file:///tmp/my%20ws/pkg%2B1#pkg@0.1.0"),
+            Some(Some(PathBuf::from("/tmp/my ws/pkg+1")))
+        );
+        assert_eq!(
+            path_from_unit_pkg_id(
+                "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228"
+            ),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn disabled_optional_dependencies_are_excluded_from_package_directories() {
+        let root = tempfile::tempdir().expect("a workspace directory");
+        let workspace = fs::canonicalize(root.path()).expect("the workspace resolves");
+        for (path, contents) in [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"program\", \"api\", \"enabled_opt\", \"disabled_opt\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "program/Cargo.toml",
+                "[package]\nname = \"program\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+                 [dependencies]\napi = { path = \"../api\", features = [\"active\"] }\n",
+            ),
+            ("program/src/main.rs", "fn main() {}\n"),
+            (
+                "api/Cargo.toml",
+                "[package]\nname = \"api\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+                 [features]\nactive = [\"dep:enabled_opt\"]\ninactive = [\"dep:disabled_opt\"]\n\
+                 [dependencies]\nenabled_opt = { path = \"../enabled_opt\", optional = true }\n\
+                 disabled_opt = { path = \"../disabled_opt\", optional = true }\n",
+            ),
+            ("api/src/lib.rs", "pub fn api() {}\n"),
+            (
+                "enabled_opt/Cargo.toml",
+                "[package]\nname = \"enabled_opt\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("enabled_opt/src/lib.rs", "pub fn enabled() {}\n"),
+            (
+                "disabled_opt/Cargo.toml",
+                "[package]\nname = \"disabled_opt\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("disabled_opt/src/lib.rs", "pub fn disabled() {}\n"),
+        ] {
+            let path = workspace.join(path);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+            fs::write(path, contents).expect("a file");
+        }
+
+        let cargo = std::env::var_os("CARGO").expect("cargo runs the tests");
+        let mut directories = package_directories(
+            Path::new(&cargo),
+            &workspace.join("program/Cargo.toml"),
+            "wasm32-wasip3",
+            FeatureSet::Default,
+        )
+        .expect("the closure resolves")
+        .into_iter()
+        .map(|directory| {
+            directory
+                .strip_prefix(&workspace)
+                .expect("inside the workspace")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+        directories.sort();
+        assert_eq!(
+            directories,
+            [
+                PathBuf::from("api"),
+                PathBuf::from("enabled_opt"),
+                PathBuf::from("program"),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_program_package_directories_follow_active_features() {
+        let root = helios_workspace_root::WorkspaceRoot::discover_from(Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        )))
+        .expect("discover helios workspace root");
+        let cargo = std::env::var_os("CARGO").expect("cargo runs the tests");
+        let cargo = Path::new(&cargo);
+        let hal = root.join(Path::new("hal"));
+
+        for program in [
+            "programs/audio-test",
+            "programs/http-client",
+            "programs/init",
+        ] {
+            let dirs = package_directories(
+                cargo,
+                &root.join(Path::new(program)).join("Cargo.toml"),
+                "wasm32-wasip3",
+                FeatureSet::Default,
+            )
+            .expect("program closure resolves");
+            assert!(
+                !dirs.contains(&hal),
+                "{program} does not enable helios-api/input and must not include hal/"
+            );
+            assert!(
+                dirs.contains(&root.join(Path::new("api"))),
+                "{program} depends on api/"
+            );
+        }
+
+        for (manifest, triple) in [
+            ("programs/compositor/Cargo.toml", "wasm32-wasip3"),
+            ("programs/input-test/Cargo.toml", "wasm32-wasip3"),
+            ("compiler-plugin/Cargo.toml", "wasm32-wasip1-threads"),
+        ] {
+            let dirs = package_directories(
+                cargo,
+                &root.join(Path::new(manifest)),
+                triple,
+                FeatureSet::Default,
+            )
+            .expect("hal-dependent closure resolves");
+            assert!(
+                dirs.contains(&hal),
+                "{manifest} enables helios-hal and must include hal/"
+            );
+        }
     }
 }

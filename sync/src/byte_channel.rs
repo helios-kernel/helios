@@ -1,11 +1,11 @@
 //! Async byte-stream channels used to connect a spawned child component's
 //! stdio streams to the parent that spawned it.
 //!
-//! These channels are single-producer-ish multiple-consumer-ish only on
-//! the live-object level: writers can be cloned freely, and EOF is
-//! delivered to the reader once *every* writer has been dropped. On the
-//! reader side there is exactly one consumer — dropping it cancels any
-//! further deliveries.
+//! Writers can be cloned freely, and EOF is delivered once *every* writer
+//! has been dropped. Readers can be cloned too — a guest's threads share a
+//! pipe's descriptor, and epoll waits on it beside them — and the reader
+//! side closes once every reader has been dropped. Data and EOF wake every
+//! parked reader, and room or a closed reader wakes every parked writer.
 //!
 //! Every operation is async — nothing here ever spins or blocks the
 //! cooperative executor.
@@ -28,7 +28,7 @@
 //! that consumes part of a burst and then waits for the writer's next
 //! chunk would never let the writer past a half-full queue. POSIX pipes
 //! wake writers on any read progress for the same reason, and wakeups are
-//! already coalesced here — `notify_all` drains the waker set, and a pop
+//! already coalesced here — a broadcast drains the waker set, and a pop
 //! only signals when the queue was full, so one park costs exactly one
 //! wakeup.
 //!
@@ -43,26 +43,32 @@
 //!   pushes under the queue lock cannot race a `close_reader` that
 //!   already drained the queue: `close_reader` sets the flag *while
 //!   holding* the queue lock.
-//! - Each direction has its own [`ByteSignal`]. A signal is a coalescing
-//!   permit plus a waker set guarded by its own `spin::Mutex`; the two
-//!   signals are independent, so a drain on one CPU and a write on
-//!   another never contend on the same lock.
+//! - Each direction has its own [`ByteSignal`]. A signal is a broadcast:
+//!   a generation counter plus a waker set guarded by its own
+//!   `spin::Mutex`. It stores no permit, so no wake outlives the queue
+//!   state it was raised for and no waiter can take a wake another
+//!   waiter needed. The two signals are independent, so a drain on one
+//!   CPU and a write on another never contend on the same lock.
+//! - A waiter arms before it tests: its [`SignalWait`] samples the
+//!   generation when it is created and again each time it completes, and
+//!   only then is the queue or a close flag read. A broadcast raised
+//!   after that sample completes the wait, whenever the waiter parks.
 //! - Wakeup safety (no lost wakeups) rests on a Dekker-style handshake
 //!   between [`ByteSignal::poll_notified`] and the notifiers. A waiter
-//!   claims the permit, registers its waker, then claims the permit
-//!   *again* before reporting `Pending`. A notifier publishes the permit
-//!   first and only then looks at the waiter count. Both the permit
-//!   store/load and the waiter-count store/load use `SeqCst` so that the
-//!   store-then-load pairs on the two sides cannot be reordered: if the
-//!   notifier's count load misses a registration, its permit store is
-//!   ordered before the waiter's second permit load, and the waiter
-//!   returns `Ready` instead of parking.
+//!   compares the generation with its sample, registers its waker, then
+//!   compares *again* before reporting `Pending`. A notifier advances the
+//!   generation first and only then looks at the waiter count. Both the
+//!   generation and the waiter count are stored and loaded `SeqCst` so
+//!   that the store-then-load pairs on the two sides cannot be
+//!   reordered: if the notifier's count load misses a registration, its
+//!   generation store is ordered before the waiter's second load, and
+//!   the waiter returns `Ready` instead of parking.
 
 extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
@@ -89,7 +95,8 @@ const BYTE_CHANNEL_WAKER_CAPACITY: usize = 8;
 /// back without forcing an extra copy at adapter boundaries.
 struct ByteChannel {
     queue: ByteQueue,
-    /// Notifies consumers when new bytes or a close event are available.
+    /// Wakes every parked consumer when new bytes or a close event are
+    /// available.
     readable: ByteSignal,
     /// Notifies producers parked on a full queue that a slot was freed or
     /// that the channel closed under them.
@@ -137,7 +144,14 @@ impl ByteChannel {
 
     fn close_reader(&self) {
         self.queue.close_reader(&self.reader_closed);
-        self.readable.notify_one();
+        self.readable.notify_all();
+        self.writable.notify_all();
+    }
+
+    /// Publish that every writer is gone: EOF for every reader.
+    fn close_writer(&self) {
+        self.writer_closed.store(true, Ordering::Release);
+        self.readable.notify_all();
         self.writable.notify_all();
     }
 
@@ -397,10 +411,15 @@ impl WakerSet {
     }
 }
 
+/// Broadcast wake-up for one direction of one channel.
+///
+/// Every waiter re-reads the queue and the close flags for itself, so a
+/// signal only says "the state may have moved": it releases every wait
+/// armed before it and stores nothing for a wait armed after it.
 struct ByteSignal {
-    // Coalesce notifications: queue state is authoritative, so a burst of
-    // writes must not leave hundreds of stale permits for the next empty wait.
-    permit: AtomicBool,
+    /// Advanced once per [`Self::notify_all`]. A wait completes when the
+    /// generation moves past the value it was armed at.
+    generation: AtomicU64,
     /// Number of wakers currently parked in `wakers`. Mutated only under
     /// the `wakers` lock, read without it on the notify fast path.
     waiters: AtomicUsize,
@@ -410,27 +429,21 @@ struct ByteSignal {
 impl ByteSignal {
     const fn new() -> Self {
         Self {
-            permit: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             waiters: AtomicUsize::new(0),
             wakers: Mutex::new(WakerSet::new()),
         }
     }
 
-    fn notify_one(&self) {
-        if !self.publish_permit() {
-            return;
-        }
-        let waker = self.take_waker();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+    /// Samples the generation a new wait is armed at.
+    fn arm(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
-    /// Wake every parked waiter. Used for writability, where several
-    /// tasks may be parked on the same full queue and each of them has to
-    /// re-evaluate the queue for itself.
+    /// Release every wait armed before this call and wake every parked
+    /// waiter, each of which re-evaluates the channel for itself.
     fn notify_all(&self) {
-        if !self.publish_permit() {
+        if !self.advance() {
             return;
         }
         while let Some(waker) = self.take_waker() {
@@ -438,13 +451,13 @@ impl ByteSignal {
         }
     }
 
-    /// Publish the permit and report whether anyone is parked.
+    /// Advance the generation and report whether anyone is parked.
     ///
     /// The `SeqCst` pair is load-bearing: see the module's wakeup-safety
     /// note. A `Release` store followed by an `Acquire` load may be
     /// reordered, and that reordering is exactly a lost wakeup.
-    fn publish_permit(&self) -> bool {
-        self.permit.store(true, Ordering::SeqCst);
+    fn advance(&self) -> bool {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.waiters.load(Ordering::SeqCst) != 0
     }
 
@@ -456,17 +469,28 @@ impl ByteSignal {
     }
 
     fn poll_notified(&self, cx: &mut Context<'_>, wait: &mut SignalWait) -> Poll<()> {
-        if self.try_claim_permit() {
-            self.remove_registered_waker(wait);
+        if self.complete_if_advanced(wait) {
             return Poll::Ready(());
         }
         self.register_waker(wait, cx.waker());
-        if self.try_claim_permit() {
-            self.remove_registered_waker(wait);
+        if self.complete_if_advanced(wait) {
             Poll::Ready(())
         } else {
             Poll::Pending
         }
+    }
+
+    /// Completes `wait` when a broadcast has landed since it was armed,
+    /// re-arming it at the current generation so the caller's next test
+    /// of the channel is covered by the next broadcast.
+    fn complete_if_advanced(&self, wait: &mut SignalWait) -> bool {
+        let generation = self.generation.load(Ordering::SeqCst);
+        if generation == wait.observed {
+            return false;
+        }
+        wait.observed = generation;
+        self.remove_registered_waker(wait);
+        true
     }
 
     fn register_waker(&self, wait: &mut SignalWait, waker: &Waker) {
@@ -495,20 +519,28 @@ impl ByteSignal {
         wakers.remove(waker);
         self.waiters.store(wakers.len, Ordering::SeqCst);
     }
-
-    fn try_claim_permit(&self) -> bool {
-        self.permit.swap(false, Ordering::SeqCst)
-    }
 }
 
-/// Reusable waker registration for one signal.
+/// Reusable wait on one signal: the generation it is armed at and the
+/// waker it has registered.
 struct SignalWait {
+    observed: u64,
     registered: Option<Waker>,
 }
 
 impl SignalWait {
-    const fn new() -> Self {
-        Self { registered: None }
+    /// A wait armed on `signal` now, before the caller tests the channel.
+    fn armed(signal: &ByteSignal) -> Self {
+        Self::armed_at(signal.arm())
+    }
+
+    /// A wait armed at a generation the caller sampled before it tested
+    /// the channel.
+    const fn armed_at(observed: u64) -> Self {
+        Self {
+            observed,
+            registered: None,
+        }
     }
 }
 
@@ -602,8 +634,7 @@ impl Drop for ByteWriter {
         let previous = self.channel.writer_handles.fetch_sub(1, Ordering::Relaxed);
         assert!(previous != 0, "byte writer handle count underflowed");
         if previous == 1 {
-            self.channel.writer_closed.store(true, Ordering::Release);
-            self.channel.readable.notify_one();
+            self.channel.close_writer();
         }
     }
 }
@@ -634,11 +665,12 @@ impl Drop for ByteReader {
 }
 
 impl ByteWriter {
-    /// Reusable parking state for the poll-based write paths.
+    /// Reusable parking state for the poll-based write paths, armed now:
+    /// create it before testing whether the channel can take a write.
     pub fn wait_state(&self) -> ByteWriteWait {
         ByteWriteWait {
             channel: self.channel.clone(),
-            wait: SignalWait::new(),
+            wait: SignalWait::armed(&self.channel.writable),
         }
     }
 
@@ -667,7 +699,7 @@ impl ByteWriter {
         }
         match self.channel.push(bytes) {
             Ok(QueuePush::Pushed) => {
-                self.channel.readable.notify_one();
+                self.channel.readable.notify_all();
                 TryWrite::Written
             }
             Ok(QueuePush::Full(bytes)) => TryWrite::Full(bytes),
@@ -741,7 +773,7 @@ impl ByteWriter {
     /// A producer that parks on something other than this channel has
     /// no other way to learn that the consumer went away: it is not
     /// waiting on the queue, so the close that wakes writability wakes
-    /// nothing it holds. The preview2 TCP bridge is one — it parks on a
+    /// nothing it holds. A TCP bridge is one — it parks on a
     /// socket read with no deadline — and a bridge that never learns
     /// its channel is gone never ends, keeping the socket it reads from
     /// alive for the rest of the boot (#184).
@@ -765,17 +797,21 @@ impl ByteWriter {
     }
 
     pub fn close(&self) {
-        self.channel.writer_closed.store(true, Ordering::Release);
-        self.channel.readable.notify_one();
-        self.channel.writable.notify_all();
+        self.channel.close_writer();
     }
 }
 
 impl ByteReader {
+    /// Reusable parking state for the poll-based read paths, armed now:
+    /// create it before testing whether the channel is readable.
     pub fn wait_state(&self) -> ByteReadWait {
+        self.wait_state_armed_at(self.channel.readable.arm())
+    }
+
+    fn wait_state_armed_at(&self, generation: u64) -> ByteReadWait {
         ByteReadWait {
             channel: self.channel.clone(),
-            wait: SignalWait::new(),
+            wait: SignalWait::armed_at(generation),
         }
     }
 
@@ -814,6 +850,10 @@ impl ByteReader {
     /// Await the next chunk. Returns `None` when every writer has been
     /// dropped and the queue is drained (EOF).
     pub async fn read(&self) -> Option<Bytes> {
+        // Armed before the first pop; the parking state that carries the
+        // wait is only built if that pop comes back empty, and re-arms
+        // itself each time it completes, before the next pop.
+        let armed = self.channel.readable.arm();
         let mut wait = None;
         loop {
             match self.channel.pop() {
@@ -826,7 +866,7 @@ impl ByteReader {
                         // before the last liveness guard dropped.
                         return self.channel.pop();
                     }
-                    let wait = wait.get_or_insert_with(|| self.wait_state());
+                    let wait = wait.get_or_insert_with(|| self.wait_state_armed_at(armed));
                     core::future::poll_fn(|cx| {
                         self.channel.readable.poll_notified(cx, &mut wait.wait)
                     })
@@ -1144,8 +1184,8 @@ mod tests {
     }
 
     /// A producer parked on something other than the queue still has
-    /// to learn that the consumer went away. Without this the preview2
-    /// TCP bridge, which parks on a deadline-free socket read, outlived
+    /// to learn that the consumer went away. Without this a TCP
+    /// bridge, which parks on a deadline-free socket read, outlived
     /// the instance whose channel it was feeding and kept that
     /// instance's connection open for the rest of the boot (#184).
     #[test]
@@ -1283,12 +1323,12 @@ mod tests {
         let waker = waker(counter.clone());
         let mut cx = Context::from_waker(&waker);
 
-        // Interleaving A: the drain publishes its permit after the writer
+        // Interleaving A: the drain broadcasts after the writer armed and
         // decided the queue was full but before the waker is registered.
-        // Nobody is parked, so no wake is sent — the permit alone has to
-        // carry the writer through, or it parks forever.
-        let mut wait = super::SignalWait::new();
-        assert!(!signal.try_claim_permit());
+        // Nobody is parked, so no wake is sent — the generation the wait
+        // was armed at alone has to carry the writer through, or it parks
+        // forever.
+        let mut wait = super::SignalWait::armed(signal);
         signal.notify_all();
         assert_eq!(
             counter.count(),
@@ -1298,7 +1338,7 @@ mod tests {
         assert_eq!(signal.poll_notified(&mut cx, &mut wait), Poll::Ready(()));
 
         // Interleaving B: the writer registers first, so the drain reaches
-        // its waker and the following poll observes the permit.
+        // its waker and the following poll observes the new generation.
         assert!(signal.poll_notified(&mut cx, &mut wait).is_pending());
         signal.notify_all();
         assert_eq!(counter.count(), 1);
@@ -1317,7 +1357,7 @@ mod tests {
         assert_eq!(
             writer.poll_write(&mut cx, &mut wait, &mut pending),
             Poll::Ready(Ok(())),
-            "the permit published by the drain must be observed"
+            "the broadcast raised by the drain must be observed"
         );
         assert!(pending.is_none());
     }
@@ -1355,6 +1395,105 @@ mod tests {
 
         assert_eq!(first_counter.count(), 1);
         assert_eq!(second_counter.count(), 1);
+    }
+
+    /// A pipe a guest's threads share can have several readers parked on
+    /// it at once. EOF is a state every one of them has to observe: a
+    /// close that reached only one would leave the others asleep on a
+    /// channel that can never produce another byte.
+    #[test]
+    fn a_closing_writer_completes_every_parked_reader() {
+        let (writer, reader) = byte_channel();
+        let second = reader.clone();
+
+        let first_counter = CountingWaker::new();
+        let first_waker = waker(first_counter.clone());
+        let mut first_cx = Context::from_waker(&first_waker);
+        let mut first_wait = reader.wait_state();
+
+        let second_counter = CountingWaker::new();
+        let second_waker = waker(second_counter.clone());
+        let mut second_cx = Context::from_waker(&second_waker);
+        let mut second_wait = second.wait_state();
+
+        assert!(
+            reader
+                .poll_read(&mut first_cx, &mut first_wait)
+                .is_pending()
+        );
+        assert!(
+            second
+                .poll_read(&mut second_cx, &mut second_wait)
+                .is_pending()
+        );
+
+        drop(writer);
+
+        assert_eq!(first_counter.count(), 1, "the close wakes the first reader");
+        assert_eq!(
+            second_counter.count(),
+            1,
+            "the close wakes the second reader"
+        );
+        assert_eq!(
+            reader.poll_read(&mut first_cx, &mut first_wait),
+            Poll::Ready(None)
+        );
+        assert_eq!(
+            second.poll_read(&mut second_cx, &mut second_wait),
+            Poll::Ready(None)
+        );
+    }
+
+    /// Data is the same: every parked reader re-reads the queue, one of
+    /// them takes the chunk, and the rest park again.
+    #[test]
+    fn a_write_wakes_every_parked_reader() {
+        let (writer, reader) = byte_channel();
+        let second = reader.clone();
+
+        let first_counter = CountingWaker::new();
+        let first_waker = waker(first_counter.clone());
+        let mut first_cx = Context::from_waker(&first_waker);
+        let mut first_wait = reader.wait_state();
+
+        let second_counter = CountingWaker::new();
+        let second_waker = waker(second_counter.clone());
+        let mut second_cx = Context::from_waker(&second_waker);
+        let mut second_wait = second.wait_state();
+
+        assert!(
+            reader
+                .poll_readable(&mut first_cx, &mut first_wait)
+                .is_pending()
+        );
+        assert!(
+            second
+                .poll_readable(&mut second_cx, &mut second_wait)
+                .is_pending()
+        );
+
+        assert_eq!(
+            writer.try_write(Bytes::from_static(b"one")),
+            TryWrite::Written
+        );
+
+        assert_eq!(first_counter.count(), 1, "the write wakes the first reader");
+        assert_eq!(
+            second_counter.count(),
+            1,
+            "the write wakes the second reader"
+        );
+        assert_eq!(
+            reader.poll_read(&mut first_cx, &mut first_wait),
+            Poll::Ready(Some(Bytes::from_static(b"one")))
+        );
+        assert!(
+            second
+                .poll_read(&mut second_cx, &mut second_wait)
+                .is_pending(),
+            "the chunk is gone, so the second reader parks again"
+        );
     }
 
     #[test]

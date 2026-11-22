@@ -68,6 +68,11 @@ jobs:
       profile_format: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'true' || steps.filter.outputs.profile_format || 'false' }}
       # Guest-program profiles the selected checks and smoke lanes read.
       wasm_profiles: ${{ steps.select.outputs.wasm_profiles }}
+      # gVisor's syscall suite: `full`, `listed` or `none`, and the
+      # build and shard matrices for that mode.
+      linux_suite_mode: ${{ steps.select.outputs.linux_suite_mode }}
+      linux_suite_build: ${{ steps.select.outputs.linux_suite_build }}
+      linux_suite_shards: ${{ steps.select.outputs.linux_suite_shards }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -181,6 +186,7 @@ jobs:
               - 'kernel/src/wasmtime_adapter/component_host/service/gpu.rs'
               - 'kernel/src/wasmtime_adapter/component_host/service/display.rs'
               - 'x86/src/memory_type.rs'
+              - 'x86-vmm/src/memory_type.rs'
               - 'wit/deps/helios-system/gpu.wit'
               - 'wit/deps/helios-system/display.wit'
               - 'programs/gpu-test/**'
@@ -208,6 +214,29 @@ jobs:
               - '.github/ci-lanes.json'
               - '.github/workflows/ci.yml'
               - '.github/actions/checkout-wasmtime/**'
+              - '.github/actions/ci-root-key/**'
+            # What gVisor's syscall suite measures and the suite itself:
+            # the Linux ABI and the libraries beneath it, the kernel's
+            # Linux process host, the native-execution contract and each
+            # backend's half of it, the suite's pin, runner and passing
+            # lists, the inspector action that runs it, and the lane's own
+            # definition. Like `gpu`, it overlaps `shared` rather than
+            # carving out of it.
+            linux_abi:
+              - '!**/*.md'
+              - 'linux/**'
+              - 'unix/**'
+              - 'sync/**'
+              - 'kernel/src/wasmtime_adapter/component_host/service/linux.rs'
+              - 'hal/src/native.rs'
+              - 'x86/src/native.rs'
+              - 'x86/src/native.S'
+              - 'aarch64/src/native.rs'
+              - 'aarch64/src/native.S'
+              - 'tools/gvisor-syscalls/**'
+              - 'inspector/src/linux_suite.rs'
+              - '.github/ci-lanes.json'
+              - '.github/workflows/ci.yml'
             profile_format:
               - '!**/*.md'
               - 'rust-toolchain.toml'
@@ -232,7 +261,8 @@ jobs:
           lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --arg event "${EVENT:-}" --argjson heavy "${HEAVY}" '
             to_entries
             | map(select($changed == null
-                or ($event == "push" and (.key != "test-btrfs-upstream" and .key != "test-btrfs-fuzz"))
+                or ($event == "push" and (.key != "test-btrfs-upstream" and .key != "test-btrfs-fuzz"
+                    and .key != "linux-syscalls"))
                 or (.value.surfaces + (if .value.exclusive then [] else ["shared", "pin"] end)
                     | any(. as $surface | $changed | index($surface)))))
             | map(select($heavy or (.value.heavy != true)))
@@ -252,7 +282,27 @@ jobs:
           # Every consumer declares the profile its prebuild reads.
           wasm_profiles="$(jq -c --argjson lanes "${lanes}" '
             [$lanes[] as $name | .[$name]["guest-wasm"] // empty] | unique' .github/ci-lanes.json)"
+          # gVisor's syscall suite: a full run takes every case, sharded
+          # so each shard fits a job; a listed run takes the committed
+          # passing lists' cases, one shard per architecture. aarch64
+          # runs under TCG (the Arm runners publish no KVM) and gets
+          # twice the shards.
+          linux_suite="$(jq -cn --argjson lanes "${lanes}" '
+            (if ($lanes | index("linux-syscalls-full")) then "full"
+             elif ($lanes | index("linux-syscalls")) then "listed"
+             else "none" end) as $mode
+            | [{arch: "x86_64", runner: "ubuntu-24.04", vm_arch: "x86-64", accel: "kvm", shards: 8},
+               {arch: "aarch64", runner: "ubuntu-24.04-arm", vm_arch: "aarch64", accel: "tcg", shards: 16}] as $arches
+            | {mode: $mode,
+               build: (if $mode == "none" then [] else $arches | map(del(.shards)) end),
+               shards: (if $mode == "none" then []
+                        else [$arches[] | . as $a | range(0; if $mode == "full" then $a.shards else 1 end)
+                              | {arch: $a.arch, runner: $a.runner, vm_arch: $a.vm_arch, accel: $a.accel,
+                                 shard: ., shards: (if $mode == "full" then $a.shards else 1 end)}] end)}')"
           {
+            echo "linux_suite_mode=$(jq -r .mode <<< "$linux_suite")"
+            echo "linux_suite_build=$(jq -c .build <<< "$linux_suite")"
+            echo "linux_suite_shards=$(jq -c .shards <<< "$linux_suite")"
             echo "wasm_profiles=${wasm_profiles}"
             echo "lanes=${lanes}"
             echo "checks=$(jq -c 'map(select(.["guest-wasm"] == ""))' <<< "$checks")"
@@ -265,7 +315,9 @@ jobs:
   kernel-profile:
     name: kernel-profile
     needs: changes
-    if: needs.changes.outputs.profile_format == 'true' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')
+    # The syscall suite boots a release x86-64 kernel too, so it needs this
+    # run's profile under the same condition the smoke lane does.
+    if: needs.changes.outputs.profile_format == 'true' && (contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') || needs.changes.outputs.linux_suite_mode != 'none')
     permissions:
       contents: read
     uses: ./.github/workflows/kernel-profile.yml
@@ -298,11 +350,9 @@ jobs:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev cmake ninja-build
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: libudev-dev cmake ninja-build
       # Each program's wasm, kept with the files its build read (#1022): a
       # program none of whose inputs changed is taken from the cache
       # instead of built. The key carries the run id so that each
@@ -335,6 +385,14 @@ jobs:
         with:
           workspaces: helios
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+      # Pinned `wasi-sdk-34` used by `helios-cli wasm-build` to cross-compile
+      # BoringSSL for `programs/http-client`; restored read-only on PRs and
+      # populated on `dev` pushes.
+      - name: Restore wasi-sdk-34 toolchain cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: helios/target/wasi-sdk-34
+          key: helios-wasi-sdk-34-${{ runner.os }}-${{ runner.arch }}
       # The guest programs build in the profile the matrix names; the tool
       # that drives them is the debug one every check lane runs.
       - uses: ./helios/.github/actions/helios-cli
@@ -397,16 +455,26 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install format lint dependencies
+        if: matrix.name == 'lint-fmt'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: just
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs attr libclang-dev
-      - uses: taiki-e/install-action@v2
+        if: matrix.name != 'lint-fmt'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: libudev-dev just cmake ninja-build erofs-utils btrfs-progs attr libclang-dev
+      - if: matrix.name == 'lint-fmt'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - if: matrix.name != 'lint-fmt'
+        uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools,cargo-deny,nextest
-      - uses: ./helios/.github/actions/setup-zig
+      - if: matrix.name != 'lint-fmt'
+        uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Restore WASI tooling artifacts
@@ -449,7 +517,8 @@ jobs:
           workspaces: helios
           key: ${{ matrix.name }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
-      - uses: astral-sh/setup-uv@v6
+      - if: matrix.name != 'lint-fmt'
+        uses: astral-sh/setup-uv@v6
       # After the Rust cache, so a lane whose cache holds the binary
       # builds it from there when no other job has uploaded it yet.
       - uses: ./helios/.github/actions/helios-cli
@@ -549,13 +618,13 @@ jobs:
           key: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
             qemu-system-misc opensbi
-          qemu-system-riscv64 --version
+      - name: Record QEMU version
+        run: qemu-system-riscv64 --version
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
@@ -904,14 +973,15 @@ jobs:
           key: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
-            python3-venv pkg-config flex bison \
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
             swtpm
+      - name: Record swtpm and KVM availability
+        run: |
           swtpm --version
           # Recorded rather than required: the accelerator is picked by
           # capability and today's Arm runners publish no KVM node.
@@ -1129,12 +1199,12 @@ jobs:
           # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
           # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
-            --accel tcg --kernel-feature linux \
+            --accel tcg --smp 4 --kernel-feature linux \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1152,6 +1222,13 @@ jobs:
           # results check-memory.sh records from Linux, which build-fixtures.sh
           # first confirmed on this runner.
           grep -Fqx 'memory:0' linux-smoke.out
+          grep -Fqx 'pthreads:0' linux-smoke.out
+          # The system-information suite (#1035) runs as a process with no
+          # wall-clock right and no scheduling or resource privilege, the
+          # same modes build-fixtures.sh asserts on this Linux runner.
+          for suite in clock random identity limits machine priority container; do
+            grep -Fqx "$suite: ok" linux-smoke.out
+          done
       - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
@@ -1417,13 +1494,12 @@ jobs:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils \
-            python3-venv pkg-config flex bison \
-            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
             swtpm
       - name: Restore the pinned QEMU install prefix
         id: qemu-cache
@@ -1518,12 +1594,13 @@ jobs:
           key: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils btrfs-progs \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
             qemu-system-x86 ovmf swtpm
+      - name: Record QEMU, swtpm and KVM availability
+        run: |
           qemu-system-x86_64 --version
           swtpm --version
           # The inspector picks the accelerator by capability; this only
@@ -1810,12 +1887,12 @@ jobs:
           # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
           # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
-            --accel kvm --kernel-feature linux \
+            --accel kvm --smp 4 --kernel-feature linux \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1833,6 +1910,13 @@ jobs:
           # results check-memory.sh records from Linux, which build-fixtures.sh
           # first confirmed on this runner.
           grep -Fqx 'memory:0' linux-smoke.out
+          grep -Fqx 'pthreads:0' linux-smoke.out
+          # The system-information suite (#1035) runs as a process with no
+          # wall-clock right and no scheduling or resource privilege, the
+          # same modes build-fixtures.sh asserts on this Linux runner.
+          for suite in clock random identity limits machine priority container; do
+            grep -Fqx "$suite: ok" linux-smoke.out
+          done
       - name: Kill the guest during a btrfs write burst
         timeout-minutes: 10
         shell: bash
@@ -2660,12 +2744,13 @@ jobs:
           key: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build erofs-utils \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils
             qemu-system-x86 ovmf swtpm socat
+      - name: Record QEMU and KVM availability
+        run: |
           qemu-system-x86_64 --version
           if [ -e /dev/kvm ]; then
             sudo chmod 666 /dev/kvm
@@ -2832,17 +2917,16 @@ jobs:
           key: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
           restore-keys: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          # The build dependencies of both pinned builds, Mesa's lavapipe
-          # as the host Vulkan driver.
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build meson ovmf \
-            python3-venv pkg-config flex bison \
-            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev \
-            libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build meson ovmf
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev
+            libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev
             mesa-vulkan-drivers libegl-mesa0 gdb
+      - name: Configure Venus render devices
+        run: |
           # vgem gives a GPU-less runner the render node QEMU's EGL
           # context opens; the azure kernel's own modules package carries
           # it.
@@ -3088,9 +3172,9 @@ jobs:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install upstream test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends btrfs-progs wamerican libclang-dev
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: btrfs-progs wamerican libclang-dev
       - name: Build Helios upstream test adapters
         working-directory: helios
         run: cargo build --locked -p helios-btrfs --examples --features test-support
@@ -3126,18 +3210,21 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Resolve running kernel headers package
+        id: kernel-headers
+        run: echo "headers=linux-headers-$(uname -r)" >> "$GITHUB_OUTPUT"
       - name: Install fstests, btrfs-progs and FUSE
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            acl attr automake bc dbench dump e2fsprogs fio gawk gcc git indent \
-            libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin \
-            liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev \
-            uuid-runtime xfsprogs "linux-headers-$(uname -r)" sqlite3 \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            acl attr automake bc dbench dump e2fsprogs fio gawk gcc git indent
+            libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin
+            liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev
+            uuid-runtime xfsprogs ${{ steps.kernel-headers.outputs.headers }} sqlite3
             libgdbm-compat-dev xfslibs-dev btrfs-progs fuse3 libclang-dev
       - name: Build the FUSE adapter
         working-directory: helios
-        run: cargo build --locked -p helios-btrfs --example fuse-btrfs --features test-support,write
+        run: cargo build --locked --release -p helios-btrfs --example fuse-btrfs --features test-support,write
       - name: Run fstests against the FUSE mount
         working-directory: helios
         run: sudo env "PATH=$PATH" tools/btrfs/fstests/run.sh
@@ -3190,10 +3277,411 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # gVisor's syscall suite (#1064). `linux-syscalls` runs the committed
+  # passing lists' cases on a pull request or push that touches the
+  # `linux_abi` surface; `linux-syscalls-full` runs every case on dispatch
+  # and nightly. Both build the pinned suite statically, run each case on
+  # a native Linux runner of the same architecture first, and run every
+  # case that does not fail there on Helios, one guest process per case
+  # under a bound. `tools/gvisor-syscalls` holds the pin, the runner and
+  # the lists.
+  linux-syscalls-build:
+    name: linux-syscalls-build (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.linux_suite_mode != 'none'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 40 || 15 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.linux_suite_build) }}
+    # The suite's build is kept as an image in this repository's container
+    # registry, one per architecture and per pin, build script and image
+    # definition; only a run that is not a pull request publishes one.
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SUITE: ${{ github.workspace }}/gvisor-syscalls
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+          sparse-checkout: |
+            tools/gvisor-syscalls
+            .github
+      - uses: astral-sh/setup-uv@v6
+      - name: Log in to the container registry
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      # A registry that answers anything but "manifest unknown" fails the
+      # step: only an image this pin has never had is built.
+      - name: Take this pin's prebuilt suite
+        id: prebuilt
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/helios-gvisor-syscalls:${{ matrix.arch }}-${{ hashFiles('helios/tools/gvisor-syscalls/pin.json', 'helios/tools/gvisor-syscalls/build.sh', 'helios/tools/gvisor-syscalls/image/Dockerfile') }}
+        run: |
+          set -euo pipefail
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          if output="$(docker pull "$IMAGE" 2>&1)"; then
+            # A scratch image has no command; `docker create` needs one
+            # only to exist, never to run.
+            container="$(docker create "$IMAGE" none)"
+            mkdir -p "$SUITE/bin"
+            docker cp "$container:/." "$SUITE/bin"
+            docker rm "$container" > /dev/null
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            cat "$SUITE/bin/BUILT"
+          elif grep -q 'manifest unknown' <<< "$output"; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "no prebuilt suite at $IMAGE"
+          else
+            echo "$output" >&2
+            exit 1
+          fi
+      # A listed run builds only the listed binaries, which make no
+      # complete image; a full run builds them all and, outside a pull
+      # request, publishes them.
+      - name: Build the suite's static binaries
+        if: steps.prebuilt.outputs.found == 'false'
+        shell: bash
+        working-directory: helios
+        env:
+          ARCH: ${{ matrix.arch }}
+          MODE: ${{ needs.changes.outputs.linux_suite_mode }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == listed ]]; then
+            uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls binaries \
+              "tools/gvisor-syscalls/passing/$ARCH.txt" > "$RUNNER_TEMP/binaries.txt"
+            bash tools/gvisor-syscalls/build.sh "$ARCH" "$SUITE/bin" "$RUNNER_TEMP/binaries.txt"
+          else
+            bash tools/gvisor-syscalls/build.sh "$ARCH" "$SUITE/bin"
+          fi
+          cat "$SUITE/bin/BUILT"
+      - name: Publish the suite's build
+        if: steps.prebuilt.outputs.found == 'false' && needs.changes.outputs.linux_suite_mode == 'full' && github.event_name != 'pull_request'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.prebuilt.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker build --file helios/tools/gvisor-syscalls/image/Dockerfile --tag "$IMAGE" "$SUITE/bin"
+          docker push "$IMAGE"
+      - name: List the cases the binaries hold
+        shell: bash
+        working-directory: helios
+        env:
+          ARCH: ${{ matrix.arch }}
+          MODE: ${{ needs.changes.outputs.linux_suite_mode }}
+        run: |
+          set -euo pipefail
+          only=()
+          if [[ "$MODE" == listed ]]; then
+            only=(--only "tools/gvisor-syscalls/passing/$ARCH.txt")
+          fi
+          uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls list \
+            --bin-dir "$SUITE/bin" --out "$SUITE/cases.txt" "${only[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gvisor-syscalls-${{ matrix.arch }}
+          path: ${{ env.SUITE }}
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-syscalls:
+    name: linux-syscalls (${{ matrix.arch }} ${{ matrix.shard }}/${{ matrix.shards }})
+    needs: [changes, kernel-profile, wasm-release, linux-syscalls-build]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.linux-syscalls-build.result == 'success' && needs.wasm-release.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 40 || 15 }}
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.linux_suite_shards) }}
+    env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
+      HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+      HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+      HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+      # The QEMU smoke-aarch64 builds, for the same reason: Ubuntu 24.04's
+      # asserts in its emulated GICv3 under multi-threaded TCG.
+      QEMU_VERSION: "11.1.1"
+      QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
+      QEMU_PREFIX: ${{ github.workspace }}/qemu-install
+      SUITE: ${{ github.workspace }}/gvisor-syscalls
+      RESULTS: ${{ github.workspace }}/gvisor-syscalls-results
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: actions/download-artifact@v4
+        with:
+          name: gvisor-syscalls-${{ matrix.arch }}
+          path: ${{ env.SUITE }}
+      - name: Count the shard's cases
+        id: cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An artifact does not keep file modes.
+          find "$SUITE/bin" -name '*_test' -type f -exec chmod +x {} +
+          count="$(awk 'NF && !/^#/' "$SUITE/cases.txt" | wc -l)"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "${count} cases in the suite list"
+      - uses: astral-sh/setup-uv@v6
+      # The bound native Linux gives one case. gVisor marks its slowest
+      # binaries `large` (fifteen minutes for the whole binary under
+      # Bazel); one case of them finishes in seconds natively, so a
+      # minute separates a hang from a slow case.
+      - name: Run the shard natively
+        shell: bash
+        working-directory: helios
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULTS"
+          uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls native \
+            --bin-dir "$SUITE/bin" --cases "$SUITE/cases.txt" \
+            --shard "${{ matrix.shard }}/${{ matrix.shards }}" --timeout 60 \
+            --results "$RESULTS/native-${{ matrix.arch }}-${{ matrix.shard }}.jsonl"
+      - uses: ./helios/.github/actions/checkout-wasmtime
+        if: steps.cases.outputs.count != '0'
+      - uses: ./helios/.github/actions/ci-root-key
+        if: steps.cases.outputs.count != '0'
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
+      - name: Restore the precompiled cwasm cache
+        if: steps.cases.outputs.count != '0'
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install host dependencies (x86_64)
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: libudev-dev just cmake ninja-build erofs-utils btrfs-progs qemu-system-x86 ovmf
+      - name: Record QEMU and KVM availability (x86_64)
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64'
+        run: |
+          qemu-system-x86_64 --version
+          sudo chmod 666 /dev/kvm
+          ls -la /dev/kvm
+      - name: Install host dependencies (aarch64)
+        if: steps.cases.outputs.count != '0' && matrix.arch != 'x86_64'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+      - name: Restore the pinned QEMU install prefix
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
+        id: qemu-cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.QEMU_PREFIX }}
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
+      - name: Build the pinned QEMU
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64' && steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          tarball="qemu-${QEMU_VERSION}.tar.xz"
+          curl -fsSLO "https://download.qemu.org/${tarball}"
+          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
+          tar xf "${tarball}"
+          cd "qemu-${QEMU_VERSION}"
+          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
+          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
+          ninja -C build install
+      - name: Put the pinned QEMU on PATH
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
+        run: |
+          echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@v2
+        if: steps.cases.outputs.count != '0'
+        with:
+          tool: wasm-tools
+      - uses: ./helios/.github/actions/setup-zig
+        if: steps.cases.outputs.count != '0'
+        with:
+          version: 0.13.0
+      - name: Stage Limine bootloader share
+        if: steps.cases.outputs.count != '0'
+        run: |
+          # The digest is the one of v12.9.6's `limine-binary.tar.gz`.
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      - name: Restore WASI tooling artifacts
+        if: steps.cases.outputs.count != '0'
+        id: artifact-cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.cases.outputs.count != '0' && steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      - uses: ./helios/.github/actions/helios-cli
+        if: steps.cases.outputs.count != '0'
+        with:
+          profile: release
+      - name: Build inspector
+        if: steps.cases.outputs.count != '0'
+        working-directory: helios
+        run: cargo build --release -p helios-inspector
+      # An x86-64 release kernel is built against the kernel profile, as
+      # in smoke-x86-64: the default branch's, or this run's when the
+      # change moves the profile's format.
+      - name: Fetch the kernel profile
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64' && needs.changes.outputs.profile_format != 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch
+      - name: Fetch this run's kernel profile
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64' && needs.changes.outputs.profile_format == 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch --run "${{ github.run_id }}"
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        if: steps.cases.outputs.count != '0'
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
+      # Each case runs as its own guest process under the bound below,
+      # and a case that takes the guest down costs that case and a boot.
+      # The binaries reach the guest through the read-only host share at
+      # `/host`: the whole suite is far larger than a boot payload. Under
+      # TCG a case runs at emulation speed, so its bound is three times
+      # the KVM one.
+      - name: Run the shard on Helios
+        if: steps.cases.outputs.count != '0'
+        shell: bash
+        working-directory: helios
+        env:
+          VM_ARCH: ${{ matrix.vm_arch }}
+          ACCEL: ${{ matrix.accel }}
+          CASE_TIMEOUT: ${{ matrix.accel == 'tcg' && 180 || 60 }}
+        run: |
+          set -euo pipefail
+          runtime="$RESULTS/runtime-${{ matrix.arch }}-${{ matrix.shard }}"
+          mkdir -p "$runtime"
+          uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls helios \
+            --cases "$SUITE/cases.txt" \
+            --native "$RESULTS/native-${{ matrix.arch }}-${{ matrix.shard }}.jsonl" \
+            --shard "${{ matrix.shard }}/${{ matrix.shards }}" \
+            --results "$RESULTS/helios-${{ matrix.arch }}-${{ matrix.shard }}.jsonl" \
+            --log "$runtime/inspector.log" \
+            -- ./target/release/helios-inspector vm --arch "$VM_ARCH" --release --memory 2G \
+              --accel "$ACCEL" --kernel-feature linux \
+              --runtime-dir "$runtime" --keep-runtime-dir \
+              --shared-dir "$SUITE/bin" \
+              --boot-program debugger --no-compiler-plugin \
+              linux-suite --guest-dir /host --case-timeout-seconds "$CASE_TIMEOUT"
+      # Nothing to boot for: the report still reads one file per shard.
+      - name: Record an empty Helios run
+        if: steps.cases.outputs.count == '0'
+        run: touch "$RESULTS/helios-${{ matrix.arch }}-${{ matrix.shard }}.jsonl"
+      - name: Preserve the shard's results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gvisor-syscalls-results-${{ matrix.arch }}-${{ matrix.shard }}
+          # The records and the guest's logs; the runtime directory's disk
+          # images stay behind.
+          path: |
+            ${{ env.RESULTS }}/*.jsonl
+            ${{ env.RESULTS }}/runtime-*/*.log
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-syscalls-report:
+    name: linux-syscalls-report
+    needs: [changes, linux-syscalls]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.linux-syscalls.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      REPORT: ${{ github.workspace }}/gvisor-syscalls-report
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+          sparse-checkout: tools/gvisor-syscalls
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gvisor-syscalls-results-*
+          path: results
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: gvisor-syscalls-x86_64
+          path: suite/x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: gvisor-syscalls-aarch64
+          path: suite/aarch64
+      # Both architectures are counted and published before either gates,
+      # so a regression on one still leaves the other's report.
+      - name: Count, publish and gate both architectures
+        shell: bash
+        working-directory: helios
+        env:
+          MODE: ${{ needs.changes.outputs.linux_suite_mode }}
+        run: |
+          set -euo pipefail
+          status=0
+          for arch in x86_64 aarch64; do
+            shopt -s nullglob
+            native=("$GITHUB_WORKSPACE"/results/native-"$arch"-*.jsonl)
+            helios=("$GITHUB_WORKSPACE"/results/helios-"$arch"-*.jsonl)
+            shopt -u nullglob
+            uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls report \
+              --arch "$arch" --mode "$MODE" \
+              --cases "$GITHUB_WORKSPACE/suite/$arch/cases.txt" \
+              --native "${native[@]}" --helios "${helios[@]}" \
+              --passing "tools/gvisor-syscalls/passing/$arch.txt" \
+              --pin tools/gvisor-syscalls/pin.json \
+              --out-dir "$REPORT" --summary "$GITHUB_STEP_SUMMARY" || status=1
+          done
+          exit "$status"
+      - name: Preserve the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gvisor-syscalls-report
+          path: ${{ env.REPORT }}
+          if-no-files-found: error
+          retention-days: 90
+
   gate:
     name: CI result
     if: always()
-    needs: [changes, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fstests, test-btrfs-fuzz]
+    needs: [changes, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fstests, test-btrfs-fuzz, linux-syscalls-build, linux-syscalls, linux-syscalls-report]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

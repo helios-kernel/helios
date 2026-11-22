@@ -5,6 +5,12 @@
 
 #[cfg(target_os = "linux")]
 mod daemon;
+#[cfg(any(target_os = "linux", test))]
+mod mountinfo;
+#[cfg(any(target_os = "linux", test))]
+mod options;
+#[cfg(any(target_os = "linux", test))]
+mod protocol;
 
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
@@ -18,7 +24,7 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "fuse-btrfs failed");
-            std::process::ExitCode::FAILURE
+            error.exit_code()
         }
     }
 }

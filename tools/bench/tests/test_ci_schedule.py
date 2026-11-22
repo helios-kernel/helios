@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 from fnmatch import fnmatchcase
 
@@ -135,8 +136,19 @@ def test_every_selected_review_job_has_a_fifteen_minute_limit(ci_jobs, tmp_path)
     jobs = {"changes", "checks", "tests", "gate"}
     jobs.update(name for name in json.loads(selected["lanes"]) if name in ci_jobs)
     jobs.update(f"wasm-{profile}" for profile in json.loads(selected["wasm_profiles"]))
+    mode = selected["linux_suite_mode"]
+    assert mode == "listed"
+    jobs.update({"linux-syscalls-build", "linux-syscalls", "linux-syscalls-report"})
+    # The suite's jobs take their limit from the mode: a full run's shards
+    # are heavy and run on dispatch and nightly only.
+    by_mode = re.compile(
+        r"\$\{\{ needs\.changes\.outputs\.linux_suite_mode == 'full' && (\d+) \|\| (\d+) \}\}"
+    )
     for name in jobs:
-        assert int(ci_jobs[name]["timeout-minutes"]) <= 15, name
+        limit = ci_jobs[name]["timeout-minutes"]
+        if matched := by_mode.fullmatch(limit):
+            limit = matched[1] if mode == "full" else matched[2]
+        assert int(limit) <= 15, name
 
 
 @pytest.mark.parametrize(
@@ -226,6 +238,8 @@ def test_wasmtime_pin_keeps_every_existing_consumer(ci_jobs, tmp_path):
     assert set(json.loads(selected["lanes"])) == set(catalog) - {
         "smoke-x86-64-venus",
         "test-btrfs-fstests",
+        "linux-syscalls",
+        "linux-syscalls-full",
     }
 
 

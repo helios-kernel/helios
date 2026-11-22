@@ -21,8 +21,8 @@ use std::path::Path;
 use erofs_rs::build::{Builder, Compression, Metadata, Options, SpecialFile};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
-    BlockSerial, DeviceId, DirCookie, FileSystem, FsError, FsPath, IoError, NodeKind, OpenFlags,
-    WritePosition,
+    BlockSerial, DeviceId, DirCookie, DirStream, FileSystem, FsError, FsPath, IoError, NodeKind,
+    OpenFlags, WritePosition,
 };
 
 use super::{ErofsError, ErofsFs};
@@ -137,10 +137,11 @@ type FsResultBytes = Result<Vec<u8>, FsError>;
 /// each page resuming at the cookie the last entry of the one before it
 /// returned.
 fn list(fs: &ErofsFs<MemoryDisk>, dir: &str) -> Result<Vec<(String, NodeKind)>, FsError> {
+    let stream = block_on(fs.open_dir(path(dir)))?;
     let mut entries = Vec::new();
     let mut cookie = DirCookie::START;
     loop {
-        let page = block_on(fs.read_dir(path(dir), cookie, PAGE))?;
+        let page = block_on(stream.read(cookie, PAGE))?;
         let complete = page.len() < PAGE;
         for entry in &page {
             assert_ne!(entry.inode, 0, "{} carries its inode", entry.name);
@@ -234,7 +235,7 @@ fn assert_refusals(fs: &ErofsFs<MemoryDisk>) {
         Err(FsError::IsDirectory)
     );
     assert_eq!(
-        block_on(fs.read_dir(path("hello.txt"), DirCookie::START, 8)),
+        block_on(fs.open_dir(path("hello.txt"))).map(drop),
         Err(FsError::NotDirectory)
     );
     assert_eq!(
@@ -266,8 +267,9 @@ fn assert_refusals(fs: &ErofsFs<MemoryDisk>) {
     // `docs/` holds six entries, `.` and `..` among them, in one block:
     // index 7 of that block is past its last entry, so no listing of the
     // directory handed that cookie out.
+    let docs = block_on(fs.open_dir(path("docs"))).expect("opens docs");
     assert_eq!(
-        block_on(fs.read_dir(path("docs"), DirCookie::new(7), 8)),
+        block_on(docs.read(DirCookie::new(7), 8)),
         Err(FsError::Invalid)
     );
 }
@@ -511,16 +513,21 @@ fn request(
             host_share: None,
             disks: Some(cache_over(disk, 256, 1)),
         },
-        MountSource::Disk {
-            serial: BlockSerial::new(serial.as_bytes()).unwrap(),
-        },
-        "/mnt",
-        false,
-        crate::vfs::BtrfsWriteOptions {
-            entropy: crate::test_support::test_root_entropy(),
-            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-            compress: None,
-            commit: None,
+        crate::MountRequest {
+            source: MountSource::Disk {
+                serial: BlockSerial::new(serial.as_bytes()).unwrap(),
+            },
+            point: "/mnt",
+            read_only: false,
+            sharing: crate::MountSharing::Shared,
+            write: crate::vfs::BtrfsWriteOptions {
+                entropy: crate::test_support::test_root_entropy(),
+                concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+                compress: None,
+                commit: None,
+                max_inline: None,
+                now: 1_700_000_000_000_000_000,
+            },
         },
     ))
     .map(drop)
@@ -545,6 +552,34 @@ fn a_disk_mount_request_attaches_the_image_read_only() {
     assert_eq!(resolved.writable().map(drop), Err(FsError::ReadOnly));
     let listing = block_on(namespace.list("/mnt/docs")).unwrap();
     assert_eq!(listing.len(), CJK_FILES.len() + 1);
+}
+
+#[test]
+fn erofs_unix_attributes_preserve_stored_mode_and_owner() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let script = root.join("run.sh");
+    fs::write(&script, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
+    let host_meta = fs::metadata(&script).unwrap();
+    let image_path = scratch.path().join("attrs.erofs");
+    Options::default()
+        .compression(Compression::None)
+        .build_from_directory(&root, &image_path)
+        .unwrap();
+    let image = fs::read(image_path).unwrap();
+    let fs = mount(&image).expect("erofs mounts");
+    assert_eq!(
+        block_on(fs.unix_attributes(FsPath::new("run.sh").unwrap())).expect("unix attrs"),
+        crate::UnixAttributes {
+            permissions: 0o750,
+            uid: host_meta.uid(),
+            gid: host_meta.gid(),
+        }
+    );
 }
 
 #[test]

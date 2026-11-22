@@ -19,8 +19,8 @@ use core::convert::Infallible;
 
 use bytes::Bytes;
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags, RenameMode, WritePosition,
+    DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError, FsPath, FsResult, Metadata,
+    NodeId, NodeKind, OpenFlags, OwnedFsPath, RenameMode, WritePosition,
 };
 use triomphe::Arc;
 
@@ -367,8 +367,26 @@ const fn entry_inode(index: usize) -> u64 {
     index as u64 + FIRST_ENTRY_INODE
 }
 
+/// An open directory stream over the immutable boot filesystem.
+pub struct BootDir {
+    index: Arc<BootIndex>,
+    path: OwnedFsPath,
+}
+
+impl DirStream for BootDir {
+    async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+        self.index
+            .read_dir(self.path.as_path(), cookie, max_entries)
+    }
+
+    async fn rewind(&mut self) -> FsResult<()> {
+        Ok(())
+    }
+}
+
 impl FileSystem for BootFs {
     type Write = Infallible;
+    type Dir = BootDir;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.index.metadata(path)
@@ -428,13 +446,16 @@ impl FileSystem for BootFs {
         Err(FsError::ReadOnly)
     }
 
-    async fn read_dir(
-        &self,
-        path: FsPath<'_>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> FsResult<Vec<DirEntry>> {
-        self.index.read_dir(path, cookie, max_entries)
+    async fn open_dir(&self, path: FsPath<'_>) -> FsResult<BootDir> {
+        if let Some((_, node)) = self.index.lookup(path)?
+            && node.kind != NodeKind::Directory
+        {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(BootDir {
+            index: self.index.clone(),
+            path: OwnedFsPath::from(path),
+        })
     }
 
     async fn create_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
@@ -486,7 +507,8 @@ mod tests {
     use futures_lite::future::block_on;
     use helios_artifact::bootfs::{EntryKind, WriteEntry, write_image};
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags, WritePosition,
+        DeviceId, DirCookie, DirStream, FileSystem, FsError, FsPath, NodeKind, OpenFlags,
+        WritePosition,
     };
 
     use super::{BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
@@ -513,7 +535,8 @@ mod tests {
     }
 
     fn names(fs: &BootFs, directory: &str) -> Vec<(String, NodeKind)> {
-        block_on(fs.read_dir(path(directory), DirCookie::START, usize::MAX))
+        let dir = block_on(fs.open_dir(path(directory))).expect("opens directory");
+        block_on(dir.read(DirCookie::START, usize::MAX))
             .expect("directory lists")
             .into_iter()
             .map(|entry| (entry.name, entry.kind))
@@ -581,9 +604,10 @@ mod tests {
     #[test]
     fn listing_resumes_from_a_cookie() {
         let fs = boot();
-        let first = block_on(fs.read_dir(FsPath::ROOT, DirCookie::START, 2)).expect("lists");
+        let dir = block_on(fs.open_dir(FsPath::ROOT)).expect("opens");
+        let first = block_on(dir.read(DirCookie::START, 2)).expect("lists");
         assert_eq!(first.len(), 2);
-        let rest = block_on(fs.read_dir(FsPath::ROOT, first[1].next, usize::MAX)).expect("lists");
+        let rest = block_on(dir.read(first[1].next, usize::MAX)).expect("lists");
         let all: Vec<_> = first.iter().chain(&rest).map(|entry| &entry.name).collect();
         assert_eq!(all, ["bin", "empty", "etc", "lib", "lib.txt"]);
     }

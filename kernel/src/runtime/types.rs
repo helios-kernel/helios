@@ -353,6 +353,17 @@ impl DnsError {
     }
 }
 
+/// Usable RFC 9460 Type 65 (`HTTPS`) service parameters resolved for an origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpsRecord {
+    /// ALPN protocol identifiers from `SvcParamKey` 1, in wire order.
+    pub alpn: Vec<String>,
+    /// Alternative port from `SvcParamKey` 3, when overridden.
+    pub port: Option<u16>,
+    /// Minimum TTL across the answer chain, in nanoseconds.
+    pub ttl_nanos: u64,
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum TcpErrorKind {
     #[error("host could not be resolved")]
@@ -466,6 +477,8 @@ pub enum NetworkErrorDetail {
     NetworkAuthorityMissing,
     #[error("privileged bind authority is required for this port")]
     PrivilegedBindDenied,
+    #[error("requested local address is not available")]
+    AddressNotAvailable,
     #[error("virtio network device advance failed")]
     VirtioAdvanceFailed,
     #[error("DNS servers are not configured")]
@@ -581,6 +594,7 @@ impl NetworkErrorDetail {
             Self::NetworkServiceUnavailable => "network service is unavailable",
             Self::NetworkAuthorityMissing => "network authority is missing required rights",
             Self::PrivilegedBindDenied => "privileged bind authority is required for this port",
+            Self::AddressNotAvailable => "requested local address is not available",
             Self::VirtioAdvanceFailed => "virtio network device advance failed",
             Self::DnsServersUnavailable => "DNS servers are not configured",
             Self::DnsQueryStartFailed => "DNS query could not be started",
@@ -643,6 +657,8 @@ pub struct UdpDatagram {
     pub address: NetworkIpAddress,
     pub port: u16,
     pub bytes: Bytes,
+    /// Full payload length of the datagram before truncation to the caller's buffer.
+    pub original_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -661,6 +677,17 @@ pub struct TcpListener<Listener> {
 pub enum NetworkIpAddress {
     Ipv4(Ipv4Address),
     Ipv6(helios_netstack::Ipv6Address),
+}
+
+impl NetworkIpAddress {
+    /// Whether this address is the wildcard (`0.0.0.0` or `::`).
+    #[must_use]
+    pub const fn is_unspecified(self) -> bool {
+        match self {
+            Self::Ipv4(address) => u32::from_be_bytes(address.octets()) == 0,
+            Self::Ipv6(address) => address.is_unspecified(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -834,6 +861,9 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     fn hardware_address(&self) -> [u8; 6];
 
+    /// Whether the stack currently owns `address` as a configured local address.
+    fn owns_ip_address(&self, address: NetworkIpAddress) -> bool;
+
     /// Asks the DHCP server whether the lease the interface holds is
     /// still good, after a machine restore may have moved the machine to
     /// another network. An interface that is not DHCP-configured does
@@ -856,6 +886,13 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         host: &'a str,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a;
+
+    fn dns_resolve_https<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Option<HttpsRecord>, DnsError>> + Send + 'a;
 
     fn tcp_connect<'a>(
         &'a self,
@@ -936,66 +973,6 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a;
 
-    /// Drains up to `max_bytes` of what `stream`'s receive queue already
-    /// holds, without parking and without driving the device.
-    ///
-    /// This is the non-blocking `read` of a socket-backed byte stream: it
-    /// runs on the guest task's own poll, so the only bytes it may report
-    /// are the ones already delivered to the shard — anything still in
-    /// the device's rings belongs to the readiness wait that follows a
-    /// `Pending` answer. A drain that relieves receive backpressure
-    /// raises the shard's arrival signal itself.
-    fn tcp_try_read(
-        &self,
-        stream: Self::TcpStream,
-        max_bytes: usize,
-    ) -> Result<TcpReadProgress, TcpError>;
-
-    /// What `stream`'s send side does with a write right now — the
-    /// permit a stream reports.
-    ///
-    /// `Room` is the byte count a `write` may queue without parking,
-    /// `Pending` is a full send queue on a live connection, and `Closed`
-    /// is a connection that cannot send again — so a caller parking on
-    /// the answer does not sleep through a shutdown.
-    fn tcp_send_room(&self, stream: Self::TcpStream) -> Result<TcpWriteProgress, TcpError>;
-
-    /// Queues up to `bytes.len()` on `stream`'s send path and publishes
-    /// it synchronously: the stack's segment production, the egress drain
-    /// onto the rings and the doorbell all run on the caller's own poll.
-    /// `Room` is the count `bytes` gave up; whatever did not fit stays
-    /// in `bytes` for the caller to park or complete later. `Pending`
-    /// and `Closed` are a queue that took nothing, classified under the
-    /// same lock that ran the write: a full send queue on a live
-    /// connection, or a send side that cannot send again — so the one
-    /// call answers what a separate probe would take a second lock to
-    /// say.
-    ///
-    /// Synchronous because a guest stream's `write` may not block:
-    /// everything it touches — the shard lock, the ring's `try_lock`
-    /// submit — is held for the call and released before it returns.
-    fn tcp_try_write(
-        &self,
-        stream: Self::TcpStream,
-        bytes: &mut Bytes,
-    ) -> Result<TcpWriteProgress, TcpError>;
-
-    /// Resolves when `stream`'s send queue has room, when the send side
-    /// can no longer send, or when the stream is gone — a socket-backed
-    /// output stream's readiness wait.
-    ///
-    /// A dead send side resolves the wait rather than failing it: the
-    /// pollable contract is that a closed stream is ready, and the
-    /// accessor that follows reports the state. The implementation
-    /// samples the owning shard's arrival mark and the queue pair's
-    /// event mark before it probes the send queue, so an ACK — or a
-    /// reset — another processor drains between the probe and the park
-    /// resolves the wait rather than being slept through.
-    fn tcp_write_ready(
-        &self,
-        stream: Self::TcpStream,
-    ) -> impl Future<Output = Result<(), TcpError>> + Send + '_;
-
     /// Waits up to `timeout_nanos` for `stream` to have received bytes
     /// and copies them out of its receive queue straight into `buffer`.
     ///
@@ -1005,6 +982,16 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     /// the copy carried on within the same deadline; bytes that could not
     /// be handed over stay queued.
     fn tcp_read_into<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        buffer: &'a mut RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<TcpReadInto, TcpError>> + Send + 'a;
+
+    /// Waits up to `timeout_nanos` for `stream` to have received bytes
+    /// and copies them into `buffer` without consuming them from the
+    /// stream's receive queue.
+    fn tcp_peek_into<'a>(
         &'a self,
         stream: Self::TcpStream,
         buffer: &'a mut RegisteredTcpReadBuffer<'_>,
@@ -1036,6 +1023,7 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     fn udp_bind(
         &self,
+        local_address: NetworkIpAddress,
         local_port: u16,
     ) -> impl Future<Output = Result<UdpBinding<Self::UdpSocket>, UdpError>> + Send + '_;
 
@@ -1070,6 +1058,15 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<u64, UdpError>> + Send + 'a;
 
     fn udp_receive<'a>(
+        &'a self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a;
+
+    /// Waits up to `timeout_nanos` for a datagram on `socket` and returns a
+    /// copy without removing it from the receive queue.
+    fn udp_peek<'a>(
         &'a self,
         socket: Self::UdpSocket,
         max_bytes: u32,
@@ -1197,6 +1194,12 @@ pub struct HostMetadata {
     pub qid_path: u64,
     pub qid_type: u8,
     pub mode: u32,
+    /// The owner and group the host reports (`Rgetattr.uid`, `.gid`).
+    pub uid: u32,
+    pub gid: u32,
+    /// The device number a character or block device node names
+    /// (`Rgetattr.rdev`); zero for every other kind.
+    pub rdev: u64,
     pub size: u64,
     /// Hard-link count reported by the host (`Rgetattr.nlink`).
     pub link_count: u64,
@@ -1206,6 +1209,18 @@ pub struct HostMetadata {
     pub modified_nanos: u64,
     /// Last status change time in nanoseconds since the Unix epoch.
     pub status_nanos: u64,
+}
+
+/// What a node created on the host share is made with: its permission bits
+/// and its group, the two a 9P2000.L creation carries (`Tlcreate` and
+/// `Tmkdir` take a mode and a gid, `Tsymlink` a gid). The owner is the
+/// server's to assign from the identity the session attached as, as it is
+/// for Linux's own 9p client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostCreation {
+    /// The permission, set-id and sticky bits (`07777`).
+    pub permissions: u32,
+    pub gid: u32,
 }
 
 impl HostMetadata {
@@ -1503,13 +1518,17 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Creates the regular file `path`, made as `creation` says.
     fn create_file<'a>(
         &'a self,
         path: &'a str,
+        creation: HostCreation,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Creates the directory `path`, made as `creation` says.
     fn create_directory<'a>(
         &'a self,
         path: &'a str,
+        creation: HostCreation,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
     fn remove<'a>(
         &'a self,
@@ -1526,10 +1545,13 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         source: &'a str,
         destination: &'a str,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Creates the symbolic link `link_path` to `target`, in group `gid`;
+    /// a link's mode is always `0777`.
     fn symlink<'a>(
         &'a self,
         target: &'a str,
         link_path: &'a str,
+        gid: u32,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
     fn read_link<'a>(
         &'a self,

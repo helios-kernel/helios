@@ -5,13 +5,17 @@
 //! is visible through [`Transaction::view`] at once, and a commit writes them
 //! all durably as one generation.
 
+pub(crate) mod acl;
 pub(crate) mod chunks;
 mod extents;
 pub(crate) mod file;
 pub(crate) mod namespace;
 pub(crate) mod ownership;
 pub(crate) mod reflink;
+pub(crate) mod replay;
 pub(crate) mod reserve;
+mod writeback;
+pub(crate) mod xattr;
 
 use core::num::NonZeroUsize;
 use futures::future;
@@ -20,7 +24,9 @@ use self::namespace::Name;
 use self::reflink::FileId;
 use crate::accounting::{Accounting, Allocation};
 use crate::commit::CommitImage;
+use crate::compress::policy::Compressor;
 use crate::data::{File, Reader};
+use crate::delalloc::Delalloc;
 use crate::fs::Snapshot;
 use crate::ondisk::objectid;
 use crate::retirement::Retirements;
@@ -61,6 +67,8 @@ pub(crate) struct Transaction<S> {
     pub(crate) trees: Trees,
     pub(crate) space: Space,
     pub(crate) accounting: Accounting,
+    /// File data written but not yet given extents.
+    pub(crate) delalloc: Delalloc,
 }
 
 /// Private operation state. Inode allocation high-water marks deliberately
@@ -74,6 +82,7 @@ pub(crate) struct Checkpoint {
     trees: Trees,
     space: Space,
     accounting: Accounting,
+    delalloc: Delalloc,
 }
 
 impl<S: BlockSink> Transaction<S> {
@@ -88,6 +97,12 @@ impl<S: BlockSink> Transaction<S> {
         self.trees.block_count() as u64 * u64::from(self.volume.superblock().nodesize())
     }
 
+    /// Bytes of file data written but not yet given extents, every one of
+    /// which writeback, and so the commit, writes.
+    pub(crate) fn dirty_data_bytes(&self) -> u64 {
+        self.delalloc.bytes()
+    }
+
     /// A reader's view of this transaction as it stands: its private tree
     /// blocks, its moved roots and the private data they reach. The writer
     /// keeps that data from reuse while the view lives.
@@ -99,6 +114,7 @@ impl<S: BlockSink> Transaction<S> {
             self.accounting.checksum_root(),
             &self.trees,
             self.space.private_data(),
+            &self.delalloc,
         )
     }
 
@@ -111,6 +127,7 @@ impl<S: BlockSink> Transaction<S> {
             trees: self.trees.clone(),
             space: self.space.clone(),
             accounting: self.accounting.clone(),
+            delalloc: self.delalloc.clone(),
         };
         self.space.begin_operation();
         saved
@@ -124,12 +141,15 @@ impl<S: BlockSink> Transaction<S> {
         self.trees = saved.trees;
         self.space = saved.space;
         self.accounting = saved.accounting;
+        self.delalloc = saved.delalloc;
     }
 
     pub(crate) async fn inode_metadata(&self, file: FileId) -> Result<Metadata, WriteError> {
-        self.inode_item(file.tree, file.inode)
-            .await
-            .map(|(_, metadata)| metadata)
+        let (_, mut metadata) = self.inode_item(file.tree, file.inode).await?;
+        metadata.nbytes = metadata
+            .nbytes
+            .saturating_add(self.delalloc.file_bytes(file.tree, file.inode));
+        Ok(metadata)
     }
 
     pub(crate) async fn lookup_file(&self, name: Name<'_>) -> Result<Option<FileId>, WriteError> {
@@ -146,8 +166,8 @@ impl<S: BlockSink> Transaction<S> {
         })
     }
 
-    /// Read the transaction's current inode and extents, including staged data
-    /// and unpublished checksum items from earlier writes in this transaction.
+    /// Read the transaction's current inode and data: its dirty pages, and
+    /// its extents, staged data and unpublished checksum items included.
     pub(crate) async fn read_file(
         &self,
         tree: u64,
@@ -165,6 +185,7 @@ impl<S: BlockSink> Transaction<S> {
                         root,
                         number: inode,
                         metadata: &metadata,
+                        dirty: self.delalloc.file(tree, inode),
                     },
                     offset,
                     output,
@@ -176,11 +197,13 @@ impl<S: BlockSink> Transaction<S> {
     /// Starts from the writer's committed allocation state for `pin`'s
     /// generation. Only the roots are read from disk; the per-transaction
     /// exclusions (mirror stripes, reader pins) are applied to a clone.
+    /// `compresses` says whether the mount compresses new data.
     pub(crate) async fn new(
         volume: Volume<S>,
         pin: Arc<Snapshot>,
         retirements: &mut Retirements,
         committed: &Allocation,
+        compresses: bool,
     ) -> Result<Self, WriteError> {
         let root = pin.root_tree;
         let (image, roots) =
@@ -206,6 +229,11 @@ impl<S: BlockSink> Transaction<S> {
             free,
         );
         let trees = Trees::new(generation, volume.superblock().csum_type());
+        let delalloc = Delalloc::new(
+            u64::from(volume.superblock().sectorsize()),
+            reserve::csums_per_leaf(volume.superblock()),
+            compresses,
+        );
         let chunk = volume.superblock().chunk_tree();
         Ok(Self {
             generation: pin,
@@ -223,6 +251,7 @@ impl<S: BlockSink> Transaction<S> {
             space,
             accounting,
             trees,
+            delalloc,
         })
     }
 
@@ -241,8 +270,12 @@ impl<S: BlockSink> Transaction<S> {
         mut self,
         retirements: &mut Retirements,
         mut uuid: impl FnMut() -> [u8; 16],
+        compressor: &mut Compressor,
         concurrency: NonZeroUsize,
     ) -> Result<Committed, WriteError> {
+        // The dirty data gets its extents before anything is written, so
+        // the generation holds every change readers saw.
+        self.writeback_all(compressor, concurrency).await?;
         // Block groups nothing uses leave first, as the cleaner does after a
         // commit; what they free is out of reach of this commit's chunks.
         self.remove_unused_groups().await?;
