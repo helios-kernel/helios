@@ -1,5 +1,8 @@
 extern crate std;
 
+#[cfg(feature = "write")]
+mod xattr;
+
 use alloc::collections::BTreeMap;
 #[cfg(feature = "write")]
 use alloc::string::String;
@@ -708,6 +711,7 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
         mode,
         uid: 1000,
         gid: 1000,
+        umask: 0,
     };
     let mut tx = writer.join().await.unwrap();
     let edits = tx.edits();
@@ -900,6 +904,7 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
                     mode: 0o040755,
                     uid: 1000,
                     gid: 1000,
+                    umask: 0,
                 },
                 when,
             )
@@ -919,6 +924,7 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
                 mode: 0o100640,
                 uid: 1000,
                 gid: 1000,
+                umask: 0,
             },
             when,
         )
@@ -1745,6 +1751,7 @@ async fn exercise_inode_flags(mut verify: impl FnMut(&std::path::Path)) {
         permissions: 0o644,
         uid: 1000,
         gid: 1000,
+        umask: 0,
     };
     macro_rules! refused {
         ($tx:ident, $operation:expr) => {{
@@ -2008,6 +2015,7 @@ fn a_policy_compresses_only_inodes_that_linux_would_compress() {
                             permissions: 0o644,
                             uid: 0,
                             gid: 0,
+                            umask: 0,
                         },
                         when,
                     )
@@ -2247,6 +2255,7 @@ fn owned_mutations_preserve_readonly_subvolumes() {
             permissions: 0o644,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
         let when = crate::Timestamp {
             seconds: 1_700_000_100,
@@ -2318,6 +2327,7 @@ fn handles_reject_foreign_mounts_and_outlive_their_handle_and_commit() {
             permissions: 0o644,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
         assert!(matches!(
             tx.metadata(&foreign).await,
@@ -2392,6 +2402,7 @@ fn handles_follow_commits_but_reject_reused_inode_numbers() {
             permissions: 0o644,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
         let original = tx.create_file(name, attributes(), when).await.unwrap();
         tx.commit().await.unwrap();
@@ -2475,6 +2486,7 @@ fn owned_mutations_commit_as_one_generation() {
             permissions: 0o644,
             uid: 1000,
             gid: 1000,
+            umask: 0,
         };
 
         let source = tx
@@ -2681,6 +2693,7 @@ fn exercise_operation_rollback(mut verify: impl FnMut(&std::path::Path)) {
                 permissions: 0o644,
                 uid: 1000,
                 gid: 1000,
+                umask: 0,
             };
             let mut tx = writer.join().await.unwrap();
             let _ = tx.create_file(name, attributes(), when).await.unwrap();
@@ -3264,6 +3277,7 @@ fn carried_allocation_state_equals_a_reload_after_every_commit() {
                 permissions: 0o644,
                 uid: 0,
                 gid: 0,
+                umask: 0,
             };
             let check = |writer: &Writer<Disk, FixtureUuids>, step: &'static str| {
                 let image = image.try_clone().unwrap();
@@ -3655,6 +3669,7 @@ fn data_chunks_are_allocated_after_the_mkfs_group_fills() {
                 permissions: 0o644,
                 uid: 0,
                 gid: 0,
+                umask: 0,
             };
             // Several times the one data group a fresh image has.
             const MIB: usize = 1 << 20;
@@ -3834,6 +3849,7 @@ fn a_system_chunk_lands_in_the_bootstrap_array_and_survives_remount() {
                     permissions: 0o600,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when,
             )
@@ -3912,6 +3928,7 @@ fn a_full_device_shrinks_data_windows_and_reports_enospc_only_without_a_free_sec
             permissions: 0o644,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
         const PIECE: usize = 64 << 10;
         let mut tx = writer.join().await.unwrap();
@@ -4069,6 +4086,7 @@ async fn touch(writer: &mut super::writer::Writer<Disk, FixtureUuids>, name: &st
             permissions: 0o600,
             uid: 0,
             gid: 0,
+            umask: 0,
         },
         when,
     )
@@ -4116,6 +4134,7 @@ fn unused_block_groups_leave_after_their_extents_are_free_and_no_reader_pins_the
                     permissions: 0o644,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when,
             )
@@ -6343,6 +6362,7 @@ fn running_attributes() -> super::writer::Attributes {
         permissions: 0o644,
         uid: 1000,
         gid: 1000,
+        umask: 0,
     }
 }
 
@@ -7281,6 +7301,7 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
                     permissions: 0o644,
                     uid: 1000,
                     gid: 1000,
+                    umask: 0,
                 },
                 stamp_of(1_700_000_050),
             )
@@ -7328,6 +7349,7 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
             permissions,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
         assert!(matches!(
             tx.create_file(at!(format!("new-{name}")), setuid(0o4755), when)
@@ -7416,6 +7438,7 @@ fn write_after_metadata_flush_reclaims_unused_data_group_still_allocates_data() 
             permissions: 0o644,
             uid: 0,
             gid: 0,
+            umask: 0,
         };
 
         // Fill the mkfs data group completely so no bytes remain in it.
@@ -7572,6 +7595,7 @@ fn large_extent_checksum_items_stay_within_linux_max_csum_items() {
                     permissions: 0o644,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when,
             )
