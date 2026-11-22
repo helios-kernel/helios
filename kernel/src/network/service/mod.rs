@@ -47,7 +47,6 @@ use helios_netstack::{
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
-use crate::SocketReadiness;
 use crate::{
     ComponentNetworkService, DnsError, DnsErrorKind, HttpsRecord, Ipv4Address as KernelIpv4Address,
     Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MacAddress, NetworkAdminBackend,
@@ -57,6 +56,7 @@ use crate::{
     TcpReadInto, TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError,
     UdpErrorKind, UptimeClock,
 };
+use crate::{SocketReadiness, TcpConnectPoll};
 use triomphe::Arc;
 
 const EPHEMERAL_PORT_START: u16 = 49_152;

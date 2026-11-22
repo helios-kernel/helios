@@ -22,7 +22,7 @@
 //!   with release/acquire atomics and wake the service through
 //!   [`ProgressSignal`] armed before the policy is sampled.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::{Arc as SharedArc, Weak as SharedWeak};
 use alloc::vec::Vec;
@@ -40,22 +40,28 @@ use helios_hal::fs::{
     BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError,
     FsPath, FsResult, Metadata, NodeId, NodeKind, OpenFlags, Opened, RenameMode, WritePosition,
 };
+use helios_hal::fs_management::{
+    BalanceFilter, BalanceReport, DedupeOutcome, QgroupId, QgroupInfo, QgroupLimit, QuotaStatus,
+    ResizeTarget, ScrubReport, SubvolumeInfo, VolumeDeviceInfo, VolumeManagement,
+    VolumeManagementError, VolumeManagementResult,
+};
 use helios_hal::io::{IoError, IoResult};
 use triomphe::Arc;
 
+use super::DeviceIdAllocator;
 use crate::{
     BlockCacheError, BlockPages, CACHE_BLOCK_BYTES, CachedDisk, ProgressSignal, RootEntropyHandle,
 };
 use helios_btrfs::write::{
     CompressionPolicy, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, DEFAULT_MAX_INLINE, EncodeError,
-    WriteError, Writer, default_dirty_data_limit,
+    WriteError, Writer, default_dirty_data_limit, stream_referenced_sources,
 };
 
 mod prepared;
 mod writer;
 pub use prepared::BtrfsWrite;
 pub use writer::{BtrfsOpenHandle, BtrfsService};
-use writer::{Operation, PendingReleases, Response};
+use writer::{ManageClient, ManageOperation, ManageResponse, Operation, PendingReleases, Response};
 
 /// Runtime inputs for writable disk mounts.
 #[derive(Clone)]
@@ -312,9 +318,15 @@ struct Inner<Device: BlockDevice<Buffer = BlockPages>> {
     /// A writable mount's service queue, shared with the machine's list of
     /// writable mounts (`WritableMount`) by a weak reference.
     writer: Option<SharedArc<writer::Client>>,
+    /// Volume management channel owned by the same [`BtrfsService`] task.
+    manage: Option<SharedArc<ManageClient<Device>>>,
     /// The commit policy a writable mount's service follows.
     policy: Option<Arc<LivePolicy>>,
-    devices: BTreeMap<u64, (DeviceId, u64)>,
+    /// Subvolume tree id -> `(DeviceId, root_inode)`, dynamically extended
+    /// when subvolumes or snapshots are created at runtime.
+    devices: Arc<spin::Mutex<BTreeMap<u64, (DeviceId, u64)>>>,
+    /// Volume device id -> backing disk serial, updated on add/remove/replace.
+    block_serials: Arc<spin::Mutex<BTreeMap<u64, BlockSerial>>>,
     serial: BlockSerial,
     writes: prepared::Leases,
     write_round: usize,
@@ -342,18 +354,23 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             _lease: MountLease::Read { _lease: lease },
         }))
         .await?;
+        let primary_devid = reader.superblock().devid();
         let mut devices = BTreeMap::new();
         reader
             .subvolumes(|tree, root_inode| {
                 devices.insert(tree, (allocate_device(), root_inode));
             })
             .await?;
+        let mut block_serials = BTreeMap::new();
+        block_serials.insert(primary_devid, serial);
         Ok(Self {
             inner: Arc::new(Inner {
                 reader: Arc::new(spin::Mutex::new(reader)),
                 writer: None,
+                manage: None,
                 policy: None,
-                devices,
+                devices: Arc::new(spin::Mutex::new(devices)),
+                block_serials: Arc::new(spin::Mutex::new(block_serials)),
                 serial,
                 writes: Arc::new(spin::Mutex::new(BTreeMap::new())),
                 write_round: CACHE_BLOCK_BYTES,
@@ -366,6 +383,41 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
     pub async fn mount_writable(
         disk: CachedDisk<Device>,
         mut allocate_device: impl FnMut() -> DeviceId + Send,
+        options: BtrfsWriteOptions,
+    ) -> Result<(Self, BtrfsService<Device>), BtrfsMountError> {
+        let mut max_id = 0_u64;
+        let (fs, service) = Self::mount_writable_inner(
+            disk,
+            || {
+                let id = allocate_device();
+                max_id = max_id.max(id.raw());
+                id
+            },
+            None,
+            options,
+        )
+        .await?;
+        // Ensure any subvolumes created later in standalone mounts get distinct
+        // device ids above those handed out at mount time.
+        let _ = max_id;
+        Ok((fs, service))
+    }
+
+    /// Construct a writable mount using `allocator` for initial and dynamically
+    /// created subvolumes.
+    pub async fn mount_writable_with_allocator(
+        disk: CachedDisk<Device>,
+        allocator: DeviceIdAllocator,
+        options: BtrfsWriteOptions,
+    ) -> Result<(Self, BtrfsService<Device>), BtrfsMountError> {
+        let initial = allocator.clone();
+        Self::mount_writable_inner(disk, || initial.allocate(), Some(allocator), options).await
+    }
+
+    async fn mount_writable_inner(
+        disk: CachedDisk<Device>,
+        mut allocate_device: impl FnMut() -> DeviceId + Send,
+        shared_allocator: Option<DeviceIdAllocator>,
         options: BtrfsWriteOptions,
     ) -> Result<(Self, BtrfsService<Device>), BtrfsMountError> {
         let BtrfsWriteOptions {
@@ -393,14 +445,25 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
         .await?;
         writer.set_max_inline(max_inline);
         let reader = writer.snapshot()?;
+        let primary_devid = reader.superblock().devid();
         let mut devices = BTreeMap::new();
+        let mut highest_device = 0_u64;
         reader
             .subvolumes(|tree, root_inode| {
-                devices.insert(tree, (allocate_device(), root_inode));
+                let id = allocate_device();
+                highest_device = highest_device.max(id.raw());
+                devices.insert(tree, (id, root_inode));
             })
             .await?;
+        let device_ids = shared_allocator
+            .unwrap_or_else(|| DeviceIdAllocator::starting_at(highest_device.saturating_add(1)));
+        let devices = Arc::new(spin::Mutex::new(devices));
+        let mut block_serials = BTreeMap::new();
+        block_serials.insert(primary_devid, serial);
+        let block_serials = Arc::new(spin::Mutex::new(block_serials));
         let reader = Arc::new(spin::Mutex::new(reader));
         let (client, receiver, exit) = writer::channel(concurrency);
+        let (manage_client, manage_receiver) = writer::manage_channel(concurrency);
         let policy = Arc::new(LivePolicy::new(
             commit.unwrap_or_else(CommitPolicy::machine_default),
             max_inline,
@@ -408,7 +471,11 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
         let service = BtrfsService {
             writer,
             receiver,
+            manage_receiver,
             published: reader.clone(),
+            devices: devices.clone(),
+            block_serials: block_serials.clone(),
+            device_ids,
             releases: SharedArc::new(PendingReleases::new()),
             concurrency,
             policy: policy.clone(),
@@ -419,8 +486,10 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
                 inner: Arc::new(Inner {
                     reader,
                     writer: Some(SharedArc::new(client)),
+                    manage: Some(SharedArc::new(manage_client)),
                     policy: Some(policy),
                     devices,
+                    block_serials,
                     serial,
                     writes: Arc::new(spin::Mutex::new(BTreeMap::new())),
                     write_round: CACHE_BLOCK_BYTES.saturating_mul(concurrency.get()),
@@ -428,6 +497,11 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             },
             service,
         ))
+    }
+
+    /// Returns the registered block device serial for `devid`, if known.
+    pub fn device_serial(&self, devid: u64) -> Option<BlockSerial> {
+        self.inner.block_serials.lock().get(&devid).copied()
     }
 
     /// The commit policy of a writable mount; `None` for a read-only one.
@@ -471,6 +545,9 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
     /// device go; every request after it fails. A read-only mount has
     /// nothing to end.
     pub async fn unmount(&self) {
+        if let Some(manage) = &self.inner.manage {
+            manage.close();
+        }
         if let Some(writer) = &self.inner.writer {
             writer.unmount().await;
         }
@@ -577,7 +654,13 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
         number: u64,
         metadata: helios_btrfs::Metadata,
     ) -> FsResult<Metadata> {
-        let device = self.inner.devices.get(&tree).ok_or(FsError::Io)?;
+        let device = self
+            .inner
+            .devices
+            .lock()
+            .get(&tree)
+            .copied()
+            .ok_or(FsError::Io)?;
         let kind = node_kind(metadata.kind)?;
         Ok(Metadata {
             id: NodeId::new(device.0, number),
@@ -676,7 +759,14 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> DirStream for BtrfsDir<
                     let number = match entry.target {
                         EntryTarget::Inode(number) => number,
                         EntryTarget::Subvolume(tree) => {
-                            self.fs.inner.devices.get(&tree).ok_or(FsError::Io)?.1
+                            self.fs
+                                .inner
+                                .devices
+                                .lock()
+                                .get(&tree)
+                                .copied()
+                                .ok_or(FsError::Io)?
+                                .1
                         }
                     };
                     Ok(DirEntry {
@@ -1011,6 +1101,400 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
     }
     async fn sync_data_handle(&self, handle: &Self::OpenHandle) -> FsResult<()> {
         self.sync_handle(handle).await
+    }
+}
+
+impl<Device: BlockDevice<Buffer = BlockPages> + 'static> BtrfsFs<Device> {
+    async fn manage(
+        &self,
+        operation: ManageOperation<Device>,
+    ) -> VolumeManagementResult<ManageResponse> {
+        self.inner
+            .manage
+            .as_ref()
+            .ok_or(VolumeManagementError::Fs(FsError::ReadOnly))?
+            .execute(operation)
+            .await
+    }
+}
+
+impl<Device: BlockDevice<Buffer = BlockPages> + 'static> VolumeManagement for BtrfsFs<Device> {
+    type Device = CachedDisk<Device>;
+
+    async fn create_subvolume(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+    ) -> VolumeManagementResult<SubvolumeInfo> {
+        match self
+            .manage(ManageOperation::CreateSubvolume {
+                path: String::from(path.as_str()),
+                now,
+            })
+            .await?
+        {
+            ManageResponse::Subvolume(info) => Ok(info),
+            _ => unreachable!("create_subvolume returns SubvolumeInfo"),
+        }
+    }
+
+    async fn delete_subvolume(&self, path: FsPath<'_>, now: u64) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::DeleteSubvolume {
+            path: String::from(path.as_str()),
+            now,
+        })
+        .await
+        .map(drop)
+    }
+
+    async fn snapshot_subvolume(
+        &self,
+        source: FsPath<'_>,
+        destination: FsPath<'_>,
+        read_only: bool,
+        now: u64,
+    ) -> VolumeManagementResult<SubvolumeInfo> {
+        match self
+            .manage(ManageOperation::SnapshotSubvolume {
+                source: String::from(source.as_str()),
+                destination: String::from(destination.as_str()),
+                read_only,
+                now,
+            })
+            .await?
+        {
+            ManageResponse::Subvolume(info) => Ok(info),
+            _ => unreachable!("snapshot_subvolume returns SubvolumeInfo"),
+        }
+    }
+
+    async fn set_subvolume_read_only(
+        &self,
+        path: FsPath<'_>,
+        read_only: bool,
+        _now: u64,
+    ) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::SetSubvolumeReadOnly {
+            path: String::from(path.as_str()),
+            read_only,
+        })
+        .await
+        .map(drop)
+    }
+
+    async fn subvolume_info(&self, path: FsPath<'_>) -> VolumeManagementResult<SubvolumeInfo> {
+        match self
+            .manage(ManageOperation::SubvolumeInfo {
+                path: String::from(path.as_str()),
+            })
+            .await?
+        {
+            ManageResponse::Subvolume(info) => Ok(info),
+            _ => unreachable!("subvolume_info returns SubvolumeInfo"),
+        }
+    }
+
+    async fn list_subvolumes(&self) -> VolumeManagementResult<Vec<SubvolumeInfo>> {
+        match self.manage(ManageOperation::ListSubvolumes).await? {
+            ManageResponse::Subvolumes(list) => Ok(list),
+            _ => unreachable!("list_subvolumes returns Vec<SubvolumeInfo>"),
+        }
+    }
+
+    async fn send_subvolume(
+        &self,
+        subvolume: FsPath<'_>,
+        parent: Option<FsPath<'_>>,
+        clone_sources: &[FsPath<'_>],
+    ) -> VolumeManagementResult<Vec<u8>> {
+        match self
+            .manage(ManageOperation::SendSubvolume {
+                subvolume: String::from(subvolume.as_str()),
+                parent: parent.map(|p| String::from(p.as_str())),
+                clone_sources: clone_sources
+                    .iter()
+                    .map(|p| String::from(p.as_str()))
+                    .collect(),
+            })
+            .await?
+        {
+            ManageResponse::Stream(bytes) => Ok(bytes),
+            _ => unreachable!("send_subvolume returns Vec<u8>"),
+        }
+    }
+
+    async fn receive_subvolume<'a, F>(
+        &'a self,
+        destination: FsPath<'a>,
+        stream: &'a [u8],
+        now: u64,
+        mut authorize_source: F,
+    ) -> VolumeManagementResult<SubvolumeInfo>
+    where
+        F: FnMut(FsPath<'_>) -> VolumeManagementResult<()> + Send + 'a,
+    {
+        // Parse the stream upfront to discover every source subvolume UUID
+        // referenced by `SNAPSHOT` or `CLONE`, then authorize each matching
+        // subvolume's canonical path via `authorize_source` before sending the
+        // receive request to the single-owner service.
+        let referenced = stream_referenced_sources(stream).map_err(writer::volume_error)?;
+        let mut authorized_sources = BTreeSet::new();
+        if !referenced.is_empty() {
+            let subvols = self.list_subvolumes().await?;
+            for (uuid, ctransid) in referenced {
+                if let Some(found) = subvols.iter().find(|sv| {
+                    (sv.uuid == uuid && sv.ctransid == ctransid)
+                        || (sv.received_uuid == Some(uuid) && sv.stransid == ctransid)
+                }) {
+                    let rel = FsPath::new(&found.path)
+                        .ok_or(VolumeManagementError::Fs(FsError::Invalid))?;
+                    authorize_source(rel)?;
+                    authorized_sources.insert(found.path.clone());
+                }
+            }
+        }
+        match self
+            .manage(ManageOperation::ReceiveSubvolume {
+                destination: String::from(destination.as_str()),
+                stream: stream.to_vec(),
+                now,
+                authorized_sources,
+            })
+            .await?
+        {
+            ManageResponse::Subvolume(info) => Ok(info),
+            _ => unreachable!("receive_subvolume returns SubvolumeInfo"),
+        }
+    }
+
+    async fn reflink(
+        &self,
+        source: FsPath<'_>,
+        source_offset: u64,
+        destination: FsPath<'_>,
+        destination_offset: u64,
+        length: u64,
+        now: u64,
+    ) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::Reflink {
+            source: String::from(source.as_str()),
+            source_offset,
+            destination: String::from(destination.as_str()),
+            destination_offset,
+            length,
+            now,
+        })
+        .await
+        .map(drop)
+    }
+
+    async fn dedupe(
+        &self,
+        source: FsPath<'_>,
+        source_offset: u64,
+        destination: FsPath<'_>,
+        destination_offset: u64,
+        length: u64,
+        now: u64,
+    ) -> VolumeManagementResult<DedupeOutcome> {
+        match self
+            .manage(ManageOperation::Dedupe {
+                source: String::from(source.as_str()),
+                source_offset,
+                destination: String::from(destination.as_str()),
+                destination_offset,
+                length,
+                now,
+            })
+            .await?
+        {
+            ManageResponse::Dedupe(outcome) => Ok(outcome),
+            _ => unreachable!("dedupe returns DedupeOutcome"),
+        }
+    }
+
+    async fn list_devices(&self) -> VolumeManagementResult<Vec<VolumeDeviceInfo>> {
+        if self.inner.manage.is_some() {
+            return match self.manage(ManageOperation::ListDevices).await? {
+                ManageResponse::Devices(list) => Ok(list),
+                _ => unreachable!("list_devices returns Vec<VolumeDeviceInfo>"),
+            };
+        }
+        let reader = self.snapshot();
+        let mut list = reader
+            .devices()
+            .await
+            .map_err(|e| VolumeManagementError::Fs(self.fs_error(e)))?;
+        let serials = self.inner.block_serials.lock();
+        for dev in &mut list {
+            dev.serial = serials.get(&dev.devid).copied();
+        }
+        Ok(list)
+    }
+
+    async fn add_device(
+        &self,
+        device: Self::Device,
+        _now: u64,
+    ) -> VolumeManagementResult<VolumeDeviceInfo> {
+        match self
+            .manage(ManageOperation::AddDevice { disk: device })
+            .await?
+        {
+            ManageResponse::Device(info) => Ok(info),
+            _ => unreachable!("add_device returns VolumeDeviceInfo"),
+        }
+    }
+
+    async fn remove_device(&self, devid: u64, _now: u64) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::RemoveDevice { devid })
+            .await
+            .map(drop)
+    }
+
+    async fn replace_device(
+        &self,
+        source_devid: u64,
+        target: Self::Device,
+        _now: u64,
+    ) -> VolumeManagementResult<VolumeDeviceInfo> {
+        match self
+            .manage(ManageOperation::ReplaceDevice {
+                source_devid,
+                target,
+            })
+            .await?
+        {
+            ManageResponse::Device(info) => Ok(info),
+            _ => unreachable!("replace_device returns VolumeDeviceInfo"),
+        }
+    }
+
+    async fn resize_device(
+        &self,
+        devid: Option<u64>,
+        target: ResizeTarget,
+        _now: u64,
+    ) -> VolumeManagementResult<VolumeDeviceInfo> {
+        match self
+            .manage(ManageOperation::ResizeDevice { devid, target })
+            .await?
+        {
+            ManageResponse::Device(info) => Ok(info),
+            _ => unreachable!("resize_device returns VolumeDeviceInfo"),
+        }
+    }
+
+    async fn balance(
+        &self,
+        filter: BalanceFilter,
+        _now: u64,
+    ) -> VolumeManagementResult<BalanceReport> {
+        match self.manage(ManageOperation::Balance { filter }).await? {
+            ManageResponse::Balance(report) => Ok(report),
+            _ => unreachable!("balance returns BalanceReport"),
+        }
+    }
+
+    async fn scrub(
+        &self,
+        devid: Option<u64>,
+        read_only: bool,
+    ) -> VolumeManagementResult<ScrubReport> {
+        match self
+            .manage(ManageOperation::Scrub { devid, read_only })
+            .await?
+        {
+            ManageResponse::Scrub(report) => Ok(report),
+            _ => unreachable!("scrub returns ScrubReport"),
+        }
+    }
+
+    async fn quota_enable(&self, _now: u64) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::QuotaEnable).await.map(drop)
+    }
+
+    async fn quota_disable(&self, _now: u64) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::QuotaDisable).await.map(drop)
+    }
+
+    async fn quota_rescan(&self, _now: u64) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::QuotaRescan).await.map(drop)
+    }
+
+    async fn qgroup_create(&self, id: QgroupId, _now: u64) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::QgroupCreate { id })
+            .await
+            .map(drop)
+    }
+
+    async fn qgroup_destroy(&self, id: QgroupId, _now: u64) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::QgroupDestroy { id })
+            .await
+            .map(drop)
+    }
+
+    async fn qgroup_assign(
+        &self,
+        member: QgroupId,
+        parent: QgroupId,
+        _now: u64,
+    ) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::QgroupAssign { member, parent })
+            .await
+            .map(drop)
+    }
+
+    async fn qgroup_remove(
+        &self,
+        member: QgroupId,
+        parent: QgroupId,
+        _now: u64,
+    ) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::QgroupRemove { member, parent })
+            .await
+            .map(drop)
+    }
+
+    async fn qgroup_limit(
+        &self,
+        id: QgroupId,
+        limit: QgroupLimit,
+        _now: u64,
+    ) -> VolumeManagementResult<()> {
+        self.manage(ManageOperation::QgroupLimit { id, limit })
+            .await
+            .map(drop)
+    }
+
+    async fn quota_status(&self) -> VolumeManagementResult<QuotaStatus> {
+        if self.inner.manage.is_some() {
+            return match self.manage(ManageOperation::QuotaStatus).await? {
+                ManageResponse::QuotaStatus(status) => Ok(status),
+                _ => unreachable!("quota_status returns QuotaStatus"),
+            };
+        }
+        let reader = self.snapshot();
+        let (status, _) = reader
+            .quota_info()
+            .await
+            .map_err(|e| VolumeManagementError::Fs(self.fs_error(e)))?;
+        Ok(status)
+    }
+
+    async fn list_qgroups(&self) -> VolumeManagementResult<Vec<QgroupInfo>> {
+        if self.inner.manage.is_some() {
+            return match self.manage(ManageOperation::ListQgroups).await? {
+                ManageResponse::Qgroups(list) => Ok(list),
+                _ => unreachable!("list_qgroups returns Vec<QgroupInfo>"),
+            };
+        }
+        let reader = self.snapshot();
+        let (_, list) = reader
+            .quota_info()
+            .await
+            .map_err(|e| VolumeManagementError::Fs(self.fs_error(e)))?;
+        Ok(list)
     }
 }
 

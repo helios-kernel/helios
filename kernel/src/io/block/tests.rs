@@ -460,17 +460,32 @@ pub(crate) fn cache_over(
     max_blocks: usize,
     processors: usize,
 ) -> BlockCache<MemoryDisk> {
-    let layout = DiskLayout::new(disk.geometry()).expect("the test disk fits the cache");
+    cache_over_many(core::slice::from_ref(disk), max_blocks, processors)
+}
+
+/// A cache over multiple disks, sized and shaped by the test.
+pub(crate) fn cache_over_many(
+    disks: &[MemoryDisk],
+    max_blocks: usize,
+    processors: usize,
+) -> BlockCache<MemoryDisk> {
+    let entries: alloc::vec::Vec<_> = disks
+        .iter()
+        .map(|disk| {
+            let layout = DiskLayout::new(disk.geometry()).expect("the test disk fits the cache");
+            CacheDisk {
+                serial: BlockSerial::new(disk.state.serial.as_bytes()).expect("serial fits"),
+                layout,
+                read_only: disk.is_read_only(),
+                device: disk.clone(),
+            }
+        })
+        .collect();
     BlockCache::new(
         BlockCacheLimits { max_blocks },
         processors,
         CompressedPool::new(1 << 20, processors),
-        [CacheDisk {
-            serial: BlockSerial::new(disk.state.serial.as_bytes()).expect("serial fits"),
-            layout,
-            read_only: disk.is_read_only(),
-            device: disk.clone(),
-        }],
+        entries,
     )
 }
 

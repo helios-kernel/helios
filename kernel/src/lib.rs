@@ -226,17 +226,19 @@ pub use network::{
     validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
-    AudioClaimCap, ClockAuthorityRights, CompileAuthority, ComponentStdioRefusal,
-    ControlProcessorsCap, DeviceClassRights, DeviceGrantClaimCap, DiagnosticAuthorityRights,
-    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap, JoinAuthority, LinkAuthorityRights,
-    LinkSourceCap, LinkTargetDirectoryCap, LinuxImageRefusal, MachineAuthorityRights,
-    MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
-    NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
-    ProcessAuthorityRights, ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind,
-    ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority,
-    SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap,
-    TerminalOutputCap, TtyControlCap, UdpCap, UnbindableStdio, UnmountCap,
+    AudioClaimCap, BtrfsDedupeCap, BtrfsDeviceAdminCap, BtrfsMountAdminCap, BtrfsReceiveCap,
+    BtrfsReflinkCap, BtrfsSendCap, BtrfsSnapshotCap, BtrfsSubvolCreateCap, BtrfsSubvolDeleteCap,
+    BtrfsSubvolReadCap, BtrfsSubvolReadOnlyCap, ClockAuthorityRights, CompileAuthority,
+    ComponentStdioRefusal, ControlProcessorsCap, DeviceClassRights, DeviceGrantClaimCap,
+    DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
+    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap,
+    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, LinuxImageRefusal,
+    MachineAuthorityRights, MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap,
+    NetworkAuthorityRights, NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority,
+    ProcessAuthorityError, ProcessAuthorityRights, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
+    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
+    TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap, UnbindableStdio, UnmountCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -250,9 +252,9 @@ pub use runtime::{
     HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
     HostWrite, HttpsRecord, Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress,
     NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind, PingReply,
-    RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind,
-    TcpListener, TcpReadInto, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError,
-    UdpErrorKind,
+    RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpConnectPoll, TcpError,
+    TcpErrorKind, TcpListener, TcpReadInto, TcpReadProgress, TcpWriteProgress, UdpBinding,
+    UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use signing_key::{
     CwasmSigningKey, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,
@@ -265,14 +267,15 @@ pub use surface::{
     SurfaceServiceError, SurfaceShared,
 };
 pub use vfs::{
-    AttachedStorage, BOOT_DEVICE, BtrfsOpenHandle, DiskImage, ErofsError, ErofsFs, FileContents,
-    Follow, FsDescriptor, FsDescriptorFlags, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
-    MAX_SYMLINK_DEPTH, MemoryFs, MemoryUnixMetadata, MemoryWrite, MountError, MountFlags,
-    MountGrant, MountHold, MountRequest, MountRequestError, MountSharing, MountSource, MountTable,
-    MountedFs, MountedOpenHandle, MountedWrite, Namespace, NoDisks, PrivateMountClaim,
-    PrivateMountClaimError, ROOT_GRANT, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs,
-    RootWrite, SharedOwner, Storage, UnixAttributes, XattrSetMode, object_identity, request_mount,
-    request_unmount, symlink_target, within_directory,
+    AttachedStorage, BOOT_DEVICE, BtrfsManagementError, BtrfsOpenHandle, BtrfsVolumeRequest,
+    DeviceIdAllocator, DiskImage, ErofsError, ErofsFs, FileContents, Follow, FsDescriptor,
+    FsDescriptorFlags, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS, MAX_SYMLINK_DEPTH,
+    MemoryFs, MemoryUnixMetadata, MemoryWrite, MountError, MountFlags, MountGrant, MountHold,
+    MountRequest, MountRequestError, MountSharing, MountSource, MountTable, MountedFs,
+    MountedOpenHandle, MountedWrite, Namespace, NoDisks, PrivateMountClaim, PrivateMountClaimError,
+    ROOT_GRANT, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, SharedOwner, Storage,
+    UnixAttributes, XattrSetMode, object_identity, request_mount, request_unmount, symlink_target,
+    within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

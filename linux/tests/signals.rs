@@ -191,6 +191,15 @@ impl Clock for TestPlatform {
     }
 }
 
+impl helios_linux::syscall::Network<helios_unix::NoNetwork> for TestPlatform {
+    fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+        match address {}
+    }
+    fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+        unreachable!()
+    }
+}
+
 impl System for TestPlatform {
     fn realtime_nanos(&self) -> u64 {
         self.now_ns.load(Ordering::Relaxed)

@@ -1,0 +1,270 @@
+package helios:system@0.1.0;
+
+/// Copy-on-write volume management for mounted btrfs filesystems, bounded by
+/// the caller's grants.
+///
+/// Every path argument is resolved against the caller's directory authority
+/// before the operation touches the volume:
+///
+/// - `snapshot-subvolume`: `READ` over the whole source subvolume root (a
+///   grant narrower than the subvolume root is refused) and `MUTATE_DIRECTORY`
+///   at the destination.
+/// - `create-subvolume`: `MUTATE_DIRECTORY` at the parent directory.
+/// - `delete-subvolume`: `MUTATE_DIRECTORY` at the parent directory and over
+///   the whole subvolume being removed.
+/// - `set-subvolume-read-only`: `MUTATE_DIRECTORY` over the whole subvolume
+///   root.
+/// - `subvolume-info`: `READ` over the subvolume root.
+/// - `list-subvolumes`: `READ` over the mount point.
+/// - `send-subvolume`: `READ` over the whole subvolume root, plus `READ` over
+///   the parent snapshot and every clone source subvolume root.
+/// - `receive-subvolume`: `MUTATE_DIRECTORY` at the destination, plus `READ`
+///   over any source subvolume root referenced by `SNAPSHOT` or `CLONE` in the
+///   stream.
+/// - `reflink`: `READ` on the source file and `WRITE` on the destination file.
+/// - `dedupe`: `READ` on the source file and `WRITE` on the destination file.
+/// - Device, resize, balance, scrub and quota operations: mount authority over
+///   the mount point (`programs.mount-grant` plus `MUTATE_DIRECTORY` at the
+///   mount point), plus an explicit device grant wherever a device is named.
+interface btrfs {
+  /// Identity and state of one subvolume inside a volume.
+  record subvolume-info {
+    id: u64,
+    parent-id: option<u64>,
+    /// Normalized path of the subvolume root relative to the mount point
+    /// (empty string for the top-level subvolume).
+    path: string,
+    /// 16-byte subvolume UUID.
+    uuid: list<u8>,
+    /// 16-byte source subvolume UUID for a snapshot, if any.
+    parent-uuid: option<list<u8>>,
+    /// 16-byte original subvolume UUID recorded by receive, if any.
+    received-uuid: option<list<u8>>,
+    generation: u64,
+    ctransid: u64,
+    otransid: u64,
+    stransid: u64,
+    rtransid: u64,
+    read-only: bool,
+  }
+
+  /// Outcome of an extent deduplication request.
+  record dedupe-outcome {
+    /// Whether both byte ranges were byte-for-byte identical and deduplicated.
+    same: bool,
+    /// Number of bytes whose extents were shared.
+    bytes-deduped: u64,
+  }
+
+  /// Target size for a volume device resize operation.
+  variant resize-target {
+    /// Expand to the full capacity of the backing block device.
+    max,
+    /// Set the device size in the volume to an explicit byte length.
+    bytes(u64),
+  }
+
+  /// One backing device participating in a volume.
+  record volume-device-info {
+    devid: u64,
+    /// 16-byte device UUID.
+    uuid: list<u8>,
+    total-bytes: u64,
+    bytes-used: u64,
+    /// Block device serial when the device is backed by a registered disk.
+    serial: option<string>,
+  }
+
+  /// Selection criteria for a chunk balance pass.
+  record balance-filter {
+    data: bool,
+    metadata: bool,
+    system: bool,
+    usage-max-percent: option<u8>,
+    limit: option<u64>,
+  }
+
+  /// Summary of a completed chunk balance pass.
+  record balance-report {
+    considered: u64,
+    relocated: u64,
+  }
+
+  /// Summary of a completed volume scrub pass.
+  record scrub-report {
+    data-extents-scrubbed: u64,
+    tree-extents-scrubbed: u64,
+    data-bytes-scrubbed: u64,
+    tree-bytes-scrubbed: u64,
+    csum-errors: u64,
+    verify-errors: u64,
+    uncorrectable-errors: u64,
+    corrected-errors: u64,
+    no-csum-sectors: u64,
+  }
+
+  /// Quota group identifier (`level/id`).
+  record qgroup-id {
+    level: u16,
+    id: u64,
+  }
+
+  /// Space limits configured on a quota group.
+  record qgroup-limit {
+    max-referenced: option<u64>,
+    max-exclusive: option<u64>,
+  }
+
+  /// Accounting and configuration of one quota group.
+  record qgroup-info {
+    id: qgroup-id,
+    referenced-bytes: u64,
+    referenced-compressed-bytes: u64,
+    exclusive-bytes: u64,
+    exclusive-compressed-bytes: u64,
+    limit: qgroup-limit,
+    parents: list<qgroup-id>,
+  }
+
+  /// Volume-wide quota subsystem state.
+  record quota-status {
+    enabled: bool,
+    rescanning: bool,
+    inconsistent: bool,
+    generation: u64,
+  }
+
+  enum btrfs-error-kind {
+    permission-denied,
+    not-btrfs,
+    not-found,
+    already-exists,
+    read-only-filesystem,
+    not-directory,
+    is-directory,
+    not-empty,
+    no-space,
+    invalid-argument,
+    cross-device,
+    busy,
+    io,
+    not-subvolume,
+    read-only-subvolume,
+    subvolume-not-read-only,
+    subvolume-not-empty,
+    default-subvolume,
+    quota-not-enabled,
+    quota-already-enabled,
+    quota-exceeded,
+    qgroup-not-found,
+    qgroup-exists,
+    qgroup-invalid-relation,
+    device-not-found,
+    last-device,
+    device-too-small,
+    invalid-stream,
+    alignment,
+    overlap,
+    checksum-policy-mismatch,
+    clone-source-out-of-range,
+  }
+
+  record btrfs-error {
+    kind: btrfs-error-kind,
+    detail: string,
+  }
+
+  /// Creates a new empty subvolume at `path`.
+  create-subvolume: async func(path: string) -> result<subvolume-info, btrfs-error>;
+
+  /// Deletes the subvolume rooted at `path`.
+  delete-subvolume: async func(path: string) -> result<_, btrfs-error>;
+
+  /// Creates a snapshot of the subvolume rooted at `source` at `destination`.
+  snapshot-subvolume: async func(source: string, destination: string, read-only: bool) -> result<subvolume-info, btrfs-error>;
+
+  /// Sets or clears the read-only flag on the subvolume rooted at `path`.
+  set-subvolume-read-only: async func(path: string, read-only: bool) -> result<_, btrfs-error>;
+
+  /// Describes the subvolume rooted at `path`.
+  get-subvolume-info: async func(path: string) -> result<subvolume-info, btrfs-error>;
+
+  /// Lists every live subvolume in the btrfs volume mounted at `mount-point`.
+  list-subvolumes: async func(mount-point: string) -> result<list<subvolume-info>, btrfs-error>;
+
+  /// Produces a Linux-compatible btrfs send stream (v1) for the read-only
+  /// subvolume at `subvolume`, optionally incremental against `parent` and
+  /// cloning matching extents from `clone-sources`.
+  send-subvolume: async func(subvolume: string, parent: option<string>, clone-sources: list<string>) -> result<list<u8>, btrfs-error>;
+
+  /// Applies a Linux-compatible btrfs send stream into the directory at
+  /// `destination`, creating a read-only received subvolume.
+  receive-subvolume: async func(destination: string, payload: list<u8>) -> result<subvolume-info, btrfs-error>;
+
+  /// Shares extents from `source` into `destination` (reflink / range clone).
+  reflink: async func(source: string, source-offset: u64, destination: string, destination-offset: u64, length: u64) -> result<_, btrfs-error>;
+
+  /// Shares extents from `source` into `destination` only if both byte ranges
+  /// are byte-for-byte identical.
+  dedupe: async func(source: string, source-offset: u64, destination: string, destination-offset: u64, length: u64) -> result<dedupe-outcome, btrfs-error>;
+
+  /// Lists every backing device in the btrfs volume mounted at `mount-point`.
+  list-devices: async func(mount-point: string) -> result<list<volume-device-info>, btrfs-error>;
+
+  /// Adds the block device identified by `device` (serial) to the btrfs volume
+  /// mounted at `mount-point`.
+  add-device: async func(mount-point: string, device: string) -> result<volume-device-info, btrfs-error>;
+
+  /// Relocates chunks off `devid` and removes it from the btrfs volume mounted
+  /// at `mount-point`.
+  remove-device: async func(mount-point: string, devid: u64) -> result<_, btrfs-error>;
+
+  /// Replaces `source-devid` in place with the block device identified by
+  /// `target-device` (serial).
+  replace-device: async func(mount-point: string, source-devid: u64, target-device: string) -> result<volume-device-info, btrfs-error>;
+
+  /// Resizes `devid` (or the primary device when absent) in the btrfs volume
+  /// mounted at `mount-point`.
+  resize-device: async func(mount-point: string, devid: option<u64>, target: resize-target) -> result<volume-device-info, btrfs-error>;
+
+  /// Relocates chunks matching `filter` in the btrfs volume mounted at
+  /// `mount-point`.
+  balance: async func(mount-point: string, filter: balance-filter) -> result<balance-report, btrfs-error>;
+
+  /// Verifies all checksummed metadata and data extents in the btrfs volume
+  /// mounted at `mount-point` (optionally restricted to `devid`), repairing
+  /// corrupt mirrors when `read-only` is false.
+  scrub: async func(mount-point: string, devid: option<u64>, read-only: bool) -> result<scrub-report, btrfs-error>;
+
+  /// Enables quota groups on the btrfs volume mounted at `mount-point`.
+  quota-enable: async func(mount-point: string) -> result<_, btrfs-error>;
+
+  /// Disables quota groups on the btrfs volume mounted at `mount-point`.
+  quota-disable: async func(mount-point: string) -> result<_, btrfs-error>;
+
+  /// Recomputes all quota group counts on the btrfs volume mounted at
+  /// `mount-point`.
+  quota-rescan: async func(mount-point: string) -> result<_, btrfs-error>;
+
+  /// Queries the quota subsystem status of the btrfs volume mounted at
+  /// `mount-point`.
+  get-quota-status: async func(mount-point: string) -> result<quota-status, btrfs-error>;
+
+  /// Lists every quota group on the btrfs volume mounted at `mount-point`.
+  qgroup-list: async func(mount-point: string) -> result<list<qgroup-info>, btrfs-error>;
+
+  /// Creates an explicit quota group `group`.
+  qgroup-create: async func(mount-point: string, group: qgroup-id) -> result<_, btrfs-error>;
+
+  /// Destroys a quota group `group`.
+  qgroup-destroy: async func(mount-point: string, group: qgroup-id) -> result<_, btrfs-error>;
+
+  /// Assigns `member` as a child of `parent`.
+  qgroup-assign: async func(mount-point: string, member: qgroup-id, parent: qgroup-id) -> result<_, btrfs-error>;
+
+  /// Removes `member` from `parent`.
+  qgroup-remove: async func(mount-point: string, member: qgroup-id, parent: qgroup-id) -> result<_, btrfs-error>;
+
+  /// Configures space limits on `group`.
+  set-qgroup-limit: async func(mount-point: string, group: qgroup-id, limit: qgroup-limit) -> result<_, btrfs-error>;
+}

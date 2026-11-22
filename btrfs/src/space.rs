@@ -543,6 +543,14 @@ impl Space {
         unused
     }
 
+    /// Summaries `(start, length, flags, declared_used)` of every block group.
+    pub(crate) fn group_summaries(&self) -> Vec<(u64, u64, u64, u64)> {
+        self.groups
+            .iter()
+            .map(|group| (group.start, group.length, group.flags, group.declared_used))
+            .collect()
+    }
+
     /// Drops a group `unused_groups` named, so no later reservation can take a
     /// block from it.
     pub(crate) fn remove_group(&mut self, start: u64) {

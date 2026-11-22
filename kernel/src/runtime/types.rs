@@ -714,6 +714,15 @@ pub struct SocketReadiness {
     pub hangup: bool,
 }
 
+/// Current handshake progress of a non-blocking TCP connection attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpConnectPoll {
+    /// The three-way handshake is still in flight.
+    Pending,
+    /// The stream is established and ready for I/O.
+    Connected,
+}
+
 /// What a non-parking poll of a TCP stream's receive queue found.
 ///
 /// The tri-state a `read` that must never block resolves to: bytes to
@@ -894,6 +903,11 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<HttpsRecord>, DnsError>> + Send + 'a;
 
+    /// Returns the DNS resolver addresses currently configured on this link,
+    /// in the same preference order `dns_resolve` uses (DHCP IPv4 first, else
+    /// IPv6 RDNSS).
+    fn dns_servers(&self) -> Vec<NetworkIpAddress>;
+
     fn tcp_connect<'a>(
         &'a self,
         host: &'a str,
@@ -923,6 +937,30 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_;
+
+    /// Begins a TCP connection attempt without waiting for the three-way
+    /// handshake to complete. Drives the stack once so the initial SYN is
+    /// queued immediately and returns whether the connection is already
+    /// established or still pending.
+    fn tcp_connect_start(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        hop_limit: u8,
+    ) -> impl Future<Output = Result<(Self::TcpStream, TcpConnectPoll), TcpError>> + Send + '_;
+
+    /// Drives the stack and inspects a pending TCP connection attempt.
+    fn tcp_connect_poll(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<TcpConnectPoll, TcpError>> + Send + '_;
+
+    /// Returns the local IP address and port bound to `stream`, if any.
+    fn tcp_local_endpoint(
+        &self,
+        stream: Self::TcpStream,
+    ) -> Result<Option<(NetworkIpAddress, u16)>, TcpError>;
 
     /// Listens with an explicit hop limit, inherited by accepted connections
     /// so their SYN-ACK carries it too.
@@ -964,6 +1002,24 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a {
         async move { self.tcp_write_all(stream, &bytes, timeout_nanos).await }
+    }
+
+    /// Writes up to `bytes.len()` bytes to `stream`, returning a partial count
+    /// if some bytes were queued before the send window filled or `timeout_nanos`
+    /// expired. Fails with `TcpErrorKind::Timeout` only when zero bytes could be
+    /// queued before the deadline.
+    fn tcp_write_some_bytes<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<usize, TcpError>> + Send + 'a {
+        async move {
+            let len = bytes.len();
+            self.tcp_write_all_bytes(stream, bytes, timeout_nanos)
+                .await?;
+            Ok(len)
+        }
     }
 
     fn tcp_read<'a>(

@@ -125,6 +125,7 @@ pub(super) fn duplicate<R: Resources, F: fs::Filesystem<R>>(
             // F_GETFL: access mode belongs to the open resource; status flags
             // live on the shared open file description.
             3 => {
+                let mut fdflags = entry.fdflags();
                 let mode = match &entry.descriptor {
                     FileDescriptor::File(open) => fs.file_access(open.node()).linux_accmode(),
                     FileDescriptor::Preopen { descriptor, .. } => {
@@ -134,9 +135,15 @@ pub(super) fn duplicate<R: Resources, F: fs::Filesystem<R>>(
                     FileDescriptor::PipeWrite { .. }
                     | FileDescriptor::Stdout
                     | FileDescriptor::Stderr => fs::O_WRONLY,
+                    FileDescriptor::Socket(sock) => {
+                        if sock.is_nonblocking() {
+                            fdflags |= FDFLAG_NONBLOCK;
+                        }
+                        fs::O_RDWR
+                    }
                     _ => fs::O_RDWR,
                 };
-                mode | fs::fdflags_to_linux(abi, entry.fdflags())
+                mode | fs::fdflags_to_linux(abi, fdflags)
             }
             // F_SETFL
             4 => {
@@ -144,10 +151,11 @@ pub(super) fn duplicate<R: Resources, F: fs::Filesystem<R>>(
                     return errno(EBADF);
                 }
                 let updated = fs::apply_setfl(abi, entry.fdflags(), flags);
-                table
-                    .get_entry(fd as u32 as i32)
-                    .unwrap()
-                    .set_fdflags(updated);
+                let slot = table.get_entry(fd as u32 as i32).unwrap();
+                slot.set_fdflags(updated);
+                if let FileDescriptor::Socket(sock) = &slot.descriptor {
+                    sock.set_nonblocking(updated & FDFLAG_NONBLOCK != 0);
+                }
                 0
             }
             _ => errno(EINVAL),
@@ -470,7 +478,11 @@ fn valid_nesting<R: Resources>(
             }
         })
 }
-pub(super) async fn epoll_wait<R: Resources, M: UserMemory, O: Stdio + Clock>(
+pub(super) async fn epoll_wait<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + Clock + super::socket::Network<R::Network>,
+>(
     abi: Abi,
     process: &Process<R>,
     args: [u64; 6],
@@ -478,6 +490,7 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, O: Stdio + Clock>(
     io: &O,
     has_mask: bool,
 ) -> SyscallOutcome {
+    const NETWORK_REPOLL_NANOS: u64 = 1_000_000;
     let epoll = {
         let table = process.shared.descriptors.lock();
         let Some(entry) = table.get_entry(args[0] as u32 as i32) else {
@@ -515,60 +528,89 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, O: Stdio + Clock>(
     loop {
         let mut waits = Vec::new();
         let mut watch_stdin = false;
-        {
-            let table = process.shared.descriptors.lock();
+        let mut repoll = false;
+        // Snapshot interests and their non-socket readiness synchronously under
+        // the descriptor table lock; socket readiness probes are async and run
+        // after the spin lock is dropped.
+        let snapshot: Vec<_> = {
+            let guard = process.shared.descriptors.lock();
             let interests = epoll.interests();
             poll::arm_epoll_waits::<R, O>(
                 process,
                 &epoll,
-                &table,
+                &guard,
                 io,
                 &mut waits,
                 &mut watch_stdin,
+                &mut repoll,
             );
-            let mut count = 0;
-            for interest in interests {
-                let Some(target) = table.get_entry(interest.fd) else {
-                    continue;
-                };
-                let events = poll::ready_mask::<R, O>(process, target, &table, io, true)
-                    & (interest.events | EPOLLERR | EPOLLHUP);
-                if events == 0 {
-                    continue;
-                }
-                let mut event = [0; 16];
-                let bytes = &mut event[..size];
-                bytes[..4].copy_from_slice(&events.to_le_bytes());
-                bytes[data..].copy_from_slice(&interest.data.to_linux().to_le_bytes());
-                if memory
-                    .write(args[1].wrapping_add(count * size as u64), bytes)
-                    .is_err()
-                {
-                    if installed_mask {
-                        process.signals.restore_temp_mask();
+            interests
+                .into_iter()
+                .filter_map(|interest| {
+                    let target = guard.get_entry(interest.fd)?;
+                    if matches!(target.descriptor, FileDescriptor::Socket(_)) {
+                        Some((interest, Some(target.clone()), 0))
+                    } else {
+                        let events = poll::ready_mask::<R, O>(process, target, &guard, io, true)
+                            & (interest.events | EPOLLERR | EPOLLHUP);
+                        Some((interest, None, events))
                     }
-                    return SyscallOutcome::Return(if count == 0 { errno(EFAULT) } else { count });
-                }
-                epoll.delivered(interest.fd);
-                count += 1;
-                if count == maxevents as u64 {
-                    break;
-                }
+                })
+                .collect()
+        };
+        let mut count = 0;
+        for (interest, socket_entry, sync_events) in snapshot {
+            let events = match socket_entry {
+                Some(entry) => match &entry.descriptor {
+                    FileDescriptor::Socket(sock) => {
+                        super::socket::socket_epoll_ready(sock, interest.events, io).await
+                    }
+                    _ => sync_events,
+                },
+                None => sync_events,
+            };
+            if events == 0 {
+                continue;
             }
-            if count != 0 {
+            let mut event = [0; 16];
+            let bytes = &mut event[..size];
+            bytes[..4].copy_from_slice(&events.to_le_bytes());
+            bytes[data..].copy_from_slice(&interest.data.to_linux().to_le_bytes());
+            if memory
+                .write(args[1].wrapping_add(count * size as u64), bytes)
+                .is_err()
+            {
                 if installed_mask {
                     process.signals.restore_temp_mask();
                 }
-                return SyscallOutcome::Return(count);
+                return SyscallOutcome::Return(if count == 0 { errno(EFAULT) } else { count });
+            }
+            epoll.delivered(interest.fd);
+            count += 1;
+            if count == maxevents as u64 {
+                break;
             }
         }
-        if deadline.is_some_and(|end| io.now_nanos() >= end) {
+        if count != 0 {
+            if installed_mask {
+                process.signals.restore_temp_mask();
+            }
+            return SyscallOutcome::Return(count);
+        }
+        let now = io.now_nanos();
+        if deadline.is_some_and(|end| now >= end) {
             if installed_mask {
                 process.signals.restore_temp_mask();
             }
             return SyscallOutcome::Return(0);
         }
-        if poll::wait_once(&process.signals, deadline, &mut waits, watch_stdin, io).await {
+        let wake_at = match (deadline, repoll) {
+            (Some(end), true) => Some(end.min(now.saturating_add(NETWORK_REPOLL_NANOS))),
+            (Some(end), false) => Some(end),
+            (None, true) => Some(now.saturating_add(NETWORK_REPOLL_NANOS)),
+            (None, false) => None,
+        };
+        if poll::wait_once(&process.signals, wake_at, &mut waits, watch_stdin, io).await {
             // Leave `saved_mask` active (`TIF_RESTORE_SIGMASK`) so signal
             // delivery writes the original mask into `uc_sigmask`.
             return SyscallOutcome::RestartNoHand;
@@ -642,6 +684,14 @@ mod tests {
         }
         async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
             Ok(Bytes::new())
+        }
+    }
+    impl super::super::socket::Network<helios_unix::NoNetwork> for TestIo {
+        fn to_ip(&self, address: core::convert::Infallible) -> super::super::socket::IpAddr {
+            match address {}
+        }
+        fn encode_ip(&self, _: super::super::socket::IpAddr) -> core::convert::Infallible {
+            unreachable!()
         }
     }
     struct Wakes(AtomicUsize);

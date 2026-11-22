@@ -145,6 +145,7 @@ pub(super) fn ready_mask<R: Resources, O: Stdio>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn arm_entry_wait<R: Resources, O: Stdio>(
     process: &Process<R>,
     entry: &Entry<R>,
@@ -153,10 +154,11 @@ pub(super) fn arm_entry_wait<R: Resources, O: Stdio>(
     stdio: &O,
     waits: &mut Vec<Wait>,
     watch_stdin: &mut bool,
+    repoll: &mut bool,
 ) {
     match &entry.descriptor {
         FileDescriptor::Epoll(child) if events & (POLLIN | POLLRDNORM) != 0 => {
-            arm_epoll_waits::<R, O>(process, child, table, stdio, waits, watch_stdin);
+            arm_epoll_waits::<R, O>(process, child, table, stdio, waits, watch_stdin, repoll);
         }
         FileDescriptor::Stdin { .. } => {
             // Only arm stdin wait when stdin is currently quiet; if data or EOF
@@ -165,6 +167,21 @@ pub(super) fn arm_entry_wait<R: Resources, O: Stdio>(
             let current = ready_mask::<R, O>(process, entry, table, stdio, false);
             if current & (POLLIN | POLLHUP | POLLERR) == 0 {
                 *watch_stdin = true;
+            }
+        }
+        FileDescriptor::Socket(sock) => {
+            if let Some((reader, carry_len)) = sock.pair_read_probe() {
+                if events & (POLLIN | POLLRDNORM) != 0 && carry_len == 0 {
+                    waits.push(Wait::Read(reader.clone(), reader.wait_state()));
+                }
+                if events & (POLLOUT | POLLWRNORM) != 0
+                    && let Some(writer) = sock.pair_writer()
+                    && !writer.is_writable()
+                {
+                    waits.push(Wait::Write(writer.clone(), writer.wait_state()));
+                }
+            } else if sock.handle().is_some() {
+                *repoll = true;
             }
         }
         _ => {
@@ -182,6 +199,7 @@ pub(super) fn arm_epoll_waits<R: Resources, O: Stdio>(
     stdio: &O,
     waits: &mut Vec<Wait>,
     watch_stdin: &mut bool,
+    repoll: &mut bool,
 ) {
     for interest in epoll.interests() {
         if let Some(entry) = table.get_entry(interest.fd) {
@@ -193,6 +211,7 @@ pub(super) fn arm_epoll_waits<R: Resources, O: Stdio>(
                 stdio,
                 waits,
                 watch_stdin,
+                repoll,
             );
         }
     }
@@ -281,7 +300,13 @@ fn read_sigmask<M: UserMemory>(
     Ok(Some(SignalSet::from_bits(u64::from_le_bytes(mask))))
 }
 
-pub(super) async fn poll<R: Resources, M: UserMemory, O: Stdio + Clock>(
+const NETWORK_REPOLL_NANOS: u64 = 1_000_000;
+
+pub(super) async fn poll<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + Clock + socket::Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -293,7 +318,11 @@ pub(super) async fn poll<R: Resources, M: UserMemory, O: Stdio + Clock>(
     poll_common(process, args[0], args[1], deadline, None, memory, io).await
 }
 
-pub(super) async fn ppoll<R: Resources, M: UserMemory, O: Stdio + Clock>(
+pub(super) async fn ppoll<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + Clock + socket::Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -310,7 +339,11 @@ pub(super) async fn ppoll<R: Resources, M: UserMemory, O: Stdio + Clock>(
     poll_common(process, args[0], args[1], deadline, temp_mask, memory, io).await
 }
 
-async fn poll_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
+async fn poll_common<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + Clock + socket::Network<R::Network>,
+>(
     process: &Process<R>,
     fds_ptr: u64,
     nfds: u64,
@@ -350,7 +383,9 @@ async fn poll_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
     loop {
         let mut waits = Vec::new();
         let mut watch_stdin = false;
+        let mut repoll = false;
         let mut ready_count = 0u64;
+        let mut pending_sockets = Vec::new();
         {
             let table = process.shared.descriptors.lock();
             for (idx, &(fd, events)) in requests.iter().enumerate() {
@@ -363,9 +398,24 @@ async fn poll_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
                     ready_count += 1;
                     continue;
                 };
-                let mask = ready_mask::<R, O>(process, entry, &table, io, false);
                 let wanted =
                     u32::from(events) & (POLLIN | POLLPRI | POLLOUT | POLLRDNORM | POLLWRNORM);
+                if matches!(entry.descriptor, FileDescriptor::Socket(_)) {
+                    revents[idx] = 0;
+                    arm_entry_wait::<R, O>(
+                        process,
+                        entry,
+                        wanted,
+                        &table,
+                        io,
+                        &mut waits,
+                        &mut watch_stdin,
+                        &mut repoll,
+                    );
+                    pending_sockets.push((idx, entry.clone(), wanted));
+                    continue;
+                }
+                let mask = ready_mask::<R, O>(process, entry, &table, io, false);
                 let rev = mask & (wanted | POLLERR | POLLHUP);
                 revents[idx] = rev as u16;
                 if rev != 0 {
@@ -379,11 +429,22 @@ async fn poll_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
                         io,
                         &mut waits,
                         &mut watch_stdin,
+                        &mut repoll,
                     );
                 }
             }
         }
-        if ready_count != 0 || deadline.is_some_and(|end| io.now_nanos() >= end) {
+        for (idx, entry, wanted) in pending_sockets {
+            if let FileDescriptor::Socket(sock) = &entry.descriptor {
+                let rev = socket::socket_epoll_ready(sock, wanted, io).await;
+                revents[idx] = rev as u16;
+                if rev != 0 {
+                    ready_count += 1;
+                }
+            }
+        }
+        let now = io.now_nanos();
+        if ready_count != 0 || deadline.is_some_and(|end| now >= end) {
             if installed_mask {
                 process.signals.restore_temp_mask();
             }
@@ -395,7 +456,13 @@ async fn poll_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
             }
             return SyscallOutcome::Return(ready_count);
         }
-        if wait_once(&process.signals, deadline, &mut waits, watch_stdin, io).await {
+        let wake_at = match (deadline, repoll) {
+            (Some(end), true) => Some(end.min(now.saturating_add(NETWORK_REPOLL_NANOS))),
+            (Some(end), false) => Some(end),
+            (None, true) => Some(now.saturating_add(NETWORK_REPOLL_NANOS)),
+            (None, false) => None,
+        };
+        if wait_once(&process.signals, wake_at, &mut waits, watch_stdin, io).await {
             // Leave `saved_mask` active (`TIF_RESTORE_SIGMASK`) so signal
             // delivery writes the original mask into `uc_sigmask`.
             return SyscallOutcome::RestartNoHand;
@@ -426,7 +493,11 @@ fn set_bit(bits: &mut [u8], fd: usize) {
     }
 }
 
-pub(super) async fn select<R: Resources, M: UserMemory, O: Stdio + Clock>(
+pub(super) async fn select<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + Clock + socket::Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -482,7 +553,11 @@ pub(super) async fn select<R: Resources, M: UserMemory, O: Stdio + Clock>(
     outcome
 }
 
-pub(super) async fn pselect6<R: Resources, M: UserMemory, O: Stdio + Clock>(
+pub(super) async fn pselect6<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + Clock + socket::Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -522,7 +597,11 @@ pub(super) async fn pselect6<R: Resources, M: UserMemory, O: Stdio + Clock>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn select_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
+async fn select_common<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + Clock + socket::Network<R::Network>,
+>(
     process: &Process<R>,
     nfds: i32,
     read_ptr: u64,
@@ -583,7 +662,9 @@ async fn select_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
 
         let mut waits = Vec::new();
         let mut watch_stdin = false;
+        let mut repoll = false;
         let mut ready_bits = 0u64;
+        let mut pending_sockets = Vec::new();
         {
             let table = process.shared.descriptors.lock();
             for fd in 0..nfds_usize {
@@ -599,6 +680,30 @@ async fn select_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
                     }
                     return SyscallOutcome::Return(errno(EBADF));
                 };
+                let mut events = 0u32;
+                if want_r {
+                    events |= POLLIN | POLLRDNORM;
+                }
+                if want_w {
+                    events |= POLLOUT | POLLWRNORM;
+                }
+                if want_x {
+                    events |= POLLPRI;
+                }
+                if matches!(entry.descriptor, FileDescriptor::Socket(_)) {
+                    arm_entry_wait::<R, O>(
+                        process,
+                        entry,
+                        events,
+                        &table,
+                        io,
+                        &mut waits,
+                        &mut watch_stdin,
+                        &mut repoll,
+                    );
+                    pending_sockets.push((fd, entry.clone(), want_r, want_w, want_x, events));
+                    continue;
+                }
                 let mask = ready_mask::<R, O>(process, entry, &table, io, false);
                 let mut hit = false;
                 if want_r && (mask & SELECT_IN_SET) != 0 {
@@ -617,16 +722,6 @@ async fn select_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
                     hit = true;
                 }
                 if !hit {
-                    let mut events = 0u32;
-                    if want_r {
-                        events |= POLLIN | POLLRDNORM;
-                    }
-                    if want_w {
-                        events |= POLLOUT | POLLWRNORM;
-                    }
-                    if want_x {
-                        events |= POLLPRI;
-                    }
                     arm_entry_wait::<R, O>(
                         process,
                         entry,
@@ -635,12 +730,31 @@ async fn select_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
                         io,
                         &mut waits,
                         &mut watch_stdin,
+                        &mut repoll,
                     );
                 }
             }
         }
+        for (fd, entry, want_r, want_w, want_x, events) in pending_sockets {
+            if let FileDescriptor::Socket(sock) = &entry.descriptor {
+                let mask = socket::socket_epoll_ready(sock, events, io).await;
+                if want_r && (mask & SELECT_IN_SET) != 0 {
+                    set_bit(&mut out_read, fd);
+                    ready_bits += 1;
+                }
+                if want_w && (mask & SELECT_OUT_SET) != 0 {
+                    set_bit(&mut out_write, fd);
+                    ready_bits += 1;
+                }
+                if want_x && (mask & SELECT_EX_SET) != 0 {
+                    set_bit(&mut out_except, fd);
+                    ready_bits += 1;
+                }
+            }
+        }
 
-        if ready_bits != 0 || deadline.is_some_and(|end| io.now_nanos() >= end) {
+        let now = io.now_nanos();
+        if ready_bits != 0 || deadline.is_some_and(|end| now >= end) {
             if installed_mask {
                 process.signals.restore_temp_mask();
             }
@@ -661,7 +775,13 @@ async fn select_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
             }
             return SyscallOutcome::Return(ready_bits);
         }
-        if wait_once(&process.signals, deadline, &mut waits, watch_stdin, io).await {
+        let wake_at = match (deadline, repoll) {
+            (Some(end), true) => Some(end.min(now.saturating_add(NETWORK_REPOLL_NANOS))),
+            (Some(end), false) => Some(end),
+            (None, true) => Some(now.saturating_add(NETWORK_REPOLL_NANOS)),
+            (None, false) => None,
+        };
+        if wait_once(&process.signals, wake_at, &mut waits, watch_stdin, io).await {
             return SyscallOutcome::RestartNoHand;
         }
     }

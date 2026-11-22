@@ -26,19 +26,21 @@
 //! A log tree a crash left behind an fsync is replayed when the writer mounts,
 //! in one transaction committed before [`Writer::mount`] returns; a log item
 //! the replay does not implement refuses the mount ([`LogReplayError`]).
-//! Writable support is single-device and excludes verity,
-//! unknown compat-ro features and filesystems with quotas enabled (the writer
-//! maintains no quota-group accounting). Space comes from the block groups, and the
-//! writer allocates a chunk on the device when a type runs short, following
-//! Linux's regular policy and its single and DUP profiles (see
-//! [`ChunkError`] for what is refused): a data chunk when no free range
-//! holds a reservation, metadata and system chunks ahead of need so a commit
-//! never runs out of tree blocks. A write that finds the data space short
-//! stores the prefix that fits, and only one that cannot store a sector
-//! reports out of space; writeback uses the smaller free ranges that remain
-//! for the space reserved. The caller supplies time, compression policy, the
-//! inline data limit (Linux's `max_inline`), I/O concurrency and a UUID
-//! generator for root records that lack a valid UUID extension.
+//! Writable support excludes verity and unknown compat-ro features. Once quotas
+//! are enabled (or on a filesystem mounted with an existing quota tree), the
+//! writer maintains quota-group accounting (`BTRFS_QUOTA_TREE_OBJECTID`) and
+//! enforces configured limits. Multi-device volumes are supported across
+//! `SINGLE`, `DUP`, and `RAID1` profiles (see [`ChunkError`] for what is
+//! refused). Space comes from the block groups, and the writer allocates a
+//! chunk on the device(s) when a type runs short, following Linux's regular
+//! policy: a data chunk when no free range holds a reservation, metadata and
+//! system chunks ahead of need so a commit never runs out of tree blocks. A
+//! write that finds the data space short stores the prefix that fits, and only
+//! one that cannot store a sector reports out of space; writeback uses the
+//! smaller free ranges that remain for the space reserved. The caller supplies
+//! time, compression policy, the inline data limit (Linux's `max_inline`), I/O
+//! concurrency and a UUID generator for root records that lack a valid UUID
+//! extension.
 
 pub use crate::allocation::AllocationDefect;
 pub use crate::allocation::data::DataDefect;
@@ -50,6 +52,7 @@ pub use crate::fs::writer::{
     InodeHandle, Name, RootUuids, Special, Usage, WriteTransaction, Writer,
     default_dirty_data_limit,
 };
+pub use crate::receive::stream_referenced_sources;
 pub use crate::space::{SpaceDefect, SpaceError};
 pub use crate::transaction::chunks::ChunkError;
 pub use crate::transaction::fallocate::AllocateMode;
@@ -59,4 +62,8 @@ pub use crate::transaction::xattr::XattrMode;
 pub use crate::tree::edit::EditError;
 pub use crate::tree::write::WriteError;
 pub use crate::uuid_tree::UuidDefect;
+pub use helios_hal::fs_management::{
+    BalanceFilter, BalanceReport, DedupeOutcome, QgroupId, QgroupInfo, QgroupLimit, QuotaStatus,
+    ResizeTarget, ScrubReport, SubvolumeInfo, VolumeDeviceInfo,
+};
 pub use miniz_oxide::deflate::CompressionLevel as ZlibLevel;

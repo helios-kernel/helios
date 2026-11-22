@@ -135,7 +135,7 @@ async fn allocation_of<S: BlockSource>(fs: &Filesystem<S>) -> crate::accounting:
 #[cfg(feature = "write")]
 async fn change_root_mode<S: crate::source::BlockSink>(
     fs: &Filesystem<S>,
-) -> Result<(TreeRoot, crate::transaction::Committed), WriteError> {
+) -> Result<(TreeRoot, crate::transaction::Committed<S>), WriteError> {
     change_root_mode_with_retirements(fs, &mut crate::retirement::Retirements::default()).await
 }
 
@@ -143,7 +143,7 @@ async fn change_root_mode<S: crate::source::BlockSink>(
 async fn change_root_mode_with_retirements<S: crate::source::BlockSink>(
     fs: &Filesystem<S>,
     retirements: &mut crate::retirement::Retirements,
-) -> Result<(TreeRoot, crate::transaction::Committed), WriteError> {
+) -> Result<(TreeRoot, crate::transaction::Committed<S>), WriteError> {
     use crate::transaction::Transaction;
 
     let mut transaction = Transaction::new(
@@ -2091,41 +2091,16 @@ fn a_policy_compresses_only_inodes_that_linux_would_compress() {
 
 #[cfg(feature = "write")]
 #[test]
-fn writer_refuses_a_filesystem_with_a_quota_tree_and_the_reader_keeps_working() {
-    use crate::ondisk::{item_type, objectid};
+fn writer_mounts_a_filesystem_with_a_quota_tree_and_maintains_counts() {
+    use super::writer::{Attributes, Name};
+    use helios_hal::fs_management::QgroupId;
     block_on(async {
         let (_, image) = filesystem_image();
         let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
             .await
             .unwrap();
-        let old = writer.snapshot().unwrap();
-        let mut tx = writer.join().await.unwrap();
-        let edits = tx.edits();
-        // Linux enables quotas by adding a root item for tree 8; the item's
-        // content does not matter to the refusal, so borrow the checksum
-        // tree's.
-        let (_, item) = edits
-            .trees
-            .floor(
-                &old.volume,
-                edits.roots.root,
-                Key::new(objectid::CSUM_TREE, item_type::ROOT_ITEM, u64::MAX),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        edits.roots.root = edits
-            .trees
-            .apply(
-                &old.volume,
-                edits.roots.root,
-                Key::new(objectid::QUOTA_TREE, item_type::ROOT_ITEM, 0),
-                Some(&item),
-                &mut edits.space,
-            )
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
+        writer.quota_enable().await.unwrap();
+        assert!(writer.quota_status().await.unwrap().enabled);
 
         let reader = Filesystem::mount(Disk(image.try_clone().unwrap()))
             .await
@@ -2134,10 +2109,60 @@ fn writer_refuses_a_filesystem_with_a_quota_tree_and_the_reader_keeps_working() 
             reader.root().await.unwrap().kind(),
             crate::FileKind::Directory
         );
-        assert!(matches!(
-            mount_writer(Disk(image)).await,
-            Err(WriteError::QuotaTreePresent)
-        ));
+        let (status, _) = reader.quota_info().await.unwrap();
+        assert!(status.enabled);
+
+        let mut remounted = mount_writer(Disk(image)).await.unwrap();
+        assert!(remounted.quota_status().await.unwrap().enabled);
+        let qg5 = QgroupId::new(0, 5).unwrap();
+        let before = remounted
+            .list_qgroups()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|group| group.id == qg5)
+            .unwrap();
+
+        let when = crate::Timestamp {
+            seconds: 1_700_000_050,
+            nanoseconds: 0,
+        };
+        {
+            let mut tx = remounted.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let created = tx
+                .create_file(
+                    Name {
+                        parent: &root,
+                        bytes: b"quota-counted.bin",
+                    },
+                    Attributes {
+                        permissions: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        umask: 0,
+                    },
+                    when,
+                )
+                .await
+                .unwrap();
+            tx.write_file(&created, 0, &vec![0x5a; 8192], when)
+                .await
+                .unwrap();
+        }
+        remounted.commit().await.unwrap();
+
+        let after = remounted
+            .list_qgroups()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|group| group.id == qg5)
+            .unwrap();
+        assert!(
+            after.referenced_bytes > before.referenced_bytes,
+            "qgroup referenced bytes should grow after writing: before={before:?}, after={after:?}"
+        );
     });
 }
 
@@ -3778,10 +3803,15 @@ fn data_chunks_are_allocated_after_the_mkfs_group_fills() {
                     .find(|&&(start, ..)| start == logical)
                     .unwrap();
                 assert_eq!(physical.len(), if flags & (1 << 5) != 0 { 2 } else { 1 });
-                assert_eq!(
-                    fs.volume.chunks().map(logical, length).unwrap().as_slice(),
-                    physical
-                );
+                let mapped: Vec<u64> = fs
+                    .volume
+                    .chunks()
+                    .map(logical, length)
+                    .unwrap()
+                    .into_iter()
+                    .map(|stripe| stripe.offset)
+                    .collect();
+                assert_eq!(mapped, *physical);
                 if let [first, second] = physical[..] {
                     let (mut a, mut b) = (vec![0; length as usize], vec![0; length as usize]);
                     image.read_exact_at(&mut a, first).unwrap();
@@ -4746,7 +4776,7 @@ fn data_staging_writes_all_copies_without_publishing_roots() {
             .unwrap();
         let mut actual = vec![0; bytes.len()];
         for physical in fs.volume.chunks().map(key.objectid, key.offset).unwrap() {
-            image.read_exact_at(&mut actual, physical).unwrap();
+            image.read_exact_at(&mut actual, physical.offset).unwrap();
             assert_eq!(actual, bytes);
         }
         let sums = trees
@@ -4776,7 +4806,7 @@ fn data_staging_writes_all_copies_without_publishing_roots() {
             copies_seen = copies_seen.max(copies.len());
             let mut actual = vec![0; bytes.len()];
             for physical in copies {
-                image.read_exact_at(&mut actual, physical).unwrap();
+                image.read_exact_at(&mut actual, physical.offset).unwrap();
                 assert_eq!(actual, bytes);
             }
         }

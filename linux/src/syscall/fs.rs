@@ -1877,7 +1877,11 @@ fn read_iovecs<M: UserMemory>(
     Ok(iovs)
 }
 
-pub(super) async fn readv_common<R: Resources, M: UserMemory, O: Stdio + Filesystem<R>>(
+pub(super) async fn readv_common<
+    R: Resources,
+    M: UserMemory,
+    O: Stdio + Filesystem<R> + Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     explicit_offset: Option<i64>,
@@ -1962,7 +1966,11 @@ pub(super) async fn readv_common<R: Resources, M: UserMemory, O: Stdio + Filesys
     SyscallOutcome::Return(done)
 }
 
-pub(super) async fn writev_common<R: Resources, M: VirtualMemory, O: Stdio + Filesystem<R>>(
+pub(super) async fn writev_common<
+    R: Resources,
+    M: VirtualMemory,
+    O: Stdio + Filesystem<R> + Network<R::Network>,
+>(
     process: &Process<R>,
     args: [u64; 6],
     explicit_offset: Option<i64>,

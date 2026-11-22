@@ -5,6 +5,7 @@ world init {
   import helios:hv/virtualization@0.1.0;
   import helios:system/programs@0.1.0;
   import helios:system/mounts@0.1.0;
+  import helios:system/btrfs@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
@@ -27,6 +28,7 @@ world debugger{
   import helios:hv/virtualization@0.1.0;
   import helios:system/programs@0.1.0;
   import helios:system/mounts@0.1.0;
+  import helios:system/btrfs@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
@@ -208,6 +210,15 @@ world audio-host {
 /// lifecycle's result twice.
 world processors-host {
   import helios:system/processors@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/btrfs` bindings from.
+///
+/// Separate from the program worlds for the same reason `processors-host` is:
+/// the kernel serves this one interface to both the `init` and `debugger`
+/// worlds, and one generated type set keeps the two from mapping results twice.
+world btrfs-host {
+  import helios:system/btrfs@0.1.0;
 }
 
 /// A program that draws through `wasi:webgpu` on a platform canvas: the

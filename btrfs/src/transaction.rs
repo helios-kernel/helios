@@ -7,6 +7,8 @@
 
 pub(crate) mod acl;
 pub(crate) mod chunks;
+pub(crate) mod dedupe;
+pub(crate) mod devices;
 mod extents;
 pub(crate) mod fallocate;
 pub(crate) mod file;
@@ -14,8 +16,10 @@ pub(crate) mod namespace;
 pub(crate) mod orphan;
 pub(crate) mod ownership;
 pub(crate) mod reflink;
+pub(crate) mod relocate;
 pub(crate) mod replay;
 pub(crate) mod reserve;
+pub(crate) mod subvolume;
 mod writeback;
 pub(crate) mod xattr;
 
@@ -33,6 +37,7 @@ use crate::data::{File, Reader};
 use crate::delalloc::Delalloc;
 use crate::fs::Snapshot;
 use crate::ondisk::objectid;
+use crate::qgroup::QuotaTree;
 use crate::retirement::Retirements;
 use crate::roots::Roots;
 use crate::source::{BlockSink, PendingWrites, READ_ALIGNMENT};
@@ -45,8 +50,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// Produced only once the new roots are durable, or for an unchanged view.
-pub(crate) struct Committed {
+pub(crate) struct Committed<S> {
     pub(crate) snapshot: Arc<Snapshot>,
+    /// The live devices after this commit (reflecting any add/remove/replace).
+    pub(crate) devices: Arc<Vec<(u64, Arc<S>)>>,
     /// The allocation state of `snapshot`'s generation; `None` for an unchanged
     /// view, whose state is the one the transaction started from.
     pub(crate) allocation: Option<Allocation>,
@@ -58,20 +65,28 @@ pub(crate) struct Transaction<S> {
     // keep allocated numbers monotonic even after an inode is deleted again.
     inode_high_water: BTreeMap<u64, u64>,
     pub(crate) volume: Volume<S>,
-    image: CommitImage,
+    pub(crate) image: CommitImage,
     pub(crate) roots: Roots,
     /// The chunk tree's root. The superblock, not the root tree, records it.
-    chunk_root: TreeRoot,
-    /// Device ranges of chunks this transaction removed. They stay out of
-    /// reach of chunk allocation until the transaction publishes
-    /// (`btrfs_dev_extent_hole` skips `pending_chunks`). Only `commit` removes
-    /// chunks, so no operation checkpoint covers it.
-    released: Vec<core::ops::Range<u64>>,
+    pub(crate) chunk_root: TreeRoot,
+    /// Device ranges of chunks this transaction removed (`(devid, range)`).
+    /// They stay out of reach of chunk allocation until the transaction
+    /// publishes (`btrfs_dev_extent_hole` skips `pending_chunks`).
+    pub(crate) released: Vec<(u64, core::ops::Range<u64>)>,
+    /// Optional device excluded from chunk allocation during device removal.
+    pub(crate) excluded_device: Option<u64>,
+    /// Optional per-device ceiling in bytes during device shrink.
+    pub(crate) device_size_limit: Option<(u64, u64)>,
     pub(crate) trees: Trees,
     pub(crate) space: Space,
     pub(crate) accounting: Accounting,
+    /// Quota tree when quotas are enabled on this filesystem.
+    pub(crate) quota: Option<QuotaTree>,
     /// File data written but not yet given extents.
     pub(crate) delalloc: Delalloc,
+    /// When true, `commit` publishes a new generation even if no tree blocks
+    /// changed (for example after changing superblock device metadata).
+    pub(crate) force_commit: bool,
     /// Open-handle accounting mirrored from the owning [`crate::write::Writer`],
     /// checkpointed and rolled back alongside tree edits.
     pub(crate) open: OpenInodes,
@@ -88,7 +103,9 @@ pub(crate) struct Checkpoint {
     trees: Trees,
     space: Space,
     accounting: Accounting,
+    quota: Option<QuotaTree>,
     delalloc: Delalloc,
+    force_commit: bool,
     open: OpenInodes,
 }
 
@@ -134,7 +151,9 @@ impl<S: BlockSink> Transaction<S> {
             trees: self.trees.clone(),
             space: self.space.clone(),
             accounting: self.accounting.clone(),
+            quota: self.quota.clone(),
             delalloc: self.delalloc.clone(),
+            force_commit: self.force_commit,
             open: self.open.clone(),
         };
         self.space.begin_operation();
@@ -149,8 +168,153 @@ impl<S: BlockSink> Transaction<S> {
         self.trees = saved.trees;
         self.space = saved.space;
         self.accounting = saved.accounting;
+        self.quota = saved.quota;
         self.delalloc = saved.delalloc;
+        self.force_commit = saved.force_commit;
         self.open = saved.open;
+    }
+
+    /// Checks quota limits on subvolume `tree` before allocating
+    /// `additional_bytes` of data/metadata.
+    pub(crate) fn check_quota_limit(
+        &self,
+        tree: u64,
+        additional_bytes: u64,
+    ) -> Result<(), WriteError> {
+        let Some(quota) = &self.quota else {
+            return Ok(());
+        };
+        let pending = self.delalloc.tree_bytes(tree);
+        quota.check_limit(tree, pending, additional_bytes)
+    }
+
+    /// Enables quota groups by creating `QUOTA_TREE` and scanning all live
+    /// subvolumes.
+    pub(crate) async fn quota_enable(&mut self) -> Result<(), WriteError> {
+        if self.quota.is_some() {
+            return Err(WriteError::QuotaAlreadyEnabled);
+        }
+        let qroot = self
+            .trees
+            .create(
+                &self.volume,
+                self.roots.root,
+                objectid::QUOTA_TREE,
+                &mut self.space,
+            )
+            .await?;
+        self.roots.insert_internal(qroot);
+        let mut quota = QuotaTree::new_enabled(qroot, self.trees.generation());
+        quota
+            .recompute(&self.volume, &self.trees, &self.roots)
+            .await?;
+        self.quota = Some(quota);
+        self.force_commit = true;
+        Ok(())
+    }
+
+    /// Disables quota groups by dropping `QUOTA_TREE` and removing its root
+    /// item from `ROOT_TREE`.
+    pub(crate) async fn quota_disable(&mut self) -> Result<(), WriteError> {
+        let Some(quota) = self.quota.take() else {
+            return Err(WriteError::QuotaNotEnabled);
+        };
+        // Commit/sync ensures `QUOTA_TREE` blocks are accounted before dropping;
+        // caller runs this on a clean transaction so `quota.root` is committed.
+        self.drop_subtree(objectid::QUOTA_TREE, quota.root).await?;
+        self.roots
+            .remove_tree(
+                &self.volume,
+                &mut self.trees,
+                &mut self.space,
+                objectid::QUOTA_TREE,
+            )
+            .await?;
+        self.force_commit = true;
+        Ok(())
+    }
+
+    /// Recomputes every qgroup's referenced and exclusive byte counters from
+    /// scratch.
+    pub(crate) async fn quota_rescan(&mut self) -> Result<(), WriteError> {
+        let Some(quota) = &mut self.quota else {
+            return Err(WriteError::QuotaNotEnabled);
+        };
+        quota
+            .recompute(&self.volume, &self.trees, &self.roots)
+            .await?;
+        self.force_commit = true;
+        Ok(())
+    }
+
+    pub(crate) fn qgroup_create(
+        &mut self,
+        id: helios_hal::fs_management::QgroupId,
+    ) -> Result<(), WriteError> {
+        let generation = self.trees.generation();
+        let Some(quota) = &mut self.quota else {
+            return Err(WriteError::QuotaNotEnabled);
+        };
+        quota.create_group(id, generation)?;
+        self.force_commit = true;
+        Ok(())
+    }
+
+    pub(crate) fn qgroup_destroy(
+        &mut self,
+        id: helios_hal::fs_management::QgroupId,
+    ) -> Result<(), WriteError> {
+        let live: alloc::collections::BTreeSet<u64> = self
+            .roots
+            .live_subvolume_roots()
+            .into_iter()
+            .map(|(tree, _)| tree)
+            .collect();
+        let Some(quota) = &mut self.quota else {
+            return Err(WriteError::QuotaNotEnabled);
+        };
+        quota.destroy_group(id, &live)?;
+        self.force_commit = true;
+        Ok(())
+    }
+
+    pub(crate) fn qgroup_assign(
+        &mut self,
+        member: helios_hal::fs_management::QgroupId,
+        parent: helios_hal::fs_management::QgroupId,
+    ) -> Result<(), WriteError> {
+        let Some(quota) = &mut self.quota else {
+            return Err(WriteError::QuotaNotEnabled);
+        };
+        quota.assign(member, parent)?;
+        self.force_commit = true;
+        Ok(())
+    }
+
+    pub(crate) fn qgroup_remove(
+        &mut self,
+        member: helios_hal::fs_management::QgroupId,
+        parent: helios_hal::fs_management::QgroupId,
+    ) -> Result<(), WriteError> {
+        let Some(quota) = &mut self.quota else {
+            return Err(WriteError::QuotaNotEnabled);
+        };
+        quota.remove_relation(member, parent)?;
+        self.force_commit = true;
+        Ok(())
+    }
+
+    pub(crate) fn qgroup_limit(
+        &mut self,
+        id: helios_hal::fs_management::QgroupId,
+        limit: helios_hal::fs_management::QgroupLimit,
+    ) -> Result<(), WriteError> {
+        let Some(quota) = &mut self.quota else {
+            return Err(WriteError::QuotaNotEnabled);
+        };
+        quota.set_limit(id, limit)?;
+        self.force_commit = true;
+        Ok(())
     }
 
     pub(crate) fn unbacked_delalloc_bytes(&self, file: FileId) -> u64 {
@@ -233,6 +397,11 @@ impl<S: BlockSink> Transaction<S> {
             roots.get(objectid::CSUM_TREE)?,
             free,
         );
+        let quota = if let Ok(qroot) = roots.get(objectid::QUOTA_TREE) {
+            Some(QuotaTree::load(&volume, qroot).await?)
+        } else {
+            None
+        };
         let trees = Trees::new(generation, volume.superblock().csum_type());
         let delalloc = Delalloc::new(
             u64::from(volume.superblock().sectorsize()),
@@ -247,6 +416,8 @@ impl<S: BlockSink> Transaction<S> {
             image,
             roots,
             released: Vec::new(),
+            excluded_device: None,
+            device_size_limit: None,
             chunk_root: TreeRoot {
                 tree: objectid::CHUNK_TREE,
                 bytenr: chunk.bytenr,
@@ -255,8 +426,10 @@ impl<S: BlockSink> Transaction<S> {
             },
             space,
             accounting,
+            quota,
             trees,
             delalloc,
+            force_commit: false,
             open: OpenInodes::new(),
         })
     }
@@ -278,7 +451,7 @@ impl<S: BlockSink> Transaction<S> {
         mut uuid: impl FnMut() -> [u8; 16],
         compressor: &mut Compressor,
         concurrency: NonZeroUsize,
-    ) -> Result<Committed, WriteError> {
+    ) -> Result<Committed<S>, WriteError> {
         // The dirty data gets its extents before anything is written, so
         // the generation holds every change readers saw.
         self.writeback_all(compressor, concurrency).await?;
@@ -286,10 +459,27 @@ impl<S: BlockSink> Transaction<S> {
         // commit; what they free is out of reach of this commit's chunks.
         self.remove_unused_groups().await?;
         // A metadata chunk the commit may need exists before it starts.
-        if self.trees.blocks().next().is_some() {
+        if self.trees.blocks().next().is_some() || self.quota.is_some() {
             self.grow_metadata().await?;
         }
+        // When quotas are enabled and anything changed (or quota state itself
+        // was edited), recompute exact qgroup counts over all live subvolumes
+        // before the root/extent convergence loop writes `QUOTA_TREE`.
+        if let Some(quota) = &mut self.quota
+            && (quota.dirty || self.force_commit || self.trees.blocks().next().is_some())
+        {
+            quota
+                .recompute(&self.volume, &self.trees, &self.roots)
+                .await?;
+        }
         loop {
+            let mut quota_changed = false;
+            if let Some(quota) = &mut self.quota {
+                quota_changed = quota
+                    .sync(&self.volume, &mut self.trees, &mut self.space)
+                    .await?;
+                self.roots.set(quota.root)?;
+            }
             self.accounting
                 .sync_allocations(&self.volume, &mut self.trees, &mut self.space)
                 .await?;
@@ -299,20 +489,35 @@ impl<S: BlockSink> Transaction<S> {
             if let Some(root) = self.accounting.free_root() {
                 self.roots.set(root)?;
             }
-            if !self
+            let roots_changed = self
                 .roots
                 .sync(&self.volume, &mut self.trees, &mut self.space, &mut uuid)
-                .await?
-            {
+                .await?;
+            if !roots_changed && !quota_changed {
                 break;
             }
         }
-        if self.trees.blocks().next().is_none() {
+        if !self.force_commit && self.trees.blocks().next().is_none() {
             return Ok(Committed {
                 snapshot: self.generation.clone(),
+                devices: self.volume.shared_devices(),
                 allocation: None,
             });
         }
+        let dev_items = self.all_dev_items().await?;
+        if let Some((_, primary)) = dev_items
+            .iter()
+            .find(|(id, _)| *id == self.volume.superblock().devid())
+            .or_else(|| dev_items.first())
+        {
+            self.image.set_dev_item(*primary);
+        }
+        let total_bytes: u64 = dev_items
+            .iter()
+            .map(|(_, item)| item.total_bytes.get())
+            .sum();
+        self.image
+            .set_device_totals(dev_items.len() as u64, total_bytes);
         let allocation = self.accounting.committed(&self.space)?;
         self.image.prepare(
             &self.roots,
@@ -347,9 +552,11 @@ impl<S: BlockSink> Transaction<S> {
             }
         }
         writes.finish().await?;
-        self.volume.publish(self.image).await?;
+        let devices = self.volume.shared_devices();
+        self.volume.publish(self.image, &dev_items).await?;
         Ok(Committed {
             snapshot,
+            devices,
             allocation: Some(allocation),
         })
     }

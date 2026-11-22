@@ -280,6 +280,9 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
             current & !FDFLAG_NONBLOCK
         };
         entry.set_fdflags(next);
+        if let FileDescriptor::Socket(sock) = &entry.descriptor {
+            sock.set_nonblocking(enable);
+        }
         return 0;
     }
 

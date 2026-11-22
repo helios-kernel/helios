@@ -179,6 +179,15 @@ struct Sink {
     hostname: helios_linux::syscall::UtsField,
     domainname: helios_linux::syscall::UtsField,
 }
+impl helios_linux::syscall::Network<helios_unix::NoNetwork> for Sink {
+    fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+        match address {}
+    }
+    fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+        unreachable!()
+    }
+}
+
 impl System for Sink {
     fn realtime_nanos(&self) -> u64 {
         self.wall_nanos

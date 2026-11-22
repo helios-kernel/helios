@@ -186,7 +186,11 @@ fn a_compressing_mount_writes_extents_the_reader_reads_back() {
                 );
                 drop(fs);
             };
-            futures::future::join(client, service.run(idle_timer())).await;
+            futures::future::join(
+                alloc::boxed::Box::pin(client),
+                alloc::boxed::Box::pin(service.run(idle_timer())),
+            )
+            .await;
             let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
                 .await
                 .expect("reopen");
@@ -308,7 +312,11 @@ fn chunked_stream_writes_coalesce_into_zstd_extents() {
             fs.sync(path("compressible")).await.expect("fsync");
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
 
         let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
             .await
@@ -439,7 +447,11 @@ fn prepared_writes_fill_rounds_synchronously_keep_start_offset_and_coalesce() {
             assert_eq!(extents[0].len, expected.len().next_multiple_of(4096) as u64);
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
 }
 
@@ -895,7 +907,11 @@ fn writable_service_publishes_namespace_and_survives_remount() {
             );
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
         let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(101))
             .await
             .expect("reopen");
@@ -973,7 +989,11 @@ fn a_node_created_without_an_identity_inherits_from_its_parent() {
             }
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
     let view = block_on(helios_btrfs::Filesystem::mount(Bytes(
         disk.bytes_at(0, FORMATTED_BYTES),
@@ -1075,7 +1095,11 @@ fn writable_mount_refuses_to_open_special_nodes_and_keeps_them_across_writes() {
                 .expect("creates regular file beside special nodes");
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
 }
 
@@ -1159,7 +1183,11 @@ fn writable_service_renames_with_noreplace_and_exchange_and_survives_remount() {
             fs.sync(path("日本語")).await.expect("commit");
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
         let reopened = BtrfsFs::mount(cache.disk(0), || DeviceId::new(111))
             .await
             .expect("reopen");
@@ -1372,7 +1400,11 @@ fn a_change_is_visible_at_once_and_durable_once_a_sync_covers_it() {
             assert_eq!(fs.sync(path("absent")).await, Err(FsError::NoEntry));
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
 }
 
@@ -1507,7 +1539,11 @@ fn the_dirty_data_bound_writes_back_without_a_commit() {
             assert_eq!(durable_generation(disk), start + 1);
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
 }
 
@@ -1550,7 +1586,11 @@ fn the_dirty_bound_commits_without_a_sync() {
             settle(|| durable_generation(disk) == start + 2).await;
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
 }
 
@@ -1584,7 +1624,11 @@ fn unmounting_commits_the_running_transaction() {
             .expect("write");
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
     assert_eq!(durable_generation(&disk), start + 1);
     let reopened = mount(&cache_over(&disk, 256, 1));
@@ -1627,7 +1671,11 @@ fn a_failed_commit_fails_its_sync_and_leaves_the_previous_tree() {
             );
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
     assert_eq!(durable_generation(&disk), start);
     let reopened = mount(&cache_over(&disk, 256, 1));
@@ -1856,7 +1904,11 @@ fn the_max_inline_option_bounds_inline_files_and_follows_its_operator() {
             fs.sync(path(AFTER)).await.expect("sync");
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
     let reopened = mount(&cache_over(&disk, 256, 1));
     let snapshot = reopened.inner.reader.lock().clone();
@@ -2021,7 +2073,828 @@ fn open_dir_bounds_iteration_during_renames_and_refreshes_on_rewind() {
             drop(empty_stream);
             drop(fs);
         };
-        futures::future::join(client, service.run(idle_timer())).await;
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
+    });
+}
+
+fn mgmt_auth(
+    dirs: &[(&str, crate::DirectoryAuthorityRights)],
+    mount: bool,
+    devices: &[&str],
+) -> ProcessAuthority {
+    use crate::device::DeviceName;
+    use crate::{DirectoryPreopen, MountAuthorityRights};
+
+    let mut auth = ProcessAuthority::empty();
+    for &(dir, rights) in dirs {
+        auth.insert_directory_preopen(DirectoryPreopen::new(dir, dir, rights).unwrap());
+    }
+    if mount {
+        auth.grant_mount_rights(MountAuthorityRights::MOUNT);
+    }
+    for &dev in devices {
+        auth.grant_device(DeviceName::new(dev).unwrap()).unwrap();
+    }
+    auth
+}
+
+fn mgmt_req<'a>(
+    authority: &'a ProcessAuthority,
+    namespace: &'a Namespace<MemoryStorage>,
+    cache: &crate::BlockCache<MemoryDisk>,
+) -> crate::vfs::BtrfsVolumeRequest<'a, MemoryStorage> {
+    crate::vfs::BtrfsVolumeRequest {
+        authority,
+        namespace,
+        attached: AttachedStorage {
+            host_share: None,
+            disks: Some(cache.clone()),
+        },
+        now: 1_750_000_000_000_000_000,
+    }
+}
+
+/// Authority and execution test for subvolume create/delete, RO/RW snapshot,
+/// read-only toggle, info, and list.
+#[test]
+fn btrfs_management_subvolume_and_snapshot_grants() {
+    use helios_hal::fs_management::VolumeManagementError;
+
+    use crate::vfs::BtrfsManagementError;
+    use crate::{DirectoryAuthorityRights, request_unmount};
+
+    let dev1 = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    let cache = cache_over(&dev1, 512, 1);
+    let namespace = mount_point_namespace();
+    let root_auth = ProcessAuthority::root();
+
+    block_on(async {
+        let service = request_mount(
+            &root_auth,
+            &namespace,
+            AttachedStorage {
+                host_share: None,
+                disks: Some(cache.clone()),
+            },
+            mount_request(btrfs_source(), false, write_options(1, None)),
+        )
+        .await
+        .expect("mount writable btrfs")
+        .expect("btrfs service");
+
+        let client = async {
+            let rw_no_mutate = mgmt_auth(
+                &[(
+                    "/mnt",
+                    DirectoryAuthorityRights::READ | DirectoryAuthorityRights::WRITE,
+                )],
+                false,
+                &[],
+            );
+            let mutate_mnt = mgmt_auth(
+                &[("/mnt", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                false,
+                &[],
+            );
+
+            // Subvolume create: READ+WRITE without MUTATE_DIRECTORY refused.
+            assert!(matches!(
+                mgmt_req(&rw_no_mutate, &namespace, &cache)
+                    .create_subvolume("/mnt/sub")
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let sub_info = mgmt_req(&mutate_mnt, &namespace, &cache)
+                .create_subvolume("/mnt/sub")
+                .await
+                .expect("create subvolume with MUTATE_DIRECTORY");
+            assert_eq!(sub_info.path, "sub");
+
+            for dir in ["/mnt/sub/inner", "/mnt/snaps"] {
+                let res = namespace.resolve(dir).unwrap();
+                res.fs()
+                    .create_directory(res.path(), 1_750_000_001_000_000_000)
+                    .await
+                    .unwrap();
+            }
+
+            // Snapshot: narrower READ grant inside `/mnt/sub/inner` is REFUSED.
+            let narrow_snap = mgmt_auth(
+                &[
+                    ("/mnt/sub/inner", DirectoryAuthorityRights::READ),
+                    ("/mnt/snaps", DirectoryAuthorityRights::MUTATE_DIRECTORY),
+                ],
+                false,
+                &[],
+            );
+            assert!(matches!(
+                mgmt_req(&narrow_snap, &namespace, &cache)
+                    .snapshot_subvolume("/mnt/sub", "/mnt/snaps/s1", true)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            assert!(matches!(
+                mgmt_req(&narrow_snap, &namespace, &cache)
+                    .snapshot_subvolume("/mnt/sub/inner", "/mnt/snaps/s1", true)
+                    .await,
+                Err(BtrfsManagementError::Volume(
+                    VolumeManagementError::NotSubvolume
+                ))
+            ));
+            let snap_no_dest_mutate = mgmt_auth(
+                &[
+                    ("/mnt/sub", DirectoryAuthorityRights::READ),
+                    ("/mnt/snaps", DirectoryAuthorityRights::READ),
+                ],
+                false,
+                &[],
+            );
+            assert!(matches!(
+                mgmt_req(&snap_no_dest_mutate, &namespace, &cache)
+                    .snapshot_subvolume("/mnt/sub", "/mnt/snaps/s1", true)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let exact_snap = mgmt_auth(
+                &[
+                    ("/mnt/sub", DirectoryAuthorityRights::READ),
+                    ("/mnt/snaps", DirectoryAuthorityRights::MUTATE_DIRECTORY),
+                ],
+                false,
+                &[],
+            );
+            let ro1 = mgmt_req(&exact_snap, &namespace, &cache)
+                .snapshot_subvolume("/mnt/sub", "/mnt/snaps/ro1", true)
+                .await
+                .expect("RO snapshot");
+            assert!(ro1.read_only);
+            let rw1 = mgmt_req(&exact_snap, &namespace, &cache)
+                .snapshot_subvolume("/mnt/sub", "/mnt/snaps/rw1", false)
+                .await
+                .expect("RW snapshot");
+            assert!(!rw1.read_only);
+
+            // set_subvolume_read_only, subvolume_info, list_subvolumes, delete_subvolume.
+            let ro_narrow = mgmt_auth(
+                &[(
+                    "/mnt/snaps/rw1/inner",
+                    DirectoryAuthorityRights::MUTATE_DIRECTORY,
+                )],
+                false,
+                &[],
+            );
+            assert!(matches!(
+                mgmt_req(&ro_narrow, &namespace, &cache)
+                    .set_subvolume_read_only("/mnt/snaps/rw1", true)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            assert!(matches!(
+                mgmt_req(&rw_no_mutate, &namespace, &cache)
+                    .set_subvolume_read_only("/mnt/snaps/rw1", true)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            mgmt_req(&mutate_mnt, &namespace, &cache)
+                .set_subvolume_read_only("/mnt/snaps/rw1", true)
+                .await
+                .expect("set RO");
+            assert!(matches!(
+                mgmt_req(&narrow_snap, &namespace, &cache)
+                    .subvolume_info("/mnt/sub")
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            assert!(matches!(
+                mgmt_req(&exact_snap, &namespace, &cache)
+                    .list_subvolumes("/mnt")
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let listed = mgmt_req(&rw_no_mutate, &namespace, &cache)
+                .list_subvolumes("/mnt")
+                .await
+                .expect("list subvolumes");
+            assert!(listed.len() >= 4);
+
+            let del_sub_only = mgmt_auth(
+                &[("/mnt/snaps/rw1", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                false,
+                &[],
+            );
+            assert!(matches!(
+                mgmt_req(&del_sub_only, &namespace, &cache)
+                    .delete_subvolume("/mnt/snaps/rw1")
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let del_both = mgmt_auth(
+                &[("/mnt/snaps", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                false,
+                &[],
+            );
+            mgmt_req(&del_both, &namespace, &cache)
+                .delete_subvolume("/mnt/snaps/rw1")
+                .await
+                .expect("delete subvolume");
+
+            request_unmount(&root_auth, &namespace, "/mnt")
+                .await
+                .expect("unmount");
+        };
+
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
+    });
+}
+
+/// Authority and execution test for full and incremental send & receive.
+#[test]
+fn btrfs_management_send_and_receive_grants() {
+    use helios_hal::fs_management::VolumeManagementError;
+
+    use crate::vfs::BtrfsManagementError;
+    use crate::{DirectoryAuthorityRights, request_unmount};
+
+    let dev1 = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    let cache = cache_over(&dev1, 512, 1);
+    let namespace = mount_point_namespace();
+    let root_auth = ProcessAuthority::root();
+
+    block_on(async {
+        let service = request_mount(
+            &root_auth,
+            &namespace,
+            AttachedStorage {
+                host_share: None,
+                disks: Some(cache.clone()),
+            },
+            mount_request(btrfs_source(), false, write_options(1, None)),
+        )
+        .await
+        .expect("mount writable btrfs")
+        .expect("btrfs service");
+
+        let client = async {
+            let full_dir = mgmt_auth(
+                &[(
+                    "/mnt",
+                    DirectoryAuthorityRights::READ | DirectoryAuthorityRights::MUTATE_DIRECTORY,
+                )],
+                false,
+                &[],
+            );
+            mgmt_req(&full_dir, &namespace, &cache)
+                .create_subvolume("/mnt/sub")
+                .await
+                .expect("create sub");
+            for dir in ["/mnt/sub/inner", "/mnt/snaps", "/mnt/recv"] {
+                let res = namespace.resolve(dir).unwrap();
+                res.fs()
+                    .create_directory(res.path(), 1_750_000_001_000_000_000)
+                    .await
+                    .unwrap();
+            }
+            mgmt_req(&full_dir, &namespace, &cache)
+                .snapshot_subvolume("/mnt/sub", "/mnt/snaps/ro1", true)
+                .await
+                .expect("ro1");
+            mgmt_req(&full_dir, &namespace, &cache)
+                .snapshot_subvolume("/mnt/sub", "/mnt/snaps/ro2", true)
+                .await
+                .expect("ro2");
+
+            // Send: narrower READ inside subvolume or missing parent READ is refused.
+            let send_narrow_inner = mgmt_auth(
+                &[("/mnt/snaps/ro1/inner", DirectoryAuthorityRights::READ)],
+                false,
+                &[],
+            );
+            assert!(matches!(
+                mgmt_req(&send_narrow_inner, &namespace, &cache)
+                    .send_subvolume("/mnt/snaps/ro1", None, &[])
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let send_child_only = mgmt_auth(
+                &[("/mnt/snaps/ro2", DirectoryAuthorityRights::READ)],
+                false,
+                &[],
+            );
+            assert!(matches!(
+                mgmt_req(&send_child_only, &namespace, &cache)
+                    .send_subvolume("/mnt/snaps/ro2", Some("/mnt/snaps/ro1"), &[])
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let send_both = mgmt_auth(
+                &[
+                    ("/mnt/snaps/ro1", DirectoryAuthorityRights::READ),
+                    ("/mnt/snaps/ro2", DirectoryAuthorityRights::READ),
+                ],
+                false,
+                &[],
+            );
+            let full_stream = mgmt_req(&send_both, &namespace, &cache)
+                .send_subvolume("/mnt/snaps/ro1", None, &[])
+                .await
+                .expect("full send");
+            let inc_stream = mgmt_req(&send_both, &namespace, &cache)
+                .send_subvolume("/mnt/snaps/ro2", Some("/mnt/snaps/ro1"), &[])
+                .await
+                .expect("incremental send");
+
+            // Receive: requires MUTATE_DIRECTORY at destination + READ on referenced parent.
+            let rw_no_mutate = mgmt_auth(
+                &[(
+                    "/mnt",
+                    DirectoryAuthorityRights::READ | DirectoryAuthorityRights::WRITE,
+                )],
+                false,
+                &[],
+            );
+            assert!(matches!(
+                mgmt_req(&rw_no_mutate, &namespace, &cache)
+                    .receive_subvolume("/mnt/recv", &full_stream)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let recv_only = mgmt_auth(
+                &[("/mnt/recv", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                false,
+                &[],
+            );
+            let rec1 = mgmt_req(&recv_only, &namespace, &cache)
+                .receive_subvolume("/mnt/recv", &full_stream)
+                .await
+                .expect("full receive");
+            assert!(rec1.read_only);
+            assert!(matches!(
+                mgmt_req(&recv_only, &namespace, &cache)
+                    .receive_subvolume("/mnt/recv", &inc_stream)
+                    .await,
+                Err(BtrfsManagementError::Volume(
+                    VolumeManagementError::PermissionDenied
+                ))
+            ));
+            let recv_with_source = mgmt_auth(
+                &[
+                    ("/mnt/recv", DirectoryAuthorityRights::MUTATE_DIRECTORY),
+                    ("/mnt/snaps/ro1", DirectoryAuthorityRights::READ),
+                    ("/mnt/recv/ro1", DirectoryAuthorityRights::READ),
+                ],
+                false,
+                &[],
+            );
+            let rec2 = mgmt_req(&recv_with_source, &namespace, &cache)
+                .receive_subvolume("/mnt/recv", &inc_stream)
+                .await
+                .expect("incremental receive with source READ");
+            assert!(rec2.read_only);
+
+            request_unmount(&root_auth, &namespace, "/mnt")
+                .await
+                .expect("unmount");
+        };
+
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
+    });
+}
+
+/// Authority and execution test for reflink and dedupe (`READ` on source +
+/// `WRITE` on destination).
+#[test]
+fn btrfs_management_reflink_and_dedupe_grants() {
+    use crate::vfs::BtrfsManagementError;
+    use crate::{DirectoryAuthorityRights, request_unmount};
+
+    let dev1 = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    let cache = cache_over(&dev1, 512, 1);
+    let namespace = mount_point_namespace();
+    let root_auth = ProcessAuthority::root();
+
+    block_on(async {
+        let service = request_mount(
+            &root_auth,
+            &namespace,
+            AttachedStorage {
+                host_share: None,
+                disks: Some(cache.clone()),
+            },
+            mount_request(btrfs_source(), false, write_options(1, None)),
+        )
+        .await
+        .expect("mount writable btrfs")
+        .expect("btrfs service");
+
+        let client = async {
+            let payload = alloc::vec![0x33u8; 8192];
+            for file in ["/mnt/a.bin", "/mnt/b.bin", "/mnt/c.bin"] {
+                let f = namespace.resolve(file).unwrap();
+                f.fs()
+                    .open(f.path(), OpenFlags::CREATE, 1_750_000_001_000_000_000)
+                    .await
+                    .unwrap();
+                if file != "/mnt/c.bin" {
+                    crate::vfs::write_bytes(
+                        f.fs(),
+                        f.path(),
+                        WritePosition::At(0),
+                        &payload,
+                        1_750_000_001_000_000_000,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+
+            let read_only = mgmt_auth(&[("/mnt", DirectoryAuthorityRights::READ)], false, &[]);
+            let write_only = mgmt_auth(&[("/mnt", DirectoryAuthorityRights::WRITE)], false, &[]);
+            let rw = mgmt_auth(
+                &[(
+                    "/mnt",
+                    DirectoryAuthorityRights::READ | DirectoryAuthorityRights::WRITE,
+                )],
+                false,
+                &[],
+            );
+
+            assert!(matches!(
+                mgmt_req(&read_only, &namespace, &cache)
+                    .reflink("/mnt/a.bin", 0, "/mnt/c.bin", 0, 8192)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            assert!(matches!(
+                mgmt_req(&write_only, &namespace, &cache)
+                    .reflink("/mnt/a.bin", 0, "/mnt/c.bin", 0, 8192)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            mgmt_req(&rw, &namespace, &cache)
+                .reflink("/mnt/a.bin", 0, "/mnt/c.bin", 0, 8192)
+                .await
+                .expect("reflink");
+
+            assert!(matches!(
+                mgmt_req(&read_only, &namespace, &cache)
+                    .dedupe("/mnt/a.bin", 0, "/mnt/b.bin", 0, 8192)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            assert!(matches!(
+                mgmt_req(&write_only, &namespace, &cache)
+                    .dedupe("/mnt/a.bin", 0, "/mnt/b.bin", 0, 8192)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let outcome = mgmt_req(&rw, &namespace, &cache)
+                .dedupe("/mnt/a.bin", 0, "/mnt/b.bin", 0, 8192)
+                .await
+                .expect("dedupe");
+            assert!(outcome.same);
+            assert_eq!(outcome.bytes_deduped, 8192);
+
+            request_unmount(&root_auth, &namespace, "/mnt")
+                .await
+                .expect("unmount");
+        };
+
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
+    });
+}
+
+/// Authority and execution test for device-naming operations: add, replace,
+/// remove, device-targeted resize, and device-targeted scrub.
+#[test]
+fn btrfs_management_device_and_resize_grants() {
+    use helios_hal::fs_management::ResizeTarget;
+
+    use crate::io::cache_over_many;
+    use crate::vfs::BtrfsManagementError;
+    use crate::{DirectoryAuthorityRights, request_unmount};
+
+    let dev1 = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    let blank = alloc::vec![0u8; FORMATTED_BYTES];
+    let dev2 = MemoryDisk::holding_writable("btrfs-dev2", &blank);
+    let dev3 = MemoryDisk::holding_writable("btrfs-dev3", &blank);
+    let cache = cache_over_many(&[dev1, dev2, dev3], 512, 1);
+
+    let namespace = mount_point_namespace();
+    let root_auth = ProcessAuthority::root();
+
+    block_on(async {
+        let service = request_mount(
+            &root_auth,
+            &namespace,
+            AttachedStorage {
+                host_share: None,
+                disks: Some(cache.clone()),
+            },
+            mount_request(btrfs_source(), false, write_options(1, None)),
+        )
+        .await
+        .expect("mount writable btrfs")
+        .expect("btrfs service");
+
+        let client = async {
+            let mutate_only = mgmt_auth(
+                &[("/mnt", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                false,
+                &[],
+            );
+            let mount_no_dir = mgmt_auth(&[], true, &["btrfs-test", "btrfs-dev2", "btrfs-dev3"]);
+            let mount_no_dev = mgmt_auth(
+                &[("/mnt", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                true,
+                &[],
+            );
+
+            for denied in [&mutate_only, &mount_no_dir] {
+                assert!(matches!(
+                    mgmt_req(denied, &namespace, &cache)
+                        .list_devices("/mnt")
+                        .await,
+                    Err(BtrfsManagementError::Authority(_))
+                ));
+                assert!(matches!(
+                    mgmt_req(denied, &namespace, &cache)
+                        .resize_device("/mnt", None, ResizeTarget::Max)
+                        .await,
+                    Err(BtrfsManagementError::Authority(_))
+                ));
+            }
+
+            // Device-naming ops require explicit device grants on top of mount authority.
+            assert!(matches!(
+                mgmt_req(&mount_no_dev, &namespace, &cache)
+                    .add_device("/mnt", "btrfs-dev2")
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let with_dev2 = mgmt_auth(
+                &[("/mnt", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                true,
+                &["btrfs-dev2"],
+            );
+            let added = mgmt_req(&with_dev2, &namespace, &cache)
+                .add_device("/mnt", "btrfs-dev2")
+                .await
+                .expect("add_device");
+            assert_eq!(added.devid, 2);
+
+            assert!(matches!(
+                mgmt_req(&mount_no_dev, &namespace, &cache)
+                    .resize_device("/mnt", Some(2), ResizeTarget::Bytes(112 << 20))
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let resized = mgmt_req(&with_dev2, &namespace, &cache)
+                .resize_device("/mnt", Some(2), ResizeTarget::Bytes(112 << 20))
+                .await
+                .expect("resize dev 2");
+            assert_eq!(resized.total_bytes, 112 << 20);
+
+            assert!(matches!(
+                mgmt_req(&mount_no_dev, &namespace, &cache)
+                    .scrub("/mnt", Some(2), true)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let scrub_dev2 = mgmt_req(&with_dev2, &namespace, &cache)
+                .scrub("/mnt", Some(2), true)
+                .await
+                .expect("scrub dev 2");
+            assert_eq!(scrub_dev2.uncorrectable_errors, 0);
+
+            assert!(matches!(
+                mgmt_req(&with_dev2, &namespace, &cache)
+                    .replace_device("/mnt", 2, "btrfs-dev3")
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let with_dev3_only = mgmt_auth(
+                &[("/mnt", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                true,
+                &["btrfs-dev3"],
+            );
+            assert!(matches!(
+                mgmt_req(&with_dev3_only, &namespace, &cache)
+                    .replace_device("/mnt", 2, "btrfs-dev3")
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            let with_dev2_and_3 = mgmt_auth(
+                &[("/mnt", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                true,
+                &["btrfs-dev2", "btrfs-dev3"],
+            );
+            let replaced = mgmt_req(&with_dev2_and_3, &namespace, &cache)
+                .replace_device("/mnt", 2, "btrfs-dev3")
+                .await
+                .expect("replace dev 2 -> dev 3");
+            assert_eq!(replaced.devid, 2);
+
+            assert!(matches!(
+                mgmt_req(&with_dev2, &namespace, &cache)
+                    .remove_device("/mnt", 2)
+                    .await,
+                Err(BtrfsManagementError::Authority(_))
+            ));
+            mgmt_req(&with_dev3_only, &namespace, &cache)
+                .remove_device("/mnt", 2)
+                .await
+                .expect("remove dev 2");
+
+            request_unmount(&root_auth, &namespace, "/mnt")
+                .await
+                .expect("unmount");
+        };
+
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
+    });
+}
+
+/// Authority and execution test for balance, whole-volume scrub, and quota
+/// group lifecycle operations.
+#[test]
+fn btrfs_management_balance_scrub_and_quota_grants() {
+    use helios_hal::fs_management::{BalanceFilter, QgroupId, QgroupLimit};
+
+    use crate::vfs::BtrfsManagementError;
+    use crate::{DirectoryAuthorityRights, request_unmount};
+
+    let dev1 = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    let cache = cache_over(&dev1, 512, 1);
+    let namespace = mount_point_namespace();
+    let root_auth = ProcessAuthority::root();
+
+    block_on(async {
+        let service = request_mount(
+            &root_auth,
+            &namespace,
+            AttachedStorage {
+                host_share: None,
+                disks: Some(cache.clone()),
+            },
+            mount_request(btrfs_source(), false, write_options(1, None)),
+        )
+        .await
+        .expect("mount writable btrfs")
+        .expect("btrfs service");
+
+        let client = async {
+            let mutate_only = mgmt_auth(
+                &[("/mnt", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                false,
+                &[],
+            );
+            let mount_no_dir = mgmt_auth(&[], true, &[]);
+            let mount_admin = mgmt_auth(
+                &[("/mnt", DirectoryAuthorityRights::MUTATE_DIRECTORY)],
+                true,
+                &[],
+            );
+
+            for denied in [&mutate_only, &mount_no_dir] {
+                assert!(matches!(
+                    mgmt_req(denied, &namespace, &cache)
+                        .balance("/mnt", BalanceFilter::default())
+                        .await,
+                    Err(BtrfsManagementError::Authority(_))
+                ));
+                assert!(matches!(
+                    mgmt_req(denied, &namespace, &cache)
+                        .scrub("/mnt", None, true)
+                        .await,
+                    Err(BtrfsManagementError::Authority(_))
+                ));
+                assert!(matches!(
+                    mgmt_req(denied, &namespace, &cache)
+                        .quota_enable("/mnt")
+                        .await,
+                    Err(BtrfsManagementError::Authority(_))
+                ));
+                assert!(matches!(
+                    mgmt_req(denied, &namespace, &cache)
+                        .quota_status("/mnt")
+                        .await,
+                    Err(BtrfsManagementError::Authority(_))
+                ));
+                assert!(matches!(
+                    mgmt_req(denied, &namespace, &cache)
+                        .list_qgroups("/mnt")
+                        .await,
+                    Err(BtrfsManagementError::Authority(_))
+                ));
+            }
+
+            let bal = mgmt_req(&mount_admin, &namespace, &cache)
+                .balance(
+                    "/mnt",
+                    BalanceFilter {
+                        data: true,
+                        metadata: false,
+                        system: false,
+                        usage_max_percent: None,
+                        limit: Some(1),
+                    },
+                )
+                .await
+                .expect("balance");
+            assert!(bal.considered >= 1);
+            let scrub_all = mgmt_req(&mount_admin, &namespace, &cache)
+                .scrub("/mnt", None, true)
+                .await
+                .expect("scrub all");
+            assert_eq!(scrub_all.uncorrectable_errors, 0);
+
+            let qg = QgroupId::new(1, 7).unwrap();
+            let root_qg = QgroupId::new(0, 5).unwrap();
+            mgmt_req(&mount_admin, &namespace, &cache)
+                .quota_enable("/mnt")
+                .await
+                .expect("quota enable");
+            assert!(
+                mgmt_req(&mount_admin, &namespace, &cache)
+                    .quota_status("/mnt")
+                    .await
+                    .unwrap()
+                    .enabled
+            );
+            mgmt_req(&mount_admin, &namespace, &cache)
+                .qgroup_create("/mnt", qg)
+                .await
+                .expect("qgroup create");
+            mgmt_req(&mount_admin, &namespace, &cache)
+                .qgroup_assign("/mnt", root_qg, qg)
+                .await
+                .expect("qgroup assign");
+            mgmt_req(&mount_admin, &namespace, &cache)
+                .qgroup_limit(
+                    "/mnt",
+                    qg,
+                    QgroupLimit {
+                        max_referenced: Some(64 << 20),
+                        max_exclusive: None,
+                    },
+                )
+                .await
+                .expect("qgroup limit");
+            mgmt_req(&mount_admin, &namespace, &cache)
+                .quota_rescan("/mnt")
+                .await
+                .expect("quota rescan");
+            assert!(
+                mgmt_req(&mount_admin, &namespace, &cache)
+                    .list_qgroups("/mnt")
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|g| g.id == qg)
+            );
+            mgmt_req(&mount_admin, &namespace, &cache)
+                .qgroup_remove("/mnt", root_qg, qg)
+                .await
+                .expect("qgroup remove");
+            mgmt_req(&mount_admin, &namespace, &cache)
+                .qgroup_destroy("/mnt", qg)
+                .await
+                .expect("qgroup destroy");
+            mgmt_req(&mount_admin, &namespace, &cache)
+                .quota_disable("/mnt")
+                .await
+                .expect("quota disable");
+
+            request_unmount(&root_auth, &namespace, "/mnt")
+                .await
+                .expect("unmount");
+        };
+
+        futures::future::join(
+            alloc::boxed::Box::pin(client),
+            alloc::boxed::Box::pin(service.run(idle_timer())),
+        )
+        .await;
     });
 }
 

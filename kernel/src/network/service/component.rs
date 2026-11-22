@@ -248,6 +248,28 @@ where
         }
     }
 
+    /// Returns the DNS resolver addresses currently known on this link in the
+    /// same order [`resolver_endpoint`](Self::resolver_endpoint) selects them:
+    /// DHCP IPv4 resolvers when present, otherwise IPv6 RDNSS resolvers.
+    pub fn dns_servers(&self) -> Vec<NetworkIpAddress> {
+        self.inner.state.with(|state| {
+            if !state.dns_servers.is_empty() {
+                state
+                    .dns_servers
+                    .iter()
+                    .copied()
+                    .map(|addr| NetworkIpAddress::Ipv4(map_ipv4_address(addr)))
+                    .collect()
+            } else {
+                state
+                    .stack
+                    .ipv6_dns_servers()
+                    .map(NetworkIpAddress::Ipv6)
+                    .collect()
+            }
+        })
+    }
+
     /// The resolver this link can actually reach.
     ///
     /// A DHCP-supplied resolver is preferred because the IPv4 path is
@@ -499,6 +521,10 @@ where
         NetworkService::dns_resolve_https(self, host, port, timeout_nanos).await
     }
 
+    fn dns_servers(&self) -> Vec<NetworkIpAddress> {
+        NetworkService::dns_servers(self)
+    }
+
     async fn tcp_connect<'a>(
         &'a self,
         host: &'a str,
@@ -537,6 +563,27 @@ where
             timeout_nanos,
         )
         .await
+    }
+
+    async fn tcp_connect_start(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        hop_limit: u8,
+    ) -> Result<(Self::TcpStream, TcpConnectPoll), TcpError> {
+        NetworkService::tcp_connect_start(self, remote_address, port, local_port, hop_limit).await
+    }
+
+    async fn tcp_connect_poll(&self, stream: Self::TcpStream) -> Result<TcpConnectPoll, TcpError> {
+        NetworkService::tcp_connect_poll(self, stream).await
+    }
+
+    fn tcp_local_endpoint(
+        &self,
+        stream: Self::TcpStream,
+    ) -> Result<Option<(NetworkIpAddress, u16)>, TcpError> {
+        NetworkService::tcp_local_endpoint(self, stream)
     }
 
     async fn tcp_listen(
@@ -600,6 +647,15 @@ where
         timeout_nanos: u64,
     ) -> Result<(), TcpError> {
         NetworkService::tcp_write_all_bytes(self, stream, bytes, timeout_nanos).await
+    }
+
+    async fn tcp_write_some_bytes(
+        &self,
+        stream: Self::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, TcpError> {
+        NetworkService::tcp_write_some_bytes(self, stream, bytes, timeout_nanos).await
     }
 
     async fn tcp_read(

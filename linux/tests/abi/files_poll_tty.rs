@@ -400,6 +400,15 @@ impl Tty for MockHost {
     }
 }
 
+impl helios_linux::syscall::Network<NoNetwork> for MockHost {
+    fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+        match address {}
+    }
+    fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+        unreachable!()
+    }
+}
+
 impl Filesystem<MemRes> for MockHost {
     fn file_access(&self, file: &MemFile) -> FileAccess {
         file.access

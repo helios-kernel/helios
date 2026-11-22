@@ -355,6 +355,11 @@ jobs:
           # rather than the single commit a default checkout fetches.
           fetch-depth: 0
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The candidate's boot payload is signed with CI's key (#1023); the
+      # baseline's own checkout predates it and signs with a key of its own.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       # The fork the baseline commit pins, when it is not the candidate's:
       # its checkout is laid out beside it, at the path its profile was
       # collected against (#486, tools/bench/src/helios_bench/baseline.py).
@@ -614,6 +619,9 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
       - uses: ./helios/.github/actions/bench-host
         with:
           network-tools: "true"

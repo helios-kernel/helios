@@ -152,10 +152,13 @@ pub async fn request_mount<S: Storage>(
                     .await
                     .map_err(|error| MountRequestError::Btrfs { serial, error })?
             } else {
-                let (fs, task) =
-                    BtrfsFs::mount_writable(disk, || namespace.table().allocate_device(), write)
-                        .await
-                        .map_err(|error| MountRequestError::Btrfs { serial, error })?;
+                let (fs, task) = BtrfsFs::mount_writable_with_allocator(
+                    disk,
+                    namespace.table().device_allocator(),
+                    write,
+                )
+                .await
+                .map_err(|error| MountRequestError::Btrfs { serial, error })?;
                 service = Some(task);
                 fs
             };
