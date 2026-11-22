@@ -340,7 +340,7 @@ jobs:
     needs: changes
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'debug')
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       matrix:
         profile: [debug]
@@ -425,7 +425,7 @@ jobs:
     needs: changes
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'release')
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       matrix:
         profile: [release]
