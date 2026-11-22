@@ -13,11 +13,12 @@ use futures_lite::future::zip;
 
 pub use crate::bindings::helios::system::programs::{
     AotHint, AotRequest, AotResult, CapabilityGrant, ChildTermination, ClockGrant, ClockRight,
-    DeviceClass, DeviceGrant, DiagnosticsGrant, DiagnosticsRight, DirectoryGrant, ExecError,
-    ExecErrorKind, ExecOutput, ExecRequest, ExecResult, ExitStatus, FilesystemRight, LinkGrant,
-    LinkRight, MachineGrant, MachineRight, MountGrant, MountRight, NetworkGrant, NetworkRight,
-    ProcessGrant, ProcessRight, SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest,
-    TerminalGrant, TerminalRight,
+    ContainerConfig, ContainerCredentials, ContainerExecRequest, ContainerIdentity, ContainerMount,
+    ContainerMountSharing, ContainerSpawnRequest, DeviceClass, DeviceGrant, DiagnosticsGrant,
+    DiagnosticsRight, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest,
+    ExecResult, ExitStatus, FilesystemRight, LinkGrant, LinkRight, MachineGrant, MachineRight,
+    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
+    SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
 };
 
 impl PartialEq for ChildTermination {
@@ -280,6 +281,41 @@ async fn drain_stream(pair: (StreamReader<u8>, FutureReader<Result<(), ()>>)) ->
     }
     let _ = std::future::IntoFuture::into_future(future).await;
     collected
+}
+
+/// Owned handle to a kernel Linux container.
+///
+/// The handle wraps the `helios:system/programs.container` WIT resource.
+/// Processes launched through it share its root, mounts, PID namespace
+/// (starting at 1), hostname and domain name, and are bounded by the
+/// container's granted authority.
+pub struct Container {
+    inner: raw::Container,
+}
+
+impl Container {
+    /// Create a new Linux container bounded by the caller's authority.
+    pub async fn create(config: ContainerConfig) -> Result<Self, SpawnError> {
+        let inner = raw::create_container(config).await?;
+        Ok(Self { inner })
+    }
+
+    /// Spawn a Linux program inside this container and return its live handle.
+    pub async fn spawn(&self, request: ContainerSpawnRequest) -> Result<Child, SpawnError> {
+        let inner = self.inner.spawn(request).await?;
+        Ok(Child { inner })
+    }
+
+    /// Run a Linux program to completion inside this container, collecting its
+    /// buffered stdout and stderr.
+    pub async fn exec(&self, request: ContainerExecRequest) -> Result<ExecResult, ExecError> {
+        self.inner.exec(request).await
+    }
+}
+
+/// Create a new Linux container bounded by the caller's authority.
+pub async fn create_container(config: ContainerConfig) -> Result<Container, SpawnError> {
+    Container::create(config).await
 }
 
 /// Launch a program by path and wait for it to finish, collecting its

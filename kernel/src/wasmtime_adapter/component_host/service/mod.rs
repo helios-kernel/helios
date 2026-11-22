@@ -238,6 +238,12 @@ where
 /// Distinct from [`ProgramExecContext`], which is the host the program
 /// runs *in*, and from [`ChildStdio`], which is how the caller talks to
 /// it once it is running.
+#[cfg(feature = "linux")]
+pub(super) struct LinuxContainerLaunch<StorageImpl: crate::Storage> {
+    pub(super) container: Arc<crate::LinuxContainer<StorageImpl>>,
+    pub(super) credentials: Option<helios_linux::syscall::Credentials>,
+}
+
 pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::Storage> {
     argv: ProgramArgv,
     env: LaunchEnvironment,
@@ -251,6 +257,11 @@ pub(super) struct ProgramLaunch<Net: ComponentHostNetwork, StorageImpl: crate::S
     /// descriptor table; a component ignores one.
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_dispositions: Vec<WasixSignalDisposition>,
+    /// Explicit Linux container for launches started through a container
+    /// handle. Direct Linux ELF launches wrap themselves in an ephemeral
+    /// container bounded by `authority`.
+    #[cfg(feature = "linux")]
+    container: Option<LinuxContainerLaunch<StorageImpl>>,
     /// The launch's phase timeline: [`phases::Timeline::disabled`]
     /// when the launch-phase target is off or the launcher is not a
     /// launch call (plugin loads record nothing).
@@ -275,6 +286,31 @@ impl<Net: ComponentHostNetwork, StorageImpl: crate::Storage> ProgramLaunch<Net, 
             filesystem,
             descriptors: None,
             signal_dispositions: Vec::new(),
+            #[cfg(feature = "linux")]
+            container: None,
+            timeline: phases::Timeline::disabled(),
+        }
+    }
+
+    #[cfg(feature = "linux")]
+    pub(super) fn in_container(
+        argv: ProgramArgv,
+        env: Vec<(String, String)>,
+        container: Arc<crate::LinuxContainer<StorageImpl>>,
+        credentials: Option<helios_linux::syscall::Credentials>,
+    ) -> Self {
+        let authority = container.authority().clone();
+        Self {
+            argv,
+            env: LaunchEnvironment::from_guest(env),
+            authority,
+            filesystem: None,
+            descriptors: None,
+            signal_dispositions: Vec::new(),
+            container: Some(LinuxContainerLaunch {
+                container,
+                credentials,
+            }),
             timeline: phases::Timeline::disabled(),
         }
     }
@@ -379,6 +415,14 @@ where
     http_client_pre: spin::Once<Option<PreparedComponent<CpuImpl, Net, StorageImpl>>>,
     plugin_read_serial: crate::SerialReader,
     plugin_write_serial: crate::DebugSerialWriter,
+    #[cfg(feature = "linux")]
+    next_container_id: core::sync::atomic::AtomicU64,
+    #[cfg(feature = "linux")]
+    containers: Mutex<
+        alloc::collections::BTreeMap<crate::ContainerId, Arc<crate::LinuxContainer<StorageImpl>>>,
+    >,
+    #[cfg(feature = "linux")]
+    retired_containers: Arc<Mutex<Vec<NonZeroU64>>>,
     _marker: core::marker::PhantomData<fn() -> StorageImpl>,
 }
 
@@ -397,6 +441,8 @@ struct ProgramSpawnRequest<Net: ComponentHostNetwork, StorageImpl: crate::Storag
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
+    #[cfg(feature = "linux")]
+    container: Option<LinuxContainerLaunch<StorageImpl>>,
 }
 
 /// A program's bytes, classified by how far the kernel trusts them.
@@ -461,6 +507,105 @@ impl ProgramSource {
             #[cfg(feature = "linux")]
             Self::LinuxElf(bytes) => bytes.len(),
             Self::BootfsArtifact(bytes) => bytes.as_slice().len(),
+        }
+    }
+}
+
+#[cfg(feature = "linux")]
+fn map_container_error(error: crate::ContainerError) -> ProgramExecError {
+    let kind = match &error {
+        crate::ContainerError::InvalidRootTarget(_)
+        | crate::ContainerError::InvalidMountTarget(_)
+        | crate::ContainerError::DuplicateMountTarget(_)
+        | crate::ContainerError::NotADirectory { .. }
+        | crate::ContainerError::TooManyMounts => ProgramExecErrorKind::InvalidPath,
+        crate::ContainerError::Authority { .. }
+        | crate::ContainerError::MountSharingMismatch { .. }
+        | crate::ContainerError::PrivateMountBusy { .. }
+        | crate::ContainerError::ReadOnlyMount { .. } => ProgramExecErrorKind::PermissionDenied,
+        crate::ContainerError::Filesystem { error: fs, .. } => {
+            return ProgramExecError::from_source_read_error(*fs);
+        }
+    };
+    ProgramExecError {
+        kind,
+        detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(error)),
+    }
+}
+
+#[cfg(feature = "linux")]
+async fn load_container_executable<CpuImpl, StorageImpl>(
+    cpu: &CpuImpl,
+    container: &crate::LinuxContainer<StorageImpl>,
+    path: &str,
+    timeline: &phases::Timeline,
+) -> Result<LinuxExecutable, ProgramExecError>
+where
+    CpuImpl: Cpu,
+    StorageImpl: crate::Storage,
+{
+    let contents = container
+        .filesystem()
+        .read_executable(path)
+        .await
+        .map_err(ProgramExecError::from_source_read_error)?;
+    let bytes = match contents {
+        FileContents::Boot(boot) => Bytes::copy_from_slice(boot.as_slice()),
+        FileContents::Written(written) => written,
+    };
+    timeline.record(cpu, LaunchPhase::SourceRead);
+    if !is_linux_elf(&bytes) {
+        return Err(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::LinuxImageInvalid(crate::LinuxImageRefusal::Malformed),
+        });
+    }
+    timeline.record(cpu, LaunchPhase::LoadBegin);
+    let loaded = LinuxExecutable::load(cpu, bytes)?;
+    timeline.record(cpu, LaunchPhase::LoadComplete);
+    Ok(loaded)
+}
+
+/// Handle to a kernel Linux container stored in a component's resource table.
+///
+/// Kept non-generic so `wasmtime::component::bindgen!` maps
+/// `helios:system/programs.container` directly to it; the underlying
+/// [`crate::LinuxContainer`] lives in [`UserProgramService`] keyed by `id`.
+/// Dropping the handle (either explicitly or on store teardown) retires `id`
+/// so the service drops the container and releases any private mount claims.
+pub struct ContainerHandle {
+    id: NonZeroU64,
+    retired: Arc<Mutex<Vec<NonZeroU64>>>,
+    active: bool,
+}
+
+impl ContainerHandle {
+    #[cfg(feature = "linux")]
+    fn new(id: crate::ContainerId, retired: Arc<Mutex<Vec<NonZeroU64>>>) -> Self {
+        Self {
+            id: NonZeroU64::new(id.raw()).expect("container id is nonzero"),
+            retired,
+            active: true,
+        }
+    }
+
+    #[cfg(feature = "linux")]
+    pub(super) fn id(&self) -> crate::ContainerId {
+        crate::ContainerId::new(self.id)
+    }
+
+    #[cfg(feature = "linux")]
+    fn disarm(&mut self) -> crate::ContainerId {
+        self.active = false;
+        crate::ContainerId::new(self.id)
+    }
+}
+
+impl Drop for ContainerHandle {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            self.retired.lock().push(self.id);
         }
     }
 }
@@ -652,6 +797,12 @@ where
             http_client_pre: spin::Once::new(),
             plugin_read_serial: read_serial,
             plugin_write_serial: write_serial,
+            #[cfg(feature = "linux")]
+            next_container_id: core::sync::atomic::AtomicU64::new(1),
+            #[cfg(feature = "linux")]
+            containers: Mutex::new(alloc::collections::BTreeMap::new()),
+            #[cfg(feature = "linux")]
+            retired_containers: Arc::new(Mutex::new(Vec::new())),
             _marker: core::marker::PhantomData,
         }),
     };
@@ -1342,6 +1493,143 @@ where
         &self.inner.code_map
     }
 
+    #[cfg(feature = "linux")]
+    fn drain_retired_containers(&self) {
+        let retired: Vec<NonZeroU64> = {
+            let mut queue = self.inner.retired_containers.lock();
+            core::mem::take(&mut *queue)
+        };
+        if retired.is_empty() {
+            return;
+        }
+        let mut table = self.inner.containers.lock();
+        for id in retired {
+            table.remove(&crate::ContainerId::new(id));
+        }
+    }
+
+    #[cfg(feature = "linux")]
+    pub(super) fn allocate_container_id(&self) -> crate::ContainerId {
+        let raw = self
+            .inner
+            .next_container_id
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::ContainerId::new(NonZeroU64::new(raw).expect("container id counter starts at 1"))
+    }
+
+    /// Creates a new isolated Linux container owned by this service and returns
+    /// its resource handle.
+    #[cfg(feature = "linux")]
+    pub(super) async fn create_container(
+        &self,
+        caller_authority: &ProcessAuthority,
+        caller_namespace: &Namespace<StorageImpl>,
+        non_fs_authority: ProcessAuthority,
+        config: crate::ContainerConfig,
+    ) -> Result<ContainerHandle, ProgramExecError> {
+        self.drain_retired_containers();
+        let id = self.allocate_container_id();
+        let container = crate::LinuxContainer::create(
+            id,
+            caller_authority,
+            caller_namespace,
+            non_fs_authority,
+            config,
+        )
+        .await
+        .map_err(map_container_error)?;
+        self.inner.containers.lock().insert(id, Arc::new(container));
+        Ok(ContainerHandle::new(
+            id,
+            self.inner.retired_containers.clone(),
+        ))
+    }
+
+    /// Looks up a live container by handle.
+    #[cfg(feature = "linux")]
+    pub(super) fn get_container(
+        &self,
+        handle: &ContainerHandle,
+    ) -> Result<Arc<crate::LinuxContainer<StorageImpl>>, ProgramExecError> {
+        self.drain_retired_containers();
+        self.inner
+            .containers
+            .lock()
+            .get(&handle.id())
+            .cloned()
+            .ok_or_else(|| ProgramExecError {
+                kind: ProgramExecErrorKind::Unavailable,
+                detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(
+                    "container handle is no longer active",
+                )),
+            })
+    }
+
+    /// Immediately removes a dropped container handle from the service so any
+    /// private mount claims it held are released right away.
+    pub(super) fn remove_container(&self, handle: &mut ContainerHandle) {
+        #[cfg(feature = "linux")]
+        {
+            let id = handle.disarm();
+            self.inner.containers.lock().remove(&id);
+            self.drain_retired_containers();
+        }
+        #[cfg(not(feature = "linux"))]
+        {
+            let _ = handle;
+        }
+    }
+
+    /// Loads a Linux executable strictly from `container`'s own filesystem and
+    /// spawns it inside `container`.
+    #[cfg(feature = "linux")]
+    pub(super) async fn spawn_in_container(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        path: &str,
+        launch: ProgramLaunch<Net, StorageImpl>,
+    ) -> Result<ChildHandle, ProgramExecError> {
+        let container = launch
+            .container
+            .as_ref()
+            .expect("container spawn carries a container")
+            .container
+            .clone();
+        let executable =
+            load_container_executable(&exec_context.cpu, &container, path, &launch.timeline)
+                .await?;
+        self.spawn_loaded(exec_context, ProgramExecutable::Linux(executable), launch)
+    }
+
+    /// Loads a Linux executable strictly from `container`'s own filesystem,
+    /// runs it to completion inside `container`, and returns buffered output.
+    #[cfg(feature = "linux")]
+    pub(super) async fn exec_in_container(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
+        path: &str,
+        stdin: Vec<u8>,
+        launch: ProgramLaunch<Net, StorageImpl>,
+    ) -> Result<ExecResult, ProgramExecError> {
+        let container = launch
+            .container
+            .as_ref()
+            .expect("container exec carries a container")
+            .container
+            .clone();
+        let executable =
+            load_container_executable(&exec_context.cpu, &container, path, &launch.timeline)
+                .await?;
+        self.exec_loaded_buffered(
+            exec_context,
+            ProgramExecutable::Linux(executable),
+            stdin,
+            launch,
+        )
+        .await
+        .map(|(result, _)| result)
+    }
+
     /// Spawn a new child program. The returned handle gives the caller
     /// direct access to the child's stdin/stdout/stderr channels and a
     /// future resolving with its exit status.
@@ -1439,8 +1727,33 @@ where
             filesystem,
             descriptors,
             signal_dispositions,
+            #[cfg(feature = "linux")]
+            container,
             timeline,
         } = launch;
+        #[cfg(feature = "linux")]
+        let container = match (&executable, container) {
+            (ProgramExecutable::Linux(_), Some(explicit)) => Some(explicit),
+            (ProgramExecutable::Linux(_), None) => {
+                // Every Linux process runs inside a container; direct ELF
+                // launches (e.g. from WASIX `/bin/dash` or `programs.exec`)
+                // receive a dedicated container bounded by their launch
+                // authority and namespace.
+                let namespace = filesystem
+                    .as_ref()
+                    .unwrap_or_else(|| exec_context.runtime_state.root_namespace());
+                let ephemeral = Arc::new(crate::LinuxContainer::ephemeral(
+                    self.allocate_container_id(),
+                    authority.clone(),
+                    namespace,
+                ));
+                Some(LinuxContainerLaunch {
+                    container: ephemeral,
+                    credentials: None,
+                })
+            }
+            (_, other) => other,
+        };
         let started_at = exec_context
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
@@ -1458,6 +1771,8 @@ where
             descriptors,
             signal_state: signal_state.clone(),
             signal_dispositions,
+            #[cfg(feature = "linux")]
+            container,
         };
 
         let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
@@ -1487,6 +1802,8 @@ where
                 request.descriptors,
                 request.signal_state,
                 request.signal_dispositions,
+                #[cfg(feature = "linux")]
+                request.container,
                 run_spawner,
                 progress,
                 executable,

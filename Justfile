@@ -193,6 +193,8 @@ test-libraries:
     # `driver` feature.
     {{ cli }} venus-protocol-fetch
     cargo nextest run -p helios-venus -p helios-venus-gen --features helios-venus/driver
+    # The HTTP client plugin's host unit, HTTP/2, and HTTP/3 tests.
+    cargo nextest run -p helios-http-client
     # The ACPI library runs QEMU's own CPU hotplug AML, from the pinned
     # tables the fetch below hash-verifies.
     just acpi-tables-fetch

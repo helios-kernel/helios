@@ -29,6 +29,8 @@ mod isa;
 pub use isa::GuestIsa;
 mod kernel_exception;
 mod limine_tpm_event_log;
+#[cfg(feature = "linux")]
+mod linux_container;
 mod log;
 mod machine;
 mod memory;
@@ -171,6 +173,12 @@ pub use kernel_exception::{
     dispatch_native_trap, install_native_trap_handler,
 };
 pub use limine_tpm_event_log::LimineTpmEventLogRequest;
+#[cfg(feature = "linux")]
+pub use linux_container::{
+    ContainerConfig, ContainerError, ContainerFilesystem, ContainerId, ContainerMount,
+    ContainerMountSpec, ContainerNodeInfo, ContainerProcessGuard, ContainerResolved,
+    LinuxContainer,
+};
 pub use machine::{
     AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
     MachineGenerationHandle, ResetDevice, UnhandledAdvances, install_generation_reactions,
@@ -240,10 +248,11 @@ pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostCreation, HostDirEntry, HostDirLimit,
     HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
-    HostWrite, Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
-    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadInto,
-    TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    HostWrite, HttpsRecord, Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress,
+    NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind, PingReply,
+    RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind,
+    TcpListener, TcpReadInto, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind,
 };
 pub use signing_key::{
     CwasmSigningKey, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,
@@ -260,9 +269,10 @@ pub use vfs::{
     Follow, FsDescriptor, FsDescriptorFlags, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
     MAX_SYMLINK_DEPTH, MemoryFs, MemoryUnixMetadata, MemoryWrite, MountError, MountFlags,
     MountGrant, MountHold, MountRequest, MountRequestError, MountSharing, MountSource, MountTable,
-    MountedFs, MountedOpenHandle, MountedWrite, Namespace, NoDisks, ROOT_GRANT, ROOT_LAYER_DEVICE,
-    ReaderError, Resolved, RootFs, RootWrite, SharedOwner, Storage, UnixAttributes, XattrSetMode,
-    object_identity, request_mount, request_unmount, symlink_target, within_directory,
+    MountedFs, MountedOpenHandle, MountedWrite, Namespace, NoDisks, PrivateMountClaim,
+    PrivateMountClaimError, ROOT_GRANT, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs,
+    RootWrite, SharedOwner, Storage, UnixAttributes, XattrSetMode, object_identity, request_mount,
+    request_unmount, symlink_target, within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
@@ -272,9 +282,10 @@ pub use vsock::{
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{
     ChildExit, ChildHandle, ChildTermination, ComponentBindingSet, ComponentHostProcessorRole,
-    HostRuntimeState, SignalTermination, UserProgramService, component_host_processor_role,
-    component_host_processors_to_start, component_host_system_processor,
-    component_host_worker_count, install_component_host_program_service, install_program_service,
+    ContainerHandle, HostRuntimeState, SignalTermination, UserProgramService,
+    component_host_processor_role, component_host_processors_to_start,
+    component_host_system_processor, component_host_worker_count,
+    install_component_host_program_service, install_program_service,
     run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever, system_component_should_run_on,
 };

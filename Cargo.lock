@@ -699,6 +699,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "boring"
+version = "5.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78768ebbcd8b284d61c52e2058a4de72e61015aa2b41da2489b29a5211c7a2d5"
+dependencies = [
+ "bitflags 2.13.1",
+ "boring-sys",
+ "foreign-types",
+ "libc",
+ "openssl-macros",
+]
+
+[[package]]
+name = "boring-sys"
+version = "5.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30c5445059ff90c02d95d05345f2b5f13c135150eb8ac6432ea182d47420799e"
+dependencies = [
+ "bindgen",
+ "cmake",
+ "fs_extra",
+ "fslock",
+]
+
+[[package]]
 name = "btrfs-disk"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -784,7 +809,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "410e22339ff9a7d87dd747b3769e67dbdd93863c7f2eeb704f8d726217fa5e7b"
 dependencies = [
  "bytes",
- "serde",
 ]
 
 [[package]]
@@ -963,6 +987,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
 dependencies = [
  "error-code",
+]
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -1549,6 +1582,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
+name = "debug_panic"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9377eb110cece2e9431deb8d7d2ec8c116510b896741f9f2bf02b352147aa2a6"
+
+[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1703,6 +1742,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-lookup"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "263c0ccfc6b3b6a93e959edad4f985779e76c0b36dbb2e13e3d27c690974adf1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "socket2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1823,6 +1874,18 @@ name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
+
+[[package]]
+name = "enum_dispatch"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
+dependencies = [
+ "once_cell",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "equivalent"
@@ -2045,6 +2108,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "foreign-types"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d737d9aa519fb7b749cbc3b962edcf310a8dd1f4b67c91c4f83975dbdd17d965"
+dependencies = [
+ "foreign-types-macros",
+ "foreign-types-shared",
+]
+
+[[package]]
+name = "foreign-types-macros"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea5190182e6915eb873ddbc16e23b711b6eb1f9c00a0d0a3a91b5f6228475225"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
+name = "foreign-types-shared"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2058,6 +2148,22 @@ name = "frame-alloc"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5adb4b661164fa282d7b168d48821f36bea1a3bff55d0a367b4b4de58f025a2"
+
+[[package]]
+name = "fs_extra"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
+
+[[package]]
+name = "fslock"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04412b8935272e3a9bae6f48c7bfff74c2911f60525404edfdd28e49884c3bfb"
+dependencies = [
+ "libc",
+ "winapi",
+]
 
 [[package]]
 name = "funty"
@@ -2143,17 +2249,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
-]
-
-[[package]]
-name = "futures-rustls"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8f2f12607f92c69b12ed746fabf9ca4f5c482cba46679c1a75b874ed7c26adb"
-dependencies = [
- "futures-io",
- "rustls",
- "rustls-pki-types",
 ]
 
 [[package]]
@@ -2720,12 +2815,18 @@ dependencies = [
 name = "helios-http-client"
 version = "0.1.0"
 dependencies = [
+ "executor-core",
  "futures-channel",
  "futures-lite",
  "helios-api",
  "http",
+ "http-kit-h2",
+ "http-kit-h3",
+ "http-kit-io",
+ "http-kit-tls",
  "rustls",
  "rustls-pure",
+ "tempfile",
  "thiserror 2.0.21",
  "zenwave",
 ]
@@ -3309,22 +3410,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "http-body-util"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c"
-dependencies = [
- "bytes",
- "futures-core",
- "http",
- "http-body",
- "pin-project-lite",
-]
-
-[[package]]
 name = "http-kit"
 version = "0.8.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#070b0cadfc5bb666b7afde378642059d365ab8ef"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#6165752d54534269bc39c89b9a00b030fe2aec06"
 dependencies = [
  "bytes",
  "bytestr",
@@ -3333,7 +3421,6 @@ dependencies = [
  "futures-lite",
  "http",
  "http-body",
- "http-body-util",
  "http-kit-io",
  "mime",
  "pin-project-lite",
@@ -3345,7 +3432,7 @@ dependencies = [
 [[package]]
 name = "http-kit-h1"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#070b0cadfc5bb666b7afde378642059d365ab8ef"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#6165752d54534269bc39c89b9a00b030fe2aec06"
 dependencies = [
  "async-channel",
  "bytes",
@@ -3360,9 +3447,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-kit-h2"
+version = "0.1.0"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#6165752d54534269bc39c89b9a00b030fe2aec06"
+dependencies = [
+ "async-channel",
+ "bytes",
+ "futures-lite",
+ "http",
+ "http-kit",
+ "http-kit-io",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "http-kit-h3"
+version = "0.6.2"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#6165752d54534269bc39c89b9a00b030fe2aec06"
+dependencies = [
+ "async-channel",
+ "boring",
+ "bytes",
+ "futures-lite",
+ "futures-util",
+ "http",
+ "http-kit",
+ "http-kit-io",
+ "quiche",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "http-kit-io"
 version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#070b0cadfc5bb666b7afde378642059d365ab8ef"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#6165752d54534269bc39c89b9a00b030fe2aec06"
 dependencies = [
  "bytes",
  "compio-buf",
@@ -3375,7 +3495,7 @@ dependencies = [
 [[package]]
 name = "http-kit-tls"
 version = "0.4.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#070b0cadfc5bb666b7afde378642059d365ab8ef"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#6165752d54534269bc39c89b9a00b030fe2aec06"
 dependencies = [
  "futures-lite",
  "http-kit-io",
@@ -3414,13 +3534,9 @@ version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
 dependencies = [
- "atomic-waker",
  "bytes",
- "futures-core",
  "http",
  "http-body",
- "httparse",
- "itoa",
  "pin-project-lite",
  "smallvec",
  "tokio",
@@ -3667,6 +3783,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "intrusive-collections"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4275b20e6057cd7733fd8df8a5a31701e4fe44497dad0f3fa0e1c4fb971506be"
 
 [[package]]
 name = "io-kit-sys"
@@ -4601,6 +4723,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "octets"
+version = "0.3.7"
+source = "git+https://github.com/lexoliu/quiche?branch=fix%2F0.30.0-err-error-string-n#bc60381da0f8e3ce3e7c9b3bf148c50a16d9aa30"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4615,6 +4742,17 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "openssl-macros"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "openssl-probe"
@@ -5121,6 +5259,28 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "quiche"
+version = "0.30.0"
+source = "git+https://github.com/lexoliu/quiche?branch=fix%2F0.30.0-err-error-string-n#bc60381da0f8e3ce3e7c9b3bf148c50a16d9aa30"
+dependencies = [
+ "boring",
+ "boring-sys",
+ "bytes",
+ "debug_panic",
+ "either",
+ "enum_dispatch",
+ "foreign-types-shared",
+ "intrusive-collections",
+ "libc",
+ "libm",
+ "log",
+ "octets",
+ "slab",
+ "smallvec",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8122,7 +8282,7 @@ dependencies = [
 [[package]]
 name = "zenwave"
 version = "0.12.0"
-source = "git+https://github.com/zen-rs/zenwave?branch=main#9e8ff65dcc21c80633273134afce93113f79fb0b"
+source = "git+https://github.com/zen-rs/zenwave?branch=main#8c79201aa3e364a663d42110e5bb969c0846c7f8"
 dependencies = [
  "async-fs",
  "async-io",
@@ -8133,22 +8293,22 @@ dependencies = [
  "cfg_aliases 0.2.2",
  "cookie_store",
  "dirs",
+ "dns-lookup",
  "executor-core",
  "futures-channel",
  "futures-io",
- "futures-rustls",
  "futures-util",
  "gloo-timers",
  "hickory-proto",
  "hickory-resolver",
  "http",
- "http-body-util",
  "http-kit",
  "http-kit-h1",
+ "http-kit-h2",
+ "http-kit-h3",
  "http-kit-io",
  "http-kit-tls",
  "httpdate",
- "hyper",
  "hyper-util",
  "jni",
  "jni-min-helper",
@@ -8156,6 +8316,7 @@ dependencies = [
  "libc",
  "ndk-context",
  "once_cell",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",

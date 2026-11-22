@@ -629,6 +629,19 @@ fn nanos(time: Timestamp) -> FsResult<u64> {
         .ok_or(FsError::Overflow)
 }
 
+impl<Device: BlockDevice<Buffer = BlockPages> + 'static> BtrfsFs<Device> {
+    /// The stored Unix ownership and mode bits of the inode at `path`.
+    pub async fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<super::UnixAttributes> {
+        let inode = self.inode(&self.snapshot(), path).await?;
+        let meta = inode.metadata();
+        Ok(super::UnixAttributes {
+            permissions: meta.permissions & 0o7777,
+            uid: meta.uid,
+            gid: meta.gid,
+        })
+    }
+}
+
 /// An open btrfs directory stream, bounded at the last `DIR_INDEX` present
 /// when it was opened (`btrfs_opendir` and `btrfs_real_readdir` in Linux
 /// `fs/btrfs/inode.c`, commit `9b378f6ad48c`, refreshed on `rewind` as commit

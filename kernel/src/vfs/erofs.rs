@@ -276,6 +276,39 @@ where
     Ok(())
 }
 
+trait ErofsPermissionBits {
+    fn permission_bits(self) -> u32;
+}
+
+impl ErofsPermissionBits for u16 {
+    fn permission_bits(self) -> u32 {
+        u32::from(self) & 0o7777
+    }
+}
+
+#[cfg(unix)]
+impl ErofsPermissionBits for std::fs::Permissions {
+    fn permission_bits(self) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        self.mode() & 0o7777
+    }
+}
+
+impl<Device> ErofsFs<Device>
+where
+    Device: BlockDevice<Buffer = BlockPages> + 'static,
+{
+    /// The stored Unix ownership and mode bits of the inode at `path`.
+    pub async fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<super::UnixAttributes> {
+        let inode = self.inode(path).await?;
+        Ok(super::UnixAttributes {
+            permissions: inode.permissions().permission_bits(),
+            uid: inode.uid(),
+            gid: inode.gid(),
+        })
+    }
+}
+
 /// An open directory stream over a read-only EROFS image.
 pub struct ErofsDir<Device: BlockDevice<Buffer = BlockPages>> {
     fs: ErofsFs<Device>,
