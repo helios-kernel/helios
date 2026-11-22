@@ -3,23 +3,25 @@
 //! As Linux's btrfs, a change is visible at once and durable at commit. Each
 //! mutation joins the writer's running transaction, and reads go through the
 //! writer's view of it, so the next request sees every reply's change. The
-//! transaction commits on `fsync`, `fsyncdir` and unmount, and when its dirty
-//! metadata reaches Linux's bound.
+//! transaction commits on `fsync`, `fsyncdir`, `remount,ro` and unmount, and
+//! when its dirty metadata reaches Linux's bound.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fuser::{Errno, FileAttr, FileHandle, FileType, Generation, INodeNo, TimeOrNow};
+use fuser::{
+    Errno, FileAttr, FileHandle, FileType, Generation, INodeNo, OpenAccMode, OpenFlags, TimeOrNow,
+};
 use futures_lite::future::block_on;
 use helios_btrfs::write::{
     Attributes, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, Special,
-    Writer, XattrMode, default_dirty_data_limit,
+    WriteError, Writer, XattrMode, default_dirty_data_limit,
 };
 use helios_btrfs::{
     BlockSink, BlockSource, DirBound, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode,
@@ -28,7 +30,7 @@ use helios_btrfs::{
 use helios_hal::fs::RenameMode;
 
 use super::OpenError;
-use super::device::Device;
+use super::device::{Claim, Device};
 use super::errno::{read_errno, write_errno};
 use super::inodes::{Identity, Inodes};
 
@@ -47,6 +49,25 @@ const DOT_COOKIES: u64 = 2;
 const PERMISSION_BITS: u32 = 0o7777;
 
 type Snapshot<S> = Filesystem<Arc<S>>;
+
+/// Shared synchronization handle between the FUSE event loop and the control
+/// socket thread.
+pub struct SharedState {
+    pub state: Mutex<State>,
+    /// Signalled whenever the last open writable file handle is released or
+    /// the filesystem is destroyed, so a `remount,ro` waiting on an in-flight
+    /// async `FUSE_RELEASE` wakes immediately.
+    pub writable_released: Condvar,
+}
+
+impl SharedState {
+    pub fn new(state: State) -> Self {
+        Self {
+            state: Mutex::new(state),
+            writable_released: Condvar::new(),
+        }
+    }
+}
 
 /// The attributes a `setattr` request changes; `None` leaves one alone.
 #[derive(Default)]
@@ -83,6 +104,22 @@ pub struct Statfs {
     pub block_size: u32,
 }
 
+enum Storage<S> {
+    ReadOnly(Snapshot<S>),
+    Writable(Box<Writer<S, RandomUuids>>),
+}
+
+/// Device ownership retained for the lifetime of a [`Device`]-backed [`State`]
+/// so `remount,rw` can check `BLKROGET` and upgrade a read-only mount to a
+/// [`Writer`] without releasing the `O_EXCL` claim.
+pub struct DeviceBacking {
+    claim: Claim,
+    path: PathBuf,
+    concurrency: NonZeroUsize,
+    #[cfg(test)]
+    direct_io: bool,
+}
+
 /// State of an open directory stream (`FUSE_OPENDIR` .. `FUSE_RELEASEDIR`),
 /// following Linux's `btrfs_opendir` and `btrfs_real_readdir`
 /// (`fs/btrfs/inode.c`, commit `9b378f6ad48c`, refreshed on rewind as
@@ -98,14 +135,18 @@ struct OpenDir {
     started: bool,
 }
 
-pub struct State<S = Device> {
-    writer: Writer<S, RandomUuids>,
+pub struct State<S = Device, B = DeviceBacking> {
+    storage: Storage<S>,
+    backing: B,
     inodes: Inodes,
     /// The dirty data the writer holds before it writes it back.
     dirty_data_limit: u64,
     open_dirs: HashMap<u64, OpenDir>,
     next_dir_handle: u64,
     read_only: bool,
+    destroyed: bool,
+    next_fh: u64,
+    writable_handles: HashSet<u64>,
 }
 
 /// The host's memory, which holds the writer's dirty data.
@@ -119,8 +160,202 @@ fn host_memory_bytes() -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
-impl<S: BlockSink> State<S> {
-    pub fn open(device: S, concurrency: NonZeroUsize, read_only: bool) -> Result<Self, OpenError> {
+impl State<Device, DeviceBacking> {
+    pub fn open(
+        claim: Claim,
+        device_path: PathBuf,
+        concurrency: NonZeroUsize,
+        read_only: bool,
+    ) -> Result<Self, OpenError> {
+        Self::open_with_mode(claim, device_path, concurrency, read_only, true)
+    }
+
+    #[cfg(test)]
+    pub fn open_for_test(
+        claim: Claim,
+        device_path: PathBuf,
+        concurrency: NonZeroUsize,
+        read_only: bool,
+    ) -> Result<Self, OpenError> {
+        Self::open_with_mode(claim, device_path, concurrency, read_only, false)
+    }
+
+    fn open_with_mode(
+        claim: Claim,
+        device_path: PathBuf,
+        concurrency: NonZeroUsize,
+        read_only: bool,
+        direct_io: bool,
+    ) -> Result<Self, OpenError> {
+        if !read_only {
+            return Self::open_writable(claim, device_path, concurrency, false, direct_io);
+        }
+        if claim.is_writable() {
+            match Self::open_writable(
+                claim.clone(),
+                device_path.clone(),
+                concurrency,
+                true,
+                direct_io,
+            ) {
+                Ok(state) => return Ok(state),
+                Err(OpenError::Write(
+                    WriteError::UnsupportedCompatRo { .. } | WriteError::QuotaTreePresent,
+                )) => {}
+                Err(OpenError::Device(error))
+                    if matches!(error.raw_os_error(), Some(libc::EROFS | libc::EACCES)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Self::open_read_only(claim, device_path, concurrency, direct_io)
+    }
+
+    fn open_device_rw(path: &Path, claim: Claim, direct_io: bool) -> std::io::Result<Device> {
+        #[cfg(test)]
+        if !direct_io {
+            return Device::open_for_test(path, claim);
+        }
+        let _ = direct_io;
+        Device::open_read_write(path, claim)
+    }
+
+    fn open_writable(
+        claim: Claim,
+        device_path: PathBuf,
+        concurrency: NonZeroUsize,
+        read_only: bool,
+        direct_io: bool,
+    ) -> Result<Self, OpenError> {
+        let device = Self::open_device_rw(&device_path, claim.clone(), direct_io)?;
+        Self::from_writer(
+            device,
+            DeviceBacking {
+                claim,
+                path: device_path,
+                concurrency,
+                #[cfg(test)]
+                direct_io,
+            },
+            concurrency,
+            read_only,
+        )
+    }
+
+    fn open_read_only(
+        claim: Claim,
+        device_path: PathBuf,
+        concurrency: NonZeroUsize,
+        direct_io: bool,
+    ) -> Result<Self, OpenError> {
+        #[cfg(not(test))]
+        let _ = direct_io;
+        let device = Device::open_read_only(&device_path, claim.clone())?;
+        let fs = block_on(Filesystem::mount(Arc::new(device)))?;
+        let root = block_on(fs.root())?;
+        let identity = Identity {
+            tree: root.tree(),
+            number: root.number(),
+        };
+        Ok(Self {
+            storage: Storage::ReadOnly(fs),
+            backing: DeviceBacking {
+                claim,
+                path: device_path,
+                concurrency,
+                #[cfg(test)]
+                direct_io,
+            },
+            inodes: Inodes::new(identity, root.metadata().generation, None),
+            dirty_data_limit: default_dirty_data_limit(host_memory_bytes()),
+            open_dirs: HashMap::new(),
+            next_dir_handle: 1,
+            read_only: true,
+            destroyed: false,
+            next_fh: 1,
+            writable_handles: HashSet::new(),
+        })
+    }
+
+    /// Transitions the daemon to read-write, checking `BLKROGET` (matching
+    /// Linux's `reconfigure_super` `bdev_read_only` -> `EACCES` check) and
+    /// upgrading a read-only [`Filesystem`] mount to a [`Writer`] when needed.
+    pub async fn remount_read_write(&mut self) -> Result<(), Errno> {
+        if self.destroyed {
+            return Err(Errno::ENODEV);
+        }
+        match self.backing.claim.is_block_device_read_only() {
+            Ok(true) => return Err(Errno::EACCES),
+            Ok(false) => {}
+            Err(error) => return Err(Errno::from(error)),
+        }
+        match &mut self.storage {
+            Storage::Writable(writer) => {
+                writer.snapshot().map_err(|error| write_errno(&error))?;
+            }
+            Storage::ReadOnly(_) => {
+                #[cfg(test)]
+                let direct_io = self.backing.direct_io;
+                #[cfg(not(test))]
+                let direct_io = true;
+                let device =
+                    Self::open_device_rw(&self.backing.path, self.backing.claim.clone(), direct_io)
+                        .map_err(|error| {
+                            if matches!(error.raw_os_error(), Some(libc::EROFS | libc::EACCES)) {
+                                Errno::EACCES
+                            } else {
+                                Errno::from(error)
+                            }
+                        })?;
+                let mut writer = Writer::mount(
+                    device,
+                    RandomUuids,
+                    self.backing.concurrency,
+                    Compressor::Plain,
+                    timestamp(SystemTime::now()),
+                )
+                .await
+                .map_err(|error| write_errno(&error))?;
+                let pending = self.inodes.pending_handles();
+                let resolved = {
+                    let transaction = writer.join().await.map_err(|error| write_errno(&error))?;
+                    let mut resolved = Vec::with_capacity(pending.len());
+                    for entry in pending {
+                        let Some(handle) = transaction
+                            .inode(entry.identity.tree, entry.identity.number)
+                            .await
+                            .map_err(|error| write_errno(&error))?
+                        else {
+                            continue;
+                        };
+                        let meta = transaction
+                            .metadata(&handle)
+                            .await
+                            .map_err(|error| write_errno(&error))?;
+                        if meta.generation != entry.generation {
+                            continue;
+                        }
+                        resolved.push((entry.ino, handle));
+                    }
+                    resolved
+                };
+                for (ino, handle) in resolved {
+                    self.inodes.attach_handle(ino, handle);
+                }
+                self.storage = Storage::Writable(Box::new(writer));
+            }
+        }
+        self.read_only = false;
+        Ok(())
+    }
+}
+
+impl<S: BlockSink, B> State<S, B> {
+    fn from_writer(
+        device: S,
+        backing: B,
+        concurrency: NonZeroUsize,
+        read_only: bool,
+    ) -> Result<Self, OpenError> {
         let mut writer = block_on(Writer::mount(
             device,
             RandomUuids,
@@ -139,13 +374,84 @@ impl<S: BlockSink> State<S> {
             number: root.number(),
         };
         Ok(Self {
-            writer,
-            inodes: Inodes::new(identity, root.metadata().generation, handle),
+            storage: Storage::Writable(Box::new(writer)),
+            backing,
+            inodes: Inodes::new(identity, root.metadata().generation, Some(handle)),
             dirty_data_limit: default_dirty_data_limit(host_memory_bytes()),
             open_dirs: HashMap::new(),
             next_dir_handle: 1,
             read_only,
+            destroyed: false,
+            next_fh: 1,
+            writable_handles: HashSet::new(),
         })
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn is_destroyed(&self) -> bool {
+        self.destroyed
+    }
+
+    pub fn has_open_writable(&self) -> bool {
+        !self.writable_handles.is_empty()
+    }
+
+    /// Records a file open. Writable opens (`O_WRONLY` or `O_RDWR`) fail with
+    /// `EROFS` on a read-only mount and receive a tracked handle so
+    /// `remount,ro` can reject active writers with `EBUSY`.
+    pub fn open_file(&mut self, flags: OpenFlags) -> Result<FileHandle, Errno> {
+        if matches!(
+            flags.acc_mode(),
+            OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
+        ) {
+            self.writable()?;
+            let id = self.next_fh;
+            self.next_fh += 1;
+            self.writable_handles.insert(id);
+            Ok(FileHandle(id))
+        } else {
+            Ok(FileHandle(0))
+        }
+    }
+
+    /// Releases a file handle. Returns `true` if this released the last open
+    /// writable handle.
+    pub fn release_file(&mut self, fh: FileHandle) -> bool {
+        fh.0 != 0 && self.writable_handles.remove(&fh.0) && self.writable_handles.is_empty()
+    }
+
+    /// Transitions the daemon to read-only after verifying no writable file
+    /// handles remain open and committing any running transaction.
+    pub async fn remount_read_only(&mut self) -> Result<(), Errno> {
+        if self.destroyed {
+            return Err(Errno::ENODEV);
+        }
+        if !self.writable_handles.is_empty() {
+            return Err(Errno::EBUSY);
+        }
+        self.sync().await?;
+        self.read_only = true;
+        Ok(())
+    }
+
+    /// Restores `read_only = true` when a `remount,rw` succeeded in the daemon
+    /// but the subsequent kernel `mount -i -o remount,rw` failed.
+    pub fn rollback_read_only(&mut self) -> Result<(), Errno> {
+        if self.destroyed {
+            return Err(Errno::ENODEV);
+        }
+        self.read_only = true;
+        Ok(())
+    }
+
+    /// Commits any pending transaction during unmount and marks the state
+    /// destroyed so late control-socket requests fail with `ENODEV`.
+    pub async fn destroy(&mut self) -> Result<(), Errno> {
+        self.destroyed = true;
+        self.sync().await
     }
 
     pub fn forget(&mut self, ino: INodeNo, count: u64) {
@@ -153,14 +459,27 @@ impl<S: BlockSink> State<S> {
     }
 
     fn snapshot(&self) -> Result<Snapshot<S>, Errno> {
-        self.writer.snapshot().map_err(|error| write_errno(&error))
+        match &self.storage {
+            Storage::Writable(writer) => writer.snapshot().map_err(|error| write_errno(&error)),
+            Storage::ReadOnly(fs) => Ok(fs.clone()),
+        }
     }
 
     fn writable(&self) -> Result<(), Errno> {
-        if self.read_only {
+        if self.read_only || matches!(self.storage, Storage::ReadOnly(_)) {
             return Err(Errno::EROFS);
         }
         Ok(())
+    }
+
+    fn writable_writer(&mut self) -> Result<&mut Writer<S, RandomUuids>, Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        match &mut self.storage {
+            Storage::Writable(writer) => Ok(writer),
+            Storage::ReadOnly(_) => Err(Errno::EROFS),
+        }
     }
 
     /// The inode `ino` names in `snapshot`; `ESTALE` once it was deleted or
@@ -183,11 +502,10 @@ impl<S: BlockSink> State<S> {
     /// The writer's handle for `identity`, refreshed from the running
     /// transaction.
     async fn handle_for(&mut self, identity: Identity) -> Result<InodeHandle, Errno> {
-        let transaction = self
-            .writer
-            .join()
-            .await
-            .map_err(|error| write_errno(&error))?;
+        let Storage::Writable(writer) = &mut self.storage else {
+            return Err(Errno::EROFS);
+        };
+        let transaction = writer.join().await.map_err(|error| write_errno(&error))?;
         transaction
             .inode(identity.tree, identity.number)
             .await
@@ -195,26 +513,29 @@ impl<S: BlockSink> State<S> {
             .ok_or(Errno::ESTALE)
     }
 
-    /// Makes every change so far durable: `fsync`, `fsyncdir` and unmount.
-    /// A failure poisons the writer, and the device keeps the previous
-    /// generation.
+    /// Makes every change so far durable: `fsync`, `fsyncdir`, `remount,ro`
+    /// and unmount. A failure poisons the writer, and the device keeps the
+    /// previous generation.
     pub async fn sync(&mut self) -> Result<(), Errno> {
-        self.writer
-            .commit()
-            .await
-            .map_err(|error| write_errno(&error))
+        match &mut self.storage {
+            Storage::Writable(writer) => writer.commit().await.map_err(|error| write_errno(&error)),
+            Storage::ReadOnly(_) => Ok(()),
+        }
     }
 
     /// Ends a mutation: commits once the running transaction's dirty
     /// metadata reaches Linux's bound.
     async fn settle(&mut self) -> Result<(), Errno> {
-        if self.writer.dirty().data_bytes >= self.dirty_data_limit {
-            self.writer
+        let Storage::Writable(writer) = &mut self.storage else {
+            return Ok(());
+        };
+        if writer.dirty().data_bytes >= self.dirty_data_limit {
+            writer
                 .writeback()
                 .await
                 .map_err(|error| write_errno(&error))?;
         }
-        if self.writer.dirty().metadata_bytes >= DEFAULT_DIRTY_METADATA_LIMIT {
+        if writer.dirty().metadata_bytes >= DEFAULT_DIRTY_METADATA_LIMIT {
             self.sync().await?;
         }
         Ok(())
@@ -255,10 +576,15 @@ impl<S: BlockSink> State<S> {
         };
         let ino = self.inodes.encode(identity)?;
         let generation = inode.metadata().generation;
-        let handle = if self.inodes.has_handle(ino, generation) {
-            None
-        } else {
-            Some(self.handle_for(identity).await?)
+        let handle = match &self.storage {
+            Storage::ReadOnly(_) => None,
+            Storage::Writable(_) => {
+                if self.inodes.has_handle(ino, generation) {
+                    None
+                } else {
+                    Some(self.handle_for(identity).await?)
+                }
+            }
         };
         self.inodes.record(ino, generation, handle);
         Ok((
@@ -371,7 +697,7 @@ impl<S: BlockSink> State<S> {
         self.writable()?;
         let file = self.inodes.handle(ino)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -578,7 +904,7 @@ impl<S: BlockSink> State<S> {
         self.writable()?;
         let file = self.inodes.handle(ino)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -604,7 +930,7 @@ impl<S: BlockSink> State<S> {
         let name = entry_name(name)?;
         let parent = self.inodes.handle(parent)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -650,7 +976,7 @@ impl<S: BlockSink> State<S> {
         let parent = self.inodes.handle(parent)?;
         let (identity, _) = self.inodes.identity(ino)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -682,7 +1008,7 @@ impl<S: BlockSink> State<S> {
         let name = entry_name(name)?;
         let parent = self.inodes.handle(parent)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -729,7 +1055,7 @@ impl<S: BlockSink> State<S> {
         let parent = self.inodes.handle(parent)?;
         let new_parent = self.inodes.handle(new_parent)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -754,12 +1080,22 @@ impl<S: BlockSink> State<S> {
     /// The space as the running transaction leaves it: a change is counted
     /// as soon as it is visible, not once it commits.
     pub fn statfs(&self) -> Result<Statfs, Errno> {
-        let block_size = self.snapshot()?.superblock().sectorsize();
-        let usage = self.writer.usage().map_err(|error| write_errno(&error))?;
+        let snapshot = self.snapshot()?;
+        let block_size = snapshot.superblock().sectorsize();
         let size = u64::from(block_size);
+        let (total_bytes, used_bytes) = match &self.storage {
+            Storage::Writable(writer) => {
+                let usage = writer.usage().map_err(|error| write_errno(&error))?;
+                (usage.total_bytes, usage.used_bytes)
+            }
+            Storage::ReadOnly(fs) => {
+                let sb = fs.superblock();
+                (sb.total_bytes(), sb.bytes_used())
+            }
+        };
         Ok(Statfs {
-            blocks: usage.total_bytes / size,
-            free: usage.total_bytes.saturating_sub(usage.used_bytes) / size,
+            blocks: total_bytes / size,
+            free: total_bytes.saturating_sub(used_bytes) / size,
             block_size,
         })
     }
@@ -775,12 +1111,26 @@ impl<S: BlockSink> State<S> {
         // Linux's FUSE client (`fs/fuse/xattr.c` in torvalds/linux) uses a
         // catch-all `.prefix = ""` handler, so non-ACL `getxattr` requests
         // reach the daemon for namespace and bare-prefix validation.
+        if let Storage::ReadOnly(fs) = &self.storage {
+            let snapshot = fs.clone();
+            let inode = self.open_inode(&snapshot, ino).await?;
+            let mut value = vec![0; size as usize];
+            let length = snapshot
+                .xattr(&inode, name.as_bytes(), &mut value)
+                .await
+                .map_err(|error| read_errno(&error))?
+                .ok_or(Errno::NO_XATTR)?;
+            if size != 0 && length > value.len() {
+                return Err(Errno::ERANGE);
+            }
+            value.truncate(length.min(value.len()));
+            return Ok((length, value));
+        }
         let file = self.inodes.handle(ino)?;
-        let transaction = self
-            .writer
-            .join()
-            .await
-            .map_err(|error| write_errno(&error))?;
+        let Storage::Writable(writer) = &mut self.storage else {
+            return Err(Errno::EROFS);
+        };
+        let transaction = writer.join().await.map_err(|error| write_errno(&error))?;
         let mut value = vec![0; size as usize];
         let length = transaction
             .xattr(&file, name.as_bytes(), &mut value)
@@ -808,7 +1158,7 @@ impl<S: BlockSink> State<S> {
         self.writable()?;
         let file = self.inodes.handle(ino)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -828,7 +1178,7 @@ impl<S: BlockSink> State<S> {
         self.writable()?;
         let file = self.inodes.handle(ino)?;
         let mut transaction = self
-            .writer
+            .writable_writer()?
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
@@ -973,6 +1323,7 @@ mod tests {
     use helios_btrfs::READ_ALIGNMENT;
     use helios_hal::io::{IoError, IoResult};
 
+    use super::super::device::Claim;
     use super::*;
 
     struct TempDisk {
@@ -1029,8 +1380,8 @@ mod tests {
         TempDisk::new(tree, options)
     }
 
-    fn open_state(disk: TempDisk) -> State<TempDisk> {
-        State::open(disk, NonZeroUsize::MIN, false).unwrap()
+    fn open_state(disk: TempDisk) -> State<TempDisk, ()> {
+        State::from_writer(disk, (), NonZeroUsize::MIN, false).unwrap()
     }
 
     fn test_owner() -> Owner {
@@ -1409,8 +1760,14 @@ mod tests {
             FormatOptions::new([0x44; 16], time),
         )
         .expect("format btrfs");
-        let device = Device::open_for_test(named.path()).expect("open test device");
-        let state = State::open(device, NonZeroUsize::new(1).unwrap(), false).expect("open state");
+        let claim = Claim::open(named.path(), false).expect("open test claim");
+        let state = State::open_for_test(
+            claim,
+            named.path().to_path_buf(),
+            NonZeroUsize::new(1).unwrap(),
+            false,
+        )
+        .expect("open state");
         (named, state)
     }
 

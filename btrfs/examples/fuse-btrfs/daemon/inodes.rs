@@ -13,8 +13,9 @@
 //!   (`slot = 1` for `FS_TREE`, `slot = 2 + (tree - FIRST_FREE)` for other
 //!   subvolumes) and its inode number in the low 48 bits.
 //!
-//! Every live entry in [`Inodes`] holds the writer's [`InodeHandle`], the
-//! inode's creation generation and the kernel's outstanding lookup count.
+//! Every live entry in [`Inodes`] holds the writer's [`InodeHandle`] once
+//! writable, the inode's creation generation and the kernel's outstanding
+//! lookup count.
 
 use std::collections::HashMap;
 
@@ -40,6 +41,14 @@ const FIRST_SUBVOL_SLOT: u64 = 2;
 pub struct Identity {
     pub tree: u64,
     pub number: u64,
+}
+
+/// A cached inode that needs a live writer [`InodeHandle`] attached after
+/// upgrading a read-only mount to writable.
+pub struct PendingHandle {
+    pub ino: INodeNo,
+    pub identity: Identity,
+    pub generation: u64,
 }
 
 fn encode_identity(root: Identity, identity: Identity) -> Result<INodeNo, Errno> {
@@ -104,7 +113,7 @@ fn decode_ino(root: Identity, ino: INodeNo) -> Result<Identity, Errno> {
 
 struct Entry {
     generation: u64,
-    handle: InodeHandle,
+    handle: Option<InodeHandle>,
     /// Lookups the kernel has not yet forgotten.
     lookups: u64,
 }
@@ -115,7 +124,7 @@ pub struct Inodes {
 }
 
 impl Inodes {
-    pub fn new(root: Identity, generation: u64, handle: InodeHandle) -> Self {
+    pub fn new(root: Identity, generation: u64, handle: Option<InodeHandle>) -> Self {
         let mut entries = HashMap::new();
         entries.insert(
             INodeNo::ROOT.0,
@@ -137,6 +146,34 @@ impl Inodes {
         decode_ino(self.root, ino)
     }
 
+    /// Cached entries that still need a writer [`InodeHandle`] after upgrading
+    /// a read-only mount to writable.
+    pub fn pending_handles(&self) -> Vec<PendingHandle> {
+        self.entries
+            .iter()
+            .filter_map(|(&ino, entry)| {
+                if entry.handle.is_some() {
+                    return None;
+                }
+                let ino = INodeNo(ino);
+                let identity = self.decode(ino).expect("recorded ino decodes");
+                Some(PendingHandle {
+                    ino,
+                    identity,
+                    generation: entry.generation,
+                })
+            })
+            .collect()
+    }
+
+    /// Attaches a live writer [`InodeHandle`] to `ino` after upgrading a
+    /// read-only mount to a writable [`helios_btrfs::write::Writer`].
+    pub fn attach_handle(&mut self, ino: INodeNo, handle: InodeHandle) {
+        if let Some(entry) = self.entries.get_mut(&ino.0) {
+            entry.handle = Some(handle);
+        }
+    }
+
     fn entry(&self, ino: INodeNo) -> Result<&Entry, Errno> {
         self.entries.get(&ino.0).ok_or(Errno::ESTALE)
     }
@@ -153,34 +190,31 @@ impl Inodes {
     }
 
     pub fn handle(&self, ino: INodeNo) -> Result<InodeHandle, Errno> {
-        Ok(self.entry(ino)?.handle.clone())
+        self.entry(ino)?.handle.clone().ok_or(Errno::ESTALE)
     }
 
     /// Whether a live lookup of `ino` at `generation` already holds its handle.
     pub fn has_handle(&self, ino: INodeNo, generation: u64) -> bool {
         self.entries
             .get(&ino.0)
-            .is_some_and(|entry| entry.generation == generation)
+            .is_some_and(|entry| entry.generation == generation && entry.handle.is_some())
     }
 
-    /// Records a lookup or creation of `ino` at `generation`. A caller that
-    /// passes `None` for `handle` must already have a live entry for `ino` at
-    /// `generation`.
+    /// Records a lookup or creation of `ino` at `generation`. Read-only mounts
+    /// pass `None` for `handle` until an upgrade to writable attaches live
+    /// writer handles.
     pub fn record(&mut self, ino: INodeNo, generation: u64, handle: Option<InodeHandle>) {
         match self.entries.get_mut(&ino.0) {
             Some(entry) => {
-                debug_assert!(
-                    entry.generation == generation || handle.is_some(),
-                    "generation changed without refreshing the writer handle"
-                );
-                entry.generation = generation;
-                if let Some(handle) = handle {
+                if entry.generation != generation {
+                    entry.generation = generation;
                     entry.handle = handle;
+                } else if let Some(handle) = handle {
+                    entry.handle = Some(handle);
                 }
                 entry.lookups += 1;
             }
             None => {
-                let handle = handle.expect("new inode entry requires a writer handle");
                 self.entries.insert(
                     ino.0,
                     Entry {
