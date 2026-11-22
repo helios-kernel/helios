@@ -403,7 +403,7 @@ impl<'a> Log<'a> {
             .map(address, bytes.len() as u64)
             .unwrap()
         {
-            file.write_all_at(bytes, physical).unwrap();
+            file.write_all_at(bytes, physical.offset).unwrap();
         }
     }
 

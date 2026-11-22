@@ -303,24 +303,69 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
     });
 }
 
-/// `mkfs.btrfs -O quota` creates the quota tree. A writable mount refuses it,
-/// since the writer keeps no qgroup counts, and a read-only mount still opens
-/// the image. `-O squota` sets the simple-quota incompat bit, which neither
-/// mount supports.
+/// `mkfs.btrfs -O quota` creates the quota tree. Both the read-only mount and
+/// the writer mount it, and subsequent writes maintain the quota tree cleanly
+/// for `btrfs check --readonly`. `-O squota` sets the simple-quota incompat
+/// bit, which neither mount supports.
 #[test]
 #[ignore = "needs mkfs.btrfs from btrfs-progs; the Linux CI lane runs it with --run-ignored"]
-fn writer_refuses_mkfs_images_with_quotas_and_the_reader_mounts_them() {
+fn writer_mounts_mkfs_images_with_quotas_and_refuses_squota() {
     let tree = tempfile::tempdir().unwrap();
     std::fs::write(tree.path().join("hello.txt"), b"hello btrfs\n").unwrap();
 
     let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &["-O", "quota"]);
-    super::fixture::mount(image.clone()).expect("a read-only mount ignores quotas");
-    let refused = block_on(mount(image));
-    assert!(
-        matches!(refused, Err(WriteError::QuotaTreePresent)),
-        "-O quota: refused with {:?}",
-        refused.err()
-    );
+    super::fixture::mount(image.clone()).expect("a read-only mount opens quotas");
+    let shared = std::sync::Arc::new(WritableImage(Mutex::new(image)));
+    let when = Timestamp {
+        seconds: 1_700_000_200,
+        nanoseconds: 0,
+    };
+    block_on(async {
+        let mut writer = Writer::mount(
+            SharedImage(shared.clone()),
+            no_uuid as fn() -> [u8; 16],
+            std::num::NonZeroUsize::new(1).unwrap(),
+            Compressor::Plain,
+            when,
+        )
+        .await
+        .expect("-O quota writable mount succeeds");
+        assert!(writer.quota_status().await.unwrap().enabled);
+        {
+            let mut tx = writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let handle = tx
+                .create_file(
+                    Name {
+                        parent: &root,
+                        bytes: b"quota-write.txt",
+                    },
+                    Attributes {
+                        permissions: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        umask: 0,
+                    },
+                    when,
+                )
+                .await
+                .unwrap();
+            tx.write_file(&handle, 0, &vec![0x33; 8192], when)
+                .await
+                .unwrap();
+        }
+        writer.commit().await.unwrap();
+        let qg5 = helios_hal::fs_management::QgroupId::new(0, 5).unwrap();
+        assert!(
+            writer
+                .list_qgroups()
+                .await
+                .unwrap()
+                .iter()
+                .any(|group| group.id == qg5 && group.referenced_bytes >= 8192)
+        );
+    });
+    btrfs_check(&shared);
 
     let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &["-O", "squota"]);
     let squota = |error: &helios_btrfs::Error| {

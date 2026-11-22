@@ -37,6 +37,7 @@
 extern crate alloc;
 
 mod btrfs;
+mod btrfs_management;
 mod erofs;
 mod host;
 mod memory;
@@ -48,6 +49,7 @@ mod unix;
 
 use btrfs::WritableMount;
 pub use btrfs::{BtrfsFs, BtrfsMountError, BtrfsService, BtrfsWriteOptions, CommitPolicy};
+pub use btrfs_management::{BtrfsManagementError, BtrfsVolumeRequest};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
 pub use memory::{MemoryFs, MemoryUnixMetadata, MemoryWrite, XattrSetMode};
@@ -592,12 +594,29 @@ impl<S: Storage> Drop for Retiring<'_, S> {
     }
 }
 
+/// Cloneable allocator of kernel-unique [`DeviceId`] values, shared by the
+/// mount table and any mounted volume that creates subvolumes at runtime.
+#[derive(Clone)]
+pub struct DeviceIdAllocator(Arc<AtomicU64>);
+
+impl DeviceIdAllocator {
+    /// Creates an allocator starting at `first`.
+    pub fn starting_at(first: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(first)))
+    }
+
+    /// Allocates the next distinct [`DeviceId`].
+    pub fn allocate(&self) -> DeviceId {
+        DeviceId::new(self.0.fetch_add(1, AtomicOrdering::Relaxed))
+    }
+}
+
 /// What every mount table of one kernel shares: the boot image under each
 /// namespace's root, and the device numbers mounted trees are given, which
 /// must stay distinct however many tables there are.
 struct Machine {
     boot: BootFs,
-    next_device: AtomicU64,
+    next_device: DeviceIdAllocator,
     /// Processors that may resolve a path: one pin block each, in every
     /// table.
     processors: usize,
@@ -734,7 +753,7 @@ impl<S: Storage> MountTable<S> {
     pub fn new(boot: BootFs, processors: usize) -> Self {
         Self::on(Arc::new(Machine {
             boot,
-            next_device: AtomicU64::new(AuthorityDomain::FIRST_MOUNTED.raw()),
+            next_device: DeviceIdAllocator::starting_at(AuthorityDomain::FIRST_MOUNTED.raw()),
             processors,
             writable: spin::Mutex::new(Vec::new()),
         }))
@@ -766,12 +785,13 @@ impl<S: Storage> MountTable<S> {
     /// A device id no other filesystem on this kernel has, for a tree the
     /// table is about to mount.
     pub fn allocate_device(&self) -> DeviceId {
-        DeviceId::new(
-            self.inner
-                .machine
-                .next_device
-                .fetch_add(1, AtomicOrdering::Relaxed),
-        )
+        self.inner.machine.next_device.allocate()
+    }
+
+    /// A cloneable handle to this machine's device id allocator, for
+    /// filesystems that create new subvolumes after mount.
+    pub fn device_allocator(&self) -> DeviceIdAllocator {
+        self.inner.machine.next_device.clone()
     }
 
     /// Mounts `fs` at `point`, granting what `grant` says for as long as

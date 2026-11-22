@@ -56,8 +56,23 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::StaleHandle { .. } => Errno::ESTALE,
         WriteError::InodeFlags { .. } => Errno::EPERM,
         WriteError::UnsupportedCompatRo { .. } => Errno::EROFS,
-        WriteError::QuotaTreePresent => Errno::EROFS,
         WriteError::ReadOnlySubvolume { .. } => Errno::EROFS,
+        WriteError::QuotaExceeded => Errno::EDQUOT,
+        WriteError::NotSubvolume { .. }
+        | WriteError::SubvolumeNotReadOnly { .. }
+        | WriteError::DefaultSubvolume { .. }
+        | WriteError::QuotaNotEnabled
+        | WriteError::QuotaAlreadyEnabled
+        | WriteError::QgroupNotFound { .. }
+        | WriteError::QgroupExists { .. }
+        | WriteError::QgroupInvalidRelation
+        | WriteError::DeviceNotFound { .. }
+        | WriteError::LastDevice
+        | WriteError::DeviceTooSmall { .. }
+        | WriteError::InvalidStream(_)
+        | WriteError::DedupeDestinationRange => Errno::EINVAL,
+        WriteError::SubvolumeNotEmpty { .. } => Errno::ENOTEMPTY,
+        WriteError::PermissionDenied => Errno::EACCES,
         WriteError::CloneAlignment
         | WriteError::CloneSourceRange
         | WriteError::CloneOverlap

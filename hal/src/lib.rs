@@ -13,6 +13,7 @@ pub mod device;
 pub mod display;
 pub mod entropy;
 pub mod fs;
+pub mod fs_management;
 pub mod generation;
 pub mod hv;
 pub mod input;

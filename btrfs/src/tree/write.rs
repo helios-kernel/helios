@@ -32,14 +32,44 @@ pub enum WriteError {
     InodeFlags { tree: u64, inode: u64, flags: u64 },
     #[error("read-write mount does not support compat-ro feature {name} ({bit:#x})")]
     UnsupportedCompatRo { name: &'static str, bit: u64 },
-    /// Quota groups are not maintained by the writer (lexoliu/helios#1043);
-    /// writing would leave Linux's qgroup counts stale.
-    #[error(
-        "read-write mount does not maintain quota groups, and the root tree holds a quota tree"
-    )]
-    QuotaTreePresent,
     #[error("subvolume {tree} is read-only")]
     ReadOnlySubvolume { tree: u64 },
+    #[error("inode {inode} in tree {tree} is not a subvolume root")]
+    NotSubvolume { tree: u64, inode: u64 },
+    #[error("subvolume {tree} must be read-only for send")]
+    SubvolumeNotReadOnly { tree: u64 },
+    #[error("subvolume {tree} contains nested subvolumes and cannot be deleted")]
+    SubvolumeNotEmpty { tree: u64 },
+    #[error("cannot delete default or top-level subvolume {tree}")]
+    DefaultSubvolume { tree: u64 },
+    #[error("quotas are not enabled on this filesystem")]
+    QuotaNotEnabled,
+    #[error("quotas are already enabled on this filesystem")]
+    QuotaAlreadyEnabled,
+    #[error("quota limit exceeded")]
+    QuotaExceeded,
+    #[error("quota group {}/{} does not exist", id.level, id.id)]
+    QgroupNotFound {
+        id: helios_hal::fs_management::QgroupId,
+    },
+    #[error("quota group {}/{} already exists", id.level, id.id)]
+    QgroupExists {
+        id: helios_hal::fs_management::QgroupId,
+    },
+    #[error("invalid quota group relation")]
+    QgroupInvalidRelation,
+    #[error("device {devid} does not belong to this filesystem")]
+    DeviceNotFound { devid: u64 },
+    #[error("cannot remove the last remaining device from the filesystem")]
+    LastDevice,
+    #[error("target device ({available} bytes) is smaller than required ({required} bytes)")]
+    DeviceTooSmall { required: u64, available: u64 },
+    #[error("malformed send stream: {0}")]
+    InvalidStream(alloc::string::String),
+    #[error("caller lacks permission for this operation")]
+    PermissionDenied,
+    #[error("dedupe destination range extends beyond the file")]
+    DedupeDestinationRange,
     #[error("clone offsets must be sector aligned and any partial sector must end both files")]
     CloneAlignment,
     #[error("clone source range extends beyond the file")]
@@ -511,6 +541,186 @@ impl Trees {
             generation: self.generation,
             level: 0,
         })
+    }
+
+    /// Allocates a new root block for `new_tree` by copying `source`'s root
+    /// node verbatim with updated `owner`, `bytenr`, `generation` and checksum
+    /// (Linux's `btrfs_copy_root` for snapshot creation).
+    ///
+    /// Returns the new [`TreeRoot`] and the copied [`Node`] so the caller can
+    /// increment references on its direct children (tree blocks or data extents).
+    pub(crate) async fn copy_root<S: BlockSource, A: MetadataAllocator>(
+        &mut self,
+        volume: &Volume<S>,
+        source: TreeRoot,
+        new_tree: u64,
+        allocator: &mut A,
+    ) -> Result<(TreeRoot, Node), WriteError> {
+        let node = self
+            .read(
+                volume,
+                source.bytenr,
+                Expected {
+                    level: source.level,
+                    generation: source.generation,
+                    first_key: None,
+                },
+            )
+            .await?;
+        let first = if node.nritems > 0 {
+            node.key(0)
+        } else {
+            Key::new(0, 0, 0)
+        };
+        let address = allocator.allocate(new_tree, node.level, first)?;
+        let encoded = if node.level == 0 {
+            let leaf = Leaf::from_node(&node);
+            leaf.encode(
+                0..node.nritems,
+                address,
+                self.generation,
+                new_tree,
+                self.checksum,
+            )
+        } else {
+            let branch = Branch::from_node(&node);
+            branch.encode(
+                0..node.nritems,
+                address,
+                self.generation,
+                new_tree,
+                self.checksum,
+            )
+        };
+        self.insert(encoded);
+        Ok((
+            TreeRoot {
+                tree: new_tree,
+                bytenr: address,
+                generation: self.generation,
+                level: node.level,
+            },
+            node,
+        ))
+    }
+
+    /// Rewrites every tree block reachable from `root` whose address lies in
+    /// `range` (and its ancestors up to the root) so no block of `root`
+    /// remains inside `range`. The caller must already have excluded `range`
+    /// from `allocator` so newly allocated replacements land elsewhere.
+    pub(crate) async fn cow_range<S: BlockSource, A: MetadataAllocator>(
+        &mut self,
+        volume: &Volume<S>,
+        root: TreeRoot,
+        range: core::ops::Range<u64>,
+        allocator: &mut A,
+    ) -> Result<TreeRoot, WriteError> {
+        let mut keys_to_touch = Vec::new();
+        self.collect_keys_in_range(volume, root, &range, &mut keys_to_touch)
+            .await?;
+        let mut current = root;
+        for key in keys_to_touch {
+            let existing = self.get(volume, current, key).await?;
+            if let Some(bytes) = existing {
+                current = self
+                    .apply(volume, current, key, Some(&bytes), allocator)
+                    .await?;
+            }
+        }
+        // Handle an empty root leaf whose address is itself in `range`.
+        if range.contains(&current.bytenr) {
+            let node = self
+                .read(
+                    volume,
+                    current.bytenr,
+                    Expected {
+                        level: current.level,
+                        generation: current.generation,
+                        first_key: None,
+                    },
+                )
+                .await?;
+            let first = if node.nritems > 0 {
+                node.key(0)
+            } else {
+                Key::new(0, 0, 0)
+            };
+            let fresh = allocator.allocate(current.tree, node.level, first)?;
+            let encoded = if node.level == 0 {
+                let leaf = Leaf::from_node(&node);
+                leaf.encode(
+                    0..node.nritems,
+                    fresh,
+                    self.generation,
+                    current.tree,
+                    self.checksum,
+                )
+            } else {
+                let branch = Branch::from_node(&node);
+                branch.encode(
+                    0..node.nritems,
+                    fresh,
+                    self.generation,
+                    current.tree,
+                    self.checksum,
+                )
+            };
+            self.insert(encoded);
+            self.retire(current.tree, current.bytenr, &node, allocator);
+            current = TreeRoot {
+                tree: current.tree,
+                bytenr: fresh,
+                generation: self.generation,
+                level: node.level,
+            };
+        }
+        Ok(current)
+    }
+
+    async fn collect_keys_in_range<S: BlockSource>(
+        &self,
+        volume: &Volume<S>,
+        root: TreeRoot,
+        range: &core::ops::Range<u64>,
+        keys: &mut Vec<Key>,
+    ) -> Result<(), WriteError> {
+        // Explicit stack DFS (bounded depth MAX_LEVEL = 8).
+        let mut stack = alloc::vec![(root.bytenr, root.level, root.generation, false)];
+        while let Some((address, level, generation, ancestor_in_range)) = stack.pop() {
+            let in_range = range.contains(&address);
+            let node = self
+                .read(
+                    volume,
+                    address,
+                    Expected {
+                        level,
+                        generation,
+                        first_key: None,
+                    },
+                )
+                .await?;
+            if level == 0 {
+                if (in_range || ancestor_in_range) && node.nritems > 0 {
+                    keys.push(node.key(0));
+                }
+            } else {
+                // If this internal node is in range, touching one leaf beneath it
+                // CoWs this node; if any child is in range, we descend into all
+                // children to catch every block in range.
+                let mut pushed_any = false;
+                for slot in (0..node.nritems).rev() {
+                    let (child_addr, child_gen) = node.child(slot);
+                    // Propagate `in_range` only to the first child so we don't
+                    // unnecessarily CoW unrelated sibling leaves; every child
+                    // still checks its own `range.contains(&child_addr)`.
+                    let force = (in_range || ancestor_in_range) && slot == 0;
+                    stack.push((child_addr, level - 1, child_gen, force));
+                    pushed_any = true;
+                }
+                let _ = pushed_any;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn generation(&self) -> u64 {

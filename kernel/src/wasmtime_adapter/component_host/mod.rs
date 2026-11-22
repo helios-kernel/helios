@@ -2078,6 +2078,7 @@ where
 {
     add_programs_to_linker(linker)?;
     mounts::add_mounts_to_linker(linker)?;
+    service::add_btrfs_to_linker(linker)?;
     add_net_to_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::DebuggerVsock, _, _, _>(linker)?;
     add_stats_to_linker(linker)?;
@@ -2284,6 +2285,7 @@ where
 {
     add_programs_to_program_linker(linker)?;
     mounts::add_mounts_to_program_linker(linker)?;
+    service::add_btrfs_to_linker(linker)?;
     add_net_to_program_linker(linker)?;
     vsock::add_vsock_to_linker::<vsock::ProgramVsock, _, _, _>(linker)?;
     add_stats_to_program_linker(linker)?;

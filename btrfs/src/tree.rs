@@ -113,6 +113,13 @@ impl Node {
             .get()
     }
 
+    #[cfg(feature = "write")]
+    pub(crate) fn chunk_tree_uuid(&self) -> [u8; 16] {
+        view::<RawHeader>(&self.bytes)
+            .expect("validated node")
+            .chunk_tree_uuid
+    }
+
     pub(crate) fn level(&self) -> u8 {
         self.level
     }

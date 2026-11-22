@@ -36,7 +36,7 @@ pub(crate) struct Attributes {
     pub(crate) umask: u32,
 }
 
-fn validate_name(name: &[u8]) -> Result<(), WriteError> {
+pub(super) fn validate_name(name: &[u8]) -> Result<(), WriteError> {
     if name.is_empty()
         || name.len() > NAME_MAX
         || name == b"."
