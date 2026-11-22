@@ -17,6 +17,12 @@
 //!   blocks the transaction retires stay pinned through the generation the
 //!   transaction started from, and private data the transaction releases is
 //!   held from reuse until no live view reaches it.
+//! - A write dirties pages of the running transaction and allocates no
+//!   extent, as Linux's delayed allocation: it reserves the data space its
+//!   pages need when it is accepted, so it is refused, or stored short,
+//!   with `ENOSPC` then and never later. [`Writer::writeback`] gives the
+//!   dirty data its extents, at Linux's sizes; its caller runs it when the
+//!   dirty data reaches its bound, and every commit runs it first.
 //! - [`Writer::commit`] makes the running transaction durable as one
 //!   generation. Its caller decides when; Linux commits on `sync`, `fsync`
 //!   and `fdatasync`, when its `commit=` interval expires, when the dirty
@@ -34,12 +40,11 @@ use helios_hal::fs::RenameMode;
 
 use super::{Filesystem, Snapshot, find_root};
 use crate::accounting::Allocation;
-use crate::compress::policy::{Compressor, inode_compresses};
-use crate::compress::write::{Encoder, Plain};
+use crate::compress::policy::Compressor;
 use crate::ondisk::objectid;
 use crate::retirement::Retirements;
 use crate::source::BlockSink;
-use crate::transaction::file::WriteOptions;
+use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
 use crate::transaction::replay::PendingLog;
@@ -49,49 +54,6 @@ use crate::transaction::{Checkpoint, Transaction};
 use crate::tree::write::WriteError;
 use crate::{DeviceNumber, Error, FileKind, Metadata, Timestamp};
 
-/// What a mount's options give each of its data mutations: Linux's
-/// `compress=` and `max_inline=`, with the caller's time and concurrency.
-/// The encoder is chosen per inode: one that Linux does not compress
-/// (`NODATASUM`, `NODATACOW` or `NOCOMPRESS`) is written uncompressed, where
-/// the [`WriteOptions`] forms refuse a compressing encoder for it.
-pub struct MountPolicy<'a> {
-    pub when: Timestamp,
-    pub concurrency: NonZeroUsize,
-    pub compressor: &'a mut Compressor,
-    /// Linux's `max_inline` mount option; see [`WriteOptions::max_inline`].
-    pub max_inline: u64,
-}
-
-/// Evaluates `$body` with `$options`, the [`WriteOptions`] `$policy` gives an
-/// inode that compresses when `$compresses`.
-macro_rules! with_policy {
-    ($policy:expr, $compresses:expr, |$options:ident| $body:expr) => {{
-        let MountPolicy {
-            when,
-            concurrency,
-            compressor,
-            max_inline,
-        } = $policy;
-        macro_rules! run {
-            ($encoder:expr) => {{
-                let $options = WriteOptions {
-                    when,
-                    concurrency,
-                    encoder: $encoder,
-                    max_inline,
-                };
-                $body
-            }};
-        }
-        match compressor {
-            Compressor::Zlib(encoder) if $compresses => run!(encoder),
-            Compressor::Lzo(encoder) if $compresses => run!(encoder),
-            Compressor::Zstd(encoder) if $compresses => run!(&mut **encoder),
-            _ => run!(Plain),
-        }
-    }};
-}
-
 /// The dirty metadata a running transaction holds before it is committed,
 /// unless the mount's operator chose another bound: Linux's
 /// `BTRFS_DIRTY_METADATA_THRESH`, `SZ_32M` in `fs/btrfs/fs.h`, past which
@@ -100,17 +62,34 @@ macro_rules! with_policy {
 /// a commit is what writes them back here.
 pub const DEFAULT_DIRTY_METADATA_LIMIT: u64 = 32 << 20;
 
+/// The share of memory, in percent, that dirty file data takes before
+/// writeback starts: Linux's `dirty_background_ratio`, 10 in
+/// `mm/page-writeback.c`, which starts background writeback when the dirty
+/// pages reach that share of the memory that can hold them
+/// (`global_dirtyable_memory`).
+pub const DIRTY_BACKGROUND_RATIO: u64 = 10;
+
+/// The dirty data a mount holds before [`Writer::writeback`], unless its
+/// operator chose another bound: [`DIRTY_BACKGROUND_RATIO`] of the
+/// `memory_bytes` that can hold it.
+pub const fn default_dirty_data_limit(memory_bytes: u64) -> u64 {
+    memory_bytes / 100 * DIRTY_BACKGROUND_RATIO
+}
+
 /// What the running transaction holds that its commit writes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dirty {
     /// Bytes of private tree blocks held in memory.
     pub metadata_bytes: u64,
+    /// Bytes of file data held in memory without extents, which
+    /// [`Writer::writeback`] writes.
+    pub data_bytes: u64,
 }
 
 impl Dirty {
     /// Nothing waits for a commit.
     pub const fn is_clean(self) -> bool {
-        self.metadata_bytes == 0
+        self.metadata_bytes == 0 && self.data_bytes == 0
     }
 }
 
@@ -223,6 +202,11 @@ pub struct Writer<S, U> {
     mount: Arc<MountIdentity>,
     /// What every commit needs, the ones a mutation forces included.
     uuids: U,
+    /// The mount's compression, which writeback encodes new extents with.
+    compressor: Compressor,
+    /// Linux's `max_inline` mount option: the most stored bytes an inline
+    /// extent holds.
+    max_inline: u64,
     concurrency: NonZeroUsize,
 }
 
@@ -258,7 +242,9 @@ struct Running<S> {
 
 impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// Mounts `source` for writing. Every commit takes root UUIDs from
-    /// `uuids` and keeps at most `concurrency` block writes in flight.
+    /// `uuids`, writeback encodes the data of every inode Linux would
+    /// compress with `compressor` (the `compress=` mount option), and both
+    /// keep at most `concurrency` block writes in flight.
     ///
     /// A log tree a crash left behind an fsync is replayed first, in one
     /// transaction that this call commits before it returns, as Linux's
@@ -270,6 +256,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         source: S,
         uuids: U,
         concurrency: NonZeroUsize,
+        compressor: Compressor,
         now: Timestamp,
     ) -> Result<Self, WriteError> {
         let current = Filesystem::mount_committed(Arc::new(source)).await?;
@@ -300,6 +287,8 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             running: None,
             mount: Arc::new(MountIdentity),
             uuids,
+            compressor,
+            max_inline: DEFAULT_MAX_INLINE,
             concurrency,
         };
         if let Some(log) = log {
@@ -324,15 +313,42 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         self.commit_running().await
     }
 
+    /// The mount's `max_inline` limit, in bytes.
+    pub fn max_inline(&self) -> u64 {
+        self.max_inline
+    }
+
+    /// Changes the mount's `max_inline`, as Linux's
+    /// `mount -o remount,max_inline=`: subsequent mutations store inline data
+    /// under the new limit, and what is already stored stays as it is.
+    pub fn set_max_inline(&mut self, max_inline: u64) {
+        self.max_inline = max_inline;
+    }
+
+    /// Changes the mount's compression policy, as Linux's
+    /// `mount -o remount,compress=`: writes back dirty data queued under the
+    /// previous policy first so its reserved extent count stays exact, then
+    /// applies `compressor` to subsequent writes.
+    pub async fn set_compressor(&mut self, compressor: Compressor) -> Result<(), WriteError> {
+        self.writeback().await?;
+        let compresses = compressor.algorithm().is_some();
+        self.compressor = compressor;
+        if let Some(running) = &mut self.running {
+            running.inner.delalloc.set_compresses(compresses);
+        }
+        Ok(())
+    }
+
     /// The space the filesystem has, and what it uses once the running
-    /// transaction commits: a write is visible at once, and so is its space.
+    /// transaction commits: a write is visible at once, and so is its
+    /// space, its dirty data counted at the space it reserved.
     pub fn usage(&self) -> Result<Usage, WriteError> {
         let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
         let superblock = committed.superblock();
         Ok(Usage {
             total_bytes: superblock.total_bytes(),
             used_bytes: match &self.running {
-                Some(running) => running.inner.bytes_used()?,
+                Some(running) => running.inner.bytes_used()? + running.inner.dirty_data_bytes(),
                 None => superblock.bytes_used(),
             },
         })
@@ -365,12 +381,30 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
 
     /// What the next commit writes.
     pub fn dirty(&self) -> Dirty {
-        Dirty {
-            metadata_bytes: self
-                .running
-                .as_ref()
-                .map_or(0, |running| running.inner.dirty_metadata_bytes()),
+        self.running
+            .as_ref()
+            .map_or(Dirty::default(), |running| Dirty {
+                metadata_bytes: running.inner.dirty_metadata_bytes(),
+                data_bytes: running.inner.dirty_data_bytes(),
+            })
+    }
+
+    /// Gives the running transaction's dirty data its extents, as Linux's
+    /// writeback of an inode's delalloc ranges; the data stays visible as it
+    /// was and becomes durable at the next commit. A failure, or dropping the
+    /// future, leaves the data dirty and the transaction as it was.
+    pub async fn writeback(&mut self) -> Result<(), WriteError> {
+        if self.dirty().data_bytes == 0 {
+            return Ok(());
         }
+        let mut transaction = self.join().await?;
+        let mut operation = Mutation::checkpointed(&mut transaction, Units::default());
+        operation.inner_mut().prepare_mutation().await?;
+        let (inner, compressor, concurrency, _) = operation.split();
+        inner.writeback_all(compressor, concurrency).await?;
+        // The reservations the data took when it was written pay for this:
+        // there is nothing left to refuse it for.
+        operation.publish()
     }
 
     /// Joins the running transaction, starting one from the last durable
@@ -387,8 +421,14 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
         if self.running.is_none() {
             let (volume, pin) = (committed.volume.clone(), committed.snapshot.clone());
-            let inner =
-                Transaction::new(volume, pin, &mut self.retirements, &self.allocation).await?;
+            let inner = Transaction::new(
+                volume,
+                pin,
+                &mut self.retirements,
+                &self.allocation,
+                self.compressor.algorithm().is_some(),
+            )
+            .await?;
             self.running = Some(Running {
                 inner,
                 view: None,
@@ -399,8 +439,8 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     }
 
     /// Makes every mutation the running transaction holds durable as one
-    /// generation, which readers then see. With nothing running, or nothing
-    /// changed, nothing is written.
+    /// generation, which readers then see: its dirty data is written back
+    /// first. With nothing running, or nothing changed, nothing is written.
     ///
     /// The changes were visible before this call, so a failure, or dropping
     /// the future before it finishes, poisons the writer instead of
@@ -409,11 +449,9 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         if self.committed.is_none() {
             return Err(WriteError::WriterPoisoned);
         }
-        if self
-            .running
-            .as_ref()
-            .is_none_or(|running| running.inner.dirty_metadata_bytes() == 0)
-        {
+        if self.running.as_ref().is_none_or(|running| {
+            running.inner.dirty_metadata_bytes() == 0 && running.inner.dirty_data_bytes() == 0
+        }) {
             // A clean transaction holds nothing the last commit did not.
             self.running = None;
             return Ok(());
@@ -434,6 +472,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             .commit(
                 &mut self.retirements,
                 || uuids.next_uuid(),
+                &mut self.compressor,
                 self.concurrency,
             )
             .await?;
@@ -475,6 +514,39 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
 
     fn inner_mut(&mut self) -> &mut Transaction<Arc<S>> {
         &mut self.running_mut().inner
+    }
+
+    /// The running transaction beside the mount's compressor, I/O concurrency
+    /// and `max_inline` limit, for the operations that encode or write data.
+    pub(crate) fn split(
+        &mut self,
+    ) -> (&mut Transaction<Arc<S>>, &mut Compressor, NonZeroUsize, u64) {
+        let writer = &mut *self.writer;
+        let running = writer
+            .running
+            .as_mut()
+            .expect("a handle exists only while its transaction runs");
+        (
+            &mut running.inner,
+            &mut writer.compressor,
+            writer.concurrency,
+            writer.max_inline,
+        )
+    }
+
+    /// The mount's `max_inline` limit, in bytes.
+    pub fn max_inline(&self) -> u64 {
+        self.writer.max_inline()
+    }
+
+    /// Changes the mount's `max_inline`, as [`Writer::set_max_inline`].
+    pub fn set_max_inline(&mut self, max_inline: u64) {
+        self.writer.set_max_inline(max_inline);
+    }
+
+    /// Changes the mount's compression policy, as [`Writer::set_compressor`].
+    pub async fn set_compressor(&mut self, compressor: Compressor) -> Result<(), WriteError> {
+        self.writer.set_compressor(compressor).await
     }
 
     #[cfg(test)]
@@ -557,6 +629,30 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         .await
     }
 
+    /// A handle on inode `number` of subvolume `tree`, `None` when no such
+    /// inode exists in the running transaction. For a caller that resolves a
+    /// persisted inode identity without walking from the root, such as a FUSE
+    /// or NFS export lookup.
+    pub async fn inode(&self, tree: u64, number: u64) -> Result<Option<InodeHandle>, WriteError> {
+        if !super::is_subvolume(tree) {
+            return Ok(None);
+        }
+        match self
+            .load_handle(FileId {
+                tree,
+                inode: number,
+            })
+            .await
+        {
+            Ok(handle) => Ok(Some(handle)),
+            Err(
+                WriteError::Read(Error::MissingInode { .. })
+                | WriteError::Read(Error::MissingRoot { .. }),
+            ) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn metadata(&self, handle: &InodeHandle) -> Result<Metadata, WriteError> {
         self.checked(handle).await
     }
@@ -587,99 +683,87 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     /// Writes `data` at `offset` and returns the bytes stored, as `write(2)`:
-    /// fewer than `data.len()` only when the device ran out of free sectors
-    /// partway, never zero for a nonempty write, which fails instead.
-    pub async fn write_file<E: Encoder>(
+    /// fewer than `data.len()` only when the data space ran out partway,
+    /// never zero for a nonempty write, which fails instead. The data is
+    /// dirty until writeback gives it extents, compressed when the mount
+    /// compresses and Linux would compress the inode (no `NODATASUM`,
+    /// `NODATACOW` or `NOCOMPRESS`).
+    pub async fn write_file(
         &mut self,
         file: &InodeHandle,
         offset: u64,
         data: &[u8],
-        options: WriteOptions<E>,
+        when: Timestamp,
     ) -> Result<usize, WriteError> {
-        // Counted as checksummed: a NODATASUM inode reserves more than it
-        // uses, never less.
-        let units = self.inner().write_units(data.len() as u64, true);
+        self.checked(file).await?;
+        let id = file.id;
+        self.inner().roots.check_writable(id.tree)?;
+        let max_inline = self.writer.max_inline;
+        let units = self
+            .reserve_with_data(DataReservation::Write {
+                file: id,
+                offset,
+                length: data.len() as u64,
+                max_inline,
+            })
+            .await?;
         let mut operation = Mutation::new(self, units).await?;
         operation.checked(file).await?;
-        let file = file.id;
-        operation.inner_mut().roots.check_writable(file.tree)?;
-        let written = operation
-            .inner_mut()
-            .write_file(file.tree, file.inode, offset, data, options)
+        let (inner, compressor, _, max_inline) = operation.split();
+        let written = inner
+            .write_file(id, offset, data, when, compressor, max_inline)
             .await?;
         operation.accept()?;
         Ok(written)
     }
 
-    /// [`Self::write_file`] under the mount's policy.
-    pub async fn write_file_with_policy(
-        &mut self,
-        file: &InodeHandle,
-        offset: u64,
-        data: &[u8],
-        policy: MountPolicy<'_>,
-    ) -> Result<usize, WriteError> {
-        let compresses = inode_compresses(self.metadata(file).await?.flags);
-        with_policy!(policy, compresses, |options| self
-            .write_file(file, offset, data, options)
-            .await)
-    }
-
-    /// Sets the size of `file`, as `truncate(2)`. `options` stores the data
-    /// left in the first sector when Linux would write it back: a grown or
-    /// compressed inline file.
-    pub async fn truncate_file<E: Encoder>(
+    /// Sets the size of `file`, as `truncate(2)`. A grown or compressed inline
+    /// file re-stores its first sector under the mount's policy.
+    pub async fn truncate_file(
         &mut self,
         file: &InodeHandle,
         size: u64,
-        options: WriteOptions<E>,
+        when: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self, Units::TRUNCATE).await?;
+        self.checked(file).await?;
+        let max_inline = self.writer.max_inline;
+        let units = self
+            .reserve_with_data(DataReservation::Truncate {
+                file: file.id,
+                size,
+                max_inline,
+            })
+            .await?;
+        let mut operation = Mutation::new(self, units).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner_mut().roots.check_writable(file.tree)?;
-        operation
-            .inner_mut()
-            .truncate_file(file.tree, file.inode, size, options)
+        let (inner, compressor, _, max_inline) = operation.split();
+        inner
+            .truncate_file(file.tree, file.inode, size, when, compressor, max_inline)
             .await?;
         operation.accept()
     }
 
-    /// [`Self::truncate_file`] under the mount's policy.
-    pub async fn truncate_file_with_policy(
-        &mut self,
-        file: &InodeHandle,
-        size: u64,
-        policy: MountPolicy<'_>,
-    ) -> Result<(), WriteError> {
-        let compresses = inode_compresses(self.metadata(file).await?.flags);
-        with_policy!(policy, compresses, |options| self
-            .truncate_file(file, size, options)
-            .await)
-    }
-
-    /// [`Self::clone_range`] under the mount's policy, which the destination's
-    /// flags select the encoder of.
-    pub async fn clone_range_with_policy(
+    /// Shares `range` of one file's extents into another, as `FICLONERANGE`,
+    /// writing back dirty data in the source range first so its extents can be
+    /// shared.
+    pub async fn clone_range(
         &mut self,
         range: CloneRange<'_>,
-        policy: MountPolicy<'_>,
+        when: Timestamp,
     ) -> Result<(), WriteError> {
-        let compresses = inode_compresses(self.metadata(range.destination).await?.flags);
-        with_policy!(policy, compresses, |options| self
-            .clone_range(range, options)
-            .await)
-    }
-
-    /// Shares `range` of one file's extents into another, as `FICLONERANGE`.
-    /// `options` writes what cannot be shared: an inline source, and inline
-    /// destination data the shared extents replace.
-    pub async fn clone_range<E: Encoder>(
-        &mut self,
-        range: CloneRange<'_>,
-        options: WriteOptions<E>,
-    ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self, Units::CLONE).await?;
+        self.checked(range.source).await?;
+        self.checked(range.destination).await?;
+        let units = self
+            .reserve_with_data(DataReservation::Clone {
+                source: range.source.id,
+                destination: range.destination.id,
+                offset: range.destination_offset,
+                length: range.length,
+            })
+            .await?;
+        let mut operation = Mutation::new(self, units).await?;
         operation.checked(range.source).await?;
         operation.checked(range.destination).await?;
         let range = RawCloneRange {
@@ -693,7 +777,10 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             .inner_mut()
             .roots
             .check_writable(range.destination.tree)?;
-        operation.inner_mut().clone_range(range, options).await?;
+        let (inner, compressor, concurrency, max_inline) = operation.split();
+        inner
+            .clone_range(range, when, compressor, concurrency, max_inline)
+            .await?;
         operation.accept()
     }
 
@@ -1000,6 +1087,149 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         }
         Err(self.inner().exhausted(units))
     }
+
+    /// Reserves both data and metadata space for an operation that may dirty
+    /// file pages. A metadata-flush commit can delete an empty data block group
+    /// (`remove_unused_groups`), shrinking [`Transaction::data_budget`] below
+    /// the data reservation, so data space is re-ensured after that commit.
+    async fn reserve_with_data(&mut self, operation: DataReservation) -> Result<Units, WriteError> {
+        let mut flushed = false;
+        loop {
+            let reservation = match operation {
+                DataReservation::Write {
+                    file,
+                    offset,
+                    length,
+                    max_inline,
+                } => {
+                    self.inner()
+                        .write_reservation(file, offset, length, max_inline)
+                        .await?
+                }
+                DataReservation::Truncate {
+                    file,
+                    size,
+                    max_inline,
+                } => {
+                    self.inner()
+                        .truncate_reservation(file, size, max_inline)
+                        .await?
+                }
+                DataReservation::Clone {
+                    source,
+                    destination,
+                    offset,
+                    length,
+                } => {
+                    self.inner()
+                        .clone_reservation(source, destination, offset, length)
+                        .await?
+                }
+            };
+            self.reserve_data(reservation).await?;
+            let units = match operation {
+                DataReservation::Write {
+                    file,
+                    offset,
+                    length,
+                    max_inline,
+                } => {
+                    self.inner()
+                        .write_units(file, offset, length, max_inline)
+                        .await?
+                }
+                DataReservation::Truncate { .. } => {
+                    if reservation == 0 {
+                        Units::TRUNCATE
+                    } else {
+                        Units {
+                            insert: 4,
+                            update: 1,
+                            frees: false,
+                        }
+                    }
+                }
+                DataReservation::Clone { .. } => Units::CLONE,
+            };
+            if self.inner().reserves(units) {
+                return Ok(units);
+            }
+            if !flushed && !self.writer.dirty().is_clean() {
+                self.writer.commit().await?;
+                self.writer.start().await?;
+                flushed = true;
+                continue;
+            }
+            let mut chunk = Mutation::checkpointed(self, Units::default());
+            chunk.inner_mut().force_metadata_chunk().await?;
+            chunk.accept()?;
+            if self.inner().reserves(units) {
+                return Ok(units);
+            }
+            return Err(self.inner().exhausted(units));
+        }
+    }
+
+    /// Makes room for a mutation that may dirty `bytes` of data, in the
+    /// order of Linux's data space flush (`priority_reclaim_data_space` and
+    /// `data_flush_states` in `fs/btrfs/space-info.c`): data chunks while
+    /// the device has room (`ALLOC_CHUNK_FORCE`), then writeback of the
+    /// dirty data (`FLUSH_DELALLOC_FULL`), which returns what compression
+    /// saves, then a commit (`COMMIT_TRANS`), which returns the extents the
+    /// transaction released. What still does not fit makes the write short,
+    /// or refuses it when not one sector does.
+    async fn reserve_data(&mut self, bytes: u64) -> Result<(), WriteError> {
+        self.grow_data_to(bytes).await?;
+        if self.inner().data_budget() >= bytes {
+            return Ok(());
+        }
+        if self.writer.dirty().data_bytes != 0 {
+            self.writer.writeback().await?;
+            if self.inner().data_budget() >= bytes {
+                return Ok(());
+            }
+        }
+        if !self.writer.dirty().is_clean() {
+            self.writer.commit().await?;
+            self.writer.start().await?;
+            // A commit can delete unused groups and return device extents.
+            self.grow_data_to(bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn grow_data_to(&mut self, bytes: u64) -> Result<(), WriteError> {
+        while self.inner().data_budget() < bytes {
+            let mut chunk = Mutation::checkpointed(self, Units::default());
+            let grew = chunk.inner_mut().grow_data().await?;
+            chunk.accept()?;
+            if !grew {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DataReservation {
+    Write {
+        file: FileId,
+        offset: u64,
+        length: u64,
+        max_inline: u64,
+    },
+    Truncate {
+        file: FileId,
+        size: u64,
+        max_inline: u64,
+    },
+    Clone {
+        source: FileId,
+        destination: FileId,
+        offset: u64,
+        length: u64,
+    },
 }
 
 /// The mutation future owns this guard. Its drop restores the complete private
@@ -1038,8 +1268,14 @@ impl<'op, 'tx, S: BlockSink, U: RootUuids> Mutation<'op, 'tx, S, U> {
 
     /// Accepts the operation and makes it visible to readers. One that left
     /// the commit less than its work needs is refused and rolled back.
-    fn accept(mut self) -> Result<(), WriteError> {
+    fn accept(self) -> Result<(), WriteError> {
         self.transaction.inner().check_commit_hold(self.units)?;
+        self.publish()
+    }
+
+    /// Accepts the operation without checking what it left the commit: for
+    /// work the transaction already reserved.
+    fn publish(mut self) -> Result<(), WriteError> {
         let view = self.transaction.inner().view()?;
         self.saved = None;
         self.transaction.install(view);

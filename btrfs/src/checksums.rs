@@ -8,9 +8,19 @@ use crate::Key;
 use crate::ondisk::{RawHeader, RawItem, item_type, objectid};
 use crate::source::BlockSource;
 use crate::space::Space;
+use crate::superblock::Superblock;
 use crate::tree::TreeRoot;
 use crate::tree::write::{Trees, WriteError};
 use crate::volume::Volume;
+
+/// Linux's `__MAX_CSUM_ITEMS` (`fs/btrfs/file-item.h`): the most checksum
+/// entries one `EXTENT_CSUM` item may hold, which `btrfs check` enforces
+/// (`check/main.c`).
+pub(crate) fn max_csum_items(superblock: &Superblock) -> usize {
+    let leaf_data = superblock.nodesize() as usize - size_of::<RawHeader>();
+    let item_space = leaf_data - 2 * size_of::<RawItem>();
+    (item_space / superblock.csum_type().size()) - 1
+}
 
 #[derive(Clone)]
 pub(crate) struct Checksums {
@@ -26,13 +36,16 @@ impl Checksums {
         trees: &mut Trees,
         space: &mut Space,
         logical: u64,
-        data: &[u8],
+        pieces: &[&[u8]],
     ) -> Result<(), WriteError> {
         let sector = volume.superblock().sectorsize() as usize;
         let algorithm = volume.superblock().csum_type();
-        let mut digests = Vec::with_capacity(data.len() / sector * algorithm.size());
-        for sector in data.chunks_exact(sector) {
-            digests.extend_from_slice(algorithm.digest(sector).as_bytes());
+        let length: usize = pieces.iter().map(|piece| piece.len()).sum();
+        let mut digests = Vec::with_capacity(length / sector * algorithm.size());
+        for piece in pieces {
+            for sector in piece.chunks_exact(sector) {
+                digests.extend_from_slice(algorithm.digest(sector).as_bytes());
+            }
         }
         self.store(volume, trees, space, logical, &digests).await
     }
@@ -58,10 +71,7 @@ impl Checksums {
             .and_then(|length| logical.checked_add(length))
             .ok_or_else(invalid)?;
         self.remove(volume, trees, space, logical..end).await?;
-        let per_item = (volume.superblock().nodesize() as usize
-            - size_of::<RawHeader>()
-            - size_of::<RawItem>())
-            / digest;
+        let per_item = max_csum_items(volume.superblock());
         for (index, chunk) in digests.chunks(per_item * digest).enumerate() {
             let start = logical + (index * per_item) as u64 * sector;
             self.root = trees

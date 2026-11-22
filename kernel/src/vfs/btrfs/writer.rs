@@ -17,10 +17,14 @@
 //!   commit, and syncs that arrive during a commit share the next.
 //! - **The task commits on its own** when the commit interval has passed
 //!   since the running transaction first changed, when the dirty metadata
-//!   reaches the policy's bound, and when the queue closes at unmount. The
-//!   policy is read afresh on every change an operator makes.
-//! - **A failed commit ends the service.** Its sync waiters, and every later
-//!   request, fail; the device keeps the previous complete generation.
+//!   reaches the policy's bound, and when the queue closes at unmount. It
+//!   writes the dirty data back into extents, without a commit, when that
+//!   reaches the policy's data bound. The policy is read afresh on every
+//!   change an operator makes.
+//! - **A failed commit or writeback ends the service.** Its sync waiters,
+//!   and every later request, fail; the device keeps the previous complete
+//!   generation. A writeback that failed would fail again in the commit, so
+//!   the mount stops taking writes it cannot make durable.
 
 use alloc::string::String;
 use alloc::sync::Arc as SharedArc;
@@ -33,8 +37,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use futures::channel::oneshot;
 use futures::future::{Either, select};
 use helios_btrfs::write::{
-    Attributes, ChunkError, Compressor, InodeHandle, MountPolicy, Name, RootUuids, SpaceError,
-    WriteError, WriteTransaction, Writer,
+    Attributes, ChunkError, InodeHandle, Name, RootUuids, SpaceError, WriteError, WriteTransaction,
+    Writer,
 };
 use helios_btrfs::{BlockSink, Error, FileKind, Timestamp};
 use helios_hal::cpu::{Cpu, Instant};
@@ -218,7 +222,6 @@ pub struct BtrfsService<Device: BlockDevice<Buffer = BlockPages>> {
     pub(super) receiver: ProviderReceiver<Request>,
     pub(super) published: Arc<spin::Mutex<Snapshot<Device>>>,
     pub(super) concurrency: NonZeroUsize,
-    pub(super) compressor: Compressor,
     pub(super) policy: Arc<LivePolicy>,
     /// Last, so the end is reported only once everything above has gone.
     pub(super) _exit: ExitGuard,
@@ -247,6 +250,9 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
             let mark = self.policy.changed.mark();
             let policy = self.policy.load();
             let dirty = self.writer.dirty();
+            if dirty.is_clean() {
+                dirty_since = None;
+            }
             let deadline = dirty_since.map(|since| {
                 since.saturating_add(timer.cpu().timebase().duration_to_ticks(policy.interval))
             });
@@ -255,6 +261,12 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                     || deadline.is_some_and(|deadline| deadline <= timer.now()))
             {
                 if !self.commit(Vec::new(), &mut dirty_since).await {
+                    return;
+                }
+                continue;
+            }
+            if dirty.data_bytes != 0 && dirty.data_bytes >= policy.dirty_data_limit {
+                if !self.writeback().await {
                     return;
                 }
                 continue;
@@ -285,9 +297,13 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                     let Some(syncs) = self.apply_batch(first).await else {
                         return;
                     };
-                    if dirty_since.is_none() && !self.writer.dirty().is_clean() {
+                    if self.writer.dirty().is_clean() {
+                        dirty_since = None;
+                    } else if dirty_since.is_none() {
                         dirty_since = Some(timer.now());
                     }
+                    // The dirty data bound is judged at the top of the loop,
+                    // once no commit has written the data back here.
                     let dirty = self.writer.dirty();
                     if (!syncs.is_empty()
                         || dirty.metadata_bytes >= self.policy.load().dirty_metadata_limit)
@@ -327,7 +343,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
         let mut replies = Vec::with_capacity(requests.len());
         let mut syncs = Vec::new();
         // An operator's change applies from the next batch.
-        let max_inline = self.policy.max_inline();
+        transaction.set_max_inline(self.policy.max_inline());
         for request in requests {
             if request.reply.is_canceled() {
                 continue;
@@ -338,9 +354,6 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                 &request.path,
                 request.when,
                 request.operation,
-                concurrency,
-                &mut self.compressor,
-                max_inline,
             )
             .await;
             match result {
@@ -356,6 +369,25 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
             let _ = reply.send(result);
         }
         Some(syncs)
+    }
+
+    /// Writes the dirty data back into extents and publishes the result,
+    /// which releases the pages the previous view held. Returns false once
+    /// the writeback failed, which ends the service.
+    async fn writeback(&mut self) -> bool {
+        match self.writer.writeback().await {
+            Ok(()) => {
+                *self.published.lock() = self
+                    .writer
+                    .snapshot()
+                    .expect("a writer that just wrote back is not poisoned");
+                true
+            }
+            Err(error) => {
+                tracing::error!(%error, "btrfs writeback failed; the mount takes no more writes");
+                false
+            }
+        }
     }
 
     /// Commits the running transaction and answers `syncs`. Returns false
@@ -447,17 +479,8 @@ async fn apply<S: BlockSink, U: RootUuids>(
     path: &str,
     now: u64,
     operation: Operation,
-    concurrency: NonZeroUsize,
-    compressor: &mut Compressor,
-    max_inline: u64,
 ) -> FsResult<Response> {
     let when = timestamp(now);
-    let policy = |compressor| MountPolicy {
-        when,
-        concurrency,
-        compressor,
-        max_inline,
-    };
     match operation {
         Operation::Write {
             inode,
@@ -473,7 +496,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .checked_add(bytes.len() as u64)
                 .ok_or(FsError::Overflow)?;
             let written = transaction
-                .write_file_with_policy(&inode, offset, &bytes, policy(&mut *compressor))
+                .write_file(&inode, offset, &bytes, when)
                 .await
                 .map_err(fs_error)?;
             // A device with no more free sectors stores a prefix, which the
@@ -527,7 +550,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
             }
             if flags.contains(OpenFlags::TRUNCATE) {
                 transaction
-                    .truncate_file_with_policy(&file, 0, policy(&mut *compressor))
+                    .truncate_file(&file, 0, when)
                     .await
                     .map_err(fs_error)?;
             }
@@ -615,7 +638,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
         Operation::Truncate { size } => {
             let file = inode(transaction, path).await?;
             transaction
-                .truncate_file_with_policy(&file, size, policy(&mut *compressor))
+                .truncate_file(&file, size, when)
                 .await
                 .map_err(fs_error)?;
         }
