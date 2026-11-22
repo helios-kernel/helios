@@ -45,6 +45,8 @@ use crate::ondisk::objectid;
 use crate::retirement::Retirements;
 use crate::roots::Roots;
 use crate::source::BlockSink;
+use crate::space::{DATA, SpaceError};
+use crate::transaction::fallocate::AllocateMode;
 use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::orphan::{OpenInodes, ReleaseOutcome, committed_orphans};
@@ -233,6 +235,10 @@ impl<F: FnMut() -> [u8; 16] + Send> RootUuids for F {
 pub struct Usage {
     pub total_bytes: u64,
     pub used_bytes: u64,
+    /// Bytes available for file data allocation (`f_bavail` in Linux's
+    /// `btrfs_statfs`): free space in existing data block groups plus
+    /// unallocated device space usable for new data chunks.
+    pub available_bytes: u64,
 }
 
 /// The transaction every mutation joins until the next commit.
@@ -405,14 +411,50 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// transaction commits: a write is visible at once, and so is its
     /// space, its dirty data counted at the space it reserved.
     pub fn usage(&self) -> Result<Usage, WriteError> {
+        const DUP: u64 = 1 << 5;
         let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
         let superblock = committed.superblock();
+        let total_bytes = superblock.total_bytes();
+        let (used_bytes, available_bytes) = match &self.running {
+            Some(running) => {
+                let used = running.inner.bytes_used()? + running.inner.dirty_data_bytes();
+                let dup = running
+                    .inner
+                    .space
+                    .latest_flags(DATA)
+                    .is_some_and(|flags| flags & DUP != 0);
+                let avail = running.inner.data_budget().saturating_add(
+                    running
+                        .inner
+                        .volume
+                        .chunks()
+                        .unallocated_data_bytes(total_bytes, dup),
+                );
+                (used, avail.min(total_bytes.saturating_sub(used)))
+            }
+            None => {
+                let used = superblock.bytes_used();
+                let chunks = committed.volume.chunks();
+                let dup = self
+                    .allocation
+                    .space
+                    .latest_flags(DATA)
+                    .is_some_and(|flags| flags & DUP != 0);
+                let free_data = self
+                    .allocation
+                    .space
+                    .totals(DATA)
+                    .1
+                    .saturating_sub(chunks.data_superblock_stripe_bytes());
+                let avail =
+                    free_data.saturating_add(chunks.unallocated_data_bytes(total_bytes, dup));
+                (used, avail.min(total_bytes.saturating_sub(used)))
+            }
+        };
         Ok(Usage {
-            total_bytes: superblock.total_bytes(),
-            used_bytes: match &self.running {
-                Some(running) => running.inner.bytes_used()? + running.inner.dirty_data_bytes(),
-                None => superblock.bytes_used(),
-            },
+            total_bytes,
+            used_bytes,
+            available_bytes,
         })
     }
 
@@ -637,7 +679,7 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     async fn load_handle(&self, id: FileId) -> Result<InodeHandle, WriteError> {
-        let metadata = self.inner().inode_metadata(id).await?;
+        let (_, metadata) = self.inner().inode_item(id.tree, id.inode).await?;
         Ok(InodeHandle {
             mount: self.writer.mount.clone(),
             id,
@@ -659,7 +701,11 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             inode: handle.id.inode,
             generation: handle.generation,
         };
-        let metadata = match self.inner().inode_metadata(handle.id).await {
+        let (_, metadata) = match self
+            .inner()
+            .inode_item(handle.id.tree, handle.id.inode)
+            .await
+        {
             Err(WriteError::Read(Error::MissingInode { .. })) => return Err(stale()),
             result => result?,
         };
@@ -721,7 +767,11 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     pub async fn metadata(&self, handle: &InodeHandle) -> Result<Metadata, WriteError> {
-        self.checked(handle).await
+        let mut metadata = self.checked(handle).await?;
+        metadata.nbytes = metadata
+            .nbytes
+            .saturating_add(self.inner().unbacked_delalloc_bytes(handle.id));
+        Ok(metadata)
     }
 
     pub async fn lookup(
@@ -847,6 +897,47 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         let (inner, compressor, concurrency, max_inline) = operation.split();
         inner
             .clone_range(range, when, compressor, concurrency, max_inline)
+            .await?;
+        operation.accept()
+    }
+
+    /// Preallocates space, punches holes or zeroes a byte range of `file`, as
+    /// Linux's `btrfs_fallocate` (`fs/btrfs/file.c`).
+    pub async fn fallocate(
+        &mut self,
+        file: &InodeHandle,
+        offset: u64,
+        length: u64,
+        mode: AllocateMode,
+        when: Timestamp,
+    ) -> Result<(), WriteError> {
+        self.checked(file).await?;
+        let id = file.id;
+        self.inner().roots.check_writable(id.tree)?;
+        let max_inline = self.writer.max_inline;
+        let units = self
+            .reserve_with_data(DataReservation::Fallocate {
+                file: id,
+                offset,
+                length,
+                mode,
+                max_inline,
+            })
+            .await?;
+        let mut operation = Mutation::new(self, units).await?;
+        operation.checked(file).await?;
+        let (inner, compressor, concurrency, max_inline) = operation.split();
+        inner
+            .fallocate(
+                id,
+                offset,
+                length,
+                mode,
+                when,
+                compressor,
+                concurrency,
+                max_inline,
+            )
             .await?;
         operation.accept()
     }
@@ -1286,6 +1377,22 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
                         .clone_reservation(source, destination, offset, length)
                         .await?
                 }
+                DataReservation::Fallocate {
+                    file,
+                    offset,
+                    length,
+                    mode,
+                    max_inline,
+                } => {
+                    let bytes = self
+                        .inner()
+                        .fallocate_reservation(file, offset, length, mode, max_inline)
+                        .await?;
+                    if bytes > self.inner().volume.superblock().total_bytes() {
+                        return Err(SpaceError::Exhausted { bytes, flags: DATA }.into());
+                    }
+                    bytes
+                }
             };
             self.reserve_data(reservation).await?;
             let units = match operation {
@@ -1311,6 +1418,9 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
                     }
                 }
                 DataReservation::Clone { .. } => Units::CLONE,
+                DataReservation::Fallocate { mode, .. } => {
+                    self.inner().fallocate_units(mode, reservation)
+                }
             };
             if self.inner().reserves(units) {
                 return Ok(units);
@@ -1390,6 +1500,13 @@ enum DataReservation {
         destination: FileId,
         offset: u64,
         length: u64,
+    },
+    Fallocate {
+        file: FileId,
+        offset: u64,
+        length: u64,
+        mode: AllocateMode,
+        max_inline: u64,
     },
 }
 

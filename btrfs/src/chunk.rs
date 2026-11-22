@@ -308,6 +308,67 @@ impl ChunkMap {
         ranges
     }
 
+    /// Logical bytes of existing `DATA` chunks masked out by superblock mirror
+    /// stripes (`superblock_stripes` restricted to chunks carrying
+    /// `BLOCK_GROUP_DATA`).
+    #[cfg(feature = "write")]
+    pub(crate) fn data_superblock_stripe_bytes(&self) -> u64 {
+        let mut excluded = 0_u64;
+        for chunk in &self.chunks {
+            if chunk.flags & BLOCK_GROUP_DATA == 0 {
+                continue;
+            }
+            for &physical in &chunk.copies {
+                for mirror in crate::superblock::MIRROR_OFFSETS {
+                    let start = (mirror / STRIPE_LEN * STRIPE_LEN).max(physical);
+                    let end = (mirror / STRIPE_LEN * STRIPE_LEN + STRIPE_LEN)
+                        .min(physical + chunk.length);
+                    if start < end {
+                        excluded = excluded.saturating_add(end - start);
+                    }
+                }
+            }
+        }
+        excluded
+    }
+
+    /// Unallocated device space available for new data chunks, matching
+    /// Linux's `btrfs_calc_avail_data_space` (`fs/btrfs/super.c`) on one
+    /// device: device bytes past `BTRFS_DEVICE_RANGE_RESERVED` (1 MiB) not
+    /// claimed by any chunk, divided by the data profile's copy count and
+    /// rounded down to `STRIPE_LEN`, minus any superblock mirror stripe in the
+    /// unallocated region.
+    #[cfg(feature = "write")]
+    pub(crate) fn unallocated_data_bytes(&self, total_bytes: u64, dup: bool) -> u64 {
+        const DEVICE_RANGE_RESERVED: u64 = 1 << 20;
+        let used_device: u64 = self
+            .chunks
+            .iter()
+            .map(|chunk| chunk.length.saturating_mul(chunk.copies.len() as u64))
+            .sum();
+        let unallocated = total_bytes
+            .saturating_sub(DEVICE_RANGE_RESERVED)
+            .saturating_sub(used_device);
+        let copies = if dup { 2 } else { 1 };
+        let mut available = (unallocated / copies) / STRIPE_LEN * STRIPE_LEN;
+        for mirror in crate::superblock::MIRROR_OFFSETS {
+            let stripe_start = mirror / STRIPE_LEN * STRIPE_LEN;
+            let stripe_end = stripe_start + STRIPE_LEN;
+            if stripe_start < DEVICE_RANGE_RESERVED || stripe_end > total_bytes {
+                continue;
+            }
+            let covered = self.chunks.iter().any(|chunk| {
+                chunk.copies.iter().any(|&physical| {
+                    physical <= stripe_start && stripe_end <= physical + chunk.length
+                })
+            });
+            if !covered {
+                available = available.saturating_sub(STRIPE_LEN);
+            }
+        }
+        available
+    }
+
     /// The device offset of every copy of `[logical, logical + len)`, which
     /// must lie inside one chunk.
     pub(crate) fn map(&self, logical: u64, len: u64) -> Result<ArrayVec<u64, MAX_COPIES>, Error> {

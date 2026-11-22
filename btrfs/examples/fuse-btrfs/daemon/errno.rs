@@ -93,6 +93,7 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::AclNotSupported { .. } => Errno::EOPNOTSUPP,
         WriteError::AclDefaultNotDirectory { .. } => Errno::EACCES,
         WriteError::FileOverflow => Errno::EFBIG,
+        WriteError::FallocateRange => Errno::EINVAL,
         WriteError::NoSpace { .. } => Errno::ENOSPC,
         WriteError::Chunk(ChunkError::NoDeviceSpace { .. }) => Errno::ENOSPC,
         WriteError::Chunk(ChunkError::SystemArrayFull { .. }) => Errno::ENOSPC,
