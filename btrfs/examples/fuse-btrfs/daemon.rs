@@ -211,34 +211,34 @@ fn fuser_mount_options(fs_name: &Path, options: &MountOptions) -> Vec<MountOptio
     // complete committed tree, and the unmount's commit runs as the session
     // ends: what was written before the unmount is durable once the daemon
     // lets go of its `Hold`.
+    //
+    // Block-filesystem defaults (`mount(8)`): `suid`, `dev` and `exec` are on
+    // unless `-o` clears them, whereas fuser's own default sets `MS_NOSUID`
+    // and `MS_NODEV` unless told otherwise.
     let mut out = vec![
         MountOption::FSName(fs_name.to_string_lossy().into_owned()),
         MountOption::DefaultPermissions,
-    ];
-    if let Some(ro) = options.read_only {
-        out.push(if ro { MountOption::RO } else { MountOption::RW });
-    }
-    if let Some(suid) = options.suid {
-        out.push(if suid {
+        if options.read_only.unwrap_or(false) {
+            MountOption::RO
+        } else {
+            MountOption::RW
+        },
+        if options.suid.unwrap_or(true) {
             MountOption::Suid
         } else {
             MountOption::NoSuid
-        });
-    }
-    if let Some(dev) = options.dev {
-        out.push(if dev {
+        },
+        if options.dev.unwrap_or(true) {
             MountOption::Dev
         } else {
             MountOption::NoDev
-        });
-    }
-    if let Some(exec) = options.exec {
-        out.push(if exec {
+        },
+        if options.exec.unwrap_or(true) {
             MountOption::Exec
         } else {
             MountOption::NoExec
-        });
-    }
+        },
+    ];
     if let Some(atime) = options.atime {
         match atime {
             AtimeMode::Atime => out.push(MountOption::Atime),

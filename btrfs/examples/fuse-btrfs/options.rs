@@ -55,7 +55,14 @@ impl MountOptions {
         let is_remount = tokens.contains(&"remount");
         for option in tokens {
             match option {
-                "defaults" => {}
+                "defaults" => {
+                    if !is_remount {
+                        parsed.read_only = Some(false);
+                        parsed.suid = Some(true);
+                        parsed.dev = Some(true);
+                        parsed.exec = Some(true);
+                    }
+                }
                 "remount" => parsed.remount = true,
                 "ro" => parsed.read_only = Some(true),
                 "rw" => parsed.read_only = Some(false),

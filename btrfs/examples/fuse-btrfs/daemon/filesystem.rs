@@ -9,8 +9,6 @@
 //! lacks the feature, and nothing else:
 //!
 //! - `setattr` changing the file flags: `EOPNOTSUPP`
-//! - `setattr` or a creation giving a non-directory S_ISUID or S_ISGID: `EPERM`
-//! - `mknod` of anything but a regular file: `EPERM`
 //! - `fallocate`: `EOPNOTSUPP`
 //! - `rename` with `RENAME_WHITEOUT`, or with both `RENAME_NOREPLACE` and
 //!   `RENAME_EXCHANGE`: `EINVAL`
@@ -29,7 +27,8 @@ use fuser::{
     WriteFlags,
 };
 use futures_lite::future::block_on;
-use helios_btrfs::Timestamp;
+use helios_btrfs::write::Special;
+use helios_btrfs::{DeviceNumber, Timestamp};
 use helios_hal::fs::RenameMode;
 
 use super::state::{Node, Owner, Setattr, SharedState, State, target_bytes, timestamp};
@@ -155,16 +154,26 @@ impl Filesystem for Daemon {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        _rdev: u32,
+        rdev: u32,
         reply: ReplyEntry,
     ) {
-        if mode & libc::S_IFMT != libc::S_IFREG {
-            return reply.error(Errno::EPERM);
-        }
+        // The kernel sends `mknod`'s own encoding of the number
+        // (`fuse_mknod` in `fs/fuse/dir.c` applies `new_encode_dev`).
+        let device = DeviceNumber::decode(rdev);
+        let node = match mode & libc::S_IFMT {
+            libc::S_IFREG => Node::File,
+            libc::S_IFCHR => Node::Special(Special::CharDevice(device)),
+            libc::S_IFBLK => Node::Special(Special::BlockDevice(device)),
+            libc::S_IFIFO => Node::Special(Special::Fifo),
+            libc::S_IFSOCK => Node::Special(Special::Socket),
+            // `vfs_mknod` refuses every other type before it reaches a
+            // filesystem.
+            _ => return reply.error(Errno::EINVAL),
+        };
         self.create_entry(
             parent,
             name,
-            Node::File,
+            node,
             permissions(mode),
             caller(req, umask),
             reply,
@@ -295,9 +304,8 @@ impl Filesystem for Daemon {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        // Both flags together, `RENAME_WHITEOUT` (a whiteout is a device
-        // node, which the writer cannot create) and unknown bits are `EINVAL`
-        // as on Linux.
+        // Both flags together, `RENAME_WHITEOUT` (which `rename` does not
+        // implement) and unknown bits are `EINVAL` as on Linux.
         let mode = if flags.is_empty() {
             RenameMode::Replace
         } else if flags == RenameFlags::RENAME_NOREPLACE {

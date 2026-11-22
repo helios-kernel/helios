@@ -511,18 +511,21 @@ fn request(
             host_share: None,
             disks: Some(cache_over(disk, 256, 1)),
         },
-        MountSource::Disk {
-            serial: BlockSerial::new(serial.as_bytes()).unwrap(),
-        },
-        "/mnt",
-        false,
-        crate::vfs::BtrfsWriteOptions {
-            entropy: crate::test_support::test_root_entropy(),
-            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-            compress: None,
-            commit: None,
-            max_inline: None,
-            now: 1_700_000_000_000_000_000,
+        crate::MountRequest {
+            source: MountSource::Disk {
+                serial: BlockSerial::new(serial.as_bytes()).unwrap(),
+            },
+            point: "/mnt",
+            read_only: false,
+            sharing: crate::MountSharing::Shared,
+            write: crate::vfs::BtrfsWriteOptions {
+                entropy: crate::test_support::test_root_entropy(),
+                concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+                compress: None,
+                commit: None,
+                max_inline: None,
+                now: 1_700_000_000_000_000_000,
+            },
         },
     ))
     .map(drop)
