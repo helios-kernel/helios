@@ -452,6 +452,38 @@ where
     }
 }
 
+/// Writes `len` bytes at `position` through an open handle and resolves with
+/// where they landed and how many did, staging them through
+/// [`FileSystem::prepare_write_handle`].
+pub async fn write_handle_with<F, S>(
+    fs: &F,
+    handle: &F::OpenHandle,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+    mut source: S,
+) -> FsResult<Landed>
+where
+    F: FileSystem,
+    S: FnMut(usize, &mut [u8]),
+{
+    let mut write = fs.prepare_write_handle(handle, position, len, now).await?;
+    loop {
+        match write.fill(&mut source).submit().await? {
+            WriteProgress::More(next) => write = next,
+            WriteProgress::Done(landed) => return Ok(landed),
+        }
+    }
+}
+
+/// The result of opening a path or creating an unnamed temporary file:
+/// its current metadata and a handle retaining the open object until dropped.
+#[derive(Clone, Debug)]
+pub struct Opened<H> {
+    pub metadata: Metadata,
+    pub handle: H,
+}
+
 /// Where a directory listing resumes.
 ///
 /// Opaque to the caller: it is [`DirCookie::START`] or a value a previous
@@ -585,25 +617,56 @@ impl OwnedFsPath {
 /// share) ignores it. Symbolic links are never followed here: `stat`
 /// describes the link itself, and resolving a link is the caller's job.
 pub trait FileSystem: Clone + Send + Sync + 'static {
+    /// An open reference to a filesystem object, keeping unlinked or unnamed
+    /// files alive until the final clone is dropped.
+    type OpenHandle: Clone + Send + Sync + 'static;
+
     /// Describes the object at `path` without following a final symbolic
     /// link.
     fn stat<'a>(&'a self, path: FsPath<'a>)
     -> impl Future<Output = FsResult<Metadata>> + Send + 'a;
 
+    /// Describes the open object referenced by `handle`.
+    fn stat_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+    ) -> impl Future<Output = FsResult<Metadata>> + Send + 'a;
+
     /// Opens the object at `path` as `flags` asks, creating or truncating
-    /// a regular file, and describes what was opened.
+    /// a regular file, and returns its metadata together with an open handle.
     fn open<'a>(
         &'a self,
         path: FsPath<'a>,
         flags: OpenFlags,
         now: u64,
-    ) -> impl Future<Output = FsResult<Metadata>> + Send + 'a;
+    ) -> impl Future<Output = FsResult<Opened<Self::OpenHandle>>> + Send + 'a;
+
+    /// Creates and opens an unnamed temporary regular file within the
+    /// filesystem subtree containing `directory` (`nlink == 0`). When
+    /// `exclusive` is false, [`Self::link_handle`] may later give the file a
+    /// directory entry; when true, linking it fails with [`FsError::NoEntry`].
+    fn open_tmpfile<'a>(
+        &'a self,
+        _directory: FsPath<'a>,
+        _exclusive: bool,
+        _now: u64,
+    ) -> impl Future<Output = FsResult<Opened<Self::OpenHandle>>> + Send + 'a {
+        core::future::ready(Err(FsError::Unsupported))
+    }
 
     /// Reads at most `max_bytes` from `offset`. An empty result is end of
     /// file.
     fn read_at<'a>(
         &'a self,
         path: FsPath<'a>,
+        offset: u64,
+        max_bytes: usize,
+    ) -> impl Future<Output = FsResult<Bytes>> + Send + 'a;
+
+    /// Reads at most `max_bytes` from `offset` of the open object `handle`.
+    fn read_handle_at<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
         offset: u64,
         max_bytes: usize,
     ) -> impl Future<Output = FsResult<Bytes>> + Send + 'a;
@@ -627,6 +690,15 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         now: u64,
     ) -> impl Future<Output = FsResult<Self::Write>> + Send + 'a;
 
+    /// Stages a write of `len` bytes at `position` on the open object `handle`.
+    fn prepare_write_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+        position: WritePosition,
+        len: usize,
+        now: u64,
+    ) -> impl Future<Output = FsResult<Self::Write>> + Send + 'a;
+
     /// Truncates or zero-extends a regular file to `size` bytes.
     fn set_size<'a>(
         &'a self,
@@ -635,10 +707,27 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
+    /// Truncates or zero-extends the open regular file `handle` to `size` bytes.
+    fn set_size_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+        size: u64,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
     /// Sets the access and modification times; `None` leaves one as it is.
     fn set_times<'a>(
         &'a self,
         path: FsPath<'a>,
+        access_nanos: Option<u64>,
+        modified_nanos: Option<u64>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
+    /// Sets the access and modification times of the open object `handle`.
+    fn set_times_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
         now: u64,
@@ -654,6 +743,12 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     fn open_dir<'a>(
         &'a self,
         path: FsPath<'a>,
+    ) -> impl Future<Output = FsResult<Self::Dir>> + Send + 'a;
+
+    /// Opens a directory listing stream for the open directory `handle`.
+    fn open_dir_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
     ) -> impl Future<Output = FsResult<Self::Dir>> + Send + 'a;
 
     fn create_directory<'a>(
@@ -700,6 +795,15 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
+    /// Gives the open non-directory `handle` the name `link` (including
+    /// materializing a non-exclusive unnamed temporary file).
+    fn link_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+        link: FsPath<'a>,
+        now: u64,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
     /// Creates a symbolic link at `link` whose target text is `target`.
     fn symlink<'a>(
         &'a self,
@@ -717,9 +821,21 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
     /// Makes the file's data and metadata durable.
     fn sync<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
+    /// Makes the open object `handle`'s data and metadata durable.
+    fn sync_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
     /// Makes the file's data durable, and the metadata needed to read it
     /// back.
     fn sync_data<'a>(&'a self, path: FsPath<'a>) -> impl Future<Output = FsResult<()>> + Send + 'a;
+
+    /// Makes the open object `handle`'s data and essential metadata durable.
+    fn sync_data_handle<'a>(
+        &'a self,
+        handle: &'a Self::OpenHandle,
+    ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 }
 
 bitflags! {

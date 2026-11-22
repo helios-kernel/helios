@@ -191,6 +191,25 @@ impl Roots {
         })
     }
 
+    /// Every live writable subvolume tree id, in ascending tree order, for
+    /// mount-time orphan cleanup (`btrfs_cleanup_fs_roots`).
+    #[cfg(feature = "write")]
+    pub(crate) fn writable_subvolumes(&self) -> Vec<u64> {
+        self.entries
+            .iter()
+            .filter_map(|(&tree, entry)| {
+                if tree != objectid::FS_TREE
+                    && !(objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&tree)
+                {
+                    return None;
+                }
+                let head = view::<RawRootItem>(&entry.bytes).expect("validated root item");
+                // Live (`refs != 0`) and not `BTRFS_ROOT_SUBVOL_RDONLY` (bit 0).
+                (head.refs.get() != 0 && head.flags.get() & 1 == 0).then_some(tree)
+            })
+            .collect()
+    }
+
     /// Has the commit rewrite tree `tree`'s root item even when the tree did
     /// not move, as `btrfs_record_root_in_trans` does: the root tree then
     /// changes, so the commit publishes a new generation.

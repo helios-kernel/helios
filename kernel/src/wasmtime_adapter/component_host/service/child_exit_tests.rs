@@ -720,6 +720,7 @@ fn proc_exec_with_unreadable_environment_fails_with_efault_and_caller_keeps_runn
                 | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         let created = wasi_fs::open_at(
             &ns,

@@ -61,6 +61,10 @@ pub(crate) mod objectid {
     #[cfg(feature = "write")]
     pub(crate) const DEV_ITEMS: u64 = 1;
     pub(crate) const EXTENT_CSUM: u64 = -10_i64 as u64;
+    /// `BTRFS_ORPHAN_OBJECTID`: orphan items in a subvolume tree whose offset
+    /// names an inode awaiting deletion or an unnamed `O_TMPFILE`.
+    #[cfg(feature = "write")]
+    pub(crate) const ORPHAN: u64 = -5_i64 as u64;
     /// `BTRFS_TREE_LOG_OBJECTID`: the owner of every log tree block, and the
     /// object id of the log root tree's root items.
     #[cfg(feature = "write")]
@@ -74,6 +78,10 @@ pub(crate) mod item_type {
     #[cfg(feature = "write")]
     pub(crate) const INODE_EXTREF: u8 = 13;
     pub(crate) const XATTR_ITEM: u8 = 24;
+    /// `BTRFS_ORPHAN_ITEM_KEY`: empty item at `(ORPHAN, ORPHAN_ITEM, inode)`
+    /// recording an inode whose link count is zero or whose truncate is open.
+    #[cfg(feature = "write")]
+    pub(crate) const ORPHAN_ITEM: u8 = 48;
     /// `BTRFS_DIR_LOG_ITEM_KEY`: a log's directory-item range, which only
     /// kernels before 5.17 wrote; replay reads index ranges alone.
     #[cfg(feature = "write")]

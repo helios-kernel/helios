@@ -22,9 +22,9 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{
     BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, InitFlags, KernelConfig,
-    LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
-    WriteFlags,
+    LockOwner, OpenFlags, Owner as FuseOwner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow, WriteFlags,
 };
 use futures_lite::future::block_on;
 use helios_btrfs::write::Special;
@@ -101,7 +101,9 @@ impl Filesystem for Daemon {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.run(|state| state.forget(ino, nlookup));
+        if self.run(|state| block_on(state.forget(ino, nlookup))) {
+            self.shared.writable_released.notify_all();
+        }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -127,6 +129,7 @@ impl Filesystem for Daemon {
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         flags: Option<BsdFileFlags>,
+        _kill_suid_gid: bool,
         reply: ReplyAttr,
     ) {
         if flags.is_some() {
@@ -155,12 +158,13 @@ impl Filesystem for Daemon {
 
     fn mknod(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         rdev: u32,
+        owner: FuseOwner,
         reply: ReplyEntry,
     ) {
         // The kernel sends `mknod`'s own encoding of the number
@@ -181,18 +185,19 @@ impl Filesystem for Daemon {
             name,
             node,
             permissions(mode),
-            caller(req, umask),
+            owner_with_umask(owner, umask),
             reply,
         );
     }
 
     fn mkdir(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
+        owner: FuseOwner,
         reply: ReplyEntry,
     ) {
         self.create_entry(
@@ -200,17 +205,18 @@ impl Filesystem for Daemon {
             name,
             Node::Directory,
             permissions(mode),
-            caller(req, umask),
+            owner_with_umask(owner, umask),
             reply,
         );
     }
 
     fn symlink(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
         target: &std::path::Path,
+        owner: FuseOwner,
         reply: ReplyEntry,
     ) {
         self.create_entry(
@@ -219,13 +225,20 @@ impl Filesystem for Daemon {
             Node::Symlink(target_bytes(target)),
             0o777,
             // `posix_acl_create` leaves a symlink's mode alone.
-            caller(req, 0),
+            owner_with_umask(owner, 0),
             reply,
         );
     }
 
-    fn open(&self, _req: &Request, _ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        match self.run(|state| state.open_file(flags)) {
+    fn open(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        flags: OpenFlags,
+        _kill_suid_gid: bool,
+        reply: ReplyOpen,
+    ) {
+        match self.run(|state| block_on(state.open_file(ino, flags))) {
             Ok(fh) => reply.opened(fh, FopenFlags::empty()),
             Err(errno) => reply.error(errno),
         }
@@ -233,21 +246,46 @@ impl Filesystem for Daemon {
 
     fn create(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         flags: i32,
+        _kill_suid_gid: bool,
+        owner: FuseOwner,
         reply: ReplyCreate,
     ) {
-        let owner = caller(req, umask);
+        let owner = owner_with_umask(owner, umask);
         let permissions = permissions(mode);
         match self.run(|state| {
             let (attr, generation) =
                 block_on(state.create(parent, name, Node::File, permissions, owner, now()))?;
-            let fh = state.open_file(OpenFlags(flags))?;
+            let fh = block_on(state.open_file(attr.ino, OpenFlags(flags)))?;
             Ok((attr, generation, fh))
+        }) {
+            Ok((attr, generation, fh)) => {
+                reply.created(&TTL, &attr, generation, fh, FopenFlags::empty())
+            }
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn tmpfile(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        _kill_suid_gid: bool,
+        owner: FuseOwner,
+        reply: ReplyCreate,
+    ) {
+        let owner = owner_with_umask(owner, umask);
+        let permissions = permissions(mode);
+        match self.run(|state| {
+            block_on(state.tmpfile(parent, permissions, owner, OpenFlags(flags), now()))
         }) {
             Ok((attr, generation, fh)) => {
                 reply.created(&TTL, &attr, generation, fh, FopenFlags::empty())
@@ -266,7 +304,7 @@ impl Filesystem for Daemon {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if self.run(|state| state.release_file(fh)) {
+        if self.run(|state| block_on(state.release_file(fh))) {
             self.shared.writable_released.notify_all();
         }
         reply.ok();
@@ -308,6 +346,7 @@ impl Filesystem for Daemon {
         newparent: INodeNo,
         newname: &OsStr,
         flags: RenameFlags,
+        _owner: Option<FuseOwner>,
         reply: ReplyEmpty,
     ) {
         // Both flags together, `RENAME_WHITEOUT` (which `rename` does not
@@ -450,7 +489,9 @@ impl Filesystem for Daemon {
         _flags: fuser::OpenFlags,
         reply: ReplyEmpty,
     ) {
-        self.run(|state| state.releasedir(fh));
+        if self.run(|state| block_on(state.releasedir(fh))) {
+            self.shared.writable_released.notify_all();
+        }
         reply.ok();
     }
 
@@ -545,10 +586,10 @@ impl Daemon {
     }
 }
 
-fn caller(req: &Request, umask: u32) -> Owner {
+fn owner_with_umask(owner: FuseOwner, umask: u32) -> Owner {
     Owner {
-        uid: req.uid(),
-        gid: req.gid(),
+        uid: owner.uid,
+        gid: owner.gid,
         umask,
     }
 }
