@@ -2795,6 +2795,7 @@ fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() 
                 compress: None,
                 commit: None,
                 max_inline: None,
+                now: 1_700_000_000_000_000_000,
             },
         )
         .await

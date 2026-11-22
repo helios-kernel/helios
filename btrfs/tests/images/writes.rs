@@ -52,9 +52,16 @@ async fn mount(image: SparseImage) -> Result<ImageWriter, WriteError> {
         WritableImage(Mutex::new(image)),
         no_uuid as fn() -> [u8; 16],
         std::thread::available_parallelism().unwrap(),
+        MOUNTED,
     )
     .await
 }
+
+/// When the images are mounted; none has a log for it to stamp.
+const MOUNTED: Timestamp = Timestamp {
+    seconds: 1_700_000_000,
+    nanoseconds: 0,
+};
 
 /// A writer over the image `mkfs.btrfs` produces for the guest smoke (128 MiB,
 /// default features) commits a created file and reads it back.
@@ -568,6 +575,7 @@ fn linux_authority_survives_unrelated_writes() {
             SharedImage(shared.clone()),
             no_uuid as fn() -> [u8; 16],
             std::thread::available_parallelism().unwrap(),
+            MOUNTED,
         )
         .await
         .unwrap();
@@ -805,6 +813,7 @@ fn linux_reads_back_the_authority_helios_sets() {
             SharedImage(shared.clone()),
             no_uuid as fn() -> [u8; 16],
             std::thread::available_parallelism().unwrap(),
+            MOUNTED,
         )
         .await
         .unwrap();
@@ -1178,6 +1187,7 @@ fn attributes_cross_between_linux_and_helios() {
             SharedImage(shared.clone()),
             no_uuid as fn() -> [u8; 16],
             std::thread::available_parallelism().unwrap(),
+            MOUNTED,
         )
         .await
         .unwrap();
@@ -1394,6 +1404,7 @@ fn exercise_inline_limits(image: SparseImage) -> std::sync::Arc<WritableImage> {
             SharedImage(shared.clone()),
             no_uuid as fn() -> [u8; 16],
             concurrency,
+            MOUNTED,
         )
         .await
         .unwrap();

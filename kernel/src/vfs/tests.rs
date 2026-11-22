@@ -42,6 +42,7 @@ fn request(source: crate::MountSource, read_only: bool) -> crate::MountRequest<'
             compress: None,
             commit: None,
             max_inline: None,
+            now: 1_700_000_000_000_000_000,
         },
     }
 }

@@ -113,6 +113,7 @@ fn write_options(
         compress,
         commit: None,
         max_inline: None,
+        now: 1_700_000_000_000_000_000,
     }
 }
 

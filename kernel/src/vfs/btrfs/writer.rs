@@ -435,7 +435,7 @@ async fn inherited<S: BlockSink, U: RootUuids>(
     })
 }
 
-fn timestamp(nanos: u64) -> Timestamp {
+pub(super) fn timestamp(nanos: u64) -> Timestamp {
     Timestamp {
         seconds: (nanos / 1_000_000_000) as i64,
         nanoseconds: (nanos % 1_000_000_000) as u32,
