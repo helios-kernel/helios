@@ -1662,4 +1662,91 @@ fn unix_dgram_and_inet_raw_sockets_support_interface_ioctls_and_cap_net_raw() {
     );
     mem.read(0x100, &mut req).unwrap();
     assert_eq!(&req[18..24], &[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+
+    // 3. getsockopt(SO_PROTOCOL) reports IPPROTO_RAW on raw IP sockets, and
+    //    getpeername / shutdown / sendto return ENOTCONN / EOPNOTSUPP (never ENOTSOCK).
+    const SYS_GETPEERNAME: u64 = 52;
+    const SYS_SHUTDOWN: u64 = 48;
+    const SYS_GETSOCKOPT: u64 = 55;
+    const SOL_SOCKET: u64 = 1;
+    const SO_PROTOCOL: u64 = 38;
+    const ENOTCONN: u64 = 107;
+
+    mem.write(0x210, &4u32.to_le_bytes()).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_GETSOCKOPT,
+            [raw_fd, SOL_SOCKET, SO_PROTOCOL, 0x200, 0x210, 0]
+        ),
+        0
+    );
+    let mut proto_bytes = [0u8; 4];
+    mem.read(0x200, &mut proto_bytes).unwrap();
+    assert_eq!(i32::from_le_bytes(proto_bytes), IPPROTO_RAW as i32);
+
+    mem.write(0x220, &16u32.to_le_bytes()).unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_GETPEERNAME,
+            [unix_fd, 0x230, 0x220, 0, 0, 0]
+        ),
+        -(ENOTCONN as i64)
+    );
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_GETPEERNAME,
+            [raw_fd, 0x230, 0x220, 0, 0, 0]
+        ),
+        -(ENOTCONN as i64)
+    );
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SHUTDOWN,
+            [unix_fd, 2, 0, 0, 0, 0]
+        ),
+        -(ENOTCONN as i64)
+    );
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SHUTDOWN,
+            [raw_fd, 2, 0, 0, 0, 0]
+        ),
+        -(ENOTCONN as i64)
+    );
+    mem.write(0x240, b"hi").unwrap();
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SENDTO,
+            [unix_fd, 0x240, 2, 0, 0, 0]
+        ),
+        -(EOPNOTSUPP as i64)
+    );
+    assert_eq!(
+        call(
+            &mut process,
+            &mut mem,
+            &mut plat,
+            SYS_SENDTO,
+            [raw_fd, 0x240, 2, 0, 0, 0]
+        ),
+        -(EOPNOTSUPP as i64)
+    );
 }

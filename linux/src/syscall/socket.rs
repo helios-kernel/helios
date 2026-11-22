@@ -1437,6 +1437,8 @@ pub(crate) async fn getpeername<R: Resources, M: UserMemory, Net: Network<R::Net
             },
             _ => return errno(ENOTCONN),
         }
+    } else if sock.is_unix_unbound() || sock.raw_ip_protocol().is_some() {
+        return errno(ENOTCONN);
     } else {
         return errno(ENOTSOCK);
     };
@@ -1603,6 +1605,17 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
             Err(ETIMEDOUT) => Err(EAGAIN),
             Err(err) => Err(err),
         };
+    }
+
+    if sock.is_unix_unbound() {
+        return Err(if sock.kind() == SocketKind::Stream {
+            ENOTCONN
+        } else {
+            EOPNOTSUPP
+        });
+    }
+    if sock.raw_ip_protocol().is_some() {
+        return Err(EOPNOTSUPP);
     }
 
     Err(ENOTSOCK)
@@ -1826,6 +1839,17 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
             Err(ETIMEDOUT) => return Err(EAGAIN),
             Err(err) => return Err(err),
         }
+    }
+
+    if sock.is_unix_unbound() {
+        return Err(if sock.kind() == SocketKind::Stream {
+            ENOTCONN
+        } else {
+            EOPNOTSUPP
+        });
+    }
+    if sock.raw_ip_protocol().is_some() {
+        return Err(EOPNOTSUPP);
     }
 
     Err(ENOTSOCK)
@@ -2342,6 +2366,10 @@ pub(crate) async fn shutdown<R: Resources, Net: Network<R::Network>>(
             sock.mark_shutdown_write();
         }
         return 0;
+    }
+
+    if sock.is_unix_unbound() || sock.raw_ip_protocol().is_some() {
+        return errno(ENOTCONN);
     }
 
     errno(ENOTSOCK)
@@ -2958,6 +2986,8 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 nl.protocol as i32
             } else if let Some(pkt) = sock.packet_state() {
                 i32::from(pkt.protocol.to_be())
+            } else if let Some(raw_proto) = sock.raw_ip_protocol() {
+                raw_proto
             } else {
                 match sock.protocol() {
                     Some(TransportProtocol::Tcp) => IPPROTO_TCP,
