@@ -1202,6 +1202,7 @@ pub(super) const fn wasix_socket_type(kind: SocketKind) -> i32 {
     match kind {
         SocketKind::Stream => WASIX_SOCK_TYPE_STREAM,
         SocketKind::Datagram => WASIX_SOCK_TYPE_DGRAM,
+        SocketKind::Raw => WASIX_SOCK_TYPE_RAW,
     }
 }
 
@@ -1243,6 +1244,7 @@ where
     let descriptor = Preview1Descriptor::Socket(match wasix_socket_kind(socktype) {
         Ok(SocketKind::Stream) => UnixSocket::<Net>::tcp(family),
         Ok(SocketKind::Datagram) => UnixSocket::<Net>::udp(family),
+        Ok(SocketKind::Raw) => return p1::errno::INVAL,
         Err(errno) => return errno,
     });
     let fd = match caller.data_mut().descriptors.insert(descriptor) {
@@ -1561,7 +1563,7 @@ where
         Some(UnixSocketHandle::<Net>::UdpSocket(socket)) => service
             .udp_set_hop_limit(socket, hop_limit)
             .map_or_else(p1_errno_from_udp_error, |()| p1::errno::SUCCESS),
-        None => p1::errno::SUCCESS,
+        Some(UnixSocketHandle::<Net>::PacketSocket(_)) | None => p1::errno::SUCCESS,
     }
 }
 

@@ -661,6 +661,19 @@ pub struct UdpDatagram {
     pub original_len: usize,
 }
 
+/// One raw link-layer Ethernet frame delivered to an `AF_PACKET` socket.
+#[derive(Clone, Debug)]
+pub struct PacketFrame {
+    /// Linux interface index (`1` = `lo`, `2` = `eth0`).
+    pub ifindex: u32,
+    /// Ethernet protocol (EtherType) in host byte order (for example `0x0800`).
+    pub protocol: u16,
+    /// Frame bytes, truncated to the caller's requested maximum length.
+    pub bytes: Bytes,
+    /// Full original frame length before truncation.
+    pub original_len: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct UdpBinding<Socket> {
     pub socket: Socket,
@@ -1147,6 +1160,74 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     /// A datagram socket owes its peers no shutdown sequence, so unlike
     /// the TCP closes this queues nothing and publishes nothing.
     fn udp_close(&self, socket: Self::UdpSocket);
+
+    /// Opens an `AF_PACKET` tap receiving frames matching `protocol` (host byte
+    /// order; `0x0003` / `ETH_P_ALL` matches every EtherType).
+    fn packet_open(&self, protocol: u16) -> Result<u64, UdpError> {
+        let _ = protocol;
+        Err(UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        })
+    }
+
+    /// Rebinds an open `AF_PACKET` tap to `protocol` (host byte order) and
+    /// `ifindex` (`0` = any interface, `1` = `lo`, `2` = `eth0`).
+    fn packet_bind(&self, socket: u64, protocol: u16, ifindex: u32) -> Result<(), UdpError> {
+        let _ = (socket, protocol, ifindex);
+        Err(UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        })
+    }
+
+    /// Transmits a raw Ethernet frame on `ifindex` (`0` or `2` = `eth0`, `1` = `lo`).
+    fn packet_send<'a>(
+        &'a self,
+        socket: u64,
+        ifindex: u32,
+        frame: &'a [u8],
+    ) -> impl Future<Output = Result<usize, UdpError>> + Send + 'a {
+        let _ = (socket, ifindex, frame);
+        async {
+            Err(UdpError {
+                kind: UdpErrorKind::Unsupported,
+                detail: NetworkErrorDetail::UnsupportedAddressFamily,
+            })
+        }
+    }
+
+    /// Waits up to `timeout_nanos` for one raw Ethernet frame on `socket`.
+    fn packet_receive<'a>(
+        &'a self,
+        socket: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> impl Future<Output = Result<Option<PacketFrame>, UdpError>> + Send + 'a {
+        let _ = (socket, max_bytes, timeout_nanos, peek);
+        async {
+            Err(UdpError {
+                kind: UdpErrorKind::Unsupported,
+                detail: NetworkErrorDetail::UnsupportedAddressFamily,
+            })
+        }
+    }
+
+    /// Non-destructive readiness of an `AF_PACKET` tap, driving the device RX
+    /// ring before probing so `epoll_wait`/`poll` observe freshly arrived frames.
+    fn packet_readiness(
+        &self,
+        socket: u64,
+    ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+        let _ = socket;
+        async { Ok(SocketReadiness::default()) }
+    }
+
+    /// Retires an `AF_PACKET` tap. Synchronous because `Drop` calls it.
+    fn packet_close(&self, socket: u64) {
+        let _ = socket;
+    }
 }
 
 pub trait ComponentNetworkState<Service>: Clone + Send + 'static
