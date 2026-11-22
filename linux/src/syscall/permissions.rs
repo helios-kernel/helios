@@ -353,8 +353,8 @@ pub fn stripped_mode_on_write(creds: &Credentials, inode: InodeMeta) -> Option<u
     }
 }
 
-/// Validates `mknod`/`mknodat` (`fs/namei.c` `do_mknodat`, Linux v6.12) and
-/// returns the `NodeKind` to create.
+/// Validates `mknod`/`mknodat` (`fs/namei.c` `may_mknod` + `do_mknodat`, Linux
+/// v6.12) and returns the `NodeKind` to create.
 pub fn check_mknod(creds: &Credentials, mode: u32) -> Result<NodeKind, FsOpError> {
     let kind = match mode & S_IFMT {
         0 | S_IFREG => NodeKind::File,
@@ -362,6 +362,7 @@ pub fn check_mknod(creds: &Credentials, mode: u32) -> Result<NodeKind, FsOpError
         S_IFSOCK => NodeKind::Socket,
         S_IFCHR => NodeKind::CharacterDevice,
         S_IFBLK => NodeKind::BlockDevice,
+        S_IFDIR => return Err(FsOpError::PermissionDenied),
         _ => return Err(FsOpError::Fs(FsError::Invalid)),
     };
     if matches!(kind, NodeKind::CharacterDevice | NodeKind::BlockDevice)

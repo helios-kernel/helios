@@ -497,6 +497,30 @@ fn chmod_chown_mknod_and_xattr_syscalls_decode_on_both_abis() {
                 0x0103
             ))
         );
+        // Linux `fs/namei.c` `may_mknod`: S_IFDIR -> EPERM, S_IFLNK -> EINVAL.
+        let at_fdcwd = (-100i32) as u32 as u64;
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Mknodat,
+                [at_fdcwd, path_addr, 0o040_000 | 0o755, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EPERM)
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Mknodat,
+                [at_fdcwd, path_addr, 0o120_000 | 0o777, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EINVAL)
+        );
 
         // Invalid xattr flags -> EINVAL; oversized value -> E2BIG; null name -> EFAULT.
         assert_eq!(

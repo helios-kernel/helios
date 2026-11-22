@@ -97,10 +97,11 @@ int main(void) {
     CHECK(fchownat(dfd, "file", euid, egid, 0) == 0);
     CHECK(fchownat(dfd, "link", (uid_t)-1, (gid_t)-1, AT_SYMLINK_NOFOLLOW) == 0);
 
-    /* mknodat: FIFO & regular file without CAP_MKNOD; invalid S_IFDIR -> EINVAL. */
+    /* mknodat: FIFO & regular file without CAP_MKNOD; S_IFDIR -> EPERM, S_IFLNK -> EINVAL. */
     CHECK(mknodat(dfd, "reg", S_IFREG | 0644, 0) == 0);
     CHECK(mknodat(dfd, "pipe", S_IFIFO | 0644, 0) == 0);
-    CHECK(SYS(SYS_mknodat, dfd, "bad-dir", S_IFDIR | 0755, 0) == -EINVAL);
+    CHECK(SYS(SYS_mknodat, dfd, "bad-dir", S_IFDIR | 0755, 0) == -EPERM);
+    CHECK(SYS(SYS_mknodat, dfd, "bad-lnk", S_IFLNK | 0777, 0) == -EINVAL);
     if (!has_cap_mknod) {
         CHECK(SYS(SYS_mknodat, dfd, "chr", S_IFCHR | 0600, 0x0103) == -EPERM);
     }
