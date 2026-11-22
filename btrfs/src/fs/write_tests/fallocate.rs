@@ -619,6 +619,27 @@ fn fallocate_respects_immutable_and_append_inode_flags() {
 }
 
 #[test]
+fn fallocate_consumes_reported_available_bytes_without_enospc() {
+    let (_named, mut writer) = mount_image(true, Compressor::Plain);
+    let usage = writer.usage().unwrap();
+    assert!(usage.available_bytes > 512 * 1024);
+    assert!(usage.available_bytes <= usage.total_bytes - usage.used_bytes);
+    let reserve = (usage.available_bytes - 512 * 1024) / SECTOR * SECTOR;
+    block_on(async {
+        let mut tx = writer.join().await.unwrap();
+        let file = create(&mut tx, b"fill").await;
+        tx.fallocate(&file, 0, reserve, AllocateMode::Allocate, when(1))
+            .await
+            .unwrap();
+        assert_eq!(tx.metadata(&file).await.unwrap().size, reserve);
+        assert_eq!(tx.metadata(&file).await.unwrap().nbytes, reserve);
+        tx.commit().await.unwrap();
+    });
+    let after = writer.usage().unwrap();
+    assert!(after.available_bytes < usage.available_bytes);
+}
+
+#[test]
 #[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
 fn fallocate_passes_btrfs_check() {
     for no_holes in [true, false] {

@@ -1,5 +1,7 @@
 generic/020 # _attr_get_maxval_size hardcodes a 65536-byte xattr value for FSTYP=fuse, exceeding BTRFS_MAX_XATTR_SIZE
 generic/108 # #1085: overwrites SCRATCH_DEV with LVM pvcreate while FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
+generic/250 # #1085: overwrites SCRATCH_DEV with pwrite before _scratch_mkfs_sized skips on FSTYP=fuse and _dmerror_mount omits FUSE_SUBTYP
+generic/252 # #1085: overwrites SCRATCH_DEV with pwrite before _scratch_mkfs_sized skips on FSTYP=fuse and _dmerror_mount omits FUSE_SUBTYP
 generic/338 # #1085: common/dmerror _dmerror_mount passes -t fuse without FUSE_SUBTYP
 generic/409 # #1085: _get_mount passes -t fuse without FUSE_SUBTYP
 generic/410 # #1085: _get_mount passes -t fuse without FUSE_SUBTYP

@@ -462,7 +462,7 @@ impl Filesystem for Daemon {
             Ok(statfs) => reply.statfs(
                 statfs.blocks,
                 statfs.free,
-                statfs.free,
+                statfs.available,
                 // The format keeps no inode count, as Linux's btrfs reports.
                 0,
                 0,

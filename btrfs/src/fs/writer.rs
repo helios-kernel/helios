@@ -230,6 +230,10 @@ impl<F: FnMut() -> [u8; 16] + Send> RootUuids for F {
 pub struct Usage {
     pub total_bytes: u64,
     pub used_bytes: u64,
+    /// Bytes available for file data allocation (`f_bavail` in Linux's
+    /// `btrfs_statfs`): free space in existing data block groups plus
+    /// unallocated device space usable for new data chunks.
+    pub available_bytes: u64,
 }
 
 /// The transaction every mutation joins until the next commit.
@@ -345,14 +349,50 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// transaction commits: a write is visible at once, and so is its
     /// space, its dirty data counted at the space it reserved.
     pub fn usage(&self) -> Result<Usage, WriteError> {
+        const DUP: u64 = 1 << 5;
         let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
         let superblock = committed.superblock();
+        let total_bytes = superblock.total_bytes();
+        let (used_bytes, available_bytes) = match &self.running {
+            Some(running) => {
+                let used = running.inner.bytes_used()? + running.inner.dirty_data_bytes();
+                let dup = running
+                    .inner
+                    .space
+                    .latest_flags(DATA)
+                    .is_some_and(|flags| flags & DUP != 0);
+                let avail = running.inner.data_budget().saturating_add(
+                    running
+                        .inner
+                        .volume
+                        .chunks()
+                        .unallocated_data_bytes(total_bytes, dup),
+                );
+                (used, avail.min(total_bytes.saturating_sub(used)))
+            }
+            None => {
+                let used = superblock.bytes_used();
+                let chunks = committed.volume.chunks();
+                let dup = self
+                    .allocation
+                    .space
+                    .latest_flags(DATA)
+                    .is_some_and(|flags| flags & DUP != 0);
+                let free_data = self
+                    .allocation
+                    .space
+                    .totals(DATA)
+                    .1
+                    .saturating_sub(chunks.data_superblock_stripe_bytes());
+                let avail =
+                    free_data.saturating_add(chunks.unallocated_data_bytes(total_bytes, dup));
+                (used, avail.min(total_bytes.saturating_sub(used)))
+            }
+        };
         Ok(Usage {
-            total_bytes: superblock.total_bytes(),
-            used_bytes: match &self.running {
-                Some(running) => running.inner.bytes_used()? + running.inner.dirty_data_bytes(),
-                None => superblock.bytes_used(),
-            },
+            total_bytes,
+            used_bytes,
+            available_bytes,
         })
     }
 

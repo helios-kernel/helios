@@ -101,6 +101,7 @@ pub struct Owner {
 pub struct Statfs {
     pub blocks: u64,
     pub free: u64,
+    pub available: u64,
     pub block_size: u32,
 }
 
@@ -1105,19 +1106,22 @@ impl<S: BlockSink, B> State<S, B> {
         let snapshot = self.snapshot()?;
         let block_size = snapshot.superblock().sectorsize();
         let size = u64::from(block_size);
-        let (total_bytes, used_bytes) = match &self.storage {
+        let (total_bytes, used_bytes, available_bytes) = match &self.storage {
             Storage::Writable(writer) => {
                 let usage = writer.usage().map_err(|error| write_errno(&error))?;
-                (usage.total_bytes, usage.used_bytes)
+                (usage.total_bytes, usage.used_bytes, usage.available_bytes)
             }
             Storage::ReadOnly(fs) => {
                 let sb = fs.superblock();
-                (sb.total_bytes(), sb.bytes_used())
+                let total = sb.total_bytes();
+                let used = sb.bytes_used();
+                (total, used, total.saturating_sub(used))
             }
         };
         Ok(Statfs {
             blocks: total_bytes / size,
             free: total_bytes.saturating_sub(used_bytes) / size,
+            available: available_bytes / size,
             block_size,
         })
     }
