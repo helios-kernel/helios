@@ -43,9 +43,13 @@ use crate::accounting::Allocation;
 use crate::compress::policy::Compressor;
 use crate::ondisk::objectid;
 use crate::retirement::Retirements;
+use crate::roots::Roots;
 use crate::source::BlockSink;
+use crate::space::{DATA, SpaceError};
+use crate::transaction::fallocate::AllocateMode;
 use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
+use crate::transaction::orphan::{OpenInodes, ReleaseOutcome, committed_orphans};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
 use crate::transaction::replay::PendingLog;
 use crate::transaction::reserve::Units;
@@ -199,6 +203,9 @@ pub struct Writer<S, U> {
     allocation: Allocation,
     retirements: Retirements,
     running: Option<Running<S>>,
+    /// Open-handle accounting carried across transactions while `running` is
+    /// `None`; mirrored into `running.inner.open` while a transaction runs.
+    open: OpenInodes,
     mount: Arc<MountIdentity>,
     /// What every commit needs, the ones a mutation forces included.
     uuids: U,
@@ -228,6 +235,10 @@ impl<F: FnMut() -> [u8; 16] + Send> RootUuids for F {
 pub struct Usage {
     pub total_bytes: u64,
     pub used_bytes: u64,
+    /// Bytes available for file data allocation (`f_bavail` in Linux's
+    /// `btrfs_statfs`): free space in existing data block groups plus
+    /// unallocated device space usable for new data chunks.
+    pub available_bytes: u64,
 }
 
 /// The transaction every mutation joins until the next commit.
@@ -285,6 +296,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             allocation,
             retirements: Retirements::default(),
             running: None,
+            open: OpenInodes::new(),
             mount: Arc::new(MountIdentity),
             uuids,
             compressor,
@@ -294,6 +306,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         if let Some(log) = log {
             writer.replay(log, now).await?;
         }
+        writer.cleanup_orphans().await?;
         Ok(writer)
     }
 
@@ -311,6 +324,61 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         running.inner.replay_log(log, now).await?;
         running.inner.check_commit_hold(Units::default())?;
         self.commit_running().await
+    }
+
+    /// Processes orphan items left behind by a crash across every live
+    /// writable subvolume before the writable mount is published, as Linux's
+    /// `btrfs_cleanup_fs_roots` and `btrfs_orphan_cleanup`. Does nothing and
+    /// writes no generation when no subvolume carries an orphan item.
+    async fn cleanup_orphans(&mut self) -> Result<(), WriteError> {
+        let pending: Vec<(u64, Vec<u64>)> = {
+            let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
+            let roots = Roots::load(&committed.volume, committed.snapshot.root_tree).await?;
+            let mut pending = Vec::new();
+            for tree in roots.writable_subvolumes() {
+                let root = roots.get(tree)?;
+                let orphans = committed_orphans(&committed.volume, root).await?;
+                if !orphans.is_empty() {
+                    pending.push((tree, orphans));
+                }
+            }
+            pending
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.start().await?;
+        for (tree, orphans) in pending {
+            for inode in orphans {
+                if self.running.is_none() {
+                    self.start().await?;
+                }
+                let running = self
+                    .running
+                    .as_mut()
+                    .expect("a transaction runs once started");
+                running.inner.prepare_mutation().await?;
+                running.inner.cleanup_orphan(tree, inode).await?;
+                if running.inner.dirty_metadata_bytes() >= DEFAULT_DIRTY_METADATA_LIMIT {
+                    running.inner.check_commit_hold(Units::default())?;
+                    self.commit_running().await?;
+                }
+            }
+        }
+        if let Some(running) = self.running.as_mut() {
+            running.inner.check_commit_hold(Units::default())?;
+            self.commit_running().await?;
+        }
+        Ok(())
+    }
+
+    /// Whether any open handle currently keeps an unlinked or `O_TMPFILE`
+    /// orphan inode alive on this mount.
+    pub fn has_open_orphans(&self) -> bool {
+        match &self.running {
+            Some(running) => running.inner.open.has_orphans(),
+            None => self.open.has_orphans(),
+        }
     }
 
     /// The mount's `max_inline` limit, in bytes.
@@ -343,14 +411,50 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// transaction commits: a write is visible at once, and so is its
     /// space, its dirty data counted at the space it reserved.
     pub fn usage(&self) -> Result<Usage, WriteError> {
+        const DUP: u64 = 1 << 5;
         let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
         let superblock = committed.superblock();
+        let total_bytes = superblock.total_bytes();
+        let (used_bytes, available_bytes) = match &self.running {
+            Some(running) => {
+                let used = running.inner.bytes_used()? + running.inner.dirty_data_bytes();
+                let dup = running
+                    .inner
+                    .space
+                    .latest_flags(DATA)
+                    .is_some_and(|flags| flags & DUP != 0);
+                let avail = running.inner.data_budget().saturating_add(
+                    running
+                        .inner
+                        .volume
+                        .chunks()
+                        .unallocated_data_bytes(total_bytes, dup),
+                );
+                (used, avail.min(total_bytes.saturating_sub(used)))
+            }
+            None => {
+                let used = superblock.bytes_used();
+                let chunks = committed.volume.chunks();
+                let dup = self
+                    .allocation
+                    .space
+                    .latest_flags(DATA)
+                    .is_some_and(|flags| flags & DUP != 0);
+                let free_data = self
+                    .allocation
+                    .space
+                    .totals(DATA)
+                    .1
+                    .saturating_sub(chunks.data_superblock_stripe_bytes());
+                let avail =
+                    free_data.saturating_add(chunks.unallocated_data_bytes(total_bytes, dup));
+                (used, avail.min(total_bytes.saturating_sub(used)))
+            }
+        };
         Ok(Usage {
-            total_bytes: superblock.total_bytes(),
-            used_bytes: match &self.running {
-                Some(running) => running.inner.bytes_used()? + running.inner.dirty_data_bytes(),
-                None => superblock.bytes_used(),
-            },
+            total_bytes,
+            used_bytes,
+            available_bytes,
         })
     }
 
@@ -421,7 +525,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
         if self.running.is_none() {
             let (volume, pin) = (committed.volume.clone(), committed.snapshot.clone());
-            let inner = Transaction::new(
+            let mut inner = Transaction::new(
                 volume,
                 pin,
                 &mut self.retirements,
@@ -429,6 +533,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
                 self.compressor.algorithm().is_some(),
             )
             .await?;
+            inner.open = self.open.clone();
             self.running = Some(Running {
                 inner,
                 view: None,
@@ -452,8 +557,11 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         if self.running.as_ref().is_none_or(|running| {
             running.inner.dirty_metadata_bytes() == 0 && running.inner.dirty_data_bytes() == 0
         }) {
-            // A clean transaction holds nothing the last commit did not.
-            self.running = None;
+            // A clean transaction holds nothing the last commit did not,
+            // except any in-memory open-handle accounting updates.
+            if let Some(running) = self.running.take() {
+                self.open = running.inner.open;
+            }
             return Ok(());
         }
         self.commit_running().await
@@ -466,6 +574,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             .running
             .take()
             .expect("the caller commits a running transaction");
+        self.open = running.inner.open.clone();
         let uuids = &mut self.uuids;
         let mut committed = running
             .inner
@@ -570,7 +679,7 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     async fn load_handle(&self, id: FileId) -> Result<InodeHandle, WriteError> {
-        let metadata = self.inner().inode_metadata(id).await?;
+        let (_, metadata) = self.inner().inode_item(id.tree, id.inode).await?;
         Ok(InodeHandle {
             mount: self.writer.mount.clone(),
             id,
@@ -592,7 +701,11 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             inode: handle.id.inode,
             generation: handle.generation,
         };
-        let metadata = match self.inner().inode_metadata(handle.id).await {
+        let (_, metadata) = match self
+            .inner()
+            .inode_item(handle.id.tree, handle.id.inode)
+            .await
+        {
             Err(WriteError::Read(Error::MissingInode { .. })) => return Err(stale()),
             result => result?,
         };
@@ -654,7 +767,11 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     pub async fn metadata(&self, handle: &InodeHandle) -> Result<Metadata, WriteError> {
-        self.checked(handle).await
+        let mut metadata = self.checked(handle).await?;
+        metadata.nbytes = metadata
+            .nbytes
+            .saturating_add(self.inner().unbacked_delalloc_bytes(handle.id));
+        Ok(metadata)
     }
 
     pub async fn lookup(
@@ -780,6 +897,47 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         let (inner, compressor, concurrency, max_inline) = operation.split();
         inner
             .clone_range(range, when, compressor, concurrency, max_inline)
+            .await?;
+        operation.accept()
+    }
+
+    /// Preallocates space, punches holes or zeroes a byte range of `file`, as
+    /// Linux's `btrfs_fallocate` (`fs/btrfs/file.c`).
+    pub async fn fallocate(
+        &mut self,
+        file: &InodeHandle,
+        offset: u64,
+        length: u64,
+        mode: AllocateMode,
+        when: Timestamp,
+    ) -> Result<(), WriteError> {
+        self.checked(file).await?;
+        let id = file.id;
+        self.inner().roots.check_writable(id.tree)?;
+        let max_inline = self.writer.max_inline;
+        let units = self
+            .reserve_with_data(DataReservation::Fallocate {
+                file: id,
+                offset,
+                length,
+                mode,
+                max_inline,
+            })
+            .await?;
+        let mut operation = Mutation::new(self, units).await?;
+        operation.checked(file).await?;
+        let (inner, compressor, concurrency, max_inline) = operation.split();
+        inner
+            .fallocate(
+                id,
+                offset,
+                length,
+                mode,
+                when,
+                compressor,
+                concurrency,
+                max_inline,
+            )
             .await?;
         operation.accept()
     }
@@ -985,13 +1143,107 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         Ok(handle)
     }
 
+    /// Records one more open handle holding `file` alive across unlinks.
+    /// While at least one open handle exists, removing the last link leaves
+    /// the inode and an on-disk orphan item in place until the final
+    /// [`Self::release_inode`].
+    pub async fn open_inode(&mut self, file: &InodeHandle) -> Result<(), WriteError> {
+        self.checked(file).await?;
+        self.inner_mut().open.retain(file.id, file.generation)
+    }
+
+    /// Creates an unnamed regular file inode (`O_TMPFILE`) in `parent`'s
+    /// subvolume, inheriting default ACLs and `S_ISGID` group ownership from
+    /// `parent` without touching `parent`'s entries or timestamps. Records an
+    /// on-disk orphan item and opens one handle on the returned inode; when
+    /// `linkable` is true (no `O_EXCL`), [`Self::hard_link`] may later give it
+    /// a name and remove its orphan item.
+    pub async fn create_tmpfile(
+        &mut self,
+        parent: &InodeHandle,
+        attributes: Attributes,
+        linkable: bool,
+        when: Timestamp,
+    ) -> Result<InodeHandle, WriteError> {
+        let parent_meta = self.checked(parent).await?;
+        if parent_meta.kind != FileKind::Directory {
+            return Err(Error::WrongKind {
+                tree: parent.tree(),
+                inode: parent.number(),
+                expected: FileKind::Directory,
+                found: parent_meta.kind,
+            }
+            .into());
+        }
+        let raw_attributes = attributes.raw(0o100000)?;
+        let units = if self
+            .inner()
+            .has_default_acl(parent.tree(), parent.number())
+            .await?
+        {
+            Units::TMPFILE_INHERITING_ACLS
+        } else {
+            Units::TMPFILE
+        };
+        let mut operation = Mutation::new(self, units).await?;
+        operation.checked(parent).await?;
+        let (tree, parent_id) = (parent.tree(), parent.number());
+        operation.inner_mut().roots.check_writable(tree)?;
+        let inode = operation
+            .inner_mut()
+            .create_tmpfile(tree, parent_id, raw_attributes, linkable, when)
+            .await?;
+        let handle = operation.load_handle(FileId { tree, inode }).await?;
+        operation.accept()?;
+        Ok(handle)
+    }
+
+    /// Releases one open handle previously acquired with [`Self::open_inode`]
+    /// or [`Self::create_tmpfile`]. If this was the final open handle on an
+    /// orphaned inode, deletes the inode (its extents, checksums, extended
+    /// attributes and delayed-allocation pages) and its orphan item in one
+    /// transaction and returns `Ok(true)`; otherwise returns `Ok(false)`.
+    pub async fn release_inode(&mut self, file: &InodeHandle) -> Result<bool, WriteError> {
+        if !Arc::ptr_eq(&self.writer.mount, &file.mount) {
+            return Err(WriteError::ForeignHandle);
+        }
+        let mut preview = self.inner().open.clone();
+        match preview.release(file.id, file.generation)? {
+            ReleaseOutcome::StillOpen | ReleaseOutcome::ClosedLinked => {
+                self.inner_mut().open = preview;
+                Ok(false)
+            }
+            ReleaseOutcome::DeleteOrphan => {
+                let mut operation = Mutation::new(self, Units::UNLINK).await?;
+                let outcome = operation
+                    .inner_mut()
+                    .open
+                    .release(file.id, file.generation)?;
+                debug_assert_eq!(outcome, ReleaseOutcome::DeleteOrphan);
+                operation.inner_mut().roots.check_writable(file.tree())?;
+                operation
+                    .inner_mut()
+                    .delete_orphan_inode(file.tree(), file.number())
+                    .await?;
+                operation.accept()?;
+                Ok(true)
+            }
+        }
+    }
+
     pub async fn hard_link(
         &mut self,
         name: Name<'_>,
         file: &InodeHandle,
         when: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self, Units::LINK).await?;
+        let metadata = self.checked(file).await?;
+        let units = if metadata.nlink == 0 {
+            Units::LINK_ORPHAN
+        } else {
+            Units::LINK
+        };
+        let mut operation = Mutation::new(self, units).await?;
         operation.checked(file).await?;
         let name = operation.entry_name(name).await?;
         if file.tree() != name.tree {
@@ -1125,6 +1377,22 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
                         .clone_reservation(source, destination, offset, length)
                         .await?
                 }
+                DataReservation::Fallocate {
+                    file,
+                    offset,
+                    length,
+                    mode,
+                    max_inline,
+                } => {
+                    let bytes = self
+                        .inner()
+                        .fallocate_reservation(file, offset, length, mode, max_inline)
+                        .await?;
+                    if bytes > self.inner().volume.superblock().total_bytes() {
+                        return Err(SpaceError::Exhausted { bytes, flags: DATA }.into());
+                    }
+                    bytes
+                }
             };
             self.reserve_data(reservation).await?;
             let units = match operation {
@@ -1150,6 +1418,9 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
                     }
                 }
                 DataReservation::Clone { .. } => Units::CLONE,
+                DataReservation::Fallocate { mode, .. } => {
+                    self.inner().fallocate_units(mode, reservation)
+                }
             };
             if self.inner().reserves(units) {
                 return Ok(units);
@@ -1229,6 +1500,13 @@ enum DataReservation {
         destination: FileId,
         offset: u64,
         length: u64,
+    },
+    Fallocate {
+        file: FileId,
+        offset: u64,
+        length: u64,
+        mode: AllocateMode,
+        max_inline: u64,
     },
 }
 

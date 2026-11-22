@@ -1087,6 +1087,7 @@ impl MemoryFs {
 }
 
 impl FileSystem for MemoryFs {
+    super::delegate_path_handles!();
     type Write = MemoryWrite;
     type Dir = MemoryDir;
 
@@ -1094,7 +1095,12 @@ impl FileSystem for MemoryFs {
         self.state.lock().metadata(self.device, path)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        now: u64,
+    ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
         let mut state = self.state.lock();
         match state.inode(path) {
             Ok((_, inode)) => {
@@ -1131,7 +1137,11 @@ impl FileSystem for MemoryFs {
             }
             Err(error) => return Err(error),
         }
-        state.metadata(self.device, path)
+        let metadata = state.metadata(self.device, path)?;
+        Ok(helios_hal::fs::Opened {
+            metadata,
+            handle: OwnedFsPath::from(path),
+        })
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {

@@ -47,7 +47,9 @@ mod storage;
 mod unix;
 
 use btrfs::WritableMount;
-pub use btrfs::{BtrfsFs, BtrfsMountError, BtrfsService, BtrfsWriteOptions, CommitPolicy};
+pub use btrfs::{
+    BtrfsFs, BtrfsMountError, BtrfsOpenHandle, BtrfsService, BtrfsWriteOptions, CommitPolicy,
+};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
 pub use memory::{MemoryFs, MemoryUnixMetadata, MemoryWrite, XattrSetMode};
@@ -76,8 +78,8 @@ use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FileSystemRights, FilledWrite, FsError,
-    FsPath, FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition,
-    WriteProgress,
+    FsPath, FsResult, Metadata, NodeKind, OpenFlags, Opened, OwnedFsPath, PreparedWrite,
+    RenameMode, WritePosition, WriteProgress,
 };
 use thiserror::Error;
 use triomphe::Arc;
@@ -110,14 +112,103 @@ pub const ROOT_GRANT: MountGrant = MountGrant {
 /// The deepest chain of symbolic links one resolution follows.
 pub const MAX_SYMLINK_DEPTH: usize = 16;
 
+/// Delegates the handle-addressed [`FileSystem`] methods to the path-addressed
+/// methods for filesystems whose [`FileSystem::OpenHandle`] is [`OwnedFsPath`].
+macro_rules! delegate_path_handles {
+    () => {
+        type OpenHandle = helios_hal::fs::OwnedFsPath;
+
+        async fn stat_handle(
+            &self,
+            handle: &Self::OpenHandle,
+        ) -> helios_hal::fs::FsResult<helios_hal::fs::Metadata> {
+            self.stat(handle.as_path()).await
+        }
+
+        async fn read_handle_at(
+            &self,
+            handle: &Self::OpenHandle,
+            offset: u64,
+            max_bytes: usize,
+        ) -> helios_hal::fs::FsResult<bytes::Bytes> {
+            self.read_at(handle.as_path(), offset, max_bytes).await
+        }
+
+        async fn prepare_write_handle(
+            &self,
+            handle: &Self::OpenHandle,
+            position: helios_hal::fs::WritePosition,
+            len: usize,
+            now: u64,
+        ) -> helios_hal::fs::FsResult<Self::Write> {
+            self.prepare_write(handle.as_path(), position, len, now)
+                .await
+        }
+
+        async fn set_size_handle(
+            &self,
+            handle: &Self::OpenHandle,
+            size: u64,
+            now: u64,
+        ) -> helios_hal::fs::FsResult<()> {
+            self.set_size(handle.as_path(), size, now).await
+        }
+
+        async fn set_times_handle(
+            &self,
+            handle: &Self::OpenHandle,
+            access_nanos: Option<u64>,
+            modified_nanos: Option<u64>,
+            now: u64,
+        ) -> helios_hal::fs::FsResult<()> {
+            self.set_times(handle.as_path(), access_nanos, modified_nanos, now)
+                .await
+        }
+
+        async fn open_dir_handle(
+            &self,
+            handle: &Self::OpenHandle,
+        ) -> helios_hal::fs::FsResult<Self::Dir> {
+            self.open_dir(handle.as_path()).await
+        }
+
+        async fn link_handle(
+            &self,
+            handle: &Self::OpenHandle,
+            link: helios_hal::fs::FsPath<'_>,
+            now: u64,
+        ) -> helios_hal::fs::FsResult<()> {
+            self.link(handle.as_path(), link, now).await
+        }
+
+        async fn sync_handle(&self, handle: &Self::OpenHandle) -> helios_hal::fs::FsResult<()> {
+            self.sync(handle.as_path()).await
+        }
+
+        async fn sync_data_handle(
+            &self,
+            handle: &Self::OpenHandle,
+        ) -> helios_hal::fs::FsResult<()> {
+            self.sync_data(handle.as_path()).await
+        }
+    };
+}
+pub(crate) use delegate_path_handles;
+
 /// Defines [`MountedFs`] over the closed set of filesystem kinds, with a
 /// [`FileSystem`] implementation that forwards each operation to the kind
 /// it holds. Adding a kind is one line here.
 macro_rules! mount_kinds {
-    ($($(#[$doc:meta])* $kind:ident($fs:ty)),+ $(,)?) => {
+    ($($(#[$doc:meta])* $kind:ident($fs:ty => $open:ty)),+ $(,)?) => {
         /// A mounted filesystem of one of the kinds the kernel builds.
         pub enum MountedFs<S: Storage> {
             $($(#[$doc])* $kind($fs),)+
+        }
+
+        /// An open handle returned by whichever kind a [`MountedFs`] holds.
+        #[derive(Clone)]
+        pub enum MountedOpenHandle {
+            $($kind($open),)+
         }
 
         // Written out rather than derived: a derive would also demand
@@ -130,6 +221,7 @@ macro_rules! mount_kinds {
         }
 
         impl<S: Storage> FileSystem for MountedFs<S> {
+            type OpenHandle = MountedOpenHandle;
             type Write = MountedWrite<S>;
             type Dir = MountedDir<S>;
 
@@ -137,8 +229,42 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.stat(path).await,)+ }
             }
 
-            async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
-                match self { $(Self::$kind(fs) => fs.open(path, flags, now).await,)+ }
+            async fn stat_handle(&self, handle: &MountedOpenHandle) -> FsResult<Metadata> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => fs.stat_handle(handle).await,)+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+
+            async fn open(
+                &self,
+                path: FsPath<'_>,
+                flags: OpenFlags,
+                now: u64,
+            ) -> FsResult<Opened<MountedOpenHandle>> {
+                match self {
+                    $(Self::$kind(fs) => fs.open(path, flags, now).await.map(|opened| Opened {
+                        metadata: opened.metadata,
+                        handle: MountedOpenHandle::$kind(opened.handle),
+                    }),)+
+                }
+            }
+
+            async fn open_tmpfile(
+                &self,
+                directory: FsPath<'_>,
+                exclusive: bool,
+                now: u64,
+            ) -> FsResult<Opened<MountedOpenHandle>> {
+                match self {
+                    $(Self::$kind(fs) => fs
+                        .open_tmpfile(directory, exclusive, now)
+                        .await
+                        .map(|opened| Opened {
+                            metadata: opened.metadata,
+                            handle: MountedOpenHandle::$kind(opened.handle),
+                        }),)+
+                }
             }
 
             async fn read_at(
@@ -148,6 +274,20 @@ macro_rules! mount_kinds {
                 max_bytes: usize,
             ) -> FsResult<Bytes> {
                 match self { $(Self::$kind(fs) => fs.read_at(path, offset, max_bytes).await,)+ }
+            }
+
+            async fn read_handle_at(
+                &self,
+                handle: &MountedOpenHandle,
+                offset: u64,
+                max_bytes: usize,
+            ) -> FsResult<Bytes> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.read_handle_at(handle, offset, max_bytes).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
             }
 
             async fn prepare_write<'a>(
@@ -164,8 +304,39 @@ macro_rules! mount_kinds {
                 }
             }
 
+            async fn prepare_write_handle<'a>(
+                &'a self,
+                handle: &'a MountedOpenHandle,
+                position: WritePosition,
+                len: usize,
+                now: u64,
+            ) -> FsResult<MountedWrite<S>> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.prepare_write_handle(handle, position, len, now)
+                            .await
+                            .map(MountedWrite::$kind)
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+
             async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
                 match self { $(Self::$kind(fs) => fs.set_size(path, size, now).await,)+ }
+            }
+
+            async fn set_size_handle(
+                &self,
+                handle: &MountedOpenHandle,
+                size: u64,
+                now: u64,
+            ) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.set_size_handle(handle, size, now).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
             }
 
             async fn set_times(
@@ -182,9 +353,33 @@ macro_rules! mount_kinds {
                 }
             }
 
+            async fn set_times_handle(
+                &self,
+                handle: &MountedOpenHandle,
+                access_nanos: Option<u64>,
+                modified_nanos: Option<u64>,
+                now: u64,
+            ) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.set_times_handle(handle, access_nanos, modified_nanos, now).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+
             async fn open_dir(&self, path: FsPath<'_>) -> FsResult<MountedDir<S>> {
                 match self {
                     $(Self::$kind(fs) => fs.open_dir(path).await.map(MountedDir::$kind),)+
+                }
+            }
+
+            async fn open_dir_handle(&self, handle: &MountedOpenHandle) -> FsResult<MountedDir<S>> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.open_dir_handle(handle).await.map(MountedDir::$kind)
+                    })+
+                    _ => Err(FsError::CrossDevice),
                 }
             }
 
@@ -214,6 +409,20 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.link(existing, link, now).await,)+ }
             }
 
+            async fn link_handle(
+                &self,
+                handle: &MountedOpenHandle,
+                link: FsPath<'_>,
+                now: u64,
+            ) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.link_handle(handle, link, now).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+
             async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
                 match self { $(Self::$kind(fs) => fs.symlink(target, link, now).await,)+ }
             }
@@ -226,8 +435,26 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.sync(path).await,)+ }
             }
 
+            async fn sync_handle(&self, handle: &MountedOpenHandle) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.sync_handle(handle).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+
             async fn sync_data(&self, path: FsPath<'_>) -> FsResult<()> {
                 match self { $(Self::$kind(fs) => fs.sync_data(path).await,)+ }
+            }
+
+            async fn sync_data_handle(&self, handle: &MountedOpenHandle) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.sync_data_handle(handle).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
             }
         }
 
@@ -350,17 +577,17 @@ pub(crate) async fn write_bytes<F: FileSystem>(
 mount_kinds! {
     /// A namespace's root: its own tree over the boot image. Only the
     /// table's root is of this kind; [`MountTable::mount`] refuses it.
-    Root(RootFs),
+    Root(RootFs => OwnedFsPath),
     /// The boot image on its own, read-only.
-    Boot(BootFs),
+    Boot(BootFs => OwnedFsPath),
     /// A tree in kernel memory, shared by every namespace that sees it.
-    Memory(MemoryFs),
+    Memory(MemoryFs => OwnedFsPath),
     /// The host share over 9p.
-    Host(HostShare<S::HostShare>),
+    Host(HostShare<S::HostShare> => OwnedFsPath),
     /// An EROFS image on a mount-source disk, read-only.
-    Erofs(ErofsFs<S::Disk>),
-    /// A btrfs image on a mount-source disk, read-only.
-    Btrfs(BtrfsFs<S::Disk>),
+    Erofs(ErofsFs<S::Disk> => OwnedFsPath),
+    /// A btrfs image on a mount-source disk.
+    Btrfs(BtrfsFs<S::Disk> => BtrfsOpenHandle),
 }
 
 /// Why a mount or unmount was refused.
@@ -982,6 +1209,9 @@ pub struct Resolved<'a, S: Storage> {
     /// The mount's hold; `None` for the namespace's root, which is never
     /// unmounted.
     hold: Option<&'a MountHold>,
+    /// Open filesystem handle when this resolution came from an open descriptor
+    /// or stream, allowing I/O on unlinked or unnamed files.
+    open: Option<&'a MountedOpenHandle>,
     /// Exclusive container owner slot for [`MountSharing::Private`] mounts.
     private_owner: Option<&'a PrivateMountOwner>,
     /// The pin on the mount's slot; `None` for the root, and for a view
@@ -990,6 +1220,18 @@ pub struct Resolved<'a, S: Storage> {
 }
 
 impl<'a, S: Storage> Resolved<'a, S> {
+    /// Attaches an open handle to this resolution so operations dispatch
+    /// through the handle rather than re-resolving the path.
+    pub fn with_open(mut self, open: Option<&'a MountedOpenHandle>) -> Self {
+        self.open = open;
+        self
+    }
+
+    /// The attached open handle, when this resolution serves an open
+    /// descriptor or stream.
+    pub fn open(&self) -> Option<&'a MountedOpenHandle> {
+        self.open
+    }
     /// The filesystem, for reading.
     pub fn fs(&self) -> &'a MountedFs<S> {
         self.fs
@@ -1080,12 +1322,19 @@ impl<'a, S: Storage> Resolved<'a, S> {
     /// using the file after the caller's borrow ends. It holds the mount
     /// ([`MountHold`]) rather than pinning its slot.
     pub fn held(&self) -> HeldPath<S> {
+        self.held_open(self.open.cloned())
+    }
+
+    /// An owned copy of this resolution retaining `open` across polls so a
+    /// stream keeps an unlinked or unnamed file alive until it finishes.
+    pub fn held_open(&self, open: Option<MountedOpenHandle>) -> HeldPath<S> {
         HeldPath(Arc::new(HeldInner {
             fs: self.fs.clone(),
             grant: self.grant,
             absolute: String::from(&*self.absolute),
             point_len: self.point_len,
             hold: self.hold(),
+            open,
             private_owner: self.private_owner.cloned(),
         }))
     }
@@ -1108,6 +1357,7 @@ struct HeldInner<S: Storage> {
     absolute: String,
     point_len: usize,
     hold: Option<MountHold>,
+    open: Option<MountedOpenHandle>,
     private_owner: Option<PrivateMountOwner>,
 }
 
@@ -1127,6 +1377,7 @@ impl<S: Storage> HeldPath<S> {
             absolute: Cow::Borrowed(&held.absolute),
             point_len: held.point_len,
             hold: held.hold.as_ref(),
+            open: held.open.as_ref(),
             private_owner: held.private_owner.as_ref(),
             _pin: None,
         }
@@ -1392,6 +1643,7 @@ impl<S: Storage> Namespace<S> {
                 absolute,
                 point_len,
                 hold: Some(&mount.hold),
+                open: None,
                 private_owner: mount.private_owner.as_ref(),
                 _pin: Some(pin),
             },
@@ -1401,6 +1653,7 @@ impl<S: Storage> Namespace<S> {
                 absolute,
                 point_len: 0,
                 hold: None,
+                open: None,
                 private_owner: None,
                 _pin: None,
             },
@@ -1455,10 +1708,30 @@ impl<S: Storage> Namespace<S> {
     /// Every entry of the directory at `absolute`, with the mount points
     /// directly inside it, which the filesystem beneath may not have.
     pub async fn list(&self, absolute: &str) -> FsResult<Vec<DirEntry>> {
+        self.list_dir(absolute, None).await
+    }
+
+    /// Every entry of an open directory handle resolved at `absolute`.
+    pub async fn list_open(
+        &self,
+        absolute: &str,
+        open: &MountedOpenHandle,
+    ) -> FsResult<Vec<DirEntry>> {
+        self.list_dir(absolute, Some(open)).await
+    }
+
+    async fn list_dir(
+        &self,
+        absolute: &str,
+        open: Option<&MountedOpenHandle>,
+    ) -> FsResult<Vec<DirEntry>> {
         /// Entries one listing request asks for.
         const BATCH: usize = 256;
         let resolved = self.resolve(absolute)?;
-        let dir = resolved.fs().open_dir(resolved.path()).await?;
+        let dir = match open {
+            Some(handle) => resolved.fs().open_dir_handle(handle).await?,
+            None => resolved.fs().open_dir(resolved.path()).await?,
+        };
         let mut entries: Vec<DirEntry> = Vec::new();
         let mut cookie = DirCookie::START;
         loop {
@@ -1547,6 +1820,46 @@ impl<S: Storage> Namespace<S> {
         existing
             .writable()?
             .link(existing.path(), link.path(), now)
+            .await
+    }
+
+    /// Creates and opens an unnamed temporary file (`O_TMPFILE`) in the mount
+    /// containing `directory`.
+    pub async fn open_tmpfile(
+        &self,
+        directory: &str,
+        exclusive: bool,
+        now: u64,
+    ) -> FsResult<(Opened<MountedOpenHandle>, Option<MountHold>)> {
+        let resolved = self.resolve(directory)?;
+        let opened = resolved
+            .writable()?
+            .open_tmpfile(resolved.path(), exclusive, now)
+            .await?;
+        Ok((opened, resolved.hold()))
+    }
+
+    /// Gives an open handle (`O_TMPFILE` or open file) the name `link` on the
+    /// same mount as `source_mount_path`; across two mounts,
+    /// [`FsError::CrossDevice`].
+    pub async fn link_open(
+        &self,
+        source_mount_path: &str,
+        handle: &MountedOpenHandle,
+        link: &str,
+        now: u64,
+    ) -> FsResult<()> {
+        let source = self.resolve(source_mount_path)?;
+        let link = self.resolve(link)?;
+        if !source.same_mount(&link) {
+            return Err(FsError::CrossDevice);
+        }
+        if link.is_mount_root() {
+            return Err(FsError::NotPermitted);
+        }
+        source
+            .writable()?
+            .link_handle(handle, link.path(), now)
             .await
     }
 

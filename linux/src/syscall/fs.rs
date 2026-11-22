@@ -1884,9 +1884,9 @@ pub(super) async fn readv_common<R: Resources, M: UserMemory, O: Stdio + Filesys
     rwf_flags: u64,
     memory: &mut M,
     output: &mut O,
-) -> u64 {
+) -> SyscallOutcome {
     if rwf_flags & !(RWF_HIPRI | RWF_NOWAIT) != 0 {
-        return errno(EOPNOTSUPP);
+        return SyscallOutcome::Return(errno(EOPNOTSUPP));
     }
     let Some(entry) = process
         .shared
@@ -1895,31 +1895,31 @@ pub(super) async fn readv_common<R: Resources, M: UserMemory, O: Stdio + Filesys
         .get_entry(args[0] as u32 as i32)
         .cloned()
     else {
-        return errno(EBADF);
+        return SyscallOutcome::Return(errno(EBADF));
     };
     if explicit_offset.is_some() && entry_file::<R>(&entry).is_none() {
-        return errno(ESPIPE);
+        return SyscallOutcome::Return(errno(ESPIPE));
     }
     if let Some(off) = explicit_offset
         && off < 0
     {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
     let iovs = match read_iovecs(memory, args[1], args[2]) {
         Ok(iovs) => iovs,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
     if iovs.is_empty() {
         // Still validate readable/directory errors on files.
         if let Some(open) = entry_file::<R>(&entry) {
             if entry.fdflags() & FDFLAG_PATH != 0 || !output.file_access(open.node()).readable() {
-                return errno(EBADF);
+                return SyscallOutcome::Return(errno(EBADF));
             }
             if output.file_is_directory(open.node()) {
-                return errno(EISDIR);
+                return SyscallOutcome::Return(errno(EISDIR));
             }
         }
-        return 0;
+        return SyscallOutcome::Return(0);
     }
     let mut done = 0u64;
     let mut cur_off = explicit_offset;
@@ -1931,13 +1931,25 @@ pub(super) async fn readv_common<R: Resources, M: UserMemory, O: Stdio + Filesys
         if len == 0 {
             continue;
         }
-        let res = if entry_file::<R>(&entry).is_some() {
-            read_file(process, &entry, base, len, cur_off, memory, output).await
+        let outcome = if entry_file::<R>(&entry).is_some() {
+            SyscallOutcome::Return(
+                read_file(process, &entry, base, len, cur_off, memory, output).await,
+            )
         } else {
             super::read(process, [args[0], base, len, 0, 0, 0], memory, output).await
         };
+        let res = match outcome {
+            SyscallOutcome::Return(res) => res,
+            interrupted => {
+                return if done == 0 {
+                    interrupted
+                } else {
+                    SyscallOutcome::Return(done)
+                };
+            }
+        };
         if (res as i64) < 0 {
-            return if done == 0 { res } else { done };
+            return SyscallOutcome::Return(if done == 0 { res } else { done });
         }
         done += res;
         if let Some(ref mut off) = cur_off {
@@ -1947,7 +1959,7 @@ pub(super) async fn readv_common<R: Resources, M: UserMemory, O: Stdio + Filesys
             break;
         }
     }
-    done
+    SyscallOutcome::Return(done)
 }
 
 pub(super) async fn writev_common<R: Resources, M: VirtualMemory, O: Stdio + Filesystem<R>>(
@@ -1957,9 +1969,9 @@ pub(super) async fn writev_common<R: Resources, M: VirtualMemory, O: Stdio + Fil
     rwf_flags: u64,
     memory: &mut M,
     output: &mut O,
-) -> u64 {
+) -> SyscallOutcome {
     if rwf_flags & !(RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND) != 0 {
-        return errno(EOPNOTSUPP);
+        return SyscallOutcome::Return(errno(EOPNOTSUPP));
     }
     let Some(entry) = process
         .shared
@@ -1968,30 +1980,30 @@ pub(super) async fn writev_common<R: Resources, M: VirtualMemory, O: Stdio + Fil
         .get_entry(args[0] as u32 as i32)
         .cloned()
     else {
-        return errno(EBADF);
+        return SyscallOutcome::Return(errno(EBADF));
     };
     if explicit_offset.is_some() && entry_file::<R>(&entry).is_none() {
-        return errno(ESPIPE);
+        return SyscallOutcome::Return(errno(ESPIPE));
     }
     if let Some(off) = explicit_offset
         && off < 0
     {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
     let iovs = match read_iovecs(memory, args[1], args[2]) {
         Ok(iovs) => iovs,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
     if iovs.is_empty() {
         if let Some(open) = entry_file::<R>(&entry) {
             if entry.fdflags() & FDFLAG_PATH != 0 || !output.file_access(open.node()).writable() {
-                return errno(EBADF);
+                return SyscallOutcome::Return(errno(EBADF));
             }
             if output.file_is_directory(open.node()) {
-                return errno(EISDIR);
+                return SyscallOutcome::Return(errno(EISDIR));
             }
         }
-        return 0;
+        return SyscallOutcome::Return(0);
     }
     let mut done = 0u64;
     let mut cur_off = explicit_offset;
@@ -2003,16 +2015,28 @@ pub(super) async fn writev_common<R: Resources, M: VirtualMemory, O: Stdio + Fil
         if len == 0 {
             continue;
         }
-        let res = if entry_file::<R>(&entry).is_some() {
-            write_file(
-                process, &entry, base, len, cur_off, rwf_flags, memory, output,
+        let outcome = if entry_file::<R>(&entry).is_some() {
+            SyscallOutcome::Return(
+                write_file(
+                    process, &entry, base, len, cur_off, rwf_flags, memory, output,
+                )
+                .await,
             )
-            .await
         } else {
             super::write(process, [args[0], base, len, 0, 0, 0], memory, output).await
         };
+        let res = match outcome {
+            SyscallOutcome::Return(res) => res,
+            interrupted => {
+                return if done == 0 {
+                    interrupted
+                } else {
+                    SyscallOutcome::Return(done)
+                };
+            }
+        };
         if (res as i64) < 0 {
-            return if done == 0 { res } else { done };
+            return SyscallOutcome::Return(if done == 0 { res } else { done });
         }
         done += res;
         if let Some(ref mut off) = cur_off {
@@ -2022,7 +2046,7 @@ pub(super) async fn writev_common<R: Resources, M: VirtualMemory, O: Stdio + Fil
             break;
         }
     }
-    done
+    SyscallOutcome::Return(done)
 }
 
 pub(super) async fn lseek<R: Resources, F: Filesystem<R>>(

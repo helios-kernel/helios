@@ -1,10 +1,12 @@
+use super::signal::{ThreadSignalSlot, WaitOutcome};
 use super::*;
+use crate::signal_frame::SigInfo;
 use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
 use helios_sync::{TryRead, TryWrite, byte_channel};
 use helios_unix::{
     DescriptorTableError, Epoll, EventError, EventFd, FDFLAG_NONBLOCK, FDFLAG_PATH, Interest,
-    InterestError,
+    InterestError, Signal, SignalSet,
 };
 
 /// Monotonic time and async deadline waits supplied by the execution owner.
@@ -173,30 +175,40 @@ pub(super) fn duplicate<R: Resources, F: fs::Filesystem<R>>(
     }
 }
 pub(super) async fn write_resource<R: Resources, M: UserMemory>(
+    signals: &ThreadSignalSlot,
     entry: &Entry<R>,
     args: [u64; 6],
     memory: &M,
-) -> u64 {
+) -> SyscallOutcome {
     match &entry.descriptor {
         FileDescriptor::Event(event) => {
             if args[2] < 8 {
-                return errno(EINVAL);
+                return SyscallOutcome::Return(errno(EINVAL));
             }
             let mut bytes = [0; 8];
             if memory.read(args[1], &mut bytes).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
             let value = u64::from_le_bytes(bytes);
             loop {
                 let mut wait = event.wait_state();
                 match event.write(value) {
-                    Ok(()) => return 8,
-                    Err(EventError::InvalidIncrement) => return errno(EINVAL),
+                    Ok(()) => return SyscallOutcome::Return(8),
+                    Err(EventError::InvalidIncrement) => {
+                        return SyscallOutcome::Return(errno(EINVAL));
+                    }
                     Err(EventError::WouldBlock) if entry.fdflags() & FDFLAG_NONBLOCK != 0 => {
-                        return errno(EAGAIN);
+                        return SyscallOutcome::Return(errno(EAGAIN));
                     }
                     Err(EventError::WouldBlock) => {
-                        poll_fn(|cx| event.poll_changed(cx, &mut wait)).await
+                        if matches!(
+                            signals
+                                .interruptible(poll_fn(|cx| event.poll_changed(cx, &mut wait)))
+                                .await,
+                            WaitOutcome::Interrupted
+                        ) {
+                            return SyscallOutcome::RestartSys;
+                        }
                     }
                 }
             }
@@ -210,81 +222,117 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
                     .read(args[1].wrapping_add(total), &mut bytes[..size])
                     .is_err()
                 {
-                    return if total == 0 { errno(EFAULT) } else { total };
+                    return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
                 }
                 let chunk = Bytes::copy_from_slice(&bytes[..size]);
                 let result = if entry.fdflags() & FDFLAG_NONBLOCK != 0 {
                     match writer.try_write(chunk) {
                         TryWrite::Written => Ok(()),
-                        TryWrite::Closed => Err(EPIPE),
-                        TryWrite::Full(_) => Err(EAGAIN),
+                        TryWrite::Closed => Err(Some(EPIPE)),
+                        TryWrite::Full(_) => Err(Some(EAGAIN)),
                     }
                 } else {
-                    writer.write(chunk).await.map_err(|_| EPIPE)
+                    match signals.interruptible(writer.write(chunk)).await {
+                        WaitOutcome::Ready(Ok(())) => Ok(()),
+                        WaitOutcome::Ready(Err(_)) => Err(Some(EPIPE)),
+                        WaitOutcome::Interrupted => Err(None),
+                    }
                 };
-                if let Err(error) = result {
-                    return if total == 0 { errno(error) } else { total };
+                match result {
+                    Ok(()) => total += size as u64,
+                    Err(Some(EPIPE)) => {
+                        // Linux `fs/pipe.c` `pipe_write`: broken pipe raises
+                        // `SIGPIPE` on the writing thread and returns `-EPIPE`.
+                        signals
+                            .process()
+                            .raise_thread(signals, SigInfo::from_kernel(Signal::SIGPIPE));
+                        return SyscallOutcome::Return(if total == 0 {
+                            errno(EPIPE)
+                        } else {
+                            total
+                        });
+                    }
+                    Err(Some(error)) => {
+                        return SyscallOutcome::Return(if total == 0 {
+                            errno(error)
+                        } else {
+                            total
+                        });
+                    }
+                    Err(None) => {
+                        return if total == 0 {
+                            SyscallOutcome::RestartSys
+                        } else {
+                            SyscallOutcome::Return(total)
+                        };
+                    }
                 }
-                total += size as u64;
             }
-            total
+            SyscallOutcome::Return(total)
         }
-        FileDescriptor::NullDevice => args[2].min(MAX_RW_COUNT),
-        _ => errno(EBADF),
+        FileDescriptor::NullDevice => SyscallOutcome::Return(args[2].min(MAX_RW_COUNT)),
+        _ => SyscallOutcome::Return(errno(EBADF)),
     }
 }
 pub(super) async fn read_resource<R: Resources, M: UserMemory>(
+    signals: &ThreadSignalSlot,
     entry: &Entry<R>,
     args: [u64; 6],
     memory: &mut M,
-) -> u64 {
+) -> SyscallOutcome {
     let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
     match &entry.descriptor {
         FileDescriptor::Event(event) => {
             if args[2] < 8 {
-                return errno(EINVAL);
+                return SyscallOutcome::Return(errno(EINVAL));
             }
             // Validate the destination before consuming the counter.
             if memory.check_writable(args[1], 8).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
             let value = if nonblock {
                 match event.try_read() {
                     Ok(value) => value,
-                    Err(_) => return errno(EAGAIN),
+                    Err(_) => return SyscallOutcome::Return(errno(EAGAIN)),
                 }
             } else {
-                event.read().await
+                match signals.interruptible(event.read()).await {
+                    WaitOutcome::Ready(value) => value,
+                    WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                }
             };
             if memory.write(args[1], &value.to_le_bytes()).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
-            8
+            SyscallOutcome::Return(8)
         }
         FileDescriptor::PipeRead { reader } => {
             let limit = args[2].min(MAX_RW_COUNT) as usize;
             if memory.check_writable(args[1], limit).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
             let next = if nonblock {
                 match reader.try_read_limit(limit) {
                     TryRead::Ready(bytes) => Some(bytes),
                     TryRead::Eof => None,
-                    TryRead::Pending => return errno(EAGAIN),
+                    TryRead::Pending => return SyscallOutcome::Return(errno(EAGAIN)),
                 }
             } else {
-                reader.read_limit(limit).await
+                match signals.interruptible(reader.read_limit(limit)).await {
+                    WaitOutcome::Ready(bytes) => bytes,
+                    WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                }
             };
             let Some(bytes) = next else {
-                return 0;
+                return SyscallOutcome::Return(0);
             };
             if memory.write(args[1], &bytes).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
-            bytes.len() as u64
+            SyscallOutcome::Return(bytes.len() as u64)
         }
-        FileDescriptor::NullDevice => 0,
-        _ => errno(EBADF),
+        FileDescriptor::NullDevice => SyscallOutcome::Return(0),
+        _ => SyscallOutcome::Return(errno(EBADF)),
     }
 }
 pub(super) fn epoll_create<R: Resources>(
@@ -429,14 +477,14 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, O: Stdio + Clock>(
     memory: &mut M,
     io: &O,
     has_mask: bool,
-) -> u64 {
+) -> SyscallOutcome {
     let epoll = {
         let table = process.shared.descriptors.lock();
         let Some(entry) = table.get_entry(args[0] as u32 as i32) else {
-            return errno(EBADF);
+            return SyscallOutcome::Return(errno(EBADF));
         };
         let FileDescriptor::Epoll(epoll) = &entry.descriptor else {
-            return errno(EINVAL);
+            return SyscallOutcome::Return(errno(EINVAL));
         };
         epoll.clone()
     };
@@ -444,17 +492,23 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, O: Stdio + Clock>(
     let size = data + 8;
     let maxevents = args[2] as i32;
     if maxevents <= 0 || maxevents as u64 > i32::MAX as u64 / size as u64 {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
-    if has_mask && args[4] != 0 {
+    let installed_mask = if has_mask && args[4] != 0 {
         if args[5] != 8 {
-            return errno(EINVAL);
+            return SyscallOutcome::Return(errno(EINVAL));
         }
-        let mut mask = [0u8; 8];
-        if memory.read(args[4], &mut mask).is_err() {
-            return errno(EFAULT);
+        let mut mask_bytes = [0u8; 8];
+        if memory.read(args[4], &mut mask_bytes).is_err() {
+            return SyscallOutcome::Return(errno(EFAULT));
         }
-    }
+        process
+            .signals
+            .push_temp_mask(SignalSet::from_bits(u64::from_le_bytes(mask_bytes)));
+        true
+    } else {
+        false
+    };
     let timeout = args[3] as i32;
     let deadline =
         (timeout >= 0).then(|| io.now_nanos().saturating_add(timeout as u64 * 1_000_000));
@@ -490,7 +544,10 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, O: Stdio + Clock>(
                     .write(args[1].wrapping_add(count * size as u64), bytes)
                     .is_err()
                 {
-                    return if count == 0 { errno(EFAULT) } else { count };
+                    if installed_mask {
+                        process.signals.restore_temp_mask();
+                    }
+                    return SyscallOutcome::Return(if count == 0 { errno(EFAULT) } else { count });
                 }
                 epoll.delivered(interest.fd);
                 count += 1;
@@ -499,13 +556,23 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, O: Stdio + Clock>(
                 }
             }
             if count != 0 {
-                return count;
+                if installed_mask {
+                    process.signals.restore_temp_mask();
+                }
+                return SyscallOutcome::Return(count);
             }
         }
         if deadline.is_some_and(|end| io.now_nanos() >= end) {
-            return 0;
+            if installed_mask {
+                process.signals.restore_temp_mask();
+            }
+            return SyscallOutcome::Return(0);
         }
-        poll::wait_once(deadline, &mut waits, watch_stdin, io).await;
+        if poll::wait_once(&process.signals, deadline, &mut waits, watch_stdin, io).await {
+            // Leave `saved_mask` active (`TIF_RESTORE_SIGMASK`) so signal
+            // delivery writes the original mask into `uc_sigmask`.
+            return SyscallOutcome::RestartNoHand;
+        }
     }
 }
 
@@ -638,7 +705,10 @@ mod tests {
             assert!(future.as_mut().poll(&mut context).is_pending());
             event.write(1).unwrap();
             assert!(wakes.0.load(Ordering::Relaxed) > 0);
-            assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(1));
+            assert_eq!(
+                future.as_mut().poll(&mut context),
+                Poll::Ready(SyscallOutcome::Return(1))
+            );
         }
         assert_eq!(
             u32::from_le_bytes(memory.0[..4].try_into().unwrap()),

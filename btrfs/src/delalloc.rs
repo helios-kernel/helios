@@ -39,13 +39,24 @@ pub(crate) const MAX_EXTENT_SIZE: u64 = 128 << 20;
 /// `compress_file_range` encodes at a time.
 pub(crate) const MAX_UNCOMPRESSED: u64 = 128 << 10;
 
+/// One dirty sector and whether it lies over an unallocated file range (not
+/// already covered by an existing regular or preallocated extent on disk).
+#[derive(Clone)]
+struct DirtyPage {
+    data: Page,
+    unbacked: bool,
+}
+
 /// One inode's dirty data.
 #[derive(Clone)]
 pub(crate) struct DirtyFile {
-    /// Sector-aligned file offset to the sector's bytes.
-    pages: RedBlackTreeMapSync<u64, Page>,
+    /// Sector-aligned file offset to the sector's bytes and backing state.
+    pages: RedBlackTreeMapSync<u64, DirtyPage>,
     /// The maximal runs of contiguous pages, start to end.
     runs: RedBlackTreeMapSync<u64, u64>,
+    /// Dirty pages that do not overwrite an already allocated regular or
+    /// preallocated extent (`EXTENT_DELALLOC_NEW` / `new_delalloc_bytes`).
+    unbacked_pages: u64,
     /// Whether writeback compresses the data.
     compresses: bool,
     /// Whether writeback stores checksums for the data.
@@ -61,6 +72,7 @@ impl DirtyFile {
         Self {
             pages: RedBlackTreeMapSync::new_sync(),
             runs: RedBlackTreeMapSync::new_sync(),
+            unbacked_pages: 0,
             compresses,
             checksummed,
             extents: 0,
@@ -88,7 +100,7 @@ impl DirtyFile {
     pub(crate) fn pages(&self, range: Range<u64>) -> impl Iterator<Item = (u64, &Page)> + '_ {
         self.pages
             .range(range)
-            .map(|(&offset, page)| (offset, page))
+            .map(|(&offset, page)| (offset, &page.data))
     }
 
     /// The dirty runs, clipped to `range`, in file order.
@@ -262,11 +274,13 @@ impl Delalloc {
         self.files.get(&(tree, inode))
     }
 
-    /// Dirty bytes of `(tree, inode)`: Linux's `btrfs_inode::delalloc_bytes`,
-    /// which `btrfs_getattr` adds to `nbytes` when reporting `st_blocks`.
-    pub(crate) fn file_bytes(&self, tree: u64, inode: u64) -> u64 {
+    /// Dirty bytes of `(tree, inode)` that do not overwrite an already
+    /// allocated regular or preallocated extent: Linux's
+    /// `btrfs_inode::delalloc_bytes` without double-counting space already
+    /// accounted in `inode.nbytes` (`generic/568`).
+    pub(crate) fn unbacked_file_bytes(&self, tree: u64, inode: u64) -> u64 {
         self.file(tree, inode)
-            .map_or(0, |file| file.pages.size() as u64 * self.sector)
+            .map_or(0, |file| file.unbacked_pages * self.sector)
     }
 
     pub(crate) fn is_dirty(&self, tree: u64, inode: u64, offset: u64) -> bool {
@@ -330,12 +344,16 @@ impl Delalloc {
     }
 
     /// Stores `page` as the sector at `offset` of an inode with `flags`.
+    /// `unbacked` is recorded only when `offset` is newly dirtied: a page
+    /// overwriting an already dirty sector keeps its original backing state,
+    /// because no extent is inserted or dropped beneath a dirty page.
     pub(crate) fn insert(
         &mut self,
         (tree, inode): (u64, u64),
         flags: u64,
         offset: u64,
         page: Page,
+        unbacked: bool,
     ) {
         debug_assert_eq!(page.len() as u64, self.sector, "a page is one sector");
         debug_assert!(offset.is_multiple_of(self.sector), "offset is a sector");
@@ -344,10 +362,23 @@ impl Delalloc {
         let mut file = self
             .take(key)
             .unwrap_or_else(|| DirtyFile::new(compresses, checksummed));
-        if !file.pages.contains_key(&offset) {
-            file.add_run(offset..offset + self.sector);
-        }
-        file.pages.insert_mut(offset, page);
+        let unbacked = match file.pages.get(&offset) {
+            Some(existing) => existing.unbacked,
+            None => {
+                file.add_run(offset..offset + self.sector);
+                if unbacked {
+                    file.unbacked_pages += 1;
+                }
+                unbacked
+            }
+        };
+        file.pages.insert_mut(
+            offset,
+            DirtyPage {
+                data: page,
+                unbacked,
+            },
+        );
         self.store(key, file);
     }
 
@@ -362,9 +393,16 @@ impl Delalloc {
         let Some(mut file) = self.take(key) else {
             return;
         };
-        let offsets: Vec<u64> = file.pages.range(range.clone()).map(|(&at, _)| at).collect();
-        for offset in offsets {
+        let removed: Vec<(u64, bool)> = file
+            .pages
+            .range(range.clone())
+            .map(|(&at, page)| (at, page.unbacked))
+            .collect();
+        for (offset, unbacked) in removed {
             file.pages.remove_mut(&offset);
+            if unbacked {
+                file.unbacked_pages -= 1;
+            }
         }
         file.cut_runs(range);
         self.store(key, file);
@@ -392,7 +430,7 @@ mod tests {
         let file = (5, 257);
         // 160 KiB, then a gap, then one page: compressed windows of 128 KiB.
         for index in (0..40).rev().chain([45]) {
-            dirty.insert(file, 0, index * 4096, page(index as u8));
+            dirty.insert(file, 0, index * 4096, page(index as u8), true);
         }
         let state = dirty.file(5, 257).unwrap();
         assert_eq!(state.extent_limit(), MAX_UNCOMPRESSED);
@@ -403,6 +441,7 @@ mod tests {
         assert_eq!(state.extents, 2 + 1);
         assert_eq!(dirty.items(), 3 + 1);
         assert_eq!(dirty.bytes(), 41 * 4096);
+        assert_eq!(dirty.unbacked_file_bytes(5, 257), 41 * 4096);
 
         // A cut in the middle of the first window leaves one extent each side.
         dirty.remove_range(5, 257, 4096..2 * 4096);
@@ -414,14 +453,28 @@ mod tests {
         assert_eq!(state.runs(2 * 4096 + 1..46 * 4096 - 1).len(), 2);
         assert_eq!(state.extents, 1 + 2 + 1);
         assert_eq!(dirty.bytes(), 40 * 4096);
+        assert_eq!(dirty.unbacked_file_bytes(5, 257), 40 * 4096);
 
-        // Rewriting a dirty page changes neither the runs nor the totals.
-        dirty.insert(file, 0, 0, page(9));
+        // Rewriting a dirty page changes neither the runs nor the totals, and
+        // preserves its original unbacked flag.
+        dirty.insert(file, 0, 0, page(9), false);
         assert_eq!(dirty.bytes(), 40 * 4096);
-        assert_eq!(dirty.file(5, 257).unwrap().pages.get(&0).unwrap()[0], 9);
+        assert_eq!(dirty.unbacked_file_bytes(5, 257), 40 * 4096);
+        assert_eq!(
+            dirty.file(5, 257).unwrap().pages.get(&0).unwrap().data[0],
+            9
+        );
+
+        // A backed page counts toward delalloc bytes but not unbacked bytes.
+        dirty.insert(file, 0, 4096, page(7), false);
+        assert_eq!(dirty.bytes(), 41 * 4096);
+        assert_eq!(dirty.unbacked_file_bytes(5, 257), 40 * 4096);
+        dirty.remove_range(5, 257, 4096..2 * 4096);
+        assert_eq!(dirty.unbacked_file_bytes(5, 257), 40 * 4096);
 
         dirty.remove_file(5, 257);
         assert!(dirty.file(5, 257).is_none());
+        assert_eq!(dirty.unbacked_file_bytes(5, 257), 0);
         assert_eq!(
             (dirty.bytes(), dirty.items(), dirty.inode_updates()),
             (0, 0, 0)
@@ -431,7 +484,7 @@ mod tests {
     #[test]
     fn an_inode_that_does_not_compress_takes_linux_largest_extents() {
         let mut dirty = Delalloc::new(4096, 1000, true);
-        dirty.insert((5, 300), INODE_NODATASUM, 0, page(1));
+        dirty.insert((5, 300), INODE_NODATASUM, 0, page(1), true);
         let file = dirty.file(5, 300).unwrap();
         assert_eq!(file.extent_limit(), MAX_EXTENT_SIZE);
         // No checksum leaf for NODATASUM data.
@@ -443,11 +496,12 @@ mod tests {
     #[test]
     fn a_view_keeps_the_pages_it_cloned() {
         let mut dirty = Delalloc::new(4096, 1000, false);
-        dirty.insert((5, 300), 0, 0, page(1));
+        dirty.insert((5, 300), 0, 0, page(1), true);
         let view = dirty.clone();
-        dirty.insert((5, 300), 0, 0, page(2));
+        dirty.insert((5, 300), 0, 0, page(2), false);
         dirty.remove_range(5, 300, 0..4096);
-        assert_eq!(view.file(5, 300).unwrap().pages.get(&0).unwrap()[0], 1);
+        assert_eq!(view.file(5, 300).unwrap().pages.get(&0).unwrap().data[0], 1);
+        assert_eq!(view.unbacked_file_bytes(5, 300), 4096);
         assert!(dirty.file(5, 300).is_none());
         assert_eq!(view.items(), 2);
     }
@@ -458,14 +512,14 @@ mod tests {
         let file = (5, 400);
         // First sector on a clean inode adds 1 extent, 1 csum leaf, 1 inode update.
         assert_eq!(dirty.reservation_delta(file, 0, 0..4096, false), (2, 1));
-        dirty.insert(file, 0, 0, page(1));
+        dirty.insert(file, 0, 0, page(1), true);
 
         // Contiguous appends within one 128 MiB extent and one 4-sector csum leaf
         // add zero new writeback items and zero new inode updates.
         assert_eq!(dirty.reservation_delta(file, 0, 4096..8192, false), (0, 0));
         assert_eq!(dirty.file(5, 400).unwrap().bytes_in(0..8192), 4096);
         for index in 1..4 {
-            dirty.insert(file, 0, index * 4096, page(1));
+            dirty.insert(file, 0, index * 4096, page(1), true);
         }
         // Crossing into the second csum leaf adds 1 item.
         assert_eq!(
@@ -476,12 +530,12 @@ mod tests {
         // With a gap between 0..16384 and 24576..28672, a write of 20480..28672
         // that stops short at 20480..24576 leaves a third separate run instead of
         // merging with 24576..28672; `reservation_delta` covers that extra extent.
-        dirty.insert(file, 0, 6 * 4096, page(2));
+        dirty.insert(file, 0, 6 * 4096, page(2), true);
         let before = dirty.items();
         let (delta_items, delta_inodes) =
             dirty.reservation_delta(file, 0, 5 * 4096..7 * 4096, false);
         assert_eq!(delta_inodes, 0);
-        dirty.insert(file, 0, 5 * 4096, page(3));
+        dirty.insert(file, 0, 5 * 4096, page(3), true);
         assert!(dirty.items() - before <= delta_items);
     }
 }

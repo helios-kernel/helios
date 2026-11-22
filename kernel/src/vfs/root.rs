@@ -369,6 +369,7 @@ impl RootFs {
 }
 
 impl FileSystem for RootFs {
+    super::delegate_path_handles!();
     type Write = RootWrite;
     type Dir = RootDir;
 
@@ -376,7 +377,12 @@ impl FileSystem for RootFs {
         self.find(path).map(|found| found.metadata)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        now: u64,
+    ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
         match self.find(path) {
             Ok(found) if found.layer == Layer::Upper => self.upper.open(path, flags, now).await,
             Ok(_) if flags.contains(OpenFlags::TRUNCATE) => {

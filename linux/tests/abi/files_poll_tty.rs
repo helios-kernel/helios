@@ -14,8 +14,8 @@ use helios_linux::abi::{Abi, Operation};
 use helios_linux::syscall::{
     Call, Clock, Denied, FileAccess, FileStat, Filesystem, MapError, MemoryFault, MemoryTotals,
     OpenRequest, Process, READY_IN, Region, Resources, SpawnError, SpawnedThread, StdinTryRead,
-    Stdio, Stream, System, Termios, TermiosAction, Thread, Tty, TtyError, TtyStream, UserMemory,
-    VirtualMemory, Winsize, WriteError, dispatch,
+    Stdio, Stream, SyscallOutcome, System, Termios, TermiosAction, Thread, Tty, TtyError,
+    TtyStream, UserMemory, VirtualMemory, Winsize, WriteError, dispatch,
 };
 use helios_sync::Notify;
 use helios_unix::{NoNetwork, OpenFile};
@@ -519,7 +519,7 @@ fn run_call(
     };
     let mut fut = core::pin::pin!(dispatch(process, call, mem, &mut thread, host));
     match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(ControlFlow::Continue(res)) => res,
+        Poll::Ready(ControlFlow::Continue(SyscallOutcome::Return(res))) => res,
         other => panic!("unexpected poll result for {op:?}: {other:?}"),
     }
 }
@@ -622,7 +622,7 @@ fn stdin_supports_epoll_ctl_async_wakeup_and_nonblocking_eagain() {
         assert!(wakes.0.load(Ordering::Relaxed) > 0);
         assert_eq!(
             fut.as_mut().poll(&mut cx),
-            Poll::Ready(ControlFlow::Continue(1))
+            Poll::Ready(ControlFlow::Continue(SyscallOutcome::Return(1)))
         );
     }
     let mut out = [0u8; 12];

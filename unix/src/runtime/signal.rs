@@ -103,6 +103,11 @@ impl Signal {
         matches!(self.0.get(), 9 | 19)
     }
 
+    /// Whether this is a queued real-time signal (`32..=64`, `SIGRTMIN..=SIGRTMAX`).
+    pub const fn is_realtime(self) -> bool {
+        self.0.get() > Self::STANDARD_MAX
+    }
+
     /// Kernel default action when the signal's disposition is `SIG_DFL`
     /// (`signal(7)`).
     pub const fn default_action(self) -> DefaultSignalAction {
@@ -268,8 +273,22 @@ impl SignalSet {
         Self(self.0 | other.0)
     }
 
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
     pub const fn difference(self, other: Self) -> Self {
         Self(self.0 & !other.0)
+    }
+
+    pub const fn complement(self) -> Self {
+        Self(!self.0)
+    }
+
+    /// Strips [`Signal::SIGKILL`] and [`Signal::SIGSTOP`], which POSIX and
+    /// Linux never allow in a blocked mask or handler mask.
+    pub const fn without_uncatchable(self) -> Self {
+        self.difference(Self::UNCATCHABLE)
     }
 
     /// Lowest-numbered signal present in the set, matching Linux `next_signal`

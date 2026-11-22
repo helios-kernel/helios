@@ -85,6 +85,22 @@ pub enum Operation {
     Msync,
     Madvise,
     Brk,
+    RtSigaction,
+    RtSigprocmask,
+    RtSigreturn,
+    RtSigpending,
+    RtSigtimedwait,
+    RtSigsuspend,
+    Sigaltstack,
+    Kill,
+    Tkill,
+    Tgkill,
+    /// x86-64 only: aarch64's asm-generic table has no `pause` (musl uses `ppoll`).
+    Pause,
+    /// x86-64 only: aarch64's asm-generic table has no `alarm` (musl uses `setitimer`).
+    Alarm,
+    Getitimer,
+    Setitimer,
     Ioctl,
     SchedYield,
     SchedGetaffinity,
@@ -175,6 +191,9 @@ impl Abi {
                 10 => Operation::Mprotect,
                 11 => Operation::Munmap,
                 12 => Operation::Brk,
+                13 => Operation::RtSigaction,
+                14 => Operation::RtSigprocmask,
+                15 => Operation::RtSigreturn,
                 16 => Operation::Ioctl,
                 17 => Operation::Pread64,
                 18 => Operation::Pwrite64,
@@ -189,10 +208,15 @@ impl Abi {
                 28 => Operation::Madvise,
                 32 => Operation::Dup,
                 33 => Operation::Dup2,
+                34 => Operation::Pause,
                 35 => Operation::Nanosleep,
+                36 => Operation::Getitimer,
+                37 => Operation::Alarm,
+                38 => Operation::Setitimer,
                 39 => Operation::Getpid,
                 56 => Operation::Clone,
                 60 => Operation::Exit,
+                62 => Operation::Kill,
                 63 => Operation::Uname,
                 72 => Operation::Fcntl,
                 74 => Operation::Fsync,
@@ -228,6 +252,10 @@ impl Abi {
                 118 => Operation::Getresuid,
                 119 => Operation::Setresgid,
                 120 => Operation::Getresgid,
+                127 => Operation::RtSigpending,
+                128 => Operation::RtSigtimedwait,
+                130 => Operation::RtSigsuspend,
+                131 => Operation::Sigaltstack,
                 140 => Operation::Getpriority,
                 141 => Operation::Setpriority,
                 158 => Operation::ArchPrctl,
@@ -235,6 +263,7 @@ impl Abi {
                 170 => Operation::Sethostname,
                 171 => Operation::Setdomainname,
                 186 => Operation::Gettid,
+                200 => Operation::Tkill,
                 201 => Operation::Time,
                 202 => Operation::Futex,
                 204 => Operation::SchedGetaffinity,
@@ -248,6 +277,7 @@ impl Abi {
                 231 => Operation::ExitGroup,
                 232 => Operation::EpollWait,
                 233 => Operation::EpollCtl,
+                234 => Operation::Tgkill,
                 257 => Operation::Openat,
                 258 => Operation::Mkdirat,
                 262 => Operation::Newfstatat,
@@ -333,12 +363,24 @@ impl Abi {
                 99 => Operation::SetRobustList,
                 100 => Operation::GetRobustList,
                 101 => Operation::Nanosleep,
+                102 => Operation::Getitimer,
+                103 => Operation::Setitimer,
                 112 => Operation::ClockSettime,
                 113 => Operation::ClockGettime,
                 114 => Operation::ClockGetres,
                 115 => Operation::ClockNanosleep,
                 123 => Operation::SchedGetaffinity,
                 124 => Operation::SchedYield,
+                129 => Operation::Kill,
+                130 => Operation::Tkill,
+                131 => Operation::Tgkill,
+                132 => Operation::Sigaltstack,
+                133 => Operation::RtSigsuspend,
+                134 => Operation::RtSigaction,
+                135 => Operation::RtSigprocmask,
+                136 => Operation::RtSigpending,
+                137 => Operation::RtSigtimedwait,
+                139 => Operation::RtSigreturn,
                 140 => Operation::Setpriority,
                 141 => Operation::Getpriority,
                 143 => Operation::Setregid,
@@ -427,6 +469,47 @@ impl Abi {
         match self {
             Self::X86_64 => RegisterId::X86Gpr(4),
             Self::Aarch64 => RegisterId::Aarch64Sp,
+        }
+    }
+
+    /// The user program-counter register of this ABI.
+    pub fn program_counter_register(self) -> RegisterId {
+        match self {
+            Self::X86_64 => RegisterId::X86Rip,
+            Self::Aarch64 => RegisterId::Aarch64Pc,
+        }
+    }
+
+    /// Width in bytes of the system-call instruction (`syscall` = 2 bytes on
+    /// x86-64; `svc #0` = 4 bytes on AArch64), subtracted from the saved PC
+    /// when restarting an interrupted system call (`arch/x86/kernel/signal.c`,
+    /// `arch/arm64/kernel/signal.c`).
+    pub const fn syscall_instruction_bytes(self) -> u64 {
+        match self {
+            Self::X86_64 => 2,
+            Self::Aarch64 => 4,
+        }
+    }
+
+    /// Minimum alternate signal stack size (`MINSIGSTKSZ` in Linux v6.12
+    /// `arch/x86/include/uapi/asm/signal.h` and
+    /// `arch/arm64/include/uapi/asm/signal.h`).
+    pub const fn min_sigstksz(self) -> u64 {
+        match self {
+            Self::X86_64 => 2048,
+            Self::Aarch64 => 5120,
+        }
+    }
+
+    /// Kernel-provided `rt_sigreturn` trampoline instructions when the ABI
+    /// supplies one in a user-executable page for handlers registered without
+    /// `SA_RESTORER` (`arch/arm64/kernel/vdso/sigreturn.S`: `mov x8, #139;
+    /// svc #0`). x86-64 supplies none and requires `SA_RESTORER`.
+    pub const fn sigreturn_trampoline_code(self) -> Option<&'static [u8]> {
+        match self {
+            Self::X86_64 => None,
+            // `mov x8, #139` (0xd280_1168) ; `svc #0` (0xd400_0001)
+            Self::Aarch64 => Some(&[0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4]),
         }
     }
 

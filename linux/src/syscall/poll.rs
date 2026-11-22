@@ -1,12 +1,13 @@
 //! Readiness multiplexing system calls: `poll`, `ppoll`, `select`, `pselect6`,
 //! and the shared readiness/wait machinery also used by `epoll_wait`.
 
+use super::signal::ThreadSignalSlot;
 use super::*;
 use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
 use core::task::{Context, Poll};
 use helios_sync::{ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, NotifyWaiter};
-use helios_unix::{Epoll, EventFd};
+use helios_unix::{Epoll, EventFd, SignalSet};
 
 // Linux UAPI `include/uapi/asm-generic/poll.h` and `eventpoll.h`.
 pub(super) const POLLIN: u32 = 0x0001;
@@ -197,12 +198,15 @@ pub(super) fn arm_epoll_waits<R: Resources, O: Stdio>(
     }
 }
 
+/// Waits until the deadline expires, stdin or one of `waits` becomes ready, or
+/// a deliverable signal arrives. Returns `true` when interrupted by a signal.
 pub(super) async fn wait_once<O: Stdio + Clock>(
+    signals: &ThreadSignalSlot,
     deadline: Option<u64>,
     waits: &mut [Wait],
     watch_stdin: bool,
     io: &O,
-) {
+) -> bool {
     let timer = async {
         match deadline {
             Some(end) => io.sleep_until(end).await,
@@ -218,6 +222,7 @@ pub(super) async fn wait_once<O: Stdio + Clock>(
     };
     let mut timer = core::pin::pin!(timer);
     let mut stdin_wait = core::pin::pin!(stdin_wait);
+    let mut sig = core::pin::pin!(signals.wait_deliverable());
     poll_fn(|cx| {
         let mut ready = timer.as_mut().poll(cx).is_ready();
         ready |= stdin_wait.as_mut().poll(cx).is_ready();
@@ -225,12 +230,14 @@ pub(super) async fn wait_once<O: Stdio + Clock>(
             ready |= wait.poll(cx).is_ready();
         }
         if ready {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
+            return Poll::Ready(false);
         }
+        if sig.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(true);
+        }
+        Poll::Pending
     })
-    .await;
+    .await
 }
 
 fn read_timespec_timeout<M: UserMemory, C: Clock>(
@@ -256,9 +263,13 @@ fn read_timespec_timeout<M: UserMemory, C: Clock>(
     Ok(Some(clock.now_nanos().saturating_add(delta)))
 }
 
-fn validate_sigmask<M: UserMemory>(memory: &M, ptr: u64, sigsetsize: u64) -> Result<(), u64> {
+fn read_sigmask<M: UserMemory>(
+    memory: &M,
+    ptr: u64,
+    sigsetsize: u64,
+) -> Result<Option<SignalSet>, u64> {
     if ptr == 0 {
-        return Ok(());
+        return Ok(None);
     }
     if sigsetsize != 8 {
         return Err(errno(EINVAL));
@@ -267,7 +278,7 @@ fn validate_sigmask<M: UserMemory>(memory: &M, ptr: u64, sigsetsize: u64) -> Res
     if memory.read(ptr, &mut mask).is_err() {
         return Err(errno(EFAULT));
     }
-    Ok(())
+    Ok(Some(SignalSet::from_bits(u64::from_le_bytes(mask))))
 }
 
 pub(super) async fn poll<R: Resources, M: UserMemory, O: Stdio + Clock>(
@@ -275,11 +286,11 @@ pub(super) async fn poll<R: Resources, M: UserMemory, O: Stdio + Clock>(
     args: [u64; 6],
     memory: &mut M,
     io: &O,
-) -> u64 {
+) -> SyscallOutcome {
     let timeout_ms = args[2] as i32;
     let deadline =
         (timeout_ms >= 0).then(|| io.now_nanos().saturating_add(timeout_ms as u64 * 1_000_000));
-    poll_common(process, args[0], args[1], deadline, memory, io).await
+    poll_common(process, args[0], args[1], deadline, None, memory, io).await
 }
 
 pub(super) async fn ppoll<R: Resources, M: UserMemory, O: Stdio + Clock>(
@@ -287,15 +298,16 @@ pub(super) async fn ppoll<R: Resources, M: UserMemory, O: Stdio + Clock>(
     args: [u64; 6],
     memory: &mut M,
     io: &O,
-) -> u64 {
-    if let Err(err) = validate_sigmask(memory, args[3], args[4]) {
-        return err;
-    }
+) -> SyscallOutcome {
+    let temp_mask = match read_sigmask(memory, args[3], args[4]) {
+        Ok(m) => m,
+        Err(err) => return SyscallOutcome::Return(err),
+    };
     let deadline = match read_timespec_timeout(memory, args[2], io) {
         Ok(d) => d,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
-    poll_common(process, args[0], args[1], deadline, memory, io).await
+    poll_common(process, args[0], args[1], deadline, temp_mask, memory, io).await
 }
 
 async fn poll_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
@@ -303,12 +315,13 @@ async fn poll_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
     fds_ptr: u64,
     nfds: u64,
     deadline: Option<u64>,
+    temp_mask: Option<SignalSet>,
     memory: &mut M,
     io: &O,
-) -> u64 {
+) -> SyscallOutcome {
     let limit = process.shared.descriptors.lock().limit.get().max(1024) as u64;
     if nfds > limit {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
     let count = nfds as usize;
     let mut requests = Vec::with_capacity(count);
@@ -316,15 +329,22 @@ async fn poll_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
     for idx in 0..count {
         let addr = match fds_ptr.checked_add((idx as u64) * 8) {
             Some(a) => a,
-            None => return errno(EFAULT),
+            None => return SyscallOutcome::Return(errno(EFAULT)),
         };
         if memory.read(addr, &mut raw).is_err() {
-            return errno(EFAULT);
+            return SyscallOutcome::Return(errno(EFAULT));
         }
         let fd = i32::from_le_bytes(raw[0..4].try_into().unwrap());
         let events = u16::from_le_bytes(raw[4..6].try_into().unwrap());
         requests.push((fd, events));
     }
+
+    let installed_mask = if let Some(mask) = temp_mask {
+        process.signals.push_temp_mask(mask);
+        true
+    } else {
+        false
+    };
 
     let mut revents = alloc::vec![0u16; count];
     loop {
@@ -364,15 +384,22 @@ async fn poll_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
             }
         }
         if ready_count != 0 || deadline.is_some_and(|end| io.now_nanos() >= end) {
+            if installed_mask {
+                process.signals.restore_temp_mask();
+            }
             for (idx, &rev) in revents.iter().enumerate() {
                 let addr = fds_ptr + (idx as u64) * 8 + 6;
                 if memory.write(addr, &rev.to_le_bytes()).is_err() {
-                    return errno(EFAULT);
+                    return SyscallOutcome::Return(errno(EFAULT));
                 }
             }
-            return ready_count;
+            return SyscallOutcome::Return(ready_count);
         }
-        wait_once(deadline, &mut waits, watch_stdin, io).await;
+        if wait_once(&process.signals, deadline, &mut waits, watch_stdin, io).await {
+            // Leave `saved_mask` active (`TIF_RESTORE_SIGMASK`) so signal
+            // delivery writes the original mask into `uc_sigmask`.
+            return SyscallOutcome::RestartNoHand;
+        }
     }
 }
 
@@ -404,19 +431,19 @@ pub(super) async fn select<R: Resources, M: UserMemory, O: Stdio + Clock>(
     args: [u64; 6],
     memory: &mut M,
     io: &O,
-) -> u64 {
+) -> SyscallOutcome {
     let timeout_ptr = args[4];
     let deadline = if timeout_ptr == 0 {
         None
     } else {
         let mut raw = [0u8; 16];
         if memory.read(timeout_ptr, &mut raw).is_err() {
-            return errno(EFAULT);
+            return SyscallOutcome::Return(errno(EFAULT));
         }
         let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
         let usec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
         if sec < 0 || usec < 0 {
-            return errno(EINVAL);
+            return SyscallOutcome::Return(errno(EINVAL));
         }
         let extra_sec = (usec as u64) / MICROS_PER_SECOND;
         let rem_usec = (usec as u64) % MICROS_PER_SECOND;
@@ -426,18 +453,19 @@ pub(super) async fn select<R: Resources, M: UserMemory, O: Stdio + Clock>(
             .saturating_add(rem_usec.saturating_mul(1_000));
         Some(io.now_nanos().saturating_add(delta))
     };
-    let result = select_common(
+    let outcome = select_common(
         process,
         args[0] as i32,
         args[1],
         args[2],
         args[3],
         deadline,
+        None,
         memory,
         io,
     )
     .await;
-    if (result as i64) >= 0
+    if matches!(outcome, SyscallOutcome::Return(result) if (result as i64) >= 0)
         && timeout_ptr != 0
         && let Some(end) = deadline
     {
@@ -448,10 +476,10 @@ pub(super) async fn select<R: Resources, M: UserMemory, O: Stdio + Clock>(
         out[0..8].copy_from_slice(&sec.to_le_bytes());
         out[8..16].copy_from_slice(&usec.to_le_bytes());
         if memory.write(timeout_ptr, &out).is_err() {
-            return errno(EFAULT);
+            return SyscallOutcome::Return(errno(EFAULT));
         }
     }
-    result
+    outcome
 }
 
 pub(super) async fn pselect6<R: Resources, M: UserMemory, O: Stdio + Clock>(
@@ -459,22 +487,25 @@ pub(super) async fn pselect6<R: Resources, M: UserMemory, O: Stdio + Clock>(
     args: [u64; 6],
     memory: &mut M,
     io: &O,
-) -> u64 {
+) -> SyscallOutcome {
     let sig_arg = args[5];
-    if sig_arg != 0 {
+    let temp_mask = if sig_arg != 0 {
         let mut raw = [0u8; 16];
         if memory.read(sig_arg, &mut raw).is_err() {
-            return errno(EFAULT);
+            return SyscallOutcome::Return(errno(EFAULT));
         }
         let sig_ptr = u64::from_le_bytes(raw[0..8].try_into().unwrap());
         let sig_len = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-        if let Err(err) = validate_sigmask(memory, sig_ptr, sig_len) {
-            return err;
+        match read_sigmask(memory, sig_ptr, sig_len) {
+            Ok(m) => m,
+            Err(err) => return SyscallOutcome::Return(err),
         }
-    }
+    } else {
+        None
+    };
     let deadline = match read_timespec_timeout(memory, args[4], io) {
         Ok(d) => d,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
     select_common(
         process,
@@ -483,6 +514,7 @@ pub(super) async fn pselect6<R: Resources, M: UserMemory, O: Stdio + Clock>(
         args[2],
         args[3],
         deadline,
+        temp_mask,
         memory,
         io,
     )
@@ -497,31 +529,39 @@ async fn select_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
     write_ptr: u64,
     except_ptr: u64,
     deadline: Option<u64>,
+    temp_mask: Option<SignalSet>,
     memory: &mut M,
     io: &O,
-) -> u64 {
+) -> SyscallOutcome {
     if nfds < 0 {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
     // Linux caps `n` at `fdt->max_fds` or `1024` only when above current limit,
     // after rounding up to `unsigned long` (8-byte) word count.
     let nfds_usize = nfds as usize;
     let max_limit = process.shared.descriptors.lock().limit.get().max(1024);
     if nfds_usize > max_limit.saturating_mul(8) {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
     let byte_len = nfds_usize.div_ceil(64) * 8;
     let in_read = match read_fd_set(memory, read_ptr, byte_len) {
         Ok(v) => v,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
     let in_write = match read_fd_set(memory, write_ptr, byte_len) {
         Ok(v) => v,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
     };
     let in_except = match read_fd_set(memory, except_ptr, byte_len) {
         Ok(v) => v,
-        Err(err) => return err,
+        Err(err) => return SyscallOutcome::Return(err),
+    };
+
+    let installed_mask = if let Some(mask) = temp_mask {
+        process.signals.push_temp_mask(mask);
+        true
+    } else {
+        false
     };
 
     loop {
@@ -554,7 +594,10 @@ async fn select_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
                     continue;
                 }
                 let Some(entry) = table.get_entry(fd as i32) else {
-                    return errno(EBADF);
+                    if installed_mask {
+                        process.signals.restore_temp_mask();
+                    }
+                    return SyscallOutcome::Return(errno(EBADF));
                 };
                 let mask = ready_mask::<R, O>(process, entry, &table, io, false);
                 let mut hit = false;
@@ -598,23 +641,28 @@ async fn select_common<R: Resources, M: UserMemory, O: Stdio + Clock>(
         }
 
         if ready_bits != 0 || deadline.is_some_and(|end| io.now_nanos() >= end) {
+            if installed_mask {
+                process.signals.restore_temp_mask();
+            }
             if read_ptr != 0 && !out_read.is_empty() && memory.write(read_ptr, &out_read).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
             if write_ptr != 0
                 && !out_write.is_empty()
                 && memory.write(write_ptr, &out_write).is_err()
             {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
             if except_ptr != 0
                 && !out_except.is_empty()
                 && memory.write(except_ptr, &out_except).is_err()
             {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
-            return ready_bits;
+            return SyscallOutcome::Return(ready_bits);
         }
-        wait_once(deadline, &mut waits, watch_stdin, io).await;
+        if wait_once(&process.signals, deadline, &mut waits, watch_stdin, io).await {
+            return SyscallOutcome::RestartNoHand;
+        }
     }
 }

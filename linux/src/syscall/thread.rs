@@ -4,7 +4,7 @@
 //! Flag rules and argument layouts follow Linux v6.12 (`kernel/fork.c`,
 //! `kernel/sched/syscalls.c` and `kernel/time/posix-timers.c`).
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -12,6 +12,8 @@ use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::futex::FUTEX_TID_MASK;
+use super::signal::{ProcessSignals, ThreadSignalSlot, WaitOutcome};
+use super::system::Credentials;
 use super::*;
 
 // include/uapi/linux/sched.h.
@@ -93,10 +95,23 @@ const ESRCH: u64 = 3;
 const E2BIG: u64 = 7;
 const EAGAIN: u64 = 11;
 
+struct RegisteredProcess {
+    signals: Arc<ProcessSignals>,
+    credentials: Arc<spin::Mutex<Credentials>>,
+}
+
+struct RegisteredThread {
+    tgid: NonZeroU32,
+    slot: Arc<ThreadSignalSlot>,
+    credentials: Arc<spin::Mutex<Credentials>>,
+}
+
 struct PidNamespaceState {
     next_pid: u32,
     allocated: BTreeSet<u32>,
     live_processes: u32,
+    processes: BTreeMap<u32, RegisteredProcess>,
+    threads: BTreeMap<u32, RegisteredThread>,
 }
 
 impl PidNamespaceState {
@@ -158,6 +173,8 @@ impl PidNamespace {
                 next_pid: 1,
                 allocated: BTreeSet::new(),
                 live_processes: 0,
+                processes: BTreeMap::new(),
+                threads: BTreeMap::new(),
             })),
         }
     }
@@ -177,6 +194,8 @@ impl PidNamespace {
                 next_pid,
                 allocated,
                 live_processes: 1,
+                processes: BTreeMap::new(),
+                threads: BTreeMap::new(),
             })),
         }
     }
@@ -194,6 +213,8 @@ impl PidNamespace {
     /// process has exited and decrements the container's live process count.
     pub fn release_process(&self, pid: NonZeroU32) {
         let mut state = self.inner.lock();
+        state.processes.remove(&pid.get());
+        state.threads.remove(&pid.get());
         if state.allocated.remove(&pid.get()) {
             state.live_processes = state.live_processes.saturating_sub(1);
         }
@@ -206,7 +227,102 @@ impl PidNamespace {
 
     /// Releases a non-leader thread ID when the thread exits.
     pub fn release_tid(&self, tid: NonZeroU32) {
-        self.inner.lock().allocated.remove(&tid.get());
+        let mut state = self.inner.lock();
+        state.threads.remove(&tid.get());
+        state.allocated.remove(&tid.get());
+    }
+
+    pub(super) fn register_process(
+        &self,
+        tgid: NonZeroU32,
+        signals: Arc<ProcessSignals>,
+        credentials: Arc<spin::Mutex<Credentials>>,
+    ) {
+        let mut state = self.inner.lock();
+        state.allocated.insert(tgid.get());
+        state.processes.insert(
+            tgid.get(),
+            RegisteredProcess {
+                signals,
+                credentials,
+            },
+        );
+    }
+
+    pub(super) fn unregister_process(&self, tgid: NonZeroU32) {
+        self.inner.lock().processes.remove(&tgid.get());
+    }
+
+    pub(super) fn register_thread(
+        &self,
+        tgid: NonZeroU32,
+        slot: Arc<ThreadSignalSlot>,
+        credentials: Arc<spin::Mutex<Credentials>>,
+    ) {
+        self.inner.lock().threads.insert(
+            slot.tid().get(),
+            RegisteredThread {
+                tgid,
+                slot,
+                credentials,
+            },
+        );
+    }
+
+    pub(super) fn unregister_thread(&self, tid: NonZeroU32) {
+        self.inner.lock().threads.remove(&tid.get());
+    }
+
+    pub(super) fn lookup_process(
+        &self,
+        pid: u32,
+    ) -> Option<(Arc<ProcessSignals>, Arc<spin::Mutex<Credentials>>)> {
+        let state = self.inner.lock();
+        state
+            .processes
+            .get(&pid)
+            .map(|entry| (entry.signals.clone(), entry.credentials.clone()))
+    }
+
+    pub(super) fn processes_in_group(
+        &self,
+        pgid: u32,
+    ) -> alloc::vec::Vec<(Arc<ProcessSignals>, Arc<spin::Mutex<Credentials>>)> {
+        let state = self.inner.lock();
+        state
+            .processes
+            .values()
+            .filter(|entry| entry.signals.pgid() == pgid)
+            .map(|entry| (entry.signals.clone(), entry.credentials.clone()))
+            .collect()
+    }
+
+    pub(super) fn all_processes_except(
+        &self,
+        caller_pid: u32,
+    ) -> alloc::vec::Vec<(Arc<ProcessSignals>, Arc<spin::Mutex<Credentials>>)> {
+        let state = self.inner.lock();
+        state
+            .processes
+            .iter()
+            .filter(|&(&pid, _)| pid != 1 && pid != caller_pid)
+            .map(|(_, entry)| (entry.signals.clone(), entry.credentials.clone()))
+            .collect()
+    }
+
+    pub(super) fn lookup_thread(
+        &self,
+        tid: u32,
+    ) -> Option<(
+        NonZeroU32,
+        Arc<ThreadSignalSlot>,
+        Arc<spin::Mutex<Credentials>>,
+    )> {
+        let state = self.inner.lock();
+        state
+            .threads
+            .get(&tid)
+            .map(|entry| (entry.tgid, entry.slot.clone(), entry.credentials.clone()))
     }
 
     /// Whether `pid` is currently live in this namespace.
@@ -301,11 +417,17 @@ impl ThreadGroup {
     pub(super) fn withdraw(&mut self, tid: NonZeroU32) -> bool {
         if let Some(pos) = self.live.iter().position(|thread| thread.tid == tid) {
             self.live.swap_remove(pos);
+            self.pids.unregister_thread(tid);
             if tid != self.leader {
                 self.pids.release_tid(tid);
             }
         }
-        self.live.is_empty()
+        if self.live.is_empty() {
+            self.pids.unregister_process(self.leader);
+            true
+        } else {
+            false
+        }
     }
 
     /// Records a thread's exit and returns `(broadcast_group_stop, all_exited)`.
@@ -536,9 +658,21 @@ fn spawn_parsed_clone<R: Resources, M: UserMemory, T: Thread<R>>(
     if parsed.flags & CLONE_CHILD_SETTID != 0 {
         let _ = write_tid(parsed.child_tid, tid.get(), memory);
     }
+    // Child thread inherits the caller's signal mask and starts with an empty
+    // private pending set and disabled alternate stack (`kernel/fork.c`).
+    let thread_signals = process
+        .shared
+        .signals
+        .register_thread(tid, process.signals.current_mask());
+    process.shared.pids.register_thread(
+        process.pid(),
+        thread_signals.clone(),
+        process.shared.credentials.clone(),
+    );
     let child = Process {
         shared: process.shared.clone(),
         tid,
+        signals: thread_signals,
         clear_child_tid: if parsed.flags & CLONE_CHILD_CLEARTID != 0 {
             parsed.child_tid
         } else {
@@ -559,6 +693,7 @@ fn spawn_parsed_clone<R: Resources, M: UserMemory, T: Thread<R>>(
             // `child` dropped inside `spawn_thread`, which already withdrew
             // `tid`; withdraw again idempotently in case a custom host dropped
             // after `exited` or before.
+            process.shared.signals.unregister_thread(tid);
             process.shared.threads.lock().withdraw(tid);
             errno(match error {
                 SpawnError::OutOfMemory => ENOMEM,
@@ -607,17 +742,23 @@ pub(super) fn sched_getaffinity<R: Resources, M: UserMemory, O: System>(
 
 /// `nanosleep(req, rem)` (`kernel/time/hrtimer.c`).
 pub(super) async fn nanosleep<M: UserMemory, O: Clock + System>(
+    signals: &ThreadSignalSlot,
     args: [u64; 6],
-    memory: &M,
+    memory: &mut M,
     output: &O,
 ) -> u64 {
-    clock_nanosleep([0, 0, args[0], args[1], 0, 0], memory, output).await
+    clock_nanosleep(signals, [0, 0, args[0], args[1], 0, 0], memory, output).await
 }
 
 /// `clock_nanosleep(clockid, flags, req, rem)` (`kernel/time/posix-timers.c`).
+///
+/// Interrupted relative sleeps write the remaining time to `rem` (if non-null)
+/// and return `-EINTR`; neither `nanosleep` nor `clock_nanosleep` is restarted
+/// by `SA_RESTART` (`signal(7)`).
 pub(super) async fn clock_nanosleep<M: UserMemory, O: Clock + System>(
+    signals: &ThreadSignalSlot,
     args: [u64; 6],
-    memory: &M,
+    memory: &mut M,
     output: &O,
 ) -> u64 {
     enum SleepClock {
@@ -650,20 +791,38 @@ pub(super) async fn clock_nanosleep<M: UserMemory, O: Clock + System>(
     let requested = (sec as u64)
         .saturating_mul(NANOS_PER_SECOND)
         .saturating_add(nsec as u64);
+    let rem_ptr = args[3];
     if flags & TIMER_ABSTIME != 0 {
         let now = match clock {
             SleepClock::Realtime => output.realtime_nanos(),
             SleepClock::Monotonic => output.now_nanos(),
         };
         if requested > now {
-            output
-                .sleep_until(output.now_nanos().saturating_add(requested - now))
-                .await;
+            let deadline = output.now_nanos().saturating_add(requested - now);
+            if matches!(
+                signals.interruptible(output.sleep_until(deadline)).await,
+                WaitOutcome::Interrupted
+            ) {
+                return errno(EINTR);
+            }
         }
     } else if requested != 0 {
-        output
-            .sleep_until(output.now_nanos().saturating_add(requested))
-            .await;
+        let deadline = output.now_nanos().saturating_add(requested);
+        if matches!(
+            signals.interruptible(output.sleep_until(deadline)).await,
+            WaitOutcome::Interrupted
+        ) {
+            if rem_ptr != 0 {
+                let remaining = deadline.saturating_sub(output.now_nanos());
+                let mut out = [0u8; 16];
+                out[..8].copy_from_slice(&(remaining / NANOS_PER_SECOND).to_le_bytes());
+                out[8..].copy_from_slice(&(remaining % NANOS_PER_SECOND).to_le_bytes());
+                if memory.write(rem_ptr, &out).is_err() {
+                    return errno(EFAULT);
+                }
+            }
+            return errno(EINTR);
+        }
     }
     0
 }

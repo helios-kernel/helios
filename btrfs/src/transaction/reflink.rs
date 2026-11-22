@@ -21,7 +21,7 @@ use crate::tree::Cursor;
 use crate::tree::write::WriteError;
 use crate::{Error, ItemDefect, Key, Timestamp};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileId {
     pub(crate) tree: u64,
     pub(crate) inode: u64,

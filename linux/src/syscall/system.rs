@@ -502,7 +502,6 @@ impl Default for Start {
 /// descriptor table whose limit is `RLIMIT_NOFILE`'s soft value.
 #[derive(Clone, Debug)]
 pub(super) struct Attributes {
-    pub(super) credentials: Credentials,
     values: [Rlimit; 16],
     open_files_ceiling: u64,
     pub(super) umask: u32,
@@ -550,7 +549,6 @@ impl Attributes {
             maximum: 0,
         };
         Self {
-            credentials: start.credentials,
             values,
             open_files_ceiling: start.open_files_ceiling,
             // fs/fs_struct.c `init_fs`.
@@ -1207,7 +1205,7 @@ impl<R: Resources> Process<R> {
         match which {
             0 => self.names_self(who),
             1 => who == 0,
-            _ => who == 0 || who as u32 == self.shared.attributes.lock().credentials.user.real,
+            _ => who == 0 || who as u32 == self.shared.credentials.lock().user.real,
         }
     }
 

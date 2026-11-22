@@ -558,7 +558,7 @@ impl<S: BlockSource> Filesystem<S> {
         if let Some(running) = &snapshot.running {
             metadata.nbytes = metadata
                 .nbytes
-                .saturating_add(running.dirty.file_bytes(root.tree, number));
+                .saturating_add(running.dirty.unbacked_file_bytes(root.tree, number));
         }
         Ok(Inode {
             snapshot: snapshot.clone(),

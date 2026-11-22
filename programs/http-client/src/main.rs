@@ -8,9 +8,11 @@
 //! lives out here, and none of it lives in the kernel.
 //!
 //! The plugin carries no protocol code of its own. It hosts zenwave's native
-//! backend (HTTP/1.1 and HTTP/2 over ALPN, TLS through rustls with the Mozilla
-//! roots compiled in) over `helios_api::http_kit::HeliosNet`, which is
-//! `http-kit-io` on `wasi:sockets` and the monotonic clock. What is left
+//! backend (HTTP/1.1, HTTP/2 over ALPN, and HTTP/3 over QUIC discovered via
+//! RFC 9460 `HTTPS` DNS records and `Alt-Svc`, with TLS through rustls and the
+//! Mozilla roots compiled in) over `helios_api::http_kit::HeliosNet`, which is
+//! `http-kit-io` on `wasi:sockets` and the monotonic clock, paired with
+//! `helios_api::net::resolve_https` for `HTTPS` record lookups. What is left
 //! here is the translation between `wasi:http` and `http` messages, the
 //! `request-options` timeouts, and the choice of `wasi:http` error code for
 //! each failure.
@@ -19,30 +21,36 @@
 //! on the first exchange (loading the Mozilla roots plus optional
 //! `/etc/ssl/certs/ca-certificates.crt` once) and retained across requests on
 //! that processor core so HTTP/1.1 keep-alive sockets, multiplexed HTTP/2
-//! connections, and TLS sessions are reused.
+//! connections, HTTP/3 QUIC connections, and TLS sessions are reused.
 
 mod error;
 mod fields;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod h2_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod h3_tests;
 mod request;
 mod response;
 
 use std::cell::RefCell;
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::time::Duration;
 
 use futures_channel::oneshot;
+use futures_lite::stream::Stream;
 use helios_api::http::handler::Guest;
 use helios_api::http::types;
 use helios_api::http::{ErrorCode, RequestOptions, Scheme};
 use helios_api::http_kit::{HeliosExecutor, HeliosNet};
+use helios_api::net;
 use helios_api::task::spawn;
 use http::StatusCode;
+use http_kit_io::{Answer, Resolve};
 use zenwave::backend::NativeBackend;
+use zenwave::dns::{HttpsRecord, ResolveHttps};
 use zenwave::transport::Proxy;
-use zenwave::{Body, Endpoint, Timeouts, Transport};
+use zenwave::{Body, Cause, Endpoint, ResolveError, Timeouts, Transport};
 
 use crate::error::code;
 use crate::request::BodyOutcome;
@@ -204,6 +212,46 @@ impl<T: Clone> ShardBackendCell<T> {
     }
 }
 
+/// The plugin's resolver: delegates address lookups to [`HeliosNet`] over
+/// `wasi:sockets/ip-name-lookup` and queries RFC 9460 `HTTPS` records over
+/// `helios:system/net` for HTTP/3 discovery.
+#[derive(Clone, Copy, Debug, Default)]
+struct HeliosResolver;
+
+impl Resolve for HeliosResolver {
+    fn lookup(&self, host: &str) -> impl Stream<Item = Answer> {
+        HeliosNet.lookup(host)
+    }
+}
+
+impl ResolveHttps for HeliosResolver {
+    async fn https_record(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Option<HttpsRecord>, ResolveError> {
+        map_https_lookup(net::resolve_https(host, port).await)
+    }
+}
+
+fn convert_https_record(record: net::HttpsRecord) -> HttpsRecord {
+    HttpsRecord {
+        alpn: record.alpn,
+        port: record.port,
+        ttl: record.ttl,
+    }
+}
+
+fn map_https_lookup(
+    result: io::Result<Option<net::HttpsRecord>>,
+) -> Result<Option<HttpsRecord>, ResolveError> {
+    match result {
+        Ok(record) => Ok(record.map(convert_https_record)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ResolveError::Lookup(Cause::from(error))),
+    }
+}
+
 thread_local! {
     static SHARD_BACKEND: std::rc::Rc<ShardBackendCell<NativeBackend>> =
         std::rc::Rc::new(ShardBackendCell::new());
@@ -232,7 +280,7 @@ async fn init_shard_backend(outcome: &BodyOutcome) -> Result<NativeBackend, Erro
     Ok(NativeBackend::on_current_thread(
         transport,
         HeliosNet,
-        HeliosNet,
+        HeliosResolver,
         &HeliosExecutor,
     ))
 }
@@ -339,5 +387,37 @@ mod tests {
         }));
         assert_eq!(succeeded, Ok(77));
         assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn map_https_lookup_preserves_records_absence_and_errors() {
+        let converted = map_https_lookup(Ok(Some(net::HttpsRecord {
+            alpn: vec!["h3".to_owned(), "h2".to_owned()],
+            port: Some(8443),
+            ttl: Duration::from_secs(300),
+        })))
+        .expect("record converts")
+        .expect("record present");
+        assert_eq!(converted.alpn, ["h3", "h2"]);
+        assert_eq!(converted.port, Some(8443));
+        assert_eq!(converted.ttl, Duration::from_secs(300));
+
+        assert!(
+            map_https_lookup(Ok(None))
+                .expect("none maps to Ok(None)")
+                .is_none()
+        );
+        assert!(
+            map_https_lookup(Err(io::Error::new(ErrorKind::NotFound, "nxdomain")))
+                .expect("NotFound maps to absent HTTPS record")
+                .is_none()
+        );
+
+        let error = map_https_lookup(Err(io::Error::new(ErrorKind::TimedOut, "dns timeout")))
+            .expect_err("lookup failure propagates as ResolveError::Lookup");
+        assert!(
+            matches!(error, ResolveError::Lookup(Cause::Io(ref io)) if io.kind() == ErrorKind::TimedOut),
+            "unexpected resolve error: {error:?}"
+        );
     }
 }
