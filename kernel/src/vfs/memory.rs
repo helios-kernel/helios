@@ -508,7 +508,10 @@ impl MemoryFs {
             return Err(FsError::NotPermitted);
         }
         let mut state = self.state.lock();
-        let (_, inode) = state.inode(source)?;
+        let (source_inode, source_kind) = {
+            let (number, inode) = state.inode(source)?;
+            (number, inode.kind)
+        };
         if mode == RenameMode::Exchange {
             debug_assert!(!whiteout, "an exchange hides nothing");
             return state.exchange(source, destination, now);
@@ -519,11 +522,41 @@ impl MemoryFs {
                 RenameMode::Replace | RenameMode::Exchange => Ok(()),
             };
         }
-        if inode.kind == NodeKind::Directory && destination.starts_with(source) {
+        if source_kind == NodeKind::Directory && destination.starts_with(source) {
             return Err(FsError::NotPermitted);
         }
-        state.require_new_name(destination)?;
-        let source_inode = state.inode_of(source)?;
+        let Some((dest_parent, _)) = destination.split_last() else {
+            return Err(FsError::NotPermitted);
+        };
+        if state.inode(dest_parent)?.1.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        if let Ok((dest_inode, dest)) = state.inode(destination) {
+            if mode == RenameMode::NoReplace {
+                return Err(FsError::Exists);
+            }
+            if dest_inode == source_inode {
+                return Ok(());
+            }
+            let dest_is_dir = dest.kind == NodeKind::Directory;
+            match (source_kind == NodeKind::Directory, dest_is_dir) {
+                (true, false) => return Err(FsError::NotDirectory),
+                (false, true) => return Err(FsError::IsDirectory),
+                (true, true) if state.children(destination).next().is_some() => {
+                    return Err(FsError::NotEmpty);
+                }
+                _ => {}
+            }
+            state
+                .inodes
+                .get_mut(&dest_inode)
+                .expect("replaced inode exists")
+                .status_nanos = now;
+            state.remove_name(destination);
+            if dest_is_dir {
+                state.drop_whiteouts_below(destination);
+            }
+        }
         let moved: Vec<(String, u64)> =
             core::iter::once((source.as_str().to_string(), source_inode))
                 .chain(
@@ -1537,6 +1570,49 @@ mod tests {
         block_on(fs.rename(path("b"), path("b"), RenameMode::Exchange, 4)).expect("a no-op");
         assert_eq!(names(&fs, "b"), ["inner"]);
         assert_eq!(names(&fs, ""), ["a", "b", "file"]);
+    }
+
+    #[test]
+    fn rename_replace_overwrites_existing_file_and_empty_directory() {
+        let fs = tree();
+        block_on(fs.open(path("a"), OpenFlags::CREATE, 0)).expect("creates a");
+        block_on(write_bytes(&fs, path("a"), WritePosition::At(0), b"new", 1)).expect("writes a");
+        block_on(fs.open(path("b"), OpenFlags::CREATE, 0)).expect("creates b");
+        block_on(write_bytes(&fs, path("b"), WritePosition::At(0), b"old", 1)).expect("writes b");
+        block_on(fs.create_directory(path("d1"), 0)).expect("creates d1");
+        block_on(fs.create_directory(path("d2"), 0)).expect("creates d2");
+        block_on(fs.open(path("d2/child"), OpenFlags::CREATE, 0)).expect("creates d2/child");
+        block_on(fs.create_directory(path("empty"), 0)).expect("creates empty");
+
+        // File over dir -> IsDirectory; dir over file -> NotDirectory; dir over non-empty -> NotEmpty.
+        assert_eq!(
+            block_on(fs.rename(path("a"), path("d1"), RenameMode::Replace, 2)),
+            Err(FsError::IsDirectory)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("d1"), path("a"), RenameMode::Replace, 2)),
+            Err(FsError::NotDirectory)
+        );
+        assert_eq!(
+            block_on(fs.rename(path("d1"), path("d2"), RenameMode::Replace, 2)),
+            Err(FsError::NotEmpty)
+        );
+
+        // File replaces existing file atomically.
+        block_on(fs.rename(path("a"), path("b"), RenameMode::Replace, 3)).expect("replaces file");
+        assert_eq!(block_on(fs.stat(path("a"))), Err(FsError::NoEntry));
+        assert_eq!(
+            block_on(fs.read_at(path("b"), 0, 16))
+                .expect("reads replaced b")
+                .as_ref(),
+            b"new"
+        );
+
+        // Directory replaces existing empty directory.
+        block_on(fs.rename(path("d2"), path("empty"), RenameMode::Replace, 4))
+            .expect("replaces empty dir");
+        assert_eq!(block_on(fs.stat(path("d2"))), Err(FsError::NoEntry));
+        assert_eq!(names(&fs, "empty"), ["child"]);
     }
 
     #[test]

@@ -347,6 +347,26 @@ static void test_execveat(const char *self) {
     CHECK(SYS(SYS_execveat, 999, "rel", bad_argv, envp, 0) == -EBADF);
     CHECK(SYS(SYS_execveat, AT_FDCWD, self, bad_argv, envp, 0x10000) == -EINVAL);
 
+    /* Split `self` into directory and basename so cwd/dirfd checks work
+     * identically on Linux and on Helios. */
+    const char *slash = strrchr(self, '/');
+    CHECK(slash != NULL && slash[1] != '\0');
+    char dir_path[512];
+    size_t dir_len = (size_t)(slash - self);
+    if (dir_len == 0) {
+        dir_path[0] = '/';
+        dir_path[1] = '\0';
+    } else {
+        CHECK(dir_len < sizeof(dir_path));
+        memcpy(dir_path, self, dir_len);
+        dir_path[dir_len] = '\0';
+    }
+    const char *base_name = slash + 1;
+
+    /* Executing a directory fails with -EACCES. */
+    CHECK(SYS(SYS_execve, dir_path, bad_argv, envp) == -EACCES);
+
+    /* 1. execveat(AT_FDCWD, self, ..., 0). */
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
@@ -357,6 +377,49 @@ static void test_execveat(const char *self) {
     int status = 0;
     CHECK(wait4(pid, &status, 0, NULL) == pid);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 29);
+
+    /* 2. Relative execve resolved against process cwd after chdir(). */
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        CHECK(chdir(dir_path) == 0);
+        char *argv[] = {(char *)base_name, "exit-19", NULL};
+        execve(base_name, argv, envp);
+        _exit(126);
+    }
+    status = 0;
+    CHECK(wait4(pid, &status, 0, NULL) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 19);
+
+    /* 3. execveat(dirfd, basename, ..., 0) using an open directory fd. */
+    int dirfd = open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dirfd >= 0);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        char *argv[] = {(char *)base_name, "exit-29", NULL};
+        SYS(SYS_execveat, dirfd, base_name, argv, envp, 0);
+        _exit(126);
+    }
+    close(dirfd);
+    status = 0;
+    CHECK(wait4(pid, &status, 0, NULL) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 29);
+
+    /* 4. execveat(file_fd, "", ..., AT_EMPTY_PATH) executing an open file fd. */
+    int file_fd = open(self, O_RDONLY | O_CLOEXEC);
+    CHECK(file_fd >= 0);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        char *argv[] = {(char *)self, "exit-19", NULL};
+        SYS(SYS_execveat, file_fd, "", argv, envp, AT_EMPTY_PATH);
+        _exit(126);
+    }
+    close(file_fd);
+    status = 0;
+    CHECK(wait4(pid, &status, 0, NULL) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 19);
 }
 
 static void test_wait4_waitid_stop_continue_signals(void) {

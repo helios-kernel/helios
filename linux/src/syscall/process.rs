@@ -573,6 +573,19 @@ pub(super) async fn clone_process<R: Resources, M: UserMemory, T: Thread<R>>(
         changed: Notify::new(),
     });
 
+    let child_cwd = if parsed.flags & CLONE_FS != 0 {
+        process.shared.cwd.clone()
+    } else {
+        Arc::new(spin::Mutex::new(process.shared.cwd.lock().clone()))
+    };
+    let child_shared_mappings = if share_vm {
+        process.shared.shared_mappings.clone()
+    } else {
+        Arc::new(spin::Mutex::new(
+            process.shared.shared_mappings.lock().clone(),
+        ))
+    };
+
     let child = Process {
         shared: Arc::new(ProcessShared {
             abi: process.shared.abi,
@@ -581,6 +594,8 @@ pub(super) async fn clone_process<R: Resources, M: UserMemory, T: Thread<R>>(
             pids: process.shared.pids.clone(),
             futex: process.shared.futex.clone(),
             descriptors: child_descriptors,
+            cwd: child_cwd,
+            shared_mappings: child_shared_mappings,
             stdin_lock: helios_sync::RawMutex::new(),
             stdin_carry: spin::Mutex::new(child_stdin_carry),
             credentials: child_creds,

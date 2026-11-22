@@ -21,9 +21,9 @@ use helios_linux::signal_frame::{
     SS_AUTODISARM, SS_DISABLE, SS_ONSTACK,
 };
 use helios_linux::syscall::{
-    Call, Clock, Credentials, Denied, MapError, MemoryFault, MemoryTotals, NoBacking, PidNamespace,
-    Process, Region, SignalDelivery, SpawnError, SpawnedThread, Start, Stdio, Stream,
-    SyscallOutcome, SyscallRestart, System, Thread, UserMemory, VirtualMemory, WriteError,
+    Call, Clock, Credentials, Denied, Filesystem, MapError, MemoryFault, MemoryTotals, NoBacking,
+    PidNamespace, Process, Region, SignalDelivery, SpawnError, SpawnedThread, Start, Stdio, Stream,
+    SyscallOutcome, SyscallRestart, System, Thread, Tty, UserMemory, VirtualMemory, WriteError,
     dispatch, standard_streams,
 };
 use helios_unix::{Signal, SignalSet};
@@ -178,6 +178,9 @@ impl Stdio for TestPlatform {
         core::future::pending().await
     }
 }
+
+impl Filesystem<NoBacking> for TestPlatform {}
+impl Tty for TestPlatform {}
 
 impl Clock for TestPlatform {
     fn now_nanos(&self) -> u64 {

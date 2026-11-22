@@ -28,33 +28,14 @@ case "$args_pipe" in
 esac
 
 # 2. Subshells: variable isolation and exit status propagation.
-sub_out="$("$dash_bin" -c '
-x=outer
-(x=inner; printf "in:%s " "$x"; exit 7)
-rc=$?
-printf "out:%s rc:%d\n" "$x" "$rc"
-')"
+sub_out="$("$dash_bin" -c 'x=outer; (x=inner; printf "in:%s " "$x"; exit 7); rc=$?; printf "out:%s rc:%d\n" "$x" "$rc"')"
 if [ "$sub_out" != "in:inner out:outer rc:7" ]; then
     echo "dash subshell failed: got '$sub_out'" >&2
     exit 1
 fi
 
 # 3. Background jobs and `wait` (by PID and wait-all), mixing Linux and WASIX/cat children.
-bg_out="$("$dash_bin" -c "
-($linux_args 5 a >/dev/null; exit \$?) &
-p1=\$!
-($linux_hello | $cat_prog >/dev/null) &
-p2=\$!
-(exit 11) &
-p3=\$!
-wait \$p1
-r1=\$?
-wait \$p2
-r2=\$?
-wait \$p3
-r3=\$?
-echo \"bg:\$r1:\$r2:\$r3\"
-")"
+bg_out="$("$dash_bin" -c "($linux_args 5 a >/dev/null; exit \$?) & p1=\$!; ($linux_hello | $cat_prog >/dev/null) & p2=\$!; (exit 11) & p3=\$!; wait \$p1; r1=\$?; wait \$p2; r2=\$?; wait \$p3; r3=\$?; echo bg:\$r1:\$r2:\$r3")"
 if [ "$bg_out" != "bg:5:0:11" ]; then
     echo "dash background wait failed: got '$bg_out'" >&2
     exit 1

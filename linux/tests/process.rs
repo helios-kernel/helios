@@ -233,6 +233,8 @@ impl Thread<NoBacking> for MockHost {
 }
 
 struct MockPlatform;
+impl helios_linux::syscall::Filesystem<NoBacking> for MockPlatform {}
+impl helios_linux::syscall::Tty for MockPlatform {}
 impl helios_linux::syscall::Network<helios_unix::NoNetwork> for MockPlatform {
     fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
         match address {}

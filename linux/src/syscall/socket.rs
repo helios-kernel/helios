@@ -125,8 +125,7 @@ pub const EHOSTUNREACH: u64 = 113;
 pub const EALREADY: u64 = 114;
 pub const EINPROGRESS: u64 = 115;
 
-// Linux `ioctl` request for toggling `O_NONBLOCK` (`include/uapi/asm-generic/ioctls.h`).
-pub(crate) const FIONBIO: u32 = 0x5421;
+// Linux socket flags for `socket`/`socketpair`/`accept4`.
 
 /// Maximum `iovec` entries accepted in one `sendmsg` / `recvmsg` (`UIO_MAXIOV`).
 const UIO_MAXIOV: usize = 1024;
@@ -798,10 +797,11 @@ pub(crate) fn socket<R: Resources, Net: Network<R::Network>>(
     if nonblocking {
         sock.set_nonblocking(true);
     }
-    match descriptors
-        .lock()
-        .insert_entry(Entry::<R>::new(Descriptor::<R>::Socket(sock), cloexec))
-    {
+    let entry = Entry::<R>::new(Descriptor::<R>::Socket(sock), cloexec);
+    if nonblocking {
+        entry.set_fdflags(helios_unix::FDFLAG_NONBLOCK);
+    }
+    match descriptors.lock().insert_entry(entry) {
         Ok(fd) => u64::from(fd),
         Err(err) => descriptor_errno(err),
     }
@@ -844,12 +844,18 @@ pub(crate) fn socketpair<R: Resources, M: UserMemory>(
         first.set_nonblocking(true);
         second.set_nonblocking(true);
     }
+    let entry0 = Entry::<R>::new(Descriptor::<R>::Socket(first), cloexec);
+    let entry1 = Entry::<R>::new(Descriptor::<R>::Socket(second), cloexec);
+    if nonblocking {
+        entry0.set_fdflags(helios_unix::FDFLAG_NONBLOCK);
+        entry1.set_fdflags(helios_unix::FDFLAG_NONBLOCK);
+    }
     let mut table = descriptors.lock();
-    let fd0 = match table.insert_entry(Entry::<R>::new(Descriptor::<R>::Socket(first), cloexec)) {
+    let fd0 = match table.insert_entry(entry0) {
         Ok(fd) => fd,
         Err(err) => return descriptor_errno(err),
     };
-    let fd1 = match table.insert_entry(Entry::<R>::new(Descriptor::<R>::Socket(second), cloexec)) {
+    let fd1 = match table.insert_entry(entry1) {
         Ok(fd) => fd,
         Err(err) => {
             let _ = table.close(fd0 as i32);
@@ -1085,10 +1091,11 @@ pub(crate) async fn accept<R: Resources, M: UserMemory, Net: Network<R::Network>
         accepted.set_nonblocking(true);
     }
     let cloexec = flags & SOCK_CLOEXEC != 0;
-    match descriptors
-        .lock()
-        .insert_entry(Entry::<R>::new(Descriptor::<R>::Socket(accepted), cloexec))
-    {
+    let entry = Entry::<R>::new(Descriptor::<R>::Socket(accepted), cloexec);
+    if flags & SOCK_NONBLOCK != 0 {
+        entry.set_fdflags(helios_unix::FDFLAG_NONBLOCK);
+    }
+    match descriptors.lock().insert_entry(entry) {
         Ok(new_fd) => u64::from(new_fd),
         Err(err) => descriptor_errno(err),
     }
@@ -2362,8 +2369,8 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
         return 0;
     }
 
-    let in_nonblocking = in_entry.fdflags() & (SOCK_NONBLOCK as u16) != 0;
-    let out_nonblocking = out_entry.fdflags() & (SOCK_NONBLOCK as u16) != 0;
+    let in_nonblocking = in_entry.fdflags() & helios_unix::FDFLAG_NONBLOCK != 0;
+    let out_nonblocking = out_entry.fdflags() & helios_unix::FDFLAG_NONBLOCK != 0;
     let mut total_sent = 0usize;
     while total_sent < count {
         let chunk_len = (count - total_sent).min(SENDFILE_CHUNK);
@@ -2488,6 +2495,13 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
                         errno(super::EINTR)
                     };
                 }
+                Err(super::WriteError::WouldBlock) => {
+                    return if total_sent > 0 {
+                        total_sent as u64
+                    } else {
+                        errno(EAGAIN)
+                    };
+                }
             },
             Descriptor::<R>::Stderr => match output.write(super::Stream::Stderr, &chunk).await {
                 Ok(n) => n,
@@ -2510,6 +2524,13 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
                         total_sent as u64
                     } else {
                         errno(super::EINTR)
+                    };
+                }
+                Err(super::WriteError::WouldBlock) => {
+                    return if total_sent > 0 {
+                        total_sent as u64
+                    } else {
+                        errno(EAGAIN)
                     };
                 }
             },
