@@ -904,8 +904,8 @@ mod linux_tests {
     use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
     use helios_hal::hv::RegisterId;
     use helios_hal::native::{
-        FaultKind, InstructionSet, Mapping, NativeError, NativeExecution, NativeUnavailable, Stop,
-        UserContext, UserFault, UserSpace,
+        ExtendedState, FaultKind, InstructionSet, Mapping, NativeError, NativeExecution,
+        NativeUnavailable, Stop, UserContext, UserFault, UserSpace,
     };
     use helios_hal::pmm::PhysFrame;
     use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
@@ -1026,6 +1026,17 @@ mod linux_tests {
         fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError> {
             self.tp = address;
             Ok(())
+        }
+
+        fn extended_state(&self) -> ExtendedState {
+            ExtendedState::X86Xsave(alloc::vec![0; 576])
+        }
+
+        fn set_extended_state(&mut self, state: &ExtendedState) -> Result<(), NativeError> {
+            match state {
+                ExtendedState::X86Xsave(_) => Ok(()),
+                _ => Err(NativeError::Register),
+            }
         }
 
         fn try_clone(&self) -> Result<Self, NativeError> {
@@ -1472,6 +1483,17 @@ mod linux_tests {
         fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError> {
             self.tp = address;
             Ok(())
+        }
+
+        fn extended_state(&self) -> ExtendedState {
+            ExtendedState::X86Xsave(alloc::vec![0; 576])
+        }
+
+        fn set_extended_state(&mut self, state: &ExtendedState) -> Result<(), NativeError> {
+            match state {
+                ExtendedState::X86Xsave(_) => Ok(()),
+                _ => Err(NativeError::Register),
+            }
         }
 
         fn try_clone(&self) -> Result<Self, NativeError> {

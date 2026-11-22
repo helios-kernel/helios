@@ -119,6 +119,8 @@
 //!   No processor that lacks it runs user code, because the kernel's half
 //!   stays mapped and no page-table isolation separates it.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::convert::Infallible;
 
 use thiserror::Error;
@@ -386,6 +388,24 @@ pub struct Mapping {
     pub flags: PageFlags,
 }
 
+/// AArch64 FP/SIMD state: 32 128-bit `Q`/`V` registers plus `FPSR` and `FPCR`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Aarch64FpSimd {
+    pub vregs: [u128; 32],
+    pub fpsr: u32,
+    pub fpcr: u32,
+}
+
+/// Architectural floating-point and vector state of a [`UserContext`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtendedState {
+    /// AArch64 NEON/FP state.
+    Aarch64FpSimd(Box<Aarch64FpSimd>),
+    /// x86-64 XSAVE area in the processor's standard (non-compacted) layout
+    /// (Intel SDM vol. 1, §13.4).
+    X86Xsave(Vec<u8>),
+}
+
 /// One thread of user execution. See the module docs for its concurrency
 /// contract.
 ///
@@ -410,6 +430,13 @@ pub unsafe trait UserContext: Send + 'static {
 
     /// Replaces the thread pointer; refused outside the user range.
     fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError>;
+
+    /// Reads the thread's hardware floating-point and vector state.
+    fn extended_state(&self) -> ExtendedState;
+
+    /// Replaces the thread's hardware floating-point and vector state after
+    /// validating every field the hardware checks on restore.
+    fn set_extended_state(&mut self, state: &ExtendedState) -> Result<(), NativeError>;
 
     /// Duplicates the detached architectural snapshot (general, flags, thread
     /// pointer, vector and extended state) into an independent context for a
@@ -507,6 +534,12 @@ unsafe impl UserContext for Infallible {
         match *self {}
     }
     fn set_thread_pointer(&mut self, _: VirtAddr) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn extended_state(&self) -> ExtendedState {
+        match *self {}
+    }
+    fn set_extended_state(&mut self, _: &ExtendedState) -> Result<(), NativeError> {
         match *self {}
     }
     fn try_clone(&self) -> Result<Self, NativeError> {

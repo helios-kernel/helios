@@ -17,8 +17,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::hv::RegisterId;
 use helios_hal::native::{
-    FaultKind, InstructionSet, NativeError, NativeExecution, Protection, Stop, UserContext,
-    UserFault, UserSpace,
+    ExtendedState, FaultKind, InstructionSet, NativeError, NativeExecution, Protection, Stop,
+    UserContext, UserFault, UserSpace,
 };
 use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_kernel::{NativeSpace, UserTranslation};
@@ -460,6 +460,60 @@ unsafe impl UserContext for X86Context {
             return Err(NativeError::Address);
         }
         self.switch.user_fs = address.raw() as u64;
+        Ok(())
+    }
+
+    fn extended_state(&self) -> ExtendedState {
+        let size = self._user_xstate.layout.size();
+        // SAFETY: `_user_xstate` is uniquely owned and `size` bytes long.
+        let slice =
+            unsafe { core::slice::from_raw_parts(self._user_xstate.pointer.as_ptr(), size) };
+        ExtendedState::X86Xsave(slice.to_vec())
+    }
+
+    fn set_extended_state(&mut self, state: &ExtendedState) -> Result<(), NativeError> {
+        const FXSAVE_BYTES: usize = 512;
+        const XSAVE_HEADER_END: usize = 576;
+        const MXCSR_OFFSET: usize = 24;
+        const XSTATE_BV_OFFSET: usize = 512;
+        const XCOMP_BV_OFFSET: usize = 520;
+        const RESERVED_START: usize = 528;
+
+        let ExtendedState::X86Xsave(bytes) = state else {
+            return Err(NativeError::Register);
+        };
+        let size = self._user_xstate.layout.size();
+        if (bytes.len() != FXSAVE_BYTES && bytes.len() < XSAVE_HEADER_END) || bytes.len() > size {
+            return Err(NativeError::Register);
+        }
+        if bytes.len() >= XSAVE_HEADER_END {
+            // Intel SDM vol. 2C `XRSTOR` `#GP` conditions, matching Linux
+            // `arch/x86/kernel/fpu/xstate.c` `validate_user_xstate_header`.
+            let xstate_bv =
+                u64::from_le_bytes(bytes[XSTATE_BV_OFFSET..XCOMP_BV_OFFSET].try_into().unwrap());
+            let xcomp_bv =
+                u64::from_le_bytes(bytes[XCOMP_BV_OFFSET..RESERVED_START].try_into().unwrap());
+            if xcomp_bv != 0
+                || (xstate_bv & !extended_state::current_xcr0()) != 0
+                || bytes[RESERVED_START..XSAVE_HEADER_END]
+                    .iter()
+                    .any(|&byte| byte != 0)
+            {
+                return Err(NativeError::Register);
+            }
+        }
+        // SAFETY: `_user_xstate` is uniquely owned and `size` bytes long.
+        let dst =
+            unsafe { core::slice::from_raw_parts_mut(self._user_xstate.pointer.as_ptr(), size) };
+        dst[..bytes.len()].copy_from_slice(bytes);
+        dst[bytes.len()..].fill(0);
+        if bytes.len() < XSAVE_HEADER_END && size >= XSAVE_HEADER_END {
+            // Legacy FXSAVE payload only: mark x87 and SSE valid in `xstate_bv`.
+            dst[XSTATE_BV_OFFSET..XCOMP_BV_OFFSET].copy_from_slice(&3_u64.to_le_bytes());
+        }
+        let mxcsr = u32::from_le_bytes(dst[MXCSR_OFFSET..MXCSR_OFFSET + 4].try_into().unwrap())
+            & extended_state::mxcsr_mask();
+        dst[MXCSR_OFFSET..MXCSR_OFFSET + 4].copy_from_slice(&mxcsr.to_le_bytes());
         Ok(())
     }
 

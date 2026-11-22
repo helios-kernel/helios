@@ -59,7 +59,13 @@ async fn process_dispatch(
     sink: &mut Sink,
 ) -> ControlFlow<Exit, u64> {
     let mut thread = TestThread(sink.thread.clone());
-    linux_dispatch(process, call, memory, &mut thread, sink).await
+    match linux_dispatch(process, call, memory, &mut thread, sink).await {
+        ControlFlow::Continue(helios_linux::syscall::SyscallOutcome::Return(value)) => {
+            ControlFlow::Continue(value)
+        }
+        ControlFlow::Continue(other) => panic!("unexpected syscall outcome: {other:?}"),
+        ControlFlow::Break(exit) => ControlFlow::Break(exit),
+    }
 }
 
 #[derive(Clone)]

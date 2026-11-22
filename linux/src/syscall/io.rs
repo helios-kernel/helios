@@ -1,4 +1,6 @@
+use super::signal::{ThreadSignalSlot, WaitOutcome};
 use super::*;
+use crate::signal_frame::SigInfo;
 use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
 use core::task::{Context, Poll};
@@ -6,7 +8,9 @@ use helios_sync::{
     ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, NotifyWaiter, TryRead, TryWrite,
     byte_channel,
 };
-use helios_unix::{DescriptorTableError, Epoll, EventError, EventFd, Interest, InterestError};
+use helios_unix::{
+    DescriptorTableError, Epoll, EventError, EventFd, Interest, InterestError, Signal, SignalSet,
+};
 
 /// Monotonic time and async deadline waits supplied by the execution owner.
 pub trait Clock {
@@ -145,30 +149,40 @@ pub(super) fn duplicate<R: Resources>(
     }
 }
 pub(super) async fn write_resource<R: Resources, M: UserMemory>(
+    signals: &ThreadSignalSlot,
     entry: &Entry<R>,
     args: [u64; 6],
     memory: &M,
-) -> u64 {
+) -> SyscallOutcome {
     match &entry.descriptor {
         FileDescriptor::Event(event) => {
             if args[2] < 8 {
-                return errno(EINVAL);
+                return SyscallOutcome::Return(errno(EINVAL));
             }
             let mut bytes = [0; 8];
             if memory.read(args[1], &mut bytes).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
             let value = u64::from_le_bytes(bytes);
             loop {
                 let mut wait = event.wait_state();
                 match event.write(value) {
-                    Ok(()) => return 8,
-                    Err(EventError::InvalidIncrement) => return errno(EINVAL),
+                    Ok(()) => return SyscallOutcome::Return(8),
+                    Err(EventError::InvalidIncrement) => {
+                        return SyscallOutcome::Return(errno(EINVAL));
+                    }
                     Err(EventError::WouldBlock) if entry.fdflags() & NONBLOCK != 0 => {
-                        return errno(EAGAIN);
+                        return SyscallOutcome::Return(errno(EAGAIN));
                     }
                     Err(EventError::WouldBlock) => {
-                        poll_fn(|cx| event.poll_changed(cx, &mut wait)).await
+                        if matches!(
+                            signals
+                                .interruptible(poll_fn(|cx| event.poll_changed(cx, &mut wait)))
+                                .await,
+                            WaitOutcome::Interrupted
+                        ) {
+                            return SyscallOutcome::RestartSys;
+                        }
                     }
                 }
             }
@@ -182,81 +196,117 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
                     .read(args[1].wrapping_add(total), &mut bytes[..size])
                     .is_err()
                 {
-                    return if total == 0 { errno(EFAULT) } else { total };
+                    return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
                 }
                 let chunk = Bytes::copy_from_slice(&bytes[..size]);
                 let result = if entry.fdflags() & NONBLOCK != 0 {
                     match writer.try_write(chunk) {
                         TryWrite::Written => Ok(()),
-                        TryWrite::Closed => Err(EPIPE),
-                        TryWrite::Full(_) => Err(EAGAIN),
+                        TryWrite::Closed => Err(Some(EPIPE)),
+                        TryWrite::Full(_) => Err(Some(EAGAIN)),
                     }
                 } else {
-                    writer.write(chunk).await.map_err(|_| EPIPE)
+                    match signals.interruptible(writer.write(chunk)).await {
+                        WaitOutcome::Ready(Ok(())) => Ok(()),
+                        WaitOutcome::Ready(Err(_)) => Err(Some(EPIPE)),
+                        WaitOutcome::Interrupted => Err(None),
+                    }
                 };
-                if let Err(error) = result {
-                    return if total == 0 { errno(error) } else { total };
+                match result {
+                    Ok(()) => total += size as u64,
+                    Err(Some(EPIPE)) => {
+                        // Linux `fs/pipe.c` `pipe_write`: broken pipe raises
+                        // `SIGPIPE` on the writing thread and returns `-EPIPE`.
+                        signals
+                            .process()
+                            .raise_thread(signals, SigInfo::from_kernel(Signal::SIGPIPE));
+                        return SyscallOutcome::Return(if total == 0 {
+                            errno(EPIPE)
+                        } else {
+                            total
+                        });
+                    }
+                    Err(Some(error)) => {
+                        return SyscallOutcome::Return(if total == 0 {
+                            errno(error)
+                        } else {
+                            total
+                        });
+                    }
+                    Err(None) => {
+                        return if total == 0 {
+                            SyscallOutcome::RestartSys
+                        } else {
+                            SyscallOutcome::Return(total)
+                        };
+                    }
                 }
-                total += size as u64;
             }
-            total
+            SyscallOutcome::Return(total)
         }
-        FileDescriptor::NullDevice => args[2].min(MAX_RW_COUNT),
-        _ => errno(EBADF),
+        FileDescriptor::NullDevice => SyscallOutcome::Return(args[2].min(MAX_RW_COUNT)),
+        _ => SyscallOutcome::Return(errno(EBADF)),
     }
 }
 pub(super) async fn read_resource<R: Resources, M: UserMemory>(
+    signals: &ThreadSignalSlot,
     entry: &Entry<R>,
     args: [u64; 6],
     memory: &mut M,
-) -> u64 {
+) -> SyscallOutcome {
     let nonblock = entry.fdflags() & NONBLOCK != 0;
     match &entry.descriptor {
         FileDescriptor::Event(event) => {
             if args[2] < 8 {
-                return errno(EINVAL);
+                return SyscallOutcome::Return(errno(EINVAL));
             }
             // Validate the destination before consuming the counter.
             if memory.check_writable(args[1], 8).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
             let value = if nonblock {
                 match event.try_read() {
                     Ok(value) => value,
-                    Err(_) => return errno(EAGAIN),
+                    Err(_) => return SyscallOutcome::Return(errno(EAGAIN)),
                 }
             } else {
-                event.read().await
+                match signals.interruptible(event.read()).await {
+                    WaitOutcome::Ready(value) => value,
+                    WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                }
             };
             if memory.write(args[1], &value.to_le_bytes()).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
-            8
+            SyscallOutcome::Return(8)
         }
         FileDescriptor::PipeRead { reader } => {
             let limit = args[2].min(MAX_RW_COUNT) as usize;
             if memory.check_writable(args[1], limit).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
             let next = if nonblock {
                 match reader.try_read_limit(limit) {
                     TryRead::Ready(bytes) => Some(bytes),
                     TryRead::Eof => None,
-                    TryRead::Pending => return errno(EAGAIN),
+                    TryRead::Pending => return SyscallOutcome::Return(errno(EAGAIN)),
                 }
             } else {
-                reader.read_limit(limit).await
+                match signals.interruptible(reader.read_limit(limit)).await {
+                    WaitOutcome::Ready(bytes) => bytes,
+                    WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                }
             };
             let Some(bytes) = next else {
-                return 0;
+                return SyscallOutcome::Return(0);
             };
             if memory.write(args[1], &bytes).is_err() {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             }
-            bytes.len() as u64
+            SyscallOutcome::Return(bytes.len() as u64)
         }
-        FileDescriptor::NullDevice => 0,
-        _ => errno(EBADF),
+        FileDescriptor::NullDevice => SyscallOutcome::Return(0),
+        _ => SyscallOutcome::Return(errno(EBADF)),
     }
 }
 pub(super) fn epoll_create<R: Resources>(
@@ -474,19 +524,20 @@ impl Wait {
 }
 pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
     abi: Abi,
+    signals: &ThreadSignalSlot,
     table: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
     memory: &mut M,
     clock: &C,
     has_mask: bool,
-) -> u64 {
+) -> SyscallOutcome {
     let epoll = {
         let table = table.lock();
         let Some(entry) = table.get_entry(args[0] as u32 as i32) else {
-            return errno(EBADF);
+            return SyscallOutcome::Return(errno(EBADF));
         };
         let FileDescriptor::Epoll(epoll) = &entry.descriptor else {
-            return errno(EINVAL);
+            return SyscallOutcome::Return(errno(EINVAL));
         };
         epoll.clone()
     };
@@ -494,11 +545,21 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
     let size = data + 8;
     let maxevents = args[2] as i32;
     if maxevents <= 0 || maxevents as u64 > i32::MAX as u64 / size as u64 {
-        return errno(EINVAL);
+        return SyscallOutcome::Return(errno(EINVAL));
     }
-    if has_mask && args[4] != 0 {
-        return errno(EOPNOTSUPP);
-    }
+    let installed_mask = if has_mask && args[4] != 0 {
+        if args[5] != 8 {
+            return SyscallOutcome::Return(errno(EINVAL));
+        }
+        let mut mask_bytes = [0u8; 8];
+        if memory.read(args[4], &mut mask_bytes).is_err() {
+            return SyscallOutcome::Return(errno(EFAULT));
+        }
+        signals.push_temp_mask(SignalSet::from_bits(u64::from_le_bytes(mask_bytes)));
+        true
+    } else {
+        false
+    };
     let timeout = args[3] as i32;
     let deadline =
         (timeout >= 0).then(|| clock.now_nanos().saturating_add(timeout as u64 * 1_000_000));
@@ -526,7 +587,10 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
                     .write(args[1].wrapping_add(count * size as u64), bytes)
                     .is_err()
                 {
-                    return if count == 0 { errno(EFAULT) } else { count };
+                    if installed_mask {
+                        signals.restore_temp_mask();
+                    }
+                    return SyscallOutcome::Return(if count == 0 { errno(EFAULT) } else { count });
                 }
                 epoll.delivered(interest.fd);
                 count += 1;
@@ -535,11 +599,17 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
                 }
             }
             if count != 0 {
-                return count;
+                if installed_mask {
+                    signals.restore_temp_mask();
+                }
+                return SyscallOutcome::Return(count);
             }
         }
         if deadline.is_some_and(|end| clock.now_nanos() >= end) {
-            return 0;
+            if installed_mask {
+                signals.restore_temp_mask();
+            }
+            return SyscallOutcome::Return(0);
         }
         let timer = async {
             match deadline {
@@ -548,18 +618,174 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
             }
         };
         let mut timer = core::pin::pin!(timer);
-        poll_fn(|cx| {
+        let mut sig = core::pin::pin!(signals.wait_deliverable());
+        let interrupted = poll_fn(|cx| {
             let mut ready = timer.as_mut().poll(cx).is_ready();
             for wait in &mut waits {
                 ready |= wait.poll(cx).is_ready();
             }
             if ready {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
+                return Poll::Ready(false);
             }
+            if sig.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(true);
+            }
+            Poll::Pending
         })
         .await;
+        if interrupted {
+            // Leave `saved_mask` active (`TIF_RESTORE_SIGMASK`) so signal
+            // delivery writes the original mask into `uc_sigmask`.
+            return SyscallOutcome::RestartNoHand;
+        }
+    }
+}
+
+/// `ppoll(fds, nfds, tmo_p, sigmask, sigsetsize)` (`fs/select.c`
+/// `SYSCALL_DEFINE5(ppoll)`).
+///
+/// musl implements `pause(2)` on AArch64 as `ppoll(NULL, 0, NULL, NULL, 0)`.
+pub(super) async fn ppoll<R: Resources, M: UserMemory, C: Clock>(
+    signals: &ThreadSignalSlot,
+    table: &spin::Mutex<Descriptors<R>>,
+    args: [u64; 6],
+    memory: &mut M,
+    clock: &C,
+) -> SyscallOutcome {
+    const POLLNVAL: u32 = 0x20;
+    const POLLFD_BYTES: usize = 8;
+    const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+    let fds_ptr = args[0];
+    let nfds = args[1];
+    let tmo_ptr = args[2];
+    let sigmask_ptr = args[3];
+    let sigsetsize = args[4];
+
+    if nfds > 1024 * 1024 {
+        return SyscallOutcome::Return(errno(EINVAL));
+    }
+    let nfds = nfds as usize;
+
+    let deadline = if tmo_ptr != 0 {
+        let mut ts = [0u8; 16];
+        if memory.read(tmo_ptr, &mut ts).is_err() {
+            return SyscallOutcome::Return(errno(EFAULT));
+        }
+        let sec = i64::from_le_bytes(ts[..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap());
+        if sec < 0 || !(0..NANOS_PER_SEC as i64).contains(&nsec) {
+            return SyscallOutcome::Return(errno(EINVAL));
+        }
+        let delta = (sec as u64)
+            .saturating_mul(NANOS_PER_SEC)
+            .saturating_add(nsec as u64);
+        Some(clock.now_nanos().saturating_add(delta))
+    } else {
+        None
+    };
+
+    let temp_mask = if sigmask_ptr != 0 {
+        if sigsetsize != 8 {
+            return SyscallOutcome::Return(errno(EINVAL));
+        }
+        let mut mask_bytes = [0u8; 8];
+        if memory.read(sigmask_ptr, &mut mask_bytes).is_err() {
+            return SyscallOutcome::Return(errno(EFAULT));
+        }
+        Some(SignalSet::from_bits(u64::from_le_bytes(mask_bytes)))
+    } else {
+        None
+    };
+
+    let mut pollfds = Vec::with_capacity(nfds);
+    for i in 0..nfds {
+        let mut raw = [0u8; POLLFD_BYTES];
+        if memory
+            .read(fds_ptr.wrapping_add((i * POLLFD_BYTES) as u64), &mut raw)
+            .is_err()
+        {
+            return SyscallOutcome::Return(errno(EFAULT));
+        }
+        let fd = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+        let events = u16::from_le_bytes(raw[4..6].try_into().unwrap());
+        pollfds.push((fd, events, 0u16));
+    }
+
+    let installed_mask = if let Some(mask) = temp_mask {
+        signals.push_temp_mask(mask);
+        true
+    } else {
+        false
+    };
+
+    loop {
+        let mut waits = Vec::new();
+        let mut count = 0u64;
+        {
+            let table = table.lock();
+            for (fd, events, revents) in &mut pollfds {
+                if *fd < 0 {
+                    *revents = 0;
+                    continue;
+                }
+                let Some(entry) = table.get_entry(*fd) else {
+                    *revents = POLLNVAL as u16;
+                    count += 1;
+                    continue;
+                };
+                let mask = u32::from(*events) & (EPOLLIN | EPOLLOUT);
+                let ready = ready_mask::<R>(entry, &table) & (mask | EPOLLERR | EPOLLHUP);
+                *revents = ready as u16;
+                if ready != 0 {
+                    count += 1;
+                } else if let Some(wait) = Wait::arm::<R>(entry, mask) {
+                    waits.push(wait);
+                }
+            }
+        }
+        if count != 0 || deadline.is_some_and(|end| clock.now_nanos() >= end) {
+            if installed_mask {
+                signals.restore_temp_mask();
+            }
+            for (i, (_, _, revents)) in pollfds.iter().enumerate() {
+                if memory
+                    .write(
+                        fds_ptr.wrapping_add((i * POLLFD_BYTES + 6) as u64),
+                        &revents.to_le_bytes(),
+                    )
+                    .is_err()
+                {
+                    return SyscallOutcome::Return(errno(EFAULT));
+                }
+            }
+            return SyscallOutcome::Return(count);
+        }
+        let timer = async {
+            match deadline {
+                Some(end) => clock.sleep_until(end).await,
+                None => core::future::pending().await,
+            }
+        };
+        let mut timer = core::pin::pin!(timer);
+        let mut sig = core::pin::pin!(signals.wait_deliverable());
+        let interrupted = poll_fn(|cx| {
+            let mut ready = timer.as_mut().poll(cx).is_ready();
+            for wait in &mut waits {
+                ready |= wait.poll(cx).is_ready();
+            }
+            if ready {
+                return Poll::Ready(false);
+            }
+            if sig.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(true);
+            }
+            Poll::Pending
+        })
+        .await;
+        if interrupted {
+            return SyscallOutcome::RestartNoHand;
+        }
     }
 }
 
@@ -667,9 +893,13 @@ mod tests {
         let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
         let waker = Waker::from(wakes.clone());
         let mut context = Context::from_waker(&waker);
+        let process_signals = super::signal::ProcessSignals::new(NonZeroU32::new(1).unwrap());
+        let thread_signals =
+            process_signals.register_thread(NonZeroU32::new(1).unwrap(), SignalSet::EMPTY);
         {
             let mut future = core::pin::pin!(epoll_wait::<NoBacking, _, _>(
                 Abi::X86_64,
+                &thread_signals,
                 &table,
                 [2, 0, 1, u64::MAX, 0, 0],
                 &mut memory,
@@ -679,7 +909,10 @@ mod tests {
             assert!(future.as_mut().poll(&mut context).is_pending());
             event.write(1).unwrap();
             assert!(wakes.0.load(Ordering::Relaxed) > 0);
-            assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(1));
+            assert_eq!(
+                future.as_mut().poll(&mut context),
+                Poll::Ready(SyscallOutcome::Return(1))
+            );
         }
         assert_eq!(
             u32::from_le_bytes(memory.0[..4].try_into().unwrap()),
