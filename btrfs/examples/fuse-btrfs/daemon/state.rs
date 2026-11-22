@@ -103,7 +103,7 @@ pub struct Statfs {
 
 enum Storage {
     ReadOnly(Snapshot),
-    Writable(Writer<Device, RandomUuids>),
+    Writable(Box<Writer<Device, RandomUuids>>),
 }
 
 pub struct State {
@@ -161,7 +161,7 @@ impl State {
             number: root.number(),
         };
         Ok(Self {
-            storage: Storage::Writable(writer),
+            storage: Storage::Writable(Box::new(writer)),
             claim,
             device_path,
             inodes: Inodes::new(identity, root.metadata().generation, Some(handle)),
@@ -284,7 +284,7 @@ impl State {
                         .map_err(|error| write_errno(&error))?
                 };
                 self.inodes.set_root_handle(root_handle);
-                self.storage = Storage::Writable(writer);
+                self.storage = Storage::Writable(Box::new(writer));
             }
         }
         self.read_only = false;
