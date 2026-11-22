@@ -640,6 +640,118 @@ fn fallocate_consumes_reported_available_bytes_without_enospc() {
 }
 
 #[test]
+fn writing_over_prealloc_and_regular_extents_preserves_nbytes_before_writeback() {
+    for no_holes in [true, false] {
+        let (_named, mut writer) = mount_image(no_holes, Compressor::Plain);
+        block_on(async {
+            {
+                let mut tx = writer.join().await.unwrap();
+                let file = create(&mut tx, b"prealloc").await;
+                tx.fallocate(&file, 0, 2 * SECTOR, AllocateMode::Allocate, when(1))
+                    .await
+                    .unwrap();
+                assert_eq!(tx.metadata(&file).await.unwrap().nbytes, 2 * SECTOR);
+
+                // Write 2 bytes straddling both preallocated sectors (generic/568):
+                // dirtying sectors already backed by PREALLOC must not double-count nbytes.
+                tx.write_file(&file, SECTOR - 1, b"ab", when(2))
+                    .await
+                    .unwrap();
+                assert_eq!(tx.metadata(&file).await.unwrap().nbytes, 2 * SECTOR);
+            }
+            let view = writer.snapshot().unwrap();
+            let inode = view.resolve(b"/prealloc").await.unwrap();
+            assert_eq!(inode.metadata().nbytes, 2 * SECTOR);
+            drop(view);
+
+            // Extending a dirty write past the preallocated tail adds only the
+            // newly allocated sector, matching the post-commit total.
+            {
+                let mut tx = writer.join().await.unwrap();
+                let root = tx.root().await.unwrap();
+                let file = tx.lookup(&root, b"prealloc").await.unwrap().unwrap();
+                tx.write_file(&file, 2 * SECTOR, &[0x55; 16], when(3))
+                    .await
+                    .unwrap();
+                assert_eq!(tx.metadata(&file).await.unwrap().nbytes, 3 * SECTOR);
+            }
+            let view = writer.snapshot().unwrap();
+            assert_eq!(
+                view.resolve(b"/prealloc").await.unwrap().metadata().nbytes,
+                3 * SECTOR
+            );
+            drop(view);
+
+            writer.commit().await.unwrap();
+            let committed = writer.snapshot().unwrap();
+            assert_eq!(
+                committed
+                    .resolve(b"/prealloc")
+                    .await
+                    .unwrap()
+                    .metadata()
+                    .nbytes,
+                3 * SECTOR
+            );
+            drop(committed);
+
+            // Overwriting committed regular extents must also preserve nbytes
+            // before writeback, while writing into an explicit hole adds it.
+            {
+                let mut tx = writer.join().await.unwrap();
+                let root = tx.root().await.unwrap();
+                let file = tx.lookup(&root, b"prealloc").await.unwrap().unwrap();
+                tx.write_file(&file, 0, &[0x77; 2 * SECTOR as usize], when(4))
+                    .await
+                    .unwrap();
+                assert_eq!(tx.metadata(&file).await.unwrap().nbytes, 3 * SECTOR);
+
+                let sparse = create(&mut tx, b"sparse").await;
+                tx.truncate_file(&sparse, 2 * SECTOR, when(5))
+                    .await
+                    .unwrap();
+                assert_eq!(tx.metadata(&sparse).await.unwrap().nbytes, 0);
+                tx.write_file(&sparse, 0, &[0x99; 32], when(6))
+                    .await
+                    .unwrap();
+                assert_eq!(tx.metadata(&sparse).await.unwrap().nbytes, SECTOR);
+            }
+            let view = writer.snapshot().unwrap();
+            assert_eq!(
+                view.resolve(b"/prealloc").await.unwrap().metadata().nbytes,
+                3 * SECTOR
+            );
+            assert_eq!(
+                view.resolve(b"/sparse").await.unwrap().metadata().nbytes,
+                SECTOR
+            );
+            drop(view);
+
+            writer.commit().await.unwrap();
+            let committed = writer.snapshot().unwrap();
+            assert_eq!(
+                committed
+                    .resolve(b"/prealloc")
+                    .await
+                    .unwrap()
+                    .metadata()
+                    .nbytes,
+                3 * SECTOR
+            );
+            assert_eq!(
+                committed
+                    .resolve(b"/sparse")
+                    .await
+                    .unwrap()
+                    .metadata()
+                    .nbytes,
+                SECTOR
+            );
+        });
+    }
+}
+
+#[test]
 #[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
 fn fallocate_passes_btrfs_check() {
     for no_holes in [true, false] {

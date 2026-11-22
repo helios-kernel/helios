@@ -555,10 +555,14 @@ impl<S: BlockSource> Filesystem<S> {
             defect,
         })?;
         #[cfg(feature = "write")]
-        if let Some(running) = &snapshot.running {
-            metadata.nbytes = metadata
-                .nbytes
-                .saturating_add(running.dirty.file_bytes(root.tree, number));
+        if let Some(running) = &snapshot.running
+            && running.dirty.file(root.tree, number).is_some()
+        {
+            let unbacked = running
+                .dirty
+                .unbacked_file_bytes(&nodes, root, number, self.volume.superblock().sectorsize())
+                .await?;
+            metadata.nbytes = metadata.nbytes.saturating_add(unbacked);
         }
         Ok(Inode {
             snapshot: snapshot.clone(),

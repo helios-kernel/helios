@@ -24,7 +24,10 @@ use core::ops::Range;
 use rpds::RedBlackTreeMapSync;
 
 use crate::compress::policy::inode_compresses;
-use crate::items::INODE_NODATASUM;
+use crate::items::{ExtentData, FileExtent, INODE_NODATASUM};
+use crate::ondisk::{RawFileExtentBody, RawFileExtentHead, item_type, view};
+use crate::tree::{Cursor, NodeSource, TreeRoot};
+use crate::{Error, Key};
 
 /// One sector of file data.
 pub(crate) type Page = Arc<[u8]>;
@@ -177,6 +180,21 @@ impl DirtyFile {
     }
 }
 
+/// Whether a validated `EXTENT_DATA` item occupies allocated data blocks that
+/// are already accounted in `inode.nbytes` (a regular or preallocated extent,
+/// not an inline item or an explicit zero hole).
+fn extent_is_allocated(extent: &FileExtent<'_>, item: &[u8]) -> bool {
+    match extent.data {
+        ExtentData::Inline { .. } => false,
+        ExtentData::Regular { .. } => true,
+        ExtentData::Zero => {
+            let body: &RawFileExtentBody = view(&item[size_of::<RawFileExtentHead>()..])
+                .expect("validated non-inline file extent");
+            body.disk_bytenr.get() != 0
+        }
+    }
+}
+
 /// Every inode's dirty data, with the totals the transaction's reservations
 /// and the writeback bound read.
 #[derive(Clone)]
@@ -262,11 +280,63 @@ impl Delalloc {
         self.files.get(&(tree, inode))
     }
 
-    /// Dirty bytes of `(tree, inode)`: Linux's `btrfs_inode::delalloc_bytes`,
-    /// which `btrfs_getattr` adds to `nbytes` when reporting `st_blocks`.
-    pub(crate) fn file_bytes(&self, tree: u64, inode: u64) -> u64 {
-        self.file(tree, inode)
-            .map_or(0, |file| file.pages.size() as u64 * self.sector)
+    /// Dirty bytes of `(root.tree, inode)` that do not overwrite an already
+    /// allocated regular or preallocated extent in `root`. Adding only
+    /// unbacked dirty bytes to `inode.nbytes` matches Linux's `st_blocks`
+    /// reporting without double-counting writes into preallocated or existing
+    /// regular extents before writeback replaces them.
+    pub(crate) async fn unbacked_file_bytes<R: NodeSource>(
+        &self,
+        nodes: &R,
+        root: TreeRoot,
+        inode: u64,
+        sectorsize: u32,
+    ) -> Result<u64, Error> {
+        let Some(file) = self.file(root.tree, inode) else {
+            return Ok(0);
+        };
+        let total = file.pages.size() as u64 * self.sector;
+        let runs = file.runs(0..u64::MAX);
+        if runs.is_empty() {
+            return Ok(0);
+        }
+        let mut backed = 0_u64;
+        for run in runs {
+            let mut cursor = Cursor::floor(
+                nodes,
+                root,
+                Key::new(inode, item_type::EXTENT_DATA, run.start),
+            )
+            .await?;
+            while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
+                if key.objectid > inode
+                    || (key.objectid == inode && key.item_type > item_type::EXTENT_DATA)
+                    || (key.is(inode, item_type::EXTENT_DATA) && key.offset >= run.end)
+                {
+                    break;
+                }
+                if key.is(inode, item_type::EXTENT_DATA) {
+                    let extent =
+                        FileExtent::parse(key, item, sectorsize).map_err(|defect| Error::Item {
+                            tree: root.tree,
+                            key,
+                            defect,
+                        })?;
+                    if extent_is_allocated(&extent, item) {
+                        let overlap_start = run.start.max(extent.start);
+                        let overlap_end = run.end.min(extent.end);
+                        if overlap_start < overlap_end {
+                            backed += overlap_end - overlap_start;
+                        }
+                    }
+                    if extent.end >= run.end {
+                        break;
+                    }
+                }
+                cursor.advance(nodes).await?;
+            }
+        }
+        Ok(total.saturating_sub(backed))
     }
 
     pub(crate) fn is_dirty(&self, tree: u64, inode: u64, offset: u64) -> bool {

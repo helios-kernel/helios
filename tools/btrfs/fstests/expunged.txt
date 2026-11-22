@@ -3,6 +3,7 @@ generic/108 # #1085: overwrites SCRATCH_DEV with LVM pvcreate while FSTYP=fuse _
 generic/250 # #1085: overwrites SCRATCH_DEV with pwrite before _scratch_mkfs_sized skips on FSTYP=fuse and _dmerror_mount omits FUSE_SUBTYP
 generic/252 # #1085: overwrites SCRATCH_DEV with pwrite before _scratch_mkfs_sized skips on FSTYP=fuse and _dmerror_mount omits FUSE_SUBTYP
 generic/338 # #1085: common/dmerror _dmerror_mount passes -t fuse without FUSE_SUBTYP
+generic/347 # #1085: common/dmthin _dmthin_mount passes -t fuse without FUSE_SUBTYP
 generic/409 # #1085: _get_mount passes -t fuse without FUSE_SUBTYP
 generic/410 # #1085: _get_mount passes -t fuse without FUSE_SUBTYP
 generic/411 # #1085: _get_mount passes -t fuse without FUSE_SUBTYP

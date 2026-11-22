@@ -612,7 +612,7 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     async fn load_handle(&self, id: FileId) -> Result<InodeHandle, WriteError> {
-        let metadata = self.inner().inode_metadata(id).await?;
+        let (_, metadata) = self.inner().inode_item(id.tree, id.inode).await?;
         Ok(InodeHandle {
             mount: self.writer.mount.clone(),
             id,
@@ -634,7 +634,11 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             inode: handle.id.inode,
             generation: handle.generation,
         };
-        let metadata = match self.inner().inode_metadata(handle.id).await {
+        let (_, metadata) = match self
+            .inner()
+            .inode_item(handle.id.tree, handle.id.inode)
+            .await
+        {
             Err(WriteError::Read(Error::MissingInode { .. })) => return Err(stale()),
             result => result?,
         };
@@ -696,7 +700,10 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     pub async fn metadata(&self, handle: &InodeHandle) -> Result<Metadata, WriteError> {
-        self.checked(handle).await
+        let mut metadata = self.checked(handle).await?;
+        let unbacked = self.inner().unbacked_delalloc_bytes(handle.id).await?;
+        metadata.nbytes = metadata.nbytes.saturating_add(unbacked);
+        Ok(metadata)
     }
 
     pub async fn lookup(
