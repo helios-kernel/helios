@@ -1053,8 +1053,11 @@ pub(super) fn getpgrp<R: Resources>(process: &Process<R>) -> u64 {
 pub(super) fn setpgid<R: Resources>(process: &Process<R>, args: [u64; 6]) -> u64 {
     let pid = args[0] as u32 as i32;
     let pgid = args[1] as u32 as i32;
-    if pid < 0 || pgid < 0 {
+    if pgid < 0 {
         return errno(EINVAL);
+    }
+    if pid < 0 {
+        return errno(ESRCH);
     }
     match process
         .shared

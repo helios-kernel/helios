@@ -672,6 +672,30 @@ fn pgid_sid_setsid_and_exec_resets_cloexec_and_handlers() {
         );
         let kept_fd = mem.read_i32(0x1_0108);
 
+        // Negative pid / pgid validation matches Linux kernel/sys.c.
+        assert_eq!(
+            call_ret(
+                &mut parent,
+                abi,
+                Operation::Setpgid,
+                [(-1i32) as u32 as u64, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host,
+            ),
+            err(ESRCH)
+        );
+        assert_eq!(
+            call_ret(
+                &mut parent,
+                abi,
+                Operation::Setpgid,
+                [0, (-1i32) as u32 as u64, 0, 0, 0, 0],
+                &mut mem,
+                &mut host,
+            ),
+            err(EINVAL)
+        );
+
         // Session leader cannot setsid or setpgid.
         assert_eq!(
             call_ret(

@@ -345,7 +345,9 @@ static void test_execveat(const char *self) {
     CHECK(SYS(SYS_execveat, AT_FDCWD, "/nonexistent-execveat-1034", bad_argv, envp, 0) ==
           -ENOENT);
     CHECK(SYS(SYS_execveat, 999, "rel", bad_argv, envp, 0) == -EBADF);
-    CHECK(SYS(SYS_execveat, AT_FDCWD, self, bad_argv, envp, 0x10000) == -EINVAL);
+    /* AT_REMOVEDIR (0x200) is an unlinkat flag, invalid for execveat on every
+     * Linux version (unlike 0x10000, which became AT_EXECVE_CHECK in 6.14). */
+    CHECK(SYS(SYS_execveat, AT_FDCWD, self, bad_argv, envp, AT_REMOVEDIR) == -EINVAL);
 
     /* Split `self` into directory and basename so cwd/dirfd checks work
      * identically on Linux and on Helios. */
@@ -550,7 +552,8 @@ static void test_pgid_sid_setsid(void) {
     CHECK(getsid(0) > 0);
     CHECK(SYS(SYS_getpgid, -1) == -ESRCH);
     CHECK(SYS(SYS_getsid, -1) == -ESRCH);
-    CHECK(SYS(SYS_setpgid, -1, 0) == -EINVAL);
+    CHECK(SYS(SYS_setpgid, -1, 0) == -ESRCH);
+    CHECK(SYS(SYS_setpgid, 0, -1) == -EINVAL);
 
     /* Child 1: moves into its own process group, verifies setsid() -> EPERM
      * when already a process group leader, and parent waits by P_PGID. */
