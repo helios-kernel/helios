@@ -400,7 +400,7 @@ mod tests {
 
     #[cfg(feature = "linux")]
     #[test]
-    fn linux_rtnetlink_ioctls_and_wasix_admin_share_one_network_service() {
+    fn linux_rtnetlink_ioctls_and_network_admin_share_one_network_service() {
         use core::future::Future;
         use core::num::NonZeroU32;
         use core::ops::ControlFlow;
@@ -801,16 +801,16 @@ mod tests {
         );
         assert!(run_call(&mut mem, 45, [fd, 0x2000, 256, 0, 0, 0]) >= 20);
 
-        // 3. Verify WASIX's shared NetworkAdminBackend sees both mutations on the same NetworkService.
-        let wasix_addrs = drive(service.list_addresses(NetworkPortId::new(0))).unwrap();
-        assert!(wasix_addrs.contains(&Ipv4Cidr::new(Ipv4Address::new([10, 42, 0, 9]), 24)));
-        let wasix_routes = drive(service.list_routes(NetworkPortId::new(0))).unwrap();
-        assert!(wasix_routes.iter().any(|r| {
+        // 3. Verify the shared NetworkAdminBackend sees both mutations on the same NetworkService.
+        let admin_addrs = drive(service.list_addresses(NetworkPortId::new(0))).unwrap();
+        assert!(admin_addrs.contains(&Ipv4Cidr::new(Ipv4Address::new([10, 42, 0, 9]), 24)));
+        let admin_routes = drive(service.list_routes(NetworkPortId::new(0))).unwrap();
+        assert!(admin_routes.iter().any(|r| {
             r.destination() == Ipv4Cidr::new(Ipv4Address::new([0, 0, 0, 0]), 0)
                 && r.gateway() == Ipv4Address::new([10, 42, 0, 1])
         }));
 
-        // 4. Reverse direction: WASIX add_address is immediately visible to Linux RTM_GETADDR.
+        // 4. Reverse direction: NetworkAdminBackend::add_address is immediately visible to Linux RTM_GETADDR.
         drive(service.add_address(
             NetworkPortId::new(0),
             Ipv4Cidr::new(Ipv4Address::new([192, 168, 77, 5]), 24),
