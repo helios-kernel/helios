@@ -431,6 +431,7 @@ async fn inherited<S: BlockSink, U: RootUuids>(
         permissions: node.permissions,
         uid: node.uid,
         gid: node.gid,
+        umask: 0,
     })
 }
 

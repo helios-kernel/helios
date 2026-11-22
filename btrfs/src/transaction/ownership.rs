@@ -10,17 +10,22 @@ use crate::source::BlockSink;
 use crate::tree::write::WriteError;
 use crate::{FileKind, Timestamp};
 
+/// The file type bits of an inode's mode.
+pub(crate) const S_IFMT: u32 = 0o170_000;
+pub(crate) const S_IFDIR: u32 = 0o040_000;
+pub(crate) const S_IFLNK: u32 = 0o120_000;
 /// Every bit `chmod` sets: permissions, sticky and the two set-id bits.
 const S_IALLUGO: u32 = 0o7777;
 const S_ISUID: u32 = 0o4000;
-const S_ISGID: u32 = 0o2000;
+pub(crate) const S_ISGID: u32 = 0o2000;
 
 impl<S: BlockSink> Transaction<S> {
     /// Replaces the permission bits, keeping the file type, as `chmod`
     /// (`chmod_common` in `fs/open.c` stores `(mode & S_IALLUGO) |
-    /// (inode->i_mode & ~S_IALLUGO)`). The set-id bits are stored on a
-    /// non-directory as on a directory, as `btrfs_setattr` stores whatever
-    /// `notify_change` hands it.
+    /// (inode->i_mode & ~S_IALLUGO)`), then sets an access ACL's base
+    /// entries to them as `btrfs_setattr` does with `posix_acl_chmod`. The
+    /// set-id bits are stored on a non-directory as on a directory, as
+    /// `btrfs_setattr` stores whatever `notify_change` hands it.
     pub(crate) async fn set_permissions(
         &mut self,
         tree: u64,
@@ -34,12 +39,15 @@ impl<S: BlockSink> Transaction<S> {
         let (mut raw, metadata) = self.inode_item(tree, inode).await?;
         check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
         let mode = (raw.mode.get() & !S_IALLUGO) | permissions;
+        let changed_at = changed;
         let changed = time(tree, inode, changed)?;
         raw.mode.set(mode);
         raw.ctime = changed;
         raw.transid.set(self.trees.generation());
         raw.sequence.set(raw.sequence.get().wrapping_add(1));
-        self.put_inode(tree, inode, raw).await
+        self.put_inode(tree, inode, raw).await?;
+        // `btrfs_setattr` carries the mode into the access ACL.
+        self.chmod_acl(tree, inode, mode, changed_at).await
     }
 
     /// Sets the owner and/or the group, each left alone when `None` as
@@ -53,8 +61,11 @@ impl<S: BlockSink> Transaction<S> {
     /// otherwise only when the caller is neither in the group nor holds
     /// `CAP_FSETID`; the writer has no caller, so the bit goes in both cases,
     /// as it would for an unprivileged caller. A directory keeps both bits.
-    /// `ATTR_KILL_PRIV`, which removes `security.capability`, belongs to the
-    /// extended attribute work (lexoliu/helios#1041).
+    ///
+    /// `chown_common` asks for `ATTR_KILL_PRIV` on a non-directory as well,
+    /// which `notify_change` carries to `security_inode_killpriv` and
+    /// `cap_inode_killpriv` (security/commoncap.c): `security.capability`
+    /// goes with the old owner ([`Self::kill_privileges`]).
     pub(crate) async fn set_owner(
         &mut self,
         tree: u64,
@@ -66,6 +77,7 @@ impl<S: BlockSink> Transaction<S> {
         let (mut raw, metadata) = self.inode_item(tree, inode).await?;
         check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
         let changed = time(tree, inode, changed)?;
+        self.kill_privileges(tree, inode).await?;
         if let Some(uid) = uid {
             raw.uid.set(uid);
         }

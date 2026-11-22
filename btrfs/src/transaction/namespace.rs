@@ -7,6 +7,7 @@ use helios_hal::fs::RenameMode;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
+use super::ownership::{S_IFDIR, S_IFMT, S_ISGID};
 use crate::csum::{inode_ref_hash, name_hash};
 use crate::items::{INODE_APPEND, INODE_IMMUTABLE, RecordKind, dir_index_record, dir_records};
 use crate::ondisk::{
@@ -30,6 +31,9 @@ pub(crate) struct Attributes {
     pub(crate) gid: u32,
     /// The inode item's `rdev`: a device node's number, zero otherwise.
     pub(crate) rdev: u64,
+    /// The creating process's umask, which `posix_acl_create` applies when
+    /// the parent directory has no default ACL.
+    pub(crate) umask: u32,
 }
 
 fn validate_name(name: &[u8]) -> Result<(), WriteError> {
@@ -123,7 +127,7 @@ impl<S: BlockSink> Transaction<S> {
             )
             .await?;
         self.roots.set(root)?;
-        if raw.mode.get() & 0o170_000 == 0o040_000 {
+        if raw.mode.get() & S_IFMT == S_IFDIR {
             self.roots.directory_size(tree, inode, raw.size.get())?;
         }
         Ok(())
@@ -159,6 +163,33 @@ impl<S: BlockSink> Transaction<S> {
         when: Timestamp,
     ) -> Result<u64, WriteError> {
         validate_name(name.bytes)?;
+        let (_, parent) = self.inode_item(name.tree, name.parent).await?;
+        if parent.kind != FileKind::Directory {
+            return Err(Error::WrongKind {
+                tree: name.tree,
+                inode: name.parent,
+                expected: FileKind::Directory,
+                found: parent.kind,
+            }
+            .into());
+        }
+        // `btrfs_new_inode_prepare` (`fs/btrfs/inode.c` in torvalds/linux) runs
+        // `posix_acl_create` first, then `btrfs_create_new_inode` calls
+        // `inode_init_owner` (`fs/inode.c`): under a directory with `S_ISGID`,
+        // the new inode takes the directory's group, and a directory inherits
+        // `S_ISGID` as well.
+        let mut mode = attributes.mode;
+        let inherited = self
+            .inherit_acls(name.tree, name.parent, &mut mode, attributes.umask)
+            .await?;
+        let gid = if parent.permissions & S_ISGID != 0 {
+            if mode & S_IFMT == S_IFDIR {
+                mode |= S_ISGID;
+            }
+            parent.gid
+        } else {
+            attributes.gid
+        };
         let tree = name.tree;
         let next = if let Some(last) = self.inode_high_water.get(&tree) {
             last.checked_add(1)
@@ -184,9 +215,9 @@ impl<S: BlockSink> Transaction<S> {
         let mut raw = RawInodeItem::new_zeroed();
         raw.generation.set(self.trees.generation());
         raw.transid.set(self.trees.generation());
-        raw.mode.set(attributes.mode);
+        raw.mode.set(mode);
         raw.uid.set(attributes.uid);
-        raw.gid.set(attributes.gid);
+        raw.gid.set(gid);
         raw.rdev.set(attributes.rdev);
         raw.atime = timestamp;
         raw.ctime = timestamp;
@@ -198,6 +229,7 @@ impl<S: BlockSink> Transaction<S> {
             defect,
         })?;
         self.attach(name, inode, raw, metadata.kind, when).await?;
+        self.store_inherited(tree, inode, inherited).await?;
         Ok(inode)
     }
 
