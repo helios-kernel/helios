@@ -2634,7 +2634,7 @@ fn build_environment(
             environment.push(("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1".to_owned()));
         }
     } else {
-        environment.push(("CARGO_PROFILE_DEV_OPT_LEVEL", "z".to_owned()));
+        environment.push(("CARGO_PROFILE_DEV_OPT_LEVEL", "1".to_owned()));
         environment.push(("CARGO_PROFILE_DEV_DEBUG", "0".to_owned()));
         environment.push(("CARGO_PROFILE_DEV_PANIC", "abort".to_owned()));
     }

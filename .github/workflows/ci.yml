@@ -352,7 +352,7 @@ jobs:
       - name: Install host dependencies
         uses: ./helios/.github/actions/install-apt-packages
         with:
-          packages: libudev-dev cmake ninja-build
+          packages: cmake ninja-build
       # Each program's wasm, kept with the files its build read (#1022): a
       # program none of whose inputs changed is taken from the cache
       # instead of built. The key carries the run id so that each
