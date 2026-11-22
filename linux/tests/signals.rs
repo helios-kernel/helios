@@ -36,6 +36,7 @@ const ESRCH: u64 = 3;
 const EINTR: u64 = 4;
 const EAGAIN: u64 = 11;
 const ENOMEM: u64 = 12;
+const EFAULT: u64 = 14;
 const EPIPE: u64 = 32;
 
 fn err(code: u64) -> u64 {
@@ -907,6 +908,27 @@ fn timers_alarm_itimer_and_pipe_sigpipe() {
     // Reloaded for +50ms.
     let (next_deadline, _) = proc.process_signals().next_real_timer_deadline().unwrap();
     assert_eq!(next_deadline, 2_270_000_000);
+
+    // Unwritable `old_value` must fail with EFAULT without mutating the armed timer.
+    let before_fault = proc.process_signals().next_real_timer_deadline().unwrap();
+    mem.write_u64(0x10_0108, 0);
+    mem.write_u64(0x10_0118, 0);
+    assert_eq!(
+        call_now(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Setitimer,
+            [0, 0x10_0100, 0x1, 0, 0, 0],
+            &mut mem,
+            &mut thread,
+            &mut platform
+        ),
+        SyscallOutcome::Return(err(EFAULT))
+    );
+    assert_eq!(
+        proc.process_signals().next_real_timer_deadline(),
+        Some(before_fault)
+    );
 
     // ITIMER_VIRTUAL and ITIMER_PROF fire when CPU time is accounted.
     mem.write_u64(0x10_0108, 0);

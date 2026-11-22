@@ -483,7 +483,7 @@ unsafe impl UserContext for X86Context {
             return Err(NativeError::Register);
         };
         let size = self._user_xstate.layout.size();
-        if bytes.len() < FXSAVE_BYTES || bytes.len() > size {
+        if (bytes.len() != FXSAVE_BYTES && bytes.len() < XSAVE_HEADER_END) || bytes.len() > size {
             return Err(NativeError::Register);
         }
         if bytes.len() >= XSAVE_HEADER_END {

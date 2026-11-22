@@ -1578,6 +1578,9 @@ pub(super) fn setitimer<M: UserMemory, C: Clock>(
     let Some((new_interval_ns, new_value_ns)) = decode_itimerval(&raw) else {
         return errno(EINVAL);
     };
+    if old_ptr != 0 && memory.check_writable(old_ptr, ITIMERVAL_BYTES).is_err() {
+        return errno(EFAULT);
+    }
 
     let now = clock.now_nanos();
     let old = {

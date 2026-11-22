@@ -66,6 +66,7 @@ const X86_UC_FP_XSTATE: u64 = 1;
 const X86_FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
 const X86_FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
 const X86_FXSAVE_SIZE: usize = 512;
+const X86_XSAVE_HEADER_END: usize = 576;
 const X86_SW_RESERVED_OFFSET: usize = 464;
 const X86_UC_FLAGS_OFFSET: usize = 0;
 const X86_UC_LINK_OFFSET: usize = 8;
@@ -629,7 +630,7 @@ fn restore_x86_64_frame<C: UserContext, M: UserMemory>(
         let xstate_bytes = if magic1 == X86_FP_XSTATE_MAGIC1 {
             let xstate_size = read_u32(&legacy, X86_SW_RESERVED_OFFSET + 16) as usize;
             let extended_size = read_u32(&legacy, X86_SW_RESERVED_OFFSET + 4) as usize;
-            if xstate_size < X86_FXSAVE_SIZE
+            if (xstate_size != X86_FXSAVE_SIZE && xstate_size < X86_XSAVE_HEADER_END)
                 || extended_size < xstate_size + 4
                 || xstate_size > 16384
             {
@@ -1186,6 +1187,61 @@ mod tests {
         assert_eq!(ctx.pc, original.pc);
         assert_eq!(ctx.flags, original.flags);
         assert_eq!(ctx.ext, original.ext);
+    }
+
+    #[test]
+    fn x86_64_signal_frame_rejects_partial_xsave_header_size() {
+        let mut memory = FlatMemory::new(0x10_0000, 0x1_0000);
+        let mut ctx = FakeContext::new_x86(0x10_8000, 0x40_1234);
+        setup_signal_frame(
+            &mut ctx,
+            &mut memory,
+            FrameDeliveryInput {
+                abi: Abi::X86_64,
+                info: SigInfo::from_kill(Signal::SIGUSR1, 1, 0),
+                handler: 0x40_5000,
+                restorer: 0x40_6000,
+                flags: SA_SIGINFO | SA_RESTORER,
+                saved_mask: SignalSet::EMPTY,
+                altstack: SigAltStack::disabled(),
+                sigreturn_trampoline: 0,
+                fault_address: 0,
+            },
+        )
+        .unwrap();
+        let frame_sp = ctx.register(RegisterId::X86Gpr(4)).unwrap();
+        let uc_addr = frame_sp + X86_FRAME_UC_OFFSET as u64;
+        let mut fp_ptr_bytes = [0u8; 8];
+        memory
+            .read(
+                uc_addr + (X86_UC_MCONTEXT_OFFSET + 23 * 8) as u64,
+                &mut fp_ptr_bytes,
+            )
+            .unwrap();
+        let fpstate_addr = u64::from_le_bytes(fp_ptr_bytes);
+        // Tamper `_fpx_sw_bytes.xstate_size` to 540 (strictly between 512 and 576)
+        // with matching `extended_size = 544` and `FP_XSTATE_MAGIC2` at +540.
+        memory
+            .write(
+                fpstate_addr + (X86_SW_RESERVED_OFFSET + 4) as u64,
+                &544_u32.to_le_bytes(),
+            )
+            .unwrap();
+        memory
+            .write(
+                fpstate_addr + (X86_SW_RESERVED_OFFSET + 16) as u64,
+                &540_u32.to_le_bytes(),
+            )
+            .unwrap();
+        memory
+            .write(fpstate_addr + 540, &X86_FP_XSTATE_MAGIC2.to_le_bytes())
+            .unwrap();
+        ctx.set_register(RegisterId::X86Gpr(4), frame_sp + 8)
+            .unwrap();
+        assert_eq!(
+            restore_signal_frame(Abi::X86_64, &mut ctx, &memory),
+            Err(SignalFrameError::InvalidExtendedState)
+        );
     }
 
     #[test]
