@@ -912,7 +912,7 @@ fn quota_groups_lifecycle_limits_and_remount() {
                 .write_file(&f2, 0, &vec![0x22; 65536], WHEN)
                 .await
                 .unwrap_err();
-            assert!(matches!(err, WriteError::QuotaExceeded { .. }));
+            assert!(matches!(err, WriteError::QuotaExceeded));
         }
 
         // Remount writable and verify quota tree loads cleanly.
