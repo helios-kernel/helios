@@ -133,4 +133,4 @@ RUN set -eu; \
     uv --version; \
     zig version; \
     mkfs.btrfs --version; \
-    mkfs.erofs --version
+    command -v mkfs.erofs
