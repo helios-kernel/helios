@@ -16,5 +16,5 @@ runs:
       with:
         repository: lexoliu/wasmtime
         # Branch `helios/sync-main-52`.
-        ref: 83843e3ad9613bf4d9f5a860ef8bb5aa5d9a9de5
+        ref: 56131f786d90a136fec6e80e143de18e5b38e8de
         path: ${{ inputs.path }}

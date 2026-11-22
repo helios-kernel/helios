@@ -8,8 +8,15 @@ at `../wasmtime/crates/wasmtime`.
 The local checkout must be at (branch `helios/sync-main-52`):
 
 ```text
-83843e3ad9613bf4d9f5a860ef8bb5aa5d9a9de5
+56131f786d90a136fec6e80e143de18e5b38e8de
 ```
+
+`56131f786d90a136fec6e80e143de18e5b38e8de` cherry-picks upstream
+`bytecodealliance/wasmtime#15350` (`6f943d5b0a`, "deliver `dropped` events as
+appropriate for host-written streams") onto
+`83843e3ad9613bf4d9f5a860ef8bb5aa5d9a9de5`, moving `dropped: bool` into
+`ProducerState<P, B>` inside `LockedState` so host-produced streams do not lose
+their dropped state across buffered reads (#1148).
 
 `helios/sync-main-52` replays the 32 surviving Helios fork commits from
 `helios/caller-memory` (`5048e15b9626f0382e9a5df653668a0d44b017ed`) onto
@@ -20,7 +27,7 @@ already includes bytecodealliance/wasmtime#13949 / `fb8c7616d6` from
 (`a34ece0e5a` via #14524, `18b428e6be` via #14193, and the `custom/vm.rs`
 `decommit_pages` and `decommit_queue.rs` `std::io` hunks via #14774 and #14874).
 
-Its tip commit tells a host function the linear memory of the call it is serving:
+Commit `83843e3ad9` tells a host function the linear memory of the call it is serving:
 
 - `Access::caller_memory()` returns the memory named by the `canon lower`
   options the guest called through: the calling subcomponent's own memory.
@@ -376,7 +383,7 @@ The x86 backend preserves no vector state beyond FXSAVE at interrupts and the
 `preserve_all` trampoline's 128-bit xmm0-xmm15 save at stack-limit checks
 (`x86/src/extended_state.rs`). That is sound only while the fork's x64
 Cranelift backend keeps three properties, which hold at
-`83843e3ad9613bf4d9f5a860ef8bb5aa5d9a9de5` and which every move of the fork
+`56131f786d90a136fec6e80e143de18e5b38e8de` and which every move of the fork
 must keep:
 
 - **A, 128-bit only.** Every EVEX instruction in the assembler is declared
