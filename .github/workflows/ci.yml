@@ -341,7 +341,7 @@ jobs:
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'debug')
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/lexoliu/helios-ci:0522c305e9bd4841b6cf1024d3cb2208bfa2cbecd7f86ce1fb140272509222b5
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
     timeout-minutes: 15
     strategy:
       matrix:
@@ -403,9 +403,9 @@ jobs:
         working-directory: helios
         run: >-
           "$HELIOS_CLI_BIN"
-          wasm-build --out-dir ${{ runner.temp }}/wasm-programs
+          wasm-build --out-dir "${RUNNER_TEMP}/wasm-programs"
           --profile ${{ matrix.profile }} --cargo cargo
-          --cache-dir ${{ github.workspace }}/wasm-cache
+          --cache-dir "${GITHUB_WORKSPACE}/wasm-cache"
       - uses: actions/upload-artifact@v4
         with:
           name: helios-wasm-${{ matrix.profile }}
@@ -425,7 +425,7 @@ jobs:
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'release')
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/lexoliu/helios-ci:0522c305e9bd4841b6cf1024d3cb2208bfa2cbecd7f86ce1fb140272509222b5
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
     timeout-minutes: 15
     strategy:
       matrix:
@@ -440,7 +440,7 @@ jobs:
     runs-on: ubuntu-24.04
     # `test-libraries` runs `just test-btrfs-mkfs` which uses `sudo mount -o loop`.
     container:
-      image: ghcr.io/lexoliu/helios-ci:0522c305e9bd4841b6cf1024d3cb2208bfa2cbecd7f86ce1fb140272509222b5
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
       options: --privileged
     timeout-minutes: 15
     permissions:
@@ -544,7 +544,7 @@ jobs:
     if: needs.changes.outputs.tests != '[]'
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/lexoliu/helios-ci:0522c305e9bd4841b6cf1024d3cb2208bfa2cbecd7f86ce1fb140272509222b5
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
     timeout-minutes: 15
     permissions:
       contents: read
