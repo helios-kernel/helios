@@ -754,10 +754,12 @@ fn private_and_shared_mounts_distinguish_container_views_and_capabilities() {
             assert!(!grant.flags().honours_exec_privileges());
             assert!(!grant.flags().opens_devices());
         }
-        let resolved = namespace.resolve("/mnt/bin-suid").expect("resolves");
-        let cap_bytes = tree.xattr(resolved.path(), "security.capability").unwrap();
-        assert_eq!(cap_bytes.as_deref(), Some(CAPABILITY));
-        assert_eq!(resolved.grant().file_capability(cap_bytes.as_deref()), None);
+        {
+            let resolved = namespace.resolve("/mnt/bin-suid").expect("resolves");
+            let cap_bytes = tree.xattr(resolved.path(), "security.capability").unwrap();
+            assert_eq!(cap_bytes.as_deref(), Some(CAPABILITY));
+            assert_eq!(resolved.grant().file_capability(cap_bytes.as_deref()), None);
+        }
         block_on(namespace.unmount(&unmount_cap("/mnt"))).expect("unmounts");
     }
 }
