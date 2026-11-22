@@ -15,13 +15,14 @@ use alloc::vec::Vec;
 
 use bytes::Bytes;
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FilledWrite, FsError, FsPath, FsResult, Metadata,
-    NodeId, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress,
+    DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FilledWrite, FsError, FsPath, FsResult,
+    Metadata, NodeId, NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition,
+    WriteProgress,
 };
 
 use crate::{
-    HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata,
-    HostWrite,
+    HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind,
+    HostMetadata, HostWrite,
 };
 
 /// The most of one host directory a listing holds in kernel memory.
@@ -129,8 +130,64 @@ where
     }
 }
 
+/// An open directory stream over a [`HostShare`].
+///
+/// 9p lists a whole directory per request, so the stream fetches the entries
+/// at open (and on `rewind`) and pages cookies over that snapshot.
+pub struct HostDir<H> {
+    fs: HostShare<H>,
+    path: OwnedFsPath,
+    entries: Vec<HostDirEntry>,
+}
+
+impl<H: HostFileSystem> DirStream for HostDir<H> {
+    async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+        let skip = usize::try_from(cookie.raw()).map_err(|_| FsError::Invalid)?;
+        let path = self.path.as_path();
+        let mut listed = Vec::new();
+        for (position, entry) in self.entries.iter().enumerate().skip(skip).take(max_entries) {
+            let kind = match entry.kind {
+                Some(kind) => kind,
+                // The host's listing did not say: its attributes do.
+                None => {
+                    let child = if path.is_root() {
+                        alloc::format!("/{}", entry.name)
+                    } else {
+                        alloc::format!("{}/{}", path.as_str(), entry.name)
+                    };
+                    let metadata = self
+                        .fs
+                        .client
+                        .stat_path(&child)
+                        .await
+                        .map_err(fs_error_from_host)?;
+                    metadata_from_host(&metadata)?.kind
+                }
+            };
+            listed.push(DirEntry {
+                name: entry.name.clone(),
+                kind,
+                inode: 0,
+                next: DirCookie::new(position as u64 + 1),
+            });
+        }
+        Ok(listed)
+    }
+
+    async fn rewind(&mut self) -> FsResult<()> {
+        self.entries = self
+            .fs
+            .client
+            .read_dir(host_path(self.path.as_path()), HOST_DIRECTORY_LIMIT)
+            .await
+            .map_err(fs_error_from_host)?;
+        Ok(())
+    }
+}
+
 impl<H: HostFileSystem> FileSystem for HostShare<H> {
     type Write = HostShareWrite<H::Write>;
+    type Dir = HostDir<H>;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         let metadata = self
@@ -228,47 +285,17 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
             .map_err(fs_error_from_host)
     }
 
-    async fn read_dir(
-        &self,
-        path: FsPath<'_>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> FsResult<Vec<DirEntry>> {
-        // 9p lists a whole directory per request; the cookie is the
-        // position in that listing.
-        let skip = usize::try_from(cookie.raw()).map_err(|_| FsError::Invalid)?;
+    async fn open_dir(&self, path: FsPath<'_>) -> FsResult<HostDir<H>> {
         let entries = self
             .client
             .read_dir(host_path(path), HOST_DIRECTORY_LIMIT)
             .await
             .map_err(fs_error_from_host)?;
-        let mut listed = Vec::new();
-        for (position, entry) in entries.into_iter().enumerate().skip(skip).take(max_entries) {
-            let kind = match entry.kind {
-                Some(kind) => kind,
-                // The host's listing did not say: its attributes do.
-                None => {
-                    let child = if path.is_root() {
-                        alloc::format!("/{}", entry.name)
-                    } else {
-                        alloc::format!("{}/{}", path.as_str(), entry.name)
-                    };
-                    let metadata = self
-                        .client
-                        .stat_path(&child)
-                        .await
-                        .map_err(fs_error_from_host)?;
-                    metadata_from_host(&metadata)?.kind
-                }
-            };
-            listed.push(DirEntry {
-                name: entry.name,
-                kind,
-                inode: 0,
-                next: DirCookie::new(position as u64 + 1),
-            });
-        }
-        Ok(listed)
+        Ok(HostDir {
+            fs: self.clone(),
+            path: OwnedFsPath::from(path),
+            entries,
+        })
     }
 
     async fn create_directory(&self, path: FsPath<'_>, _now: u64) -> FsResult<()> {

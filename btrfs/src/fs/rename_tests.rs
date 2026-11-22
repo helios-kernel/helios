@@ -4,8 +4,11 @@
 
 extern crate std;
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::ControlFlow;
 
 use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
@@ -20,7 +23,7 @@ use crate::transaction::Transaction;
 use crate::transaction::file::WriteOptions;
 use crate::transaction::namespace::{Attributes, Name};
 use crate::tree::write::WriteError;
-use crate::{FileKind, Timestamp as When};
+use crate::{DirBound, DirPosition, Error, FileKind, Timestamp as When};
 
 const WHEN: When = When {
     seconds: 1_700_000_100,
@@ -438,6 +441,221 @@ fn 存在しない名前との交換はenoentになりinvalidな交換はeinval�
         commit(&mut image.writer, image.named.path(), &mut |_| {}).await;
         assert_eq!(image.stat("/outer/inner").await.0, inner);
         assert_eq!(image.read("/file").await, b"x");
+    });
+}
+
+#[test]
+fn bounded_readdir_terminates_when_entries_are_renamed_during_iteration() {
+    use crate::write::{Attributes as PublicAttributes, Name as PublicName};
+
+    block_on(async {
+        let mut image = Image::new().await;
+        let attrs = PublicAttributes {
+            permissions: 0o755,
+            uid: 1000,
+            gid: 1000,
+            umask: 0,
+        };
+        let file_attrs = PublicAttributes {
+            permissions: 0o644,
+            uid: 1000,
+            gid: 1000,
+            umask: 0,
+        };
+        let (empty_dir, file, dir, mut expected) = {
+            let mut tx = image.writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let empty_dir = tx
+                .create_directory(
+                    PublicName {
+                        parent: &root,
+                        bytes: b"empty",
+                    },
+                    attrs,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+            let file = tx
+                .create_file(
+                    PublicName {
+                        parent: &root,
+                        bytes: b"regular",
+                    },
+                    file_attrs,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+            let dir = tx
+                .create_directory(
+                    PublicName {
+                        parent: &root,
+                        bytes: b"dir",
+                    },
+                    attrs,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+            let mut expected = Vec::new();
+            for name_str in ["文件", "ファイル", "파일"] {
+                tx.create_file(
+                    PublicName {
+                        parent: &dir,
+                        bytes: name_str.as_bytes(),
+                    },
+                    file_attrs,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+                expected.push(String::from(name_str));
+            }
+            for i in 0..64 {
+                let entry_name = format!("entry-{i:03}");
+                tx.create_file(
+                    PublicName {
+                        parent: &dir,
+                        bytes: entry_name.as_bytes(),
+                    },
+                    file_attrs,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+                expected.push(entry_name);
+            }
+            (empty_dir, file, dir, expected)
+        };
+
+        let snapshot = image.writer.snapshot().unwrap();
+        let file_inode = snapshot.inode(file.tree(), file.number()).await.unwrap();
+        assert!(matches!(
+            snapshot.dir_bound(&file_inode).await,
+            Err(Error::WrongKind {
+                expected: FileKind::Directory,
+                ..
+            })
+        ));
+
+        // An empty directory records `DirBound::EMPTY`; files added afterwards
+        // are not listed until the bound is refreshed.
+        let empty_inode = snapshot
+            .inode(empty_dir.tree(), empty_dir.number())
+            .await
+            .unwrap();
+        let empty_bound = snapshot.dir_bound(&empty_inode).await.unwrap();
+        assert_eq!(empty_bound, DirBound::EMPTY);
+        {
+            let mut tx = image.writer.join().await.unwrap();
+            tx.create_file(
+                PublicName {
+                    parent: &empty_dir,
+                    bytes: b"later",
+                },
+                file_attrs,
+                WHEN,
+            )
+            .await
+            .unwrap();
+        }
+        let snapshot = image.writer.snapshot().unwrap();
+        let empty_inode = snapshot
+            .inode(empty_dir.tree(), empty_dir.number())
+            .await
+            .unwrap();
+        let mut count = 0;
+        let next = snapshot
+            .read_dir(&empty_inode, DirPosition::START, empty_bound, |_| {
+                count += 1;
+                ControlFlow::Continue(())
+            })
+            .await
+            .unwrap();
+        assert_eq!((count, next), (0, None));
+        let refreshed = snapshot.dir_bound(&empty_inode).await.unwrap();
+        assert_ne!(refreshed, DirBound::EMPTY);
+        let mut refreshed_names = Vec::new();
+        snapshot
+            .read_dir(&empty_inode, DirPosition::START, refreshed, |entry| {
+                refreshed_names.push(String::from_utf8(entry.name.to_vec()).unwrap());
+                ControlFlow::Continue(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(refreshed_names, ["later"]);
+
+        // Capture the upper DIR_INDEX bound before iterating `dir`, then rename
+        // every yielded entry (`entry -> TEMPFILE -> entry`) across batches.
+        let dir_inode = snapshot.inode(dir.tree(), dir.number()).await.unwrap();
+        let bound = snapshot.dir_bound(&dir_inode).await.unwrap();
+        let mut seen = Vec::new();
+        let mut cursor = DirPosition::START;
+        let safety_cap = expected.len() * 3;
+        loop {
+            let snapshot = image.writer.snapshot().unwrap();
+            let dir_inode = snapshot.inode(dir.tree(), dir.number()).await.unwrap();
+            let mut batch = Vec::new();
+            let mut resume = None;
+            snapshot
+                .read_dir(&dir_inode, cursor, bound, |entry| {
+                    if batch.len() == 4 {
+                        return ControlFlow::Break(());
+                    }
+                    batch.push((
+                        String::from_utf8(entry.name.to_vec()).unwrap(),
+                        entry.position,
+                    ));
+                    resume = Some(DirPosition(entry.position.0 + 1));
+                    ControlFlow::Continue(())
+                })
+                .await
+                .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for (entry_name, _) in &batch {
+                let mut tx = image.writer.join().await.unwrap();
+                tx.rename(
+                    PublicName {
+                        parent: &dir,
+                        bytes: entry_name.as_bytes(),
+                    },
+                    PublicName {
+                        parent: &dir,
+                        bytes: b"TEMPFILE",
+                    },
+                    Replace,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+                tx.rename(
+                    PublicName {
+                        parent: &dir,
+                        bytes: b"TEMPFILE",
+                    },
+                    PublicName {
+                        parent: &dir,
+                        bytes: entry_name.as_bytes(),
+                    },
+                    Replace,
+                    WHEN,
+                )
+                .await
+                .unwrap();
+                seen.push(entry_name.clone());
+                assert!(
+                    seen.len() <= safety_cap,
+                    "bounded readdir looped past safety cap ({safety_cap})"
+                );
+            }
+            cursor = resume.unwrap();
+        }
+        seen.sort();
+        expected.sort();
+        assert_eq!(seen, expected);
     });
 }
 

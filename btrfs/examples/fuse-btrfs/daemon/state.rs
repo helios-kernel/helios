@@ -6,6 +6,7 @@
 //! transaction commits on `fsync`, `fsyncdir` and unmount, and when its dirty
 //! metadata reaches Linux's bound.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
@@ -14,14 +15,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, TimeOrNow};
+use fuser::{Errno, FileAttr, FileHandle, FileType, Generation, INodeNo, TimeOrNow};
 use futures_lite::future::block_on;
 use helios_btrfs::write::{
     Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, WriteOptions, Writer,
     XattrMode,
 };
 use helios_btrfs::{
-    DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
+    DirBound, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
 };
 use helios_hal::fs::RenameMode;
 
@@ -82,6 +83,12 @@ pub struct Statfs {
 pub struct State {
     writer: Writer<Device, RandomUuids>,
     inodes: Inodes,
+    /// Upper `DIR_INDEX` bound per open directory stream (`opendir` ..
+    /// `releasedir`), following Linux's `btrfs_opendir` and `btrfs_real_readdir`
+    /// (`fs/btrfs/inode.c`, commit `9b378f6ad48c`, refreshed on rewind as
+    /// commit `fd968e683bd9`).
+    open_dirs: HashMap<u64, DirBound>,
+    next_dir_handle: u64,
     concurrency: NonZeroUsize,
     read_only: bool,
 }
@@ -106,6 +113,8 @@ impl State {
         Ok(Self {
             writer,
             inodes: Inodes::new(identity, root.metadata().generation, handle),
+            open_dirs: HashMap::new(),
+            next_dir_handle: 1,
             concurrency,
             read_only,
         })
@@ -332,16 +341,54 @@ impl State {
         Ok(data)
     }
 
-    /// Hands the entries of directory `ino` after cookie `offset` to `emit`
-    /// until it returns true, meaning its reply is full.
+    /// Opens a directory stream and records its upper `DIR_INDEX` bound as of
+    /// open time (`btrfs_opendir` in Linux `fs/btrfs/inode.c`, commit
+    /// `9b378f6ad48c`).
+    pub async fn opendir(&mut self, ino: INodeNo) -> Result<FileHandle, Errno> {
+        let snapshot = self.snapshot()?;
+        let directory = self.open_inode(&snapshot, ino).await?;
+        let bound = snapshot
+            .dir_bound(&directory)
+            .await
+            .map_err(|error| read_errno(&error))?;
+        let handle = self.next_dir_handle;
+        self.next_dir_handle += 1;
+        self.open_dirs.insert(handle, bound);
+        Ok(FileHandle(handle))
+    }
+
+    /// Releases a directory stream opened by [`Self::opendir`].
+    pub fn releasedir(&mut self, fh: FileHandle) {
+        self.open_dirs.remove(&fh.0);
+    }
+
+    /// Hands the entries of directory `ino` after cookie `offset` up to the
+    /// open stream's upper `DIR_INDEX` bound to `emit` until it returns true,
+    /// meaning its reply is full.
     pub async fn readdir(
         &mut self,
         ino: INodeNo,
+        fh: FileHandle,
         offset: u64,
         mut emit: impl FnMut(INodeNo, u64, FileType, &OsStr) -> bool,
     ) -> Result<(), Errno> {
         let snapshot = self.snapshot()?;
         let directory = self.open_inode(&snapshot, ino).await?;
+        let bound = if offset == 0 {
+            // Refresh the upper `DIR_INDEX` bound at position 0 so
+            // `rewinddir(3)` sees entries added since `opendir` (Linux
+            // `fs/btrfs/inode.c`, commit `fd968e683bd9`): Linux FUSE handles
+            // `lseek(dirfd, 0, SEEK_SET)` in the VFS without sending a request
+            // to the daemon.
+            let bound = snapshot
+                .dir_bound(&directory)
+                .await
+                .map_err(|error| read_errno(&error))?;
+            *self.open_dirs.get_mut(&fh.0).ok_or(Errno::EBADF)? = bound;
+            bound
+        } else {
+            self.open_dirs.get(&fh.0).copied().ok_or(Errno::EBADF)?
+        };
         // The format stores neither `.` nor `..`; the kernel reports both.
         // The parent is not recorded, so `..` carries the directory's own number.
         for (cookie, name) in [(1, "."), (2, "..")] {
@@ -355,6 +402,7 @@ impl State {
             .read_dir(
                 &directory,
                 DirPosition(offset.saturating_sub(DOT_COOKIES)),
+                bound,
                 |entry| {
                     let identity = match entry.target {
                         EntryTarget::Inode(number) => Identity { tree, number },

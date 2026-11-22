@@ -2608,7 +2608,7 @@ mod tests {
     use crate::test_support::ManualClockCpu;
     use core::pin::pin;
     use futures_lite::future::{block_on, poll_once, zip};
-    use helios_hal::fs::{DirCookie, FileSystem, FsError, FsPath, OpenFlags};
+    use helios_hal::fs::{DirCookie, DirStream, FileSystem, FsError, FsPath, OpenFlags};
 
     #[test]
     fn p9_setattr_times_uses_specific_timestamp_flags() {
@@ -4601,8 +4601,8 @@ mod tests {
         );
         let share = HostShare::new(client);
 
-        let entries = block_on(share.read_dir(FsPath::ROOT, DirCookie::new(0), 64))
-            .expect("the directory lists");
+        let dir = block_on(share.open_dir(FsPath::ROOT)).expect("the directory opens");
+        let entries = block_on(dir.read(DirCookie::new(0), 64)).expect("the directory lists");
 
         let listed: Vec<(&str, NodeKind)> = entries
             .iter()

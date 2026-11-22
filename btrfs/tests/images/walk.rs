@@ -3,7 +3,7 @@
 
 use core::ops::ControlFlow;
 
-use helios_btrfs::{DirPosition, EntryTarget, Error, FileKind, Filesystem};
+use helios_btrfs::{DirBound, DirPosition, EntryTarget, Error, FileKind, Filesystem};
 
 use crate::fixture::{SparseImage, block_on, read_all};
 
@@ -37,10 +37,12 @@ pub fn walk(fs: &Filesystem<SparseImage>) -> Result<Census, Error> {
             FileKind::Directory => {
                 census.directories += 1;
                 let mut entries = Vec::new();
-                block_on(fs.read_dir(&inode, DirPosition::START, |entry| {
-                    entries.push((entry.name.to_vec(), entry.kind, entry.target));
-                    ControlFlow::Continue(())
-                }))?;
+                block_on(
+                    fs.read_dir(&inode, DirPosition::START, DirBound::UNBOUNDED, |entry| {
+                        entries.push((entry.name.to_vec(), entry.kind, entry.target));
+                        ControlFlow::Continue(())
+                    }),
+                )?;
                 for (name, kind, target) in entries {
                     let child = block_on(fs.lookup(&inode, &name))?
                         .expect("a listed name is found by lookup");

@@ -73,8 +73,8 @@ use bytes::{Bytes, BytesMut};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FilledWrite, FsError, FsPath,
-    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition,
+    DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FileSystemRights, FilledWrite, FsError,
+    FsPath, FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition,
     WriteProgress,
 };
 use thiserror::Error;
@@ -122,6 +122,7 @@ macro_rules! mount_kinds {
 
         impl<S: Storage> FileSystem for MountedFs<S> {
             type Write = MountedWrite<S>;
+            type Dir = MountedDir<S>;
 
             async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
                 match self { $(Self::$kind(fs) => fs.stat(path).await,)+ }
@@ -172,13 +173,10 @@ macro_rules! mount_kinds {
                 }
             }
 
-            async fn read_dir(
-                &self,
-                path: FsPath<'_>,
-                cookie: DirCookie,
-                max_entries: usize,
-            ) -> FsResult<Vec<DirEntry>> {
-                match self { $(Self::$kind(fs) => fs.read_dir(path, cookie, max_entries).await,)+ }
+            async fn open_dir(&self, path: FsPath<'_>) -> FsResult<MountedDir<S>> {
+                match self {
+                    $(Self::$kind(fs) => fs.open_dir(path).await.map(MountedDir::$kind),)+
+                }
             }
 
             async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -227,6 +225,21 @@ macro_rules! mount_kinds {
         /// A write staged by whichever kind a [`MountedFs`] holds.
         pub enum MountedWrite<S: Storage> {
             $($kind(<$fs as FileSystem>::Write),)+
+        }
+
+        /// A directory stream opened by whichever kind a [`MountedFs`] holds.
+        pub enum MountedDir<S: Storage> {
+            $($kind(<$fs as FileSystem>::Dir),)+
+        }
+
+        impl<S: Storage> DirStream for MountedDir<S> {
+            async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+                match self { $(Self::$kind(dir) => dir.read(cookie, max_entries).await,)+ }
+            }
+
+            async fn rewind(&mut self) -> FsResult<()> {
+                match self { $(Self::$kind(dir) => dir.rewind().await,)+ }
+            }
         }
 
         impl<S: Storage> PreparedWrite for MountedWrite<S> {
@@ -1307,13 +1320,11 @@ impl<S: Storage> Namespace<S> {
         /// Entries one listing request asks for.
         const BATCH: usize = 256;
         let resolved = self.resolve(absolute)?;
+        let dir = resolved.fs().open_dir(resolved.path()).await?;
         let mut entries: Vec<DirEntry> = Vec::new();
         let mut cookie = DirCookie::START;
         loop {
-            let batch = resolved
-                .fs()
-                .read_dir(resolved.path(), cookie, BATCH)
-                .await?;
+            let batch = dir.read(cookie, BATCH).await?;
             let complete = batch.len() < BATCH;
             if let Some(last) = batch.last() {
                 cookie = last.next;

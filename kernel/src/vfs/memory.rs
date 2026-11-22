@@ -30,8 +30,9 @@ use core::ops::Bound;
 use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeId,
-    NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition, WriteProgress,
+    DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError, FsPath, FsResult, Landed,
+    Metadata, NodeId, NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition,
+    WriteProgress,
 };
 use spin::Mutex;
 use triomphe::Arc;
@@ -665,8 +666,53 @@ impl MemoryFs {
     }
 }
 
+/// An open directory stream over a [`MemoryFs`].
+pub struct MemoryDir {
+    fs: MemoryFs,
+    path: OwnedFsPath,
+}
+
+impl DirStream for MemoryDir {
+    async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+        self.fs
+            .read_dir_at(self.path.as_path(), cookie, max_entries)
+    }
+
+    async fn rewind(&mut self) -> FsResult<()> {
+        Ok(())
+    }
+}
+
+impl MemoryFs {
+    pub(super) fn read_dir_at(
+        &self,
+        path: FsPath<'_>,
+        cookie: DirCookie,
+        max_entries: usize,
+    ) -> FsResult<Vec<DirEntry>> {
+        let state = self.state.lock();
+        if state.inode(path)?.1.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let skip = usize::try_from(cookie.raw()).map_err(|_| FsError::Invalid)?;
+        Ok(state
+            .children(path)
+            .enumerate()
+            .skip(skip)
+            .take(max_entries)
+            .map(|(position, (name, number))| DirEntry {
+                name: String::from(name),
+                kind: state.inodes[&number].kind,
+                inode: number,
+                next: DirCookie::new(position as u64 + 1),
+            })
+            .collect())
+    }
+}
+
 impl FileSystem for MemoryFs {
     type Write = MemoryWrite;
+    type Dir = MemoryDir;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.state.lock().metadata(self.device, path)
@@ -752,29 +798,15 @@ impl FileSystem for MemoryFs {
         Ok(())
     }
 
-    async fn read_dir(
-        &self,
-        path: FsPath<'_>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> FsResult<Vec<DirEntry>> {
+    async fn open_dir(&self, path: FsPath<'_>) -> FsResult<MemoryDir> {
         let state = self.state.lock();
         if state.inode(path)?.1.kind != NodeKind::Directory {
             return Err(FsError::NotDirectory);
         }
-        let skip = usize::try_from(cookie.raw()).map_err(|_| FsError::Invalid)?;
-        Ok(state
-            .children(path)
-            .enumerate()
-            .skip(skip)
-            .take(max_entries)
-            .map(|(position, (name, number))| DirEntry {
-                name: String::from(name),
-                kind: state.inodes[&number].kind,
-                inode: number,
-                next: DirCookie::new(position as u64 + 1),
-            })
-            .collect())
+        Ok(MemoryDir {
+            fs: self.clone(),
+            path: OwnedFsPath::from(path),
+        })
     }
 
     async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -861,8 +893,8 @@ mod tests {
 
     use futures_lite::future::block_on;
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind, OpenFlags,
-        PreparedWrite, RenameMode, WritePosition, WriteProgress,
+        DeviceId, DirCookie, DirStream, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind,
+        OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress,
     };
 
     use super::MemoryFs;
@@ -877,7 +909,8 @@ mod tests {
     }
 
     fn names(fs: &MemoryFs, directory: &str) -> Vec<String> {
-        block_on(fs.read_dir(path(directory), DirCookie::START, usize::MAX))
+        let dir = block_on(fs.open_dir(path(directory))).expect("opens directory");
+        block_on(dir.read(DirCookie::START, usize::MAX))
             .expect("directory lists")
             .into_iter()
             .map(|entry| entry.name)
@@ -1160,8 +1193,9 @@ mod tests {
         }
         block_on(fs.symlink("a", path("l"), 0)).expect("links");
         assert_eq!(names(&fs, ""), ["a", "c", "l"]);
-        let first = block_on(fs.read_dir(FsPath::ROOT, DirCookie::START, 1)).expect("lists");
-        let rest = block_on(fs.read_dir(FsPath::ROOT, first[0].next, 8)).expect("lists");
+        let dir = block_on(fs.open_dir(FsPath::ROOT)).expect("opens");
+        let first = block_on(dir.read(DirCookie::START, 1)).expect("lists");
+        let rest = block_on(dir.read(first[0].next, 8)).expect("lists");
         assert_eq!(rest.len(), 2);
         assert_eq!(rest[1].kind, NodeKind::Symlink);
         assert_eq!(block_on(fs.read_link(path("l"))).as_deref(), Ok("a"));
