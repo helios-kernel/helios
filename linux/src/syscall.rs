@@ -17,6 +17,8 @@ use helios_unix::{
 mod futex;
 mod io;
 mod memory;
+mod netlink;
+mod packet;
 mod process;
 mod signal;
 mod socket;
@@ -26,6 +28,8 @@ mod thread;
 pub use crate::abi::{Abi, Operation};
 pub use crate::signal_frame::SignalFrameError;
 pub use io::Clock;
+pub use netlink::{AF_NETLINK, NETLINK_ROUTE};
+pub use packet::AF_PACKET;
 pub use process::{
     AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, ExecError, ExecSpec, SpawnedProcess, VforkDone,
 };
@@ -34,7 +38,8 @@ pub use socket::{
     ConnectProgress, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EALREADY, ECONNABORTED,
     ECONNREFUSED, ECONNRESET, EDESTADDRREQ, EHOSTUNREACH, EINPROGRESS, EISCONN, EMSGSIZE, ENETDOWN,
     ENETUNREACH, ENOPROTOOPT, ENOTCONN, ENOTSOCK, EPIPE, EPROTONOSUPPORT, EPROTOTYPE, ETIMEDOUT,
-    IpAddr, Network, SocketAddr, SocketReady,
+    IpAddr, Ipv4InterfaceAddress, Ipv4RouteEntry, Network, PacketFrameData, SocketAddr,
+    SocketReady,
 };
 pub use system::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_KILL,
@@ -331,7 +336,7 @@ const EBADF: u64 = 9;
 const ENOMEM: u64 = 12;
 const EACCES: u64 = 13;
 const EFAULT: u64 = 14;
-const ENODEV: u64 = 19;
+pub const ENODEV: u64 = 19;
 const EINVAL: u64 = 22;
 const ENOTTY: u64 = 25;
 const ENOSYS: u64 = 38;
@@ -1078,17 +1083,37 @@ pub async fn dispatch<
                 .cloned();
             match entry {
                 Some(entry) => {
-                    if arguments[1] as u32 == socket::FIONBIO
-                        && let Descriptor::<R>::Socket(sock) = &entry.descriptor
-                    {
-                        let mut raw = [0u8; 4];
-                        if memory.read(arguments[2], &mut raw).is_err() {
-                            errno(EFAULT)
+                    if let Descriptor::<R>::Socket(sock) = &entry.descriptor {
+                        let req = arguments[1] as u32;
+                        if req == socket::FIONBIO {
+                            let mut raw = [0u8; 4];
+                            if memory.read(arguments[2], &mut raw).is_err() {
+                                errno(EFAULT)
+                            } else {
+                                let nb = i32::from_le_bytes(raw) != 0;
+                                sock.set_nonblocking(nb);
+                                entry.set_fdflags(if nb {
+                                    socket::SOCK_NONBLOCK as u16
+                                } else {
+                                    0
+                                });
+                                0
+                            }
                         } else {
-                            let nb = i32::from_le_bytes(raw) != 0;
-                            sock.set_nonblocking(nb);
-                            entry.set_fdflags(if nb { socket::SOCK_NONBLOCK as u16 } else { 0 });
-                            0
+                            let ctx = socket_context(process);
+                            match netlink::socket_ioctl::<R::Network, _, _>(
+                                req,
+                                arguments[2],
+                                ctx,
+                                memory,
+                                output,
+                            )
+                            .await
+                            {
+                                Ok(Some(ret)) => ret,
+                                Ok(None) => errno(ENOTTY),
+                                Err(err) => errno(err),
+                            }
                         }
                     } else {
                         errno(ENOTTY)
@@ -1186,6 +1211,7 @@ pub async fn dispatch<
         Operation::Socket => SyscallOutcome::Return(socket::socket::<R, _>(
             &process.shared.descriptors,
             arguments,
+            socket_context(process),
             output,
         )),
         Operation::Socketpair => SyscallOutcome::Return(socket::socketpair::<R, _>(
@@ -1194,7 +1220,14 @@ pub async fn dispatch<
             memory,
         )),
         Operation::Bind => SyscallOutcome::Return(
-            socket::bind::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await,
+            socket::bind::<R, _, _>(
+                &process.shared.descriptors,
+                arguments,
+                socket_context(process),
+                memory,
+                output,
+            )
+            .await,
         ),
         Operation::Listen => SyscallOutcome::Return(
             socket::listen::<R, _>(&process.shared.descriptors, arguments, output).await,
@@ -1213,34 +1246,51 @@ pub async fn dispatch<
             socket::connect::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
                 .await,
         ),
-        Operation::Getsockname => SyscallOutcome::Return(socket::getsockname::<R, _, _>(
-            &process.shared.descriptors,
-            arguments,
-            memory,
-            output,
-        )),
+        Operation::Getsockname => SyscallOutcome::Return(
+            socket::getsockname::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
         Operation::Getpeername => SyscallOutcome::Return(
             socket::getpeername::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
                 .await,
         ),
         Operation::Sendto => SyscallOutcome::Return(
-            socket::sendto::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await,
+            socket::sendto::<R, _, _>(
+                &process.shared.descriptors,
+                arguments,
+                socket_context(process),
+                memory,
+                output,
+            )
+            .await,
         ),
         Operation::Recvfrom => SyscallOutcome::Return(
             socket::recvfrom::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
                 .await,
         ),
         Operation::Sendmsg => SyscallOutcome::Return(
-            socket::sendmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
-                .await,
+            socket::sendmsg::<R, _, _>(
+                &process.shared.descriptors,
+                arguments,
+                socket_context(process),
+                memory,
+                output,
+            )
+            .await,
         ),
         Operation::Recvmsg => SyscallOutcome::Return(
             socket::recvmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
                 .await,
         ),
         Operation::Sendmmsg => SyscallOutcome::Return(
-            socket::sendmmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
-                .await,
+            socket::sendmmsg::<R, _, _>(
+                &process.shared.descriptors,
+                arguments,
+                socket_context(process),
+                memory,
+                output,
+            )
+            .await,
         ),
         Operation::Recvmmsg => SyscallOutcome::Return(
             socket::recvmmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
@@ -1341,6 +1391,15 @@ async fn read<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     io::read_resource::<R, M>(&process.signals, &entry, args, memory).await
 }
 
+fn socket_context<R: Resources>(process: &Process<R>) -> socket::SocketContext {
+    let creds = process.shared.credentials.lock();
+    socket::SocketContext {
+        pid: process.shared.identity.id().get() as u32,
+        cap_net_admin: creds.capabilities.has_effective(CAP_NET_ADMIN),
+        cap_net_raw: creds.capabilities.has_effective(CAP_NET_RAW),
+    }
+}
+
 async fn write<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     process: &Process<R>,
     args: [u64; 6],
@@ -1363,8 +1422,9 @@ async fn write<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
         if count > 0 && memory.read(args[1], &mut data).is_err() {
             return SyscallOutcome::Return(errno(EFAULT));
         }
+        let ctx = socket_context(process);
         return SyscallOutcome::Return(
-            match socket::socket_send(sock, data, 0, None, output).await {
+            match socket::socket_send(sock, data, 0, None, ctx, output).await {
                 Ok(written) => written as u64,
                 Err(err) => errno(err),
             },

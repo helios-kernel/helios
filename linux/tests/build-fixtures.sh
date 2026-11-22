@@ -22,7 +22,7 @@ done
 # memory calls; the rest are the system-information suite, one program per
 # call group, each checking its calls' results and errors against Linux's
 # behaviour.
-for program in hello-libc args memory clock random identity limits machine priority pthreads signals container sockets process; do
+for program in hello-libc args memory clock random identity limits machine priority pthreads signals container sockets netconfig process; do
     zig cc -target "$arch-linux-musl" -static -no-pie -s -O2 -Wl,--build-id=none \
         -Ilinux/tests "linux/tests/$program.c" -o "$out/linux/$program"
 done
@@ -61,6 +61,7 @@ if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     "$out/linux/machine"
     "$out/linux/container"
     "$out/linux/sockets"
+    "$out/linux/netconfig"
     "$out/linux/process"
     sh "$out/linux/check-dash.sh" "$out/linux/dash" "$out/linux/hello" "$out/linux/args" "$(command -v cat)"
 fi

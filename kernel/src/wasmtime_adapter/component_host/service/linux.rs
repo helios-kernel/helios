@@ -29,8 +29,9 @@
 
 use super::*;
 use crate::{
-    MulticastCap, PrivilegedBindCap, SetWallClockCap, TcpCap, TerminalInputCap, TerminalOutputCap,
-    UdpCap,
+    Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MulticastCap, NetworkAdminCap,
+    NetworkControlError, NetworkPortId, PrivilegedBindCap, SetWallClockCap, TcpCap,
+    TerminalInputCap, TerminalOutputCap, UdpCap,
 };
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
@@ -111,6 +112,7 @@ struct LinuxGrants {
     udp: Option<UdpCap>,
     privileged_bind: Option<PrivilegedBindCap>,
     multicast: Option<MulticastCap>,
+    network_admin: Option<NetworkAdminCap>,
 }
 
 impl LinuxGrants {
@@ -123,6 +125,7 @@ impl LinuxGrants {
             udp: authority.derive_udp_cap().ok(),
             privileged_bind: authority.derive_privileged_bind_cap().ok(),
             multicast: authority.derive_multicast_cap().ok(),
+            network_admin: authority.derive_network_admin_cap().ok(),
         }
     }
 }
@@ -1373,6 +1376,230 @@ where
             return Err(EACCES);
         }
         self.check_udp_open()
+    }
+
+    async fn interface_mac(&self) -> Result<[u8; 6], u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .mac_address(NetworkPortId::new(0))
+            .await
+            .map(crate::MacAddress::octets)
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn list_ipv4_addresses(&self) -> Result<Vec<syscall::Ipv4InterfaceAddress>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let addrs = service
+            .list_addresses(NetworkPortId::new(0))
+            .await
+            .map_err(linux_errno_from_control_error)?;
+        Ok(addrs
+            .into_iter()
+            .map(|cidr| syscall::Ipv4InterfaceAddress {
+                address: cidr.address().octets(),
+                prefix: cidr.prefix_len(),
+            })
+            .collect())
+    }
+
+    async fn add_ipv4_address(&self, address: syscall::Ipv4InterfaceAddress) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(address.address), address.prefix);
+        service
+            .add_address(NetworkPortId::new(0), cidr)
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn remove_ipv4_address(&self, address: syscall::Ipv4InterfaceAddress) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(address.address), address.prefix);
+        service
+            .remove_address(NetworkPortId::new(0), cidr)
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn list_ipv4_routes(&self) -> Result<Vec<syscall::Ipv4RouteEntry>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let routes = service
+            .list_routes(NetworkPortId::new(0))
+            .await
+            .map_err(linux_errno_from_control_error)?;
+        Ok(routes
+            .into_iter()
+            .map(|route| {
+                let gw = route.gateway().octets();
+                syscall::Ipv4RouteEntry {
+                    destination: route.destination().address().octets(),
+                    prefix: route.destination().prefix_len(),
+                    gateway: if gw == [0, 0, 0, 0] { None } else { Some(gw) },
+                }
+            })
+            .collect())
+    }
+
+    async fn add_ipv4_route(&self, route: syscall::Ipv4RouteEntry) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(route.destination), route.prefix);
+        let gw = crate::Ipv4Address::new(route.gateway.unwrap_or([0, 0, 0, 0]));
+        service
+            .add_route(NetworkPortId::new(0), KernelIpv4Route::new(cidr, gw))
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn remove_ipv4_route(&self, route: syscall::Ipv4RouteEntry) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(route.destination), route.prefix);
+        let gw = crate::Ipv4Address::new(route.gateway.unwrap_or([0, 0, 0, 0]));
+        service
+            .remove_route(NetworkPortId::new(0), KernelIpv4Route::new(cidr, gw))
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    fn check_net_admin(&self) -> Result<(), u64> {
+        const EPERM: u64 = 1;
+        if self.shared.grants.network_admin.is_none() {
+            return Err(EPERM);
+        }
+        Ok(())
+    }
+
+    fn packet_open(
+        &self,
+        protocol: u16,
+    ) -> Result<Arc<helios_unix::OwnedPacketSocket<crate::UnixNetwork<Net>>>, u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let id = service
+            .packet_open(protocol)
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(helios_unix::OwnedPacketSocket::new(
+            crate::UnixNetwork::new(service),
+            id,
+        ))
+    }
+
+    fn packet_bind(&self, socket: u64, protocol: u16, ifindex: u32) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .packet_bind(socket, protocol, ifindex)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn packet_send<'a>(
+        &'a self,
+        socket: u64,
+        ifindex: u32,
+        frame: &'a [u8],
+    ) -> Result<usize, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .packet_send(socket, ifindex, frame)
+            .await
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn packet_receive(
+        &self,
+        socket: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<syscall::PacketFrameData>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let frame = service
+            .packet_receive(socket, max_bytes, timeout_nanos, peek)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(frame.map(|f| syscall::PacketFrameData {
+            ifindex: f.ifindex,
+            protocol: f.protocol,
+            bytes: f.bytes,
+            original_len: f.original_len,
+        }))
+    }
+
+    async fn packet_readiness(&self, socket: u64) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let ready = service
+            .packet_readiness(socket)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(syscall::SocketReady {
+            readable: ready.readable,
+            writable: ready.writable,
+            hangup: ready.hangup,
+        })
+    }
+}
+
+fn linux_errno_from_control_error(error: NetworkControlError) -> u64 {
+    const EINVAL: u64 = 22;
+    const EIO: u64 = 5;
+    const EOPNOTSUPP: u64 = 95;
+    match error {
+        NetworkControlError::PortUnavailable => syscall::ENODEV,
+        NetworkControlError::BridgeUnavailable => EOPNOTSUPP,
+        NetworkControlError::InvalidBridgeRequest
+        | NetworkControlError::InvalidAddress
+        | NetworkControlError::InvalidRoute
+        | NetworkControlError::RouteTimestampOutOfRange => EINVAL,
+        NetworkControlError::BackendFault => EIO,
     }
 }
 

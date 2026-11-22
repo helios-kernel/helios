@@ -22,6 +22,7 @@ impl<Service: ComponentNetworkService> SocketNetwork for UnixNetwork<Service> {
     type TcpStream = Service::TcpStream;
     type TcpListener = Service::TcpListener;
     type UdpSocket = Service::UdpSocket;
+    type PacketSocket = u64;
 
     /// The netstack's receive window and transmit buffer, and its default
     /// hop limit.
@@ -41,6 +42,10 @@ impl<Service: ComponentNetworkService> SocketNetwork for UnixNetwork<Service> {
 
     fn udp_close(&self, socket: Self::UdpSocket) {
         self.0.udp_close(socket);
+    }
+
+    fn packet_close(&self, socket: Self::PacketSocket) {
+        self.0.packet_close(socket);
     }
 }
 

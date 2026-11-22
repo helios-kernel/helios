@@ -11,14 +11,16 @@ use alloc::vec::Vec;
 use bytes::Bytes;
 use core::future::Future;
 use helios_unix::{
-    OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, PairRecvError, Socket, SocketFamily,
-    SocketFlag, SocketKind, SocketNetwork, SocketOptionError, SocketSize, SocketTime, TcpSocket,
-    TransportProtocol, UdpSocket,
+    OwnedPacketSocket, OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, PairRecvError, Socket,
+    SocketFamily, SocketFlag, SocketKind, SocketNetwork, SocketOptionError, SocketSize, SocketTime,
+    TcpSocket, TransportProtocol, UdpSocket,
 };
 
 use super::io::descriptor_errno;
+use super::netlink::{self, AF_NETLINK, NETLINK_ROUTE};
+use super::packet::{self, AF_PACKET, SockaddrLl};
 use super::{
-    Descriptor, Descriptors, EACCES, EBADF, EFAULT, EINVAL, Entry, MAX_RW_COUNT, Process,
+    Descriptor, Descriptors, EACCES, EBADF, EFAULT, EINVAL, EPERM, Entry, MAX_RW_COUNT, Process,
     Resources, UserMemory, errno,
 };
 
@@ -31,6 +33,7 @@ pub const AF_INET6: u16 = 10;
 // Linux UAPI socket types and creation flags (`include/linux/net.h`).
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
+const SOCK_RAW: u32 = 3;
 const SOCK_TYPE_MASK: u32 = 0x0f;
 pub(crate) const SOCK_NONBLOCK: u32 = 0x0800;
 const SOCK_CLOEXEC: u32 = 0x80000;
@@ -43,9 +46,9 @@ const IPPROTO_IPV6: i32 = 41;
 
 // Linux UAPI `MSG_*` flags (`include/linux/socket.h`).
 const MSG_OOB: u32 = 0x01;
-const MSG_PEEK: u32 = 0x02;
-const MSG_TRUNC: u32 = 0x20;
-const MSG_DONTWAIT: u32 = 0x40;
+pub(crate) const MSG_PEEK: u32 = 0x02;
+pub(crate) const MSG_TRUNC: u32 = 0x20;
+pub(crate) const MSG_DONTWAIT: u32 = 0x40;
 const MSG_WAITALL: u32 = 0x100;
 const MSG_WAITFORONE: u32 = 0x10000;
 const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
@@ -73,9 +76,13 @@ const SO_RCVLOWAT: i32 = 18;
 const SO_SNDLOWAT: i32 = 19;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
+const SO_BINDTODEVICE: i32 = 25;
 const SO_ACCEPTCONN: i32 = 30;
 const SO_PROTOCOL: i32 = 38;
 const SO_DOMAIN: i32 = 39;
+
+const SOL_PACKET: i32 = 263;
+const PACKET_AUXDATA: i32 = 8;
 
 const TCP_NODELAY: i32 = 1;
 
@@ -93,6 +100,7 @@ const IPV6_V6ONLY: i32 = 26;
 
 // Linux errno values (`include/uapi/asm-generic/errno.h`).
 pub const EAGAIN: u64 = 11;
+pub const ENODEV: u64 = 19;
 pub const ESPIPE: u64 = 29;
 pub const EPIPE: u64 = 32;
 pub const ENOTSOCK: u64 = 88;
@@ -181,6 +189,38 @@ pub struct SocketReady {
     pub readable: bool,
     pub writable: bool,
     pub hangup: bool,
+}
+
+/// Process identity and Linux capability flags needed by socket operations.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SocketContext {
+    pub pid: u32,
+    pub cap_net_admin: bool,
+    pub cap_net_raw: bool,
+}
+
+/// One IPv4 address + prefix length configured on the primary interface (`eth0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipv4InterfaceAddress {
+    pub address: [u8; 4],
+    pub prefix: u8,
+}
+
+/// One IPv4 route entry in the shared kernel routing table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipv4RouteEntry {
+    pub destination: [u8; 4],
+    pub prefix: u8,
+    pub gateway: Option<[u8; 4]>,
+}
+
+/// One raw link-layer frame received on an `AF_PACKET` socket.
+#[derive(Clone, Debug)]
+pub struct PacketFrameData {
+    pub ifindex: u32,
+    pub protocol: u16,
+    pub bytes: Bytes,
+    pub original_len: usize,
 }
 
 /// Network and container-authority boundary the Linux socket syscalls call.
@@ -397,6 +437,97 @@ pub trait Network<N: SocketNetwork> {
     fn check_multicast_v6(&self) -> Result<(), u64> {
         Err(ENETDOWN)
     }
+
+    fn interface_mac(&self) -> impl Future<Output = Result<[u8; 6], u64>> + Send + '_ {
+        core::future::ready(Err(ENETDOWN))
+    }
+
+    fn list_ipv4_addresses(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Ipv4InterfaceAddress>, u64>> + Send + '_ {
+        core::future::ready(Err(ENETDOWN))
+    }
+
+    fn add_ipv4_address(
+        &self,
+        address: Ipv4InterfaceAddress,
+    ) -> impl Future<Output = Result<(), u64>> + Send + '_ {
+        let _ = address;
+        core::future::ready(Err(EPERM))
+    }
+
+    fn remove_ipv4_address(
+        &self,
+        address: Ipv4InterfaceAddress,
+    ) -> impl Future<Output = Result<(), u64>> + Send + '_ {
+        let _ = address;
+        core::future::ready(Err(EPERM))
+    }
+
+    fn list_ipv4_routes(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Ipv4RouteEntry>, u64>> + Send + '_ {
+        core::future::ready(Err(ENETDOWN))
+    }
+
+    fn add_ipv4_route(
+        &self,
+        route: Ipv4RouteEntry,
+    ) -> impl Future<Output = Result<(), u64>> + Send + '_ {
+        let _ = route;
+        core::future::ready(Err(EPERM))
+    }
+
+    fn remove_ipv4_route(
+        &self,
+        route: Ipv4RouteEntry,
+    ) -> impl Future<Output = Result<(), u64>> + Send + '_ {
+        let _ = route;
+        core::future::ready(Err(EPERM))
+    }
+
+    fn check_net_admin(&self) -> Result<(), u64> {
+        Err(EPERM)
+    }
+
+    fn packet_open(&self, protocol: u16) -> Result<Arc<OwnedPacketSocket<N>>, u64> {
+        let _ = protocol;
+        Err(EPERM)
+    }
+
+    fn packet_bind(&self, socket: N::PacketSocket, protocol: u16, ifindex: u32) -> Result<(), u64> {
+        let _ = (socket, protocol, ifindex);
+        Err(ENETDOWN)
+    }
+
+    fn packet_send<'a>(
+        &'a self,
+        socket: N::PacketSocket,
+        ifindex: u32,
+        frame: &'a [u8],
+    ) -> impl Future<Output = Result<usize, u64>> + Send + 'a {
+        let _ = (socket, ifindex, frame);
+        core::future::ready(Err(ENETDOWN))
+    }
+
+    fn packet_receive(
+        &self,
+        socket: N::PacketSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> impl Future<Output = Result<Option<PacketFrameData>, u64>> + Send + '_ {
+        let _ = (socket, max_bytes, timeout_nanos, peek);
+        core::future::ready(Err(ENETDOWN))
+    }
+
+    fn packet_readiness(
+        &self,
+        socket: N::PacketSocket,
+    ) -> impl Future<Output = Result<SocketReady, u64>> + Send + '_ {
+        let _ = socket;
+        core::future::ready(Err(ENETDOWN))
+    }
 }
 
 fn get_socket<R: Resources>(
@@ -588,44 +719,81 @@ pub(crate) async fn poll_connecting<N: SocketNetwork, Net: Network<N>>(
 pub(crate) fn socket<R: Resources, Net: Network<R::Network>>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
+    ctx: SocketContext,
     net: &Net,
 ) -> u64 {
     let domain = args[0] as u32;
     let raw_type = args[1] as u32;
     let protocol = args[2] as i32;
 
-    let family = match domain as u16 {
-        AF_INET => SocketFamily::Ipv4,
-        AF_INET6 => SocketFamily::Ipv6,
-        _ => return errno(EAFNOSUPPORT),
-    };
     let flags = raw_type & !SOCK_TYPE_MASK;
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return errno(EINVAL);
     }
     let nonblocking = flags & SOCK_NONBLOCK != 0;
     let cloexec = flags & SOCK_CLOEXEC != 0;
+    let sock_type = raw_type & SOCK_TYPE_MASK;
 
-    let sock = match raw_type & SOCK_TYPE_MASK {
-        SOCK_STREAM => {
-            if protocol != 0 && protocol != IPPROTO_TCP {
+    let sock = match domain as u16 {
+        AF_INET | AF_INET6 => {
+            let family = if domain as u16 == AF_INET {
+                SocketFamily::Ipv4
+            } else {
+                SocketFamily::Ipv6
+            };
+            match sock_type {
+                SOCK_STREAM => {
+                    if protocol != 0 && protocol != IPPROTO_TCP {
+                        return errno(EPROTONOSUPPORT);
+                    }
+                    if let Err(err) = net.check_tcp_open() {
+                        return errno(err);
+                    }
+                    Socket::<R::Network>::tcp(family)
+                }
+                SOCK_DGRAM => {
+                    if protocol != 0 && protocol != IPPROTO_UDP {
+                        return errno(EPROTONOSUPPORT);
+                    }
+                    if let Err(err) = net.check_udp_open() {
+                        return errno(err);
+                    }
+                    Socket::<R::Network>::udp(family)
+                }
+                _ => return errno(EINVAL),
+            }
+        }
+        AF_NETLINK => {
+            if sock_type != SOCK_RAW && sock_type != SOCK_DGRAM {
+                return errno(EPROTOTYPE);
+            }
+            if protocol as u32 != NETLINK_ROUTE {
                 return errno(EPROTONOSUPPORT);
             }
-            if let Err(err) = net.check_tcp_open() {
-                return errno(err);
-            }
-            Socket::<R::Network>::tcp(family)
+            let kind = if sock_type == SOCK_RAW {
+                SocketKind::Raw
+            } else {
+                SocketKind::Datagram
+            };
+            Socket::<R::Network>::netlink(kind, NETLINK_ROUTE)
         }
-        SOCK_DGRAM => {
-            if protocol != 0 && protocol != IPPROTO_UDP {
-                return errno(EPROTONOSUPPORT);
+        AF_PACKET => {
+            let kind = match sock_type {
+                SOCK_RAW => SocketKind::Raw,
+                SOCK_DGRAM => SocketKind::Datagram,
+                _ => return errno(EPROTOTYPE),
+            };
+            if !ctx.cap_net_raw {
+                return errno(EPERM);
             }
-            if let Err(err) = net.check_udp_open() {
-                return errno(err);
-            }
-            Socket::<R::Network>::udp(family)
+            let host_protocol = u16::from_be(protocol as u16);
+            let handle = match net.packet_open(host_protocol) {
+                Ok(handle) => handle,
+                Err(err) => return errno(err),
+            };
+            Socket::<R::Network>::packet(kind, handle, host_protocol)
         }
-        _ => return errno(EINVAL),
+        _ => return errno(EAFNOSUPPORT),
     };
     if nonblocking {
         sock.set_nonblocking(true);
@@ -702,6 +870,7 @@ pub(crate) fn socketpair<R: Resources, M: UserMemory>(
 pub(crate) async fn bind<R: Resources, M: UserMemory, Net: Network<R::Network>>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
+    ctx: SocketContext,
     memory: &M,
     net: &Net,
 ) -> u64 {
@@ -712,6 +881,18 @@ pub(crate) async fn bind<R: Resources, M: UserMemory, Net: Network<R::Network>>(
         Ok(sock) => sock,
         Err(err) => return errno(err),
     };
+    if sock.is_netlink() {
+        return match netlink::bind(&sock, addr_ptr, addrlen, ctx, memory) {
+            Ok(()) => 0,
+            Err(err) => errno(err),
+        };
+    }
+    if sock.is_packet() {
+        return match packet::bind(&sock, addr_ptr, addrlen, memory, net) {
+            Ok(()) => 0,
+            Err(err) => errno(err),
+        };
+    }
     let Some(target) = (match parse_sockaddr(memory, addr_ptr, addrlen) {
         Ok(target) => target,
         Err(err) => return errno(err),
@@ -1099,7 +1280,7 @@ pub(crate) async fn connect<R: Resources, M: UserMemory, Net: Network<R::Network
     .unwrap_or_else(|| errno(EINVAL))
 }
 
-pub(crate) fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Network>>(
+pub(crate) async fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Network>>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
     memory: &mut M,
@@ -1114,6 +1295,18 @@ pub(crate) fn getsockname<R: Resources, M: UserMemory, Net: Network<R::Network>>
     };
     if sock.is_pair() {
         return match write_sockaddr_bytes(memory, addr_ptr, addrlen_ptr, &AF_UNIX.to_le_bytes()) {
+            Ok(()) => 0,
+            Err(err) => errno(err),
+        };
+    }
+    if sock.is_netlink() {
+        return match netlink::getsockname(&sock, addr_ptr, addrlen_ptr, memory) {
+            Ok(()) => 0,
+            Err(err) => errno(err),
+        };
+    }
+    if sock.is_packet() {
+        return match packet::getsockname(&sock, addr_ptr, addrlen_ptr, memory, net).await {
             Ok(()) => 0,
             Err(err) => errno(err),
         };
@@ -1227,11 +1420,19 @@ pub(crate) async fn getpeername<R: Resources, M: UserMemory, Net: Network<R::Net
 
 /// Core send routine shared by `write`, `writev`, `sendto`, `sendmsg`,
 /// `sendmmsg` and `sendfile`.
+/// Optional destination address passed to [`socket_send`].
+pub(crate) enum SendDest {
+    Inet(SocketAddr),
+    Netlink,
+    Packet(SockaddrLl),
+}
+
 pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
     sock: &Socket<N>,
     data: Vec<u8>,
     flags: u32,
-    dest: Option<SocketAddr>,
+    dest: Option<SendDest>,
+    ctx: SocketContext,
     net: &Net,
 ) -> Result<usize, u64> {
     if flags & MSG_OOB != 0 {
@@ -1241,6 +1442,25 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
         return Err(EPIPE);
     }
     let nonblocking = sock.is_nonblocking() || (flags & MSG_DONTWAIT != 0);
+
+    if sock.is_netlink() {
+        return netlink::send(sock, &data, ctx, net).await;
+    }
+
+    if sock.is_packet() {
+        let sll = match dest {
+            Some(SendDest::Packet(sll)) => Some(sll),
+            Some(_) => return Err(EAFNOSUPPORT),
+            None => None,
+        };
+        return packet::send(sock, &data, sll, net).await;
+    }
+
+    let dest = match dest {
+        Some(SendDest::Inet(addr)) => Some(addr),
+        Some(_) => return Err(EAFNOSUPPORT),
+        None => None,
+    };
 
     if let Some(writer) = sock.pair_writer() {
         if dest.is_some() {
@@ -1362,9 +1582,15 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
 
 /// Result of [`socket_recv`]: received bytes, optional peer address, and
 /// original datagram length before truncation (for `MSG_TRUNC`).
+pub(crate) enum RecvPeer {
+    Inet(SocketAddr),
+    Netlink { pid: u32, groups: u32 },
+    Packet(SockaddrLl),
+}
+
 pub(crate) struct RecvResult {
     pub data: Bytes,
-    pub peer: Option<SocketAddr>,
+    pub peer: Option<RecvPeer>,
     pub full_len: usize,
     pub truncated: bool,
 }
@@ -1401,6 +1627,34 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
     let nonblocking = sock.is_nonblocking() || (flags & MSG_DONTWAIT != 0);
     let peek = flags & MSG_PEEK != 0;
     let waitall = flags & MSG_WAITALL != 0 && !nonblocking && !peek;
+
+    if sock.is_netlink() {
+        let (data, orig_len) = netlink::recv(sock, max_len, flags)?;
+        let truncated = orig_len > data.len();
+        return Ok(RecvResult {
+            data: Bytes::from(data),
+            peer: Some(RecvPeer::Netlink { pid: 0, groups: 0 }),
+            full_len: orig_len,
+            truncated,
+        });
+    }
+
+    if sock.is_packet() {
+        let options = sock.options();
+        let timeout = effective_timeout_bounded(
+            options.time(SocketTime::ReceiveTimeout),
+            nonblocking,
+            timeout_bound,
+        );
+        let (data, orig_len, sll) = packet::recv(sock, max_len, flags, timeout, net).await?;
+        let truncated = orig_len > data.len();
+        return Ok(RecvResult {
+            data: Bytes::from(data),
+            peer: Some(RecvPeer::Packet(sll)),
+            full_len: orig_len,
+            truncated,
+        });
+    }
 
     if sock.is_pair() {
         if max_len == 0 {
@@ -1535,7 +1789,7 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
                 };
                 return Ok(RecvResult {
                     data,
-                    peer: Some(peer),
+                    peer: Some(RecvPeer::Inet(peer)),
                     full_len: original_len,
                     truncated,
                 });
@@ -1549,9 +1803,48 @@ async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
     Err(ENOTSOCK)
 }
 
+fn parse_send_dest<N: SocketNetwork, M: UserMemory>(
+    sock: &Socket<N>,
+    memory: &M,
+    addr: u64,
+    addrlen: u32,
+) -> Result<Option<SendDest>, u64> {
+    if addr == 0 || addrlen == 0 {
+        return Ok(None);
+    }
+    if sock.is_netlink() {
+        let _ = netlink::read_sockaddr_nl(memory, addr, addrlen)?;
+        return Ok(Some(SendDest::Netlink));
+    }
+    if sock.is_packet() {
+        let sll = packet::read_sockaddr_ll(memory, addr, addrlen)?;
+        return Ok(Some(SendDest::Packet(sll)));
+    }
+    match parse_sockaddr(memory, addr, addrlen)? {
+        Some(a) => Ok(Some(SendDest::Inet(a))),
+        None => Err(EAFNOSUPPORT),
+    }
+}
+
+fn write_recv_peer<M: UserMemory>(
+    memory: &mut M,
+    addr: u64,
+    addrlen_ptr: u64,
+    peer: RecvPeer,
+) -> Result<(), u64> {
+    match peer {
+        RecvPeer::Inet(a) => write_sockaddr(memory, addr, addrlen_ptr, a),
+        RecvPeer::Netlink { pid, groups } => {
+            netlink::write_sockaddr_nl(memory, addr, addrlen_ptr, pid, groups)
+        }
+        RecvPeer::Packet(sll) => packet::write_sockaddr_ll(memory, addr, addrlen_ptr, sll),
+    }
+}
+
 pub(crate) async fn sendto<R: Resources, M: UserMemory, Net: Network<R::Network>>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
+    ctx: SocketContext,
     memory: &M,
     net: &Net,
 ) -> u64 {
@@ -1566,20 +1859,15 @@ pub(crate) async fn sendto<R: Resources, M: UserMemory, Net: Network<R::Network>
         Ok(sock) => sock,
         Err(err) => return errno(err),
     };
-    let dest = if dest_ptr != 0 {
-        match parse_sockaddr(memory, dest_ptr, addrlen) {
-            Ok(Some(addr)) => Some(addr),
-            Ok(None) => return errno(EAFNOSUPPORT),
-            Err(err) => return errno(err),
-        }
-    } else {
-        None
+    let dest = match parse_send_dest(&sock, memory, dest_ptr, addrlen) {
+        Ok(dest) => dest,
+        Err(err) => return errno(err),
     };
     let mut data = vec![0u8; len];
     if len > 0 && memory.read(buf_ptr, &mut data).is_err() {
         return errno(EFAULT);
     }
-    match socket_send(&sock, data, flags, dest, net).await {
+    match socket_send(&sock, data, flags, dest, ctx, net).await {
         Ok(sent) => sent as u64,
         Err(err) => errno(err),
     }
@@ -1613,7 +1901,7 @@ pub(crate) async fn recvfrom<R: Resources, M: UserMemory, Net: Network<R::Networ
         return errno(EFAULT);
     }
     if let Some(peer) = result.peer
-        && let Err(err) = write_sockaddr(memory, src_ptr, addrlen_ptr, peer)
+        && let Err(err) = write_recv_peer(memory, src_ptr, addrlen_ptr, peer)
     {
         return errno(err);
     }
@@ -1683,18 +1971,12 @@ async fn sendmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
     sock: &Socket<N>,
     msg_ptr: u64,
     flags: u32,
+    ctx: SocketContext,
     memory: &M,
     net: &Net,
 ) -> Result<usize, u64> {
     let hdr = read_msghdr(memory, msg_ptr)?;
-    let dest = if hdr.msg_name != 0 && hdr.msg_namelen > 0 {
-        match parse_sockaddr(memory, hdr.msg_name, hdr.msg_namelen)? {
-            Some(addr) => Some(addr),
-            None => return Err(EAFNOSUPPORT),
-        }
-    } else {
-        None
-    };
+    let dest = parse_send_dest(sock, memory, hdr.msg_name, hdr.msg_namelen)?;
     let iovecs = read_iovecs(memory, hdr.msg_iov, hdr.msg_iovlen)?;
     let total: usize = iovecs.iter().map(|(_, len)| *len).sum();
     let mut data = Vec::with_capacity(total);
@@ -1706,7 +1988,7 @@ async fn sendmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
         data.resize(start + len, 0);
         memory.read(base, &mut data[start..]).map_err(|_| EFAULT)?;
     }
-    socket_send(sock, data, flags, dest, net).await
+    socket_send(sock, data, flags, dest, ctx, net).await
 }
 
 async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
@@ -1743,7 +2025,25 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
     let out_namelen = if let Some(peer) = result.peer {
         if hdr.msg_name != 0 {
             let mut encoded = [0u8; SOCKADDR_IN6_LEN];
-            let full = encode_sockaddr(peer, &mut encoded);
+            let full = match peer {
+                RecvPeer::Inet(addr) => encode_sockaddr(addr, &mut encoded),
+                RecvPeer::Netlink { pid, groups } => {
+                    encoded[0..2].copy_from_slice(&AF_NETLINK.to_ne_bytes());
+                    encoded[4..8].copy_from_slice(&pid.to_ne_bytes());
+                    encoded[8..12].copy_from_slice(&groups.to_ne_bytes());
+                    netlink::SOCKADDR_NL_LEN
+                }
+                RecvPeer::Packet(sll) => {
+                    encoded[0..2].copy_from_slice(&AF_PACKET.to_ne_bytes());
+                    encoded[2..4].copy_from_slice(&sll.protocol.to_be_bytes());
+                    encoded[4..8].copy_from_slice(&(sll.ifindex as i32).to_ne_bytes());
+                    encoded[8..10].copy_from_slice(&sll.hatype.to_ne_bytes());
+                    encoded[10] = sll.pkttype;
+                    encoded[11] = sll.halen;
+                    encoded[12..20].copy_from_slice(&sll.addr);
+                    packet::SOCKADDR_LL_LEN
+                }
+            };
             let copy = (hdr.msg_namelen as usize).min(full);
             if copy > 0 {
                 memory
@@ -1779,6 +2079,7 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
 pub(crate) async fn sendmsg<R: Resources, M: UserMemory, Net: Network<R::Network>>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
+    ctx: SocketContext,
     memory: &M,
     net: &Net,
 ) -> u64 {
@@ -1789,7 +2090,7 @@ pub(crate) async fn sendmsg<R: Resources, M: UserMemory, Net: Network<R::Network
         Ok(sock) => sock,
         Err(err) => return errno(err),
     };
-    match sendmsg_one(&sock, msg_ptr, flags, memory, net).await {
+    match sendmsg_one(&sock, msg_ptr, flags, ctx, memory, net).await {
         Ok(sent) => sent as u64,
         Err(err) => errno(err),
     }
@@ -1817,6 +2118,7 @@ pub(crate) async fn recvmsg<R: Resources, M: UserMemory, Net: Network<R::Network
 pub(crate) async fn sendmmsg<R: Resources, M: UserMemory, Net: Network<R::Network>>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
+    ctx: SocketContext,
     memory: &mut M,
     net: &Net,
 ) -> u64 {
@@ -1840,7 +2142,7 @@ pub(crate) async fn sendmmsg<R: Resources, M: UserMemory, Net: Network<R::Networ
                 errno(EFAULT)
             };
         };
-        match sendmsg_one(&sock, entry_ptr, flags, memory, net).await {
+        match sendmsg_one(&sock, entry_ptr, flags, ctx, memory, net).await {
             Ok(bytes) => {
                 if memory
                     .write(entry_ptr + 56, &(bytes as u32).to_le_bytes())
@@ -2110,7 +2412,16 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
         }
         let sent = match &out_entry.descriptor {
             Descriptor::<R>::Socket(sock) => {
-                match socket_send(sock, chunk.to_vec(), 0, None, output).await {
+                match socket_send(
+                    sock,
+                    chunk.to_vec(),
+                    0,
+                    None,
+                    SocketContext::default(),
+                    output,
+                )
+                .await
+                {
                     Ok(n) => n,
                     Err(err) => {
                         return if total_sent > 0 {
@@ -2341,6 +2652,52 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
                 Err(err) => errno(option_error_errno(err)),
             }
         }
+        (SOL_SOCKET, SO_BINDTODEVICE) => {
+            let unbind = if optlen == 0 {
+                true
+            } else {
+                let len = (optlen as usize).min(16);
+                let mut name = vec![0u8; len];
+                if memory.read(optval, &mut name).is_err() {
+                    return errno(EFAULT);
+                }
+                let nul = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                if nul == 0 {
+                    true
+                } else {
+                    let ifindex = match netlink::lookup_ifindex(&name[..nul]) {
+                        Ok(idx) => idx,
+                        Err(err) => return errno(err),
+                    };
+                    if let Some(pkt) = sock.packet_state() {
+                        if let Err(err) = net.packet_bind(pkt.handle.id(), pkt.protocol, ifindex) {
+                            return errno(err);
+                        }
+                        let _ = sock.with_packet_mut(|p| p.ifindex = ifindex);
+                        return 0;
+                    }
+                    return errno(EOPNOTSUPP);
+                }
+            };
+            if unbind {
+                if let Some(pkt) = sock.packet_state() {
+                    if let Err(err) = net.packet_bind(pkt.handle.id(), pkt.protocol, 0) {
+                        return errno(err);
+                    }
+                    let _ = sock.with_packet_mut(|p| p.ifindex = 0);
+                }
+                0
+            } else {
+                0
+            }
+        }
+        (SOL_PACKET, PACKET_AUXDATA) if sock.is_packet() => {
+            let val = match read_opt_i32(memory, optval, optlen) {
+                Ok(v) => v,
+                Err(err) => return errno(err),
+            };
+            if val == 0 { 0 } else { errno(EOPNOTSUPP) }
+        }
         (SOL_SOCKET, SO_RCVBUF)
         | (SOL_SOCKET, SO_SNDBUF)
         | (SOL_SOCKET, SO_RCVLOWAT)
@@ -2514,6 +2871,7 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             let ty: i32 = match sock.kind() {
                 SocketKind::Stream => SOCK_STREAM as i32,
                 SocketKind::Datagram => SOCK_DGRAM as i32,
+                SocketKind::Raw => SOCK_RAW as i32,
             };
             match write_opt_bytes(memory, optval, optlen_ptr, &ty.to_le_bytes()) {
                 Ok(()) => 0,
@@ -2521,10 +2879,16 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             }
         }
         (SOL_SOCKET, SO_PROTOCOL) => {
-            let proto: i32 = match sock.protocol() {
-                Some(TransportProtocol::Tcp) => IPPROTO_TCP,
-                Some(TransportProtocol::Udp) => IPPROTO_UDP,
-                None => 0,
+            let proto: i32 = if let Some(nl) = sock.netlink_state() {
+                nl.protocol as i32
+            } else if let Some(pkt) = sock.packet_state() {
+                i32::from(pkt.protocol.to_be())
+            } else {
+                match sock.protocol() {
+                    Some(TransportProtocol::Tcp) => IPPROTO_TCP,
+                    Some(TransportProtocol::Udp) => IPPROTO_UDP,
+                    None => 0,
+                }
             };
             match write_opt_bytes(memory, optval, optlen_ptr, &proto.to_le_bytes()) {
                 Ok(()) => 0,
@@ -2532,10 +2896,16 @@ pub(crate) async fn getsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             }
         }
         (SOL_SOCKET, SO_DOMAIN) => {
-            let domain: i32 = match sock.family() {
-                Some(SocketFamily::Ipv4) => i32::from(AF_INET),
-                Some(SocketFamily::Ipv6) => i32::from(AF_INET6),
-                None => i32::from(AF_UNIX),
+            let domain: i32 = if sock.is_netlink() {
+                i32::from(AF_NETLINK)
+            } else if sock.is_packet() {
+                i32::from(AF_PACKET)
+            } else {
+                match sock.family() {
+                    Some(SocketFamily::Ipv4) => i32::from(AF_INET),
+                    Some(SocketFamily::Ipv6) => i32::from(AF_INET6),
+                    None => i32::from(AF_UNIX),
+                }
             };
             match write_opt_bytes(memory, optval, optlen_ptr, &domain.to_le_bytes()) {
                 Ok(()) => 0,
@@ -2726,6 +3096,35 @@ pub(crate) async fn socket_epoll_ready<N: SocketNetwork, Net: Network<N>>(
                 Err(_) => EPOLLERR,
             },
             UdpSocket::Unbound { .. } => EPOLLOUT,
+        };
+        return ready & (interest | EPOLLERR | EPOLLHUP);
+    }
+
+    if sock.is_netlink() {
+        let state = netlink::readiness(sock);
+        let mut mask = 0;
+        if state.readable {
+            mask |= EPOLLIN;
+        }
+        if state.writable {
+            mask |= EPOLLOUT;
+        }
+        return mask & (interest | EPOLLERR | EPOLLHUP);
+    }
+
+    if sock.is_packet() {
+        let ready = match packet::readiness(sock, net).await {
+            Ok(state) => {
+                let mut mask = 0;
+                if state.readable {
+                    mask |= EPOLLIN;
+                }
+                if state.writable {
+                    mask |= EPOLLOUT;
+                }
+                mask
+            }
+            Err(_) => EPOLLERR,
         };
         return ready & (interest | EPOLLERR | EPOLLHUP);
     }

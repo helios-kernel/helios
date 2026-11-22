@@ -2,6 +2,8 @@ mod address;
 use address::*;
 mod error;
 use error::*;
+mod packet;
+use packet::*;
 mod pump;
 use pump::*;
 mod routes;
@@ -51,7 +53,7 @@ use crate::{
     ComponentNetworkService, DnsError, DnsErrorKind, HttpsRecord, Ipv4Address as KernelIpv4Address,
     Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, MacAddress, NetworkAdminBackend,
     NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
-    PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
+    PacketFrame, PingError, PingErrorKind, PingReply, ProfileSink, ProgressMark, ProgressSignal,
     RegisteredTcpReadBuffer, RootEntropyHandle, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
     TcpReadInto, TcpReadProgress, TcpWriteProgress, Timer, UdpBinding, UdpDatagram, UdpError,
     UdpErrorKind, UptimeClock,
@@ -179,6 +181,7 @@ where
     /// the interface exactly once without a task or a device poll of
     /// its own.
     link_up: AtomicBool,
+    packet_taps: PacketTapRegistry,
 }
 
 struct NetworkControlPlane {
@@ -781,6 +784,7 @@ where
                 poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
                 stack_rx_budget,
                 link_up: AtomicBool::new(device.link_state().is_up()),
+                packet_taps: PacketTapRegistry::new(),
                 device,
             }),
         }

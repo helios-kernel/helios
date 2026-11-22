@@ -782,6 +782,41 @@ where
     fn udp_close(&self, socket: Self::UdpSocket) {
         NetworkService::udp_close(self, socket);
     }
+
+    fn packet_open(&self, protocol: u16) -> Result<u64, UdpError> {
+        NetworkService::packet_open(self, protocol)
+    }
+
+    fn packet_bind(&self, socket: u64, protocol: u16, ifindex: u32) -> Result<(), UdpError> {
+        NetworkService::packet_bind(self, socket, protocol, ifindex)
+    }
+
+    async fn packet_send<'a>(
+        &'a self,
+        socket: u64,
+        ifindex: u32,
+        frame: &'a [u8],
+    ) -> Result<usize, UdpError> {
+        NetworkService::packet_send(self, socket, ifindex, frame).await
+    }
+
+    async fn packet_receive(
+        &self,
+        socket: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<PacketFrame>, UdpError> {
+        NetworkService::packet_receive(self, socket, max_bytes, timeout_nanos, peek).await
+    }
+
+    async fn packet_readiness(&self, socket: u64) -> Result<SocketReadiness, UdpError> {
+        NetworkService::packet_readiness(self, socket).await
+    }
+
+    fn packet_close(&self, socket: u64) {
+        NetworkService::packet_close(self, socket);
+    }
 }
 
 impl<CpuImpl, DeviceImpl> NetworkAdminBackend for NetworkService<CpuImpl, DeviceImpl>
