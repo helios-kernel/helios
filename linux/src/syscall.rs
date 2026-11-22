@@ -18,6 +18,7 @@ mod futex;
 mod io;
 mod memory;
 mod signal;
+mod socket;
 mod system;
 mod thread;
 
@@ -25,6 +26,12 @@ pub use crate::abi::{Abi, Operation};
 pub use crate::signal_frame::SignalFrameError;
 pub use io::Clock;
 pub use signal::{ProcessSignals, SignalDelivery, SyscallRestart, ThreadSignalSlot};
+pub use socket::{
+    ConnectProgress, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EALREADY, ECONNABORTED,
+    ECONNREFUSED, ECONNRESET, EDESTADDRREQ, EHOSTUNREACH, EINPROGRESS, EISCONN, EMSGSIZE, ENETDOWN,
+    ENETUNREACH, ENOPROTOOPT, ENOTCONN, ENOTSOCK, EPIPE, EPROTONOSUPPORT, EPROTOTYPE, ETIMEDOUT,
+    IpAddr, Network, SocketAddr, SocketReady,
+};
 pub use system::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_KILL,
     CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_BROADCAST, CAP_NET_RAW, CAP_SETGID, CAP_SETUID,
@@ -297,7 +304,6 @@ const ESRCH: u64 = 3;
 const EINTR: u64 = 4;
 const EIO: u64 = 5;
 const EBADF: u64 = 9;
-const EAGAIN: u64 = 11;
 const ENOMEM: u64 = 12;
 const EACCES: u64 = 13;
 const EFAULT: u64 = 14;
@@ -629,7 +635,12 @@ fn errno(value: u64) -> u64 {
 
 /// Dispatches one Linux system call on `process`'s thread. `Exit` and
 /// `ExitGroup` consume the thread's execution loop through `Break`.
-pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + Clock + System>(
+pub async fn dispatch<
+    R: Resources,
+    M: VirtualMemory,
+    T: Thread<R>,
+    O: Stdio + Clock + System + Network<R::Network>,
+>(
     process: &mut Process<R>,
     call: Call,
     memory: &mut M,
@@ -839,17 +850,34 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
         }
         Operation::ArchPrctl => SyscallOutcome::Return(arch_prctl(abi, arguments, memory, thread)),
         Operation::Writev => writev::<R, _, _>(process, arguments, memory, output).await,
-        Operation::Ioctl => SyscallOutcome::Return(
-            match process
+        Operation::Ioctl => SyscallOutcome::Return({
+            let entry = process
                 .shared
                 .descriptors
                 .lock()
                 .get_entry(arguments[0] as u32 as i32)
-            {
-                Some(_) => errno(ENOTTY),
+                .cloned();
+            match entry {
+                Some(entry) => {
+                    if arguments[1] as u32 == socket::FIONBIO
+                        && let Descriptor::<R>::Socket(sock) = &entry.descriptor
+                    {
+                        let mut raw = [0u8; 4];
+                        if memory.read(arguments[2], &mut raw).is_err() {
+                            errno(EFAULT)
+                        } else {
+                            let nb = i32::from_le_bytes(raw) != 0;
+                            sock.set_nonblocking(nb);
+                            entry.set_fdflags(if nb { socket::SOCK_NONBLOCK as u16 } else { 0 });
+                            0
+                        }
+                    } else {
+                        errno(ENOTTY)
+                    }
+                }
                 None => errno(EBADF),
-            },
-        ),
+            }
+        }),
         Operation::Write => write::<R, _, _>(process, arguments, memory, output).await,
         Operation::ClockGettime => {
             SyscallOutcome::Return(system::clock_gettime(arguments, memory, output))
@@ -936,12 +964,89 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
         Operation::Umask => SyscallOutcome::Return(process.umask(arguments)),
         Operation::Getpriority => SyscallOutcome::Return(process.getpriority(arguments)),
         Operation::Setpriority => SyscallOutcome::Return(process.setpriority(arguments)),
+        Operation::Socket => SyscallOutcome::Return(socket::socket::<R, _>(
+            &process.shared.descriptors,
+            arguments,
+            output,
+        )),
+        Operation::Socketpair => SyscallOutcome::Return(socket::socketpair::<R, _>(
+            &process.shared.descriptors,
+            arguments,
+            memory,
+        )),
+        Operation::Bind => SyscallOutcome::Return(
+            socket::bind::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await,
+        ),
+        Operation::Listen => SyscallOutcome::Return(
+            socket::listen::<R, _>(&process.shared.descriptors, arguments, output).await,
+        ),
+        operation @ (Operation::Accept | Operation::Accept4) => SyscallOutcome::Return(
+            socket::accept::<R, _, _>(
+                &process.shared.descriptors,
+                arguments,
+                memory,
+                output,
+                operation == Operation::Accept4,
+            )
+            .await,
+        ),
+        Operation::Connect => SyscallOutcome::Return(
+            socket::connect::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
+        Operation::Getsockname => SyscallOutcome::Return(socket::getsockname::<R, _, _>(
+            &process.shared.descriptors,
+            arguments,
+            memory,
+            output,
+        )),
+        Operation::Getpeername => SyscallOutcome::Return(
+            socket::getpeername::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
+        Operation::Sendto => SyscallOutcome::Return(
+            socket::sendto::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await,
+        ),
+        Operation::Recvfrom => SyscallOutcome::Return(
+            socket::recvfrom::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
+        Operation::Sendmsg => SyscallOutcome::Return(
+            socket::sendmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
+        Operation::Recvmsg => SyscallOutcome::Return(
+            socket::recvmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
+        Operation::Sendmmsg => SyscallOutcome::Return(
+            socket::sendmmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
+        Operation::Recvmmsg => SyscallOutcome::Return(
+            socket::recvmmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
+        Operation::Shutdown => SyscallOutcome::Return(
+            socket::shutdown::<R, _>(&process.shared.descriptors, arguments, output).await,
+        ),
+        Operation::Sendfile => {
+            SyscallOutcome::Return(socket::sendfile::<R, _>(process, arguments, output).await)
+        }
+        Operation::Setsockopt => SyscallOutcome::Return(
+            socket::setsockopt::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
+        Operation::Getsockopt => SyscallOutcome::Return(
+            socket::getsockopt::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await,
+        ),
         Operation::Unknown => SyscallOutcome::Return(errno(ENOSYS)),
     };
     ControlFlow::Continue(outcome)
 }
 
-async fn read<R: Resources, M: UserMemory, O: Stdio>(
+async fn read<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -956,6 +1061,24 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
     else {
         return SyscallOutcome::Return(errno(EBADF));
     };
+    if let Descriptor::<R>::Socket(sock) = &entry.descriptor {
+        let limit = args[2].min(MAX_RW_COUNT) as usize;
+        if limit == 0 {
+            return SyscallOutcome::Return(0);
+        }
+        if memory.check_writable(args[1], limit).is_err() {
+            return SyscallOutcome::Return(errno(EFAULT));
+        }
+        return SyscallOutcome::Return(match socket::socket_recv(sock, limit, 0, output).await {
+            Ok(recv) => {
+                if !recv.data.is_empty() && memory.write(args[1], &recv.data).is_err() {
+                    return SyscallOutcome::Return(errno(EFAULT));
+                }
+                recv.data.len() as u64
+            }
+            Err(err) => errno(err),
+        });
+    }
     if matches!(entry.descriptor, Descriptor::<R>::Stdin { .. }) {
         let limit = args[2].min(MAX_RW_COUNT) as usize;
         if limit == 0 {
@@ -999,7 +1122,7 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
     io::read_resource::<R, M>(&process.signals, &entry, args, memory).await
 }
 
-async fn write<R: Resources, M: UserMemory, O: Stdio>(
+async fn write<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &M,
@@ -1015,6 +1138,19 @@ async fn write<R: Resources, M: UserMemory, O: Stdio>(
     else {
         return SyscallOutcome::Return(errno(EBADF));
     };
+    if let Descriptor::<R>::Socket(sock) = &entry.descriptor {
+        let count = args[2].min(MAX_RW_COUNT) as usize;
+        let mut data = alloc::vec![0u8; count];
+        if count > 0 && memory.read(args[1], &mut data).is_err() {
+            return SyscallOutcome::Return(errno(EFAULT));
+        }
+        return SyscallOutcome::Return(
+            match socket::socket_send(sock, data, 0, None, output).await {
+                Ok(written) => written as u64,
+                Err(err) => errno(err),
+            },
+        );
+    }
     let stream = match &entry.descriptor {
         Descriptor::<R>::Stdout => Stream::Stdout,
         Descriptor::<R>::Stderr => Stream::Stderr,
@@ -1085,7 +1221,7 @@ fn arch_prctl<R: Resources, M: UserMemory, T: Thread<R>>(
     }
 }
 
-async fn writev<R: Resources, M: UserMemory, O: Stdio>(
+async fn writev<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &M,

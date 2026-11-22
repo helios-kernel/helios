@@ -672,6 +672,76 @@ impl<S: Storage> LinuxContainer<S> {
     pub fn set_domainname(&self, name: UtsField) {
         self.uts.lock().domainname = name;
     }
+
+    /// Renders `/etc/resolv.conf` for this container from `dns_servers`
+    /// (the resolver addresses returned by `ComponentNetworkService::dns_servers`).
+    ///
+    /// Returns an empty document if the container was not granted
+    /// [`crate::NetworkAuthorityRights::DNS`].
+    pub fn resolv_conf(&self, dns_servers: &[crate::NetworkIpAddress]) -> String {
+        if self.authority.derive_dns_cap().is_err() {
+            return String::new();
+        }
+        format_resolv_conf(dns_servers)
+    }
+
+    /// Renders `/etc/hosts` for this container, mapping `127.0.0.1` and `::1`
+    /// to `localhost` and the container's current UTS hostname.
+    pub fn hosts(&self) -> String {
+        let hostname = self.hostname();
+        let host = core::str::from_utf8(hostname.as_bytes()).unwrap_or("");
+        format_hosts(host)
+    }
+
+    /// Returns the synthesized bytes for container-managed `/etc` name
+    /// resolution files (`/etc/resolv.conf`, `/etc/hosts`), or `None` for any
+    /// other path.
+    pub fn synthetic_etc_file(
+        &self,
+        path: &str,
+        dns_servers: &[crate::NetworkIpAddress],
+    ) -> Option<Vec<u8>> {
+        let normalized = normalize_container_path(path).ok()?;
+        match normalized.as_str() {
+            "/etc/resolv.conf" => Some(self.resolv_conf(dns_servers).into_bytes()),
+            "/etc/hosts" => Some(self.hosts().into_bytes()),
+            _ => None,
+        }
+    }
+}
+
+/// Formats `/etc/resolv.conf` with one `nameserver <ip>` line per resolver.
+pub fn format_resolv_conf(dns_servers: &[crate::NetworkIpAddress]) -> String {
+    use core::fmt::Write;
+    let mut out = String::new();
+    for server in dns_servers {
+        match *server {
+            crate::NetworkIpAddress::Ipv4(addr) => {
+                let ip = core::net::Ipv4Addr::from(addr.octets());
+                let _ = writeln!(out, "nameserver {ip}");
+            }
+            crate::NetworkIpAddress::Ipv6(addr) => {
+                let ip = core::net::Ipv6Addr::from(addr.octets());
+                let _ = writeln!(out, "nameserver {ip}");
+            }
+        }
+    }
+    out
+}
+
+/// Formats `/etc/hosts` for loopback IPv4/IPv6 and the container's hostname.
+pub fn format_hosts(hostname: &str) -> String {
+    use core::fmt::Write;
+    let mut out = String::new();
+    let trimmed = hostname.trim();
+    if trimmed.is_empty() || trimmed == "localhost" || trimmed == "(none)" {
+        let _ = writeln!(out, "127.0.0.1 localhost");
+        let _ = writeln!(out, "::1 localhost");
+    } else {
+        let _ = writeln!(out, "127.0.0.1 localhost {trimmed}");
+        let _ = writeln!(out, "::1 localhost {trimmed}");
+    }
+    out
 }
 
 async fn attach_container_mount<S: Storage>(
@@ -1356,5 +1426,73 @@ mod tests {
             ),
             Err(FsError::NoEntry)
         ));
+    }
+
+    #[test]
+    fn synthetic_etc_resolv_conf_and_hosts_reflect_authority_and_resolvers() {
+        let host_ns = test_namespace();
+        let resolvers = [
+            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([10, 0, 2, 3])),
+            crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
+                0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+            ])),
+        ];
+
+        // Container without DNS authority sees an empty /etc/resolv.conf.
+        let no_dns = LinuxContainer::ephemeral(
+            ContainerId::new(NonZeroU64::new(9).unwrap()),
+            ProcessAuthority::empty(),
+            &host_ns,
+        );
+        assert_eq!(
+            no_dns.synthetic_etc_file("/etc/resolv.conf", &resolvers),
+            Some(Vec::new())
+        );
+
+        // Container with DNS authority sees both IPv4 and IPv6 resolvers.
+        let mut with_dns_auth = ProcessAuthority::empty();
+        with_dns_auth.grant_network_rights(crate::NetworkAuthorityRights::DNS);
+        let with_dns = LinuxContainer::ephemeral(
+            ContainerId::new(NonZeroU64::new(10).unwrap()),
+            with_dns_auth,
+            &host_ns,
+        );
+        let resolv = String::from_utf8(
+            with_dns
+                .synthetic_etc_file("/etc/resolv.conf", &resolvers)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolv,
+            "nameserver 10.0.2.3\nnameserver 2001:4860:4860::8888\n"
+        );
+
+        // Default unset UTS hostname ("(none)") is omitted from /etc/hosts.
+        let default_hosts = String::from_utf8(
+            with_dns
+                .synthetic_etc_file("/etc/hosts", &resolvers)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(default_hosts, "127.0.0.1 localhost\n::1 localhost\n");
+
+        // /etc/hosts reflects the container's current UTS hostname.
+        with_dns.set_hostname(UtsField::from_bytes(b"app-box").unwrap());
+        let hosts = String::from_utf8(
+            with_dns
+                .synthetic_etc_file("/etc/hosts", &resolvers)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            hosts,
+            "127.0.0.1 localhost app-box\n::1 localhost app-box\n"
+        );
+        assert!(
+            with_dns
+                .synthetic_etc_file("/etc/passwd", &resolvers)
+                .is_none()
+        );
     }
 }

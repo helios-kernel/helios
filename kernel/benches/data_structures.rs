@@ -640,6 +640,34 @@ impl ComponentNetworkService for BenchNetworkService {
         Err(bench_dns_error())
     }
 
+    fn dns_servers(&self) -> alloc::vec::Vec<NetworkIpAddress> {
+        alloc::vec::Vec::new()
+    }
+
+    async fn tcp_connect_start(
+        &self,
+        _remote_address: NetworkIpAddress,
+        _port: u16,
+        _local_port: u16,
+        _hop_limit: u8,
+    ) -> Result<(Self::TcpStream, helios_kernel::TcpConnectPoll), TcpError> {
+        Err(bench_tcp_error())
+    }
+
+    async fn tcp_connect_poll(
+        &self,
+        _stream: Self::TcpStream,
+    ) -> Result<helios_kernel::TcpConnectPoll, TcpError> {
+        Err(bench_tcp_error())
+    }
+
+    fn tcp_local_endpoint(
+        &self,
+        _stream: Self::TcpStream,
+    ) -> Result<Option<(NetworkIpAddress, u16)>, TcpError> {
+        Err(bench_tcp_error())
+    }
+
     async fn tcp_connect(
         &self,
         _host: &str,

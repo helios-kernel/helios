@@ -4337,6 +4337,11 @@ where
         })
     }
 
+    /// Returns the local endpoint bound to `socket`, if any.
+    pub fn tcp_local_endpoint(&self, socket: SocketId) -> Result<Option<TcpEndpoint>, StackError> {
+        Ok(self.tcp_socket(socket)?.local_endpoint())
+    }
+
     /// The receive state of one socket, for a caller that has to report
     /// why it made no progress.
     ///
