@@ -1,3 +1,5 @@
+use alloc::string::String;
+
 use super::*;
 
 impl<CpuImpl, DeviceImpl> NetworkService<CpuImpl, DeviceImpl>
@@ -11,6 +13,149 @@ where
         timeout_nanos: u64,
     ) -> Result<Vec<NetworkIpAddress>, DnsError> {
         self.execute_dns_resolve(host, timeout_nanos).await
+    }
+
+    pub async fn dns_resolve_https(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
+        self.execute_dns_resolve_https(host, port, timeout_nanos)
+            .await
+    }
+
+    /// Queries RFC 9460 Type 65 (`HTTPS`) records for `host:port`.
+    ///
+    /// IP literals have no `HTTPS` record (`Ok(None)`), and `NODATA`,
+    /// `NXDOMAIN`, and `AliasMode` `.` also answer `Ok(None)`. An `AliasMode`
+    /// target whose own `HTTPS` RRSet was not included in the packet is
+    /// re-queried on the same connected resolver socket within the remaining
+    /// [`DNS_MAX_CNAME_CHAIN`] hop budget.
+    pub(super) async fn execute_dns_resolve_https(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
+        if is_ip_literal(host) {
+            return Ok(None);
+        }
+        let qname = DnsWireName::https_qname(host, port).ok_or(DnsError {
+            kind: DnsErrorKind::UnresolvedHost,
+            detail: NetworkErrorDetail::DnsQueryStartFailed,
+        })?;
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        self.wait_for_dns_transport(deadline_nanos).await?;
+        let resolver = self.resolver_endpoint()?;
+        let socket = self.open_resolver_socket(resolver)?;
+        let result = self
+            .resolve_https_through(&socket, qname, deadline_nanos)
+            .await;
+        self.close_resolver_socket(&socket);
+        result
+    }
+
+    async fn resolve_https_through(
+        &self,
+        socket: &ResolverSocket,
+        mut qname: DnsWireName,
+        deadline_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
+        let mut hops_remaining = DNS_MAX_CNAME_CHAIN;
+        let mut min_ttl_seconds: Option<u32> = None;
+        let mut visited: Vec<DnsWireName> = vec![qname];
+        let mut next_alias = qname;
+
+        loop {
+            let query_id = self
+                .inner
+                .state
+                .shard_at(socket.shard_idx)
+                .lock()
+                .draw_dns_query_id();
+            let mut query_sent = false;
+            let step = loop {
+                let wait = self.shard_wait(socket.shard_idx);
+                self.drive_dns().await?;
+                let now = StackInstant::from_nanos(self.now_nanos());
+                let polled = {
+                    let mut shard = self.inner.state.shard_at(socket.shard_idx).lock();
+                    let ready = if query_sent {
+                        shard.poll_dns_https_response(
+                            socket,
+                            query_id,
+                            &qname,
+                            hops_remaining,
+                            &mut next_alias,
+                        )?
+                    } else {
+                        None
+                    };
+                    if ready.is_some() {
+                        ready
+                    } else {
+                        query_sent = true;
+                        shard.send_dns_wire_query(
+                            socket,
+                            query_id,
+                            &qname,
+                            DnsRecordType::Https,
+                            now,
+                        )?;
+                        shard.poll_dns_https_response(
+                            socket,
+                            query_id,
+                            &qname,
+                            hops_remaining,
+                            &mut next_alias,
+                        )?
+                    }
+                };
+                if let Some(polled) = polled {
+                    break polled;
+                }
+                if self.now_nanos() >= deadline_nanos {
+                    return Err(DnsError {
+                        kind: DnsErrorKind::Timeout,
+                        detail: NetworkErrorDetail::DnsLookupTimeout,
+                    });
+                }
+                self.drive_dns().await?;
+                self.wait_for_shard_progress(
+                    wait,
+                    self.retransmit_wait(deadline_nanos, NETWORK_RETRANSMIT_WAIT),
+                )
+                .await;
+            };
+
+            match step {
+                PolledHttpsResponse::Service(mut record) => {
+                    if let Some(chain_ttl) = min_ttl_seconds {
+                        record.ttl_nanos =
+                            record.ttl_nanos.min(u64::from(chain_ttl) * 1_000_000_000);
+                    }
+                    return Ok(Some(record));
+                }
+                PolledHttpsResponse::NoRecord => return Ok(None),
+                PolledHttpsResponse::ServerFailure => {
+                    return Err(DnsError {
+                        kind: DnsErrorKind::Unavailable,
+                        detail: NetworkErrorDetail::DnsLookupFailed,
+                    });
+                }
+                PolledHttpsResponse::Alias { ttl_seconds, hops } => {
+                    if hops > hops_remaining || visited.contains(&next_alias) {
+                        return Ok(None);
+                    }
+                    hops_remaining -= hops;
+                    min_ttl_seconds =
+                        Some(min_ttl_seconds.map_or(ttl_seconds, |min| min.min(ttl_seconds)));
+                    visited.push(next_alias);
+                    qname = next_alias;
+                }
+            }
+        }
     }
 
     /// Resolves `host` to every address the resolver knows, in both
@@ -343,6 +488,15 @@ where
         timeout_nanos: u64,
     ) -> Result<Vec<NetworkIpAddress>, DnsError> {
         NetworkService::dns_resolve(self, host, timeout_nanos).await
+    }
+
+    async fn dns_resolve_https<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
+        NetworkService::dns_resolve_https(self, host, port, timeout_nanos).await
     }
 
     async fn tcp_connect<'a>(
@@ -1018,6 +1172,11 @@ impl NetworkShard {
         )
     }
 
+    /// One nonzero question id for a single-record lookup (`HTTPS`).
+    pub(super) fn draw_dns_query_id(&mut self) -> u16 {
+        self.entropy.nonzero_u16()
+    }
+
     /// Sends whichever of the pair's questions is still outstanding.
     ///
     /// Called on every poll iteration, so an unanswered question is
@@ -1037,6 +1196,37 @@ impl NetworkShard {
             self.send_dns_query(socket, queries.aaaa, host, DnsRecordType::Aaaa, now)?;
         }
         Ok(())
+    }
+
+    pub(super) fn send_dns_wire_query(
+        &mut self,
+        socket: &ResolverSocket,
+        query_id: u16,
+        qname: &DnsWireName,
+        record: DnsRecordType,
+        now: StackInstant,
+    ) -> Result<(), DnsError> {
+        let mut payload = [0u8; 512];
+        let len = DnsQuestionWriter::new(&mut payload)
+            .write_wire_query(query_id, qname, record)
+            .ok_or(DnsError {
+                kind: DnsErrorKind::UnresolvedHost,
+                detail: NetworkErrorDetail::DnsQueryStartFailed,
+            })?;
+        self.stack
+            .send_udp(
+                socket.stack_socket,
+                socket.resolver,
+                DNS_PORT,
+                &payload[..len],
+                query_id,
+                now,
+            )
+            .map(|_| ())
+            .map_err(|_| DnsError {
+                kind: DnsErrorKind::Unavailable,
+                detail: NetworkErrorDetail::DnsQueryStartFailed,
+            })
     }
 
     fn send_dns_query(
@@ -1105,10 +1295,62 @@ impl NetworkShard {
             match record {
                 DnsRecordType::A => answers.a_answered = true,
                 DnsRecordType::Aaaa => answers.aaaa_answered = true,
+                DnsRecordType::Https => unreachable!("HTTPS uses poll_dns_https_response"),
             }
             answers.extend(message.addresses.iter().copied());
         }
         Ok(())
+    }
+
+    pub(super) fn poll_dns_https_response(
+        &mut self,
+        socket: &ResolverSocket,
+        query_id: u16,
+        qname: &DnsWireName,
+        max_hops: usize,
+        alias_out: &mut DnsWireName,
+    ) -> Result<Option<PolledHttpsResponse>, DnsError> {
+        let socket = socket.stack_socket;
+        let mut resolved = None;
+        while let Some(datagram) = self.stack.take_udp(socket).map_err(|_| DnsError {
+            kind: DnsErrorKind::Unavailable,
+            detail: NetworkErrorDetail::DnsQueryStartFailed,
+        })? {
+            if resolved.is_some() {
+                continue;
+            }
+            let Some(response) = DnsResponse::parse(&datagram.bytes) else {
+                continue;
+            };
+            if response.id() != query_id {
+                continue;
+            }
+            let Some(outcome) = response.https_outcome(qname, max_hops) else {
+                continue;
+            };
+            resolved = Some(match outcome {
+                DnsHttpsOutcome::Service(record) => PolledHttpsResponse::Service(HttpsRecord {
+                    alpn: record
+                        .alpn
+                        .iter()
+                        .map(|&protocol| String::from(protocol))
+                        .collect(),
+                    port: record.port,
+                    ttl_nanos: u64::from(record.ttl_seconds) * 1_000_000_000,
+                }),
+                DnsHttpsOutcome::Alias {
+                    target,
+                    ttl_seconds,
+                    hops,
+                } => {
+                    *alias_out = target;
+                    PolledHttpsResponse::Alias { ttl_seconds, hops }
+                }
+                DnsHttpsOutcome::NoRecord => PolledHttpsResponse::NoRecord,
+                DnsHttpsOutcome::ServerFailure(_) => PolledHttpsResponse::ServerFailure,
+            });
+        }
+        Ok(resolved)
     }
 
     /// Drives IPv6 stateless address autoconfiguration one step:
@@ -1215,4 +1457,21 @@ impl DnsAnswers {
         }
         Ok(self.addresses)
     }
+}
+
+pub(super) enum PolledHttpsResponse {
+    Service(HttpsRecord),
+    Alias { ttl_seconds: u32, hops: usize },
+    NoRecord,
+    ServerFailure,
+}
+
+fn is_ip_literal(host: &str) -> bool {
+    parse_ipv4(host).is_some()
+        || parse_ipv6(host).is_some()
+        || host
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .and_then(parse_ipv6)
+            .is_some()
 }
