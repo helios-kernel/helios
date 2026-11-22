@@ -1224,6 +1224,7 @@ fn user_attributes_apply_to_regular_files_directories_and_sockets() {
                     mode: 0o140_755,
                     uid: 1000,
                     gid: 1000,
+                    rdev: 0,
                     umask: 0,
                 },
                 when(3),

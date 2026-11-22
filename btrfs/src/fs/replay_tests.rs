@@ -122,6 +122,7 @@ async fn create<S: BlockSink>(
             },
             Attributes {
                 mode,
+                rdev: 0,
                 umask: 0,
                 uid: 1000,
                 gid: 1000,
@@ -1289,7 +1290,13 @@ async fn authority(check: bool) {
     let meta = *dev_inode.metadata();
     assert_eq!(
         (meta.kind, meta.permissions, meta.uid, meta.gid, meta.rdev),
-        (FileKind::CharDevice, 0o0660, 0, 6, 0x0103)
+        (
+            FileKind::CharDevice,
+            0o0660,
+            0,
+            6,
+            crate::DeviceNumber::from_inode_item(0x0103)
+        )
     );
 
     let root_dir = fs.root().await.unwrap();
