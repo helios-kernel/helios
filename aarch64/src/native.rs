@@ -287,6 +287,10 @@ unsafe impl UserTranslation for Aarch64Tables {
     fn physical(&self, frame: NonNull<u8>) -> u64 {
         frame.as_ptr() as u64 - self.offset as u64
     }
+
+    fn new_empty(&self) -> Result<Self, NativeError> {
+        Self::new()
+    }
 }
 
 impl Aarch64Tables {

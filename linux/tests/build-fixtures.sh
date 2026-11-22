@@ -22,13 +22,15 @@ done
 # memory calls; the rest are the system-information suite, one program per
 # call group, each checking its calls' results and errors against Linux's
 # behaviour.
-for program in hello-libc args memory clock random identity limits machine priority pthreads signals container sockets; do
+for program in hello-libc args memory clock random identity limits machine priority pthreads signals container sockets process; do
     zig cc -target "$arch-linux-musl" -static -no-pie -s -O2 -Wl,--build-id=none \
         -Ilinux/tests "linux/tests/$program.c" -o "$out/linux/$program"
 done
+bash linux/tests/build-dash.sh "$out/linux/dash" "$arch"
 cp linux/tests/check-memory.sh "$out/linux/check-memory.sh"
 cp linux/tests/check-pthreads.sh "$out/linux/check-pthreads.sh"
 cp linux/tests/check-signals.sh "$out/linux/check-signals.sh"
+cp linux/tests/check-dash.sh "$out/linux/check-dash.sh"
 # The same executables first run under Linux, establishing their ABI assertions.
 if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     "$out/linux/hello"
@@ -54,4 +56,6 @@ if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     "$out/linux/machine"
     "$out/linux/container"
     "$out/linux/sockets"
+    "$out/linux/process"
+    sh "$out/linux/check-dash.sh" "$out/linux/dash" "$out/linux/hello" "$out/linux/args" "$(command -v cat)"
 fi

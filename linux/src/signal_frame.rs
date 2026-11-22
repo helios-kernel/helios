@@ -53,6 +53,11 @@ pub const SEGV_ACCERR: i32 = 2;
 pub const BUS_ADRALN: i32 = 1;
 pub const BUS_ADRERR: i32 = 2;
 pub const TRAP_BRKPT: i32 = 1;
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
+pub const CLD_DUMPED: i32 = 3;
+pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
 
 /// Size of Linux `siginfo_t` (`SI_MAX_SIZE`, `include/uapi/asm-generic/siginfo.h`).
 pub const SIGINFO_SIZE: usize = 128;
@@ -126,6 +131,9 @@ pub enum SignalFrameError {
 pub enum SigInfoPayload {
     /// Sender PID and real UID (`SI_USER`, `SI_TKILL`).
     Kill { pid: u32, uid: u32 },
+    /// Child status event (`SIGCHLD` / `waitid`: `CLD_EXITED`, `CLD_KILLED`,
+    /// `CLD_DUMPED`, `CLD_STOPPED`, `CLD_CONTINUED`).
+    Child { pid: u32, uid: u32, status: i32 },
     /// Faulting memory or instruction address (`SIGSEGV`, `SIGBUS`, `SIGILL`,
     /// `SIGFPE`, `SIGTRAP`).
     Fault { addr: u64 },
@@ -259,6 +267,11 @@ impl SigInfo {
             SigInfoPayload::Kill { pid, uid } => {
                 write_u32(&mut bytes, 16, pid);
                 write_u32(&mut bytes, 20, uid);
+            }
+            SigInfoPayload::Child { pid, uid, status } => {
+                write_u32(&mut bytes, 16, pid);
+                write_u32(&mut bytes, 20, uid);
+                write_i32(&mut bytes, 24, status);
             }
             SigInfoPayload::Fault { addr } => {
                 write_u64(&mut bytes, 16, addr);

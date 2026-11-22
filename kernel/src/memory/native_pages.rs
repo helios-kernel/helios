@@ -27,6 +27,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
@@ -75,6 +76,12 @@ pub unsafe trait UserTranslation: Send + 'static {
 
     /// The physical address of a user frame, from its direct-map address.
     fn physical(&self, frame: NonNull<u8>) -> u64;
+
+    /// Allocates a fresh, empty translation-table root matching this space's
+    /// kernel half and direct-map offset, for [`UserSpace::clone_cow`].
+    fn new_empty(&self) -> Result<Self, NativeError>
+    where
+        Self: Sized;
 }
 
 /// A native user address space: the page index and the backend's
@@ -128,11 +135,88 @@ impl<Tables> Drop for NativeSlice<'_, Tables> {
     }
 }
 
+/// A reference-counted copy-on-write user frame. Dropping the last `Arc`
+/// returns the frame to the user memory pool on the executing processor.
+#[derive(Debug)]
+struct SharedFrame(NonNull<u8>);
+
+// SAFETY: a user frame is a 4 KiB direct-mapped allocation managed by the user
+// memory pool; shared frames stay read-only in hardware until copied or
+// unwrapped by the sole surviving owner.
+unsafe impl Send for SharedFrame {}
+unsafe impl Sync for SharedFrame {}
+
+impl SharedFrame {
+    fn into_raw(self) -> NonNull<u8> {
+        let ptr = self.0;
+        core::mem::forget(self);
+        ptr
+    }
+}
+
+impl Drop for SharedFrame {
+    fn drop(&mut self) {
+        deallocate_user_frame_on(helios_hal::cpu::current_processor(), self.0);
+    }
+}
+
+/// Ownership of one committed 4 KiB user frame inside [`NativePages`].
+///
+/// Non-forked pages stay [`Self::Unique`] with no heap allocation or atomic
+/// refcount traffic; [`NativeSpace::clone_cow`] promotes committed frames to
+/// [`Self::Shared`] so parent and child share them read-only until either
+/// writes.
+#[derive(Debug)]
+enum FrameRef {
+    Unique(NonNull<u8>),
+    Shared(Arc<SharedFrame>),
+}
+
+impl FrameRef {
+    fn ptr(&self) -> NonNull<u8> {
+        match self {
+            Self::Unique(ptr) => *ptr,
+            Self::Shared(shared) => shared.0,
+        }
+    }
+
+    fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared(_))
+    }
+
+    fn share(&mut self) -> Self {
+        match self {
+            Self::Unique(ptr) => {
+                let shared = Arc::new(SharedFrame(*ptr));
+                let clone = Arc::clone(&shared);
+                *self = Self::Shared(shared);
+                Self::Shared(clone)
+            }
+            Self::Shared(shared) => Self::Shared(Arc::clone(shared)),
+        }
+    }
+
+    fn release(self, processor: helios_hal::cpu::ProcessorId) {
+        match self {
+            Self::Unique(ptr) => deallocate_user_frame_on(processor, ptr),
+            Self::Shared(shared) => drop(shared),
+        }
+    }
+}
+
+fn hardware_flags(flags: PageFlags, shared: bool) -> PageFlags {
+    if shared {
+        flags - PageFlags::WRITE
+    } else {
+        flags
+    }
+}
+
 /// What a change took out of the tables: the frames to free once its
 /// shootdown is done, and the page span `[first, last)` it removed or
 /// narrowed translations in, empty when it touched none.
 struct Removed {
-    frames: Vec<NonNull<u8>>,
+    frames: Vec<FrameRef>,
     first: u64,
     last: u64,
 }
@@ -181,22 +265,28 @@ impl<Tables: UserTranslation> NativeSpace<Tables> {
         NativeSlice { space: self }
     }
 
-    /// Completes a change: invalidates what it removed or narrowed wherever
-    /// a slice may hold it, then frees the frames it took out.
-    fn complete(&self, tables: &Tables, removed: Removed) {
-        if removed.first < removed.last {
+    /// Runs a TLB shootdown over `[first, last)` whenever any slice of this
+    /// space may be executing on another processor.
+    fn invalidate_if_active(&self, tables: &Tables, first: u64, last: u64) {
+        if first < last {
             // Pairs with `begin_slice`: either this load sees a slice that
             // is starting, or that slice counts itself after it and the root
             // it loads walks the tables as written above. A slice that has
             // ended left nothing behind on its processor.
             fence(Ordering::SeqCst);
             if self.shared.slices.load(Ordering::SeqCst) != 0 {
-                tables.invalidate(removed.first, removed.last);
+                tables.invalidate(first, last);
             }
         }
+    }
+
+    /// Completes a change: invalidates what it removed or narrowed wherever
+    /// a slice may hold it, then frees the frames it took out.
+    fn complete(&self, tables: &Tables, removed: Removed) {
+        self.invalidate_if_active(tables, removed.first, removed.last);
         let processor = helios_hal::cpu::current_processor();
         for frame in removed.frames {
-            deallocate_user_frame_on(processor, frame);
+            frame.release(processor);
         }
     }
 }
@@ -226,7 +316,7 @@ impl<Tables: UserTranslation> SpaceState<Tables> {
     /// frames wait for the shootdown.
     fn take(&mut self, first: u64, last: u64) -> Removed {
         let mut removed = Removed::new();
-        for (base, frame) in self.pages.remove_range(first, last) {
+        for (base, frame) in self.pages.remove_range_refs(first, last) {
             self.tables.uninstall(base);
             removed.touch(base);
             removed.frames.push(frame);
@@ -257,17 +347,97 @@ impl<Tables: UserTranslation> SpaceState<Tables> {
         Ok(())
     }
 
-    /// Gives every uncommitted page of `[first, last)` its frame. Pages
-    /// committed before a failure keep theirs: they read as zeros either
-    /// way.
-    fn commit_range(&mut self, first: u64, last: u64) -> Result<(), NativeError> {
+    /// Ensures committed page `base` is privately owned (`FrameRef::Unique`)
+    /// and writable in hardware (`flags`). Upgrades in place when this space
+    /// is the sole surviving owner, or performs a break-before-make copy onto
+    /// a fresh frame when another space still references the frame.
+    fn break_cow_page(
+        &mut self,
+        space: &NativeSpace<Tables>,
+        base: u64,
+        flags: PageFlags,
+    ) -> Result<(), NativeError> {
+        if !self
+            .pages
+            .frames
+            .get(&base)
+            .is_some_and(FrameRef::is_shared)
+        {
+            return Ok(());
+        }
+        let FrameRef::Shared(shared) = self
+            .pages
+            .frames
+            .remove(&base)
+            .expect("checked shared frame exists")
+        else {
+            unreachable!("checked is_shared above");
+        };
+        match Arc::try_unwrap(shared) {
+            Ok(sole) => {
+                // Sole surviving owner: upgrade back to `Unique` in place and
+                // widen the hardware PTE (widening needs no shootdown).
+                self.pages
+                    .frames
+                    .insert(base, FrameRef::Unique(sole.into_raw()));
+                self.tables.protect(base, flags);
+                Ok(())
+            }
+            Err(shared) => {
+                let processor = helios_hal::cpu::current_processor();
+                let Ok(new_frame) = allocate_user_frame_zeroed_on(processor) else {
+                    self.pages.frames.insert(base, FrameRef::Shared(shared));
+                    return Err(NativeError::OutOfMemory);
+                };
+                // SAFETY: both `shared.0` and `new_frame` are valid 4 KiB
+                // direct-mapped user frames; `shared` is read-only in hardware
+                // and remains alive until dropped below.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        shared.0.as_ptr(),
+                        new_frame.as_ptr(),
+                        PAGE as usize,
+                    );
+                }
+                let old_phys = self.tables.physical(shared.0);
+                let new_phys = self.tables.physical(new_frame);
+                // Break-before-make (Arm ARM D8.14.1): uninstall the shared
+                // translation and shoot down active slices before installing
+                // the private physical frame.
+                self.tables.uninstall(base);
+                space.invalidate_if_active(&self.tables, base, base + PAGE);
+                if let Err(error) = self.tables.install(base, new_phys, flags) {
+                    let _ = self
+                        .tables
+                        .install(base, old_phys, hardware_flags(flags, true));
+                    deallocate_user_frame_on(processor, new_frame);
+                    self.pages.frames.insert(base, FrameRef::Shared(shared));
+                    return Err(error);
+                }
+                self.pages.frames.insert(base, FrameRef::Unique(new_frame));
+                drop(shared);
+                Ok(())
+            }
+        }
+    }
+
+    /// Gives every uncommitted page of `[first, last)` a private frame and
+    /// breaks copy-on-write on any shared page so a kernel write never mutates
+    /// another space's frame.
+    fn ensure_writable_private_range(
+        &mut self,
+        space: &NativeSpace<Tables>,
+        first: u64,
+        last: u64,
+    ) -> Result<(), NativeError> {
         for base in (first..last).step_by(PAGE as usize) {
             let page = self
                 .pages
                 .get(base)
                 .expect("write checks every page is mapped first");
-            if page.frame.is_none() {
-                self.commit(base, page.flags)?;
+            match page.frame {
+                None => self.commit(base, page.flags)?,
+                Some(_) => self.break_cow_page(space, base, page.flags)?,
             }
         }
         Ok(())
@@ -363,7 +533,7 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             return Ok(());
         }
         let (first, last) = state.pages.span(address, bytes.len() as u64)?;
-        state.commit_range(first, last)?;
+        state.ensure_writable_private_range(self, first, last)?;
         state.pages.write(address, bytes, PageFlags::WRITE)
     }
 
@@ -401,6 +571,8 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         }
         if page.frame.is_none() {
             state.commit(first, page.flags)?;
+        } else {
+            state.break_cow_page(self, first, page.flags)?;
         }
         let frame = state
             .pages
@@ -432,6 +604,8 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         }
         if page.frame.is_none() {
             state.commit(first, page.flags)?;
+        } else {
+            state.break_cow_page(self, first, page.flags)?;
         }
         let frame = state
             .pages
@@ -470,10 +644,14 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         }
         let SpaceState { pages, tables } = &mut *state;
         let mut narrowed = Removed::new();
-        pages.protect_range(first, last, flags, |base, old_flags| {
-            tables.protect(base, flags);
-            if !flags.contains(old_flags) {
-                narrowed.touch(base);
+        pages.protect_range_with_sharing(first, last, flags, |base, old_flags, shared| {
+            let old_hw = hardware_flags(old_flags, shared);
+            let new_hw = hardware_flags(flags, shared);
+            if old_hw != new_hw {
+                tables.protect(base, new_hw);
+                if !new_hw.contains(old_hw) {
+                    narrowed.touch(base);
+                }
             }
         });
         self.complete(&state.tables, narrowed);
@@ -486,7 +664,7 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         state.pages.span(first, last - first)?;
         let SpaceState { pages, tables } = &mut *state;
         let mut removed = Removed::new();
-        for (base, frame) in pages.discard_range(first, last) {
+        for (base, frame) in pages.discard_range_refs(first, last) {
             tables.uninstall(base);
             removed.touch(base);
             removed.frames.push(frame);
@@ -517,15 +695,16 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         // Each moved frame is reachable at both addresses until the source
         // goes, so a slice racing the move reaches one frame, never two. The
         // growth tail takes no frames until touched.
-        let committed = state.pages.committed_in(from_first, from_last);
-        for (index, (base, frame)) in committed.iter().enumerate() {
+        let committed = state.pages.committed_in_with_sharing(from_first, from_last);
+        for (index, (base, ptr, shared)) in committed.iter().enumerate() {
             let target = to_first + (base - from_first);
-            let physical = state.tables.physical(*frame);
-            if let Err(error) = state.tables.install(target, physical, flags) {
+            let physical = state.tables.physical(*ptr);
+            let hw = hardware_flags(flags, *shared);
+            if let Err(error) = state.tables.install(target, physical, hw) {
                 // Unwind the destination. Its moved translations alias frames
                 // the source still owns, so none are freed here.
                 let mut unwound = Removed::new();
-                for (base, _) in &committed[..index] {
+                for (base, _, _) in &committed[..index] {
                     let target = to_first + (base - from_first);
                     state.tables.uninstall(target);
                     unwound.touch(target);
@@ -536,12 +715,12 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         }
         let SpaceState { pages, tables } = &mut *state;
         let mut source = Removed::new();
-        let moved = pages.remove_range(from_first, from_last);
+        let moved = pages.remove_range_refs(from_first, from_last);
         pages.insert_region(to_first, to_last, flags);
         for (base, frame) in moved {
             tables.uninstall(base);
             source.touch(base);
-            pages.insert_frame(to_first + (base - from_first), frame);
+            pages.insert_frame_ref(to_first + (base - from_first), frame);
         }
         self.complete(&state.tables, source);
         Ok(())
@@ -555,10 +734,13 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             return Err(NativeError::NotMapped);
         }
         match page.frame {
+            None => state.commit(base, page.flags),
+            Some(_) if access.contains(PageFlags::WRITE) => {
+                state.break_cow_page(self, base, page.flags)
+            }
             // A translation older than the page's current access, left on
             // the faulting processor: walking the tables again succeeds.
             Some(_) => Ok(()),
-            None => state.commit(base, page.flags),
         }
     }
 
@@ -580,6 +762,59 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
             .free_range(hint.raw() as u64, byte_len as u64)
             .map(|start| VirtAddr::new(start as usize))
     }
+
+    fn clone_cow(&self) -> Result<Self, NativeError> {
+        let mut state = self.shared.state.lock();
+        let mut child_tables = state.tables.new_empty()?;
+        let mut child_pages = NativePages {
+            regions: state.pages.regions.clone(),
+            frames: BTreeMap::new(),
+            start: state.pages.start,
+            end: state.pages.end,
+        };
+        let mut narrowed = Removed::new();
+        let SpaceState { pages, tables } = &mut *state;
+        let keys: Vec<u64> = pages.frames.keys().copied().collect();
+        for base in keys {
+            let flags = pages
+                .region_at(base)
+                .expect("every committed frame lies inside a mapped region")
+                .1
+                .flags;
+            let hw_flags = hardware_flags(flags, true);
+            let frame_ref = pages
+                .frames
+                .get_mut(&base)
+                .expect("key came from pages.frames");
+            let physical = tables.physical(frame_ref.ptr());
+            let was_shared = frame_ref.is_shared();
+            if let Err(error) = child_tables.install(base, physical, hw_flags) {
+                // Shoot down any parent pages already narrowed before dropping
+                // `child_pages` (which decrements its `Arc<SharedFrame>` refs).
+                self.complete(tables, narrowed);
+                return Err(error);
+            }
+            let child_ref = frame_ref.share();
+            child_pages.frames.insert(base, child_ref);
+            if !was_shared && flags.contains(PageFlags::WRITE) {
+                tables.protect(base, hw_flags);
+                narrowed.touch(base);
+            }
+        }
+        // Shoot down every narrowed parent PTE before exposing the child space
+        // so no sibling thread in the parent can write through a stale writable
+        // TLB entry into a newly shared frame.
+        self.complete(tables, narrowed);
+        Ok(Self {
+            shared: Box::new(Shared {
+                state: Mutex::new(SpaceState {
+                    pages: child_pages,
+                    tables: child_tables,
+                }),
+                slices: CachePadded::new(AtomicUsize::new(0)),
+            }),
+        })
+    }
 }
 
 impl<Tables> Drop for NativeSpace<Tables> {
@@ -587,8 +822,8 @@ impl<Tables> Drop for NativeSpace<Tables> {
         // No slice outlives the borrow of this space, and every slice's exit
         // left no translation of it usable on its processor.
         let processor = helios_hal::cpu::current_processor();
-        for frame in self.shared.state.get_mut().pages.drain_frames() {
-            deallocate_user_frame_on(processor, frame);
+        for frame in self.shared.state.get_mut().pages.drain_frame_refs() {
+            frame.release(processor);
         }
     }
 }
@@ -614,7 +849,7 @@ pub struct NativePages {
     /// address; adjacent ranges with identical `flags` are merged.
     regions: BTreeMap<u64, MappedRegion>,
     /// Committed backing frames keyed by page base inside `regions`.
-    frames: BTreeMap<u64, NonNull<u8>>,
+    frames: BTreeMap<u64, FrameRef>,
     /// The lowest mappable address: page zero stays unmapped.
     start: u64,
     /// The end of the user range.
@@ -721,7 +956,7 @@ impl NativePages {
     pub fn get(&self, base: u64) -> Option<NativePage> {
         let (_, region) = self.region_at(base)?;
         Some(NativePage {
-            frame: self.frames.get(&base).copied(),
+            frame: self.frames.get(&base).map(FrameRef::ptr),
             flags: region.flags,
         })
     }
@@ -753,6 +988,10 @@ impl NativePages {
     }
 
     pub fn insert_frame(&mut self, base: u64, frame: NonNull<u8>) {
+        self.insert_frame_ref(base, FrameRef::Unique(frame));
+    }
+
+    fn insert_frame_ref(&mut self, base: u64, frame: FrameRef) {
         let previous = self.frames.insert(base, frame);
         assert!(previous.is_none(), "user page {base:#x} framed twice");
     }
@@ -774,7 +1013,7 @@ impl NativePages {
             self.region_at(base).is_some(),
             "committing unmapped user page {base:#x}"
         );
-        let previous = self.frames.insert(base, frame);
+        let previous = self.frames.insert(base, FrameRef::Unique(frame));
         assert!(previous.is_none(), "user page {base:#x} committed twice");
     }
 
@@ -794,7 +1033,7 @@ impl NativePages {
         }
     }
 
-    fn drain_frames_in_range(&mut self, first: u64, last: u64) -> Vec<(u64, NonNull<u8>)> {
+    fn drain_frames_in_range(&mut self, first: u64, last: u64) -> Vec<(u64, FrameRef)> {
         let mut tail = self.frames.split_off(&first);
         let mut rest = tail.split_off(&last);
         self.frames.append(&mut rest);
@@ -811,6 +1050,18 @@ impl NativePages {
         flags: PageFlags,
         mut on_committed: impl FnMut(u64, PageFlags),
     ) {
+        self.protect_range_with_sharing(first, last, flags, |base, old_flags, _| {
+            on_committed(base, old_flags);
+        });
+    }
+
+    fn protect_range_with_sharing(
+        &mut self,
+        first: u64,
+        last: u64,
+        flags: PageFlags,
+        mut on_committed: impl FnMut(u64, PageFlags, bool),
+    ) {
         if first >= last {
             return;
         }
@@ -823,8 +1074,8 @@ impl NativePages {
             .collect();
         for (start, region) in &keys {
             if region.flags != flags {
-                for (&base, _) in self.frames.range(*start..region.end) {
-                    on_committed(base, region.flags);
+                for (&base, frame) in self.frames.range(*start..region.end) {
+                    on_committed(base, region.flags, frame.is_shared());
                 }
             }
             self.regions.remove(start);
@@ -836,6 +1087,13 @@ impl NativePages {
     /// ranges and their access intact, returning the `(base, frame)` pairs
     /// removed.
     pub fn discard_range(&mut self, first: u64, last: u64) -> Vec<(u64, NonNull<u8>)> {
+        self.discard_range_refs(first, last)
+            .into_iter()
+            .map(|(base, frame)| (base, frame.ptr()))
+            .collect()
+    }
+
+    fn discard_range_refs(&mut self, first: u64, last: u64) -> Vec<(u64, FrameRef)> {
         if first >= last {
             return Vec::new();
         }
@@ -845,13 +1103,27 @@ impl NativePages {
     pub fn committed_in(&self, first: u64, last: u64) -> Vec<(u64, NonNull<u8>)> {
         self.frames
             .range(first..last)
-            .map(|(&base, &frame)| (base, frame))
+            .map(|(&base, frame)| (base, frame.ptr()))
+            .collect()
+    }
+
+    fn committed_in_with_sharing(&self, first: u64, last: u64) -> Vec<(u64, NonNull<u8>, bool)> {
+        self.frames
+            .range(first..last)
+            .map(|(&base, frame)| (base, frame.ptr(), frame.is_shared()))
             .collect()
     }
 
     /// Takes every page of `[first, last)` out of the index, returning the
     /// committed `(base, frame)` pairs that were mapped there.
     pub fn remove_range(&mut self, first: u64, last: u64) -> Vec<(u64, NonNull<u8>)> {
+        self.remove_range_refs(first, last)
+            .into_iter()
+            .map(|(base, frame)| (base, frame.ptr()))
+            .collect()
+    }
+
+    fn remove_range_refs(&mut self, first: u64, last: u64) -> Vec<(u64, FrameRef)> {
         if first >= last {
             return Vec::new();
         }
@@ -866,6 +1138,10 @@ impl NativePages {
 
     /// Takes every committed frame out of the index.
     pub fn drain_frames(&mut self) -> impl Iterator<Item = NonNull<u8>> {
+        self.drain_frame_refs().map(|frame| frame.ptr())
+    }
+
+    fn drain_frame_refs(&mut self) -> impl Iterator<Item = FrameRef> {
         self.regions.clear();
         core::mem::take(&mut self.frames).into_values()
     }
@@ -961,7 +1237,7 @@ impl NativePages {
         };
 
         let mut cursor = first;
-        for (&base, &frame) in self.frames.range(first..last) {
+        for (&base, frame) in self.frames.range(first..last) {
             if cursor < base {
                 let gap = (base.min(end_addr) - cursor.max(address)) as usize;
                 emit(None, gap);
@@ -969,7 +1245,7 @@ impl NativePages {
             let skip = address.saturating_sub(base) as usize;
             let take = ((base + PAGE).min(end_addr) - base.max(address)) as usize;
             // SAFETY: `skip` lies inside this page's frame.
-            let start = unsafe { NonNull::new_unchecked(frame.as_ptr().add(skip)) };
+            let start = unsafe { NonNull::new_unchecked(frame.ptr().as_ptr().add(skip)) };
             emit(Some(start), take);
             cursor = base + PAGE;
         }
@@ -1207,6 +1483,12 @@ mod tests {
         fn physical(&self, frame: NonNull<u8>) -> u64 {
             frame.as_ptr() as u64
         }
+
+        fn new_empty(&self) -> Result<Self, NativeError> {
+            Ok(alloc::sync::Arc::new(ShootdownLog {
+                events: Mutex::new(Vec::new()),
+            }))
+        }
     }
 
     fn ensure_pool() {
@@ -1353,6 +1635,10 @@ mod tests {
         fn physical(&self, frame: NonNull<u8>) -> u64 {
             frame.as_ptr() as u64
         }
+
+        fn new_empty(&self) -> Result<Self, NativeError> {
+            Ok(InstallLog(alloc::sync::Arc::new(Mutex::new(Vec::new()))))
+        }
     }
 
     #[test]
@@ -1448,6 +1734,214 @@ mod tests {
         space.unmap(huge).unwrap();
         space.unmap(range(0x40_000, 4)).unwrap();
         space.unmap(range(0x80_000, 32)).unwrap();
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+    }
+
+    /// Hardware PTE model for copy-on-write tests: records every installed
+    /// `(physical, flags)` entry and every shootdown span.
+    #[derive(Clone)]
+    struct TrackingTables {
+        ptes: Arc<Mutex<BTreeMap<u64, (u64, PageFlags)>>>,
+        shootdowns: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl TrackingTables {
+        fn new() -> Self {
+            Self {
+                ptes: Arc::new(Mutex::new(BTreeMap::new())),
+                shootdowns: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn pte(&self, base: u64) -> Option<(u64, PageFlags)> {
+            self.ptes.lock().get(&base).copied()
+        }
+    }
+
+    // SAFETY: host test model tracking hardware translations without running
+    // hardware slices.
+    unsafe impl UserTranslation for TrackingTables {
+        fn install(
+            &mut self,
+            base: u64,
+            physical: u64,
+            flags: PageFlags,
+        ) -> Result<(), NativeError> {
+            let prev = self.ptes.lock().insert(base, (physical, flags));
+            assert!(
+                prev.is_none(),
+                "install must obey break-before-make on {base:#x}"
+            );
+            Ok(())
+        }
+
+        fn uninstall(&mut self, base: u64) {
+            let prev = self.ptes.lock().remove(&base);
+            assert!(prev.is_some(), "uninstall on unmapped page {base:#x}");
+        }
+
+        fn protect(&mut self, base: u64, flags: PageFlags) {
+            let mut ptes = self.ptes.lock();
+            let entry = ptes.get_mut(&base).expect("protect on mapped page");
+            entry.1 = flags;
+        }
+
+        fn invalidate(&self, first: u64, last: u64) {
+            self.shootdowns.lock().push((first, last));
+        }
+
+        fn physical(&self, frame: NonNull<u8>) -> u64 {
+            frame.as_ptr() as u64
+        }
+
+        fn new_empty(&self) -> Result<Self, NativeError> {
+            Ok(Self::new())
+        }
+    }
+
+    #[test]
+    fn cow_clone_shares_frames_shoots_down_parent_and_copies_on_write_fault() {
+        ensure_pool();
+        let parent_tables = TrackingTables::new();
+        let parent = NativeSpace::new(parent_tables.clone(), PAGE, 1 << 47);
+        let rw = PageFlags::READ | PageFlags::WRITE;
+        let range = |start: usize, pages: usize| {
+            VirtRange::new(VirtAddr::new(start), pages * PAGE as usize)
+        };
+
+        let baseline = crate::memory::user_heap_stats().allocated_bytes;
+        parent.map(range(0x10_000, 2), b"hello-cow", rw).unwrap();
+        // Page 0x10_000 is committed; 0x11_000 is uncommitted zero-fill.
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + PAGE as usize
+        );
+        let (orig_phys, orig_flags) = parent_tables.pte(0x10_000).unwrap();
+        assert_eq!(orig_flags, rw);
+
+        // Hold an active slice on parent to verify clone_cow shoots down narrowed PTEs.
+        let slice = parent.begin_slice();
+        let child = parent.clone_cow().unwrap();
+        drop(slice);
+
+        // Zero additional frames allocated by clone_cow!
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + PAGE as usize
+        );
+        // Parent's hardware PTE lost WRITE and was shot down.
+        assert_eq!(
+            parent_tables.pte(0x10_000),
+            Some((orig_phys, PageFlags::READ))
+        );
+        assert_eq!(*parent_tables.shootdowns.lock(), vec![(0x10_000, 0x11_000)]);
+        // Logical mapping still reports READ | WRITE in both spaces.
+        assert_eq!(
+            parent.mapping(range(0x10_000, 2)).map(|m| m.flags),
+            Some(rw)
+        );
+        assert_eq!(child.mapping(range(0x10_000, 2)).map(|m| m.flags), Some(rw));
+
+        // Child write fault copies the frame privately without touching parent.
+        let child_slice = child.begin_slice();
+        child
+            .resolve_fault(VirtAddr::new(0x10_000), PageFlags::WRITE)
+            .unwrap();
+        drop(child_slice);
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 2 * PAGE as usize
+        );
+        child.write(VirtAddr::new(0x10_000), b"child-val").unwrap();
+
+        let mut parent_bytes = [0u8; 9];
+        let mut child_bytes = [0u8; 9];
+        parent
+            .read(VirtAddr::new(0x10_000), &mut parent_bytes)
+            .unwrap();
+        child
+            .read(VirtAddr::new(0x10_000), &mut child_bytes)
+            .unwrap();
+        assert_eq!(&parent_bytes, b"hello-cow");
+        assert_eq!(&child_bytes, b"child-val");
+
+        // Parent is now the sole surviving owner of `orig_phys`: a write fault
+        // on parent upgrades in place without allocating a third frame!
+        parent
+            .resolve_fault(VirtAddr::new(0x10_000), PageFlags::WRITE)
+            .unwrap();
+        assert_eq!(
+            crate::memory::user_heap_stats().allocated_bytes,
+            baseline + 2 * PAGE as usize
+        );
+        assert_eq!(parent_tables.pte(0x10_000), Some((orig_phys, rw)));
+
+        drop(child);
+        drop(parent);
+        assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+    }
+
+    #[test]
+    fn cow_kernel_write_atomics_mprotect_and_mremap_preserve_isolation() {
+        ensure_pool();
+        let parent_tables = TrackingTables::new();
+        let parent = NativeSpace::new(parent_tables.clone(), PAGE, 1 << 47);
+        let rw = PageFlags::READ | PageFlags::WRITE;
+        let range = |start: usize, pages: usize| {
+            VirtRange::new(VirtAddr::new(start), pages * PAGE as usize)
+        };
+
+        let baseline = crate::memory::user_heap_stats().allocated_bytes;
+        parent.map(range(0x20_000, 1), b"orig", rw).unwrap();
+        parent
+            .map(range(0x30_000, 1), b"prot", PageFlags::READ)
+            .unwrap();
+        parent.map(range(0x40_000, 1), b"move", rw).unwrap();
+
+        let child = parent.clone_cow().unwrap();
+
+        // 1. Kernel write / atomic store / atomic CAS break CoW without mutating peer.
+        child
+            .atomic_store_u32(VirtAddr::new(0x20_004), 0xdead_beef)
+            .unwrap();
+        assert_eq!(parent.atomic_load_u32(VirtAddr::new(0x20_004)), Ok(0));
+        assert_eq!(
+            child.atomic_compare_exchange_u32(VirtAddr::new(0x20_004), 0xdead_beef, 42),
+            Ok(Ok(0xdead_beef))
+        );
+        assert_eq!(parent.atomic_load_u32(VirtAddr::new(0x20_004)), Ok(0));
+
+        // 2. Widening a shared RO page via `protect(RW)` keeps hardware PTE RO
+        //    so CoW still fires on write instead of corrupting the peer.
+        parent.protect(range(0x30_000, 1), rw).unwrap();
+        assert_eq!(
+            parent_tables.pte(0x30_000).map(|(_, flags)| flags),
+            Some(PageFlags::READ)
+        );
+        parent.write(VirtAddr::new(0x30_000), b"edit").unwrap();
+        let mut child_prot = [0u8; 4];
+        child
+            .read(VirtAddr::new(0x30_000), &mut child_prot)
+            .unwrap();
+        assert_eq!(&child_prot, b"prot");
+
+        // 3. Remapping (`mremap`) a CoW page keeps hardware PTE RO until write.
+        parent
+            .remap(range(0x40_000, 1), range(0x50_000, 1))
+            .unwrap();
+        assert_eq!(
+            parent_tables.pte(0x50_000).map(|(_, flags)| flags),
+            Some(PageFlags::READ)
+        );
+        parent.write(VirtAddr::new(0x50_000), b"mut!").unwrap();
+        let mut child_move = [0u8; 4];
+        child
+            .read(VirtAddr::new(0x40_000), &mut child_move)
+            .unwrap();
+        assert_eq!(&child_move, b"move");
+
+        drop(child);
+        drop(parent);
         assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
     }
 }

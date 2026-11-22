@@ -12,38 +12,42 @@ use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::futex::FUTEX_TID_MASK;
+use super::process::{
+    ChildWaitState, ProcessTreeRecord, TryWaitResult, WaitCloneFilter, WaitEvent, WaitEventKind,
+    WaitTarget,
+};
 use super::signal::{ProcessSignals, ThreadSignalSlot, WaitOutcome};
 use super::system::Credentials;
 use super::*;
 
 // include/uapi/linux/sched.h.
-const CSIGNAL: u64 = 0x0000_00ff;
+pub(super) const CSIGNAL: u64 = 0x0000_00ff;
 const CLONE_NEWTIME: u64 = 0x0000_0080;
-const CLONE_VM: u64 = 0x0000_0100;
-const CLONE_FS: u64 = 0x0000_0200;
-const CLONE_FILES: u64 = 0x0000_0400;
-const CLONE_SIGHAND: u64 = 0x0000_0800;
+pub(super) const CLONE_VM: u64 = 0x0000_0100;
+pub(super) const CLONE_FS: u64 = 0x0000_0200;
+pub(super) const CLONE_FILES: u64 = 0x0000_0400;
+pub(super) const CLONE_SIGHAND: u64 = 0x0000_0800;
 const CLONE_PIDFD: u64 = 0x0000_1000;
 const CLONE_PTRACE: u64 = 0x0000_2000;
-const CLONE_VFORK: u64 = 0x0000_4000;
-const CLONE_PARENT: u64 = 0x0000_8000;
+pub(super) const CLONE_VFORK: u64 = 0x0000_4000;
+pub(super) const CLONE_PARENT: u64 = 0x0000_8000;
 const CLONE_THREAD: u64 = 0x0001_0000;
 const CLONE_NEWNS: u64 = 0x0002_0000;
-const CLONE_SYSVSEM: u64 = 0x0004_0000;
-const CLONE_SETTLS: u64 = 0x0008_0000;
-const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
-const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
-const CLONE_DETACHED: u64 = 0x0040_0000;
-const CLONE_UNTRACED: u64 = 0x0080_0000;
-const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+pub(super) const CLONE_SYSVSEM: u64 = 0x0004_0000;
+pub(super) const CLONE_SETTLS: u64 = 0x0008_0000;
+pub(super) const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+pub(super) const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+pub(super) const CLONE_DETACHED: u64 = 0x0040_0000;
+pub(super) const CLONE_UNTRACED: u64 = 0x0080_0000;
+pub(super) const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 const CLONE_NEWCGROUP: u64 = 0x0200_0000;
 const CLONE_NEWUTS: u64 = 0x0400_0000;
 const CLONE_NEWIPC: u64 = 0x0800_0000;
 const CLONE_NEWUSER: u64 = 0x1000_0000;
 const CLONE_NEWPID: u64 = 0x2000_0000;
 const CLONE_NEWNET: u64 = 0x4000_0000;
-const CLONE_IO: u64 = 0x8000_0000;
-const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
+pub(super) const CLONE_IO: u64 = 0x8000_0000;
+pub(super) const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
 const CLONE_INTO_CGROUP: u64 = 1 << 33;
 
 const KNOWN_CLONE3_FLAGS: u64 = CLONE_NEWTIME
@@ -95,11 +99,6 @@ const ESRCH: u64 = 3;
 const E2BIG: u64 = 7;
 const EAGAIN: u64 = 11;
 
-struct RegisteredProcess {
-    signals: Arc<ProcessSignals>,
-    credentials: Arc<spin::Mutex<Credentials>>,
-}
-
 struct RegisteredThread {
     tgid: NonZeroU32,
     slot: Arc<ThreadSignalSlot>,
@@ -110,8 +109,13 @@ struct PidNamespaceState {
     next_pid: u32,
     allocated: BTreeSet<u32>,
     live_processes: u32,
-    processes: BTreeMap<u32, RegisteredProcess>,
+    processes: BTreeMap<u32, ProcessTreeRecord>,
     threads: BTreeMap<u32, RegisteredThread>,
+}
+
+struct PidNamespaceInner {
+    state: spin::Mutex<PidNamespaceState>,
+    wait_changed: Notify,
 }
 
 impl PidNamespaceState {
@@ -133,7 +137,8 @@ impl PidNamespaceState {
     }
 }
 
-/// Container-local PID and TID allocator (`kernel/pid.c`).
+/// Container-local PID and TID allocator and process tree (`kernel/pid.c`,
+/// `kernel/exit.c`).
 ///
 /// Process and thread IDs start at 1 within each container, never collide
 /// across processes or threads inside the container, and are never visible
@@ -142,15 +147,16 @@ impl PidNamespaceState {
 /// # Concurrency contract
 ///
 /// Synchronized by a short synchronous `spin::Mutex`, never held across an
-/// `.await`.
+/// `.await`; child wait state transitions broadcast on lock-free `wait_changed`
+/// after releasing the mutex.
 #[derive(Clone)]
 pub struct PidNamespace {
-    inner: Arc<spin::Mutex<PidNamespaceState>>,
+    inner: Arc<PidNamespaceInner>,
 }
 
 impl core::fmt::Debug for PidNamespace {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let state = self.inner.lock();
+        let state = self.inner.state.lock();
         formatter
             .debug_struct("PidNamespace")
             .field("live_processes", &state.live_processes)
@@ -169,13 +175,16 @@ impl PidNamespace {
     /// A fresh PID namespace whose first process receives PID 1.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(spin::Mutex::new(PidNamespaceState {
-                next_pid: 1,
-                allocated: BTreeSet::new(),
-                live_processes: 0,
-                processes: BTreeMap::new(),
-                threads: BTreeMap::new(),
-            })),
+            inner: Arc::new(PidNamespaceInner {
+                state: spin::Mutex::new(PidNamespaceState {
+                    next_pid: 1,
+                    allocated: BTreeSet::new(),
+                    live_processes: 0,
+                    processes: BTreeMap::new(),
+                    threads: BTreeMap::new(),
+                }),
+                wait_changed: Notify::new(),
+            }),
         }
     }
 
@@ -190,44 +199,65 @@ impl PidNamespace {
         let mut allocated = BTreeSet::new();
         allocated.insert(leader.get());
         Self {
-            inner: Arc::new(spin::Mutex::new(PidNamespaceState {
-                next_pid,
-                allocated,
-                live_processes: 1,
-                processes: BTreeMap::new(),
-                threads: BTreeMap::new(),
-            })),
+            inner: Arc::new(PidNamespaceInner {
+                state: spin::Mutex::new(PidNamespaceState {
+                    next_pid,
+                    allocated,
+                    live_processes: 1,
+                    processes: BTreeMap::new(),
+                    threads: BTreeMap::new(),
+                }),
+                wait_changed: Notify::new(),
+            }),
         }
     }
 
     /// Allocates a new process (thread-group leader) ID starting at 1 and
     /// increments the container's live process count.
     pub fn allocate_process(&self) -> Result<NonZeroU32, u64> {
-        let mut state = self.inner.lock();
+        let mut state = self.inner.state.lock();
         let pid = state.allocate_raw()?;
         state.live_processes = state.live_processes.saturating_add(1);
         Ok(pid)
     }
 
-    /// Releases a process (thread-group leader) ID once every thread of the
-    /// process has exited and decrements the container's live process count.
+    /// Unconditionally releases a process ID (used for root/ephemeral
+    /// processes with no container parent and for rollback on failed spawn).
     pub fn release_process(&self, pid: NonZeroU32) {
-        let mut state = self.inner.lock();
-        state.processes.remove(&pid.get());
+        let mut state = self.inner.state.lock();
+        let was_live = state
+            .processes
+            .remove(&pid.get())
+            .is_none_or(|record| record.is_live());
         state.threads.remove(&pid.get());
-        if state.allocated.remove(&pid.get()) {
+        if state.allocated.remove(&pid.get()) && was_live {
             state.live_processes = state.live_processes.saturating_sub(1);
         }
+        // If container PID 1 exits, clean up any orphaned zombies.
+        if pid.get() == 1 {
+            let orphaned: Vec<u32> = state
+                .processes
+                .iter()
+                .filter(|(_, record)| !record.is_live() && record.ppid == 1)
+                .map(|(&child_pid, _)| child_pid)
+                .collect();
+            for child_pid in orphaned {
+                state.processes.remove(&child_pid);
+                state.allocated.remove(&child_pid);
+            }
+        }
+        drop(state);
+        self.inner.wait_changed.notify_all();
     }
 
     /// Allocates a thread ID inside this namespace for a cloned thread.
     pub fn allocate_tid(&self) -> Result<NonZeroU32, u64> {
-        self.inner.lock().allocate_raw()
+        self.inner.state.lock().allocate_raw()
     }
 
     /// Releases a non-leader thread ID when the thread exits.
     pub fn release_tid(&self, tid: NonZeroU32) {
-        let mut state = self.inner.lock();
+        let mut state = self.inner.state.lock();
         state.threads.remove(&tid.get());
         state.allocated.remove(&tid.get());
     }
@@ -238,19 +268,450 @@ impl PidNamespace {
         signals: Arc<ProcessSignals>,
         credentials: Arc<spin::Mutex<Credentials>>,
     ) {
-        let mut state = self.inner.lock();
+        let mut state = self.inner.state.lock();
         state.allocated.insert(tgid.get());
         state.processes.insert(
             tgid.get(),
-            RegisteredProcess {
+            ProcessTreeRecord::new_root(tgid, signals, credentials),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn register_child_process(
+        &self,
+        pid: NonZeroU32,
+        ppid: u32,
+        pgid: NonZeroU32,
+        sid: NonZeroU32,
+        exit_signal: Option<Signal>,
+        signals: Arc<ProcessSignals>,
+        credentials: Arc<spin::Mutex<Credentials>>,
+    ) {
+        let mut state = self.inner.state.lock();
+        state.allocated.insert(pid.get());
+        state.processes.insert(
+            pid.get(),
+            ProcessTreeRecord {
+                ppid,
+                pgid,
+                sid,
+                exit_signal,
+                has_execed: false,
+                state: ChildWaitState::Running,
                 signals,
                 credentials,
             },
         );
     }
 
-    pub(super) fn unregister_process(&self, tgid: NonZeroU32) {
-        self.inner.lock().processes.remove(&tgid.get());
+    /// Marks `pid` as having completed `execve` (so its parent may no longer
+    /// change its process group with `setpgid`).
+    pub fn mark_execed(&self, pid: NonZeroU32) {
+        if let Some(record) = self.inner.state.lock().processes.get_mut(&pid.get()) {
+            record.has_execed = true;
+        }
+    }
+
+    /// Records that `pid` stopped on `signal`, notifying its parent's `wait4` /
+    /// `waitid` (`WUNTRACED`/`WSTOPPED`) and raising `SIGCHLD` unless the
+    /// parent has `SA_NOCLDSTOP`.
+    pub fn mark_stopped(&self, pid: NonZeroU32, signal: Signal) {
+        let parent_notify = {
+            let mut state = self.inner.state.lock();
+            let (ppid, child_uid) = match state.processes.get_mut(&pid.get()) {
+                Some(record) if record.is_live() => {
+                    record.state = ChildWaitState::Stopped {
+                        signal,
+                        reported: false,
+                    };
+                    (record.ppid, record.real_uid())
+                }
+                _ => return,
+            };
+            if ppid != 0 {
+                state
+                    .processes
+                    .get(&ppid)
+                    .filter(|parent| parent.is_live())
+                    .map(|parent| (parent.signals.clone(), child_uid))
+            } else {
+                None
+            }
+        };
+        if let Some((parent_signals, uid)) = parent_notify
+            && !parent_signals.sigchld_nocldstop()
+        {
+            parent_signals.raise_process(crate::signal_frame::SigInfo {
+                signo: Signal::SIGCHLD,
+                errno: 0,
+                code: crate::signal_frame::CLD_STOPPED,
+                payload: crate::signal_frame::SigInfoPayload::Child {
+                    pid: pid.get(),
+                    uid,
+                    status: i32::from(signal.raw()),
+                },
+            });
+        }
+        self.inner.wait_changed.notify_all();
+    }
+
+    /// Records that stopped process `pid` resumed on `SIGCONT`, waking any
+    /// parent waiting with `WCONTINUED`.
+    pub fn mark_continued(&self, pid: NonZeroU32) {
+        let parent_notify = {
+            let mut state = self.inner.state.lock();
+            let (ppid, child_uid) = match state.processes.get_mut(&pid.get()) {
+                Some(record) if record.is_live() => {
+                    record.state = ChildWaitState::Continued { reported: false };
+                    (record.ppid, record.real_uid())
+                }
+                _ => return,
+            };
+            if ppid != 0 {
+                state
+                    .processes
+                    .get(&ppid)
+                    .filter(|parent| parent.is_live())
+                    .map(|parent| (parent.signals.clone(), child_uid))
+            } else {
+                None
+            }
+        };
+        if let Some((parent_signals, uid)) = parent_notify
+            && !parent_signals.sigchld_nocldstop()
+        {
+            parent_signals.raise_process(crate::signal_frame::SigInfo {
+                signo: Signal::SIGCHLD,
+                errno: 0,
+                code: crate::signal_frame::CLD_CONTINUED,
+                payload: crate::signal_frame::SigInfoPayload::Child {
+                    pid: pid.get(),
+                    uid,
+                    status: i32::from(Signal::SIGCONT.raw()),
+                },
+            });
+        }
+        self.inner.wait_changed.notify_all();
+    }
+
+    /// Transitions `pid` to exited/zombie state, reparents any children of
+    /// `pid` to PID 1, auto-reaps if the parent is gone or ignores `SIGCHLD` /
+    /// sets `SA_NOCLDWAIT`, and notifies parent (`SIGCHLD` + `wait_changed`).
+    pub fn mark_exited(&self, pid: NonZeroU32, termination: ChildTermination) {
+        let mut signals_to_send: Vec<(Arc<ProcessSignals>, crate::signal_frame::SigInfo)> =
+            Vec::new();
+        {
+            let mut state = self.inner.state.lock();
+            let Some(record) = state.processes.get(&pid.get()) else {
+                return;
+            };
+            if !record.is_live() {
+                return;
+            }
+            let ppid = record.ppid;
+            let exit_signal = record.exit_signal;
+            let child_uid = record.real_uid();
+
+            state.threads.remove(&pid.get());
+            state.live_processes = state.live_processes.saturating_sub(1);
+
+            // Reparent surviving children of `pid` to container init (PID 1),
+            // or auto-reap their zombies if PID 1 is absent or is `pid` itself.
+            let init_alive = pid.get() != 1
+                && state
+                    .processes
+                    .get(&1)
+                    .is_some_and(ProcessTreeRecord::is_live);
+            let init_auto_reap = init_alive
+                && state
+                    .processes
+                    .get(&1)
+                    .is_some_and(|init| init.signals.sigchld_auto_reap());
+            let mut reparented_zombies = Vec::new();
+            let mut auto_reap_children = Vec::new();
+            for (&child_pid, child) in state.processes.iter_mut() {
+                if child.ppid == pid.get() {
+                    if init_alive {
+                        child.ppid = 1;
+                        if let ChildWaitState::Exited(term) = child.state {
+                            if init_auto_reap {
+                                auto_reap_children.push(child_pid);
+                            } else {
+                                reparented_zombies.push((child_pid, child.real_uid(), term));
+                            }
+                        }
+                    } else {
+                        child.ppid = 0;
+                        if !child.is_live() {
+                            auto_reap_children.push(child_pid);
+                        }
+                    }
+                }
+            }
+            for child_pid in auto_reap_children {
+                state.processes.remove(&child_pid);
+                state.allocated.remove(&child_pid);
+            }
+            if !reparented_zombies.is_empty()
+                && let Some(init) = state.processes.get(&1)
+            {
+                for (zpid, zuid, term) in reparented_zombies {
+                    let event = WaitEvent {
+                        pid: zpid,
+                        uid: zuid,
+                        kind: WaitEventKind::Exited(term),
+                    };
+                    signals_to_send.push((init.signals.clone(), event.encode_siginfo()));
+                }
+            }
+
+            // Decide whether `pid` stays as a zombie for `ppid` or auto-reaps.
+            let parent_info = if ppid != 0 {
+                state
+                    .processes
+                    .get(&ppid)
+                    .filter(|parent| parent.is_live())
+                    .map(|parent| (parent.signals.clone(), parent.signals.sigchld_auto_reap()))
+            } else {
+                None
+            };
+
+            match parent_info {
+                Some((parent_signals, auto_reap)) => {
+                    if exit_signal == Some(Signal::SIGCHLD) && auto_reap {
+                        state.processes.remove(&pid.get());
+                        state.allocated.remove(&pid.get());
+                    } else {
+                        if let Some(entry) = state.processes.get_mut(&pid.get()) {
+                            entry.state = ChildWaitState::Exited(termination);
+                        }
+                        if let Some(sig) = exit_signal {
+                            let info = if sig == Signal::SIGCHLD {
+                                WaitEvent {
+                                    pid: pid.get(),
+                                    uid: child_uid,
+                                    kind: WaitEventKind::Exited(termination),
+                                }
+                                .encode_siginfo()
+                            } else {
+                                crate::signal_frame::SigInfo::from_kill(sig, pid.get(), child_uid)
+                            };
+                            signals_to_send.push((parent_signals, info));
+                        }
+                    }
+                }
+                None => {
+                    // No live parent inside this container: release PID immediately.
+                    state.processes.remove(&pid.get());
+                    state.allocated.remove(&pid.get());
+                }
+            }
+        }
+        for (target_signals, info) in signals_to_send {
+            let _ = target_signals.raise_process(info);
+        }
+        self.inner.wait_changed.notify_all();
+    }
+
+    pub(super) fn wait_waiter(&self) -> NotifyWaiter {
+        self.inner.wait_changed.waiter()
+    }
+
+    pub(super) fn poll_wait_changed(
+        &self,
+        cx: &mut Context<'_>,
+        waiter: &mut NotifyWaiter,
+    ) -> Poll<()> {
+        self.inner.wait_changed.poll_notified(cx, waiter)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_wait(
+        &self,
+        parent: NonZeroU32,
+        target: WaitTarget,
+        clone_filter: WaitCloneFilter,
+        want_exited: bool,
+        want_stopped: bool,
+        want_continued: bool,
+        nowait: bool,
+    ) -> TryWaitResult {
+        let mut state = self.inner.state.lock();
+        let mut matched_any_child = false;
+        let mut ready_pid: Option<(u32, WaitEvent)> = None;
+
+        for (&pid, record) in state.processes.iter() {
+            if record.ppid != parent.get() || !clone_filter.matches(record.exit_signal) {
+                continue;
+            }
+            let matches = match target {
+                WaitTarget::Any => true,
+                WaitTarget::Pid(want) => pid == want,
+                WaitTarget::Pgid(want) => record.pgid.get() == want,
+            };
+            if !matches {
+                continue;
+            }
+            matched_any_child = true;
+            let event_kind = match record.state {
+                ChildWaitState::Exited(term) if want_exited => Some(WaitEventKind::Exited(term)),
+                ChildWaitState::Stopped {
+                    signal,
+                    reported: false,
+                } if want_stopped => Some(WaitEventKind::Stopped(signal)),
+                ChildWaitState::Continued { reported: false } if want_continued => {
+                    Some(WaitEventKind::Continued)
+                }
+                _ => None,
+            };
+            if let Some(kind) = event_kind {
+                ready_pid = Some((
+                    pid,
+                    WaitEvent {
+                        pid,
+                        uid: record.real_uid(),
+                        kind,
+                    },
+                ));
+                break;
+            }
+        }
+
+        if let Some((pid, event)) = ready_pid {
+            if !nowait {
+                match event.kind {
+                    WaitEventKind::Exited(_) => {
+                        state.processes.remove(&pid);
+                        state.allocated.remove(&pid);
+                    }
+                    WaitEventKind::Stopped(_) => {
+                        if let Some(record) = state.processes.get_mut(&pid)
+                            && let ChildWaitState::Stopped { reported, .. } = &mut record.state
+                        {
+                            *reported = true;
+                        }
+                    }
+                    WaitEventKind::Continued => {
+                        if let Some(record) = state.processes.get_mut(&pid)
+                            && let ChildWaitState::Continued { reported } = &mut record.state
+                        {
+                            *reported = true;
+                        }
+                    }
+                }
+            }
+            return TryWaitResult::Event(event);
+        }
+
+        if matched_any_child {
+            TryWaitResult::Pending
+        } else {
+            TryWaitResult::NoChildren
+        }
+    }
+
+    pub(super) fn ppid(&self, pid: u32) -> u32 {
+        self.inner
+            .state
+            .lock()
+            .processes
+            .get(&pid)
+            .map_or(0, |record| record.ppid)
+    }
+
+    pub(super) fn pgid(&self, pid: u32) -> Option<NonZeroU32> {
+        self.inner
+            .state
+            .lock()
+            .processes
+            .get(&pid)
+            .filter(|record| record.is_live())
+            .map(|record| record.pgid)
+    }
+
+    pub(super) fn sid(&self, pid: u32) -> Option<NonZeroU32> {
+        self.inner
+            .state
+            .lock()
+            .processes
+            .get(&pid)
+            .filter(|record| record.is_live())
+            .map(|record| record.sid)
+    }
+
+    pub(super) fn setpgid(
+        &self,
+        caller: NonZeroU32,
+        raw_pid: u32,
+        raw_pgid: u32,
+    ) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        let target_pid = if raw_pid == 0 { caller.get() } else { raw_pid };
+        let new_pgid =
+            NonZeroU32::new(if raw_pgid == 0 { target_pid } else { raw_pgid }).ok_or(EINVAL)?;
+
+        let mut state = self.inner.state.lock();
+        let caller_sid = state
+            .processes
+            .get(&caller.get())
+            .map(|record| record.sid)
+            .unwrap_or(caller);
+
+        let (target_ppid, target_sid, target_has_execed) = {
+            let Some(target) = state
+                .processes
+                .get(&target_pid)
+                .filter(|record| record.is_live())
+            else {
+                return Err(ESRCH);
+            };
+            (target.ppid, target.sid, target.has_execed)
+        };
+
+        let is_self = target_pid == caller.get();
+        let is_child = target_ppid == caller.get();
+        if !is_self && !is_child {
+            return Err(ESRCH);
+        }
+        if is_child && target_has_execed {
+            return Err(EACCES);
+        }
+        if target_pid == target_sid.get() || target_sid != caller_sid {
+            return Err(EPERM);
+        }
+        if new_pgid.get() != target_pid {
+            let group_exists_in_session = state.processes.values().any(|record| {
+                record.is_live() && record.sid == caller_sid && record.pgid == new_pgid
+            });
+            if !group_exists_in_session {
+                return Err(EPERM);
+            }
+        }
+        if let Some(target) = state.processes.get_mut(&target_pid) {
+            target.pgid = new_pgid;
+            target.signals.set_pgid(new_pgid.get());
+        }
+        Ok(())
+    }
+
+    pub(super) fn setsid(&self, caller: NonZeroU32) -> Result<NonZeroU32, u64> {
+        let mut state = self.inner.state.lock();
+        let conflict = state
+            .processes
+            .values()
+            .any(|record| record.is_live() && record.pgid == caller);
+        if conflict {
+            return Err(EPERM);
+        }
+        let target = state
+            .processes
+            .get_mut(&caller.get())
+            .filter(|record| record.is_live())
+            .ok_or(EPERM)?;
+        target.sid = caller;
+        target.pgid = caller;
+        target.signals.set_pgid(caller.get());
+        Ok(caller)
     }
 
     pub(super) fn register_thread(
@@ -259,7 +720,7 @@ impl PidNamespace {
         slot: Arc<ThreadSignalSlot>,
         credentials: Arc<spin::Mutex<Credentials>>,
     ) {
-        self.inner.lock().threads.insert(
+        self.inner.state.lock().threads.insert(
             slot.tid().get(),
             RegisteredThread {
                 tgid,
@@ -270,17 +731,18 @@ impl PidNamespace {
     }
 
     pub(super) fn unregister_thread(&self, tid: NonZeroU32) {
-        self.inner.lock().threads.remove(&tid.get());
+        self.inner.state.lock().threads.remove(&tid.get());
     }
 
     pub(super) fn lookup_process(
         &self,
         pid: u32,
     ) -> Option<(Arc<ProcessSignals>, Arc<spin::Mutex<Credentials>>)> {
-        let state = self.inner.lock();
+        let state = self.inner.state.lock();
         state
             .processes
             .get(&pid)
+            .filter(|entry| entry.is_live())
             .map(|entry| (entry.signals.clone(), entry.credentials.clone()))
     }
 
@@ -288,11 +750,11 @@ impl PidNamespace {
         &self,
         pgid: u32,
     ) -> alloc::vec::Vec<(Arc<ProcessSignals>, Arc<spin::Mutex<Credentials>>)> {
-        let state = self.inner.lock();
+        let state = self.inner.state.lock();
         state
             .processes
             .values()
-            .filter(|entry| entry.signals.pgid() == pgid)
+            .filter(|entry| entry.is_live() && entry.pgid.get() == pgid)
             .map(|entry| (entry.signals.clone(), entry.credentials.clone()))
             .collect()
     }
@@ -301,11 +763,11 @@ impl PidNamespace {
         &self,
         caller_pid: u32,
     ) -> alloc::vec::Vec<(Arc<ProcessSignals>, Arc<spin::Mutex<Credentials>>)> {
-        let state = self.inner.lock();
+        let state = self.inner.state.lock();
         state
             .processes
             .iter()
-            .filter(|&(&pid, _)| pid != 1 && pid != caller_pid)
+            .filter(|&(&pid, entry)| entry.is_live() && pid != 1 && pid != caller_pid)
             .map(|(_, entry)| (entry.signals.clone(), entry.credentials.clone()))
             .collect()
     }
@@ -318,22 +780,22 @@ impl PidNamespace {
         Arc<ThreadSignalSlot>,
         Arc<spin::Mutex<Credentials>>,
     )> {
-        let state = self.inner.lock();
+        let state = self.inner.state.lock();
         state
             .threads
             .get(&tid)
             .map(|entry| (entry.tgid, entry.slot.clone(), entry.credentials.clone()))
     }
 
-    /// Whether `pid` is currently live in this namespace.
+    /// Whether `pid` is currently allocated (live or unreaped zombie) in this namespace.
     pub fn contains(&self, pid: u32) -> bool {
-        self.inner.lock().allocated.contains(&pid)
+        self.inner.state.lock().allocated.contains(&pid)
     }
 
     /// Number of live processes (thread groups) in this namespace, as
     /// `sysinfo().procs` reports.
     pub fn process_count(&self) -> u32 {
-        self.inner.lock().live_processes
+        self.inner.state.lock().live_processes
     }
 }
 
@@ -422,12 +884,7 @@ impl ThreadGroup {
                 self.pids.release_tid(tid);
             }
         }
-        if self.live.is_empty() {
-            self.pids.unregister_process(self.leader);
-            true
-        } else {
-            false
-        }
+        self.live.is_empty()
     }
 
     /// Records a thread's exit and returns `(broadcast_group_stop, all_exited)`.
@@ -469,15 +926,15 @@ impl ThreadGroup {
     }
 }
 
-struct ParsedClone {
-    flags: u64,
-    stack: Option<u64>,
-    parent_tid: u64,
-    child_tid: u64,
-    tls: u64,
+pub(super) struct ParsedClone {
+    pub(super) flags: u64,
+    pub(super) stack: Option<u64>,
+    pub(super) parent_tid: u64,
+    pub(super) child_tid: u64,
+    pub(super) tls: u64,
 }
 
-fn validate_flag_combinations(flags: u64) -> Result<(), u64> {
+fn validate_thread_flag_combinations(flags: u64) -> Result<(), u64> {
     // kernel/fork.c `copy_process`.
     if flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0 {
         return Err(EINVAL);
@@ -504,36 +961,41 @@ fn validate_flag_combinations(flags: u64) -> Result<(), u64> {
 }
 
 /// `clone` (`kernel/fork.c` `SYSCALL_DEFINE5(clone)`).
-pub(super) fn clone<R: Resources, M: UserMemory, T: Thread<R>>(
+pub(super) async fn clone<R: Resources, M: UserMemory, T: Thread<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
     thread: &mut T,
 ) -> u64 {
     let decoded = process.shared.abi.clone_registers(args);
-    // Legacy `clone` reads `lower_32_bits(clone_flags)` and keeps `CSIGNAL`
-    // in the low byte, which `CLONE_THREAD` ignores.
-    let flags = u64::from(decoded.flags as u32) & !CSIGNAL;
-    if let Err(err) = validate_flag_combinations(flags) {
-        return errno(err);
+    let raw_flags = u64::from(decoded.flags as u32);
+    let exit_signal_raw = raw_flags & CSIGNAL;
+    let flags = raw_flags & !CSIGNAL;
+    let parsed = ParsedClone {
+        flags,
+        stack: (decoded.stack != 0).then_some(decoded.stack),
+        parent_tid: decoded.parent_tid,
+        child_tid: decoded.child_tid,
+        tls: decoded.tls,
+    };
+    if flags & CLONE_THREAD != 0 {
+        if let Err(err) = validate_thread_flag_combinations(flags) {
+            return errno(err);
+        }
+        spawn_parsed_clone(process, parsed, memory, thread)
+    } else {
+        let exit_signal = match super::process::validate_process_clone_flags(flags, exit_signal_raw)
+        {
+            Ok(sig) => sig,
+            Err(err) => return errno(err),
+        };
+        super::process::clone_process(process, parsed, exit_signal, memory, thread).await
     }
-    spawn_parsed_clone(
-        process,
-        ParsedClone {
-            flags,
-            stack: (decoded.stack != 0).then_some(decoded.stack),
-            parent_tid: decoded.parent_tid,
-            child_tid: decoded.child_tid,
-            tls: decoded.tls,
-        },
-        memory,
-        thread,
-    )
 }
 
 /// `clone3(uargs, size)` (`kernel/fork.c` `SYSCALL_DEFINE2(clone3)` and
 /// `copy_clone_args_from_user`).
-pub(super) fn clone3<R: Resources, M: UserMemory, T: Thread<R>>(
+pub(super) async fn clone3<R: Resources, M: UserMemory, T: Thread<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -598,24 +1060,32 @@ pub(super) fn clone3<R: Resources, M: UserMemory, T: Thread<R>>(
             _ => return errno(EINVAL),
         },
     };
-    if let Err(err) = validate_flag_combinations(flags) {
-        return errno(err);
+    let parsed = ParsedClone {
+        flags,
+        stack,
+        parent_tid,
+        child_tid,
+        tls,
+    };
+    if flags & CLONE_THREAD != 0 {
+        if let Err(err) = validate_thread_flag_combinations(flags) {
+            return errno(err);
+        }
+        spawn_parsed_clone(process, parsed, memory, thread)
+    } else {
+        let exit_sig = match super::process::validate_process_clone_flags(flags, exit_signal) {
+            Ok(sig) => sig,
+            Err(err) => return errno(err),
+        };
+        super::process::clone_process(process, parsed, exit_sig, memory, thread).await
     }
-    spawn_parsed_clone(
-        process,
-        ParsedClone {
-            flags,
-            stack,
-            parent_tid,
-            child_tid,
-            tls,
-        },
-        memory,
-        thread,
-    )
 }
 
-fn write_tid<M: UserMemory>(address: u64, tid: u32, memory: &mut M) -> Result<(), MemoryFault> {
+pub(super) fn write_tid<M: UserMemory>(
+    address: u64,
+    tid: u32,
+    memory: &mut M,
+) -> Result<(), MemoryFault> {
     if address & 3 == 0 {
         memory.atomic_store_u32(address, tid)
     } else {

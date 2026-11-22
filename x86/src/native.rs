@@ -220,6 +220,18 @@ unsafe impl UserTranslation for X86Tables {
     fn physical(&self, frame: NonNull<u8>) -> u64 {
         (frame.as_ptr() as usize - self.tables.offset) as u64
     }
+
+    fn new_empty(&self) -> Result<Self, NativeError> {
+        let mut tables = X86Tables {
+            root: Box::new(PageTable::new()),
+            tables: Tables {
+                frames: Vec::new(),
+                offset: self.tables.offset,
+            },
+        };
+        tables.sync_kernel_half();
+        Ok(tables)
+    }
 }
 
 impl X86Tables {

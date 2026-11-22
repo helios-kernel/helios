@@ -378,6 +378,18 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     /// the placement [`Self::map_anywhere`] chooses. `None` when none is
     /// free.
     fn free_range(&self, hint: VirtAddr, byte_len: usize) -> Option<VirtAddr>;
+
+    /// Duplicates this address space with copy-on-write sharing of every
+    /// committed frame (`fork(2)`).
+    ///
+    /// Both spaces keep identical logical mappings and access flags. Writable
+    /// committed pages are narrowed to read-only in hardware and shot down on
+    /// any active slice of `self` before returning, so neither space mutates a
+    /// shared frame; a subsequent write fault or kernel write copies the page
+    /// privately (or upgrades it in place when only one owner remains).
+    fn clone_cow(&self) -> Result<Self, NativeError>
+    where
+        Self: Sized;
 }
 
 /// A run of pages mapped with one access, as [`UserSpace::mapping`]
@@ -517,6 +529,10 @@ unsafe impl UserSpace for Infallible {
         match *self {}
     }
     fn free_range(&self, _: VirtAddr, _: usize) -> Option<VirtAddr> {
+        match *self {}
+    }
+
+    fn clone_cow(&self) -> Result<Self, NativeError> {
         match *self {}
     }
 }

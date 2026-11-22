@@ -412,6 +412,7 @@ fn mremap_to<M: VirtualMemory>(
 }
 
 /// The program break: where it started and where the process last set it.
+#[derive(Clone)]
 pub(super) struct ProgramBreak {
     start: u64,
     current: u64,
