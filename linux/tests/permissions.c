@@ -112,8 +112,8 @@ int main(void) {
     const char *val = "中文 日本語 한국어";
     size_t vlen = strlen(val);
 
-    CHECK(SYS(SYS_fsetxattr, fd, "user.lang", val, vlen, XATTR_CREATE | XATTR_REPLACE) ==
-          -EINVAL);
+    /* Unknown flag bit outside (XATTR_CREATE | XATTR_REPLACE) -> EINVAL. */
+    CHECK(SYS(SYS_fsetxattr, fd, "user.lang", val, vlen, 0x4) == -EINVAL);
 
     long set_rc = SYS(SYS_fsetxattr, fd, "user.lang", val, vlen, XATTR_CREATE);
     if (set_rc == 0) {
