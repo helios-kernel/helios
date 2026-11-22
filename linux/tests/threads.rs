@@ -283,6 +283,8 @@ impl System for Platform {
         "#1 Helios test"
     }
 }
+impl helios_linux::syscall::Filesystem<NoBacking> for Platform {}
+impl helios_linux::syscall::Tty for Platform {}
 
 fn drive<T>(future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);

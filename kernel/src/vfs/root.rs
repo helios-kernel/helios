@@ -515,7 +515,38 @@ impl FileSystem for RootFs {
         if found.metadata.kind == NodeKind::Directory && self.merges_boot(source, &found) {
             return Err(FsError::CrossDevice);
         }
-        self.creatable(destination)?;
+        if mode == RenameMode::NoReplace {
+            self.creatable(destination)?;
+        } else {
+            let Some((parent, _)) = destination.split_last() else {
+                return Err(FsError::NotPermitted);
+            };
+            match self.find(destination) {
+                Ok(dest_found) => {
+                    match (
+                        found.metadata.kind == NodeKind::Directory,
+                        dest_found.metadata.kind == NodeKind::Directory,
+                    ) {
+                        (true, false) => return Err(FsError::NotDirectory),
+                        (false, true) => return Err(FsError::IsDirectory),
+                        (true, true)
+                            if !self
+                                .read_dir_at(destination, DirCookie::START, 1)
+                                .await?
+                                .is_empty() =>
+                        {
+                            return Err(FsError::NotEmpty);
+                        }
+                        _ => {}
+                    }
+                    self.copy_up_directories(parent)?;
+                }
+                Err(FsError::NoEntry) => {
+                    self.copy_up_directories(parent)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let found = self.copy_up(source)?;
         let whiteout = self.lower_beneath(source, &found);
         self.upper

@@ -1,12 +1,11 @@
 use super::*;
 use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
-use core::task::{Context, Poll};
-use helios_sync::{
-    ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, NotifyWaiter, TryRead, TryWrite,
-    byte_channel,
+use helios_sync::{TryRead, TryWrite, byte_channel};
+use helios_unix::{
+    DescriptorTableError, Epoll, EventError, EventFd, FDFLAG_NONBLOCK, FDFLAG_PATH, Interest,
+    InterestError,
 };
-use helios_unix::{DescriptorTableError, Epoll, EventError, EventFd, Interest, InterestError};
 
 /// Monotonic time and async deadline waits supplied by the execution owner.
 pub trait Clock {
@@ -14,16 +13,18 @@ pub trait Clock {
     fn sleep_until(&self, deadline: u64) -> impl Future<Output = ()> + Send;
 }
 // Linux UAPI: O_NONBLOCK, O_CLOEXEC and eventfd's semaphore bit.
-const NONBLOCK: u16 = 0x800;
+const O_NONBLOCK_LINUX: u64 = 0x800;
 const CLOEXEC: u64 = 0x80000;
 const EAGAIN: u64 = 11;
 const EPIPE: u64 = 32;
 const EEXIST: u64 = 17;
 const ENOENT: u64 = 2;
-const EPOLLIN: u32 = 1;
-const EPOLLOUT: u32 = 4;
-const EPOLLERR: u32 = 8;
-const EPOLLHUP: u32 = 16;
+const EPOLLIN: u32 = poll::POLLIN;
+const EPOLLOUT: u32 = poll::POLLOUT;
+const EPOLLERR: u32 = poll::POLLERR;
+const EPOLLHUP: u32 = poll::POLLHUP;
+const EPOLLRDNORM: u32 = poll::POLLRDNORM;
+const EPOLLWRNORM: u32 = poll::POLLWRNORM;
 const EPOLLONESHOT: u32 = 1 << 30; // Linux eventpoll.h
 
 pub(super) fn descriptor_errno(error: DescriptorTableError) -> u64 {
@@ -36,7 +37,9 @@ pub(super) fn descriptor_errno(error: DescriptorTableError) -> u64 {
 }
 fn insert<R: Resources>(table: &mut Descriptors<R>, descriptor: Descriptor<R>, flags: u64) -> u64 {
     let entry = Entry::<R>::new(descriptor, flags & CLOEXEC != 0);
-    entry.set_fdflags(flags as u16 & NONBLOCK);
+    if flags & O_NONBLOCK_LINUX != 0 {
+        entry.set_fdflags(FDFLAG_NONBLOCK);
+    }
     table
         .insert_entry(entry)
         .map_or_else(descriptor_errno, u64::from)
@@ -47,7 +50,7 @@ pub(super) fn event<R: Resources>(
     has_flags: bool,
 ) -> u64 {
     let flags = if has_flags { args[1] as u32 as u64 } else { 0 };
-    if flags & !(CLOEXEC | u64::from(NONBLOCK) | 1) != 0 {
+    if flags & !(CLOEXEC | O_NONBLOCK_LINUX | 1) != 0 {
         return errno(EINVAL);
     }
     insert::<R>(
@@ -63,7 +66,7 @@ pub(super) fn pipe<R: Resources, M: UserMemory>(
     has_flags: bool,
 ) -> u64 {
     let flags = if has_flags { args[1] as u32 as u64 } else { 0 };
-    if flags & !(CLOEXEC | u64::from(NONBLOCK)) != 0 {
+    if flags & !(CLOEXEC | O_NONBLOCK_LINUX) != 0 {
         return errno(EINVAL);
     }
     let (writer, reader) = byte_channel();
@@ -86,10 +89,12 @@ pub(super) fn pipe<R: Resources, M: UserMemory>(
     }
     0
 }
-pub(super) fn duplicate<R: Resources>(
+pub(super) fn duplicate<R: Resources, F: fs::Filesystem<R>>(
+    abi: Abi,
     table: &mut Descriptors<R>,
     operation: Operation,
     arguments: [u64; 6],
+    fs: &F,
 ) -> u64 {
     let [fd, arg, flags, ..] = arguments;
     let Some(mut entry) = table.get_entry(fd as u32 as i32).cloned() else {
@@ -97,27 +102,50 @@ pub(super) fn duplicate<R: Resources>(
     };
     if operation == Operation::Fcntl {
         return match arg as u32 {
-            1 => u64::from(entry.close_on_exec), // F_GETFD
+            // F_DUPFD (0) and F_DUPFD_CLOEXEC (1030)
+            cmd @ (0 | 1030) => {
+                let min_fd = flags as i32;
+                if min_fd < 0 || (min_fd as usize) >= table.limit.get() {
+                    return errno(EINVAL);
+                }
+                entry.close_on_exec = cmd == 1030;
+                table
+                    .insert_entry_from(min_fd, entry)
+                    .map_or_else(descriptor_errno, u64::from)
+            }
+            // F_GETFD
+            1 => u64::from(entry.close_on_exec),
+            // F_SETFD
             2 => {
                 table.get_entry_mut(fd as u32 as i32).unwrap().close_on_exec = flags & 1 != 0;
                 0
             }
+            // F_GETFL: access mode belongs to the open resource; status flags
+            // live on the shared open file description.
             3 => {
-                // F_GETFL: access mode belongs to the open resource.
-                let mode = match entry.descriptor {
-                    FileDescriptor::PipeRead { .. } | FileDescriptor::Stdin { .. } => 0,
+                let mode = match &entry.descriptor {
+                    FileDescriptor::File(open) => fs.file_access(open.node()).linux_accmode(),
+                    FileDescriptor::Preopen { descriptor, .. } => {
+                        fs.file_access(descriptor).linux_accmode()
+                    }
+                    FileDescriptor::PipeRead { .. } | FileDescriptor::Stdin { .. } => fs::O_RDONLY,
                     FileDescriptor::PipeWrite { .. }
                     | FileDescriptor::Stdout
-                    | FileDescriptor::Stderr => 1,
-                    _ => 2,
+                    | FileDescriptor::Stderr => fs::O_WRONLY,
+                    _ => fs::O_RDWR,
                 };
-                mode | u64::from(entry.fdflags())
+                mode | fs::fdflags_to_linux(abi, entry.fdflags())
             }
+            // F_SETFL
             4 => {
+                if entry.fdflags() & FDFLAG_PATH != 0 {
+                    return errno(EBADF);
+                }
+                let updated = fs::apply_setfl(abi, entry.fdflags(), flags);
                 table
                     .get_entry(fd as u32 as i32)
                     .unwrap()
-                    .set_fdflags(flags as u16 & NONBLOCK);
+                    .set_fdflags(updated);
                 0
             }
             _ => errno(EINVAL),
@@ -164,7 +192,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
                 match event.write(value) {
                     Ok(()) => return 8,
                     Err(EventError::InvalidIncrement) => return errno(EINVAL),
-                    Err(EventError::WouldBlock) if entry.fdflags() & NONBLOCK != 0 => {
+                    Err(EventError::WouldBlock) if entry.fdflags() & FDFLAG_NONBLOCK != 0 => {
                         return errno(EAGAIN);
                     }
                     Err(EventError::WouldBlock) => {
@@ -185,7 +213,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
                     return if total == 0 { errno(EFAULT) } else { total };
                 }
                 let chunk = Bytes::copy_from_slice(&bytes[..size]);
-                let result = if entry.fdflags() & NONBLOCK != 0 {
+                let result = if entry.fdflags() & FDFLAG_NONBLOCK != 0 {
                     match writer.try_write(chunk) {
                         TryWrite::Written => Ok(()),
                         TryWrite::Closed => Err(EPIPE),
@@ -210,7 +238,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory>(
     args: [u64; 6],
     memory: &mut M,
 ) -> u64 {
-    let nonblock = entry.fdflags() & NONBLOCK != 0;
+    let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
     match &entry.descriptor {
         FileDescriptor::Event(event) => {
             if args[2] < 8 {
@@ -294,15 +322,17 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
     let Some(target) = table.get_entry(fd) else {
         return errno(EBADF);
     };
+    if target.fdflags() & FDFLAG_PATH != 0 {
+        return errno(EBADF);
+    }
     if fd == epfd {
         return errno(EINVAL);
     }
+    // Regular files, directories and `/dev/null` cannot be monitored by epoll
+    // (`EPERM`), whereas standard streams (pipes or terminals) can.
     if matches!(
         target.descriptor,
-        FileDescriptor::Stdin { .. }
-            | FileDescriptor::Stdout
-            | FileDescriptor::Stderr
-            | FileDescriptor::NullDevice
+        FileDescriptor::File(_) | FileDescriptor::Preopen { .. } | FileDescriptor::NullDevice
     ) {
         return errno(EPERM);
     }
@@ -328,7 +358,10 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
             return errno(EFAULT);
         }
         let events = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        if events & !(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLONESHOT) != 0 {
+        if events
+            & !(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDNORM | EPOLLWRNORM | EPOLLONESHOT)
+            != 0
+        {
             return errno(EINVAL);
         }
         let interest = Interest {
@@ -371,47 +404,6 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
         Err(InterestError::NotFound) => errno(ENOENT),
     }
 }
-fn ready_mask<R: Resources>(entry: &Entry<R>, table: &Descriptors<R>) -> u32 {
-    match &entry.descriptor {
-        FileDescriptor::Event(event) => {
-            (if event.is_readable() { EPOLLIN } else { 0 })
-                | (if event.is_writable() { EPOLLOUT } else { 0 })
-        }
-        FileDescriptor::PipeRead { reader } => {
-            (if reader.has_buffered_data() {
-                EPOLLIN
-            } else {
-                0
-            }) | (if reader.is_writer_closed() {
-                EPOLLHUP
-            } else {
-                0
-            })
-        }
-        FileDescriptor::PipeWrite { writer } => {
-            if writer.is_reader_closed() {
-                EPOLLERR
-            } else if writer.is_writable() {
-                EPOLLOUT
-            } else {
-                0
-            }
-        }
-        FileDescriptor::Epoll(epoll) => {
-            if epoll.interests().iter().any(|interest| {
-                table.get_entry(interest.fd).is_some_and(|entry| {
-                    ready_mask::<R>(entry, table) & (interest.events | EPOLLERR | EPOLLHUP) != 0
-                })
-            }) {
-                EPOLLIN
-            } else {
-                0
-            }
-        }
-        FileDescriptor::Stdout | FileDescriptor::Stderr => EPOLLOUT,
-        _ => 0,
-    }
-}
 // Linux limits nested epoll traversal to five levels (eventpoll.c EP_MAX_NESTS).
 fn valid_nesting<R: Resources>(
     target: &Epoll<R::Data>,
@@ -430,58 +422,16 @@ fn valid_nesting<R: Resources>(
             }
         })
 }
-fn arm_waits<R: Resources>(epoll: &Epoll<R::Data>, table: &Descriptors<R>, waits: &mut Vec<Wait>) {
-    for interest in epoll.interests() {
-        if let Some(entry) = table.get_entry(interest.fd) {
-            match &entry.descriptor {
-                FileDescriptor::Epoll(child) if interest.events & EPOLLIN != 0 => {
-                    arm_waits::<R>(child, table, waits)
-                }
-                _ => {
-                    if let Some(wait) = Wait::arm::<R>(entry, interest.events) {
-                        waits.push(wait);
-                    }
-                }
-            }
-        }
-    }
-}
-enum Wait {
-    Event(EventFd, NotifyWaiter),
-    Read(ByteReader, ByteReadWait),
-    Write(ByteWriter, ByteWriteWait),
-}
-impl Wait {
-    fn arm<R: Resources>(entry: &Entry<R>, events: u32) -> Option<Self> {
-        match &entry.descriptor {
-            FileDescriptor::Event(event) => Some(Self::Event(event.clone(), event.wait_state())),
-            FileDescriptor::PipeRead { reader, .. } if events & EPOLLIN != 0 => {
-                Some(Self::Read(reader.clone(), reader.wait_state()))
-            }
-            FileDescriptor::PipeWrite { writer } if events & EPOLLOUT != 0 => {
-                Some(Self::Write(writer.clone(), writer.wait_state()))
-            }
-            _ => None,
-        }
-    }
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        match self {
-            Self::Event(event, wait) => event.poll_changed(cx, wait),
-            Self::Read(reader, wait) => reader.poll_readable(cx, wait),
-            Self::Write(writer, wait) => writer.poll_writable(cx, wait),
-        }
-    }
-}
-pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
+pub(super) async fn epoll_wait<R: Resources, M: UserMemory, O: Stdio + Clock>(
     abi: Abi,
-    table: &spin::Mutex<Descriptors<R>>,
+    process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
-    clock: &C,
+    io: &O,
     has_mask: bool,
 ) -> u64 {
     let epoll = {
-        let table = table.lock();
+        let table = process.shared.descriptors.lock();
         let Some(entry) = table.get_entry(args[0] as u32 as i32) else {
             return errno(EBADF);
         };
@@ -497,24 +447,38 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
         return errno(EINVAL);
     }
     if has_mask && args[4] != 0 {
-        return errno(EOPNOTSUPP);
+        if args[5] != 8 {
+            return errno(EINVAL);
+        }
+        let mut mask = [0u8; 8];
+        if memory.read(args[4], &mut mask).is_err() {
+            return errno(EFAULT);
+        }
     }
     let timeout = args[3] as i32;
     let deadline =
-        (timeout >= 0).then(|| clock.now_nanos().saturating_add(timeout as u64 * 1_000_000));
+        (timeout >= 0).then(|| io.now_nanos().saturating_add(timeout as u64 * 1_000_000));
     loop {
         let mut waits = Vec::new();
+        let mut watch_stdin = false;
         {
-            let table = table.lock();
+            let table = process.shared.descriptors.lock();
             let interests = epoll.interests();
-            arm_waits::<R>(&epoll, &table, &mut waits);
+            poll::arm_epoll_waits::<R, O>(
+                process,
+                &epoll,
+                &table,
+                io,
+                &mut waits,
+                &mut watch_stdin,
+            );
             let mut count = 0;
             for interest in interests {
                 let Some(target) = table.get_entry(interest.fd) else {
                     continue;
                 };
-                let events =
-                    ready_mask::<R>(target, &table) & (interest.events | EPOLLERR | EPOLLHUP);
+                let events = poll::ready_mask::<R, O>(process, target, &table, io, true)
+                    & (interest.events | EPOLLERR | EPOLLHUP);
                 if events == 0 {
                     continue;
                 }
@@ -538,28 +502,10 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
                 return count;
             }
         }
-        if deadline.is_some_and(|end| clock.now_nanos() >= end) {
+        if deadline.is_some_and(|end| io.now_nanos() >= end) {
             return 0;
         }
-        let timer = async {
-            match deadline {
-                Some(end) => clock.sleep_until(end).await,
-                None => core::future::pending().await,
-            }
-        };
-        let mut timer = core::pin::pin!(timer);
-        poll_fn(|cx| {
-            let mut ready = timer.as_mut().poll(cx).is_ready();
-            for wait in &mut waits {
-                ready |= wait.poll(cx).is_ready();
-            }
-            if ready {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-        .await;
+        poll::wait_once(deadline, &mut waits, watch_stdin, io).await;
     }
 }
 
@@ -614,13 +560,21 @@ mod tests {
             }
         }
     }
-    struct Clock;
-    impl super::Clock for Clock {
+    struct TestIo;
+    impl super::Clock for TestIo {
         fn now_nanos(&self) -> u64 {
             0
         }
         async fn sleep_until(&self, _: u64) {
             core::future::pending().await
+        }
+    }
+    impl Stdio for TestIo {
+        async fn write(&mut self, _: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
+            Ok(bytes.len())
+        }
+        async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+            Ok(Bytes::new())
         }
     }
     struct Wakes(AtomicUsize);
@@ -650,19 +604,24 @@ mod tests {
                 one_shot: false,
             })
             .unwrap();
-        let table = spin::Mutex::new(DescriptorSlots::<Entry<NoBacking>>::from_entries(
-            alloc::vec![
-                Some(Entry::<NoBacking>::new(
-                    FileDescriptor::Event(event.clone()),
-                    false
-                )),
-                Some(Entry::<NoBacking>::new(FileDescriptor::Epoll(child), false)),
-                Some(Entry::<NoBacking>::new(
-                    FileDescriptor::Epoll(parent),
-                    false
-                )),
-            ],
-        ));
+        let descriptors = DescriptorSlots::<Entry<NoBacking>>::from_entries(alloc::vec![
+            Some(Entry::<NoBacking>::new(
+                FileDescriptor::Event(event.clone()),
+                false
+            )),
+            Some(Entry::<NoBacking>::new(FileDescriptor::Epoll(child), false)),
+            Some(Entry::<NoBacking>::new(
+                FileDescriptor::Epoll(parent),
+                false
+            )),
+        ]);
+        let process = Process::<NoBacking>::with_descriptors(
+            Abi::X86_64,
+            NonZeroU32::new(1).unwrap(),
+            0x40_0000,
+            descriptors,
+            Start::default(),
+        );
         let mut memory = Memory([0; 64]);
         let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
         let waker = Waker::from(wakes.clone());
@@ -670,10 +629,10 @@ mod tests {
         {
             let mut future = core::pin::pin!(epoll_wait::<NoBacking, _, _>(
                 Abi::X86_64,
-                &table,
+                &process,
                 [2, 0, 1, u64::MAX, 0, 0],
                 &mut memory,
-                &Clock,
+                &TestIo,
                 false
             ));
             assert!(future.as_mut().poll(&mut context).is_pending());

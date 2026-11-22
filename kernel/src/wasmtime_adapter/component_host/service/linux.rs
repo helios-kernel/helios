@@ -28,10 +28,14 @@
 //!   and stops running slices at the next timer preemption.
 
 use super::*;
-use crate::{SetWallClockCap, TerminalInputCap, TerminalOutputCap};
+use crate::{
+    ComponentFsNodeKind, LinkSourceCap, SetWallClockCap, SymlinkCreateCap, SymlinkReadCap,
+    TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap,
+};
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use helios_hal::fs::{FsError, Landed, NodeKind, RenameMode, WritePosition};
 use helios_hal::native::{
     FaultKind, NativeError, NativeExecution, NativeUnavailable, Stop, UserContext, UserFault,
     UserSpace,
@@ -41,10 +45,13 @@ use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_linux::abi::{self, Abi};
 use helios_linux::elf::{self, Image};
 use helios_linux::syscall::{
-    self, Call, Denied, EpollData, Exit, MapError, MemoryFault, MemoryTotals, Process, Region,
-    Resource, Resources, SpawnError, SpawnedThread, Start, Stdio, Stream, System, Thread,
-    UserMemory, VirtualMemory, WriteError,
+    self, AccessCheck, Call, Denied, DirListEntry, EpollData, Exit, FileAccess, FileStat,
+    Filesystem, LinkOptions, MapError, MemoryFault, MemoryTotals, OpenRequest, Process, READY_ERR,
+    READY_HUP, READY_IN, READY_OUT, Region, Resource, Resources, SpawnError, SpawnedThread, Start,
+    StdinTryRead, Stdio, Stream, System, Termios, TermiosAction, Thread, TimeUpdate, Tty, TtyError,
+    TtyStream, UserMemory, VirtualMemory, Winsize, WriteError,
 };
+use helios_sync::{TryRead, TryWrite};
 
 /// The ELF identification bytes every ELF file starts with (System V gABI,
 /// `e_ident[EI_MAG0..EI_MAG3]`).
@@ -100,8 +107,12 @@ fn user_end<Native: NativeExecution>(native: &Native) -> u64 {
 struct LinuxGrants {
     terminal_input: Option<TerminalInputCap>,
     terminal_output: Option<TerminalOutputCap>,
+    tty_control: Option<TtyControlCap>,
     /// What WASIX's `clock_time_set` derives, for `clock_settime`.
     set_wall_clock: Option<SetWallClockCap>,
+    link_source: Option<LinkSourceCap>,
+    symlink_create: Option<SymlinkCreateCap>,
+    symlink_read: Option<SymlinkReadCap>,
 }
 
 impl LinuxGrants {
@@ -109,7 +120,59 @@ impl LinuxGrants {
         Self {
             terminal_input: authority.derive_terminal_input_cap().ok(),
             terminal_output: authority.derive_terminal_output_cap().ok(),
+            tty_control: authority.derive_tty_control_cap().ok(),
             set_wall_clock: authority.derive_set_wall_clock_cap().ok(),
+            link_source: authority.derive_link_source_cap().ok(),
+            symlink_create: authority.derive_symlink_create_cap().ok(),
+            symlink_read: authority.derive_symlink_read_cap().ok(),
+        }
+    }
+}
+
+/// Process-wide terminal state aligned with [`WasixTtyState`]: whether each
+/// standard stream is attached to a terminal, plus the active `termios` and
+/// window size.
+struct LinuxTtyState {
+    stdin_tty: bool,
+    stdout_tty: bool,
+    stderr_tty: bool,
+    termios: Termios,
+    winsize: Winsize,
+}
+
+impl LinuxTtyState {
+    fn new(
+        authority: &ProcessAuthority,
+        output_mode: &OutputMode,
+        instance_id: crate::InstanceId,
+    ) -> Self {
+        let rights = authority.terminal_rights();
+        let stdin_tty = matches!(
+            output_mode.stdin_route(),
+            crate::ComponentInputRoute::Serial
+        ) && rights.contains(TerminalAuthorityRights::INPUT);
+        let stdout_tty = matches!(
+            output_mode.sink(crate::ComponentOutputStreamKind::Stdout, instance_id),
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+        ) && rights.contains(TerminalAuthorityRights::OUTPUT);
+        let stderr_tty = matches!(
+            output_mode.sink(crate::ComponentOutputStreamKind::Stderr, instance_id),
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+        ) && rights.contains(TerminalAuthorityRights::OUTPUT);
+        Self {
+            stdin_tty,
+            stdout_tty,
+            stderr_tty,
+            termios: Termios::from_flags(stdin_tty, stdin_tty, true),
+            winsize: Winsize::DEFAULT,
+        }
+    }
+
+    fn is_tty(&self, stream: TtyStream) -> bool {
+        match stream {
+            TtyStream::Stdin => self.stdin_tty,
+            TtyStream::Stdout => self.stdout_tty,
+            TtyStream::Stderr => self.stderr_tty,
         }
     }
 }
@@ -318,6 +381,13 @@ where
     /// task has exited and dropped `LinuxShared`.
     _process_guard: crate::ContainerProcessGuard,
     grants: LinuxGrants,
+    /// Process-wide terminal state (`termios`, window size, stream TTY flags).
+    /// Never held across `.await`.
+    tty: spin::Mutex<LinuxTtyState>,
+    /// Bytes drained from the debug serial ring during non-blocking reads or
+    /// readiness checks so `poll`/`epoll`/`read(O_NONBLOCK)` never drop input.
+    /// Never held across `.await`.
+    serial_peek: spin::Mutex<Vec<u8>>,
     /// The process's view of wall time, which `clock_settime` moves as
     /// WASIX's `clock_time_set` moves a program's. Never held across `.await`.
     clock: spin::Mutex<crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>>,
@@ -368,6 +438,39 @@ where
         self.fatal_error.lock().take()
     }
 
+    fn pull_serial_into_peek(&self, max_bytes: usize) -> bool {
+        let mut peek = self.serial_peek.lock();
+        if !peek.is_empty() {
+            return true;
+        }
+        let mut scratch = Vec::new();
+        (self.read_serial)(
+            &mut scratch,
+            u32::try_from(max_bytes.max(1)).unwrap_or(u32::MAX),
+        );
+        if scratch.is_empty() {
+            return false;
+        }
+        peek.extend_from_slice(&scratch);
+        true
+    }
+
+    fn take_serial_peek(&self, limit: usize) -> Option<Bytes> {
+        let mut peek = self.serial_peek.lock();
+        if peek.is_empty() {
+            let mut scratch = Vec::new();
+            (self.read_serial)(&mut scratch, u32::try_from(limit).unwrap_or(u32::MAX));
+            if scratch.is_empty() {
+                return None;
+            }
+            peek.extend_from_slice(&scratch);
+        }
+        let take = peek.len().min(limit);
+        let bytes = Bytes::copy_from_slice(&peek[..take]);
+        peek.drain(..take);
+        Some(bytes)
+    }
+
     async fn wait_tasks_drained(&self) {
         loop {
             let mut waiter = self.tasks_drained.waiter();
@@ -403,8 +506,8 @@ where
     }
 }
 
-/// Per-thread host state: thread-local serial buffer, per-thread DRBG stream,
-/// and per-thread slice tick counter (`CLOCK_THREAD_CPUTIME_ID`).
+/// Per-thread host state: per-thread DRBG stream and per-thread slice tick
+/// counter (`CLOCK_THREAD_CPUTIME_ID`).
 struct LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
 where
     CpuImpl: Cpu + Clone,
@@ -412,7 +515,6 @@ where
     StorageImpl: crate::Storage,
 {
     shared: Arc<LinuxShared<CpuImpl, Net, StorageImpl, Space>>,
-    serial_input: Vec<u8>,
     entropy: crate::EntropyPool,
     thread_cpu_ticks: u64,
 }
@@ -429,7 +531,6 @@ where
             crate::EntropyPool::derive(shared.runtime_state.root_entropy(), personalization);
         Self {
             shared,
-            serial_input: Vec::new(),
             entropy,
             thread_cpu_ticks: 0,
         }
@@ -483,6 +584,44 @@ where
         }
     }
 
+    fn try_write(&mut self, stream: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
+        let kind = match stream {
+            Stream::Stdout => crate::ComponentOutputStreamKind::Stdout,
+            Stream::Stderr => crate::ComponentOutputStreamKind::Stderr,
+        };
+        match self
+            .shared
+            .output_mode
+            .sink(kind, self.shared.launched_instance.id())
+        {
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+                if self.shared.grants.terminal_output.is_none() =>
+            {
+                Err(WriteError::Denied)
+            }
+            crate::ComponentOutputSink::Local(local) => {
+                let taken = local.write(
+                    &self.shared.cpu,
+                    &self.shared.runtime_state,
+                    self.shared.write_serial,
+                    bytes,
+                );
+                if taken == 0 && !bytes.is_empty() {
+                    Err(WriteError::WouldBlock)
+                } else {
+                    Ok(taken)
+                }
+            }
+            crate::ComponentOutputSink::Child(writer) => {
+                match writer.try_write(Bytes::copy_from_slice(bytes)) {
+                    TryWrite::Written => Ok(bytes.len()),
+                    TryWrite::Closed => Err(WriteError::Io),
+                    TryWrite::Full(_) => Err(WriteError::WouldBlock),
+                }
+            }
+        }
+    }
+
     async fn read_input(&mut self, limit: usize) -> Result<Bytes, Denied> {
         Ok(match self.shared.output_mode.stdin_route() {
             crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {
@@ -490,12 +629,8 @@ where
             }
             crate::ComponentInputRoute::Serial => loop {
                 let wait = self.shared.write_serial.wait_for_debug_serial_input();
-                (self.shared.read_serial)(
-                    &mut self.serial_input,
-                    u32::try_from(limit).unwrap_or(u32::MAX),
-                );
-                if !self.serial_input.is_empty() {
-                    break Bytes::copy_from_slice(&self.serial_input);
+                if let Some(bytes) = self.shared.take_serial_peek(limit) {
+                    break bytes;
                 }
                 wait.await;
             },
@@ -504,6 +639,546 @@ where
                 stdin_rx.read_limit(limit).await.unwrap_or_default()
             }
         })
+    }
+
+    fn try_read_input(&mut self, limit: usize) -> StdinTryRead {
+        match self.shared.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {
+                StdinTryRead::Denied
+            }
+            crate::ComponentInputRoute::Serial => match self.shared.take_serial_peek(limit) {
+                Some(bytes) => StdinTryRead::Ready(bytes),
+                None => StdinTryRead::WouldBlock,
+            },
+            crate::ComponentInputRoute::Closed => StdinTryRead::Eof,
+            crate::ComponentInputRoute::Child(stdin_rx) => match stdin_rx.try_read_limit(limit) {
+                TryRead::Ready(bytes) => StdinTryRead::Ready(bytes),
+                TryRead::Eof => StdinTryRead::Eof,
+                TryRead::Pending => StdinTryRead::WouldBlock,
+            },
+        }
+    }
+
+    fn stdin_ready_mask(&self) -> u32 {
+        match self.shared.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {
+                READY_ERR
+            }
+            crate::ComponentInputRoute::Serial => {
+                if self.shared.pull_serial_into_peek(4096) {
+                    READY_IN
+                } else {
+                    0
+                }
+            }
+            crate::ComponentInputRoute::Closed => READY_IN | READY_HUP,
+            crate::ComponentInputRoute::Child(stdin_rx) => {
+                (if stdin_rx.has_buffered_data() {
+                    READY_IN
+                } else {
+                    0
+                }) | (if stdin_rx.is_writer_closed() {
+                    READY_HUP
+                } else {
+                    0
+                })
+            }
+        }
+    }
+
+    async fn wait_stdin_ready(&self) {
+        match self.shared.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {}
+            crate::ComponentInputRoute::Serial => loop {
+                let wait = self.shared.write_serial.wait_for_debug_serial_input();
+                if self.shared.pull_serial_into_peek(4096) {
+                    return;
+                }
+                wait.await;
+            },
+            crate::ComponentInputRoute::Closed => {}
+            crate::ComponentInputRoute::Child(stdin_rx) => {
+                let mut wait = stdin_rx.wait_state();
+                core::future::poll_fn(|cx| stdin_rx.poll_readable(cx, &mut wait)).await;
+            }
+        }
+    }
+
+    fn stdout_ready_mask(&self, stream: Stream) -> u32 {
+        let kind = match stream {
+            Stream::Stdout => crate::ComponentOutputStreamKind::Stdout,
+            Stream::Stderr => crate::ComponentOutputStreamKind::Stderr,
+        };
+        match self
+            .shared
+            .output_mode
+            .sink(kind, self.shared.launched_instance.id())
+        {
+            crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
+                if self.shared.grants.terminal_output.is_none() =>
+            {
+                READY_ERR
+            }
+            crate::ComponentOutputSink::Local(_) => READY_OUT,
+            crate::ComponentOutputSink::Child(writer) => {
+                if writer.is_reader_closed() {
+                    READY_ERR
+                } else if writer.is_writable() {
+                    READY_OUT
+                } else {
+                    0
+                }
+            }
+        }
+    }
+}
+
+fn node_kind_to_component(kind: NodeKind) -> ComponentFsNodeKind {
+    match kind {
+        NodeKind::Directory => ComponentFsNodeKind::Directory,
+        NodeKind::File => ComponentFsNodeKind::File,
+        NodeKind::Symlink => ComponentFsNodeKind::Symlink,
+        NodeKind::CharacterDevice => ComponentFsNodeKind::CharacterDevice,
+        NodeKind::BlockDevice => ComponentFsNodeKind::BlockDevice,
+        NodeKind::Fifo => ComponentFsNodeKind::Fifo,
+        NodeKind::Socket => ComponentFsNodeKind::Socket,
+    }
+}
+
+fn container_info_to_stat(info: &crate::ContainerNodeInfo) -> FileStat {
+    FileStat {
+        dev: info.metadata.id.device.raw(),
+        ino: info.metadata.id.inode,
+        kind: info.metadata.kind,
+        permissions: info.unix.permissions,
+        nlink: info.metadata.link_count,
+        uid: info.unix.uid,
+        gid: info.unix.gid,
+        rdev: 0,
+        size: info.metadata.size,
+        access_nanos: info.metadata.access_nanos,
+        modified_nanos: info.metadata.modified_nanos,
+        status_nanos: info.metadata.status_nanos,
+    }
+}
+
+fn resolve_time_update(update: TimeUpdate, now: u64) -> Option<u64> {
+    match update {
+        TimeUpdate::Omit => None,
+        TimeUpdate::Now => Some(now),
+        TimeUpdate::Set(nanos) => Some(nanos),
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> Tty
+    for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn is_tty(&self, stream: TtyStream) -> bool {
+        self.shared.tty.lock().is_tty(stream)
+    }
+
+    fn get_termios(&self, stream: TtyStream) -> Result<Termios, TtyError> {
+        let state = self.shared.tty.lock();
+        if !state.is_tty(stream) {
+            return Err(TtyError::NotTty);
+        }
+        Ok(state.termios)
+    }
+
+    fn set_termios(
+        &mut self,
+        stream: TtyStream,
+        termios: Termios,
+        _action: TermiosAction,
+    ) -> Result<(), TtyError> {
+        let mut state = self.shared.tty.lock();
+        if !state.is_tty(stream) {
+            return Err(TtyError::NotTty);
+        }
+        if self.shared.grants.tty_control.is_none() {
+            return Err(TtyError::Denied);
+        }
+        state.termios = termios;
+        Ok(())
+    }
+
+    fn get_winsize(&self, stream: TtyStream) -> Result<Winsize, TtyError> {
+        let state = self.shared.tty.lock();
+        if !state.is_tty(stream) {
+            return Err(TtyError::NotTty);
+        }
+        Ok(state.winsize)
+    }
+
+    fn set_winsize(&mut self, stream: TtyStream, winsize: Winsize) -> Result<(), TtyError> {
+        let mut state = self.shared.tty.lock();
+        if !state.is_tty(stream) {
+            return Err(TtyError::NotTty);
+        }
+        if self.shared.grants.tty_control.is_none() {
+            return Err(TtyError::Denied);
+        }
+        state.winsize = winsize;
+        Ok(())
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> Filesystem<LinuxResources<Net>>
+    for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn file_access(&self, file: &FsDescriptor) -> FileAccess {
+        let read = file.flags.contains(FsDescriptorFlags::READ);
+        let write = file.flags.contains(FsDescriptorFlags::WRITE);
+        match (read, write) {
+            (true, true) => FileAccess::ReadWrite,
+            (true, false) => FileAccess::ReadOnly,
+            (false, true) => FileAccess::WriteOnly,
+            (false, false) => FileAccess::PathOnly,
+        }
+    }
+
+    fn file_is_directory(&self, file: &FsDescriptor) -> bool {
+        file.kind == ComponentFsNodeKind::Directory
+    }
+
+    fn file_path<'a>(&self, file: &'a FsDescriptor) -> Option<&'a str> {
+        Some(&file.path)
+    }
+
+    fn can_exec_file(&self, file: &FsDescriptor) -> bool {
+        self.shared.container.filesystem().can_exec(&file.path)
+    }
+
+    fn same_file(&self, a: &FsDescriptor, b: &FsDescriptor) -> bool {
+        match (a.identity, b.identity) {
+            (Some(ia), Some(ib)) => ia == ib,
+            _ => a.path == b.path,
+        }
+    }
+
+    async fn open(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        request: OpenRequest,
+    ) -> Result<FsDescriptor, FsError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        let (info, container_path, mount_hold) = self
+            .shared
+            .container
+            .filesystem()
+            .open_at(base_dir, path, request, now)
+            .await?;
+        let mut flags = FsDescriptorFlags::empty();
+        if request.read {
+            flags |= FsDescriptorFlags::READ;
+        }
+        if request.write {
+            flags |= FsDescriptorFlags::WRITE;
+        }
+        if request.sync {
+            flags |= FsDescriptorFlags::FILE_INTEGRITY_SYNC;
+        }
+        if request.dsync {
+            flags |= FsDescriptorFlags::DATA_INTEGRITY_SYNC;
+        }
+        if info.metadata.kind == NodeKind::Directory {
+            flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
+        }
+        Ok(FsDescriptor {
+            path: container_path,
+            kind: node_kind_to_component(info.metadata.kind),
+            flags,
+            identity: Some(crate::vfs::object_identity(&info.metadata)),
+            mount: mount_hold,
+        })
+    }
+
+    async fn stat_path(
+        &self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+    ) -> Result<(FileStat, String), FsError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let (info, resolved_path) = self
+            .shared
+            .container
+            .filesystem()
+            .stat_at(base_dir, path, follow)
+            .await?;
+        Ok((container_info_to_stat(&info), resolved_path))
+    }
+
+    async fn stat_file(&self, file: &FsDescriptor) -> Result<FileStat, FsError> {
+        let info = self
+            .shared
+            .container
+            .filesystem()
+            .stat_resolved(&file.path)
+            .await?;
+        Ok(container_info_to_stat(&info))
+    }
+
+    async fn access_path(
+        &self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        check: AccessCheck,
+    ) -> Result<(), FsError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.shared
+            .container
+            .filesystem()
+            .access_at(base_dir, path, check)
+            .await
+    }
+
+    async fn read_at(
+        &self,
+        file: &FsDescriptor,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Bytes, FsError> {
+        self.shared
+            .container
+            .filesystem()
+            .read_at(&file.path, offset, max_bytes)
+            .await
+    }
+
+    async fn write_at(
+        &mut self,
+        file: &FsDescriptor,
+        position: WritePosition,
+        bytes: &[u8],
+    ) -> Result<Landed, FsError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .write_at(&file.path, position, bytes, now)
+            .await
+    }
+
+    async fn list_dir(
+        &self,
+        file: &FsDescriptor,
+    ) -> Result<(u64, u64, Vec<DirListEntry>), FsError> {
+        let (self_ino, parent_ino, entries) = self
+            .shared
+            .container
+            .filesystem()
+            .list_with_inodes(&file.path)
+            .await?;
+        let out = entries
+            .into_iter()
+            .map(|entry| DirListEntry {
+                name: entry.name,
+                kind: entry.kind,
+                inode: entry.inode,
+            })
+            .collect();
+        Ok((self_ino, parent_ino, out))
+    }
+
+    async fn set_size_file(&mut self, file: &FsDescriptor, size: u64) -> Result<(), FsError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_size(&file.path, size, now)
+            .await
+    }
+
+    async fn set_size_path(&mut self, cwd: &str, path: &str, size: u64) -> Result<(), FsError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_size_at(cwd, path, size, now)
+            .await
+    }
+
+    async fn sync(&self, file: &FsDescriptor, data_only: bool) -> Result<(), FsError> {
+        self.shared
+            .container
+            .filesystem()
+            .sync(&file.path, data_only)
+            .await
+    }
+
+    async fn read_link(
+        &self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+    ) -> Result<String, FsError> {
+        if self.shared.grants.symlink_read.is_none() {
+            return Err(FsError::NotPermitted);
+        }
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        self.shared
+            .container
+            .filesystem()
+            .read_link_at(base_dir, path)
+            .await
+    }
+
+    async fn mkdir(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        mode: u32,
+    ) -> Result<(), FsError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .mkdir_at(base_dir, path, mode, now)
+            .await
+    }
+
+    async fn unlink(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        remove_dir: bool,
+    ) -> Result<(), FsError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .unlink_at(base_dir, path, remove_dir, now)
+            .await
+    }
+
+    async fn rename(
+        &mut self,
+        old_base: Option<&FsDescriptor>,
+        old_path: &str,
+        new_base: Option<&FsDescriptor>,
+        new_path: &str,
+        cwd: &str,
+        mode: RenameMode,
+    ) -> Result<(), FsError> {
+        let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
+        let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .rename_at(old_dir, old_path, new_dir, new_path, mode, now)
+            .await
+    }
+
+    async fn link(
+        &mut self,
+        old_base: Option<&FsDescriptor>,
+        old_path: &str,
+        new_base: Option<&FsDescriptor>,
+        new_path: &str,
+        cwd: &str,
+        options: LinkOptions,
+    ) -> Result<(), FsError> {
+        if self.shared.grants.link_source.is_none() {
+            return Err(FsError::NotPermitted);
+        }
+        let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
+        let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .link_at(
+                old_dir,
+                old_path,
+                new_dir,
+                new_path,
+                options.follow,
+                options.empty_path,
+                now,
+            )
+            .await
+    }
+
+    async fn symlink(
+        &mut self,
+        target: &str,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        link_path: &str,
+    ) -> Result<(), FsError> {
+        if self.shared.grants.symlink_create.is_none() {
+            return Err(FsError::NotPermitted);
+        }
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .symlink_at(target, base_dir, link_path, now)
+            .await
+    }
+
+    async fn set_times_path(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        access: TimeUpdate,
+        modified: TimeUpdate,
+    ) -> Result<(), FsError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_times_at(
+                base_dir,
+                path,
+                follow,
+                resolve_time_update(access, now),
+                resolve_time_update(modified, now),
+                now,
+            )
+            .await
+    }
+
+    async fn set_times_file(
+        &mut self,
+        file: &FsDescriptor,
+        access: TimeUpdate,
+        modified: TimeUpdate,
+    ) -> Result<(), FsError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_times_resolved(
+                &file.path,
+                resolve_time_update(access, now),
+                resolve_time_update(modified, now),
+                now,
+            )
+            .await
     }
 }
 
@@ -918,6 +1593,11 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
             },
         }
     }
+    let memory = LinuxMemory {
+        space: &*shared.space,
+        user: shared.user,
+    };
+    process.flush_shared_mappings(&memory, &mut platform).await;
 }
 
 /// Runs a Linux process inside `container` to its end: maps `executable`,
@@ -1033,6 +1713,10 @@ where
         None => syscall::standard_streams::<LinuxResources<Net>>(),
     };
     let credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
+    let initial_cwd = container
+        .authority()
+        .cwd()
+        .map(|preopen| String::from(preopen.guest_name()));
     let process = Process::<LinuxResources<Net>>::with_descriptors(
         executable.abi,
         pid,
@@ -1044,11 +1728,13 @@ where
             futex: container.futex_table().clone(),
             pids: Some(container.pid_namespace().clone()),
             memory_id: Some(instance_id.raw()),
+            cwd: initial_cwd,
             ..Start::default()
         },
     );
     let observer = process.observer();
     let grants = LinuxGrants::derive(container.authority());
+    let tty = LinuxTtyState::new(container.authority(), &output_mode, instance_id);
     let shared = Arc::new(LinuxShared {
         cpu: cpu.clone(),
         timer: exec_context.timer.clone(),
@@ -1062,6 +1748,8 @@ where
         container,
         _process_guard: process_guard,
         grants,
+        tty: spin::Mutex::new(tty),
+        serial_peek: spin::Mutex::new(Vec::new()),
         clock: spin::Mutex::new(crate::KernelClock::new(
             cpu.clone(),
             exec_context.runtime_state.clone(),
@@ -1312,6 +2000,8 @@ mod tests {
                 "test"
             }
         }
+        impl Filesystem<NoBacking> for DummyOutput {}
+        impl Tty for DummyOutput {}
 
         const MMAP: u64 = 9;
         const MUNMAP: u64 = 11;

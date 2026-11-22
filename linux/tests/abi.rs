@@ -14,6 +14,8 @@ use helios_linux::syscall::{
 };
 
 // The crate root is not `mod.rs`, so the submodule names its directory.
+#[path = "abi/files_poll_tty.rs"]
+mod files_poll_tty;
 #[path = "abi/system.rs"]
 mod system;
 
@@ -219,6 +221,8 @@ impl System for Sink {
         Ok(())
     }
 }
+impl helios_linux::syscall::Filesystem<NoBacking> for Sink {}
+impl helios_linux::syscall::Tty for Sink {}
 impl Stdio for Sink {
     async fn write(&mut self, _: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
         if let Some(error) = self.error {

@@ -265,6 +265,8 @@ impl System for NoOutput {
         unreachable!("the memory tests read no kernel version")
     }
 }
+impl helios_linux::syscall::Filesystem<NoBacking> for NoOutput {}
+impl helios_linux::syscall::Tty for NoOutput {}
 
 struct Linux {
     process: Process<NoBacking>,

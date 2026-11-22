@@ -37,20 +37,21 @@ use alloc::borrow::ToOwned;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use bytes::Bytes;
 use core::num::{NonZeroU32, NonZeroU64};
 
 use helios_hal::fs::{
     DirCookie, DirEntry, DirStream, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
-    Metadata, NodeKind,
+    Landed, Metadata, NodeKind, OpenFlags, RenameMode, WritePosition, write_with,
 };
-use helios_linux::syscall::{Credentials, PidNamespace, UtsField};
+use helios_linux::syscall::{AccessCheck, Credentials, OpenRequest, PidNamespace, UtsField};
 use helios_unix::FutexTable;
 use thiserror::Error;
 
 use crate::vfs::{
     FileContents, Follow, HeldPath, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MountFlags, MountGrant,
-    MountSharing, MountedFs, Namespace, PrivateMountClaim, PrivateMountClaimError, SharedOwner,
-    Storage, UnixAttributes, join_fs_path, within_directory,
+    MountHold, MountSharing, MountedFs, Namespace, PrivateMountClaim, PrivateMountClaimError,
+    SharedOwner, Storage, UnixAttributes, join_fs_path, within_directory,
 };
 use crate::{DirectoryAuthorityRights, DirectoryPreopen, ProcessAuthority, ProcessAuthorityError};
 
@@ -225,6 +226,70 @@ impl<'a, S: Storage> ContainerResolved<'a, S> {
     pub fn file_capability<'b>(&self, stored: Option<&'b [u8]>) -> Option<&'b [u8]> {
         self.mount.grant.file_capability(stored)
     }
+
+    /// Whether `self` and `other` lie on the same container mount.
+    pub fn same_mount(&self, other: &ContainerResolved<'_, S>) -> bool {
+        core::ptr::eq(self.mount, other.mount)
+    }
+
+    /// Whether this path is the root directory of its container mount.
+    pub fn is_mount_root(&self) -> bool {
+        self.container_path == self.mount.target()
+    }
+
+    /// Clones a hold on the underlying mount so an open descriptor keeps it busy.
+    pub fn mount_hold(&self) -> Option<MountHold> {
+        self.mount.backing.resolved().hold()
+    }
+
+    fn require_read(&self) -> FsResult<()> {
+        if !self
+            .authority_rights()
+            .contains(DirectoryAuthorityRights::READ)
+        {
+            return Err(FsError::NotPermitted);
+        }
+        Ok(())
+    }
+
+    fn require_write(&self) -> FsResult<()> {
+        if self.flags().contains(MountFlags::READ_ONLY) {
+            return Err(FsError::ReadOnly);
+        }
+        if !self
+            .authority_rights()
+            .contains(DirectoryAuthorityRights::WRITE)
+        {
+            return Err(FsError::NotPermitted);
+        }
+        Ok(())
+    }
+
+    fn require_mutate_dir(&self) -> FsResult<()> {
+        if self.flags().contains(MountFlags::READ_ONLY) {
+            return Err(FsError::ReadOnly);
+        }
+        if !self
+            .authority_rights()
+            .contains(DirectoryAuthorityRights::MUTATE_DIRECTORY)
+        {
+            return Err(FsError::NotPermitted);
+        }
+        Ok(())
+    }
+
+    async fn describe(&self) -> FsResult<ContainerNodeInfo> {
+        let metadata = self.fs().stat(self.fs_path()).await?;
+        let stored = self.fs().unix_attributes(self.fs_path()).await?;
+        let unix = self.container_view(metadata.kind, stored);
+        Ok(ContainerNodeInfo {
+            metadata,
+            unix,
+            flags: self.flags(),
+            mount_point: self.mount_point().to_owned(),
+            grant: self.grant(),
+        })
+    }
 }
 
 /// Container-visible description of a resolved filesystem node.
@@ -372,6 +437,599 @@ impl<S: Storage> ContainerFilesystem<S> {
             return Err(FsError::NotPermitted);
         }
         resolved.fs().read_whole(resolved.fs_path()).await
+    }
+
+    /// Whether the container's mount for `container_path` grants execute rights.
+    pub fn can_exec(&self, container_path: &str) -> bool {
+        self.resolve(container_path).is_ok_and(|resolved| {
+            resolved
+                .authority_rights()
+                .contains(DirectoryAuthorityRights::EXECUTE)
+        })
+    }
+
+    /// Walks `raw_path` component by component relative to `base_dir` (a
+    /// normalized absolute container path) strictly within this container's
+    /// root. Enforces intermediate directory existence, intermediate symlink
+    /// expansion (`ELOOP` past `MAX_SYMLINK_DEPTH`), and trailing-slash
+    /// directory checks. Returns `(resolved, trailing_slash)`.
+    pub async fn walk_path(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+    ) -> FsResult<(ContainerResolved<'_, S>, bool)> {
+        if raw_path.is_empty() || raw_path.as_bytes().contains(&0) {
+            return Err(FsError::Invalid);
+        }
+        let mut trailing_slash = raw_path.ends_with('/');
+        let mut segments: Vec<String> = if raw_path.starts_with('/') {
+            Vec::new()
+        } else {
+            let normalized_base = normalize_container_path(base_dir)?;
+            normalized_base
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let mut pending: Vec<String> = raw_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        pending.reverse();
+
+        if pending.is_empty() {
+            return Ok((self.resolve("/")?, true));
+        }
+
+        let mut symlink_expansions = 0usize;
+        while let Some(component) = pending.pop() {
+            let is_final = pending.is_empty();
+            match component.as_str() {
+                "." | ".." => {
+                    let cur_path = build_container_path(&segments);
+                    let cur = self.resolve(&cur_path)?;
+                    let meta = cur.fs().stat(cur.fs_path()).await?;
+                    if meta.kind != NodeKind::Directory {
+                        return Err(FsError::NotDirectory);
+                    }
+                    if component == ".." {
+                        segments.pop();
+                    }
+                }
+                name => {
+                    if name.len() > 255 {
+                        return Err(FsError::NameTooLong);
+                    }
+                    segments.push(component);
+                    let cur_path = build_container_path(&segments);
+                    let resolved = self.resolve(&cur_path)?;
+                    if !is_final {
+                        let meta = resolved.fs().stat(resolved.fs_path()).await?;
+                        match meta.kind {
+                            NodeKind::Directory => {}
+                            NodeKind::Symlink => {
+                                symlink_expansions += 1;
+                                if symlink_expansions > MAX_SYMLINK_DEPTH {
+                                    return Err(FsError::Loop);
+                                }
+                                let target = resolved.fs().read_link(resolved.fs_path()).await?;
+                                if target.is_empty() || target.as_bytes().contains(&0) {
+                                    return Err(FsError::Invalid);
+                                }
+                                segments.pop();
+                                if target.starts_with('/') {
+                                    segments.clear();
+                                }
+                                let mut parts: Vec<String> = target
+                                    .split('/')
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned)
+                                    .collect();
+                                parts.reverse();
+                                pending.extend(parts);
+                            }
+                            _ => return Err(FsError::NotDirectory),
+                        }
+                    } else if follow_final || trailing_slash {
+                        match resolved.fs().stat(resolved.fs_path()).await {
+                            Ok(meta) if meta.kind == NodeKind::Symlink => {
+                                symlink_expansions += 1;
+                                if symlink_expansions > MAX_SYMLINK_DEPTH {
+                                    return Err(FsError::Loop);
+                                }
+                                let target = resolved.fs().read_link(resolved.fs_path()).await?;
+                                if target.is_empty() || target.as_bytes().contains(&0) {
+                                    return Err(FsError::Invalid);
+                                }
+                                segments.pop();
+                                if target.starts_with('/') {
+                                    segments.clear();
+                                }
+                                if target.ends_with('/') {
+                                    trailing_slash = true;
+                                }
+                                let mut parts: Vec<String> = target
+                                    .split('/')
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned)
+                                    .collect();
+                                parts.reverse();
+                                pending.extend(parts);
+                            }
+                            Ok(meta) if trailing_slash && meta.kind != NodeKind::Directory => {
+                                return Err(FsError::NotDirectory);
+                            }
+                            Ok(_) | Err(FsError::NoEntry) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
+        }
+
+        let final_path = build_container_path(&segments);
+        Ok((self.resolve(&final_path)?, trailing_slash))
+    }
+
+    /// Resolves and stats `raw_path` relative to `base_dir`, returning both
+    /// container-visible metadata and the normalized container path.
+    pub async fn stat_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+    ) -> FsResult<(ContainerNodeInfo, String)> {
+        let (resolved, _) = self.walk_path(base_dir, raw_path, follow_final).await?;
+        resolved.require_read()?;
+        let info = resolved.describe().await?;
+        Ok((info, resolved.container_path().to_owned()))
+    }
+
+    /// Stats an already-resolved container path (used for `fstat` on open
+    /// descriptors, including `O_PATH | O_NOFOLLOW` symlink descriptors).
+    pub async fn stat_resolved(&self, container_path: &str) -> FsResult<ContainerNodeInfo> {
+        let resolved = self.resolve(container_path)?;
+        resolved.describe().await
+    }
+
+    /// Checks access permissions for `raw_path` relative to `base_dir` within
+    /// the container's authority ceiling.
+    pub async fn access_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        check: AccessCheck,
+    ) -> FsResult<()> {
+        let (resolved, _) = self.walk_path(base_dir, raw_path, check.follow).await?;
+        let info = resolved.describe().await?;
+        if check.read {
+            resolved.require_read()?;
+        }
+        if check.write {
+            resolved.require_write()?;
+        }
+        if check.exec {
+            if !resolved
+                .authority_rights()
+                .contains(DirectoryAuthorityRights::EXECUTE)
+            {
+                return Err(FsError::NotPermitted);
+            }
+            if info.metadata.kind == NodeKind::File && (info.unix.permissions & 0o111) == 0 {
+                return Err(FsError::NotPermitted);
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens or creates a file or directory for Linux `open`/`openat`/`creat`.
+    pub async fn open_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        request: OpenRequest,
+        now: u64,
+    ) -> FsResult<(ContainerNodeInfo, String, Option<MountHold>)> {
+        let follow_final = !(request.nofollow || (request.create && request.exclusive));
+        let (resolved, trailing_slash) = self.walk_path(base_dir, raw_path, follow_final).await?;
+        let existing = resolved.fs().stat(resolved.fs_path()).await;
+
+        if request.path_only {
+            let meta = existing?;
+            if (request.directory || trailing_slash) && meta.kind != NodeKind::Directory {
+                return Err(FsError::NotDirectory);
+            }
+            let info = resolved.describe().await?;
+            return Ok((
+                info,
+                resolved.container_path().to_owned(),
+                resolved.mount_hold(),
+            ));
+        }
+
+        if request.create && request.exclusive && existing.is_ok() {
+            return Err(FsError::Exists);
+        }
+
+        match existing {
+            Ok(meta) => {
+                if meta.kind == NodeKind::Symlink {
+                    return Err(FsError::Loop);
+                }
+                if meta.kind == NodeKind::Directory {
+                    if request.write || request.truncate {
+                        return Err(FsError::IsDirectory);
+                    }
+                    resolved.require_read()?;
+                } else {
+                    if request.directory || trailing_slash {
+                        return Err(FsError::NotDirectory);
+                    }
+                    if request.read {
+                        resolved.require_read()?;
+                    }
+                    if request.write || request.truncate {
+                        resolved.require_write()?;
+                    }
+                    let mut flags = OpenFlags::empty();
+                    if request.truncate {
+                        flags |= OpenFlags::TRUNCATE;
+                    }
+                    resolved.fs().open(resolved.fs_path(), flags, now).await?;
+                }
+            }
+            Err(FsError::NoEntry) => {
+                if !request.create {
+                    return Err(FsError::NoEntry);
+                }
+                if trailing_slash {
+                    return Err(FsError::IsDirectory);
+                }
+                if request.directory {
+                    return Err(FsError::NotDirectory);
+                }
+                resolved.require_mutate_dir()?;
+                if request.write {
+                    resolved.require_write()?;
+                }
+                let mut flags = OpenFlags::CREATE;
+                if request.exclusive {
+                    flags |= OpenFlags::EXCLUSIVE;
+                }
+                if request.truncate {
+                    flags |= OpenFlags::TRUNCATE;
+                }
+                resolved.fs().open(resolved.fs_path(), flags, now).await?;
+                resolved
+                    .fs()
+                    .apply_created_permissions(resolved.fs_path(), request.mode, now);
+            }
+            Err(error) => return Err(error),
+        }
+
+        let info = resolved.describe().await?;
+        Ok((
+            info,
+            resolved.container_path().to_owned(),
+            resolved.mount_hold(),
+        ))
+    }
+
+    /// Reads up to `max_bytes` from `container_path` at `offset`.
+    pub async fn read_at(
+        &self,
+        container_path: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> FsResult<Bytes> {
+        let resolved = self.resolve(container_path)?;
+        resolved.require_read()?;
+        resolved
+            .fs()
+            .read_at(resolved.fs_path(), offset, max_bytes)
+            .await
+    }
+
+    /// Writes `bytes` to `container_path` at `position`.
+    pub async fn write_at(
+        &self,
+        container_path: &str,
+        position: WritePosition,
+        bytes: &[u8],
+        now: u64,
+    ) -> FsResult<Landed> {
+        let resolved = self.resolve(container_path)?;
+        resolved.require_write()?;
+        write_with(
+            resolved.fs(),
+            resolved.fs_path(),
+            position,
+            bytes.len(),
+            now,
+            |at, destination| {
+                destination.copy_from_slice(&bytes[at..at + destination.len()]);
+            },
+        )
+        .await
+    }
+
+    /// Truncates or zero-extends an open file at `container_path`.
+    pub async fn set_size(&self, container_path: &str, size: u64, now: u64) -> FsResult<()> {
+        let resolved = self.resolve(container_path)?;
+        resolved.require_write()?;
+        resolved.fs().set_size(resolved.fs_path(), size, now).await
+    }
+
+    /// Truncates or zero-extends the file at `raw_path` relative to `base_dir`.
+    pub async fn set_size_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        size: u64,
+        now: u64,
+    ) -> FsResult<()> {
+        let (resolved, _) = self.walk_path(base_dir, raw_path, true).await?;
+        resolved.require_write()?;
+        resolved.fs().set_size(resolved.fs_path(), size, now).await
+    }
+
+    /// Updates access/modified timestamps at `raw_path` relative to `base_dir`.
+    pub async fn set_times_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        access: Option<u64>,
+        modified: Option<u64>,
+        now: u64,
+    ) -> FsResult<()> {
+        let (resolved, _) = self.walk_path(base_dir, raw_path, follow_final).await?;
+        resolved.require_write()?;
+        resolved
+            .fs()
+            .set_times(resolved.fs_path(), access, modified, now)
+            .await
+    }
+
+    /// Updates access/modified timestamps on an already-resolved container path.
+    pub async fn set_times_resolved(
+        &self,
+        container_path: &str,
+        access: Option<u64>,
+        modified: Option<u64>,
+        now: u64,
+    ) -> FsResult<()> {
+        let resolved = self.resolve(container_path)?;
+        resolved.require_write()?;
+        resolved
+            .fs()
+            .set_times(resolved.fs_path(), access, modified, now)
+            .await
+    }
+
+    /// Syncs data (and metadata if `!data_only`) for `container_path`.
+    pub async fn sync(&self, container_path: &str, data_only: bool) -> FsResult<()> {
+        let resolved = self.resolve(container_path)?;
+        if data_only {
+            resolved.fs().sync_data(resolved.fs_path()).await
+        } else {
+            resolved.fs().sync(resolved.fs_path()).await
+        }
+    }
+
+    /// Reads the symbolic link target at `raw_path` relative to `base_dir`.
+    pub async fn read_link_at(&self, base_dir: &str, raw_path: &str) -> FsResult<String> {
+        let (resolved, trailing_slash) = self.walk_path(base_dir, raw_path, false).await?;
+        resolved.require_read()?;
+        if trailing_slash {
+            return Err(FsError::Invalid);
+        }
+        resolved.fs().read_link(resolved.fs_path()).await
+    }
+
+    /// Creates a directory at `raw_path` relative to `base_dir`.
+    pub async fn mkdir_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        mode: u32,
+        now: u64,
+    ) -> FsResult<()> {
+        if matches!(last_raw_component(raw_path), None | Some(".") | Some("..")) {
+            return Err(FsError::Exists);
+        }
+        let (resolved, _) = self.walk_path(base_dir, raw_path, false).await?;
+        resolved.require_mutate_dir()?;
+        resolved
+            .fs()
+            .create_directory(resolved.fs_path(), now)
+            .await?;
+        resolved
+            .fs()
+            .apply_created_permissions(resolved.fs_path(), mode, now);
+        Ok(())
+    }
+
+    /// Unlinks a file (`remove_dir == false`) or removes an empty directory
+    /// (`remove_dir == true`) at `raw_path` relative to `base_dir`.
+    pub async fn unlink_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        remove_dir: bool,
+        now: u64,
+    ) -> FsResult<()> {
+        match last_raw_component(raw_path) {
+            None => {
+                return Err(if remove_dir {
+                    FsError::Busy
+                } else {
+                    FsError::IsDirectory
+                });
+            }
+            Some(".") => {
+                return Err(if remove_dir {
+                    FsError::Invalid
+                } else {
+                    FsError::IsDirectory
+                });
+            }
+            Some("..") => {
+                return Err(if remove_dir {
+                    FsError::NotEmpty
+                } else {
+                    FsError::IsDirectory
+                });
+            }
+            Some(_) => {}
+        }
+        let (resolved, _) = self.walk_path(base_dir, raw_path, false).await?;
+        if remove_dir {
+            if resolved.is_mount_root() {
+                return Err(FsError::Busy);
+            }
+            resolved.require_mutate_dir()?;
+            let meta = resolved.fs().stat(resolved.fs_path()).await?;
+            if meta.kind != NodeKind::Directory {
+                return Err(FsError::NotDirectory);
+            }
+            resolved
+                .fs()
+                .remove_directory(resolved.fs_path(), now)
+                .await
+        } else {
+            resolved.require_mutate_dir()?;
+            let meta = resolved.fs().stat(resolved.fs_path()).await?;
+            if meta.kind == NodeKind::Directory {
+                return Err(FsError::IsDirectory);
+            }
+            resolved.fs().unlink(resolved.fs_path(), now).await
+        }
+    }
+
+    /// Renames `old_raw` (relative to `old_base`) to `new_raw` (relative to
+    /// `new_base`) within the same container mount.
+    pub async fn rename_at(
+        &self,
+        old_base: &str,
+        old_raw: &str,
+        new_base: &str,
+        new_raw: &str,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
+        if matches!(last_raw_component(old_raw), None | Some(".") | Some(".."))
+            || matches!(last_raw_component(new_raw), None | Some(".") | Some(".."))
+        {
+            return Err(FsError::Busy);
+        }
+        let (old_resolved, old_slash) = self.walk_path(old_base, old_raw, false).await?;
+        let (new_resolved, new_slash) = self.walk_path(new_base, new_raw, false).await?;
+        let old_meta = old_resolved.fs().stat(old_resolved.fs_path()).await?;
+        if (old_slash || new_slash) && old_meta.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        if !old_resolved.same_mount(&new_resolved) {
+            return Err(FsError::CrossDevice);
+        }
+        if old_resolved.is_mount_root() || new_resolved.is_mount_root() {
+            return Err(FsError::Busy);
+        }
+        old_resolved.require_mutate_dir()?;
+        new_resolved.require_mutate_dir()?;
+        old_resolved
+            .fs()
+            .rename(old_resolved.fs_path(), new_resolved.fs_path(), mode, now)
+            .await
+    }
+
+    /// Creates a hard link from `old_raw` (or `old_base` when `empty_old`) to
+    /// `new_raw` within the same container mount.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn link_at(
+        &self,
+        old_base: &str,
+        old_raw: &str,
+        new_base: &str,
+        new_raw: &str,
+        follow_old: bool,
+        empty_old: bool,
+        now: u64,
+    ) -> FsResult<()> {
+        if matches!(last_raw_component(new_raw), None | Some(".") | Some("..")) {
+            return Err(FsError::Exists);
+        }
+        let old_resolved = if empty_old {
+            self.resolve(old_base)?
+        } else {
+            self.walk_path(old_base, old_raw, follow_old).await?.0
+        };
+        let (new_resolved, new_slash) = self.walk_path(new_base, new_raw, false).await?;
+        if new_slash {
+            return match new_resolved.fs().stat(new_resolved.fs_path()).await {
+                Ok(_) => Err(FsError::Exists),
+                Err(_) => Err(FsError::NoEntry),
+            };
+        }
+        if !old_resolved.same_mount(&new_resolved) {
+            return Err(FsError::CrossDevice);
+        }
+        old_resolved.require_read()?;
+        new_resolved.require_mutate_dir()?;
+        old_resolved
+            .fs()
+            .link(old_resolved.fs_path(), new_resolved.fs_path(), now)
+            .await
+    }
+
+    /// Creates a symbolic link at `raw_path` (relative to `base_dir`) pointing
+    /// to `target`.
+    pub async fn symlink_at(
+        &self,
+        target: &str,
+        base_dir: &str,
+        raw_path: &str,
+        now: u64,
+    ) -> FsResult<()> {
+        if target.is_empty() {
+            return Err(FsError::NoEntry);
+        }
+        if matches!(last_raw_component(raw_path), None | Some(".") | Some("..")) {
+            return Err(FsError::Exists);
+        }
+        let (resolved, trailing_slash) = self.walk_path(base_dir, raw_path, false).await?;
+        if trailing_slash {
+            return match resolved.fs().stat(resolved.fs_path()).await {
+                Ok(_) => Err(FsError::Exists),
+                Err(_) => Err(FsError::NoEntry),
+            };
+        }
+        resolved.require_mutate_dir()?;
+        resolved.fs().symlink(target, resolved.fs_path(), now).await
+    }
+
+    /// Lists entries in `container_path` along with `(self_inode, parent_inode)`.
+    pub async fn list_with_inodes(
+        &self,
+        container_path: &str,
+    ) -> FsResult<(u64, u64, Vec<DirEntry>)> {
+        let self_info = self.stat(container_path).await?;
+        if self_info.metadata.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let parent_path = crate::parent_path(container_path);
+        let parent_ino = if parent_path == container_path {
+            self_info.metadata.id.inode
+        } else {
+            self.stat(parent_path)
+                .await
+                .map_or(self_info.metadata.id.inode, |info| info.metadata.id.inode)
+        };
+        let entries = self.list(container_path).await?;
+        Ok((self_info.metadata.id.inode, parent_ino, entries))
     }
 
     fn longest_mount(&self, normalized: &str) -> &ContainerMount<S> {
@@ -792,6 +1450,23 @@ fn effective_fs_rights(
 
 fn is_valid_submount_target(target: &str) -> bool {
     target.len() > 1 && target.strip_prefix('/').and_then(FsPath::new).is_some()
+}
+
+fn build_container_path(segments: &[String]) -> String {
+    if segments.is_empty() {
+        return String::from("/");
+    }
+    let total_len: usize = segments.iter().map(|s| 1 + s.len()).sum();
+    let mut out = String::with_capacity(total_len);
+    for seg in segments {
+        out.push('/');
+        out.push_str(seg);
+    }
+    out
+}
+
+fn last_raw_component(raw_path: &str) -> Option<&str> {
+    raw_path.rsplit('/').find(|s| !s.is_empty())
 }
 
 /// Normalizes an absolute path strictly within a container's `"/"`, clamping
@@ -1356,5 +2031,119 @@ mod tests {
             ),
             Err(FsError::NoEntry)
         ));
+    }
+
+    #[test]
+    fn container_path_walker_enforces_symlinks_boundaries_and_errors() {
+        let host_ns = test_namespace();
+        let rw = FileSystemRights::READ | FileSystemRights::WRITE;
+        let ro = FileSystemRights::READ;
+
+        let root_fs = mount_memory(&host_ns, "/root-a", rw, MountSharing::Private);
+        let ro_fs = mount_memory(&host_ns, "/ro", ro, MountSharing::Shared);
+        block_on(async {
+            create_file(&root_fs, "alpha", b"hello").await;
+            create_file(&ro_fs, "fixed", b"ro-data").await;
+        });
+
+        let container = block_on(LinuxContainer::create(
+            ContainerId::new(NonZeroU64::new(9).unwrap()),
+            &ProcessAuthority::root(),
+            &host_ns,
+            ProcessAuthority::empty(),
+            ContainerConfig {
+                root: ContainerMountSpec {
+                    source_path: String::from("/root-a"),
+                    target_path: String::from("/"),
+                    rights: RWX,
+                    sharing: MountSharing::Private,
+                },
+                mounts: vec![ContainerMountSpec {
+                    source_path: String::from("/ro"),
+                    target_path: String::from("/ro"),
+                    rights: RX,
+                    sharing: MountSharing::Shared,
+                }],
+                shared_owner: SharedOwner { uid: 0, gid: 0 },
+                credentials: Credentials::root(),
+                hostname: UtsField::UNSET,
+                domainname: UtsField::UNSET,
+            },
+        ))
+        .expect("container creates");
+        let fs = container.filesystem();
+
+        block_on(async {
+            // Component walker catches missing and non-directory intermediate components.
+            assert!(matches!(
+                fs.stat_at("/", "nonexistent/..", true).await,
+                Err(FsError::NoEntry)
+            ));
+            assert!(matches!(
+                fs.stat_at("/", "alpha/..", true).await,
+                Err(FsError::NotDirectory)
+            ));
+            assert!(matches!(
+                fs.stat_at("/", "alpha/", true).await,
+                Err(FsError::NotDirectory)
+            ));
+
+            // Intermediate symlink expands before `..`, and symlink loop returns `Loop`.
+            fs.mkdir_at("/", "sub", 0o755, 1).await.unwrap();
+            fs.symlink_at("sub", "/", "sym_sub", 1).await.unwrap();
+            let (_, resolved) = fs.stat_at("/", "sym_sub/../alpha", true).await.unwrap();
+            assert_eq!(resolved, "/alpha");
+
+            fs.symlink_at("loop_b", "/", "loop_a", 1).await.unwrap();
+            fs.symlink_at("loop_a", "/", "loop_b", 1).await.unwrap();
+            assert!(matches!(
+                fs.stat_at("/", "loop_a", true).await,
+                Err(FsError::Loop)
+            ));
+
+            // Dangling symlink with O_CREAT | O_EXCL fails with Exists.
+            fs.symlink_at("missing_target", "/", "dangling", 1)
+                .await
+                .unwrap();
+            let excl = OpenRequest {
+                read: true,
+                write: true,
+                create: true,
+                exclusive: true,
+                truncate: false,
+                directory: false,
+                nofollow: false,
+                path_only: false,
+                append: false,
+                sync: false,
+                dsync: false,
+                mode: 0o644,
+            };
+            assert!(matches!(
+                fs.open_at("/", "dangling", excl, 1).await,
+                Err(FsError::Exists)
+            ));
+
+            // Cross-mount rename and link fail with CrossDevice, and read-only mount fails with ReadOnly.
+            assert!(matches!(
+                fs.rename_at("/", "alpha", "/", "/ro/moved", RenameMode::Replace, 1)
+                    .await,
+                Err(FsError::CrossDevice)
+            ));
+            assert!(matches!(
+                fs.link_at("/", "alpha", "/", "/ro/linked", false, false, 1)
+                    .await,
+                Err(FsError::CrossDevice)
+            ));
+            assert!(matches!(
+                fs.write_at("/ro/fixed", WritePosition::At(0), b"x", 1)
+                    .await,
+                Err(FsError::ReadOnly)
+            ));
+            assert!(matches!(
+                fs.unlink_at("/", "/ro/fixed", false, 1).await,
+                Err(FsError::ReadOnly)
+            ));
+        });
     }
 }

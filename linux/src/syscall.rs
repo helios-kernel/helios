@@ -1,4 +1,6 @@
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use bytes::Bytes;
 use core::convert::Infallible;
 use core::future::Future;
@@ -9,17 +11,24 @@ use core::task::{Context, Poll};
 use helios_hal::vmm::PageFlags;
 use helios_sync::{Notify, NotifyWaiter, RawMutex};
 use helios_unix::{
-    ChildTermination, DescriptorSlots, FileDescriptor, FileDescriptorEntry, FutexTable, NoNetwork,
-    ProcessIdentity, ProcessMemoryIdentity, SocketNetwork,
+    ChildTermination, DescriptorSlots, FDFLAG_NONBLOCK, FileDescriptor, FileDescriptorEntry,
+    FutexTable, NoNetwork, ProcessIdentity, ProcessMemoryIdentity, SocketNetwork,
 };
 
+mod fs;
 mod futex;
 mod io;
 mod memory;
+mod poll;
 mod system;
 mod thread;
+mod tty;
 
 pub use crate::abi::{Abi, Operation};
+pub use fs::{
+    AccessCheck, DirListEntry, FileAccess, FileStat, Filesystem, LinkOptions, OpenRequest,
+    TimeUpdate,
+};
 pub use io::Clock;
 pub use system::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_KILL,
@@ -29,6 +38,7 @@ pub use system::{
     RLIM_INFINITY, Resource, Rlimit, Start, System, UTS_FIELD_MAX, UtsField, UtsNameError,
 };
 pub use thread::PidNamespace;
+pub use tty::{Termios, TermiosAction, Tty, TtyError, TtyStream, Winsize};
 
 /// The platform objects a process's descriptors can hold besides the UNIX
 /// objects `helios-unix` owns (pipes, eventfds, epoll sets, sockets): the
@@ -235,7 +245,24 @@ pub enum WriteError {
     Io,
     #[error("the process's authority does not reach this output")]
     Denied,
+    #[error("non-blocking output would block")]
+    WouldBlock,
 }
+
+/// Non-blocking standard-input read outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdinTryRead {
+    Ready(Bytes),
+    Eof,
+    WouldBlock,
+    Denied,
+}
+
+/// Readiness event mask bits (matching Linux `POLLIN`/`POLLOUT`/`POLLERR`/`POLLHUP`).
+pub const READY_IN: u32 = poll::POLLIN;
+pub const READY_OUT: u32 = poll::POLLOUT;
+pub const READY_ERR: u32 = poll::POLLERR;
+pub const READY_HUP: u32 = poll::POLLHUP;
 
 /// A refusal by the process's authority, or of an address it may not use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -254,9 +281,34 @@ pub trait Stdio {
         bytes: &[u8],
     ) -> impl Future<Output = Result<usize, WriteError>> + Send;
 
+    /// Non-blocking write for `O_NONBLOCK` stdout/stderr descriptors.
+    fn try_write(&mut self, _stream: Stream, _bytes: &[u8]) -> Result<usize, WriteError> {
+        Err(WriteError::WouldBlock)
+    }
+
     /// Waits for standard input and returns what arrived, at most `limit`
     /// bytes; empty at the end of input.
     fn read_input(&mut self, limit: usize) -> impl Future<Output = Result<Bytes, Denied>> + Send;
+
+    /// Non-blocking read for `O_NONBLOCK` stdin descriptors.
+    fn try_read_input(&mut self, _limit: usize) -> StdinTryRead {
+        StdinTryRead::WouldBlock
+    }
+
+    /// Current readiness mask (`READY_IN`, `READY_HUP`, `READY_ERR`) for standard input.
+    fn stdin_ready_mask(&self) -> u32 {
+        0
+    }
+
+    /// Waits until standard input readiness may have changed (data arrived or EOF).
+    fn wait_stdin_ready(&self) -> impl Future<Output = ()> + Send {
+        core::future::pending()
+    }
+
+    /// Current readiness mask (`READY_OUT`, `READY_ERR`) for stdout/stderr.
+    fn stdout_ready_mask(&self, _stream: Stream) -> u32 {
+        READY_OUT
+    }
 }
 
 /// A system call as its ABI's registers carry it.
@@ -271,6 +323,7 @@ const EPERM: u64 = 1;
 const EINTR: u64 = 4;
 const EIO: u64 = 5;
 const EBADF: u64 = 9;
+const EAGAIN: u64 = 11;
 const ENOMEM: u64 = 12;
 const EACCES: u64 = 13;
 const EFAULT: u64 = 14;
@@ -334,6 +387,8 @@ struct ProcessShared<R: Resources> {
     memory_id: ProcessMemoryIdentity,
     futex: FutexTable,
     descriptors: spin::Mutex<Descriptors<R>>,
+    cwd: spin::Mutex<String>,
+    shared_mappings: spin::Mutex<Vec<memory::SharedFileMapping<R::File>>>,
     stdin_lock: RawMutex,
     stdin_carry: spin::Mutex<Bytes>,
     attributes: spin::Mutex<system::Attributes>,
@@ -355,9 +410,9 @@ impl core::ops::Deref for GroupLifecycle {
 ///
 /// Each thread task exclusively owns its `Process<R>` handle while
 /// dispatching a syscall. Shared process structures synchronize internally
-/// with bounded non-awaiting critical sections (`descriptors`, `attributes`,
-/// `program_break`, `threads`, `futex`) or an async mutex (`stdin_carry`);
-/// no spin lock is ever held across an `.await`.
+/// with bounded non-awaiting critical sections (`descriptors`, `cwd`,
+/// `shared_mappings`, `attributes`, `program_break`, `threads`, `futex`) or an
+/// async mutex (`stdin_carry`); no spin lock is ever held across an `.await`.
 pub struct Process<R: Resources> {
     shared: Arc<ProcessShared<R>>,
     tid: NonZeroU32,
@@ -386,7 +441,7 @@ impl<R: Resources> Process<R> {
         id: NonZeroU32,
         program_break: u64,
         mut descriptors: Descriptors<R>,
-        start: Start,
+        mut start: Start,
     ) -> Self {
         let open_files = descriptors.limit;
         let futex = start.futex.clone();
@@ -395,6 +450,11 @@ impl<R: Resources> Process<R> {
             .clone()
             .unwrap_or_else(|| PidNamespace::standalone(id));
         let memory_id = ProcessMemoryIdentity::new(start.memory_id.unwrap_or(u64::from(id.get())));
+        let initial_cwd = start
+            .cwd
+            .take()
+            .filter(|p| p.starts_with('/'))
+            .unwrap_or_else(|| String::from("/"));
         let mut initial_stdin_carry = Bytes::new();
         for slot in descriptors.entries.iter_mut().flatten() {
             if let Descriptor::<R>::Stdin { carry } = &mut slot.descriptor
@@ -416,6 +476,8 @@ impl<R: Resources> Process<R> {
                 memory_id,
                 futex,
                 descriptors: spin::Mutex::new(descriptors),
+                cwd: spin::Mutex::new(initial_cwd),
+                shared_mappings: spin::Mutex::new(Vec::new()),
                 stdin_lock: RawMutex::new(),
                 stdin_carry: spin::Mutex::new(initial_stdin_carry),
                 attributes: spin::Mutex::new(system::Attributes::new(start, open_files)),
@@ -427,6 +489,16 @@ impl<R: Resources> Process<R> {
             robust_list,
             exited: false,
         }
+    }
+
+    /// Flushes every active writable `MAP_SHARED` file mapping back to its
+    /// backing file (used on process teardown after non-syscall exits).
+    pub async fn flush_shared_mappings<M: UserMemory, F: Filesystem<R>>(
+        &self,
+        memory: &M,
+        fs: &mut F,
+    ) {
+        memory::flush_all_shared_mappings(self, memory, fs).await;
     }
 
     /// The thread-group ID (`getpid`).
@@ -506,7 +578,12 @@ fn errno(value: u64) -> u64 {
 
 /// Dispatches one Linux system call on `process`'s thread. `Exit` and
 /// `ExitGroup` consume the thread's execution loop through `Break`.
-pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + Clock + System>(
+pub async fn dispatch<
+    R: Resources,
+    M: VirtualMemory,
+    T: Thread<R>,
+    O: Stdio + Clock + System + Filesystem<R> + Tty,
+>(
     process: &mut Process<R>,
     call: Call,
     memory: &mut M,
@@ -517,6 +594,7 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
     let arguments = call.arguments;
     let result = match abi.operation(call.number) {
         operation @ (Operation::Exit | Operation::ExitGroup) => {
+            memory::flush_all_shared_mappings(process, memory, output).await;
             futex::exit_thread(process, memory);
             let status = arguments[0] as u8;
             let exit = if operation == Operation::ExitGroup {
@@ -528,12 +606,127 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
             return ControlFlow::Break(exit);
         }
         Operation::Read => read::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Write => write::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Readv => {
+            fs::readv_common::<R, _, _>(process, arguments, None, 0, memory, output).await
+        }
+        Operation::Writev => {
+            fs::writev_common::<R, _, _>(process, arguments, None, 0, memory, output).await
+        }
+        Operation::Pread64 => fs::pread64::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Pwrite64 => fs::pwrite64::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Preadv => {
+            fs::readv_common::<R, _, _>(
+                process,
+                arguments,
+                Some(arguments[3] as i64),
+                0,
+                memory,
+                output,
+            )
+            .await
+        }
+        Operation::Pwritev => {
+            fs::writev_common::<R, _, _>(
+                process,
+                arguments,
+                Some(arguments[3] as i64),
+                0,
+                memory,
+                output,
+            )
+            .await
+        }
+        Operation::Preadv2 => {
+            let off = arguments[3] as i64;
+            fs::readv_common::<R, _, _>(
+                process,
+                arguments,
+                (off != -1).then_some(off),
+                arguments[5],
+                memory,
+                output,
+            )
+            .await
+        }
+        Operation::Pwritev2 => {
+            let off = arguments[3] as i64;
+            fs::writev_common::<R, _, _>(
+                process,
+                arguments,
+                (off != -1).then_some(off),
+                arguments[5],
+                memory,
+                output,
+            )
+            .await
+        }
+        Operation::Openat => fs::openat::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Open => fs::open::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Creat => fs::creat::<R, _, _>(process, arguments, memory, output).await,
         Operation::Close => process
             .shared
             .descriptors
             .lock()
             .close(arguments[0] as u32 as i32)
             .map_or_else(io::descriptor_errno, |_| 0),
+        Operation::CloseRange => fs::close_range::<R>(process, arguments),
+        Operation::Lseek => fs::lseek::<R, _>(process, arguments, output).await,
+        Operation::Fstat => {
+            fs::fstat::<R, _, _, _>(process, arguments, memory, output, output).await
+        }
+        Operation::Newfstatat => {
+            fs::newfstatat::<R, _, _, _>(process, arguments, memory, output, output).await
+        }
+        Operation::Stat => {
+            fs::stat::<R, _, _, _>(process, arguments, true, memory, output, output).await
+        }
+        Operation::Lstat => {
+            fs::stat::<R, _, _, _>(process, arguments, false, memory, output, output).await
+        }
+        Operation::Statx => {
+            fs::statx::<R, _, _, _>(process, arguments, memory, output, output).await
+        }
+        Operation::Faccessat => {
+            fs::faccessat::<R, _, _>(process, arguments, false, memory, output).await
+        }
+        Operation::Faccessat2 => {
+            fs::faccessat::<R, _, _>(process, arguments, true, memory, output).await
+        }
+        Operation::Access => fs::access::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Readlinkat => {
+            fs::readlinkat::<R, _, _>(process, arguments, memory, output).await
+        }
+        Operation::Readlink => fs::readlink::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Mkdirat => fs::mkdirat::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Mkdir => fs::mkdir::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Unlinkat => fs::unlinkat::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Unlink => fs::unlink::<R, _, _>(process, arguments, false, memory, output).await,
+        Operation::Rmdir => fs::unlink::<R, _, _>(process, arguments, true, memory, output).await,
+        Operation::Renameat2 => {
+            fs::renameat2::<R, _, _>(process, arguments, true, memory, output).await
+        }
+        Operation::Renameat => {
+            fs::renameat2::<R, _, _>(process, arguments, false, memory, output).await
+        }
+        Operation::Rename => fs::rename::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Linkat => fs::linkat::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Link => fs::link::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Symlinkat => fs::symlinkat::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Symlink => fs::symlink::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Utimensat => fs::utimensat::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Chdir => fs::chdir::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Fchdir => fs::fchdir::<R, _>(process, arguments, output).await,
+        Operation::Getcwd => fs::getcwd::<R, _>(process, arguments, memory),
+        Operation::Getdents64 => {
+            fs::getdents64::<R, _, _>(process, arguments, memory, output).await
+        }
+        Operation::Ftruncate => fs::ftruncate::<R, _>(process, arguments, output).await,
+        Operation::Truncate => fs::truncate::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Fsync => fs::fsync::<R, _, _>(process, arguments, false, memory, output).await,
+        Operation::Fdatasync => {
+            fs::fsync::<R, _, _>(process, arguments, true, memory, output).await
+        }
         operation @ (Operation::Pipe | Operation::Pipe2) => io::pipe::<R, _>(
             &mut process.shared.descriptors.lock(),
             arguments,
@@ -541,7 +734,13 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
             operation == Operation::Pipe2,
         ),
         operation @ (Operation::Dup | Operation::Dup2 | Operation::Dup3 | Operation::Fcntl) => {
-            io::duplicate::<R>(&mut process.shared.descriptors.lock(), operation, arguments)
+            io::duplicate::<R, _>(
+                abi,
+                &mut process.shared.descriptors.lock(),
+                operation,
+                arguments,
+                output,
+            )
         }
         operation @ (Operation::Eventfd | Operation::Eventfd2) => io::event::<R>(
             &mut process.shared.descriptors.lock(),
@@ -562,7 +761,7 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
         operation @ (Operation::EpollWait | Operation::EpollPwait) => {
             io::epoll_wait::<R, _, _>(
                 abi,
-                &process.shared.descriptors,
+                process,
                 arguments,
                 memory,
                 output,
@@ -570,22 +769,15 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
             )
             .await
         }
-        Operation::Mmap => {
-            let _mm = process.shared.program_break.lock();
-            memory::mmap(abi, arguments, memory)
-        }
-        Operation::Munmap => {
-            let _mm = process.shared.program_break.lock();
-            memory::munmap(abi, arguments, memory)
-        }
-        Operation::Mprotect => {
-            let _mm = process.shared.program_break.lock();
-            memory::mprotect(abi, arguments, memory)
-        }
-        Operation::Mremap => {
-            let _mm = process.shared.program_break.lock();
-            memory::mremap(abi, arguments, memory)
-        }
+        Operation::Poll => poll::poll::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Ppoll => poll::ppoll::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Select => poll::select::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Pselect6 => poll::pselect6::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Mmap => memory::mmap(process, abi, arguments, memory, output).await,
+        Operation::Munmap => memory::munmap(process, abi, arguments, memory, output).await,
+        Operation::Msync => memory::msync(process, abi, arguments, memory, output).await,
+        Operation::Mprotect => memory::mprotect(process, abi, arguments, memory),
+        Operation::Mremap => memory::mremap(process, abi, arguments, memory, output).await,
         Operation::Madvise => {
             let _mm = process.shared.program_break.lock();
             memory::madvise(arguments, memory)
@@ -613,21 +805,7 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
             u64::from(process.tid.get())
         }
         Operation::ArchPrctl => arch_prctl(abi, arguments, memory, thread),
-        Operation::Writev => {
-            writev::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
-        }
-        Operation::Ioctl => match process
-            .shared
-            .descriptors
-            .lock()
-            .get_entry(arguments[0] as u32 as i32)
-        {
-            Some(_) => errno(ENOTTY),
-            None => errno(EBADF),
-        },
-        Operation::Write => {
-            write::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
-        }
+        Operation::Ioctl => tty::ioctl::<R, _, _>(process, arguments, memory, output),
         Operation::ClockGettime => system::clock_gettime(arguments, memory, output),
         Operation::ClockGetres => system::clock_getres(arguments, memory),
         Operation::ClockSettime => {
@@ -722,7 +900,7 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
     ControlFlow::Continue(result)
 }
 
-async fn read<R: Resources, M: UserMemory, O: Stdio>(
+async fn read<R: Resources, M: UserMemory, O: Stdio + Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -737,6 +915,12 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
     else {
         return errno(EBADF);
     };
+    if matches!(
+        entry.descriptor,
+        Descriptor::<R>::File(_) | Descriptor::<R>::Preopen { .. }
+    ) {
+        return fs::read_file(process, &entry, args[1], args[2], None, memory, output).await;
+    }
     if matches!(entry.descriptor, Descriptor::<R>::Stdin { .. }) {
         let limit = args[2].min(MAX_RW_COUNT) as usize;
         if limit == 0 {
@@ -745,11 +929,21 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
         if memory.check_writable(args[1], limit).is_err() {
             return errno(EFAULT);
         }
+        let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
         let stdin_guard = process.shared.stdin_lock.lock().await;
         if process.shared.stdin_carry.lock().is_empty() {
-            match output.read_input(limit).await {
-                Ok(bytes) => *process.shared.stdin_carry.lock() = bytes,
-                Err(Denied) => return errno(EACCES),
+            if nonblock {
+                match output.try_read_input(limit) {
+                    StdinTryRead::Ready(bytes) => *process.shared.stdin_carry.lock() = bytes,
+                    StdinTryRead::Eof => return 0,
+                    StdinTryRead::WouldBlock => return errno(EAGAIN),
+                    StdinTryRead::Denied => return errno(EACCES),
+                }
+            } else {
+                match output.read_input(limit).await {
+                    Ok(bytes) => *process.shared.stdin_carry.lock() = bytes,
+                    Err(Denied) => return errno(EACCES),
+                }
             }
         }
         let bytes = {
@@ -766,21 +960,34 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
     io::read_resource::<R, M>(&entry, args, memory).await
 }
 
-async fn write<R: Resources, M: UserMemory, O: Stdio>(
-    descriptors: &spin::Mutex<Descriptors<R>>,
+async fn write<R: Resources, M: UserMemory, O: Stdio + Filesystem<R>>(
+    process: &Process<R>,
     args: [u64; 6],
-    memory: &M,
+    memory: &mut M,
     output: &mut O,
 ) -> u64 {
     // Linux takes fd as an unsigned int, discarding the register's upper bits.
-    let Some(entry) = descriptors.lock().get_entry(args[0] as u32 as i32).cloned() else {
+    let Some(entry) = process
+        .shared
+        .descriptors
+        .lock()
+        .get_entry(args[0] as u32 as i32)
+        .cloned()
+    else {
         return errno(EBADF);
     };
+    if matches!(
+        entry.descriptor,
+        Descriptor::<R>::File(_) | Descriptor::<R>::Preopen { .. }
+    ) {
+        return fs::write_file(process, &entry, args[1], args[2], None, 0, memory, output).await;
+    }
     let stream = match &entry.descriptor {
         Descriptor::<R>::Stdout => Stream::Stdout,
         Descriptor::<R>::Stderr => Stream::Stderr,
         _ => return io::write_resource::<R, M>(&entry, args, memory).await,
     };
+    let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
     // Linux MAX_RW_COUNT is INT_MAX rounded down to PAGE_SIZE (x86-64: 4096).
     let count = args[2].min(MAX_RW_COUNT);
     if args[1].checked_add(count).is_none() {
@@ -798,7 +1005,12 @@ async fn write<R: Resources, M: UserMemory, O: Stdio>(
         if memory.read(address, &mut buffer[..size]).is_err() {
             return if written == 0 { errno(EFAULT) } else { written };
         }
-        match output.write(stream, &buffer[..size]).await {
+        let step = if nonblock {
+            output.try_write(stream, &buffer[..size])
+        } else {
+            output.write(stream, &buffer[..size]).await
+        };
+        match step {
             Ok(n) => {
                 assert!(n <= size, "output returned more bytes than supplied");
                 written += n as u64;
@@ -814,6 +1026,7 @@ async fn write<R: Resources, M: UserMemory, O: Stdio>(
                         WriteError::Interrupted => EINTR,
                         WriteError::Io => EIO,
                         WriteError::Denied => EACCES,
+                        WriteError::WouldBlock => EAGAIN,
                     })
                 };
             }
@@ -846,79 +1059,6 @@ fn arch_prctl<R: Resources, M: UserMemory, T: Thread<R>>(
     }
 }
 
-async fn writev<R: Resources, M: UserMemory, O: Stdio>(
-    descriptors: &spin::Mutex<Descriptors<R>>,
-    args: [u64; 6],
-    memory: &M,
-    output: &mut O,
-) -> u64 {
-    if descriptors
-        .lock()
-        .get_entry(args[0] as u32 as i32)
-        .is_none()
-    {
-        return errno(EBADF);
-    }
-    let count = args[2] as u32;
-    // Linux UIO_MAXIOV; negative int values also fail this unsigned comparison.
-    if count > 1024 {
-        return errno(EINVAL);
-    }
-    if count == 0 {
-        return 0;
-    }
-    if args[1].checked_add(u64::from(count) * 16).is_none() {
-        return errno(EFAULT);
-    }
-    let mut vector = [0; 16];
-    // Import/validate all lengths before emitting bytes, as Linux import_iovec
-    // does.
-    for index in 0..count {
-        if memory
-            .read(args[1] + u64::from(index) * 16, &mut vector)
-            .is_err()
-        {
-            return errno(EFAULT);
-        }
-        let length = u64::from_le_bytes(vector[8..].try_into().unwrap());
-        if length > i64::MAX as u64 {
-            return errno(EINVAL);
-        }
-    }
-    let mut done = 0;
-    for index in 0..count {
-        if done == MAX_RW_COUNT {
-            break;
-        }
-        if memory
-            .read(args[1] + u64::from(index) * 16, &mut vector)
-            .is_err()
-        {
-            return if done == 0 { errno(EFAULT) } else { done };
-        }
-        let base = u64::from_le_bytes(vector[..8].try_into().unwrap());
-        let length = u64::from_le_bytes(vector[8..].try_into().unwrap()).min(MAX_RW_COUNT - done);
-        if length == 0 {
-            continue;
-        }
-        let result = write::<R, _, _>(
-            descriptors,
-            [args[0], base, length, 0, 0, 0],
-            memory,
-            output,
-        )
-        .await;
-        if (result as i64) < 0 {
-            return if done == 0 { result } else { done };
-        }
-        done += result;
-        if result < length {
-            break;
-        }
-    }
-    done
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1079,9 @@ mod tests {
         type Data = u64;
     }
 
+    struct NoFs;
+    impl Filesystem<Files> for NoFs {}
+
     fn open_file(descriptors: &Descriptors<Files>, fd: i32) -> &OpenFile<Node> {
         match descriptors.get_entry(fd).map(|entry| &entry.descriptor) {
             Some(Descriptor::<Files>::File(file)) => file,
@@ -956,15 +1099,19 @@ mod tests {
                 false,
             ))
             .expect("the table has room");
-        let duplicate = io::duplicate::<Files>(
+        let duplicate = io::duplicate::<Files, _>(
+            Abi::X86_64,
             &mut descriptors,
             Operation::Dup,
             [u64::from(fd), 0, 0, 0, 0, 0],
+            &NoFs,
         );
-        let target = io::duplicate::<Files>(
+        let target = io::duplicate::<Files, _>(
+            Abi::X86_64,
             &mut descriptors,
             Operation::Dup3,
             [u64::from(fd), 9, O_CLOEXEC, 0, 0, 0],
+            &NoFs,
         );
         assert_eq!(target, 9);
 
