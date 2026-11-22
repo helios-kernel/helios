@@ -14,9 +14,11 @@ ARG CARGO_DENY_VERSION=0.22.0
 ARG WASM_TOOLS_VERSION=1.263.0
 ARG UV_VERSION=0.13.9
 ARG ZIG_VERSION=0.13.0
+ARG GH_VERSION=2.105.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        acl \
         attr \
         btrfs-progs \
         build-essential \
@@ -76,6 +78,7 @@ RUN set -eu; \
             wasm_tools_sha="21c036c1740a0552124c79c6e2170cb61c5b016005671a6d5bc06cf642165431"; \
             uv_sha="a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5"; \
             zig_sha="d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"; \
+            gh_sha="79e7ab5db738c48777b696e374f8b428f0647debfb424f44d2f426370407fe2f"; \
             ;; \
         arm64) \
             gnu_triple="aarch64-unknown-linux-gnu"; \
@@ -87,6 +90,7 @@ RUN set -eu; \
             wasm_tools_sha="773b5e6bf957f0d93a9a337c9c5fc4c35509706301a80799f57a76fa367fd1ca"; \
             uv_sha="0797542018e541a9288855df555c8077eed06f7a47d206362030480e8ecc9f3d"; \
             zig_sha="041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556"; \
+            gh_sha="b1278c75107423d818f1937fd92cafc9e5e9b606631568f68d7fb816f5885a02"; \
             ;; \
         *) \
             echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; \
@@ -119,7 +123,11 @@ RUN set -eu; \
     mkdir -p /usr/local/zig; \
     tar -xJf "${work}/zig.tar.xz" --strip-components=1 -C /usr/local/zig; \
     ln -sf /usr/local/zig/zig /usr/local/bin/zig; \
-    chmod 0755 /usr/local/cargo/bin/cargo-nextest /usr/local/cargo/bin/cargo-deny /usr/local/bin/wasm-tools /usr/local/bin/uv /usr/local/bin/uvx; \
+    fetch "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${TARGETARCH}.tar.gz" \
+        "${work}/gh.tar.gz" "${gh_sha}"; \
+    tar -xzf "${work}/gh.tar.gz" --strip-components=2 -C /usr/local/bin \
+        "gh_${GH_VERSION}_linux_${TARGETARCH}/bin/gh"; \
+    chmod 0755 /usr/local/cargo/bin/cargo-nextest /usr/local/cargo/bin/cargo-deny /usr/local/bin/wasm-tools /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/gh; \
     rustc --version; \
     cargo --version; \
     just --version; \
@@ -132,5 +140,7 @@ RUN set -eu; \
     wasm-tools --version; \
     uv --version; \
     zig version; \
+    gh --version; \
+    setfacl --version; \
     mkfs.btrfs --version; \
     command -v mkfs.erofs
