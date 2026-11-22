@@ -145,21 +145,8 @@ impl<S: BlockSink> Transaction<S> {
         self.delalloc = saved.delalloc;
     }
 
-    pub(crate) async fn unbacked_delalloc_bytes(&self, file: FileId) -> Result<u64, WriteError> {
-        if self.delalloc.file(file.tree, file.inode).is_none() {
-            return Ok(0);
-        }
-        let root = self.roots.get(file.tree)?;
-        let nodes = self.trees.reader(&self.volume);
-        Ok(self
-            .delalloc
-            .unbacked_file_bytes(
-                &nodes,
-                root,
-                file.inode,
-                self.volume.superblock().sectorsize(),
-            )
-            .await?)
+    pub(crate) fn unbacked_delalloc_bytes(&self, file: FileId) -> u64 {
+        self.delalloc.unbacked_file_bytes(file.tree, file.inode)
     }
 
     pub(crate) async fn lookup_file(&self, name: Name<'_>) -> Result<Option<FileId>, WriteError> {

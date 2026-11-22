@@ -405,9 +405,12 @@ impl<S: BlockSink> Transaction<S> {
         let free_data = self.space.totals(DATA).1;
         let mixed = self.mixed();
         let mut position = offset - offset % sector;
+        // Cached `(window, allocated)` window from the fs tree so contiguous
+        // multi-sector writes over one extent or hole query the tree once.
+        let mut backing_window: Option<(Range<u64>, bool)> = None;
         while position < end {
             let fresh = !self.delalloc.is_dirty(tree, inode, position);
-            if fresh {
+            let unbacked = if fresh {
                 let reserved = self.delalloc.bytes()
                     + sector
                     + if mixed {
@@ -431,7 +434,20 @@ impl<S: BlockSink> Transaction<S> {
                     }
                     .into());
                 }
-            }
+                let allocated = match &backing_window {
+                    Some((window, allocated)) if window.contains(&position) => *allocated,
+                    _ => {
+                        let (window, allocated) = self
+                            .extent_backing_window(tree, inode, position, position + sector < end)
+                            .await?;
+                        backing_window = Some((window, allocated));
+                        allocated
+                    }
+                };
+                !allocated
+            } else {
+                false
+            };
             let from = offset.max(position);
             let to = end.min(position + sector);
             let covered = &data[(from - offset) as usize..(to - offset) as usize];
@@ -443,10 +459,59 @@ impl<S: BlockSink> Transaction<S> {
                 page[(from - position) as usize..(to - position) as usize].copy_from_slice(covered);
                 Arc::from(page)
             };
-            self.delalloc.insert((tree, inode), flags, position, page);
+            self.delalloc
+                .insert((tree, inode), flags, position, page, unbacked);
             position += sector;
         }
         Ok(end)
+    }
+
+    /// Returns `(window, allocated)` covering `position`: whether `position`
+    /// (and the rest of `window`) already lies on a regular or preallocated
+    /// data extent accounted in `inode.nbytes`, rather than a hole or inline
+    /// extent.
+    async fn extent_backing_window(
+        &self,
+        tree: u64,
+        inode: u64,
+        position: u64,
+        extend_hole: bool,
+    ) -> Result<(Range<u64>, bool), WriteError> {
+        let sector = u64::from(self.volume.superblock().sectorsize());
+        let root = self.roots.get(tree)?;
+        let key = Key::new(inode, item_type::EXTENT_DATA, position);
+        if let Some((found, bytes)) = self.trees.floor(&self.volume, root, key).await?
+            && found.is(inode, item_type::EXTENT_DATA)
+        {
+            let extent =
+                FileExtent::parse(found, &bytes, sector as u32).map_err(|defect| Error::Item {
+                    tree,
+                    key: found,
+                    defect,
+                })?;
+            if extent.end > position {
+                let allocated = match extent.data {
+                    ExtentData::Inline { .. } => false,
+                    ExtentData::Regular { .. } => true,
+                    ExtentData::Zero => {
+                        let body: &RawFileExtentBody =
+                            view(&bytes[HEAD_BYTES..]).expect("validated non-inline file extent");
+                        body.disk_bytenr.get() != 0
+                    }
+                };
+                return Ok((position..extent.end, allocated));
+            }
+        }
+        let hole_end = if extend_hole {
+            self.trees
+                .ceiling(&self.volume, root, key)
+                .await?
+                .filter(|(found, _)| found.is(inode, item_type::EXTENT_DATA))
+                .map_or(u64::MAX, |(found, _)| found.offset)
+        } else {
+            position.saturating_add(sector)
+        };
+        Ok((position..hole_end, false))
     }
 
     pub(super) async fn dirty_exact(

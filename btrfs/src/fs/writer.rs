@@ -701,8 +701,9 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
 
     pub async fn metadata(&self, handle: &InodeHandle) -> Result<Metadata, WriteError> {
         let mut metadata = self.checked(handle).await?;
-        let unbacked = self.inner().unbacked_delalloc_bytes(handle.id).await?;
-        metadata.nbytes = metadata.nbytes.saturating_add(unbacked);
+        metadata.nbytes = metadata
+            .nbytes
+            .saturating_add(self.inner().unbacked_delalloc_bytes(handle.id));
         Ok(metadata)
     }
 
