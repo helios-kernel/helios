@@ -553,7 +553,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.tests != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: read
