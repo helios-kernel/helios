@@ -309,7 +309,9 @@ where
         bytes: &[u8],
         deadline_nanos: u64,
     ) -> Result<u64, UdpError> {
-        self.wait_for_ipv4_udp(deadline_nanos).await?;
+        if !destination.is_loopback() {
+            self.wait_for_ipv4_udp(deadline_nanos).await?;
+        }
         self.execute_udp_send_ip(socket, IpAddress::Ipv4(destination), port, bytes)
             .await
     }

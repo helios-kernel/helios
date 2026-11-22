@@ -1441,3 +1441,126 @@ fn tcsetsf_does_not_flush_stdin_when_denied_and_flushes_when_allowed() {
         err(EAGAIN)
     );
 }
+
+#[test]
+fn sendfile_regular_file_same_fd_o_append_and_readonly_offset() {
+    const AT_FDCWD: u64 = (-100i32) as u32 as u64;
+    const O_WRONLY: u64 = 0x1;
+    const O_RDWR: u64 = 0x2;
+    const O_APPEND: u64 = 0x400;
+
+    let abi = Abi::X86_64;
+    let mut host = MockHost::default();
+    host.files.lock().unwrap().insert(1, b"abcdefgh".to_vec());
+    let mut mem = PageMem::default();
+    let mut process = Process::<MemRes>::new(abi, NonZeroU32::new(1).unwrap(), 0x40_0000);
+    let buf = 0x10_0000u64;
+    let ro_page = mem.map_anywhere(0x20_0000, PAGE, PageFlags::READ).unwrap();
+
+    // Open /mapped (O_RDWR) and seed it with "abcdefgh".
+    mem.write(buf, b"/mapped\0").unwrap();
+    let fd_in = run_call(
+        &mut process,
+        abi,
+        Operation::Openat,
+        [AT_FDCWD, buf, O_RDWR, 0o644, 0, 0],
+        &mut mem,
+        &mut host,
+    );
+    assert!(fd_in < 0x1000);
+    mem.write(buf + 64, b"abcdefgh").unwrap();
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Write,
+            [fd_in, buf + 64, 8, 0, 0, 0],
+            &mut mem,
+            &mut host,
+        ),
+        8
+    );
+    // Rewind fd_in to offset 0.
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Lseek,
+            [fd_in, 0, 0 /* SEEK_SET */, 0, 0, 0],
+            &mut mem,
+            &mut host,
+        ),
+        0
+    );
+
+    // 1. Same-fd sendfile(fd_in, fd_in, NULL, 4) must not deadlock on OpenFile::lock_position().
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Sendfile,
+            [fd_in, fd_in, 0, 4, 0, 0],
+            &mut mem,
+            &mut host,
+        ),
+        4
+    );
+
+    // 2. O_APPEND out_fd must be rejected with EINVAL.
+    let fd_append = run_call(
+        &mut process,
+        abi,
+        Operation::Openat,
+        [AT_FDCWD, buf, O_WRONLY | O_APPEND, 0o644, 0, 0],
+        &mut mem,
+        &mut host,
+    );
+    assert!(fd_append < 0x1000);
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Sendfile,
+            [fd_append, fd_in, 0, 4, 0, 0],
+            &mut mem,
+            &mut host,
+        ),
+        err(EINVAL)
+    );
+
+    // 3. Read-only offset_ptr must fail with EFAULT up front (both count == 4 and count == 0)
+    //    without mutating out_fd.
+    let before = host.files.lock().unwrap()[&1].clone();
+    let fd_out = run_call(
+        &mut process,
+        abi,
+        Operation::Openat,
+        [AT_FDCWD, buf, O_RDWR, 0o644, 0, 0],
+        &mut mem,
+        &mut host,
+    );
+    assert!(fd_out < 0x1000);
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Sendfile,
+            [fd_out, fd_in, ro_page, 4, 0, 0],
+            &mut mem,
+            &mut host,
+        ),
+        err(EFAULT)
+    );
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Sendfile,
+            [fd_out, fd_in, ro_page, 0, 0, 0],
+            &mut mem,
+            &mut host,
+        ),
+        err(EFAULT)
+    );
+    assert_eq!(host.files.lock().unwrap()[&1], before);
+}
