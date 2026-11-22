@@ -131,6 +131,9 @@ impl<R: Resources> Thread<R> for NoThread {
     fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
         Ok(())
     }
+    fn stack_pointer(&self) -> u64 {
+        0
+    }
     fn spawn_thread(&mut self, _: Process<R>, _: SpawnedThread) -> Result<(), SpawnError> {
         Err(SpawnError::Busy)
     }
@@ -392,7 +395,8 @@ fn call_op(
     };
     let mut thread = NoThread;
     match drive(dispatch(process, call, memory, &mut thread, platform)) {
-        ControlFlow::Continue(value) => value,
+        ControlFlow::Continue(helios_linux::syscall::SyscallOutcome::Return(value)) => value,
+        ControlFlow::Continue(other) => panic!("unexpected syscall outcome: {other:?}"),
         ControlFlow::Break(exit) => panic!("unexpected exit: {exit:?}"),
     }
 }

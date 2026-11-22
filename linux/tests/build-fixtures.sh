@@ -22,12 +22,13 @@ done
 # memory calls; the rest are the system-information suite, one program per
 # call group, each checking its calls' results and errors against Linux's
 # behaviour.
-for program in hello-libc args memory clock random identity limits machine priority pthreads container sockets; do
+for program in hello-libc args memory clock random identity limits machine priority pthreads signals container sockets; do
     zig cc -target "$arch-linux-musl" -static -no-pie -s -O2 -Wl,--build-id=none \
         -Ilinux/tests "linux/tests/$program.c" -o "$out/linux/$program"
 done
 cp linux/tests/check-memory.sh "$out/linux/check-memory.sh"
 cp linux/tests/check-pthreads.sh "$out/linux/check-pthreads.sh"
+cp linux/tests/check-signals.sh "$out/linux/check-signals.sh"
 # The same executables first run under Linux, establishing their ABI assertions.
 if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     "$out/linux/hello"
@@ -35,6 +36,7 @@ if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     HELIOS_PROCESS_ID=1 "$out/linux/args" 0 >/dev/null
     sh "$out/linux/check-memory.sh" "$out/linux/memory"
     sh "$out/linux/check-pthreads.sh" "$out/linux/pthreads"
+    sh "$out/linux/check-signals.sh" "$out/linux/signals"
     # Calls that need a privilege are asserted only for a caller known to
     # lack it; a privileged one may succeed or fail, and the fixture checks
     # either answer.

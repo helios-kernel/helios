@@ -385,6 +385,7 @@ impl DirStream for BootDir {
 }
 
 impl FileSystem for BootFs {
+    crate::vfs::delegate_path_handles!();
     type Write = Infallible;
     type Dir = BootDir;
 
@@ -392,7 +393,12 @@ impl FileSystem for BootFs {
         self.index.metadata(path)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        _now: u64,
+    ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
         let metadata = match self.index.metadata(path) {
             Ok(metadata) => metadata,
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
@@ -409,7 +415,10 @@ impl FileSystem for BootFs {
         if flags.contains(OpenFlags::TRUNCATE) {
             return Err(FsError::ReadOnly);
         }
-        Ok(metadata)
+        Ok(helios_hal::fs::Opened {
+            metadata,
+            handle: OwnedFsPath::from(path),
+        })
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {

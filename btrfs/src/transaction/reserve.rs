@@ -102,11 +102,20 @@ impl Units {
     /// adds one item for the inherited default ACL and one for the access
     /// ACL.
     pub(crate) const CREATE_INHERITING_ACLS: Self = Self::items(Self::CREATE.insert + 2);
+    /// `btrfs_tmpfile`: the inode item and its orphan item (no directory entry
+    /// or parent update).
+    pub(crate) const TMPFILE: Self = Self::items(2);
+    /// `btrfs_tmpfile` under a directory with a default ACL: adds the
+    /// inherited default and access ACL items.
+    pub(crate) const TMPFILE_INHERITING_ACLS: Self = Self::items(Self::TMPFILE.insert + 2);
     /// `btrfs_symlink`: a creation and its inline extent.
     pub(crate) const SYMLINK: Self = Self::items(5);
     /// `btrfs_link`: the inode and its inode ref, the dir item and dir
     /// index, and the parent inode.
     pub(crate) const LINK: Self = Self::items(5);
+    /// `btrfs_link` giving an `O_TMPFILE` its first name: `LINK` plus removing
+    /// its orphan item.
+    pub(crate) const LINK_ORPHAN: Self = Self::items(Self::LINK.insert + 1);
     /// `BTRFS_UNLINK_METADATA_UNITS` (`fs/btrfs/fs.h`): the orphan item,
     /// dir item, dir index, inode ref, inode and parent inode.
     pub(crate) const UNLINK: Self = Self {
@@ -136,10 +145,11 @@ impl Units {
     pub(crate) const CLONE: Self = Self::items(6);
 
     /// `btrfs_rename`: the old parent, the inode and its two refs, four dir
-    /// entries, the new parent when it differs, and the five items of a
-    /// replaced target, which is counted whether or not one exists.
+    /// entries, the new parent when it differs, and the unlink items of a
+    /// replaced target (including an orphan item when the target is held open),
+    /// counted whether or not one exists.
     pub(crate) const fn rename(across_directories: bool) -> Self {
-        Self::items(1 + 3 + 4 + across_directories as u64 + 5)
+        Self::items(1 + 3 + 4 + across_directories as u64 + UNLINK_ITEMS)
     }
 }
 

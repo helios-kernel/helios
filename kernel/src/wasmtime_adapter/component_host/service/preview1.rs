@@ -776,6 +776,7 @@ where
                 flags,
                 identity: None,
                 mount: None,
+                open: None,
             },
         })
     }
@@ -2572,16 +2573,22 @@ where
         if let Some(synthetic) = p1_synthetic_descriptor_stat(descriptor) {
             return Some(Ok(synthetic));
         }
-        p1_descriptor_path(Some(descriptor)).map(|path| Err(path.to_owned()))
+        p1_fs_descriptor(Some(descriptor)).cloned().map(Err)
     });
-    let path = match inspected {
+    let fs_descriptor = match inspected {
         Some(Ok((identity, stat_value))) => {
             return p1_write_filestat(caller, stat, identity, stat_value).await;
         }
-        Some(Err(path)) => path,
+        Some(Err(descriptor)) => descriptor,
         None => return Ok(p1::errno::BADF),
     };
-    let (identity, stat_value) = p1_stat_absolute_path(caller, &path, crate::Follow::No).await?;
+    let namespace = p1_namespace(caller);
+    let metadata = match wasi_fs::stat_descriptor(&namespace, &fs_descriptor).await {
+        Ok(metadata) => metadata,
+        Err(error) => return Ok(p1_errno_from_fs(error)),
+    };
+    let identity = crate::object_identity(&metadata);
+    let stat_value = wasi_fs::descriptor_stat(&metadata);
     p1_write_filestat(caller, stat, identity, stat_value).await
 }
 
@@ -2602,29 +2609,6 @@ where
     let base = p1_grant(base)?;
     let namespace = p1_namespace(caller);
     let metadata = wasi_fs::stat_at(&namespace, base, path_flags, path)
-        .await
-        .map_err(p1_errno_from_fs)?;
-    Ok((
-        crate::object_identity(&metadata),
-        wasi_fs::descriptor_stat(&metadata),
-    ))
-}
-
-/// Resolves a guest-absolute path through the store's namespace to its
-/// object identity and descriptor stat, following a final symbolic link
-/// when `follow` is set.
-pub(super) async fn p1_stat_absolute_path<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    path: &str,
-    follow: crate::Follow<'_>,
-) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let namespace = p1_namespace(caller);
-    let metadata = wasi_fs::stat_path(&namespace, path, follow)
         .await
         .map_err(p1_errno_from_fs)?;
     Ok((
@@ -2789,7 +2773,7 @@ where
         return p1::errno::BADF;
     };
     let namespace = p1_namespace(caller);
-    let current = match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
+    let current = match wasi_fs::stat_descriptor(&namespace, &descriptor).await {
         Ok(metadata) => metadata.size,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -3213,7 +3197,7 @@ async fn p1_seek_open_file<StorageImpl: crate::Storage>(
     let base = match whence {
         0 => 0,
         1 => position.get(),
-        2 => match wasi_fs::stat_path(namespace, &open.node().path, crate::Follow::No).await {
+        2 => match wasi_fs::stat_descriptor(namespace, open.node()).await {
             Ok(metadata) => metadata.size,
             Err(error) => return Err(p1_errno_from_fs(error)),
         },
@@ -5467,6 +5451,7 @@ mod tests {
             flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
+            open: None,
         }))
     }
 
@@ -5490,6 +5475,7 @@ mod tests {
                 | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         let file = block_on(wasi_fs::open_at(
             &namespace,
@@ -5553,6 +5539,7 @@ mod tests {
                 | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         block_on(wasi_fs::open_at(
             &namespace,
@@ -5582,6 +5569,7 @@ mod tests {
             flags: FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             identity: None,
             mount: None,
+            open: None,
         };
         let mut table =
             Preview1DescriptorTable::<crate::test_support::TestNetworkService>::from_entries(
@@ -5720,6 +5708,7 @@ mod tests {
             flags: p1_descriptor_flags(rights, 0),
             identity: None,
             mount: None,
+            open: None,
         };
 
         let reader = base(P1_RIGHT_FD_READDIR);
@@ -7178,6 +7167,7 @@ mod open_file_offset_tests {
                 | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         let opened = block_on(wasi_fs::open_at(
             &namespace,

@@ -302,7 +302,9 @@ impl Linux {
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
         {
-            Poll::Ready(ControlFlow::Continue(result)) => result,
+            Poll::Ready(ControlFlow::Continue(helios_linux::syscall::SyscallOutcome::Return(
+                result,
+            ))) => result,
             other => panic!("memory call did not complete with a result: {other:?}"),
         }
     }

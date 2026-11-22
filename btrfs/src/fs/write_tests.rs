@@ -1,6 +1,10 @@
 extern crate std;
 
 #[cfg(feature = "write")]
+mod fallocate;
+#[cfg(feature = "write")]
+mod orphan;
+#[cfg(feature = "write")]
 mod xattr;
 
 use alloc::collections::BTreeMap;
@@ -4353,7 +4357,7 @@ pub(super) fn filesystem_image_tree_file(
     filesystem_image_options(tree, file, options)
 }
 
-fn filesystem_image_options(
+pub(super) fn filesystem_image_options(
     tree: TreeBuilder,
     mut file: File,
     options: FormatOptions,

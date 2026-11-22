@@ -7,7 +7,9 @@ use helios_hal::fs::RenameMode;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
+use super::acl::Inherited;
 use super::ownership::{S_IFDIR, S_IFMT, S_ISGID};
+use super::reflink::FileId;
 use crate::csum::{inode_ref_hash, name_hash};
 use crate::items::{INODE_APPEND, INODE_IMMUTABLE, RecordKind, dir_index_record, dir_records};
 use crate::ondisk::{
@@ -249,20 +251,20 @@ impl<S: BlockSink> Transaction<S> {
         self.put_inode(tree, inode, raw).await
     }
 
-    pub(crate) async fn create_node(
+    async fn prepare_inode(
         &mut self,
-        name: Name<'_>,
+        tree: u64,
+        parent: u64,
         attributes: Attributes,
         when: Timestamp,
-    ) -> Result<u64, WriteError> {
-        validate_name(name.bytes)?;
-        let (_, parent) = self.inode_item(name.tree, name.parent).await?;
-        if parent.kind != FileKind::Directory {
+    ) -> Result<(u64, RawInodeItem, Metadata, Inherited), WriteError> {
+        let (_, parent_meta) = self.inode_item(tree, parent).await?;
+        if parent_meta.kind != FileKind::Directory {
             return Err(Error::WrongKind {
-                tree: name.tree,
-                inode: name.parent,
+                tree,
+                inode: parent,
                 expected: FileKind::Directory,
-                found: parent.kind,
+                found: parent_meta.kind,
             }
             .into());
         }
@@ -273,17 +275,16 @@ impl<S: BlockSink> Transaction<S> {
         // `S_ISGID` as well.
         let mut mode = attributes.mode;
         let inherited = self
-            .inherit_acls(name.tree, name.parent, &mut mode, attributes.umask)
+            .inherit_acls(tree, parent, &mut mode, attributes.umask)
             .await?;
-        let gid = if parent.permissions & S_ISGID != 0 {
+        let gid = if parent_meta.permissions & S_ISGID != 0 {
             if mode & S_IFMT == S_IFDIR {
                 mode |= S_ISGID;
             }
-            parent.gid
+            parent_meta.gid
         } else {
             attributes.gid
         };
-        let tree = name.tree;
         let next = if let Some(last) = self.inode_high_water.get(&tree) {
             last.checked_add(1)
         } else {
@@ -321,8 +322,42 @@ impl<S: BlockSink> Transaction<S> {
             key: Key::new(inode, item_type::INODE_ITEM, 0),
             defect,
         })?;
+        Ok((inode, raw, metadata, inherited))
+    }
+
+    pub(crate) async fn create_node(
+        &mut self,
+        name: Name<'_>,
+        attributes: Attributes,
+        when: Timestamp,
+    ) -> Result<u64, WriteError> {
+        validate_name(name.bytes)?;
+        let (inode, raw, metadata, inherited) = self
+            .prepare_inode(name.tree, name.parent, attributes, when)
+            .await?;
         self.attach(name, inode, raw, metadata.kind, when).await?;
+        self.store_inherited(name.tree, inode, inherited).await?;
+        Ok(inode)
+    }
+
+    /// Creates an unnamed regular file inode (`O_TMPFILE`) in `tree` under
+    /// `parent`: inherits ACLs and `S_ISGID` group ownership from `parent`,
+    /// leaves `parent` untouched, writes `nlink = 0` with an orphan item, and
+    /// opens one handle on the inode.
+    pub(crate) async fn create_tmpfile(
+        &mut self,
+        tree: u64,
+        parent: u64,
+        attributes: Attributes,
+        linkable: bool,
+        when: Timestamp,
+    ) -> Result<u64, WriteError> {
+        let (inode, raw, _, inherited) = self.prepare_inode(tree, parent, attributes, when).await?;
+        self.put_inode(tree, inode, raw).await?;
         self.store_inherited(tree, inode, inherited).await?;
+        self.add_orphan(tree, inode).await?;
+        self.open
+            .insert_tmpfile(FileId { tree, inode }, raw.generation.get(), linkable);
         Ok(inode)
     }
 
@@ -336,7 +371,27 @@ impl<S: BlockSink> Transaction<S> {
         if metadata.kind == FileKind::Directory {
             return Err(WriteError::DirectoryLink);
         }
-        self.attach(name, inode, raw, metadata.kind, when).await
+        let id = FileId {
+            tree: name.tree,
+            inode,
+        };
+        let linking_tmpfile = if raw.nlink.get() == 0 {
+            if !self.open.is_linkable(id) {
+                return Err(WriteError::UnlinkedInode {
+                    tree: name.tree,
+                    inode,
+                });
+            }
+            true
+        } else {
+            false
+        };
+        self.attach(name, inode, raw, metadata.kind, when).await?;
+        if linking_tmpfile {
+            self.remove_orphan(name.tree, inode).await?;
+            self.open.clear_orphan_and_linkable(id);
+        }
+        Ok(())
     }
 
     pub(crate) async fn symlink(
@@ -843,9 +898,14 @@ impl<S: BlockSink> Transaction<S> {
             .await?;
         self.roots.set(root)?;
         raw.nlink.set(raw.nlink.get() - 1);
-        if raw.nlink.get() == 0 {
+        let id = FileId { tree, inode };
+        if raw.nlink.get() == 0 && !self.open.is_open(id) {
             self.remove_inode(tree, inode).await?;
         } else {
+            if raw.nlink.get() == 0 {
+                self.add_orphan(tree, inode).await?;
+                self.open.mark_orphaned(id);
+            }
             raw.transid.set(self.trees.generation());
             raw.sequence.set(raw.sequence.get().wrapping_add(1));
             raw.ctime = timestamp;
@@ -920,6 +980,12 @@ impl<S: BlockSink> Transaction<S> {
                 found: metadata.kind,
             }
             .into());
+        }
+        if metadata.nlink == 0 {
+            return Err(WriteError::UnlinkedInode {
+                tree,
+                inode: parent,
+            });
         }
         let root = self.roots.get(tree)?;
         let hash_key = Key::new(parent, item_type::DIR_ITEM, name_hash(name));

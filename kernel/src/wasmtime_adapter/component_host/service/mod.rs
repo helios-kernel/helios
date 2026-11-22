@@ -3265,6 +3265,7 @@ mod tests {
             flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
+            open: None,
         };
         let work = FsDescriptor {
             path: "/work".into(),
@@ -3272,6 +3273,7 @@ mod tests {
             flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
+            open: None,
         };
 
         assert_eq!(
@@ -3320,6 +3322,7 @@ mod tests {
             flags: FsDescriptorFlags::WRITE,
             identity: None,
             mount: None,
+            open: None,
         }));
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
@@ -3540,6 +3543,7 @@ mod tests {
             flags: FsDescriptorFlags::WRITE,
             identity: None,
             mount: None,
+            open: None,
         }));
         assert_eq!(
             table.insert_entry_at(1, Preview1DescriptorEntry::new(file, false)),
@@ -3677,6 +3681,7 @@ mod tests {
             flags: FsDescriptorFlags::WRITE,
             identity: None,
             mount: None,
+            open: None,
         }));
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
@@ -3714,6 +3719,7 @@ mod tests {
             flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
+            open: None,
         }));
         let entry = Preview1DescriptorEntry::new(file, false);
         entry.set_fdflags(P1_FDFLAG_NONBLOCK);
@@ -3808,6 +3814,7 @@ mod tests {
                 flags: FsDescriptorFlags::READ,
                 identity: None,
                 mount: None,
+                open: None,
             },
         };
 
@@ -3936,6 +3943,7 @@ mod tests {
             flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
+            open: None,
         }));
         let retained = Preview1Descriptor::File(OpenFile::new(FsDescriptor {
             path: "/retained".into(),
@@ -3943,6 +3951,7 @@ mod tests {
             flags: FsDescriptorFlags::READ,
             identity: None,
             mount: None,
+            open: None,
         }));
         let table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![
             Some(Preview1DescriptorEntry::new(
@@ -3979,6 +3988,7 @@ mod tests {
                             flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
+                            open: None,
                         },
                     },
                     false,
@@ -4008,6 +4018,7 @@ mod tests {
                 flags: FsDescriptorFlags::READ,
                 identity: None,
                 mount: None,
+                open: None,
             },
         };
         let mut authority = ProcessAuthority::empty();
@@ -4051,6 +4062,7 @@ mod tests {
                             flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
+                            open: None,
                         },
                     },
                     false,
@@ -4065,6 +4077,7 @@ mod tests {
                     flags: FsDescriptorFlags::READ,
                     identity: None,
                     mount: None,
+                    open: None,
                 },
             }),
         };
@@ -4089,6 +4102,7 @@ mod tests {
                             flags: FsDescriptorFlags::READ,
                             identity: None,
                             mount: None,
+                            open: None,
                         },
                     },
                     false,

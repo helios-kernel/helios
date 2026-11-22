@@ -45,6 +45,7 @@ fn root() -> FsDescriptor {
             | FsDescriptorFlags::MUTATE_DIRECTORY,
         identity: None,
         mount: None,
+        open: None,
     }
 }
 
@@ -1657,6 +1658,7 @@ fn reads_need_the_read_right_on_every_backing() {
     let in_memory = create_file(&namespace, "memory/file", SECRET.as_bytes());
     let on_host = FsDescriptor {
         path: String::from("/mnt/file"),
+        open: None,
         ..on_root.clone()
     };
 

@@ -13,6 +13,7 @@ use helios_unix::{
     FUTEX_BITSET_MATCH_ANY, FutexKey, FutexScope, FutexTable, GuestAddress, ProcessMemoryIdentity,
 };
 
+use super::signal::WaitOutcome;
 use super::*;
 
 // include/uapi/linux/futex.h.
@@ -88,13 +89,13 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
     args: [u64; 6],
     memory: &M,
     output: &O,
-) -> u64 {
+) -> SyscallOutcome {
     let op = args[1] as u32;
     let private = op & FUTEX_PRIVATE_FLAG != 0;
     let realtime = op & FUTEX_CLOCK_REALTIME != 0;
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     if realtime && !matches!(cmd, FUTEX_WAIT | FUTEX_WAIT_BITSET) {
-        return errno(ENOSYS);
+        return SyscallOutcome::Return(errno(ENOSYS));
     }
     let abi = process.shared.abi;
     let memory_id = process.shared.memory_id;
@@ -107,7 +108,7 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
                     Ok((sec, nsec)) => {
                         Some(sec.saturating_mul(NANOS_PER_SECOND).saturating_add(nsec))
                     }
-                    Err(err) => return errno(err),
+                    Err(err) => return SyscallOutcome::Return(errno(err)),
                 }
             } else {
                 None
@@ -118,30 +119,30 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
                 args[5] as u32
             };
             if bitset == 0 {
-                return errno(EINVAL);
+                return SyscallOutcome::Return(errno(EINVAL));
             }
             let key = match futex_key(abi, memory_id, args[0], private, memory) {
                 Ok(key) => key,
-                Err(err) => return errno(err),
+                Err(err) => return SyscallOutcome::Return(errno(err)),
             };
             // Arm the wait before loading `*uaddr`, so no wake between the
             // load and parking can be missed.
             let mut registration = table.prepare_wait_bitset(key, bitset);
             let Ok(current) = memory.atomic_load_u32(args[0]) else {
-                return errno(EFAULT);
+                return SyscallOutcome::Return(errno(EFAULT));
             };
             if current != args[2] as u32 {
-                return errno(EAGAIN);
+                return SyscallOutcome::Return(errno(EAGAIN));
             }
             let deadline = match timeout {
                 None => None,
                 Some(duration) if cmd == FUTEX_WAIT => {
                     if duration == 0 {
-                        return if registration.is_released() {
+                        return SyscallOutcome::Return(if registration.is_released() {
                             0
                         } else {
                             errno(ETIMEDOUT)
-                        };
+                        });
                     }
                     Some(output.now_nanos().saturating_add(duration))
                 }
@@ -152,39 +153,53 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
                         output.now_nanos()
                     };
                     if target <= now {
-                        return if registration.is_released() {
+                        return SyscallOutcome::Return(if registration.is_released() {
                             0
                         } else {
                             errno(ETIMEDOUT)
-                        };
+                        });
                     }
                     Some(output.now_nanos().saturating_add(target - now))
                 }
             };
             match deadline {
-                None => {
-                    registration.released().await;
-                    0
-                }
+                None => match process.signals.interruptible(registration.released()).await {
+                    WaitOutcome::Ready(()) => SyscallOutcome::Return(0),
+                    WaitOutcome::Interrupted => {
+                        if registration.is_released() {
+                            SyscallOutcome::Return(0)
+                        } else {
+                            // `kernel/futex/waitwake.c`: untimed FUTEX_WAIT
+                            // restarts when `SA_RESTART` is set.
+                            SyscallOutcome::RestartSys
+                        }
+                    }
+                },
                 Some(end) => {
-                    {
+                    let interrupted = {
                         let mut wake = core::pin::pin!(registration.released());
                         let mut sleep = core::pin::pin!(output.sleep_until(end));
+                        let mut sig = core::pin::pin!(process.signals.wait_deliverable());
                         poll_fn(|cx| {
                             if wake.as_mut().poll(cx).is_ready()
                                 || sleep.as_mut().poll(cx).is_ready()
                             {
-                                Poll::Ready(())
-                            } else {
-                                Poll::Pending
+                                return Poll::Ready(false);
                             }
+                            if sig.as_mut().poll(cx).is_ready() {
+                                return Poll::Ready(true);
+                            }
+                            Poll::Pending
                         })
-                        .await;
-                    }
+                        .await
+                    };
                     if registration.is_released() {
-                        0
+                        SyscallOutcome::Return(0)
+                    } else if interrupted {
+                        // `signal(7)`: timed FUTEX_WAIT returns EINTR on handler.
+                        SyscallOutcome::RestartNoHand
                     } else {
-                        errno(ETIMEDOUT)
+                        SyscallOutcome::Return(errno(ETIMEDOUT))
                     }
                 }
             }
@@ -196,31 +211,31 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
                 args[5] as u32
             };
             if bitset == 0 {
-                return errno(EINVAL);
+                return SyscallOutcome::Return(errno(EINVAL));
             }
             let key = match futex_key(abi, memory_id, args[0], private, memory) {
                 Ok(key) => key,
-                Err(err) => return errno(err),
+                Err(err) => return SyscallOutcome::Return(errno(err)),
             };
             let nr_wake = args[2] as u32 as i32;
             if nr_wake <= 0 {
-                return 0;
+                return SyscallOutcome::Return(0);
             }
-            table.wake_bitset(key, nr_wake as usize, bitset) as u64
+            SyscallOutcome::Return(table.wake_bitset(key, nr_wake as usize, bitset) as u64)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             let nr_wake = args[2] as u32 as i32;
             let nr_requeue = args[3] as u32 as i32;
             if nr_wake < 0 || nr_requeue < 0 {
-                return errno(EINVAL);
+                return SyscallOutcome::Return(errno(EINVAL));
             }
             let source = match futex_key(abi, memory_id, args[0], private, memory) {
                 Ok(key) => key,
-                Err(err) => return errno(err),
+                Err(err) => return SyscallOutcome::Return(errno(err)),
             };
             let target = match futex_key(abi, memory_id, args[4], private, memory) {
                 Ok(key) => key,
-                Err(err) => return errno(err),
+                Err(err) => return SyscallOutcome::Return(errno(err)),
             };
             let expected = (cmd == FUTEX_CMP_REQUEUE).then_some(args[5] as u32);
             let outcome = table.requeue_if(
@@ -242,12 +257,12 @@ pub(super) async fn futex<R: Resources, M: UserMemory, O: Clock + System>(
             // Both `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` delegate to
             // `futex_requeue` (`kernel/futex/requeue.c`), which returns
             // `task_count` (woken + requeued).
-            match outcome {
+            SyscallOutcome::Return(match outcome {
                 Ok(outcome) => (outcome.woken + outcome.requeued) as u64,
                 Err(err) => errno(err),
-            }
+            })
         }
-        _ => errno(ENOSYS),
+        _ => SyscallOutcome::Return(errno(ENOSYS)),
     }
 }
 

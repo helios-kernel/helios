@@ -18,9 +18,27 @@ use helios_hal::vmm::PageFlags;
 use helios_linux::abi::{Abi, Operation};
 use helios_linux::syscall::{
     Call, Clock, Denied, Exit, MapError, MemoryFault, MemoryTotals, NoBacking, Process, Region,
-    SpawnError, SpawnedThread, Start, Stdio, Stream, System, Thread, UserMemory, VirtualMemory,
-    WriteError, dispatch,
+    SpawnError, SpawnedThread, Start, Stdio, Stream, SyscallOutcome, System, Thread, UserMemory,
+    VirtualMemory, WriteError, dispatch as raw_dispatch,
 };
+
+async fn dispatch<
+    M: VirtualMemory,
+    T: Thread<NoBacking>,
+    O: Stdio + Clock + System + helios_linux::syscall::Network<helios_unix::NoNetwork>,
+>(
+    process: &mut Process<NoBacking>,
+    call: Call,
+    memory: &mut M,
+    thread: &mut T,
+    output: &mut O,
+) -> ControlFlow<Exit, u64> {
+    match raw_dispatch(process, call, memory, thread, output).await {
+        ControlFlow::Continue(SyscallOutcome::Return(value)) => ControlFlow::Continue(value),
+        ControlFlow::Continue(other) => panic!("unexpected syscall outcome: {other:?}"),
+        ControlFlow::Break(exit) => ControlFlow::Break(exit),
+    }
+}
 
 const ABIS: [Abi; 2] = [Abi::X86_64, Abi::Aarch64];
 const PROGRAM_BREAK: u64 = 0x40_0000;
