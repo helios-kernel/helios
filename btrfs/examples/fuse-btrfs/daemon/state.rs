@@ -161,6 +161,10 @@ pub struct State<S = Device, B = DeviceBacking> {
     open_files: HashMap<u64, OpenFileEntry>,
     /// Total open file and directory handles per FUSE inode number.
     open_counts: HashMap<INodeNo, usize>,
+    /// Non-root directories retained for the lifetime of their kernel lookup
+    /// count (`FUSE_LOOKUP`/`FUSE_MKDIR` .. `FUSE_FORGET`), keeping unlinked
+    /// working directories (`chdir`, `O_PATH`) accessible until forgotten.
+    retained_dirs: HashMap<INodeNo, (Identity, Option<InodeHandle>)>,
 }
 
 /// The host's memory, which holds the writer's dirty data.
@@ -288,6 +292,7 @@ impl State<Device, DeviceBacking> {
             next_fh: 1,
             open_files: HashMap::new(),
             open_counts: HashMap::new(),
+            retained_dirs: HashMap::new(),
         })
     }
 
@@ -343,7 +348,13 @@ impl State<Device, DeviceBacking> {
                     .filter(|(_, entry)| entry.handle.is_none())
                     .map(|(&fh, entry)| (fh, entry.identity))
                     .collect();
-                let (resolved, attached_files, attached_dirs) = {
+                let retained_dir_ids: Vec<(INodeNo, Identity)> = self
+                    .retained_dirs
+                    .iter()
+                    .filter(|(_, (_, handle))| handle.is_none())
+                    .map(|(&ino, &(identity, _))| (ino, identity))
+                    .collect();
+                let (resolved, attached_files, attached_dirs, attached_retained_dirs) = {
                     let mut transaction =
                         writer.join().await.map_err(|error| write_errno(&error))?;
                     let mut resolved = Vec::with_capacity(pending.len());
@@ -392,7 +403,26 @@ impl State<Device, DeviceBacking> {
                             attached_dirs.push((fh, handle));
                         }
                     }
-                    (resolved, attached_files, attached_dirs)
+                    let mut attached_retained_dirs = Vec::with_capacity(retained_dir_ids.len());
+                    for (ino, identity) in retained_dir_ids {
+                        if let Some(handle) = transaction
+                            .inode(identity.tree, identity.number)
+                            .await
+                            .map_err(|error| write_errno(&error))?
+                        {
+                            transaction
+                                .open_inode(&handle)
+                                .await
+                                .map_err(|error| write_errno(&error))?;
+                            attached_retained_dirs.push((ino, handle));
+                        }
+                    }
+                    (
+                        resolved,
+                        attached_files,
+                        attached_dirs,
+                        attached_retained_dirs,
+                    )
                 };
                 for (ino, handle) in resolved {
                     self.inodes.attach_handle(ino, handle);
@@ -405,6 +435,11 @@ impl State<Device, DeviceBacking> {
                 for (fh, handle) in attached_dirs {
                     if let Some(entry) = self.open_dirs.get_mut(&fh) {
                         entry.handle = Some(handle);
+                    }
+                }
+                for (ino, handle) in attached_retained_dirs {
+                    if let Some((_, slot)) = self.retained_dirs.get_mut(&ino) {
+                        *slot = Some(handle);
                     }
                 }
                 self.storage = Storage::Writable(Box::new(writer));
@@ -451,6 +486,7 @@ impl<S: BlockSink, B> State<S, B> {
             next_fh: 1,
             open_files: HashMap::new(),
             open_counts: HashMap::new(),
+            retained_dirs: HashMap::new(),
         })
     }
 
@@ -600,11 +636,31 @@ impl<S: BlockSink, B> State<S, B> {
     /// destroyed so late control-socket requests fail with `ENODEV`.
     pub async fn destroy(&mut self) -> Result<(), Errno> {
         self.destroyed = true;
+        // Release cached directory lookups whose `FUSE_FORGET` is skipped on
+        // unmount so any unlinked directory orphan is deleted before commit.
+        let retained: Vec<InodeHandle> = self
+            .retained_dirs
+            .drain()
+            .filter_map(|(_, (_, handle))| handle)
+            .collect();
+        for handle in retained {
+            self.release_writer_handle(&handle).await;
+        }
         self.sync().await
     }
 
-    pub fn forget(&mut self, ino: INodeNo, count: u64) {
+    /// Drops `count` kernel lookups on `ino`, releasing any directory orphan
+    /// retained across lookups once `nlookup` reaches zero. Returns `true` if
+    /// doing so cleared the last `remount,ro` blocker.
+    pub async fn forget(&mut self, ino: INodeNo, count: u64) -> bool {
+        let was_blocking = self.blocks_read_only_remount();
         self.inodes.forget(ino, count);
+        if self.inodes.generation(ino).is_none()
+            && let Some((_, Some(handle))) = self.retained_dirs.remove(&ino)
+        {
+            self.release_writer_handle(&handle).await;
+        }
+        was_blocking && !self.blocks_read_only_remount()
     }
 
     fn snapshot(&self) -> Result<Snapshot<S>, Errno> {
@@ -643,7 +699,9 @@ impl<S: BlockSink, B> State<S, B> {
             Err(error) => return Err(read_errno(&error)),
         };
         if inode.metadata().generation != generation
-            || (inode.metadata().nlink == 0 && !self.is_open(ino))
+            || (inode.metadata().nlink == 0
+                && !self.is_open(ino)
+                && !self.retained_dirs.contains_key(&ino))
         {
             return Err(Errno::ESTALE);
         }
@@ -692,6 +750,29 @@ impl<S: BlockSink, B> State<S, B> {
         Ok(())
     }
 
+    /// Ensures a non-root directory inode cached in the kernel stays retained
+    /// on the writer until `FUSE_FORGET`, so an active `cwd` or `O_PATH` fd on
+    /// an unlinked directory can still stat/chdir out (`generic/011`).
+    async fn retain_dir_lookup(&mut self, ino: INodeNo, identity: Identity) -> Result<(), Errno> {
+        if ino == INodeNo::ROOT || self.retained_dirs.contains_key(&ino) {
+            return Ok(());
+        }
+        let handle = match &mut self.storage {
+            Storage::ReadOnly(_) => None,
+            Storage::Writable(writer) => {
+                let handle = self.inodes.handle(ino)?;
+                let mut transaction = writer.join().await.map_err(|error| write_errno(&error))?;
+                transaction
+                    .open_inode(&handle)
+                    .await
+                    .map_err(|error| write_errno(&error))?;
+                Some(handle)
+            }
+        };
+        self.retained_dirs.insert(ino, (identity, handle));
+        Ok(())
+    }
+
     /// The attributes and generation of `identity` as the writer sees it,
     /// recorded as one more lookup of it.
     async fn entry_of(
@@ -710,6 +791,9 @@ impl<S: BlockSink, B> State<S, B> {
         let ino = self.inodes.encode(identity)?;
         let generation = inode.metadata().generation;
         self.inodes.record(ino, generation, handle);
+        if inode.kind() == FileKind::Directory {
+            self.retain_dir_lookup(ino, identity).await?;
+        }
         Ok((
             attr(ino, inode.metadata(), &snapshot),
             fuse_generation(ino, generation),
@@ -738,6 +822,9 @@ impl<S: BlockSink, B> State<S, B> {
             }
         };
         self.inodes.record(ino, generation, handle);
+        if inode.kind() == FileKind::Directory {
+            self.retain_dir_lookup(ino, identity).await?;
+        }
         Ok((
             attr(ino, inode.metadata(), snapshot),
             fuse_generation(ino, generation),
@@ -1678,8 +1765,8 @@ mod tests {
 
             // Drop both entries via FUSE_FORGET (drop_caches) and resolve via
             // FUSE_LOOKUP(nodeid, ".").
-            state.forget(file_attr.ino, 1);
-            state.forget(dir_attr.ino, 1);
+            state.forget(file_attr.ino, 1).await;
+            state.forget(dir_attr.ino, 1).await;
             assert_eq!(state.getattr(file_attr.ino).await, Err(Errno::ESTALE));
 
             let (resolved_file, resolved_file_gen) =
@@ -1889,7 +1976,7 @@ mod tests {
                 state.lookup(file.ino, OsStr::new(".")).await,
                 Err(Errno::ESTALE)
             );
-            state.forget(file.ino, 1);
+            state.forget(file.ino, 1).await;
             assert_eq!(
                 state.lookup(file.ino, OsStr::new(".")).await,
                 Err(Errno::ESTALE)
@@ -1937,7 +2024,7 @@ mod tests {
             // If a stale entry for the old generation is still cached in
             // `inodes`, lookup(nodeid, ".") rejects it directly with ESTALE.
             let stale_handle = remounted.inodes.handle(file.ino).unwrap();
-            remounted.forget(file.ino, 1);
+            remounted.forget(file.ino, 1).await;
             remounted
                 .inodes
                 .record(file.ino, old_gen.0, Some(stale_handle));
@@ -1966,7 +2053,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_ne!(sub.ino, INodeNo::ROOT);
-            state.forget(sub.ino, 1);
+            state.forget(sub.ino, 1).await;
             drop(state);
 
             let mut remounted = open_state(TempDisk::from_file(backing));
@@ -2259,7 +2346,31 @@ mod tests {
             assert_eq!(state.getattr(dir2.ino).await.unwrap().nlink, 0);
             assert_eq!(state.getattr(dir1.ino).await.unwrap().nlink, 1);
             assert!(state.has_open_orphans());
+            // Creating entries inside an unlinked directory fails with ENOENT.
+            assert_eq!(
+                state
+                    .create(
+                        dir2.ino,
+                        OsStr::new("child"),
+                        Node::File,
+                        0o644,
+                        test_owner(),
+                        test_time(),
+                    )
+                    .await,
+                Err(Errno::ENOENT)
+            );
+            // After releasedir, the cached lookup (e.g. a process cwd) still
+            // allows getattr while export `.` lookup returns ESTALE.
             state.releasedir(dir_fh).await;
+            assert_eq!(state.getattr(dir2.ino).await.unwrap().nlink, 0);
+            assert_eq!(
+                state.lookup(dir2.ino, OsStr::new(".")).await,
+                Err(Errno::ESTALE)
+            );
+            assert!(state.has_open_orphans());
+            // Final forget deletes the unlinked directory and its orphan item.
+            state.forget(dir2.ino, 1).await;
             assert!(!state.has_open_orphans());
             assert_eq!(state.getattr(dir2.ino).await, Err(Errno::ESTALE));
 

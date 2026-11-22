@@ -101,7 +101,9 @@ impl Filesystem for Daemon {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.run(|state| state.forget(ino, nlookup));
+        if self.run(|state| block_on(state.forget(ino, nlookup))) {
+            self.shared.writable_released.notify_all();
+        }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {

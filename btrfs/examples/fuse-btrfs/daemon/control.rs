@@ -421,7 +421,7 @@ mod tests {
         // handles before `remount,rw`, including via export-handle `.` lookup.
         let (dir_attr, _) = block_on(state.lookup(INodeNo::ROOT, OsStr::new("existing"))).unwrap();
         let (file_attr, _) = block_on(state.lookup(dir_attr.ino, OsStr::new("pre.txt"))).unwrap();
-        state.forget(file_attr.ino, 1);
+        block_on(state.forget(file_attr.ino, 1));
         let (reopened_attr, _) = block_on(state.lookup(file_attr.ino, OsStr::new("."))).unwrap();
         assert_eq!(reopened_attr.ino, file_attr.ino);
         assert_eq!(
