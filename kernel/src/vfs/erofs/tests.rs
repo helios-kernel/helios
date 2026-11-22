@@ -239,15 +239,15 @@ fn assert_refusals(fs: &ErofsFs<MemoryDisk>) {
         Err(FsError::NotDirectory)
     );
     assert_eq!(
-        block_on(fs.open(path("new.txt"), OpenFlags::CREATE, 0)),
+        block_on(fs.open(path("new.txt"), OpenFlags::CREATE, 0)).map(drop),
         Err(FsError::ReadOnly)
     );
     assert_eq!(
-        block_on(fs.open(path("hello.txt"), OpenFlags::TRUNCATE, 0)),
+        block_on(fs.open(path("hello.txt"), OpenFlags::TRUNCATE, 0)).map(drop),
         Err(FsError::ReadOnly)
     );
     assert_eq!(
-        block_on(fs.open(path("hello.txt"), OpenFlags::DIRECTORY, 0)),
+        block_on(fs.open(path("hello.txt"), OpenFlags::DIRECTORY, 0)).map(drop),
         Err(FsError::NotDirectory)
     );
     assert_eq!(

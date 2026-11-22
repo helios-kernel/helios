@@ -46,9 +46,11 @@ use super::{Filesystem, Snapshot};
 use crate::accounting::Allocation;
 use crate::compress::policy::Compressor;
 use crate::retirement::Retirements;
+use crate::roots::Roots;
 use crate::source::BlockSink;
 use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
+use crate::transaction::orphan::{OpenInodes, ReleaseOutcome, committed_orphans};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
 use crate::transaction::replay::PendingLog;
 use crate::transaction::reserve::Units;
@@ -202,6 +204,9 @@ pub struct Writer<S, U> {
     allocation: Allocation,
     retirements: Retirements,
     running: Option<Running<S>>,
+    /// Open-handle accounting carried across transactions while `running` is
+    /// `None`; mirrored into `running.inner.open` while a transaction runs.
+    open: OpenInodes,
     mount: Arc<MountIdentity>,
     /// What every commit needs, the ones a mutation forces included.
     uuids: U,
@@ -297,6 +302,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             allocation,
             retirements: Retirements::default(),
             running: None,
+            open: OpenInodes::new(),
             mount: Arc::new(MountIdentity),
             uuids,
             compressor,
@@ -306,6 +312,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         if let Some(log) = log {
             writer.replay(log, now).await?;
         }
+        writer.cleanup_orphans().await?;
         Ok(writer)
     }
 
@@ -323,6 +330,61 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         running.inner.replay_log(log, now).await?;
         running.inner.check_commit_hold(Units::default())?;
         self.commit_running().await
+    }
+
+    /// Processes orphan items left behind by a crash across every live
+    /// writable subvolume before the writable mount is published, as Linux's
+    /// `btrfs_cleanup_fs_roots` and `btrfs_orphan_cleanup`. Does nothing and
+    /// writes no generation when no subvolume carries an orphan item.
+    async fn cleanup_orphans(&mut self) -> Result<(), WriteError> {
+        let pending: Vec<(u64, Vec<u64>)> = {
+            let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
+            let roots = Roots::load(&committed.volume, committed.snapshot.root_tree).await?;
+            let mut pending = Vec::new();
+            for tree in roots.writable_subvolumes() {
+                let root = roots.get(tree)?;
+                let orphans = committed_orphans(&committed.volume, root).await?;
+                if !orphans.is_empty() {
+                    pending.push((tree, orphans));
+                }
+            }
+            pending
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.start().await?;
+        for (tree, orphans) in pending {
+            for inode in orphans {
+                if self.running.is_none() {
+                    self.start().await?;
+                }
+                let running = self
+                    .running
+                    .as_mut()
+                    .expect("a transaction runs once started");
+                running.inner.prepare_mutation().await?;
+                running.inner.cleanup_orphan(tree, inode).await?;
+                if running.inner.dirty_metadata_bytes() >= DEFAULT_DIRTY_METADATA_LIMIT {
+                    running.inner.check_commit_hold(Units::default())?;
+                    self.commit_running().await?;
+                }
+            }
+        }
+        if let Some(running) = self.running.as_mut() {
+            running.inner.check_commit_hold(Units::default())?;
+            self.commit_running().await?;
+        }
+        Ok(())
+    }
+
+    /// Whether any open handle currently keeps an unlinked or `O_TMPFILE`
+    /// orphan inode alive on this mount.
+    pub fn has_open_orphans(&self) -> bool {
+        match &self.running {
+            Some(running) => running.inner.open.has_orphans(),
+            None => self.open.has_orphans(),
+        }
     }
 
     /// The mount's `max_inline` limit, in bytes.
@@ -433,7 +495,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
         let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
         if self.running.is_none() {
             let (volume, pin) = (committed.volume.clone(), committed.snapshot.clone());
-            let inner = Transaction::new(
+            let mut inner = Transaction::new(
                 volume,
                 pin,
                 &mut self.retirements,
@@ -441,6 +503,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
                 self.compressor.algorithm().is_some(),
             )
             .await?;
+            inner.open = self.open.clone();
             self.running = Some(Running {
                 inner,
                 view: None,
@@ -466,8 +529,11 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
                 && running.inner.dirty_metadata_bytes() == 0
                 && running.inner.dirty_data_bytes() == 0
         }) {
-            // A clean transaction holds nothing the last commit did not.
-            self.running = None;
+            // A clean transaction holds nothing the last commit did not,
+            // except any in-memory open-handle accounting updates.
+            if let Some(running) = self.running.take() {
+                self.open = running.inner.open;
+            }
             return Ok(());
         }
         self.commit_running().await
@@ -1205,6 +1271,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             .running
             .take()
             .expect("the caller commits a running transaction");
+        self.open = running.inner.open.clone();
         let uuids = &mut self.uuids;
         let mut committed = running
             .inner
@@ -1770,13 +1837,107 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         Ok(handle)
     }
 
+    /// Records one more open handle holding `file` alive across unlinks.
+    /// While at least one open handle exists, removing the last link leaves
+    /// the inode and an on-disk orphan item in place until the final
+    /// [`Self::release_inode`].
+    pub async fn open_inode(&mut self, file: &InodeHandle) -> Result<(), WriteError> {
+        self.checked(file).await?;
+        self.inner_mut().open.retain(file.id, file.generation)
+    }
+
+    /// Creates an unnamed regular file inode (`O_TMPFILE`) in `parent`'s
+    /// subvolume, inheriting default ACLs and `S_ISGID` group ownership from
+    /// `parent` without touching `parent`'s entries or timestamps. Records an
+    /// on-disk orphan item and opens one handle on the returned inode; when
+    /// `linkable` is true (no `O_EXCL`), [`Self::hard_link`] may later give it
+    /// a name and remove its orphan item.
+    pub async fn create_tmpfile(
+        &mut self,
+        parent: &InodeHandle,
+        attributes: Attributes,
+        linkable: bool,
+        when: Timestamp,
+    ) -> Result<InodeHandle, WriteError> {
+        let parent_meta = self.checked(parent).await?;
+        if parent_meta.kind != FileKind::Directory {
+            return Err(Error::WrongKind {
+                tree: parent.tree(),
+                inode: parent.number(),
+                expected: FileKind::Directory,
+                found: parent_meta.kind,
+            }
+            .into());
+        }
+        let raw_attributes = attributes.raw(0o100000)?;
+        let units = if self
+            .inner()
+            .has_default_acl(parent.tree(), parent.number())
+            .await?
+        {
+            Units::TMPFILE_INHERITING_ACLS
+        } else {
+            Units::TMPFILE
+        };
+        let mut operation = Mutation::new(self, units).await?;
+        operation.checked(parent).await?;
+        let (tree, parent_id) = (parent.tree(), parent.number());
+        operation.inner_mut().roots.check_writable(tree)?;
+        let inode = operation
+            .inner_mut()
+            .create_tmpfile(tree, parent_id, raw_attributes, linkable, when)
+            .await?;
+        let handle = operation.load_handle(FileId { tree, inode }).await?;
+        operation.accept()?;
+        Ok(handle)
+    }
+
+    /// Releases one open handle previously acquired with [`Self::open_inode`]
+    /// or [`Self::create_tmpfile`]. If this was the final open handle on an
+    /// orphaned inode, deletes the inode (its extents, checksums, extended
+    /// attributes and delayed-allocation pages) and its orphan item in one
+    /// transaction and returns `Ok(true)`; otherwise returns `Ok(false)`.
+    pub async fn release_inode(&mut self, file: &InodeHandle) -> Result<bool, WriteError> {
+        if !Arc::ptr_eq(&self.writer.mount, &file.mount) {
+            return Err(WriteError::ForeignHandle);
+        }
+        let mut preview = self.inner().open.clone();
+        match preview.release(file.id, file.generation)? {
+            ReleaseOutcome::StillOpen | ReleaseOutcome::ClosedLinked => {
+                self.inner_mut().open = preview;
+                Ok(false)
+            }
+            ReleaseOutcome::DeleteOrphan => {
+                let mut operation = Mutation::new(self, Units::UNLINK).await?;
+                let outcome = operation
+                    .inner_mut()
+                    .open
+                    .release(file.id, file.generation)?;
+                debug_assert_eq!(outcome, ReleaseOutcome::DeleteOrphan);
+                operation.inner_mut().roots.check_writable(file.tree())?;
+                operation
+                    .inner_mut()
+                    .delete_orphan_inode(file.tree(), file.number())
+                    .await?;
+                operation.accept()?;
+                Ok(true)
+            }
+        }
+    }
+
     pub async fn hard_link(
         &mut self,
         name: Name<'_>,
         file: &InodeHandle,
         when: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self, Units::LINK).await?;
+        let metadata = self.checked(file).await?;
+        let units = if metadata.nlink == 0 {
+            Units::LINK_ORPHAN
+        } else {
+            Units::LINK
+        };
+        let mut operation = Mutation::new(self, units).await?;
         operation.checked(file).await?;
         let name = operation.entry_name(name).await?;
         if file.tree() != name.tree {

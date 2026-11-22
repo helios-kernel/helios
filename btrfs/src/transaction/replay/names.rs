@@ -794,7 +794,7 @@ impl<S: BlockSink> Transaction<S> {
             }
         }
         for inode in orphans {
-            self.remove_inode(tree, inode).await?;
+            self.delete_orphan_inode(tree, inode).await?;
         }
         Ok(())
     }

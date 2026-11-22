@@ -607,11 +607,11 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
         Err(FsError::Invalid)
     );
     assert_eq!(
-        block_on(fs.open(path("hello"), OpenFlags::TRUNCATE, 0)),
+        block_on(fs.open(path("hello"), OpenFlags::TRUNCATE, 0)).map(drop),
         Err(FsError::ReadOnly)
     );
     assert_eq!(
-        block_on(fs.open(path("absent"), OpenFlags::CREATE, 0)),
+        block_on(fs.open(path("absent"), OpenFlags::CREATE, 0)).map(drop),
         Err(FsError::ReadOnly)
     );
 
@@ -770,7 +770,8 @@ fn writable_service_publishes_namespace_and_survives_remount() {
                     OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
                     1_000_000_000
                 )
-                .await,
+                .await
+                .map(drop),
                 Err(FsError::Exists)
             );
             let payload = alloc::vec![0x53; 19_000];
@@ -2894,5 +2895,252 @@ fn btrfs_management_balance_scrub_and_quota_grants() {
             alloc::boxed::Box::pin(service.run(idle_timer())),
         )
         .await;
+    });
+}
+
+#[test]
+fn unlinked_open_handle_retains_inode_until_final_drop_and_isolates_recreated_path() {
+    let disk = MemoryDisk::holding_writable("btrfs-orphan", &empty_image());
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache_over(&disk, 256, 1).disk(0),
+            || DeviceId::new(100),
+            write_options(1, None),
+        )
+        .await
+        .expect("writable mount");
+        let client = async move {
+            let opened = fs
+                .open(path("target"), OpenFlags::CREATE, 1_000_000_000)
+                .await
+                .expect("create target");
+            let dup = opened.handle.clone();
+            helios_hal::fs::write_handle_with(
+                &fs,
+                &opened.handle,
+                WritePosition::At(0),
+                b"original-data".len(),
+                1_000_000_001,
+                |at, dst| dst.copy_from_slice(&b"original-data"[at..at + dst.len()]),
+            )
+            .await
+            .expect("write original");
+
+            // Unlink while two handle clones are live.
+            fs.unlink(path("target"), 1_000_000_002)
+                .await
+                .expect("unlink target");
+            assert_eq!(fs.stat(path("target")).await, Err(FsError::NoEntry));
+            let unlinked_meta = fs
+                .stat_handle(&opened.handle)
+                .await
+                .expect("stat unlinked handle");
+            assert_eq!(unlinked_meta.link_count, 0);
+            assert_eq!(
+                fs.read_handle_at(&opened.handle, 0, 64)
+                    .await
+                    .expect("read unlinked")
+                    .as_ref(),
+                b"original-data"
+            );
+
+            // Recreate a new file at the same path; the open handle still refers
+            // to the unlinked inode.
+            let recreated = fs
+                .open(path("target"), OpenFlags::CREATE, 1_000_000_003)
+                .await
+                .expect("recreate target");
+            assert_ne!(recreated.metadata.id, opened.metadata.id);
+            helios_hal::fs::write_handle_with(
+                &fs,
+                &recreated.handle,
+                WritePosition::At(0),
+                b"replacement".len(),
+                1_000_000_003,
+                |at, dst| dst.copy_from_slice(&b"replacement"[at..at + dst.len()]),
+            )
+            .await
+            .expect("write replacement");
+
+            // Writes, truncate, times, and sync through the old handle affect
+            // only the unlinked inode.
+            helios_hal::fs::write_handle_with(
+                &fs,
+                &opened.handle,
+                WritePosition::End,
+                b"-more".len(),
+                1_000_000_004,
+                |at, dst| dst.copy_from_slice(&b"-more"[at..at + dst.len()]),
+            )
+            .await
+            .expect("append to unlinked");
+            assert_eq!(
+                fs.read_handle_at(&opened.handle, 0, 64)
+                    .await
+                    .expect("read updated unlinked")
+                    .as_ref(),
+                b"original-data-more"
+            );
+            assert_eq!(
+                fs.read_at(path("target"), 0, 64)
+                    .await
+                    .expect("read recreated")
+                    .as_ref(),
+                b"replacement"
+            );
+            fs.set_size_handle(&opened.handle, 8, 1_000_000_005)
+                .await
+                .expect("truncate unlinked");
+            fs.set_times_handle(
+                &opened.handle,
+                Some(2_000_000_000),
+                Some(3_000_000_000),
+                1_000_000_006,
+            )
+            .await
+            .expect("set_times unlinked");
+            fs.sync_handle(&opened.handle).await.expect("sync unlinked");
+            let after_meta = fs
+                .stat_handle(&opened.handle)
+                .await
+                .expect("stat after mutations");
+            assert_eq!(after_meta.link_count, 0);
+            assert_eq!(after_meta.size, 8);
+            assert_eq!(after_meta.modified_nanos, 3_000_000_000);
+
+            // Previously named unlinked files cannot be re-linked.
+            assert_eq!(
+                fs.link_handle(&opened.handle, path("revived"), 1_000_000_007)
+                    .await,
+                Err(FsError::NoEntry)
+            );
+
+            // Dropping the first clone leaves the inode alive via `dup`.
+            drop(opened);
+            fs.sync(FsPath::ROOT).await.expect("sync with dup alive");
+            assert_eq!(
+                fs.read_handle_at(&dup, 0, 16)
+                    .await
+                    .expect("read via dup")
+                    .as_ref(),
+                b"original"
+            );
+
+            // Dropping the final clone schedules deletion, drained before sync.
+            drop(dup);
+            fs.sync(FsPath::ROOT).await.expect("sync after final drop");
+            drop(recreated);
+            fs.unmount().await;
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+    });
+}
+
+#[test]
+fn tmpfile_handle_supports_io_linking_exclusive_refusal_and_crash_cleanup() {
+    let disk = MemoryDisk::holding_writable("btrfs-tmpfile", &empty_image());
+    let leaked_inode_id = block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache_over(&disk, 256, 1).disk(0),
+            || DeviceId::new(100),
+            write_options(1, None),
+        )
+        .await
+        .expect("writable mount");
+        let client = async move {
+            // Linkable O_TMPFILE.
+            let tmp = fs
+                .open_tmpfile(FsPath::ROOT, false, 1_000_000_000)
+                .await
+                .expect("open_tmpfile");
+            assert_eq!(tmp.metadata.link_count, 0);
+            helios_hal::fs::write_handle_with(
+                &fs,
+                &tmp.handle,
+                WritePosition::At(0),
+                b"staged-via-tmpfile".len(),
+                1_000_000_001,
+                |at, dst| dst.copy_from_slice(&b"staged-via-tmpfile"[at..at + dst.len()]),
+            )
+            .await
+            .expect("write tmpfile");
+            fs.link_handle(&tmp.handle, path("linked"), 1_000_000_002)
+                .await
+                .expect("link tmpfile");
+            assert_eq!(
+                fs.stat_handle(&tmp.handle)
+                    .await
+                    .expect("stat linked")
+                    .link_count,
+                1
+            );
+            assert_eq!(
+                fs.read_at(path("linked"), 0, 64)
+                    .await
+                    .expect("read linked")
+                    .as_ref(),
+                b"staged-via-tmpfile"
+            );
+            drop(tmp);
+
+            // Exclusive O_TMPFILE refuses link_handle and cleans up on drop.
+            let excl = fs
+                .open_tmpfile(FsPath::ROOT, true, 1_000_000_003)
+                .await
+                .expect("open exclusive tmpfile");
+            assert_eq!(
+                fs.link_handle(&excl.handle, path("cannot-link"), 1_000_000_004)
+                    .await,
+                Err(FsError::NoEntry)
+            );
+            drop(excl);
+
+            // Keep one O_TMPFILE open across unmount to simulate a crash with
+            // an active orphan item committed on disk.
+            let crashed = fs
+                .open_tmpfile(FsPath::ROOT, false, 1_000_000_005)
+                .await
+                .expect("open crash tmpfile");
+            helios_hal::fs::write_handle_with(
+                &fs,
+                &crashed.handle,
+                WritePosition::At(0),
+                b"lost".len(),
+                1_000_000_006,
+                |at, dst| dst.copy_from_slice(&b"lost"[at..at + dst.len()]),
+            )
+            .await
+            .expect("write crash tmpfile");
+            fs.unmount().await;
+            let id = crashed.metadata.id;
+            drop(crashed);
+            id
+        };
+        let (id, ()) = futures::future::join(client, service.run(idle_timer())).await;
+        id
+    });
+
+    // Writable remount cleans up the orphan left on disk while keeping `linked`.
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache_over(&disk, 256, 1).disk(0),
+            || DeviceId::new(100),
+            write_options(1, None),
+        )
+        .await
+        .expect("remount after crash");
+        let client = async move {
+            let linked = fs.stat(path("linked")).await.expect("linked survived");
+            assert_ne!(linked.id, leaked_inode_id);
+            assert_eq!(
+                fs.read_at(path("linked"), 0, 64)
+                    .await
+                    .expect("read survived")
+                    .as_ref(),
+                b"staged-via-tmpfile"
+            );
+            fs.unmount().await;
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
     });
 }

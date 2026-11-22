@@ -12,6 +12,7 @@ pub(crate) mod devices;
 mod extents;
 pub(crate) mod file;
 pub(crate) mod namespace;
+pub(crate) mod orphan;
 pub(crate) mod ownership;
 pub(crate) mod reflink;
 pub(crate) mod relocate;
@@ -25,6 +26,7 @@ use core::num::NonZeroUsize;
 use futures::future;
 
 use self::namespace::Name;
+use self::orphan::OpenInodes;
 use self::reflink::FileId;
 use crate::accounting::{Accounting, Allocation};
 use crate::commit::CommitImage;
@@ -84,6 +86,9 @@ pub(crate) struct Transaction<S> {
     /// When true, `commit` publishes a new generation even if no tree blocks
     /// changed (for example after changing superblock device metadata).
     pub(crate) force_commit: bool,
+    /// Open-handle accounting mirrored from the owning [`crate::write::Writer`],
+    /// checkpointed and rolled back alongside tree edits.
+    pub(crate) open: OpenInodes,
 }
 
 /// Private operation state. Inode allocation high-water marks deliberately
@@ -100,6 +105,7 @@ pub(crate) struct Checkpoint {
     quota: Option<QuotaTree>,
     delalloc: Delalloc,
     force_commit: bool,
+    open: OpenInodes,
 }
 
 impl<S: BlockSink> Transaction<S> {
@@ -147,6 +153,7 @@ impl<S: BlockSink> Transaction<S> {
             quota: self.quota.clone(),
             delalloc: self.delalloc.clone(),
             force_commit: self.force_commit,
+            open: self.open.clone(),
         };
         self.space.begin_operation();
         saved
@@ -163,6 +170,7 @@ impl<S: BlockSink> Transaction<S> {
         self.quota = saved.quota;
         self.delalloc = saved.delalloc;
         self.force_commit = saved.force_commit;
+        self.open = saved.open;
     }
 
     /// Checks quota limits on subvolume `tree` before allocating
@@ -425,6 +433,7 @@ impl<S: BlockSink> Transaction<S> {
             trees,
             delalloc,
             force_commit: false,
+            open: OpenInodes::new(),
         })
     }
 
