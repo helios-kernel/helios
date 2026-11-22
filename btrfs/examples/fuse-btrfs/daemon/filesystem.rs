@@ -410,16 +410,23 @@ impl Filesystem for Daemon {
         self.shared.writable_released.notify_all();
     }
 
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+        match self.run(|state| block_on(state.opendir(ino))) {
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
     fn readdir(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let listed = self.run(|state| {
-            block_on(state.readdir(ino, offset, |entry, cookie, kind, name| {
+            block_on(state.readdir(ino, fh, offset, |entry, cookie, kind, name| {
                 reply.add(entry, cookie, kind, name)
             }))
         });
@@ -427,6 +434,18 @@ impl Filesystem for Daemon {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: fuser::OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.run(|state| state.releasedir(fh));
+        reply.ok();
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {

@@ -75,3 +75,4 @@ required-features = ["test-support"]
 [[example]]
 name = "fuse-btrfs"
 required-features = ["test-support", "write"]
+test = true

@@ -156,6 +156,23 @@ impl Device {
         })
     }
 
+    #[cfg(test)]
+    pub fn open_for_test(path: &Path, claim: Claim) -> io::Result<Self> {
+        if claim.is_block_device_read_only()? {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        let buffered = OpenOptions::new().read(true).write(true).open(path)?;
+        let durable = buffered.try_clone()?;
+        let len = (&buffered).seek(SeekFrom::End(0))?;
+        Ok(Self {
+            claim,
+            buffered,
+            durable: Some(durable),
+            len,
+            poisoned: AtomicBool::new(false),
+        })
+    }
+
     fn check_alive(&self) -> IoResult<()> {
         if self.poisoned.load(Ordering::Acquire) {
             error!("the device is poisoned by an earlier failed commit");

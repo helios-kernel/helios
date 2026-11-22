@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use helios_btrfs::write::Writer;
 use helios_btrfs::{
-    BlockSink, BlockSource, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode,
+    BlockSink, BlockSource, DirBound, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode,
     READ_ALIGNMENT, Timestamp,
 };
 use helios_hal::io::{IoError, IoResult};
@@ -182,7 +182,7 @@ async fn entries(
     dir: &Inode,
 ) -> Vec<(DirPosition, Vec<u8>, FileKind, EntryTarget)> {
     let mut entries = Vec::new();
-    fs.read_dir(dir, DirPosition::START, |entry| {
+    fs.read_dir(dir, DirPosition::START, DirBound::UNBOUNDED, |entry| {
         entries.push((
             entry.position,
             entry.name.to_vec(),

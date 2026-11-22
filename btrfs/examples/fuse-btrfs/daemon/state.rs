@@ -24,7 +24,7 @@ use helios_btrfs::write::{
     WriteOptions, Writer, XattrMode,
 };
 use helios_btrfs::{
-    DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
+    DirBound, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
 };
 use helios_hal::fs::RenameMode;
 
@@ -88,6 +88,7 @@ pub enum Node<'a> {
 }
 
 /// The caller a creation is made for.
+#[derive(Clone, Copy)]
 pub struct Owner {
     pub uid: u32,
     pub gid: u32,
@@ -107,14 +108,33 @@ enum Storage {
     Writable(Box<Writer<Device, RandomUuids>>),
 }
 
+/// State of an open directory stream (`FUSE_OPENDIR` .. `FUSE_RELEASEDIR`),
+/// following Linux's `btrfs_opendir` and `btrfs_real_readdir`
+/// (`fs/btrfs/inode.c`, commit `9b378f6ad48c`, refreshed on rewind as
+/// commit `fd968e683bd9`).
+#[derive(Clone, Copy)]
+struct OpenDir {
+    bound: DirBound,
+    /// Whether this stream has already served a `readdir`. Linux FUSE handles
+    /// `lseek(dirfd, 0, SEEK_SET)` (`rewinddir(3)`) in the VFS without sending
+    /// a request, so a `readdir` at offset `0` once `started` is true signals
+    /// a rewind and refreshes `bound`, while the initial `readdir(0)` keeps
+    /// the bound captured at `opendir`.
+    started: bool,
+}
+
 pub struct State {
     storage: Storage,
     claim: Claim,
     device_path: PathBuf,
     inodes: Inodes,
+    open_dirs: HashMap<u64, OpenDir>,
+    next_dir_handle: u64,
     concurrency: NonZeroUsize,
     read_only: bool,
     destroyed: bool,
+    #[cfg(test)]
+    direct_io: bool,
     next_fh: u64,
     writable_handles: HashSet<u64>,
 }
@@ -126,11 +146,37 @@ impl State {
         concurrency: NonZeroUsize,
         read_only: bool,
     ) -> Result<Self, OpenError> {
+        Self::open_with_mode(claim, device_path, concurrency, read_only, true)
+    }
+
+    #[cfg(test)]
+    pub fn open_for_test(
+        claim: Claim,
+        device_path: PathBuf,
+        concurrency: NonZeroUsize,
+        read_only: bool,
+    ) -> Result<Self, OpenError> {
+        Self::open_with_mode(claim, device_path, concurrency, read_only, false)
+    }
+
+    fn open_with_mode(
+        claim: Claim,
+        device_path: PathBuf,
+        concurrency: NonZeroUsize,
+        read_only: bool,
+        direct_io: bool,
+    ) -> Result<Self, OpenError> {
         if !read_only {
-            return Self::open_writable(claim, device_path, concurrency, false);
+            return Self::open_writable(claim, device_path, concurrency, false, direct_io);
         }
         if claim.is_writable() {
-            match Self::open_writable(claim.clone(), device_path.clone(), concurrency, true) {
+            match Self::open_writable(
+                claim.clone(),
+                device_path.clone(),
+                concurrency,
+                true,
+                direct_io,
+            ) {
                 Ok(state) => return Ok(state),
                 Err(OpenError::Write(
                     WriteError::UnsupportedCompatRo { .. } | WriteError::QuotaTreePresent,
@@ -140,7 +186,16 @@ impl State {
                 Err(error) => return Err(error),
             }
         }
-        Self::open_read_only(claim, device_path, concurrency)
+        Self::open_read_only(claim, device_path, concurrency, direct_io)
+    }
+
+    fn open_device_rw(path: &Path, claim: Claim, direct_io: bool) -> std::io::Result<Device> {
+        #[cfg(test)]
+        if !direct_io {
+            return Device::open_for_test(path, claim);
+        }
+        let _ = direct_io;
+        Device::open_read_write(path, claim)
     }
 
     fn open_writable(
@@ -148,8 +203,9 @@ impl State {
         device_path: PathBuf,
         concurrency: NonZeroUsize,
         read_only: bool,
+        direct_io: bool,
     ) -> Result<Self, OpenError> {
-        let device = Device::open_read_write(&device_path, claim.clone())?;
+        let device = Self::open_device_rw(&device_path, claim.clone(), direct_io)?;
         let mut writer = block_on(Writer::mount(
             device,
             RandomUuids,
@@ -171,9 +227,13 @@ impl State {
             claim,
             device_path,
             inodes: Inodes::new(identity, root.metadata().generation, Some(handle)),
+            open_dirs: HashMap::new(),
+            next_dir_handle: 1,
             concurrency,
             read_only,
             destroyed: false,
+            #[cfg(test)]
+            direct_io,
             next_fh: 1,
             writable_handles: HashSet::new(),
         })
@@ -183,7 +243,9 @@ impl State {
         claim: Claim,
         device_path: PathBuf,
         concurrency: NonZeroUsize,
+        direct_io: bool,
     ) -> Result<Self, OpenError> {
+        let _ = direct_io;
         let device = Device::open_read_only(&device_path, claim.clone())?;
         let fs = block_on(Filesystem::mount(Arc::new(device)))?;
         let root = block_on(fs.root())?;
@@ -196,9 +258,13 @@ impl State {
             claim,
             device_path,
             inodes: Inodes::new(identity, root.metadata().generation, None),
+            open_dirs: HashMap::new(),
+            next_dir_handle: 1,
             concurrency,
             read_only: true,
             destroyed: false,
+            #[cfg(test)]
+            direct_io,
             next_fh: 1,
             writable_handles: HashSet::new(),
         })
@@ -271,7 +337,11 @@ impl State {
                 writer.snapshot().map_err(|error| write_errno(&error))?;
             }
             Storage::ReadOnly(_) => {
-                let device = Device::open_read_write(&self.device_path, self.claim.clone())
+                #[cfg(test)]
+                let direct_io = self.direct_io;
+                #[cfg(not(test))]
+                let direct_io = true;
+                let device = Self::open_device_rw(&self.device_path, self.claim.clone(), direct_io)
                     .map_err(|error| {
                         if matches!(error.raw_os_error(), Some(libc::EROFS | libc::EACCES)) {
                             Errno::EACCES
@@ -610,16 +680,69 @@ impl State {
         Ok(data)
     }
 
-    /// Hands the entries of directory `ino` after cookie `offset` to `emit`
-    /// until it returns true, meaning its reply is full.
+    /// Opens a directory stream and records its upper `DIR_INDEX` bound as of
+    /// open time (`btrfs_opendir` in Linux `fs/btrfs/inode.c`, commit
+    /// `9b378f6ad48c`).
+    pub async fn opendir(&mut self, ino: INodeNo) -> Result<FileHandle, Errno> {
+        let snapshot = self.snapshot()?;
+        let directory = self.open_inode(&snapshot, ino).await?;
+        let bound = snapshot
+            .dir_bound(&directory)
+            .await
+            .map_err(|error| read_errno(&error))?;
+        let handle = self.next_dir_handle;
+        self.next_dir_handle += 1;
+        self.open_dirs.insert(
+            handle,
+            OpenDir {
+                bound,
+                started: false,
+            },
+        );
+        Ok(FileHandle(handle))
+    }
+
+    /// Releases a directory stream opened by [`Self::opendir`].
+    pub fn releasedir(&mut self, fh: FileHandle) {
+        self.open_dirs.remove(&fh.0);
+    }
+
+    /// Hands the entries of directory `ino` after cookie `offset` up to the
+    /// open stream's upper `DIR_INDEX` bound to `emit` until it returns true,
+    /// meaning its reply is full.
     pub async fn readdir(
         &mut self,
         ino: INodeNo,
+        fh: FileHandle,
         offset: u64,
         mut emit: impl FnMut(INodeNo, u64, FileType, &OsStr) -> bool,
     ) -> Result<(), Errno> {
         let snapshot = self.snapshot()?;
         let directory = self.open_inode(&snapshot, ino).await?;
+        let open = *self.open_dirs.get(&fh.0).ok_or(Errno::EBADF)?;
+        let bound = if offset == 0 && open.started {
+            // Refresh the upper `DIR_INDEX` bound on rewind (`rewinddir(3)` ->
+            // `lseek(dirfd, 0, SEEK_SET)` in the Linux VFS, which FUSE does not
+            // forward to the daemon), matching Linux `fs/btrfs/inode.c`, commit
+            // `fd968e683bd9`.
+            let refreshed = snapshot
+                .dir_bound(&directory)
+                .await
+                .map_err(|error| read_errno(&error))?;
+            self.open_dirs
+                .get_mut(&fh.0)
+                .expect("open directory handle checked above")
+                .bound = refreshed;
+            refreshed
+        } else {
+            if !open.started {
+                self.open_dirs
+                    .get_mut(&fh.0)
+                    .expect("open directory handle checked above")
+                    .started = true;
+            }
+            open.bound
+        };
         // The format stores neither `.` nor `..`; the kernel reports both.
         // The parent is not recorded, so `..` carries the directory's own number.
         for (cookie, name) in [(1, "."), (2, "..")] {
@@ -633,6 +756,7 @@ impl State {
             .read_dir(
                 &directory,
                 DirPosition(offset.saturating_sub(DOT_COOKIES)),
+                bound,
                 |entry| {
                     let identity = match entry.target {
                         EntryTarget::Inode(number) => Identity { tree, number },
@@ -1066,5 +1190,179 @@ fn attr(ino: INodeNo, metadata: &Metadata, snapshot: &Snapshot) -> FileAttr {
         rdev: metadata.rdev.encode(),
         blksize: snapshot.superblock().sectorsize(),
         flags: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{OsStr, OsString};
+    use std::num::NonZeroUsize;
+
+    use ferrosys::btrfs::{FormatOptions, format_to};
+    use ferrosys::{Metadata as FormatMetadata, Timestamp as FormatTime, TreeBuilder};
+    use fuser::{Errno, FileHandle, INodeNo};
+    use futures_lite::future::block_on;
+    use helios_btrfs::Timestamp;
+    use helios_hal::fs::RenameMode;
+
+    use super::super::device::Claim;
+    use super::{Node, Owner, State};
+
+    const WHEN: Timestamp = Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 0,
+    };
+
+    fn test_state() -> (tempfile::NamedTempFile, State) {
+        let time = FormatTime::from_secs(1_700_000_000);
+        let mut named = tempfile::NamedTempFile::new().expect("temp image");
+        // ferrosys' default single-device geometry needs at least 109 MiB.
+        let size = 128 << 20;
+        named.as_file_mut().set_len(size).expect("set_len");
+        let tree = TreeBuilder::new().root(FormatMetadata::new(0o755, time));
+        format_to(
+            named.as_file_mut(),
+            tree,
+            size,
+            FormatOptions::new([0x44; 16], time),
+        )
+        .expect("format btrfs");
+        let claim = Claim::open(named.path(), false).expect("open test claim");
+        let state = State::open_for_test(
+            claim,
+            named.path().to_path_buf(),
+            NonZeroUsize::new(1).unwrap(),
+            false,
+        )
+        .expect("open state");
+        (named, state)
+    }
+
+    fn list_names(state: &mut State, ino: INodeNo, fh: FileHandle) -> Vec<OsString> {
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let mut batch = Vec::new();
+            block_on(state.readdir(ino, fh, offset, |_, cookie, _, name| {
+                if batch.len() == 2 {
+                    return true;
+                }
+                batch.push((cookie, name.to_os_string()));
+                false
+            }))
+            .expect("readdir");
+            let Some((last_cookie, _)) = batch.last() else {
+                break;
+            };
+            offset = *last_cookie;
+            names.extend(batch.into_iter().map(|(_, name)| name));
+        }
+        names
+    }
+
+    #[test]
+    fn opendir_keeps_open_bound_on_first_readdir_and_refreshes_on_rewind() {
+        let (_image, mut state) = test_state();
+        let owner = Owner {
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+        let (dir_attr, _) = block_on(state.create(
+            INodeNo::ROOT,
+            OsStr::new("work"),
+            Node::Directory,
+            0o755,
+            owner,
+            WHEN,
+        ))
+        .expect("mkdir work");
+        let dir = dir_attr.ino;
+        for name in ["文件", "ファイル", "파일"] {
+            block_on(state.create(dir, OsStr::new(name), Node::File, 0o644, owner, WHEN))
+                .expect("create initial cjk");
+        }
+
+        // Open `work`, then add an entry before the first `readdir(0)`. The
+        // open-time bound hides the entry added after `opendir`.
+        let fh = block_on(state.opendir(dir)).expect("opendir");
+        block_on(state.create(
+            dir,
+            OsStr::new("after-open"),
+            Node::File,
+            0o644,
+            owner,
+            WHEN,
+        ))
+        .expect("create after-open");
+        let first_pass = list_names(&mut state, dir, fh);
+        assert!(
+            !first_pass.iter().any(|name| name == "after-open"),
+            "first readdir(0) must keep opendir's bound: {first_pass:?}"
+        );
+
+        // A second `readdir(0)` on the same handle (`rewinddir(3)`) refreshes
+        // the bound and makes `after-open` visible.
+        let rewound = list_names(&mut state, dir, fh);
+        assert!(
+            rewound.iter().any(|name| name == "after-open"),
+            "rewound readdir(0) must see entries added since opendir: {rewound:?}"
+        );
+
+        // Renaming every yielded entry (`entry -> TEMPFILE -> entry`) while
+        // paging through `work` terminates in bounded entries.
+        let mut offset = 0;
+        let mut seen = Vec::new();
+        let safety_cap = 20;
+        loop {
+            let mut batch = Vec::new();
+            block_on(state.readdir(dir, fh, offset, |_, cookie, _, name| {
+                if batch.len() == 2 {
+                    return true;
+                }
+                batch.push((cookie, name.to_os_string()));
+                false
+            }))
+            .expect("readdir page");
+            let Some((last_cookie, _)) = batch.last() else {
+                break;
+            };
+            offset = *last_cookie;
+            for (_, name) in batch {
+                if name == "." || name == ".." {
+                    continue;
+                }
+                block_on(state.rename(
+                    dir,
+                    &name,
+                    dir,
+                    OsStr::new("TEMPFILE"),
+                    RenameMode::Replace,
+                    WHEN,
+                ))
+                .expect("rename to TEMPFILE");
+                block_on(state.rename(
+                    dir,
+                    OsStr::new("TEMPFILE"),
+                    dir,
+                    &name,
+                    RenameMode::Replace,
+                    WHEN,
+                ))
+                .expect("rename back");
+                seen.push(name);
+                assert!(
+                    seen.len() <= safety_cap,
+                    "fuse-btrfs readdir looped past safety cap ({safety_cap})"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 4, "expected 4 entries, got {seen:?}");
+
+        state.releasedir(fh);
+        assert_eq!(
+            block_on(state.readdir(dir, fh, 0, |_, _, _, _| false)),
+            Err(Errno::EBADF)
+        );
     }
 }

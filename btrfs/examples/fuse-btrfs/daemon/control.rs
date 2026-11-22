@@ -273,7 +273,7 @@ mod tests {
 
         let claim = Claim::open(&image, false).unwrap();
         let concurrency = NonZeroUsize::new(1).unwrap();
-        let state = State::open(claim, image.clone(), concurrency, false).unwrap();
+        let state = State::open_for_test(claim, image.clone(), concurrency, false).unwrap();
         let shared = Arc::new(SharedState::new(state));
         let server = ControlServer::bind_at(
             socket_path.clone(),
@@ -414,7 +414,7 @@ mod tests {
         let claim = Claim::open(&image, true).unwrap();
         assert!(!claim.is_writable());
         let concurrency = NonZeroUsize::new(1).unwrap();
-        let mut state = State::open(claim, image.clone(), concurrency, true).unwrap();
+        let mut state = State::open_for_test(claim, image.clone(), concurrency, true).unwrap();
         assert!(state.is_read_only());
 
         // Look up a pre-existing directory and file while under
