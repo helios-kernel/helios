@@ -89,6 +89,8 @@ pub(crate) mod errno {
     pub(crate) const CONNRESET: i32 = 15;
     pub(crate) const EXIST: i32 = 20;
     pub(crate) const FAULT: i32 = 21;
+    /// `__WASI_ERRNO_INTR`: interrupted function.
+    pub(crate) const INTR: i32 = 27;
     pub(crate) const INVAL: i32 = 28;
     pub(crate) const IO: i32 = 29;
     pub(crate) const ISDIR: i32 = 31;

@@ -9,11 +9,10 @@ use helios_sync::{ByteReader, ByteWriter};
 /// on; UNIX object ownership, sockets included, is common to every ABI.
 ///
 /// One entry is one descriptor slot. Cloning it is POSIX duplication: the
-/// clone shares the open description, its status flags and, for a file, the
-/// [`OpenFile`] that holds the node and the offset, and only `close_on_exec`
-/// belongs to the slot. A socket's endpoint is shared the same way, but
-/// its state (which endpoint it holds, its options) is copied into the
-/// clone.
+/// clone shares the open description, its status flags, for a file the
+/// [`OpenFile`] that holds the node and the offset, and for a socket the
+/// [`Socket`] that holds its state, options, endpoint and socket-pair carry
+/// buffer; only `close_on_exec` belongs to the slot.
 #[derive(Clone)]
 pub struct FileDescriptorEntry<File: Clone, Net: SocketNetwork, Data: Clone> {
     pub descriptor: FileDescriptor<File, Net, Data>,
@@ -105,5 +104,24 @@ mod tests {
         duplicate.close_on_exec = true;
         assert_eq!(entry.fdflags(), 8);
         assert!(!entry.close_on_exec);
+    }
+
+    #[test]
+    fn duplicate_shares_socket_description() {
+        use crate::{Socket, SocketFamily, SocketTime};
+
+        let entry = FileDescriptorEntry::<Infallible, NoNetwork, u64>::new(
+            FileDescriptor::Socket(Socket::tcp(SocketFamily::Ipv4)),
+            false,
+        );
+        let duplicate = entry.clone();
+        let (FileDescriptor::Socket(sock), FileDescriptor::Socket(dup_sock)) =
+            (&entry.descriptor, &duplicate.descriptor)
+        else {
+            unreachable!("both slots hold the socket");
+        };
+        dup_sock.set_time(SocketTime::ReceiveTimeout, Some(42));
+        assert_eq!(sock.options().time(SocketTime::ReceiveTimeout), Some(42));
+        assert!(sock.same_description(dup_sock));
     }
 }
