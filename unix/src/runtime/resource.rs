@@ -4,6 +4,23 @@ use alloc::sync::Arc;
 use bytes::Bytes;
 use core::sync::atomic::{AtomicU16, Ordering};
 use helios_sync::{ByteReader, ByteWriter};
+/// Shared open-file-description status flags stored in
+/// [`FileDescriptorEntry::fdflags`].
+///
+/// The low five bits match the WASI Preview 1 `fdflags` layout so descriptors
+/// inherited across WASIX and native Linux processes share the same status
+/// flags without translation loss; higher bits hold Linux-only status flags.
+pub const FDFLAG_APPEND: u16 = 1 << 0;
+pub const FDFLAG_DSYNC: u16 = 1 << 1;
+pub const FDFLAG_NONBLOCK: u16 = 1 << 2;
+pub const FDFLAG_RSYNC: u16 = 1 << 3;
+pub const FDFLAG_SYNC: u16 = 1 << 4;
+pub const FDFLAG_NOATIME: u16 = 1 << 5;
+pub const FDFLAG_DIRECT: u16 = 1 << 6;
+/// `O_PATH`: path-only descriptor; cannot perform I/O or seek, but may serve
+/// as a `dirfd` and answer `fstat`, `fchdir`, `fcntl`, `readlinkat`, and `close`.
+pub const FDFLAG_PATH: u16 = 1 << 7;
+
 /// ABI-independent descriptor resources. The file adapter provides the
 /// platform's backing file object and `Net` the network its sockets live
 /// on; UNIX object ownership, sockets included, is common to every ABI.

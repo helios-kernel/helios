@@ -3,13 +3,10 @@ use super::*;
 use crate::signal_frame::SigInfo;
 use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
-use core::task::{Context, Poll};
-use helios_sync::{
-    ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, NotifyWaiter, TryRead, TryWrite,
-    byte_channel,
-};
+use helios_sync::{TryRead, TryWrite, byte_channel};
 use helios_unix::{
-    DescriptorTableError, Epoll, EventError, EventFd, Interest, InterestError, Signal, SignalSet,
+    DescriptorTableError, Epoll, EventError, EventFd, FDFLAG_NONBLOCK, FDFLAG_PATH, Interest,
+    InterestError, Signal, SignalSet,
 };
 
 /// Monotonic time and async deadline waits supplied by the execution owner.
@@ -18,16 +15,18 @@ pub trait Clock {
     fn sleep_until(&self, deadline: u64) -> impl Future<Output = ()> + Send;
 }
 // Linux UAPI: O_NONBLOCK, O_CLOEXEC and eventfd's semaphore bit.
-const NONBLOCK: u16 = 0x800;
+const O_NONBLOCK_LINUX: u64 = 0x800;
 const CLOEXEC: u64 = 0x80000;
 const EAGAIN: u64 = 11;
 const EPIPE: u64 = 32;
 const EEXIST: u64 = 17;
 const ENOENT: u64 = 2;
-const EPOLLIN: u32 = 1;
-const EPOLLOUT: u32 = 4;
-const EPOLLERR: u32 = 8;
-const EPOLLHUP: u32 = 16;
+const EPOLLIN: u32 = poll::POLLIN;
+const EPOLLOUT: u32 = poll::POLLOUT;
+const EPOLLERR: u32 = poll::POLLERR;
+const EPOLLHUP: u32 = poll::POLLHUP;
+const EPOLLRDNORM: u32 = poll::POLLRDNORM;
+const EPOLLWRNORM: u32 = poll::POLLWRNORM;
 const EPOLLONESHOT: u32 = 1 << 30; // Linux eventpoll.h
 
 pub(super) fn descriptor_errno(error: DescriptorTableError) -> u64 {
@@ -40,7 +39,9 @@ pub(super) fn descriptor_errno(error: DescriptorTableError) -> u64 {
 }
 fn insert<R: Resources>(table: &mut Descriptors<R>, descriptor: Descriptor<R>, flags: u64) -> u64 {
     let entry = Entry::<R>::new(descriptor, flags & CLOEXEC != 0);
-    entry.set_fdflags(flags as u16 & NONBLOCK);
+    if flags & O_NONBLOCK_LINUX != 0 {
+        entry.set_fdflags(FDFLAG_NONBLOCK);
+    }
     table
         .insert_entry(entry)
         .map_or_else(descriptor_errno, u64::from)
@@ -51,7 +52,7 @@ pub(super) fn event<R: Resources>(
     has_flags: bool,
 ) -> u64 {
     let flags = if has_flags { args[1] as u32 as u64 } else { 0 };
-    if flags & !(CLOEXEC | u64::from(NONBLOCK) | 1) != 0 {
+    if flags & !(CLOEXEC | O_NONBLOCK_LINUX | 1) != 0 {
         return errno(EINVAL);
     }
     insert::<R>(
@@ -67,7 +68,7 @@ pub(super) fn pipe<R: Resources, M: UserMemory>(
     has_flags: bool,
 ) -> u64 {
     let flags = if has_flags { args[1] as u32 as u64 } else { 0 };
-    if flags & !(CLOEXEC | u64::from(NONBLOCK)) != 0 {
+    if flags & !(CLOEXEC | O_NONBLOCK_LINUX) != 0 {
         return errno(EINVAL);
     }
     let (writer, reader) = byte_channel();
@@ -90,10 +91,12 @@ pub(super) fn pipe<R: Resources, M: UserMemory>(
     }
     0
 }
-pub(super) fn duplicate<R: Resources>(
+pub(super) fn duplicate<R: Resources, F: fs::Filesystem<R>>(
+    abi: Abi,
     table: &mut Descriptors<R>,
     operation: Operation,
     arguments: [u64; 6],
+    fs: &F,
 ) -> u64 {
     let [fd, arg, flags, ..] = arguments;
     let Some(mut entry) = table.get_entry(fd as u32 as i32).cloned() else {
@@ -101,36 +104,57 @@ pub(super) fn duplicate<R: Resources>(
     };
     if operation == Operation::Fcntl {
         return match arg as u32 {
-            1 => u64::from(entry.close_on_exec), // F_GETFD
+            // F_DUPFD (0) and F_DUPFD_CLOEXEC (1030)
+            cmd @ (0 | 1030) => {
+                let min_fd = flags as i32;
+                if min_fd < 0 || (min_fd as usize) >= table.limit.get() {
+                    return errno(EINVAL);
+                }
+                entry.close_on_exec = cmd == 1030;
+                table
+                    .insert_entry_from(min_fd, entry)
+                    .map_or_else(descriptor_errno, u64::from)
+            }
+            // F_GETFD
+            1 => u64::from(entry.close_on_exec),
+            // F_SETFD
             2 => {
                 table.get_entry_mut(fd as u32 as i32).unwrap().close_on_exec = flags & 1 != 0;
                 0
             }
+            // F_GETFL: access mode belongs to the open resource; status flags
+            // live on the shared open file description.
             3 => {
-                // F_GETFL: access mode belongs to the open resource.
-                let (mode, extra) = match &entry.descriptor {
-                    FileDescriptor::PipeRead { .. } | FileDescriptor::Stdin { .. } => (0, 0),
+                let mut fdflags = entry.fdflags();
+                let mode = match &entry.descriptor {
+                    FileDescriptor::File(open) => fs.file_access(open.node()).linux_accmode(),
+                    FileDescriptor::Preopen { descriptor, .. } => {
+                        fs.file_access(descriptor).linux_accmode()
+                    }
+                    FileDescriptor::PipeRead { .. } | FileDescriptor::Stdin { .. } => fs::O_RDONLY,
                     FileDescriptor::PipeWrite { .. }
                     | FileDescriptor::Stdout
-                    | FileDescriptor::Stderr => (1, 0),
-                    FileDescriptor::Socket(sock) => (
-                        2,
+                    | FileDescriptor::Stderr => fs::O_WRONLY,
+                    FileDescriptor::Socket(sock) => {
                         if sock.is_nonblocking() {
-                            u64::from(NONBLOCK)
-                        } else {
-                            0
-                        },
-                    ),
-                    _ => (2, 0),
+                            fdflags |= FDFLAG_NONBLOCK;
+                        }
+                        fs::O_RDWR
+                    }
+                    _ => fs::O_RDWR,
                 };
-                mode | u64::from(entry.fdflags()) | extra
+                mode | fs::fdflags_to_linux(abi, fdflags)
             }
+            // F_SETFL
             4 => {
-                let nb = flags as u16 & NONBLOCK;
+                if entry.fdflags() & FDFLAG_PATH != 0 {
+                    return errno(EBADF);
+                }
+                let updated = fs::apply_setfl(abi, entry.fdflags(), flags);
                 let slot = table.get_entry(fd as u32 as i32).unwrap();
-                slot.set_fdflags(nb);
+                slot.set_fdflags(updated);
                 if let FileDescriptor::Socket(sock) = &slot.descriptor {
-                    sock.set_nonblocking(nb != 0);
+                    sock.set_nonblocking(updated & FDFLAG_NONBLOCK != 0);
                 }
                 0
             }
@@ -181,7 +205,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
                     Err(EventError::InvalidIncrement) => {
                         return SyscallOutcome::Return(errno(EINVAL));
                     }
-                    Err(EventError::WouldBlock) if entry.fdflags() & NONBLOCK != 0 => {
+                    Err(EventError::WouldBlock) if entry.fdflags() & FDFLAG_NONBLOCK != 0 => {
                         return SyscallOutcome::Return(errno(EAGAIN));
                     }
                     Err(EventError::WouldBlock) => {
@@ -209,7 +233,7 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
                     return SyscallOutcome::Return(if total == 0 { errno(EFAULT) } else { total });
                 }
                 let chunk = Bytes::copy_from_slice(&bytes[..size]);
-                let result = if entry.fdflags() & NONBLOCK != 0 {
+                let result = if entry.fdflags() & FDFLAG_NONBLOCK != 0 {
                     match writer.try_write(chunk) {
                         TryWrite::Written => Ok(()),
                         TryWrite::Closed => Err(Some(EPIPE)),
@@ -264,7 +288,7 @@ pub(super) async fn read_resource<R: Resources, M: UserMemory>(
     args: [u64; 6],
     memory: &mut M,
 ) -> SyscallOutcome {
-    let nonblock = entry.fdflags() & NONBLOCK != 0;
+    let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
     match &entry.descriptor {
         FileDescriptor::Event(event) => {
             if args[2] < 8 {
@@ -354,15 +378,17 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
     let Some(target) = table.get_entry(fd) else {
         return errno(EBADF);
     };
+    if target.fdflags() & FDFLAG_PATH != 0 {
+        return errno(EBADF);
+    }
     if fd == epfd {
         return errno(EINVAL);
     }
+    // Regular files, directories and `/dev/null` cannot be monitored by epoll
+    // (`EPERM`), whereas standard streams (pipes or terminals) can.
     if matches!(
         target.descriptor,
-        FileDescriptor::Stdin { .. }
-            | FileDescriptor::Stdout
-            | FileDescriptor::Stderr
-            | FileDescriptor::NullDevice
+        FileDescriptor::File(_) | FileDescriptor::Preopen { .. } | FileDescriptor::NullDevice
     ) {
         return errno(EPERM);
     }
@@ -388,7 +414,10 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
             return errno(EFAULT);
         }
         let events = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        if events & !(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLONESHOT) != 0 {
+        if events
+            & !(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDNORM | EPOLLWRNORM | EPOLLONESHOT)
+            != 0
+        {
             return errno(EINVAL);
         }
         let interest = Interest {
@@ -431,47 +460,6 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
         Err(InterestError::NotFound) => errno(ENOENT),
     }
 }
-fn ready_mask<R: Resources>(entry: &Entry<R>, table: &Descriptors<R>) -> u32 {
-    match &entry.descriptor {
-        FileDescriptor::Event(event) => {
-            (if event.is_readable() { EPOLLIN } else { 0 })
-                | (if event.is_writable() { EPOLLOUT } else { 0 })
-        }
-        FileDescriptor::PipeRead { reader } => {
-            (if reader.has_buffered_data() {
-                EPOLLIN
-            } else {
-                0
-            }) | (if reader.is_writer_closed() {
-                EPOLLHUP
-            } else {
-                0
-            })
-        }
-        FileDescriptor::PipeWrite { writer } => {
-            if writer.is_reader_closed() {
-                EPOLLERR
-            } else if writer.is_writable() {
-                EPOLLOUT
-            } else {
-                0
-            }
-        }
-        FileDescriptor::Epoll(epoll) => {
-            if epoll.interests().iter().any(|interest| {
-                table.get_entry(interest.fd).is_some_and(|entry| {
-                    ready_mask::<R>(entry, table) & (interest.events | EPOLLERR | EPOLLHUP) != 0
-                })
-            }) {
-                EPOLLIN
-            } else {
-                0
-            }
-        }
-        FileDescriptor::Stdout | FileDescriptor::Stderr => EPOLLOUT,
-        _ => 0,
-    }
-}
 // Linux limits nested epoll traversal to five levels (eventpoll.c EP_MAX_NESTS).
 fn valid_nesting<R: Resources>(
     target: &Epoll<R::Data>,
@@ -490,84 +478,21 @@ fn valid_nesting<R: Resources>(
             }
         })
 }
-fn arm_waits<R: Resources>(
-    epoll: &Epoll<R::Data>,
-    table: &Descriptors<R>,
-    waits: &mut Vec<Wait>,
-    repoll: &mut bool,
-) {
-    for interest in epoll.interests() {
-        if let Some(entry) = table.get_entry(interest.fd) {
-            match &entry.descriptor {
-                FileDescriptor::Epoll(child) if interest.events & EPOLLIN != 0 => {
-                    arm_waits::<R>(child, table, waits, repoll)
-                }
-                FileDescriptor::Socket(sock) => {
-                    if let Some((reader, carry_len)) = sock.pair_read_probe() {
-                        if interest.events & EPOLLIN != 0 && carry_len == 0 {
-                            waits.push(Wait::Read(reader.clone(), reader.wait_state()));
-                        }
-                        if interest.events & EPOLLOUT != 0
-                            && let Some(writer) = sock.pair_writer()
-                            && !writer.is_writable()
-                        {
-                            waits.push(Wait::Write(writer.clone(), writer.wait_state()));
-                        }
-                    } else if sock.handle().is_some() {
-                        *repoll = true;
-                    }
-                }
-                _ => {
-                    if let Some(wait) = Wait::arm::<R>(entry, interest.events) {
-                        waits.push(wait);
-                    }
-                }
-            }
-        }
-    }
-}
-enum Wait {
-    Event(EventFd, NotifyWaiter),
-    Read(ByteReader, ByteReadWait),
-    Write(ByteWriter, ByteWriteWait),
-}
-impl Wait {
-    fn arm<R: Resources>(entry: &Entry<R>, events: u32) -> Option<Self> {
-        match &entry.descriptor {
-            FileDescriptor::Event(event) => Some(Self::Event(event.clone(), event.wait_state())),
-            FileDescriptor::PipeRead { reader, .. } if events & EPOLLIN != 0 => {
-                Some(Self::Read(reader.clone(), reader.wait_state()))
-            }
-            FileDescriptor::PipeWrite { writer } if events & EPOLLOUT != 0 => {
-                Some(Self::Write(writer.clone(), writer.wait_state()))
-            }
-            _ => None,
-        }
-    }
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        match self {
-            Self::Event(event, wait) => event.poll_changed(cx, wait),
-            Self::Read(reader, wait) => reader.poll_readable(cx, wait),
-            Self::Write(writer, wait) => writer.poll_writable(cx, wait),
-        }
-    }
-}
 pub(super) async fn epoll_wait<
     R: Resources,
     M: UserMemory,
-    C: Clock + super::socket::Network<R::Network>,
+    O: Stdio + Clock + super::socket::Network<R::Network>,
 >(
     abi: Abi,
-    signals: &ThreadSignalSlot,
-    table: &spin::Mutex<Descriptors<R>>,
+    process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
-    clock: &C,
+    io: &O,
     has_mask: bool,
 ) -> SyscallOutcome {
     const NETWORK_REPOLL_NANOS: u64 = 1_000_000;
     let epoll = {
-        let table = table.lock();
+        let table = process.shared.descriptors.lock();
         let Some(entry) = table.get_entry(args[0] as u32 as i32) else {
             return SyscallOutcome::Return(errno(EBADF));
         };
@@ -590,24 +515,35 @@ pub(super) async fn epoll_wait<
         if memory.read(args[4], &mut mask_bytes).is_err() {
             return SyscallOutcome::Return(errno(EFAULT));
         }
-        signals.push_temp_mask(SignalSet::from_bits(u64::from_le_bytes(mask_bytes)));
+        process
+            .signals
+            .push_temp_mask(SignalSet::from_bits(u64::from_le_bytes(mask_bytes)));
         true
     } else {
         false
     };
     let timeout = args[3] as i32;
     let deadline =
-        (timeout >= 0).then(|| clock.now_nanos().saturating_add(timeout as u64 * 1_000_000));
+        (timeout >= 0).then(|| io.now_nanos().saturating_add(timeout as u64 * 1_000_000));
     loop {
         let mut waits = Vec::new();
+        let mut watch_stdin = false;
         let mut repoll = false;
         // Snapshot interests and their non-socket readiness synchronously under
         // the descriptor table lock; socket readiness probes are async and run
         // after the spin lock is dropped.
         let snapshot: Vec<_> = {
-            let guard = table.lock();
+            let guard = process.shared.descriptors.lock();
             let interests = epoll.interests();
-            arm_waits::<R>(&epoll, &guard, &mut waits, &mut repoll);
+            poll::arm_epoll_waits::<R, O>(
+                process,
+                &epoll,
+                &guard,
+                io,
+                &mut waits,
+                &mut watch_stdin,
+                &mut repoll,
+            );
             interests
                 .into_iter()
                 .filter_map(|interest| {
@@ -615,7 +551,7 @@ pub(super) async fn epoll_wait<
                     if matches!(target.descriptor, FileDescriptor::Socket(_)) {
                         Some((interest, Some(target.clone()), 0))
                     } else {
-                        let events = ready_mask::<R>(target, &guard)
+                        let events = poll::ready_mask::<R, O>(process, target, &guard, io, true)
                             & (interest.events | EPOLLERR | EPOLLHUP);
                         Some((interest, None, events))
                     }
@@ -627,7 +563,7 @@ pub(super) async fn epoll_wait<
             let events = match socket_entry {
                 Some(entry) => match &entry.descriptor {
                     FileDescriptor::Socket(sock) => {
-                        super::socket::socket_epoll_ready(sock, interest.events, clock).await
+                        super::socket::socket_epoll_ready(sock, interest.events, io).await
                     }
                     _ => sync_events,
                 },
@@ -645,7 +581,7 @@ pub(super) async fn epoll_wait<
                 .is_err()
             {
                 if installed_mask {
-                    signals.restore_temp_mask();
+                    process.signals.restore_temp_mask();
                 }
                 return SyscallOutcome::Return(if count == 0 { errno(EFAULT) } else { count });
             }
@@ -657,14 +593,14 @@ pub(super) async fn epoll_wait<
         }
         if count != 0 {
             if installed_mask {
-                signals.restore_temp_mask();
+                process.signals.restore_temp_mask();
             }
             return SyscallOutcome::Return(count);
         }
-        let now = clock.now_nanos();
+        let now = io.now_nanos();
         if deadline.is_some_and(|end| now >= end) {
             if installed_mask {
-                signals.restore_temp_mask();
+                process.signals.restore_temp_mask();
             }
             return SyscallOutcome::Return(0);
         }
@@ -674,179 +610,9 @@ pub(super) async fn epoll_wait<
             (None, true) => Some(now.saturating_add(NETWORK_REPOLL_NANOS)),
             (None, false) => None,
         };
-        let timer = async {
-            match wake_at {
-                Some(end) => clock.sleep_until(end).await,
-                None => core::future::pending().await,
-            }
-        };
-        let mut timer = core::pin::pin!(timer);
-        let mut sig = core::pin::pin!(signals.wait_deliverable());
-        let interrupted = poll_fn(|cx| {
-            let mut ready = timer.as_mut().poll(cx).is_ready();
-            for wait in &mut waits {
-                ready |= wait.poll(cx).is_ready();
-            }
-            if ready {
-                return Poll::Ready(false);
-            }
-            if sig.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(true);
-            }
-            Poll::Pending
-        })
-        .await;
-        if interrupted {
+        if poll::wait_once(&process.signals, wake_at, &mut waits, watch_stdin, io).await {
             // Leave `saved_mask` active (`TIF_RESTORE_SIGMASK`) so signal
             // delivery writes the original mask into `uc_sigmask`.
-            return SyscallOutcome::RestartNoHand;
-        }
-    }
-}
-
-/// `ppoll(fds, nfds, tmo_p, sigmask, sigsetsize)` (`fs/select.c`
-/// `SYSCALL_DEFINE5(ppoll)`).
-///
-/// musl implements `pause(2)` on AArch64 as `ppoll(NULL, 0, NULL, NULL, 0)`.
-pub(super) async fn ppoll<R: Resources, M: UserMemory, C: Clock>(
-    signals: &ThreadSignalSlot,
-    table: &spin::Mutex<Descriptors<R>>,
-    args: [u64; 6],
-    memory: &mut M,
-    clock: &C,
-) -> SyscallOutcome {
-    const POLLNVAL: u32 = 0x20;
-    const POLLFD_BYTES: usize = 8;
-    const NANOS_PER_SEC: u64 = 1_000_000_000;
-
-    let fds_ptr = args[0];
-    let nfds = args[1];
-    let tmo_ptr = args[2];
-    let sigmask_ptr = args[3];
-    let sigsetsize = args[4];
-
-    if nfds > 1024 * 1024 {
-        return SyscallOutcome::Return(errno(EINVAL));
-    }
-    let nfds = nfds as usize;
-
-    let deadline = if tmo_ptr != 0 {
-        let mut ts = [0u8; 16];
-        if memory.read(tmo_ptr, &mut ts).is_err() {
-            return SyscallOutcome::Return(errno(EFAULT));
-        }
-        let sec = i64::from_le_bytes(ts[..8].try_into().unwrap());
-        let nsec = i64::from_le_bytes(ts[8..].try_into().unwrap());
-        if sec < 0 || !(0..NANOS_PER_SEC as i64).contains(&nsec) {
-            return SyscallOutcome::Return(errno(EINVAL));
-        }
-        let delta = (sec as u64)
-            .saturating_mul(NANOS_PER_SEC)
-            .saturating_add(nsec as u64);
-        Some(clock.now_nanos().saturating_add(delta))
-    } else {
-        None
-    };
-
-    let temp_mask = if sigmask_ptr != 0 {
-        if sigsetsize != 8 {
-            return SyscallOutcome::Return(errno(EINVAL));
-        }
-        let mut mask_bytes = [0u8; 8];
-        if memory.read(sigmask_ptr, &mut mask_bytes).is_err() {
-            return SyscallOutcome::Return(errno(EFAULT));
-        }
-        Some(SignalSet::from_bits(u64::from_le_bytes(mask_bytes)))
-    } else {
-        None
-    };
-
-    let mut pollfds = Vec::with_capacity(nfds);
-    for i in 0..nfds {
-        let mut raw = [0u8; POLLFD_BYTES];
-        if memory
-            .read(fds_ptr.wrapping_add((i * POLLFD_BYTES) as u64), &mut raw)
-            .is_err()
-        {
-            return SyscallOutcome::Return(errno(EFAULT));
-        }
-        let fd = i32::from_le_bytes(raw[0..4].try_into().unwrap());
-        let events = u16::from_le_bytes(raw[4..6].try_into().unwrap());
-        pollfds.push((fd, events, 0u16));
-    }
-
-    let installed_mask = if let Some(mask) = temp_mask {
-        signals.push_temp_mask(mask);
-        true
-    } else {
-        false
-    };
-
-    loop {
-        let mut waits = Vec::new();
-        let mut count = 0u64;
-        {
-            let table = table.lock();
-            for (fd, events, revents) in &mut pollfds {
-                if *fd < 0 {
-                    *revents = 0;
-                    continue;
-                }
-                let Some(entry) = table.get_entry(*fd) else {
-                    *revents = POLLNVAL as u16;
-                    count += 1;
-                    continue;
-                };
-                let mask = u32::from(*events) & (EPOLLIN | EPOLLOUT);
-                let ready = ready_mask::<R>(entry, &table) & (mask | EPOLLERR | EPOLLHUP);
-                *revents = ready as u16;
-                if ready != 0 {
-                    count += 1;
-                } else if let Some(wait) = Wait::arm::<R>(entry, mask) {
-                    waits.push(wait);
-                }
-            }
-        }
-        if count != 0 || deadline.is_some_and(|end| clock.now_nanos() >= end) {
-            if installed_mask {
-                signals.restore_temp_mask();
-            }
-            for (i, (_, _, revents)) in pollfds.iter().enumerate() {
-                if memory
-                    .write(
-                        fds_ptr.wrapping_add((i * POLLFD_BYTES + 6) as u64),
-                        &revents.to_le_bytes(),
-                    )
-                    .is_err()
-                {
-                    return SyscallOutcome::Return(errno(EFAULT));
-                }
-            }
-            return SyscallOutcome::Return(count);
-        }
-        let timer = async {
-            match deadline {
-                Some(end) => clock.sleep_until(end).await,
-                None => core::future::pending().await,
-            }
-        };
-        let mut timer = core::pin::pin!(timer);
-        let mut sig = core::pin::pin!(signals.wait_deliverable());
-        let interrupted = poll_fn(|cx| {
-            let mut ready = timer.as_mut().poll(cx).is_ready();
-            for wait in &mut waits {
-                ready |= wait.poll(cx).is_ready();
-            }
-            if ready {
-                return Poll::Ready(false);
-            }
-            if sig.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(true);
-            }
-            Poll::Pending
-        })
-        .await;
-        if interrupted {
             return SyscallOutcome::RestartNoHand;
         }
     }
@@ -903,8 +669,8 @@ mod tests {
             }
         }
     }
-    struct Clock;
-    impl super::Clock for Clock {
+    struct TestIo;
+    impl super::Clock for TestIo {
         fn now_nanos(&self) -> u64 {
             0
         }
@@ -912,7 +678,15 @@ mod tests {
             core::future::pending().await
         }
     }
-    impl super::super::socket::Network<helios_unix::NoNetwork> for Clock {
+    impl Stdio for TestIo {
+        async fn write(&mut self, _: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
+            Ok(bytes.len())
+        }
+        async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+            Ok(Bytes::new())
+        }
+    }
+    impl super::super::socket::Network<helios_unix::NoNetwork> for TestIo {
         fn to_ip(&self, address: core::convert::Infallible) -> super::super::socket::IpAddr {
             match address {}
         }
@@ -947,34 +721,35 @@ mod tests {
                 one_shot: false,
             })
             .unwrap();
-        let table = spin::Mutex::new(DescriptorSlots::<Entry<NoBacking>>::from_entries(
-            alloc::vec![
-                Some(Entry::<NoBacking>::new(
-                    FileDescriptor::Event(event.clone()),
-                    false
-                )),
-                Some(Entry::<NoBacking>::new(FileDescriptor::Epoll(child), false)),
-                Some(Entry::<NoBacking>::new(
-                    FileDescriptor::Epoll(parent),
-                    false
-                )),
-            ],
-        ));
+        let descriptors = DescriptorSlots::<Entry<NoBacking>>::from_entries(alloc::vec![
+            Some(Entry::<NoBacking>::new(
+                FileDescriptor::Event(event.clone()),
+                false
+            )),
+            Some(Entry::<NoBacking>::new(FileDescriptor::Epoll(child), false)),
+            Some(Entry::<NoBacking>::new(
+                FileDescriptor::Epoll(parent),
+                false
+            )),
+        ]);
+        let process = Process::<NoBacking>::with_descriptors(
+            Abi::X86_64,
+            NonZeroU32::new(1).unwrap(),
+            0x40_0000,
+            descriptors,
+            Start::default(),
+        );
         let mut memory = Memory([0; 64]);
         let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
         let waker = Waker::from(wakes.clone());
         let mut context = Context::from_waker(&waker);
-        let process_signals = super::signal::ProcessSignals::new(NonZeroU32::new(1).unwrap());
-        let thread_signals =
-            process_signals.register_thread(NonZeroU32::new(1).unwrap(), SignalSet::EMPTY);
         {
             let mut future = core::pin::pin!(epoll_wait::<NoBacking, _, _>(
                 Abi::X86_64,
-                &thread_signals,
-                &table,
+                &process,
                 [2, 0, 1, u64::MAX, 0, 0],
                 &mut memory,
-                &Clock,
+                &TestIo,
                 false
             ));
             assert!(future.as_mut().poll(&mut context).is_pending());

@@ -480,6 +480,8 @@ pub struct Start {
     /// Distinct process-memory identity for futex scoping; when `None`,
     /// derived from the process ID.
     pub memory_id: Option<u64>,
+    /// Initial current working directory inside the container root. Defaults to `"/"`.
+    pub cwd: Option<alloc::string::String>,
 }
 
 impl Default for Start {
@@ -491,6 +493,7 @@ impl Default for Start {
             futex: helios_unix::FutexTable::new(),
             pids: None,
             memory_id: None,
+            cwd: None,
         }
     }
 }
@@ -501,7 +504,7 @@ impl Default for Start {
 pub(super) struct Attributes {
     values: [Rlimit; 16],
     open_files_ceiling: u64,
-    umask: u32,
+    pub(super) umask: u32,
     nice: i32,
 }
 

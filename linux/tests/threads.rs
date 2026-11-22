@@ -17,15 +17,20 @@ use std::sync::{Arc, Mutex};
 use helios_hal::vmm::PageFlags;
 use helios_linux::abi::{Abi, Operation};
 use helios_linux::syscall::{
-    Call, Clock, Denied, Exit, MapError, MemoryFault, MemoryTotals, NoBacking, Process, Region,
-    SpawnError, SpawnedThread, Start, Stdio, Stream, SyscallOutcome, System, Thread, UserMemory,
-    VirtualMemory, WriteError, dispatch as raw_dispatch,
+    Call, Clock, Denied, Exit, Filesystem, MapError, MemoryFault, MemoryTotals, NoBacking, Process,
+    Region, SpawnError, SpawnedThread, Start, Stdio, Stream, SyscallOutcome, System, Thread, Tty,
+    UserMemory, VirtualMemory, WriteError, dispatch as raw_dispatch,
 };
 
 async fn dispatch<
     M: VirtualMemory,
     T: Thread<NoBacking>,
-    O: Stdio + Clock + System + helios_linux::syscall::Network<helios_unix::NoNetwork>,
+    O: Stdio
+        + Clock
+        + System
+        + Filesystem<NoBacking>
+        + Tty
+        + helios_linux::syscall::Network<helios_unix::NoNetwork>,
 >(
     process: &mut Process<NoBacking>,
     call: Call,
@@ -310,6 +315,8 @@ impl System for Platform {
         "#1 Helios test"
     }
 }
+impl helios_linux::syscall::Filesystem<NoBacking> for Platform {}
+impl helios_linux::syscall::Tty for Platform {}
 
 fn drive<T>(future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);

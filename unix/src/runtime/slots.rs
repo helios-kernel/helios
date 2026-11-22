@@ -84,6 +84,48 @@ impl<Entry> DescriptorSlots<Entry> {
         self.entries[to] = Some(entry);
         Ok(to as u32)
     }
+    /// Allocates the lowest unused descriptor slot at or above `min_fd` within
+    /// `self.limit` and inserts `entry` there (POSIX `fcntl(F_DUPFD)` /
+    /// `F_DUPFD_CLOEXEC`).
+    pub fn insert_entry_from(
+        &mut self,
+        min_fd: i32,
+        entry: Entry,
+    ) -> Result<u32, DescriptorTableError> {
+        let min_index = usize::try_from(min_fd)
+            .map_err(|_| DescriptorTableError::BadDescriptor(min_fd as u32))?;
+        if !self.limit.admits(min_index) {
+            return Err(DescriptorTableError::TooManyDescriptors {
+                limit: self.limit.get(),
+            });
+        }
+        let existing_slot = self
+            .entries
+            .iter()
+            .enumerate()
+            .skip(min_index)
+            .find_map(|(idx, slot)| (slot.is_none() && self.limit.admits(idx)).then_some(idx));
+        let target = if let Some(idx) = existing_slot {
+            idx
+        } else {
+            let idx = self.entries.len().max(min_index);
+            if !self.limit.admits(idx) {
+                return Err(DescriptorTableError::TooManyDescriptors {
+                    limit: self.limit.get(),
+                });
+            }
+            let previous_len = self.entries.len();
+            self.entries.resize_with(idx + 1, || None);
+            if idx > previous_len {
+                self.free.release_range(previous_len..idx);
+            }
+            idx
+        };
+        let number = u32::try_from(target).map_err(|_| DescriptorTableError::IndexOverflow)?;
+        self.entries[target] = Some(entry);
+        Ok(number)
+    }
+
     pub fn get_entry(&self, fd: i32) -> Option<&Entry> {
         usize::try_from(fd)
             .ok()
@@ -106,5 +148,38 @@ impl<Entry> DescriptorSlots<Entry> {
             .ok_or(DescriptorTableError::BadDescriptor(fd as u32))?;
         self.free.release(index);
         Ok(entry)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_entry_from_respects_floor_gaps_and_limit() {
+        let mut slots = DescriptorSlots::<u32>::new();
+        slots.limit = DescriptorLimit::new(8);
+        assert_eq!(slots.insert_entry(10).unwrap(), 0);
+        assert_eq!(slots.insert_entry(11).unwrap(), 1);
+        assert_eq!(slots.insert_entry_from(4, 14).unwrap(), 4);
+        assert_eq!(slots.insert_entry_from(4, 15).unwrap(), 5);
+        // Plain allocation fills the gap below 4 without clobbering 4 or 5.
+        assert_eq!(slots.insert_entry(12).unwrap(), 2);
+        assert_eq!(slots.insert_entry(13).unwrap(), 3);
+        assert_eq!(slots.insert_entry(16).unwrap(), 6);
+        assert_eq!(slots.get_entry(4), Some(&14));
+        assert_eq!(slots.get_entry(5), Some(&15));
+        // Closing 5 lets insert_entry_from(4) reuse 5.
+        assert_eq!(slots.close(5).unwrap(), 15);
+        assert_eq!(slots.insert_entry_from(4, 25).unwrap(), 5);
+        assert_eq!(slots.insert_entry_from(4, 27).unwrap(), 7);
+        assert!(matches!(
+            slots.insert_entry_from(4, 28),
+            Err(DescriptorTableError::TooManyDescriptors { limit: 8 })
+        ));
+        assert!(matches!(
+            slots.insert_entry_from(-1, 29),
+            Err(DescriptorTableError::BadDescriptor(_))
+        ));
     }
 }

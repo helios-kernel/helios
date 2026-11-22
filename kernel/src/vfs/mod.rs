@@ -1522,6 +1522,22 @@ impl<S: Storage> MountedFs<S> {
         }
     }
 
+    /// Updates Unix permission bits on filesystems that store them in memory
+    /// (`MemoryFs` and `RootFs`'s writable upper layer). No-op on backends
+    /// whose host or on-disk metadata sets creation permissions itself.
+    pub fn apply_created_permissions(&self, path: FsPath<'_>, permissions: u32, now: u64) {
+        let mode = permissions & 0o7777;
+        match self {
+            Self::Memory(fs) => {
+                let _ = fs.set_permissions(path, mode, now);
+            }
+            Self::Root(root) => {
+                let _ = root.upper().set_permissions(path, mode, now);
+            }
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) | Self::Btrfs(_) => {}
+        }
+    }
+
     /// Ends the filesystem as it leaves the mount table: a writable btrfs
     /// mount commits and lets its device go first.
     async fn unmount(&self) {

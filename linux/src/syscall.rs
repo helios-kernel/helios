@@ -1,4 +1,6 @@
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use bytes::Bytes;
 use core::convert::Infallible;
 use core::future::Future;
@@ -10,22 +12,30 @@ use helios_hal::native::{UserContext, UserFault};
 use helios_hal::vmm::PageFlags;
 use helios_sync::{Notify, NotifyWaiter, RawMutex};
 use helios_unix::{
-    ChildTermination, DescriptorSlots, FileDescriptor, FileDescriptorEntry, FutexTable, NoNetwork,
-    ProcessIdentity, ProcessMemoryIdentity, Signal, SignalSet, SocketNetwork,
+    ChildTermination, DescriptorSlots, FDFLAG_NONBLOCK, FileDescriptor, FileDescriptorEntry,
+    FutexTable, NoNetwork, ProcessIdentity, ProcessMemoryIdentity, Signal, SignalSet,
+    SocketNetwork,
 };
 
+mod fs;
 mod futex;
 mod io;
 mod memory;
 mod netlink;
 mod packet;
+mod poll;
 mod signal;
 mod socket;
 mod system;
 mod thread;
+mod tty;
 
 pub use crate::abi::{Abi, Operation};
 pub use crate::signal_frame::SignalFrameError;
+pub use fs::{
+    AccessCheck, DirListEntry, FileAccess, FileStat, Filesystem, LinkOptions, OpenRequest,
+    TimeUpdate,
+};
 pub use io::Clock;
 pub use netlink::{AF_NETLINK, NETLINK_ROUTE};
 pub use packet::AF_PACKET;
@@ -45,6 +55,7 @@ pub use system::{
     RLIM_INFINITY, Resource, Rlimit, Start, System, UTS_FIELD_MAX, UtsField, UtsNameError,
 };
 pub use thread::PidNamespace;
+pub use tty::{Termios, TermiosAction, Tty, TtyError, TtyStream, Winsize};
 
 /// The platform objects a process's descriptors can hold besides the UNIX
 /// objects `helios-unix` owns (pipes, eventfds, epoll sets, sockets): the
@@ -272,7 +283,24 @@ pub enum WriteError {
     Io,
     #[error("the process's authority does not reach this output")]
     Denied,
+    #[error("non-blocking output would block")]
+    WouldBlock,
 }
+
+/// Non-blocking standard-input read outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdinTryRead {
+    Ready(Bytes),
+    Eof,
+    WouldBlock,
+    Denied,
+}
+
+/// Readiness event mask bits (matching Linux `POLLIN`/`POLLOUT`/`POLLERR`/`POLLHUP`).
+pub const READY_IN: u32 = poll::POLLIN;
+pub const READY_OUT: u32 = poll::POLLOUT;
+pub const READY_ERR: u32 = poll::POLLERR;
+pub const READY_HUP: u32 = poll::POLLHUP;
 
 /// A refusal by the process's authority, or of an address it may not use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -291,9 +319,34 @@ pub trait Stdio {
         bytes: &[u8],
     ) -> impl Future<Output = Result<usize, WriteError>> + Send;
 
+    /// Non-blocking write for `O_NONBLOCK` stdout/stderr descriptors.
+    fn try_write(&mut self, _stream: Stream, _bytes: &[u8]) -> Result<usize, WriteError> {
+        Err(WriteError::WouldBlock)
+    }
+
     /// Waits for standard input and returns what arrived, at most `limit`
     /// bytes; empty at the end of input.
     fn read_input(&mut self, limit: usize) -> impl Future<Output = Result<Bytes, Denied>> + Send;
+
+    /// Non-blocking read for `O_NONBLOCK` stdin descriptors.
+    fn try_read_input(&mut self, _limit: usize) -> StdinTryRead {
+        StdinTryRead::WouldBlock
+    }
+
+    /// Current readiness mask (`READY_IN`, `READY_HUP`, `READY_ERR`) for standard input.
+    fn stdin_ready_mask(&self) -> u32 {
+        0
+    }
+
+    /// Waits until standard input readiness may have changed (data arrived or EOF).
+    fn wait_stdin_ready(&self) -> impl Future<Output = ()> + Send {
+        core::future::pending()
+    }
+
+    /// Current readiness mask (`READY_OUT`, `READY_ERR`) for stdout/stderr.
+    fn stdout_ready_mask(&self, _stream: Stream) -> u32 {
+        READY_OUT
+    }
 }
 
 /// A system call as its ABI's registers carry it.
@@ -373,6 +426,8 @@ struct ProcessShared<R: Resources> {
     pids: PidNamespace,
     futex: FutexTable,
     descriptors: spin::Mutex<Descriptors<R>>,
+    cwd: spin::Mutex<String>,
+    shared_mappings: spin::Mutex<Vec<memory::SharedFileMapping<R::File>>>,
     stdin_lock: RawMutex,
     stdin_carry: spin::Mutex<Bytes>,
     credentials: Arc<spin::Mutex<Credentials>>,
@@ -396,9 +451,10 @@ impl core::ops::Deref for GroupLifecycle {
 ///
 /// Each thread task exclusively owns its `Process<R>` handle while
 /// dispatching a syscall. Shared process structures synchronize internally
-/// with bounded non-awaiting critical sections (`descriptors`, `attributes`,
-/// `credentials`, `program_break`, `signals`, `threads`, `futex`) or an async
-/// mutex (`stdin_carry`); no spin lock is ever held across an `.await`.
+/// with bounded non-awaiting critical sections (`descriptors`, `cwd`,
+/// `shared_mappings`, `attributes`, `credentials`, `program_break`, `signals`,
+/// `threads`, `futex`) or an async mutex (`stdin_carry`); no spin lock is ever
+/// held across an `.await`.
 pub struct Process<R: Resources> {
     shared: Arc<ProcessShared<R>>,
     tid: NonZeroU32,
@@ -428,7 +484,7 @@ impl<R: Resources> Process<R> {
         id: NonZeroU32,
         program_break: u64,
         mut descriptors: Descriptors<R>,
-        start: Start,
+        mut start: Start,
     ) -> Self {
         let open_files = descriptors.limit;
         let futex = start.futex.clone();
@@ -438,6 +494,11 @@ impl<R: Resources> Process<R> {
             .unwrap_or_else(|| PidNamespace::standalone(id));
         let credentials = Arc::new(spin::Mutex::new(start.credentials.clone()));
         let memory_id = ProcessMemoryIdentity::new(start.memory_id.unwrap_or(u64::from(id.get())));
+        let initial_cwd = start
+            .cwd
+            .take()
+            .filter(|p| p.starts_with('/'))
+            .unwrap_or_else(|| String::from("/"));
         let mut initial_stdin_carry = Bytes::new();
         for slot in descriptors.entries.iter_mut().flatten() {
             if let Descriptor::<R>::Stdin { carry } = &mut slot.descriptor
@@ -468,6 +529,8 @@ impl<R: Resources> Process<R> {
                 pids,
                 futex,
                 descriptors: spin::Mutex::new(descriptors),
+                cwd: spin::Mutex::new(initial_cwd),
+                shared_mappings: spin::Mutex::new(Vec::new()),
                 stdin_lock: RawMutex::new(),
                 stdin_carry: spin::Mutex::new(initial_stdin_carry),
                 credentials,
@@ -482,6 +545,16 @@ impl<R: Resources> Process<R> {
             robust_list,
             exited: false,
         }
+    }
+
+    /// Flushes every active writable `MAP_SHARED` file mapping back to its
+    /// backing file (used on process teardown after non-syscall exits).
+    pub async fn flush_shared_mappings<M: UserMemory, F: Filesystem<R>>(
+        &self,
+        memory: &M,
+        fs: &mut F,
+    ) {
+        memory::flush_all_shared_mappings(self, memory, fs).await;
     }
 
     /// Process-wide signal and interval-timer state shared across all threads
@@ -644,7 +717,7 @@ pub async fn dispatch<
     R: Resources,
     M: VirtualMemory,
     T: Thread<R>,
-    O: Stdio + Clock + System + Network<R::Network>,
+    O: Stdio + Clock + System + Filesystem<R> + Tty + Network<R::Network>,
 >(
     process: &mut Process<R>,
     call: Call,
@@ -656,6 +729,7 @@ pub async fn dispatch<
     let arguments = call.arguments;
     let outcome = match abi.operation(call.number) {
         operation @ (Operation::Exit | Operation::ExitGroup) => {
+            memory::flush_all_shared_mappings(process, memory, output).await;
             futex::exit_thread(process, memory);
             let status = arguments[0] as u8;
             let exit = if operation == Operation::ExitGroup {
@@ -734,6 +808,74 @@ pub async fn dispatch<
             output,
         )),
         Operation::Read => read::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Write => write::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Readv => {
+            fs::readv_common::<R, _, _>(process, arguments, None, 0, memory, output).await
+        }
+        Operation::Writev => {
+            fs::writev_common::<R, _, _>(process, arguments, None, 0, memory, output).await
+        }
+        Operation::Pread64 => {
+            SyscallOutcome::Return(fs::pread64::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Pwrite64 => SyscallOutcome::Return(
+            fs::pwrite64::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Preadv => {
+            fs::readv_common::<R, _, _>(
+                process,
+                arguments,
+                Some(arguments[3] as i64),
+                0,
+                memory,
+                output,
+            )
+            .await
+        }
+        Operation::Pwritev => {
+            fs::writev_common::<R, _, _>(
+                process,
+                arguments,
+                Some(arguments[3] as i64),
+                0,
+                memory,
+                output,
+            )
+            .await
+        }
+        Operation::Preadv2 => {
+            let off = arguments[3] as i64;
+            fs::readv_common::<R, _, _>(
+                process,
+                arguments,
+                (off != -1).then_some(off),
+                arguments[5],
+                memory,
+                output,
+            )
+            .await
+        }
+        Operation::Pwritev2 => {
+            let off = arguments[3] as i64;
+            fs::writev_common::<R, _, _>(
+                process,
+                arguments,
+                (off != -1).then_some(off),
+                arguments[5],
+                memory,
+                output,
+            )
+            .await
+        }
+        Operation::Openat => {
+            SyscallOutcome::Return(fs::openat::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Open => {
+            SyscallOutcome::Return(fs::open::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Creat => {
+            SyscallOutcome::Return(fs::creat::<R, _, _>(process, arguments, memory, output).await)
+        }
         Operation::Close => SyscallOutcome::Return(
             process
                 .shared
@@ -741,6 +883,101 @@ pub async fn dispatch<
                 .lock()
                 .close(arguments[0] as u32 as i32)
                 .map_or_else(io::descriptor_errno, |_| 0),
+        ),
+        Operation::CloseRange => SyscallOutcome::Return(fs::close_range::<R>(process, arguments)),
+        Operation::Lseek => {
+            SyscallOutcome::Return(fs::lseek::<R, _>(process, arguments, output).await)
+        }
+        Operation::Fstat => SyscallOutcome::Return(
+            fs::fstat::<R, _, _, _>(process, arguments, memory, output, output).await,
+        ),
+        Operation::Newfstatat => SyscallOutcome::Return(
+            fs::newfstatat::<R, _, _, _>(process, arguments, memory, output, output).await,
+        ),
+        Operation::Stat => SyscallOutcome::Return(
+            fs::stat::<R, _, _, _>(process, arguments, true, memory, output, output).await,
+        ),
+        Operation::Lstat => SyscallOutcome::Return(
+            fs::stat::<R, _, _, _>(process, arguments, false, memory, output, output).await,
+        ),
+        Operation::Statx => SyscallOutcome::Return(
+            fs::statx::<R, _, _, _>(process, arguments, memory, output, output).await,
+        ),
+        Operation::Faccessat => SyscallOutcome::Return(
+            fs::faccessat::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Faccessat2 => SyscallOutcome::Return(
+            fs::faccessat::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        Operation::Access => {
+            SyscallOutcome::Return(fs::access::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Readlinkat => SyscallOutcome::Return(
+            fs::readlinkat::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Readlink => SyscallOutcome::Return(
+            fs::readlink::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Mkdirat => {
+            SyscallOutcome::Return(fs::mkdirat::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Mkdir => {
+            SyscallOutcome::Return(fs::mkdir::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Unlinkat => SyscallOutcome::Return(
+            fs::unlinkat::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Unlink => SyscallOutcome::Return(
+            fs::unlink::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Rmdir => SyscallOutcome::Return(
+            fs::unlink::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        Operation::Renameat2 => SyscallOutcome::Return(
+            fs::renameat2::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        Operation::Renameat => SyscallOutcome::Return(
+            fs::renameat2::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Rename => {
+            SyscallOutcome::Return(fs::rename::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Linkat => {
+            SyscallOutcome::Return(fs::linkat::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Link => {
+            SyscallOutcome::Return(fs::link::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Symlinkat => SyscallOutcome::Return(
+            fs::symlinkat::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Symlink => {
+            SyscallOutcome::Return(fs::symlink::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Utimensat => SyscallOutcome::Return(
+            fs::utimensat::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Chdir => {
+            SyscallOutcome::Return(fs::chdir::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Fchdir => {
+            SyscallOutcome::Return(fs::fchdir::<R, _>(process, arguments, output).await)
+        }
+        Operation::Getcwd => SyscallOutcome::Return(fs::getcwd::<R, _>(process, arguments, memory)),
+        Operation::Getdents64 => SyscallOutcome::Return(
+            fs::getdents64::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Ftruncate => {
+            SyscallOutcome::Return(fs::ftruncate::<R, _>(process, arguments, output).await)
+        }
+        Operation::Truncate => SyscallOutcome::Return(
+            fs::truncate::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Fsync => SyscallOutcome::Return(
+            fs::fsync::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Fdatasync => SyscallOutcome::Return(
+            fs::fsync::<R, _, _>(process, arguments, true, memory, output).await,
         ),
         operation @ (Operation::Pipe | Operation::Pipe2) => {
             SyscallOutcome::Return(io::pipe::<R, _>(
@@ -751,10 +988,12 @@ pub async fn dispatch<
             ))
         }
         operation @ (Operation::Dup | Operation::Dup2 | Operation::Dup3 | Operation::Fcntl) => {
-            SyscallOutcome::Return(io::duplicate::<R>(
+            SyscallOutcome::Return(io::duplicate::<R, _>(
+                abi,
                 &mut process.shared.descriptors.lock(),
                 operation,
                 arguments,
+                output,
             ))
         }
         operation @ (Operation::Eventfd | Operation::Eventfd2) => {
@@ -780,8 +1019,7 @@ pub async fn dispatch<
         operation @ (Operation::EpollWait | Operation::EpollPwait) => {
             io::epoll_wait::<R, _, _>(
                 abi,
-                &process.signals,
-                &process.shared.descriptors,
+                process,
                 arguments,
                 memory,
                 output,
@@ -789,31 +1027,24 @@ pub async fn dispatch<
             )
             .await
         }
-        Operation::Ppoll => {
-            io::ppoll::<R, _, _>(
-                &process.signals,
-                &process.shared.descriptors,
-                arguments,
-                memory,
-                output,
-            )
-            .await
-        }
+        Operation::Poll => poll::poll::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Ppoll => poll::ppoll::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Select => poll::select::<R, _, _>(process, arguments, memory, output).await,
+        Operation::Pselect6 => poll::pselect6::<R, _, _>(process, arguments, memory, output).await,
         Operation::Mmap => {
-            let _mm = process.shared.program_break.lock();
-            SyscallOutcome::Return(memory::mmap(abi, arguments, memory))
+            SyscallOutcome::Return(memory::mmap(process, abi, arguments, memory, output).await)
         }
         Operation::Munmap => {
-            let _mm = process.shared.program_break.lock();
-            SyscallOutcome::Return(memory::munmap(abi, arguments, memory))
+            SyscallOutcome::Return(memory::munmap(process, abi, arguments, memory, output).await)
+        }
+        Operation::Msync => {
+            SyscallOutcome::Return(memory::msync(process, abi, arguments, memory, output).await)
         }
         Operation::Mprotect => {
-            let _mm = process.shared.program_break.lock();
-            SyscallOutcome::Return(memory::mprotect(abi, arguments, memory))
+            SyscallOutcome::Return(memory::mprotect(process, abi, arguments, memory))
         }
         Operation::Mremap => {
-            let _mm = process.shared.program_break.lock();
-            SyscallOutcome::Return(memory::mremap(abi, arguments, memory))
+            SyscallOutcome::Return(memory::mremap(process, abi, arguments, memory, output).await)
         }
         Operation::Madvise => {
             let _mm = process.shared.program_break.lock();
@@ -854,56 +1085,32 @@ pub async fn dispatch<
             SyscallOutcome::Return(u64::from(process.tid.get()))
         }
         Operation::ArchPrctl => SyscallOutcome::Return(arch_prctl(abi, arguments, memory, thread)),
-        Operation::Writev => writev::<R, _, _>(process, arguments, memory, output).await,
         Operation::Ioctl => SyscallOutcome::Return({
-            let entry = process
+            let is_socket = process
                 .shared
                 .descriptors
                 .lock()
                 .get_entry(arguments[0] as u32 as i32)
-                .cloned();
-            match entry {
-                Some(entry) => {
-                    if let Descriptor::<R>::Socket(sock) = &entry.descriptor {
-                        let req = arguments[1] as u32;
-                        if req == socket::FIONBIO {
-                            let mut raw = [0u8; 4];
-                            if memory.read(arguments[2], &mut raw).is_err() {
-                                errno(EFAULT)
-                            } else {
-                                let nb = i32::from_le_bytes(raw) != 0;
-                                sock.set_nonblocking(nb);
-                                entry.set_fdflags(if nb {
-                                    socket::SOCK_NONBLOCK as u16
-                                } else {
-                                    0
-                                });
-                                0
-                            }
-                        } else {
-                            let ctx = socket_context(process);
-                            match netlink::socket_ioctl::<R::Network, _, _>(
-                                req,
-                                arguments[2],
-                                ctx,
-                                memory,
-                                output,
-                            )
-                            .await
-                            {
-                                Ok(Some(ret)) => ret,
-                                Ok(None) => errno(ENOTTY),
-                                Err(err) => errno(err),
-                            }
-                        }
-                    } else {
-                        errno(ENOTTY)
-                    }
+                .is_some_and(|e| matches!(e.descriptor, Descriptor::<R>::Socket(_)));
+            if is_socket {
+                let ctx = socket_context(process);
+                match netlink::socket_ioctl::<R::Network, _, _>(
+                    arguments[1] as u32,
+                    arguments[2],
+                    ctx,
+                    memory,
+                    output,
+                )
+                .await
+                {
+                    Ok(Some(ret)) => ret,
+                    Ok(None) => tty::ioctl::<R, _, _>(process, arguments, memory, output),
+                    Err(err) => errno(err),
                 }
-                None => errno(EBADF),
+            } else {
+                tty::ioctl::<R, _, _>(process, arguments, memory, output)
             }
         }),
-        Operation::Write => write::<R, _, _>(process, arguments, memory, output).await,
         Operation::ClockGettime => {
             SyscallOutcome::Return(system::clock_gettime(arguments, memory, output))
         }
@@ -1096,7 +1303,7 @@ pub async fn dispatch<
     ControlFlow::Continue(outcome)
 }
 
-async fn read<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
+async fn read<R: Resources, M: UserMemory, O: Stdio + Filesystem<R> + Network<R::Network>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1111,6 +1318,14 @@ async fn read<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     else {
         return SyscallOutcome::Return(errno(EBADF));
     };
+    if matches!(
+        entry.descriptor,
+        Descriptor::<R>::File(_) | Descriptor::<R>::Preopen { .. }
+    ) {
+        return SyscallOutcome::Return(
+            fs::read_file(process, &entry, args[1], args[2], None, memory, output).await,
+        );
+    }
     if let Descriptor::<R>::Socket(sock) = &entry.descriptor {
         let limit = args[2].min(MAX_RW_COUNT) as usize;
         if limit == 0 {
@@ -1137,6 +1352,7 @@ async fn read<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
         if memory.check_writable(args[1], limit).is_err() {
             return SyscallOutcome::Return(errno(EFAULT));
         }
+        let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
         let stdin_guard = match process
             .signals
             .interruptible(process.shared.stdin_lock.lock())
@@ -1146,16 +1362,27 @@ async fn read<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
             signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
         };
         if process.shared.stdin_carry.lock().is_empty() {
-            match process
-                .signals
-                .interruptible(output.read_input(limit))
-                .await
-            {
-                signal::WaitOutcome::Ready(Ok(bytes)) => *process.shared.stdin_carry.lock() = bytes,
-                signal::WaitOutcome::Ready(Err(Denied)) => {
-                    return SyscallOutcome::Return(errno(EACCES));
+            if nonblock {
+                match output.try_read_input(limit) {
+                    StdinTryRead::Ready(bytes) => *process.shared.stdin_carry.lock() = bytes,
+                    StdinTryRead::Eof => return SyscallOutcome::Return(0),
+                    StdinTryRead::WouldBlock => return SyscallOutcome::Return(errno(EAGAIN)),
+                    StdinTryRead::Denied => return SyscallOutcome::Return(errno(EACCES)),
                 }
-                signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+            } else {
+                match process
+                    .signals
+                    .interruptible(output.read_input(limit))
+                    .await
+                {
+                    signal::WaitOutcome::Ready(Ok(bytes)) => {
+                        *process.shared.stdin_carry.lock() = bytes;
+                    }
+                    signal::WaitOutcome::Ready(Err(Denied)) => {
+                        return SyscallOutcome::Return(errno(EACCES));
+                    }
+                    signal::WaitOutcome::Interrupted => return SyscallOutcome::RestartSys,
+                }
             }
         }
         let bytes = {
@@ -1181,10 +1408,10 @@ fn socket_context<R: Resources>(process: &Process<R>) -> socket::SocketContext {
     }
 }
 
-async fn write<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
+async fn write<R: Resources, M: VirtualMemory, O: Stdio + Filesystem<R> + Network<R::Network>>(
     process: &Process<R>,
     args: [u64; 6],
-    memory: &M,
+    memory: &mut M,
     output: &mut O,
 ) -> SyscallOutcome {
     // Linux takes fd as an unsigned int, discarding the register's upper bits.
@@ -1197,6 +1424,14 @@ async fn write<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     else {
         return SyscallOutcome::Return(errno(EBADF));
     };
+    if matches!(
+        entry.descriptor,
+        Descriptor::<R>::File(_) | Descriptor::<R>::Preopen { .. }
+    ) {
+        return SyscallOutcome::Return(
+            fs::write_file(process, &entry, args[1], args[2], None, 0, memory, output).await,
+        );
+    }
     if let Descriptor::<R>::Socket(sock) = &entry.descriptor {
         let count = args[2].min(MAX_RW_COUNT) as usize;
         let mut data = alloc::vec![0u8; count];
@@ -1216,6 +1451,7 @@ async fn write<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
         Descriptor::<R>::Stderr => Stream::Stderr,
         _ => return io::write_resource::<R, M>(&process.signals, &entry, args, memory).await,
     };
+    let nonblock = entry.fdflags() & FDFLAG_NONBLOCK != 0;
     // Linux MAX_RW_COUNT is INT_MAX rounded down to PAGE_SIZE (x86-64: 4096).
     let count = args[2].min(MAX_RW_COUNT);
     if args[1].checked_add(count).is_none() {
@@ -1233,7 +1469,12 @@ async fn write<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
         if memory.read(address, &mut buffer[..size]).is_err() {
             return SyscallOutcome::Return(if written == 0 { errno(EFAULT) } else { written });
         }
-        match output.write(stream, &buffer[..size]).await {
+        let step = if nonblock {
+            output.try_write(stream, &buffer[..size])
+        } else {
+            output.write(stream, &buffer[..size]).await
+        };
+        match step {
             Ok(n) => {
                 assert!(n <= size, "output returned more bytes than supplied");
                 written += n as u64;
@@ -1249,6 +1490,7 @@ async fn write<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
                         WriteError::Interrupted => EINTR,
                         WriteError::Io => EIO,
                         WriteError::Denied => EACCES,
+                        WriteError::WouldBlock => EAGAIN,
                     })
                 });
             }
@@ -1281,85 +1523,6 @@ fn arch_prctl<R: Resources, M: UserMemory, T: Thread<R>>(
     }
 }
 
-async fn writev<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
-    process: &Process<R>,
-    args: [u64; 6],
-    memory: &M,
-    output: &mut O,
-) -> SyscallOutcome {
-    if process
-        .shared
-        .descriptors
-        .lock()
-        .get_entry(args[0] as u32 as i32)
-        .is_none()
-    {
-        return SyscallOutcome::Return(errno(EBADF));
-    }
-    let count = args[2] as u32;
-    // Linux UIO_MAXIOV; negative int values also fail this unsigned comparison.
-    if count > 1024 {
-        return SyscallOutcome::Return(errno(EINVAL));
-    }
-    if count == 0 {
-        return SyscallOutcome::Return(0);
-    }
-    if args[1].checked_add(u64::from(count) * 16).is_none() {
-        return SyscallOutcome::Return(errno(EFAULT));
-    }
-    let mut vector = [0; 16];
-    // Import/validate all lengths before emitting bytes, as Linux import_iovec
-    // does.
-    for index in 0..count {
-        if memory
-            .read(args[1] + u64::from(index) * 16, &mut vector)
-            .is_err()
-        {
-            return SyscallOutcome::Return(errno(EFAULT));
-        }
-        let length = u64::from_le_bytes(vector[8..].try_into().unwrap());
-        if length > i64::MAX as u64 {
-            return SyscallOutcome::Return(errno(EINVAL));
-        }
-    }
-    let mut done = 0;
-    for index in 0..count {
-        if done == MAX_RW_COUNT {
-            break;
-        }
-        if memory
-            .read(args[1] + u64::from(index) * 16, &mut vector)
-            .is_err()
-        {
-            return SyscallOutcome::Return(if done == 0 { errno(EFAULT) } else { done });
-        }
-        let base = u64::from_le_bytes(vector[..8].try_into().unwrap());
-        let length = u64::from_le_bytes(vector[8..].try_into().unwrap()).min(MAX_RW_COUNT - done);
-        if length == 0 {
-            continue;
-        }
-        match write::<R, _, _>(process, [args[0], base, length, 0, 0, 0], memory, output).await {
-            SyscallOutcome::Return(result) => {
-                if (result as i64) < 0 {
-                    return SyscallOutcome::Return(if done == 0 { result } else { done });
-                }
-                done += result;
-                if result < length {
-                    break;
-                }
-            }
-            interrupted => {
-                return if done == 0 {
-                    interrupted
-                } else {
-                    SyscallOutcome::Return(done)
-                };
-            }
-        }
-    }
-    SyscallOutcome::Return(done)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1543,9 @@ mod tests {
         type Data = u64;
     }
 
+    struct NoFs;
+    impl Filesystem<Files> for NoFs {}
+
     fn open_file(descriptors: &Descriptors<Files>, fd: i32) -> &OpenFile<Node> {
         match descriptors.get_entry(fd).map(|entry| &entry.descriptor) {
             Some(Descriptor::<Files>::File(file)) => file,
@@ -1397,15 +1563,19 @@ mod tests {
                 false,
             ))
             .expect("the table has room");
-        let duplicate = io::duplicate::<Files>(
+        let duplicate = io::duplicate::<Files, _>(
+            Abi::X86_64,
             &mut descriptors,
             Operation::Dup,
             [u64::from(fd), 0, 0, 0, 0, 0],
+            &NoFs,
         );
-        let target = io::duplicate::<Files>(
+        let target = io::duplicate::<Files, _>(
+            Abi::X86_64,
             &mut descriptors,
             Operation::Dup3,
             [u64::from(fd), 9, O_CLOEXEC, 0, 0, 0],
+            &NoFs,
         );
         assert_eq!(target, 9);
 

@@ -168,6 +168,9 @@ impl Stdio for MockPlatform {
     }
 }
 
+impl helios_linux::syscall::Filesystem<MockResources> for MockPlatform {}
+impl helios_linux::syscall::Tty for MockPlatform {}
+
 impl Clock for MockPlatform {
     fn now_nanos(&self) -> u64 {
         0

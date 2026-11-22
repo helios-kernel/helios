@@ -455,6 +455,9 @@ mod tests {
             }
         }
 
+        impl helios_linux::syscall::Filesystem<KernelTestResources> for KernelTestPlatform {}
+        impl helios_linux::syscall::Tty for KernelTestPlatform {}
+
         impl Clock for KernelTestPlatform {
             fn now_nanos(&self) -> u64 {
                 0

@@ -1205,7 +1205,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1225,12 +1225,15 @@ jobs:
           grep -Fqx 'memory:0' linux-smoke.out
           grep -Fqx 'pthreads:0' linux-smoke.out
           grep -Fqx 'signals:0' linux-smoke.out
-          # The system-information suite (#1035) runs as a process with no
-          # wall-clock right and no scheduling or resource privilege, the
-          # same modes build-fixtures.sh asserts on this Linux runner.
-          for suite in clock random identity limits machine priority container sockets netconfig; do
+          # The system-information suite (#1035), sockets (#1030), netconfig
+          # (#1031), and file/readiness/tty suites (#1028) run in the same
+          # modes build-fixtures.sh asserts on Linux.
+          for suite in clock random identity limits machine priority container sockets netconfig files files-cross readiness stdin-epoll tty; do
             grep -Fqx "$suite: ok" linux-smoke.out
           done
+          grep -Fqx 'from-wasix: 中文 日本語 한국어' linux-smoke.out
+          grep -Fqx 'from-linux-write' linux-smoke.out
+          grep -Fqx 'from-linux-mmap' linux-smoke.out
       - name: Mount EROFS and btrfs disks from init
         timeout-minutes: 5
         shell: bash
@@ -1894,7 +1897,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1914,12 +1917,15 @@ jobs:
           grep -Fqx 'memory:0' linux-smoke.out
           grep -Fqx 'pthreads:0' linux-smoke.out
           grep -Fqx 'signals:0' linux-smoke.out
-          # The system-information suite (#1035) runs as a process with no
-          # wall-clock right and no scheduling or resource privilege, the
-          # same modes build-fixtures.sh asserts on this Linux runner.
-          for suite in clock random identity limits machine priority container sockets netconfig; do
+          # The system-information suite (#1035), sockets (#1030), netconfig
+          # (#1031), and file/readiness/tty suites (#1028) run in the same
+          # modes build-fixtures.sh asserts on Linux.
+          for suite in clock random identity limits machine priority container sockets netconfig files files-cross readiness stdin-epoll tty; do
             grep -Fqx "$suite: ok" linux-smoke.out
           done
+          grep -Fqx 'from-wasix: 中文 日本語 한국어' linux-smoke.out
+          grep -Fqx 'from-linux-write' linux-smoke.out
+          grep -Fqx 'from-linux-mmap' linux-smoke.out
       - name: Kill the guest during a btrfs write burst
         timeout-minutes: 10
         shell: bash
