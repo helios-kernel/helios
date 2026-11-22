@@ -196,7 +196,12 @@ impl Superblock {
     /// one whose fsynced state is still in a log tree. Only a writable mount
     /// replays the log.
     pub(crate) fn check_supported(&self) -> Result<(), Error> {
-        self.check_features()?;
+        self.check_supported_for(1)
+    }
+
+    /// [`Self::check_supported`] for a mount given `device_count` backing devices.
+    pub(crate) fn check_supported_for(&self, device_count: usize) -> Result<(), Error> {
+        self.check_features_for(device_count)?;
         if self.log_root != 0 {
             return Err(Error::LogReplayRequired {
                 log_root: self.log_root,
@@ -205,8 +210,16 @@ impl Superblock {
         Ok(())
     }
 
-    /// Refuses a filesystem with a feature this crate does not implement.
+    /// Refuses a filesystem with a feature this crate does not implement,
+    /// requiring a single device.
+    #[cfg(feature = "write")]
     pub(crate) fn check_features(&self) -> Result<(), Error> {
+        self.check_features_for(1)
+    }
+
+    /// Refuses a filesystem with a feature this crate does not implement,
+    /// checking that its device count matches `device_count`.
+    pub(crate) fn check_features_for(&self, device_count: usize) -> Result<(), Error> {
         let mut unknown = self.incompat_flags;
         for (bit, name, supported) in INCOMPAT_FEATURES {
             if self.incompat_flags & bit != 0 && !supported {
@@ -221,7 +234,7 @@ impl Superblock {
                 bit,
             });
         }
-        if self.num_devices != 1 {
+        if self.num_devices != device_count as u64 {
             return Err(Error::MultiDevice {
                 devices: self.num_devices,
             });

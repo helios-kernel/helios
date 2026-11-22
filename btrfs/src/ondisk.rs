@@ -97,6 +97,8 @@ pub(crate) mod item_type {
     pub(crate) const ROOT_ITEM: u8 = 132;
     pub(crate) const ROOT_BACKREF: u8 = 144;
     #[cfg(feature = "write")]
+    pub(crate) const ROOT_REF: u8 = 156;
+    #[cfg(feature = "write")]
     pub(crate) const EXTENT_ITEM: u8 = 168;
     #[cfg(feature = "write")]
     pub(crate) const METADATA_ITEM: u8 = 169;
@@ -121,6 +123,14 @@ pub(crate) mod item_type {
     #[cfg(feature = "write")]
     pub(crate) const DEV_ITEM: u8 = 216;
     pub(crate) const CHUNK_ITEM: u8 = 228;
+    #[cfg(feature = "write")]
+    pub(crate) const QGROUP_STATUS: u8 = 240;
+    #[cfg(feature = "write")]
+    pub(crate) const QGROUP_INFO: u8 = 242;
+    #[cfg(feature = "write")]
+    pub(crate) const QGROUP_LIMIT: u8 = 244;
+    #[cfg(feature = "write")]
+    pub(crate) const QGROUP_RELATION: u8 = 246;
     #[cfg(feature = "write")]
     pub(crate) const UUID_SUBVOL: u8 = 251;
     #[cfg(feature = "write")]
@@ -416,6 +426,41 @@ pub(crate) struct RawFileExtentBody {
     pub(crate) num_bytes: U64,
 }
 
+/// `btrfs_qgroup_status_item` (version 1, classic qgroups).
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+#[cfg(feature = "write")]
+pub(crate) struct RawQgroupStatus {
+    pub(crate) version: U64,
+    pub(crate) generation: U64,
+    pub(crate) flags: U64,
+    pub(crate) rescan: U64,
+}
+
+/// `btrfs_qgroup_info_item`.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+#[cfg(feature = "write")]
+pub(crate) struct RawQgroupInfo {
+    pub(crate) generation: U64,
+    pub(crate) rfer: U64,
+    pub(crate) rfer_cmpr: U64,
+    pub(crate) excl: U64,
+    pub(crate) excl_cmpr: U64,
+}
+
+/// `btrfs_qgroup_limit_item`.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+#[cfg(feature = "write")]
+pub(crate) struct RawQgroupLimit {
+    pub(crate) flags: U64,
+    pub(crate) max_rfer: U64,
+    pub(crate) max_excl: U64,
+    pub(crate) rsv_rfer: U64,
+    pub(crate) rsv_excl: U64,
+}
+
 /// Views the head of `bytes` as `T`, or `None` when `bytes` is shorter.
 pub(crate) fn view<T>(bytes: &[u8]) -> Option<&T>
 where
@@ -441,4 +486,10 @@ const _: () = {
     assert!(size_of::<RawDirItem>() == 30);
     assert!(size_of::<RawFileExtentHead>() == 21);
     assert!(size_of::<RawFileExtentBody>() == 32);
+    #[cfg(feature = "write")]
+    {
+        assert!(size_of::<RawQgroupStatus>() == 32);
+        assert!(size_of::<RawQgroupInfo>() == 40);
+        assert!(size_of::<RawQgroupLimit>() == 40);
+    }
 };

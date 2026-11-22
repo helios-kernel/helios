@@ -218,9 +218,7 @@ impl State<Device, DeviceBacking> {
                 direct_io,
             ) {
                 Ok(state) => return Ok(state),
-                Err(OpenError::Write(
-                    WriteError::UnsupportedCompatRo { .. } | WriteError::QuotaTreePresent,
-                )) => {}
+                Err(OpenError::Write(WriteError::UnsupportedCompatRo { .. })) => {}
                 Err(OpenError::Device(error))
                     if matches!(error.raw_os_error(), Some(libc::EROFS | libc::EACCES)) => {}
                 Err(error) => return Err(error),

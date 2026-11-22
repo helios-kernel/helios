@@ -840,6 +840,7 @@ impl<S: BlockSink> Transaction<S> {
             }
             .into());
         }
+        self.check_quota_limit(tree, total_gap)?;
         for gap in gaps {
             // Clear any explicit hole items spanning this gap (slicing any
             // explicit hole that extends past the gap boundaries).

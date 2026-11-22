@@ -66,9 +66,17 @@ mod items;
 mod key;
 mod ondisk;
 #[cfg(feature = "write")]
+mod qgroup;
+#[cfg(feature = "write")]
+mod receive;
+#[cfg(feature = "write")]
 mod retirement;
 #[cfg(feature = "write")]
 mod roots;
+#[cfg(feature = "write")]
+mod scrub;
+#[cfg(feature = "write")]
+mod send;
 mod source;
 #[cfg(feature = "write")]
 mod space;

@@ -37,7 +37,7 @@ use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
 use crate::Key;
-use crate::chunk::{Chunk, MAX_COPIES};
+use crate::chunk::{Chunk, MAX_COPIES, Stripe};
 use crate::ondisk::{RawChunk, RawDevItem, RawStripe, STRIPE_LEN, item_type, objectid, view};
 use crate::source::BlockSink;
 use crate::space::{DATA, METADATA, SYSTEM, SpaceError};
@@ -50,6 +50,8 @@ const SZ_1G: u64 = 1 << 30;
 const DEVICE_RANGE_RESERVED: u64 = SZ_1M;
 /// `BTRFS_MAX_DATA_CHUNK_SIZE`.
 const MAX_DATA_CHUNK_SIZE: u64 = 10 * SZ_1G;
+/// `BTRFS_BLOCK_GROUP_RAID1`.
+const RAID1: u64 = 1 << 4;
 /// `BTRFS_BLOCK_GROUP_DUP`.
 const DUP: u64 = 1 << 5;
 /// `BTRFS_BLOCK_GROUP_PROFILE_MASK`: RAID0, RAID1, DUP, RAID10, RAID5, RAID6,
@@ -231,7 +233,7 @@ fn find_hole(extents: &[Range<u64>], device_bytes: u64, want: u64) -> Hole {
 /// filesystem with none gets the unreplicated profile.
 fn chunk_flags(latest: Option<u64>, kind: u64) -> Result<u64, ChunkError> {
     let flags = latest.unwrap_or(kind);
-    if flags & PROFILE_MASK & !DUP != 0 {
+    if flags & PROFILE_MASK & !(DUP | RAID1) != 0 {
         return Err(ChunkError::UnsupportedProfile { flags });
     }
     Ok(flags)
@@ -281,7 +283,7 @@ impl<S: BlockSink> Transaction<S> {
     /// Makes `length` bytes reservable as data, allocating a data chunk when no
     /// free range holds them. A full device is not an error here: the caller's
     /// reservation reports it, or shrinks to what exists.
-    pub(super) async fn ensure_data(&mut self, length: u64) -> Result<(), WriteError> {
+    pub(crate) async fn ensure_data(&mut self, length: u64) -> Result<(), WriteError> {
         if !self.space.can_reserve(length, DATA) {
             self.allocate_chunk_if_room(DATA).await?;
         }
@@ -348,16 +350,33 @@ impl<S: BlockSink> Transaction<S> {
         self.create_chunk(kind).await
     }
 
-    async fn device(&self, devid: u64) -> Result<Device, WriteError> {
-        let item = self
+    /// Every `DEV_ITEM` in the chunk tree, sorted by `devid`.
+    pub(crate) async fn all_dev_items(&self) -> Result<Vec<(u64, RawDevItem)>, WriteError> {
+        let mut items = Vec::new();
+        let mut key = Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, 0);
+        while let Some((found, bytes)) = self
             .trees
-            .get(
-                &self.volume,
-                self.chunk_root,
-                Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, devid),
-            )
+            .ceiling(&self.volume, self.chunk_root, key)
             .await?
-            .ok_or(ChunkError::MissingDevice { devid })?;
+        {
+            if found.objectid != objectid::DEV_ITEMS || found.item_type != item_type::DEV_ITEM {
+                break;
+            }
+            let dev: RawDevItem =
+                *view(&bytes).ok_or(ChunkError::Truncated { len: bytes.len() })?;
+            items.push((found.offset, dev));
+            let Some(next) = found.offset.checked_add(1) else {
+                break;
+            };
+            key.offset = next;
+        }
+        Ok(items)
+    }
+
+    pub(crate) async fn device_extents(
+        &self,
+        devid: u64,
+    ) -> Result<(Vec<Range<u64>>, [u8; 16]), WriteError> {
         let mut extents = Vec::new();
         let mut chunk_tree_uuid = [0; 16];
         let root = self.roots.get(objectid::DEV_TREE)?;
@@ -382,8 +401,62 @@ impl<S: BlockSink> Transaction<S> {
             key.offset = next;
         }
         // Ranges released by removed chunks stay allocated until publication.
-        extents.extend(self.released.iter().cloned());
+        for (rel_dev, range) in &self.released {
+            if *rel_dev == devid {
+                extents.push(range.clone());
+            }
+        }
         extents.sort_unstable_by_key(|extent| extent.start);
+        Ok((extents, chunk_tree_uuid))
+    }
+
+    /// Reads the `chunk_tree_uuid` recorded in existing device extents, or the
+    /// chunk tree root header's `chunk_tree_uuid` if none exist yet.
+    pub(crate) async fn chunk_tree_uuid(&self) -> Result<[u8; 16], WriteError> {
+        let root = self.roots.get(objectid::DEV_TREE)?;
+        let mut key = Key::new(0, 0, 0);
+        while let Some((found, bytes)) = self.trees.ceiling(&self.volume, root, key).await? {
+            if found.item_type == item_type::DEV_EXTENT
+                && let Some(uuid) = bytes.get(32..48)
+            {
+                let mut out = [0; 16];
+                out.copy_from_slice(uuid);
+                return Ok(out);
+            }
+            let Some(next) = found.offset.checked_add(1) else {
+                break;
+            };
+            key = Key::new(found.objectid, found.item_type, next);
+        }
+        let header = self
+            .trees
+            .read(
+                &self.volume,
+                self.chunk_root.bytenr,
+                crate::tree::Expected {
+                    level: self.chunk_root.level,
+                    generation: self.chunk_root.generation,
+                    first_key: None,
+                },
+            )
+            .await?;
+        Ok(header.chunk_tree_uuid())
+    }
+
+    async fn device(&self, devid: u64) -> Result<Device, WriteError> {
+        let item = self
+            .trees
+            .get(
+                &self.volume,
+                self.chunk_root,
+                Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, devid),
+            )
+            .await?
+            .ok_or(ChunkError::MissingDevice { devid })?;
+        let (extents, mut chunk_tree_uuid) = self.device_extents(devid).await?;
+        if chunk_tree_uuid == [0; 16] {
+            chunk_tree_uuid = self.chunk_tree_uuid().await?;
+        }
         Ok(Device {
             item,
             extents,
@@ -412,11 +485,6 @@ impl<S: BlockSink> Transaction<S> {
         length: u64,
         flags: u64,
     ) -> Result<(), WriteError> {
-        let devid = self.volume.superblock().devid();
-        let device = self.device(devid).await?;
-        let dev: RawDevItem = *view(&device.item).ok_or(ChunkError::Truncated {
-            len: device.item.len(),
-        })?;
         self.space.remove_group(logical);
         let chunk = self
             .volume
@@ -436,53 +504,64 @@ impl<S: BlockSink> Transaction<S> {
 
         // Each copy's device extent is `length` bytes (`create_chunk`).
         let mut root = self.roots.get(objectid::DEV_TREE)?;
-        for &physical in chunk.copies() {
+        let mut per_dev_used: alloc::collections::BTreeMap<u64, u64> =
+            alloc::collections::BTreeMap::new();
+        for &stripe in chunk.copies() {
             root = self
                 .trees
                 .apply(
                     &self.volume,
                     root,
-                    Key::new(devid, item_type::DEV_EXTENT, physical),
+                    Key::new(stripe.devid, item_type::DEV_EXTENT, stripe.offset),
                     None,
                     &mut self.space,
                 )
                 .await?;
-            self.released.push(physical..physical + length);
+            self.released
+                .push((stripe.devid, stripe.offset..stripe.offset + length));
+            *per_dev_used.entry(stripe.devid).or_default() += length;
         }
         self.roots.set(root)?;
 
-        let used = length * chunk.copies().len() as u64;
-        let mut updated = dev;
-        updated.bytes_used.set(
-            dev.bytes_used
-                .get()
-                .checked_sub(used)
-                .expect("a removed chunk was counted as allocated"),
-        );
-        let mut device_item = device.item.clone();
-        device_item[..size_of::<RawDevItem>()].copy_from_slice(updated.as_bytes());
-        for (key, bytes) in [
-            (
-                Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, devid),
-                Some(&device_item),
-            ),
-            (
-                Key::new(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM, logical),
-                None,
-            ),
-        ] {
+        let primary_devid = self.volume.superblock().devid();
+        for (devid, used) in per_dev_used {
+            let device = self.device(devid).await?;
+            let dev: RawDevItem = *view(&device.item).ok_or(ChunkError::Truncated {
+                len: device.item.len(),
+            })?;
+            let mut updated = dev;
+            updated.bytes_used.set(
+                dev.bytes_used
+                    .get()
+                    .checked_sub(used)
+                    .expect("a removed chunk was counted as allocated"),
+            );
+            let mut device_item = device.item.clone();
+            device_item[..size_of::<RawDevItem>()].copy_from_slice(updated.as_bytes());
             self.chunk_root = self
                 .trees
                 .apply(
                     &self.volume,
                     self.chunk_root,
-                    key,
-                    bytes.map(Vec::as_slice),
+                    Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, devid),
+                    Some(&device_item),
                     &mut self.space,
                 )
                 .await?;
+            if devid == primary_devid {
+                self.image.sub_device_used(used);
+            }
         }
-        self.image.sub_device_used(used);
+        self.chunk_root = self
+            .trees
+            .apply(
+                &self.volume,
+                self.chunk_root,
+                Key::new(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM, logical),
+                None,
+                &mut self.space,
+            )
+            .await?;
         if flags & SYSTEM != 0 {
             self.image.remove_system_chunk(logical)?;
         }
@@ -491,35 +570,73 @@ impl<S: BlockSink> Transaction<S> {
     }
 
     /// `btrfs_create_chunk` and the items `btrfs_create_pending_block_groups`
-    /// adds, in this transaction.
+    /// adds, in this transaction. Selects eligible devices across the volume,
+    /// respecting `excluded_device` (during device removal) and
+    /// `device_size_limit` (during device shrink).
     async fn create_chunk(&mut self, kind: u64) -> Result<(), WriteError> {
-        let flags = chunk_flags(self.space.latest_flags(kind), kind)?;
-        let superblock = self.volume.superblock();
-        let devid = superblock.devid();
-        let device_bytes = superblock.device_bytes();
-        let sector = superblock.sectorsize();
-        let device = self.device(devid).await?;
-        let dev: RawDevItem = *view(&device.item).ok_or(ChunkError::Truncated {
-            len: device.item.len(),
-        })?;
-        let policy = Policy::new(flags, device_bytes);
-        let hole = find_hole(&device.extents, device_bytes, policy.want());
-        // `gather_device_info`: a device with less than `dev_extent_min`
-        // unallocated, or no hole that large, is skipped.
-        let total_avail = device_bytes.saturating_sub(dev.bytes_used.get());
-        let max_avail = hole.size.min(policy.want());
-        if total_avail < policy.dev_extent_min || max_avail < policy.dev_extent_min {
+        let mut flags = chunk_flags(self.space.latest_flags(kind), kind)?;
+        let sector = self.volume.superblock().sectorsize();
+        let all_devs = self.all_dev_items().await?;
+        let eligible: Vec<(u64, RawDevItem)> = all_devs
+            .into_iter()
+            .filter(|(id, _)| self.excluded_device != Some(*id))
+            .collect();
+        if flags & RAID1 != 0 && eligible.len() < 2 {
+            // Fall back to DUP/SINGLE only if RAID1 cannot be satisfied on a
+            // single remaining device? No: refuse unsupported profile cleanly!
+            if self.excluded_device.is_none() {
+                return Err(ChunkError::UnsupportedProfile { flags }.into());
+            }
+            flags = (flags & !RAID1) | DUP;
+        }
+        if flags & RAID1 != 0 {
+            return self.create_raid1_chunk(flags, sector, &eligible).await;
+        }
+
+        // Choose the eligible device with the largest usable hole for SINGLE or DUP.
+        let mut best: Option<(u64, Device, RawDevItem, Hole, Policy, u64)> = None;
+        let mut largest_hole = 0_u64;
+        let mut needed_min = STRIPE_LEN;
+        for (devid, dev) in eligible {
+            let mut device_bytes = dev.total_bytes.get();
+            if let Some((lim_dev, lim_bytes)) = self.device_size_limit
+                && lim_dev == devid
+            {
+                device_bytes = device_bytes.min(lim_bytes);
+            }
+            let device = self.device(devid).await?;
+            let policy = Policy::new(flags, device_bytes);
+            needed_min = policy.dev_extent_min;
+            let hole = find_hole(&device.extents, device_bytes, policy.want());
+            largest_hole = largest_hole.max(hole.size);
+            let total_avail = device_bytes.saturating_sub(dev.bytes_used.get());
+            let max_avail = hole.size.min(policy.want());
+            if total_avail < policy.dev_extent_min || max_avail < policy.dev_extent_min {
+                continue;
+            }
+            let take = match &best {
+                None => true,
+                Some((_, _, _, prev_hole, _, _)) => hole.size > prev_hole.size,
+            };
+            if take {
+                best = Some((devid, device, dev, hole, policy, max_avail));
+            }
+        }
+        let Some((devid, device, dev, hole, policy, max_avail)) = best else {
             return Err(ChunkError::NoDeviceSpace {
                 flags,
-                largest: hole.size,
-                needed: policy.dev_extent_min,
+                largest: largest_hole,
+                needed: needed_min,
             }
             .into());
-        }
+        };
         let geometry = policy.decide(max_avail);
         let logical = self.volume.chunks().next_logical();
-        let copies: ArrayVec<u64, MAX_COPIES> = (0..geometry.stripes)
-            .map(|stripe| hole.start + stripe * geometry.stripe_size)
+        let copies: ArrayVec<Stripe, MAX_COPIES> = (0..geometry.stripes)
+            .map(|stripe| Stripe {
+                devid,
+                offset: hole.start + stripe * geometry.stripe_size,
+            })
             .collect();
 
         let mut item = RawChunk::new_zeroed();
@@ -533,10 +650,10 @@ impl<S: BlockSink> Transaction<S> {
         item.num_stripes.set(geometry.stripes as u16);
         item.sub_stripes.set(SUB_STRIPES);
         let mut chunk_item = item.as_bytes().to_vec();
-        for &physical in &copies {
+        for &stripe_loc in &copies {
             let mut stripe = RawStripe::new_zeroed();
-            stripe.devid.set(devid);
-            stripe.offset.set(physical);
+            stripe.devid.set(stripe_loc.devid);
+            stripe.offset.set(stripe_loc.offset);
             stripe.dev_uuid = dev.uuid;
             chunk_item.extend_from_slice(stripe.as_bytes());
         }
@@ -580,9 +697,7 @@ impl<S: BlockSink> Transaction<S> {
         }
 
         let mut root = self.roots.get(objectid::DEV_TREE)?;
-        for &physical in &copies {
-            // `btrfs_dev_extent`: the chunk tree, the chunk's objectid and
-            // offset, its length, and the chunk tree's UUID.
+        for &stripe_loc in &copies {
             let mut extent = Vec::with_capacity(48);
             extent.extend_from_slice(&objectid::CHUNK_TREE.to_le_bytes());
             extent.extend_from_slice(&objectid::FIRST_CHUNK_TREE.to_le_bytes());
@@ -594,7 +709,7 @@ impl<S: BlockSink> Transaction<S> {
                 .apply(
                     &self.volume,
                     root,
-                    Key::new(devid, item_type::DEV_EXTENT, physical),
+                    Key::new(stripe_loc.devid, item_type::DEV_EXTENT, stripe_loc.offset),
                     Some(&extent),
                     &mut self.space,
                 )
@@ -617,7 +732,9 @@ impl<S: BlockSink> Transaction<S> {
             )
             .await?;
 
-        self.image.add_device_used(used);
+        if devid == self.volume.superblock().devid() {
+            self.image.add_device_used(used);
+        }
         if flags & SYSTEM != 0 {
             self.image.append_system_chunk(chunk_key, &chunk_item)?;
         }
@@ -628,6 +745,157 @@ impl<S: BlockSink> Transaction<S> {
             physical = ?copies,
             "allocated a chunk"
         );
+        Ok(())
+    }
+
+    async fn create_raid1_chunk(
+        &mut self,
+        flags: u64,
+        sector: u32,
+        eligible: &[(u64, RawDevItem)],
+    ) -> Result<(), WriteError> {
+        let mut candidates = Vec::new();
+        for &(devid, dev) in eligible {
+            let mut device_bytes = dev.total_bytes.get();
+            if let Some((lim_dev, lim_bytes)) = self.device_size_limit
+                && lim_dev == devid
+            {
+                device_bytes = device_bytes.min(lim_bytes);
+            }
+            let device = self.device(devid).await?;
+            let policy = Policy::new(flags & !RAID1, device_bytes);
+            let hole = find_hole(&device.extents, device_bytes, policy.want());
+            let total_avail = device_bytes.saturating_sub(dev.bytes_used.get());
+            let avail = hole.size.min(total_avail).min(policy.want());
+            if avail >= STRIPE_LEN {
+                candidates.push((devid, device, dev, hole, policy, avail));
+            }
+        }
+        candidates.sort_by_key(|a| core::cmp::Reverse(a.5));
+        if candidates.len() < 2 {
+            let largest = candidates.first().map_or(0, |c| c.3.size);
+            return Err(ChunkError::NoDeviceSpace {
+                flags,
+                largest,
+                needed: STRIPE_LEN,
+            }
+            .into());
+        }
+        let max_avail = candidates[0].5.min(candidates[1].5);
+        let geometry = candidates[0].4.decide(max_avail);
+        let chunk_size = geometry.stripe_size;
+        let logical = self.volume.chunks().next_logical();
+        let copies: ArrayVec<Stripe, MAX_COPIES> = [
+            Stripe {
+                devid: candidates[0].0,
+                offset: candidates[0].3.start,
+            },
+            Stripe {
+                devid: candidates[1].0,
+                offset: candidates[1].3.start,
+            },
+        ]
+        .into_iter()
+        .collect();
+
+        let mut item = RawChunk::new_zeroed();
+        item.length.set(chunk_size);
+        item.owner.set(objectid::EXTENT_TREE);
+        item.stripe_len.set(STRIPE_LEN);
+        item.chunk_type.set(flags);
+        item.io_align.set(STRIPE_LEN as u32);
+        item.io_width.set(STRIPE_LEN as u32);
+        item.sector_size.set(sector);
+        item.num_stripes.set(2);
+        item.sub_stripes.set(SUB_STRIPES);
+        let mut chunk_item = item.as_bytes().to_vec();
+        for idx in 0..2 {
+            let mut stripe = RawStripe::new_zeroed();
+            stripe.devid.set(copies[idx].devid);
+            stripe.offset.set(copies[idx].offset);
+            stripe.dev_uuid = candidates[idx].2.uuid;
+            chunk_item.extend_from_slice(stripe.as_bytes());
+        }
+        let chunk_key = Key::new(objectid::FIRST_CHUNK_TREE, item_type::CHUNK_ITEM, logical);
+
+        self.volume
+            .add_chunk(Chunk::allocated(logical, chunk_size, flags, copies.clone()))
+            .map_err(|defect| ChunkError::Map { logical, defect })?;
+        self.space
+            .push_group(logical, chunk_size, flags, self.volume.chunks());
+
+        let primary_devid = self.volume.superblock().devid();
+        for candidate in candidates.iter().take(2) {
+            let devid = candidate.0;
+            let mut updated = candidate.2;
+            updated
+                .bytes_used
+                .set(updated.bytes_used.get() + chunk_size);
+            let mut device_item = candidate.1.item.clone();
+            device_item[..size_of::<RawDevItem>()].copy_from_slice(updated.as_bytes());
+            self.chunk_root = self
+                .trees
+                .apply(
+                    &self.volume,
+                    self.chunk_root,
+                    Key::new(objectid::DEV_ITEMS, item_type::DEV_ITEM, devid),
+                    Some(&device_item),
+                    &mut self.space,
+                )
+                .await?;
+            if devid == primary_devid {
+                self.image.add_device_used(chunk_size);
+            }
+        }
+        self.chunk_root = self
+            .trees
+            .apply(
+                &self.volume,
+                self.chunk_root,
+                chunk_key,
+                Some(&chunk_item),
+                &mut self.space,
+            )
+            .await?;
+
+        let mut root = self.roots.get(objectid::DEV_TREE)?;
+        for idx in 0..2 {
+            let mut extent = Vec::with_capacity(48);
+            extent.extend_from_slice(&objectid::CHUNK_TREE.to_le_bytes());
+            extent.extend_from_slice(&objectid::FIRST_CHUNK_TREE.to_le_bytes());
+            extent.extend_from_slice(&logical.to_le_bytes());
+            extent.extend_from_slice(&chunk_size.to_le_bytes());
+            extent.extend_from_slice(&candidates[idx].1.chunk_tree_uuid);
+            root = self
+                .trees
+                .apply(
+                    &self.volume,
+                    root,
+                    Key::new(copies[idx].devid, item_type::DEV_EXTENT, copies[idx].offset),
+                    Some(&extent),
+                    &mut self.space,
+                )
+                .await?;
+        }
+        self.roots.set(root)?;
+
+        let mut group = Vec::with_capacity(24);
+        group.extend_from_slice(&0_u64.to_le_bytes());
+        group.extend_from_slice(&objectid::FIRST_CHUNK_TREE.to_le_bytes());
+        group.extend_from_slice(&flags.to_le_bytes());
+        self.accounting
+            .set_group_item(
+                &self.volume,
+                &mut self.trees,
+                &mut self.space,
+                Key::new(logical, item_type::BLOCK_GROUP_ITEM, chunk_size),
+                Some(&group),
+            )
+            .await?;
+
+        if flags & SYSTEM != 0 {
+            self.image.append_system_chunk(chunk_key, &chunk_item)?;
+        }
         Ok(())
     }
 }
@@ -682,8 +950,8 @@ mod tests {
         );
         assert_eq!(chunk_flags(Some(DATA), DATA).unwrap(), DATA);
         assert_eq!(chunk_flags(None, DATA).unwrap(), DATA);
-        // RAID1, RAID1C3, RAID0, RAID10, RAID5, RAID6 and RAID1C4.
-        for profile in [1 << 4, 1 << 9, 1 << 3, 1 << 6, 1 << 7, 1 << 8, 1 << 10] {
+        // RAID1C3, RAID0, RAID10, RAID5, RAID6 and RAID1C4.
+        for profile in [1 << 9, 1 << 3, 1 << 6, 1 << 7, 1 << 8, 1 << 10] {
             let flags = METADATA | profile;
             assert!(matches!(
                 chunk_flags(Some(flags), METADATA),

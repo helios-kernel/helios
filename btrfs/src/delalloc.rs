@@ -247,6 +247,14 @@ impl Delalloc {
         file.extents + checksums
     }
 
+    /// Total dirty file bytes queued for subvolume `tree`.
+    pub(crate) fn tree_bytes(&self, tree: u64) -> u64 {
+        self.files
+            .range((tree, 0)..=(tree, u64::MAX))
+            .map(|(_, file)| file.pages.size() as u64 * self.sector)
+            .sum()
+    }
+
     fn forget(&mut self, file: &DirtyFile) {
         self.bytes -= file.pages.size() as u64 * self.sector;
         self.items -= self.file_items(file);

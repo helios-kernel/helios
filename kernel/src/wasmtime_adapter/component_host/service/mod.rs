@@ -31,6 +31,8 @@ mod hv;
 pub(super) use hv::add_hv_to_linker;
 mod processors;
 pub(super) use processors::add_processors_to_linker;
+mod btrfs;
+pub(super) use btrfs::add_btrfs_to_linker;
 mod shared_memory_plugin;
 use shared_memory_plugin::*;
 mod compiler;

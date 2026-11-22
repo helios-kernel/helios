@@ -420,6 +420,36 @@ impl Accounting {
         self.free_space.as_ref().map(|free| free.root)
     }
 
+    pub(crate) fn set_free_root(&mut self, root: TreeRoot) {
+        if let Some(free) = &mut self.free_space {
+            free.root = root;
+        }
+    }
+
+    pub(crate) fn set_checksum_root(&mut self, root: TreeRoot) {
+        self.checksums.root = root;
+    }
+
+    pub(crate) fn set_group_root(&mut self, root: TreeRoot) {
+        if root.tree == objectid::EXTENT_TREE {
+            self.root = root;
+        } else {
+            self.groups = root;
+        }
+    }
+
+    /// Inserts a newly reserved data extent at `key` with its first reference.
+    pub(crate) async fn insert_reserved_data<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        key: Key,
+        reference: DataReference,
+    ) -> Result<(), WriteError> {
+        self.insert_data(volume, trees, space, key, reference).await
+    }
+
     /// The allocation state the committed generation will have, valid once the
     /// accounting loop has converged. Call before `take_retired`.
     pub(crate) fn committed(&self, space: &Space) -> Result<Allocation, WriteError> {

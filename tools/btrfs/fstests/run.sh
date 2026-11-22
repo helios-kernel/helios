@@ -111,6 +111,50 @@ run_log_replay_tests() {
     fi
 }
 
+# Runs the Linux btrfs management interop tests (bidirectional send/receive,
+# Linux kernel mount readback, and `btrfs check --readonly` across every
+# management operation).
+run_management_interop_tests() {
+    local cargo_bin cargo_home rustup_home
+    cargo_bin=$(type -P cargo) || {
+        echo "fstests: cargo is not on PATH" >&2
+        return 1
+    }
+    local env_args=("PATH=$PATH")
+    if [[ -n "${CARGO_HOME:-}" ]]; then
+        env_args+=("CARGO_HOME=$CARGO_HOME")
+    else
+        cargo_home=$(cd -P "$(dirname "$cargo_bin")/.." && pwd)
+        if [[ "$(basename "$cargo_home")" == .cargo ]]; then
+            env_args+=("CARGO_HOME=$cargo_home")
+        fi
+    fi
+    if [[ -n "${RUSTUP_HOME:-}" ]]; then
+        env_args+=("RUSTUP_HOME=$RUSTUP_HOME")
+    else
+        rustup_home=$(cd -P "$(dirname "$cargo_bin")/../.." && pwd)/.rustup
+        if [[ -d "$rustup_home" ]]; then
+            env_args+=("RUSTUP_HOME=$rustup_home")
+        fi
+    fi
+    local profile_args=()
+    if [[ "$HELIOS_FUSE_BTRFS" == */release/* ]]; then
+        profile_args=(--release)
+    fi
+    local cmd=(
+        "$cargo_bin" test --locked -p helios-btrfs "${profile_args[@]}"
+        --features "write,test-support" --test images management::
+        -- --ignored --nocapture
+    )
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+        (cd "$root" && sudo -H -u "$SUDO_USER" env "${env_args[@]}" "${cmd[@]}") 2>&1 |
+            tee "$results/management-interop.log"
+    else
+        (cd "$root" && env "${env_args[@]}" "${cmd[@]}") 2>&1 |
+            tee "$results/management-interop.log"
+    fi
+}
+
 # Sets `loop` to a loop device backed by a new sparse file of the given size.
 # Not a command substitution: the device must reach `loops` for the cleanup.
 make_loop() {
@@ -198,6 +242,9 @@ done
 
 echo "== crash consistency"
 "$here/crash.sh" || failed+=("crash.sh failed")
+
+echo "== management interop"
+run_management_interop_tests || failed+=("management interop tests failed")
 
 if ((${#failed[@]})); then
     printf 'fstests: %s\n' "${failed[@]}" >&2
