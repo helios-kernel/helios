@@ -2109,6 +2109,30 @@ async fn drive_real_timer<CpuImpl, Net, StorageImpl>(
     }
 }
 
+/// Computes the initial stack top and, when `abi` supplies a sigreturn
+/// trampoline (AArch64), maps it at the top of `user` above an unmapped guard
+/// page so it never collides with `brk` growth at `image_end`.
+fn map_sigreturn_trampoline<Space: UserSpace>(
+    space: &Space,
+    user: VirtRange,
+    abi: Abi,
+) -> Result<(u64, u64), NativeError> {
+    if let Some(code) = abi.sigreturn_trampoline_code() {
+        let trampoline = VirtAddr::new(user.end().raw() - PhysFrame::SIZE);
+        space.map(
+            VirtRange::new(trampoline, PhysFrame::SIZE),
+            code,
+            PageFlags::READ | PageFlags::EXECUTE,
+        )?;
+        Ok((
+            (user.end().raw() - 2 * PhysFrame::SIZE) as u64,
+            trampoline.raw() as u64,
+        ))
+    } else {
+        Ok(((user.end().raw() - PhysFrame::SIZE) as u64, 0))
+    }
+}
+
 /// Runs a Linux process inside `container` to its end: maps `executable`,
 /// builds its initial stack from `argv` and `env`, allocates its container-local
 /// PID (starting at 1), drives `main` and every thread spawned via
@@ -2176,8 +2200,8 @@ where
     let mut random = [0; 16];
     exec_context.runtime_state.root_entropy().fill(&mut random);
     let user = native.user_range();
-    // One unmapped guard page above the stack.
-    let top = (user.end().raw() - PhysFrame::SIZE) as u64;
+    let (top, sigreturn_trampoline) =
+        map_sigreturn_trampoline(&*space, user, executable.abi).map_err(native_error)?;
     let stack = helios_linux::stack::build(
         &helios_linux::stack::Startup {
             entry: image.entry(),
@@ -2203,24 +2227,6 @@ where
             PageFlags::READ | PageFlags::WRITE,
         )
         .map_err(native_error)?;
-    let sigreturn_trampoline = if let Some(code) = executable.abi.sigreturn_trampoline_code() {
-        let addr = space
-            .free_range(
-                VirtAddr::new(image_end.max(PhysFrame::SIZE)),
-                PhysFrame::SIZE,
-            )
-            .ok_or_else(|| native_error(NativeError::OutOfMemory))?;
-        space
-            .map(
-                VirtRange::new(addr, PhysFrame::SIZE),
-                code,
-                PageFlags::READ | PageFlags::EXECUTE,
-            )
-            .map_err(native_error)?;
-        addr.raw() as u64
-    } else {
-        0
-    };
     let context = native
         .create_context(
             VirtAddr::new(image.entry() as usize),
@@ -2463,76 +2469,81 @@ mod tests {
         );
     }
 
+    struct DummyThread;
+
+    impl Thread for DummyThread {
+        fn thread_pointer(&self) -> u64 {
+            0
+        }
+        fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+            Err(Denied)
+        }
+        fn spawn_thread(
+            &mut self,
+            _: Process<helios_linux::syscall::NoBacking>,
+            _: SpawnedThread,
+        ) -> Result<(), SpawnError> {
+            unreachable!("no thread spawned")
+        }
+    }
+
+    struct DummyOutput;
+
+    impl syscall::Network<helios_unix::NoNetwork> for DummyOutput {
+        fn to_ip(&self, address: core::convert::Infallible) -> syscall::IpAddr {
+            match address {}
+        }
+        fn encode_ip(&self, _: syscall::IpAddr) -> core::convert::Infallible {
+            unreachable!()
+        }
+    }
+
+    impl Stdio for DummyOutput {
+        async fn write(&mut self, _: Stream, _: &[u8]) -> Result<usize, WriteError> {
+            Err(WriteError::Io)
+        }
+        async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+            Err(Denied)
+        }
+    }
+
+    impl syscall::Clock for DummyOutput {
+        fn now_nanos(&self) -> u64 {
+            0
+        }
+        async fn sleep_until(&self, _: u64) {}
+    }
+
+    impl System for DummyOutput {
+        fn realtime_nanos(&self) -> u64 {
+            0
+        }
+        fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+            Err(Denied)
+        }
+        fn cpu_nanos(&self) -> u64 {
+            0
+        }
+        fn fill_random(&mut self, _: &mut [u8]) {}
+        fn memory(&self) -> MemoryTotals {
+            MemoryTotals {
+                total_bytes: 0,
+                free_bytes: 0,
+            }
+        }
+        fn process_count(&self) -> u32 {
+            1
+        }
+        fn kernel_version(&self) -> &str {
+            "test"
+        }
+    }
+
     #[test]
     fn linux_mmap_brk_and_mremap_commit_only_touched_pages() {
         use core::future::Future;
         use core::task::{Context, Poll, Waker};
-        use helios_linux::syscall::{Clock, NoBacking, dispatch};
-
-        struct DummyThread;
-        impl Thread for DummyThread {
-            fn thread_pointer(&self) -> u64 {
-                0
-            }
-            fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
-                Err(Denied)
-            }
-            fn spawn_thread(
-                &mut self,
-                _: Process<NoBacking>,
-                _: SpawnedThread,
-            ) -> Result<(), SpawnError> {
-                unreachable!("no thread spawned")
-            }
-        }
-
-        struct DummyOutput;
-        impl syscall::Network<helios_unix::NoNetwork> for DummyOutput {
-            fn to_ip(&self, address: core::convert::Infallible) -> syscall::IpAddr {
-                match address {}
-            }
-            fn encode_ip(&self, _: syscall::IpAddr) -> core::convert::Infallible {
-                unreachable!()
-            }
-        }
-        impl Stdio for DummyOutput {
-            async fn write(&mut self, _: Stream, _: &[u8]) -> Result<usize, WriteError> {
-                Err(WriteError::Io)
-            }
-            async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
-                Err(Denied)
-            }
-        }
-        impl Clock for DummyOutput {
-            fn now_nanos(&self) -> u64 {
-                0
-            }
-            async fn sleep_until(&self, _: u64) {}
-        }
-        impl System for DummyOutput {
-            fn realtime_nanos(&self) -> u64 {
-                0
-            }
-            fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
-                Err(Denied)
-            }
-            fn cpu_nanos(&self) -> u64 {
-                0
-            }
-            fn fill_random(&mut self, _: &mut [u8]) {}
-            fn memory(&self) -> MemoryTotals {
-                MemoryTotals {
-                    total_bytes: 0,
-                    free_bytes: 0,
-                }
-            }
-            fn process_count(&self) -> u32 {
-                1
-            }
-            fn kernel_version(&self) -> &str {
-                "test"
-            }
-        }
+        use helios_linux::syscall::dispatch;
 
         const MMAP: u64 = 9;
         const MUNMAP: u64 = 11;
@@ -2658,5 +2669,89 @@ mod tests {
         assert_eq!(call(MUNMAP, [moved, grown_len, 0, 0, 0, 0]), 0);
         assert_eq!(call(BRK, [brk_start, 0, 0, 0, 0, 0]), brk_start);
         assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+    }
+
+    #[test]
+    fn aarch64_sigreturn_trampoline_sits_above_stack_guard_and_leaves_brk_free() {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        use helios_linux::syscall::dispatch;
+
+        ensure_pool();
+        let page = PhysFrame::SIZE;
+        let start = page;
+        let end = 1usize << 32;
+        let user = VirtRange::new(VirtAddr::new(start), end - start);
+
+        // x86-64 needs no kernel trampoline and keeps one guard page above the stack.
+        let x86_space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let (x86_top, x86_tramp) = map_sigreturn_trampoline(&x86_space, user, Abi::X86_64).unwrap();
+        assert_eq!(x86_tramp, 0);
+        assert_eq!(x86_top, (end - page) as u64);
+        assert_eq!(
+            x86_space.mapping(VirtRange::new(VirtAddr::new(end - page), page)),
+            None
+        );
+
+        // AArch64 maps the RX trampoline at the very top page, keeps an unmapped
+        // guard page between the stack and the trampoline, and leaves `brk`
+        // growth right at `image_end` unblocked.
+        let arm_space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let image_end = 0x41_0000usize;
+        arm_space
+            .map(
+                VirtRange::new(VirtAddr::new(0x40_0000), image_end - 0x40_0000),
+                &[],
+                PageFlags::READ | PageFlags::EXECUTE,
+            )
+            .unwrap();
+        let (arm_top, arm_tramp) =
+            map_sigreturn_trampoline(&arm_space, user, Abi::Aarch64).unwrap();
+        assert_eq!(arm_tramp, (end - page) as u64);
+        assert_eq!(arm_top, (end - 2 * page) as u64);
+        assert_eq!(
+            arm_space
+                .mapping(VirtRange::new(VirtAddr::new(end - page), page))
+                .map(|m| m.flags),
+            Some(PageFlags::READ | PageFlags::EXECUTE)
+        );
+        assert_eq!(
+            arm_space.mapping(VirtRange::new(VirtAddr::new(end - 2 * page), page)),
+            None
+        );
+
+        let expected_code = Abi::Aarch64.sigreturn_trampoline_code().unwrap();
+        let mut actual_code = vec![0u8; expected_code.len()];
+        arm_space
+            .read(VirtAddr::new(arm_tramp as usize), &mut actual_code)
+            .unwrap();
+        assert_eq!(actual_code.as_slice(), expected_code);
+
+        // Growing `brk` directly above `image_end` must succeed without colliding.
+        const AARCH64_BRK: u64 = 214;
+        let mut memory = LinuxMemory {
+            space: &arm_space,
+            user,
+            stack_growth: None,
+        };
+        let mut process = Process::new(Abi::Aarch64, NonZeroU32::new(1).unwrap(), image_end as u64);
+        let (mut thread, mut output) = (DummyThread, DummyOutput);
+        let grown = image_end as u64 + 4 * page as u64;
+        let mut fut = core::pin::pin!(dispatch(
+            &mut process,
+            Call {
+                number: AARCH64_BRK,
+                arguments: [grown, 0, 0, 0, 0, 0],
+            },
+            &mut memory,
+            &mut thread,
+            &mut output,
+        ));
+        match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(ControlFlow::Continue(SyscallOutcome::Return(result))) => {
+                assert_eq!(result, grown);
+            }
+            other => panic!("unexpected aarch64 brk outcome: {other:?}"),
+        }
     }
 }
