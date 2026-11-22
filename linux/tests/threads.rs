@@ -250,6 +250,15 @@ impl Clock for Platform {
     }
 }
 
+impl helios_linux::syscall::Network<helios_unix::NoNetwork> for Platform {
+    fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+        match address {}
+    }
+    fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+        unreachable!()
+    }
+}
+
 impl System for Platform {
     fn realtime_nanos(&self) -> u64 {
         self.realtime

@@ -169,6 +169,94 @@ where
         .await
     }
 
+    /// Starts a non-blocking TCP connection attempt and drives the stack once.
+    pub async fn tcp_connect_start(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        hop_limit: u8,
+    ) -> Result<(TcpStreamId, TcpConnectPoll), TcpError> {
+        let destination = map_network_ip_address(remote_address);
+        let local = self.local_address_for(destination).ok_or(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::NetworkServiceUnavailable,
+        })?;
+        let shard_count = self.inner.state.shard_count();
+        let opened_at = StackInstant::from_nanos(self.now_nanos());
+        let stream = if local_port == 0 {
+            self.inner.state.open_ephemeral_tcp_connect(
+                self.accepting_shard_idx(),
+                TcpConnectRequest {
+                    local,
+                    destination,
+                    port,
+                    hop_limit,
+                    opened_at,
+                },
+            )?
+        } else {
+            let owner = shard_idx_for_flow(local, local_port, destination, port, shard_count);
+            self.inner
+                .state
+                .shard_at(owner)
+                .lock()
+                .start_tcp_connect(local, destination, port, local_port, hop_limit, opened_at)
+                .map_err(TcpConnectStartError::into_tcp_error)?
+        };
+        if let Err(error) = self.drive_tcp().await {
+            self.tcp_close(stream);
+            return Err(error);
+        }
+        let now = StackInstant::from_nanos(self.now_nanos());
+        match self
+            .inner
+            .state
+            .with_handle(stream, |state| match state.poll_tcp_connect(stream) {
+                Ok(TcpConnectProgress::Connected) => Ok(TcpConnectPoll::Connected),
+                Ok(TcpConnectProgress::Pending) => Ok(TcpConnectPoll::Pending),
+                Err(error) => {
+                    state.remove_tcp_stream(stream, now);
+                    Err(error)
+                }
+            }) {
+            Ok(progress) => Ok((stream, progress)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Drives the stack and polls an in-flight non-blocking TCP connection.
+    pub async fn tcp_connect_poll(&self, stream: TcpStreamId) -> Result<TcpConnectPoll, TcpError> {
+        self.drive_tcp().await?;
+        self.inner
+            .state
+            .with_handle(stream, |state| match state.poll_tcp_connect(stream) {
+                Ok(TcpConnectProgress::Connected) => Ok(TcpConnectPoll::Connected),
+                Ok(TcpConnectProgress::Pending) => Ok(TcpConnectPoll::Pending),
+                Err(error) => Err(error),
+            })
+    }
+
+    /// Returns the local IP address and port bound to `stream`, if any.
+    pub fn tcp_local_endpoint(
+        &self,
+        stream: TcpStreamId,
+    ) -> Result<Option<(NetworkIpAddress, u16)>, TcpError> {
+        self.inner.state.with_handle(stream, |state| {
+            let socket = state.tcp_socket(stream)?;
+            state
+                .stack
+                .tcp_local_endpoint(socket)
+                .map(|endpoint| {
+                    endpoint.map(|endpoint| (map_ip_address(endpoint.address), endpoint.port))
+                })
+                .map_err(|_| TcpError {
+                    kind: TcpErrorKind::Unavailable,
+                    detail: NetworkErrorDetail::UnknownTcpStream,
+                })
+        })
+    }
+
     pub async fn tcp_listen(
         &self,
         local_address: NetworkIpAddress,

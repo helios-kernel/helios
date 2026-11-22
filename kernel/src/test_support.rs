@@ -1307,6 +1307,12 @@ mod network {
             core::future::ready(Ok(None))
         }
 
+        fn dns_servers(&self) -> Vec<crate::NetworkIpAddress> {
+            vec![crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                10, 0, 2, 3,
+            ]))]
+        }
+
         fn tcp_connect(
             &self,
             _: &str,
@@ -1343,6 +1349,42 @@ mod network {
             } else {
                 u64::from(local_port)
             }))
+        }
+
+        fn tcp_connect_start(
+            &self,
+            _: crate::NetworkIpAddress,
+            _: u16,
+            local_port: u16,
+            _: u8,
+        ) -> impl core::future::Future<
+            Output = Result<(Self::TcpStream, crate::TcpConnectPoll), crate::TcpError>,
+        > + Send
+        + '_ {
+            let id = if local_port == 0 {
+                7
+            } else {
+                u64::from(local_port)
+            };
+            core::future::ready(Ok((id, crate::TcpConnectPoll::Connected)))
+        }
+
+        fn tcp_connect_poll(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl core::future::Future<Output = Result<crate::TcpConnectPoll, crate::TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(crate::TcpConnectPoll::Connected))
+        }
+
+        fn tcp_local_endpoint(
+            &self,
+            _: Self::TcpStream,
+        ) -> Result<Option<(crate::NetworkIpAddress, u16)>, crate::TcpError> {
+            Ok(Some((
+                crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+                40000,
+            )))
         }
 
         fn tcp_listen(

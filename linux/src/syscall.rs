@@ -16,11 +16,18 @@ use helios_unix::{
 mod futex;
 mod io;
 mod memory;
+mod socket;
 mod system;
 mod thread;
 
 pub use crate::abi::{Abi, Operation};
 pub use io::Clock;
+pub use socket::{
+    ConnectProgress, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EALREADY, ECONNABORTED,
+    ECONNREFUSED, ECONNRESET, EDESTADDRREQ, EHOSTUNREACH, EINPROGRESS, EISCONN, EMSGSIZE, ENETDOWN,
+    ENETUNREACH, ENOPROTOOPT, ENOTCONN, ENOTSOCK, EPIPE, EPROTONOSUPPORT, EPROTOTYPE, ETIMEDOUT,
+    IpAddr, Network, SocketAddr, SocketReady,
+};
 pub use system::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_KILL,
     CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_BROADCAST, CAP_NET_RAW, CAP_SETGID, CAP_SETUID,
@@ -506,7 +513,12 @@ fn errno(value: u64) -> u64 {
 
 /// Dispatches one Linux system call on `process`'s thread. `Exit` and
 /// `ExitGroup` consume the thread's execution loop through `Break`.
-pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + Clock + System>(
+pub async fn dispatch<
+    R: Resources,
+    M: VirtualMemory,
+    T: Thread<R>,
+    O: Stdio + Clock + System + Network<R::Network>,
+>(
     process: &mut Process<R>,
     call: Call,
     memory: &mut M,
@@ -616,15 +628,34 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
         Operation::Writev => {
             writev::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
         }
-        Operation::Ioctl => match process
-            .shared
-            .descriptors
-            .lock()
-            .get_entry(arguments[0] as u32 as i32)
-        {
-            Some(_) => errno(ENOTTY),
-            None => errno(EBADF),
-        },
+        Operation::Ioctl => {
+            let entry = process
+                .shared
+                .descriptors
+                .lock()
+                .get_entry(arguments[0] as u32 as i32)
+                .cloned();
+            match entry {
+                Some(entry) => {
+                    if arguments[1] as u32 == socket::FIONBIO
+                        && let Descriptor::<R>::Socket(sock) = &entry.descriptor
+                    {
+                        let mut raw = [0u8; 4];
+                        if memory.read(arguments[2], &mut raw).is_err() {
+                            errno(EFAULT)
+                        } else {
+                            let nb = i32::from_le_bytes(raw) != 0;
+                            sock.set_nonblocking(nb);
+                            entry.set_fdflags(if nb { socket::SOCK_NONBLOCK as u16 } else { 0 });
+                            0
+                        }
+                    } else {
+                        errno(ENOTTY)
+                    }
+                }
+                None => errno(EBADF),
+            }
+        }
         Operation::Write => {
             write::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
         }
@@ -717,12 +748,75 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
         Operation::Umask => process.umask(arguments),
         Operation::Getpriority => process.getpriority(arguments),
         Operation::Setpriority => process.setpriority(arguments),
+        Operation::Socket => socket::socket::<R, _>(&process.shared.descriptors, arguments, output),
+        Operation::Socketpair => {
+            socket::socketpair::<R, _>(&process.shared.descriptors, arguments, memory)
+        }
+        Operation::Bind => {
+            socket::bind::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
+        }
+        Operation::Listen => {
+            socket::listen::<R, _>(&process.shared.descriptors, arguments, output).await
+        }
+        operation @ (Operation::Accept | Operation::Accept4) => {
+            socket::accept::<R, _, _>(
+                &process.shared.descriptors,
+                arguments,
+                memory,
+                output,
+                operation == Operation::Accept4,
+            )
+            .await
+        }
+        Operation::Connect => {
+            socket::connect::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
+        }
+        Operation::Getsockname => {
+            socket::getsockname::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+        }
+        Operation::Getpeername => {
+            socket::getpeername::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await
+        }
+        Operation::Sendto => {
+            socket::sendto::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
+        }
+        Operation::Recvfrom => {
+            socket::recvfrom::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await
+        }
+        Operation::Sendmsg => {
+            socket::sendmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
+        }
+        Operation::Recvmsg => {
+            socket::recvmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output).await
+        }
+        Operation::Sendmmsg => {
+            socket::sendmmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await
+        }
+        Operation::Recvmmsg => {
+            socket::recvmmsg::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await
+        }
+        Operation::Shutdown => {
+            socket::shutdown::<R, _>(&process.shared.descriptors, arguments, output).await
+        }
+        Operation::Sendfile => socket::sendfile::<R, _>(process, arguments, output).await,
+        Operation::Setsockopt => {
+            socket::setsockopt::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await
+        }
+        Operation::Getsockopt => {
+            socket::getsockopt::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
+                .await
+        }
         Operation::Unknown => errno(ENOSYS),
     };
     ControlFlow::Continue(result)
 }
 
-async fn read<R: Resources, M: UserMemory, O: Stdio>(
+async fn read<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -737,6 +831,24 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
     else {
         return errno(EBADF);
     };
+    if let Descriptor::<R>::Socket(sock) = &entry.descriptor {
+        let limit = args[2].min(MAX_RW_COUNT) as usize;
+        if limit == 0 {
+            return 0;
+        }
+        if memory.check_writable(args[1], limit).is_err() {
+            return errno(EFAULT);
+        }
+        return match socket::socket_recv(sock, limit, 0, output).await {
+            Ok(recv) => {
+                if !recv.data.is_empty() && memory.write(args[1], &recv.data).is_err() {
+                    return errno(EFAULT);
+                }
+                recv.data.len() as u64
+            }
+            Err(err) => errno(err),
+        };
+    }
     if matches!(entry.descriptor, Descriptor::<R>::Stdin { .. }) {
         let limit = args[2].min(MAX_RW_COUNT) as usize;
         if limit == 0 {
@@ -766,7 +878,7 @@ async fn read<R: Resources, M: UserMemory, O: Stdio>(
     io::read_resource::<R, M>(&entry, args, memory).await
 }
 
-async fn write<R: Resources, M: UserMemory, O: Stdio>(
+async fn write<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
     memory: &M,
@@ -776,6 +888,17 @@ async fn write<R: Resources, M: UserMemory, O: Stdio>(
     let Some(entry) = descriptors.lock().get_entry(args[0] as u32 as i32).cloned() else {
         return errno(EBADF);
     };
+    if let Descriptor::<R>::Socket(sock) = &entry.descriptor {
+        let count = args[2].min(MAX_RW_COUNT) as usize;
+        let mut data = alloc::vec![0u8; count];
+        if count > 0 && memory.read(args[1], &mut data).is_err() {
+            return errno(EFAULT);
+        }
+        return match socket::socket_send(sock, data, 0, None, output).await {
+            Ok(written) => written as u64,
+            Err(err) => errno(err),
+        };
+    }
     let stream = match &entry.descriptor {
         Descriptor::<R>::Stdout => Stream::Stdout,
         Descriptor::<R>::Stderr => Stream::Stderr,
@@ -846,7 +969,7 @@ fn arch_prctl<R: Resources, M: UserMemory, T: Thread<R>>(
     }
 }
 
-async fn writev<R: Resources, M: UserMemory, O: Stdio>(
+async fn writev<R: Resources, M: UserMemory, O: Stdio + Network<R::Network>>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
     memory: &M,

@@ -5969,6 +5969,7 @@ mod tests {
                 socket: OwnedUdpSocket::new(crate::UnixNetwork::new(service), socket),
                 local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
                 local_port: 5353,
+                peer: None,
                 options: unix_socket_options::<Net>(),
             })),
             false,

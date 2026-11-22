@@ -4173,6 +4173,7 @@ mod tests {
             ),
             local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
             local_port: 5353,
+            peer: None,
             options: unix_socket_options::<TestNet>(),
         }));
         let udp_unbound: TestDescriptor =
