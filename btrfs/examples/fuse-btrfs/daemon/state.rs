@@ -6,7 +6,7 @@
 //! transaction commits on `fsync`, `fsyncdir`, `remount,ro` and unmount, and
 //! when its dirty metadata reaches Linux's bound.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
@@ -286,14 +286,60 @@ impl State {
                 )
                 .await
                 .map_err(|error| write_errno(&error))?;
-                let root_handle = {
+                let pending = self.inodes.pending_handle_paths();
+                let (root_handle, resolved) = {
                     let transaction = writer.join().await.map_err(|error| write_errno(&error))?;
-                    transaction
+                    let root_handle = transaction
                         .root()
                         .await
-                        .map_err(|error| write_errno(&error))?
+                        .map_err(|error| write_errno(&error))?;
+                    let mut by_path: HashMap<Vec<Vec<u8>>, InodeHandle> = HashMap::new();
+                    by_path.insert(Vec::new(), root_handle.clone());
+                    let mut resolved = Vec::with_capacity(pending.len());
+                    for (ino, identity, expected_gen, path) in pending {
+                        let mut current = root_handle.clone();
+                        let mut prefix = Vec::with_capacity(path.len());
+                        let mut found = true;
+                        for component in path {
+                            prefix.push(component);
+                            if let Some(cached) = by_path.get(&prefix) {
+                                current = cached.clone();
+                                continue;
+                            }
+                            let Some(next) = transaction
+                                .lookup(&current, prefix.last().expect("component pushed"))
+                                .await
+                                .map_err(|error| write_errno(&error))?
+                            else {
+                                found = false;
+                                break;
+                            };
+                            by_path.insert(prefix.clone(), next.clone());
+                            current = next;
+                        }
+                        if !found
+                            || current.tree() != identity.tree
+                            || current.number() != identity.number
+                        {
+                            continue;
+                        }
+                        if let Some(generation) = expected_gen {
+                            let meta = transaction
+                                .metadata(&current)
+                                .await
+                                .map_err(|error| write_errno(&error))?;
+                            if meta.generation != generation {
+                                continue;
+                            }
+                        }
+                        resolved.push((ino, current));
+                    }
+                    (root_handle, resolved)
                 };
-                self.inodes.set_root_handle(root_handle);
+                self.inodes.attach_handle(INodeNo::ROOT, root_handle);
+                for (ino, handle) in resolved {
+                    self.inodes.attach_handle(ino, handle);
+                }
                 self.storage = Storage::Writable(Box::new(writer));
             }
         }
@@ -412,7 +458,7 @@ impl State {
             Err(error) => return Err(read_errno(&error)),
         };
         let generation = inode.metadata().generation;
-        let ino = self.inodes.record(identity, generation, handle);
+        let ino = self.inodes.record(identity, generation, handle, None);
         Ok((
             attr(ino, inode.metadata(), &snapshot),
             Generation(generation),
@@ -437,17 +483,20 @@ impl State {
             number: child.number(),
         };
         let generation = child.metadata().generation;
-        let handle = match &self.storage {
-            Storage::ReadOnly(_) => None,
+        let (handle, origin_path) = match &self.storage {
+            Storage::ReadOnly(_) => (None, self.inodes.child_origin_path(parent, name)),
             Storage::Writable(_) => {
-                if self.inodes.has_handle(identity, generation) {
+                let handle = if self.inodes.has_handle(identity, generation) {
                     None
                 } else {
                     Some(self.handle_of(parent, name).await?)
-                }
+                };
+                (handle, None)
             }
         };
-        let ino = self.inodes.record(identity, generation, handle);
+        let ino = self
+            .inodes
+            .record(identity, generation, handle, origin_path);
         Ok((
             attr(ino, child.metadata(), &snapshot),
             Generation(generation),

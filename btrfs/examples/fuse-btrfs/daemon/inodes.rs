@@ -24,6 +24,11 @@ struct Entry {
     /// has seen it; a directory listing alone does not know it.
     generation: Option<u64>,
     handle: Option<InodeHandle>,
+    /// Path components from `INodeNo::ROOT` recorded during lookups on a
+    /// read-only mount (`handle: None`), so upgrading to a writable `Writer`
+    /// can attach live `InodeHandle`s for every cached non-root inode before
+    /// any mutation runs.
+    origin_path: Option<Vec<Vec<u8>>>,
     /// Lookups the kernel has not yet forgotten.
     lookups: u64,
 }
@@ -41,6 +46,11 @@ impl Inodes {
             entries: HashMap::new(),
             next: INodeNo::ROOT.0 + 1,
         };
+        let origin_path = if handle.is_some() {
+            None
+        } else {
+            Some(Vec::new())
+        };
         inodes.by_identity.insert(root, INodeNo::ROOT.0);
         inodes.entries.insert(
             INodeNo::ROOT.0,
@@ -48,6 +58,7 @@ impl Inodes {
                 identity: root,
                 generation: Some(generation),
                 handle,
+                origin_path,
                 // The kernel never forgets the root.
                 lookups: 1,
             },
@@ -55,11 +66,38 @@ impl Inodes {
         inodes
     }
 
-    /// Attaches the writer's root [`InodeHandle`] after upgrading a read-only
-    /// mount to a writable [`helios_btrfs::write::Writer`].
-    pub fn set_root_handle(&mut self, handle: InodeHandle) {
-        if let Some(entry) = self.entries.get_mut(&INodeNo::ROOT.0) {
+    /// Path from `INodeNo::ROOT` to child `name` under `parent`, when `parent`
+    /// was looked up under a read-only mount without a writer handle.
+    pub fn child_origin_path(&self, parent: INodeNo, name: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let mut path = self.entries.get(&parent.0)?.origin_path.clone()?;
+        path.push(name.to_vec());
+        Some(path)
+    }
+
+    /// Cached non-root entries that still need a writer [`InodeHandle`] after
+    /// upgrading a read-only mount to writable.
+    pub fn pending_handle_paths(&self) -> Vec<(INodeNo, Identity, Option<u64>, Vec<Vec<u8>>)> {
+        let mut pending: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(&ino, entry)| {
+                if ino == INodeNo::ROOT.0 || entry.handle.is_some() {
+                    return None;
+                }
+                let path = entry.origin_path.clone()?;
+                Some((INodeNo(ino), entry.identity, entry.generation, path))
+            })
+            .collect();
+        pending.sort_by_key(|(_, _, _, path)| path.len());
+        pending
+    }
+
+    /// Attaches a live writer [`InodeHandle`] to `ino` after upgrading a
+    /// read-only mount to a writable [`helios_btrfs::write::Writer`].
+    pub fn attach_handle(&mut self, ino: INodeNo, handle: InodeHandle) {
+        if let Some(entry) = self.entries.get_mut(&ino.0) {
             entry.handle = Some(handle);
+            entry.origin_path = None;
         }
     }
 
@@ -94,6 +132,7 @@ impl Inodes {
         identity: Identity,
         generation: u64,
         handle: Option<InodeHandle>,
+        origin_path: Option<Vec<Vec<u8>>>,
     ) -> INodeNo {
         let known = self
             .by_identity
@@ -105,6 +144,9 @@ impl Inodes {
         entry.generation = Some(generation);
         if handle.is_some() {
             entry.handle = handle;
+            entry.origin_path = None;
+        } else if entry.handle.is_none() && origin_path.is_some() {
+            entry.origin_path = origin_path;
         }
         entry.lookups += 1;
         INodeNo(ino)
@@ -131,6 +173,7 @@ impl Inodes {
                 identity,
                 generation: None,
                 handle: None,
+                origin_path: None,
                 lookups: 0,
             },
         );

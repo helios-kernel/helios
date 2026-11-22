@@ -248,7 +248,14 @@ mod tests {
             .unwrap();
         file.set_len(VOLUME_BYTES).unwrap();
         let when = FerrosysTimestamp::from_secs(1_700_000_000);
-        let tree = TreeBuilder::new().root(Metadata::new(0o755, when).owned_by(0, 0));
+        let tree = TreeBuilder::new()
+            .root(Metadata::new(0o755, when).owned_by(0, 0))
+            .directory("/existing", Metadata::new(0o755, when).owned_by(0, 0))
+            .file(
+                "/existing/pre.txt",
+                b"before".to_vec(),
+                Metadata::new(0o644, when).owned_by(0, 0),
+            );
         let options = FormatOptions::new([0x5a; 16], when)
             .chunk_tree_uuid([0x22; 16])
             .device_uuid([0x33; 16])
@@ -410,11 +417,22 @@ mod tests {
         let mut state = State::open(claim, image.clone(), concurrency, true).unwrap();
         assert!(state.is_read_only());
 
+        // Look up a pre-existing directory and file while under
+        // `Storage::ReadOnly` so their FUSE inodes are cached without writer
+        // handles before `remount,rw`.
+        let (dir_attr, _) = block_on(state.lookup(INodeNo::ROOT, OsStr::new("existing"))).unwrap();
+        let (file_attr, _) = block_on(state.lookup(dir_attr.ino, OsStr::new("pre.txt"))).unwrap();
+        assert_eq!(
+            block_on(state.read(file_attr.ino, 0, 16)).unwrap(),
+            b"before"
+        );
+
         // Still read-only -> remount_read_write fails with EACCES.
         assert_eq!(block_on(state.remount_read_write()), Err(Errno::EACCES));
         assert!(state.is_read_only());
 
-        // Restore write permission -> upgrades to `Storage::Writable`.
+        // Restore write permission -> upgrades to `Storage::Writable` and
+        // attaches live handles to cached non-root inodes.
         std::fs::set_permissions(&image, Permissions::from_mode(0o644)).unwrap();
         block_on(state.remount_read_write()).unwrap();
         assert!(!state.is_read_only());
@@ -423,8 +441,18 @@ mod tests {
             seconds: 1_700_000_002,
             nanoseconds: 0,
         };
+        // Mutate the pre-cached non-root file directly (no re-lookup).
+        assert_eq!(
+            block_on(state.write(file_attr.ino, 0, b"after!", now)).unwrap(),
+            6
+        );
+        assert_eq!(
+            block_on(state.read(file_attr.ino, 0, 16)).unwrap(),
+            b"after!"
+        );
+        // Create a new file inside the pre-cached non-root directory directly.
         let (attr, _) = block_on(state.create(
-            INodeNo::ROOT,
+            dir_attr.ino,
             OsStr::new("after-upgrade.txt"),
             Node::File,
             0o644,
