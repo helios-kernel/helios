@@ -115,6 +115,8 @@ fn system_information_calls_have_each_abis_own_numbers() {
         (Operation::Time, 201, None),
         (Operation::Getrandom, 318, Some(278)),
         (Operation::Uname, 63, Some(160)),
+        (Operation::Sethostname, 170, Some(161)),
+        (Operation::Setdomainname, 171, Some(162)),
         (Operation::Sysinfo, 99, Some(179)),
         (Operation::Getuid, 102, Some(174)),
         (Operation::Geteuid, 107, Some(175)),
@@ -123,6 +125,13 @@ fn system_information_calls_have_each_abis_own_numbers() {
         (Operation::Getgroups, 115, Some(158)),
         (Operation::Getresuid, 118, Some(148)),
         (Operation::Getresgid, 120, Some(150)),
+        (Operation::Setuid, 105, Some(146)),
+        (Operation::Setgid, 106, Some(144)),
+        (Operation::Setreuid, 113, Some(145)),
+        (Operation::Setregid, 114, Some(143)),
+        (Operation::Setresuid, 117, Some(147)),
+        (Operation::Setresgid, 119, Some(149)),
+        (Operation::Setgroups, 116, Some(159)),
         (Operation::Prlimit64, 302, Some(261)),
         (Operation::Getrlimit, 97, Some(163)),
         (Operation::Setrlimit, 160, Some(164)),
@@ -466,6 +475,7 @@ fn credentials() -> Credentials {
             saved: 2002,
         },
         supplementary_groups: vec![10, 20, 30],
+        capabilities: helios_linux::syscall::LinuxCapabilities::for_uid(1001),
     }
 }
 
@@ -853,4 +863,161 @@ fn priorities_follow_nice_and_refuse_a_raise_without_rlimit_nice() {
             ESRCH
         );
     }
+}
+
+#[test]
+fn uts_hostname_and_domainname_follow_container_and_require_cap_sys_admin() {
+    for abi in ABIS {
+        let mut world = World::new(abi);
+        world.sink.hostname = helios_linux::syscall::UtsField::from_configured("box-a").unwrap();
+        world.sink.domainname =
+            helios_linux::syscall::UtsField::from_configured("lab.local").unwrap();
+
+        assert_eq!(world.call(Operation::Uname, [0, 0, 0, 0, 0, 0]), 0);
+        let field = |world: &World, index: usize| -> String {
+            let start = index * 65;
+            let slice = &world.memory.0[start..start + 65];
+            let end = slice.iter().position(|&b| b == 0).unwrap();
+            String::from_utf8(slice[..end].to_vec()).unwrap()
+        };
+        assert_eq!(field(&world, 1), "box-a");
+        assert_eq!(field(&world, 5), "lab.local");
+
+        // Root (CAP_SYS_ADMIN) can update hostname and domainname within 64 bytes.
+        world.memory.0[512..521].copy_from_slice(b"renamed-a");
+        assert_eq!(world.call(Operation::Sethostname, [512, 9, 0, 0, 0, 0]), 0);
+        world.memory.0[512..522].copy_from_slice(b"new.domain");
+        assert_eq!(
+            world.call(Operation::Setdomainname, [512, 10, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            world.call(Operation::Sethostname, [512, 65, 0, 0, 0, 0]),
+            EINVAL
+        );
+        assert_eq!(
+            world.call(Operation::Sethostname, [512, u64::MAX, 0, 0, 0, 0]),
+            EINVAL
+        );
+        assert_eq!(
+            world.call(Operation::Sethostname, [FAULT, 4, 0, 0, 0, 0]),
+            EFAULT
+        );
+        assert_eq!(world.call(Operation::Uname, [0, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(field(&world, 1), "renamed-a");
+        assert_eq!(field(&world, 5), "new.domain");
+
+        // Dropping to non-zero uid removes CAP_SYS_ADMIN and blocks sethostname.
+        assert_eq!(world.call(Operation::Setuid, [1000, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            world.call(Operation::Sethostname, [512, 4, 0, 0, 0, 0]),
+            EPERM
+        );
+        assert_eq!(
+            world.call(Operation::Setdomainname, [512, 4, 0, 0, 0, 0]),
+            EPERM
+        );
+    }
+}
+
+#[test]
+fn credentials_and_capabilities_only_narrow_container_authority() {
+    for abi in ABIS {
+        let mut world = World::new(abi);
+        world.sink.may_set_wall_clock = true;
+        world.put(64, &[1_700_000_000, 0]);
+        // uid 0 with container clock authority succeeds.
+        assert_eq!(world.call(Operation::ClockSettime, [0, 64, 0, 0, 0, 0]), 0);
+
+        // Set supplementary groups and gid/uid while root.
+        world.memory.0[256..260].copy_from_slice(&42u32.to_le_bytes());
+        world.memory.0[260..264].copy_from_slice(&99u32.to_le_bytes());
+        assert_eq!(world.call(Operation::Setgroups, [2, 256, 0, 0, 0, 0]), 0);
+        assert_eq!(world.call(Operation::Setgid, [1000, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(world.call(Operation::Setuid, [1000, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(world.call(Operation::Getuid, [0; 6]), 1000);
+        assert_eq!(world.call(Operation::Geteuid, [0; 6]), 1000);
+        assert_eq!(world.call(Operation::Getgid, [0; 6]), 1000);
+
+        // After dropping uid 0 -> 1000, Linux capabilities are cleared so
+        // clock_settime, setuid(0), and setgroups fail with EPERM even though
+        // the container still grants wall-clock authority.
+        assert_eq!(
+            world.call(Operation::ClockSettime, [0, 64, 0, 0, 0, 0]),
+            EPERM
+        );
+        assert_eq!(world.call(Operation::Setuid, [0, 0, 0, 0, 0, 0]), EPERM);
+        assert_eq!(world.call(Operation::Setgid, [0, 0, 0, 0, 0, 0]), EPERM);
+        assert_eq!(world.call(Operation::Setgroups, [0, 0, 0, 0, 0, 0]), EPERM);
+        assert_eq!(world.call(Operation::Setresuid, [0, 0, 0, 0, 0, 0]), EPERM);
+
+        // Conversely, uid 0 without container clock authority still gets EPERM.
+        let mut narrow = World::new(abi);
+        narrow.sink.may_set_wall_clock = false;
+        narrow.put(64, &[1_700_000_000, 0]);
+        assert_eq!(narrow.call(Operation::Getuid, [0; 6]), 0);
+        assert_eq!(
+            narrow.call(Operation::ClockSettime, [0, 64, 0, 0, 0, 0]),
+            EPERM
+        );
+    }
+}
+
+#[test]
+fn pid_namespaces_start_at_one_and_stay_isolated() {
+    let ns_a = helios_linux::syscall::PidNamespace::new();
+    let ns_b = helios_linux::syscall::PidNamespace::new();
+
+    let a1 = ns_a.allocate_process().unwrap();
+    let b1 = ns_b.allocate_process().unwrap();
+    assert_eq!(a1.get(), 1);
+    assert_eq!(b1.get(), 1);
+    assert_eq!(ns_a.process_count(), 1);
+    assert_eq!(ns_b.process_count(), 1);
+
+    let a_tid = ns_a.allocate_tid().unwrap();
+    let a2 = ns_a.allocate_process().unwrap();
+    assert_eq!(a_tid.get(), 2);
+    assert_eq!(a2.get(), 3);
+    assert_eq!(ns_a.process_count(), 2);
+    assert_eq!(ns_b.process_count(), 1);
+    assert!(!ns_b.contains(2));
+    assert!(!ns_b.contains(3));
+
+    ns_a.release_tid(a_tid);
+    assert!(!ns_a.contains(2));
+    assert_eq!(ns_a.process_count(), 2);
+
+    ns_a.release_process(a1);
+    assert!(!ns_a.contains(1));
+    assert_eq!(ns_a.process_count(), 1);
+    assert!(ns_b.contains(1));
+}
+
+#[test]
+fn credentials_try_for_ids_rejects_reserved_ids_and_oversized_groups() {
+    use helios_linux::syscall::{CredentialsError, NGROUPS_MAX};
+
+    assert_eq!(
+        Credentials::try_for_ids(u32::MAX, 0, Vec::new()).unwrap_err(),
+        CredentialsError::InvalidUid
+    );
+    assert_eq!(
+        Credentials::try_for_ids(0, u32::MAX, Vec::new()).unwrap_err(),
+        CredentialsError::InvalidGid
+    );
+    assert_eq!(
+        Credentials::try_for_ids(1000, 1000, vec![10, u32::MAX]).unwrap_err(),
+        CredentialsError::InvalidSupplementaryGid
+    );
+    assert_eq!(
+        Credentials::try_for_ids(1000, 1000, vec![1; NGROUPS_MAX + 1]).unwrap_err(),
+        CredentialsError::TooManySupplementaryGroups {
+            count: NGROUPS_MAX + 1,
+        }
+    );
+    let valid = Credentials::try_for_ids(1000, 1000, vec![10, 20]).expect("valid credentials");
+    assert_eq!(valid.user.effective, 1000);
+    assert_eq!(valid.group.effective, 1000);
+    assert_eq!(valid.supplementary_groups, vec![10, 20]);
 }

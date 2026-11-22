@@ -14,12 +14,12 @@ use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
 use helios_kernel::SocketReadiness;
 use helios_kernel::{
-    ComponentNetworkService, DnsError, DnsErrorKind, Executor, Ipv4Address, Ipv4Cidr, Ipv4Route,
-    MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkIpAddress, NetworkPortId, NodeRun, Notify, PingError, PingErrorKind, PingReply,
-    RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadInto,
-    TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, UserMemoryPool,
-    byte_channel,
+    ComponentNetworkService, DnsError, DnsErrorKind, Executor, HttpsRecord, Ipv4Address, Ipv4Cidr,
+    Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError,
+    NetworkErrorDetail, NetworkIpAddress, NetworkPortId, NodeRun, Notify, PingError, PingErrorKind,
+    PingReply, RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
+    TcpReadInto, TryRead, TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    UserMemoryPool, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -628,6 +628,15 @@ impl ComponentNetworkService for BenchNetworkService {
         _host: &str,
         _timeout_nanos: u64,
     ) -> Result<alloc::vec::Vec<NetworkIpAddress>, DnsError> {
+        Err(bench_dns_error())
+    }
+
+    async fn dns_resolve_https(
+        &self,
+        _host: &str,
+        _port: u16,
+        _timeout_nanos: u64,
+    ) -> Result<Option<HttpsRecord>, DnsError> {
         Err(bench_dns_error())
     }
 
