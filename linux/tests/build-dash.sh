@@ -60,9 +60,11 @@ tar -xzf "$tarball" -C "$work_dir/src" --strip-components=1
 jobs="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 (
     cd "$work_dir/build"
+    # Do not pass `--enable-static`: dash's configure.ac overwrites LDFLAGS
+    # with `-static -Wl,--fatal-warnings`, dropping `-no-pie` and failing
+    # AC_CHECK_FUNCS probes under `zig cc` on Linux CI.
     "$work_dir/src/configure" \
         --host="${arch}-linux-musl" \
-        --enable-static \
         CC="zig cc -target ${arch}-linux-musl" \
         CC_FOR_BUILD="zig cc" \
         CFLAGS="-Os" \
