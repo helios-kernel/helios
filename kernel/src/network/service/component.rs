@@ -41,10 +41,6 @@ where
         if is_ip_literal(host) {
             return Ok(None);
         }
-        let origin = DnsWireName::from_host(host).ok_or(DnsError {
-            kind: DnsErrorKind::UnresolvedHost,
-            detail: NetworkErrorDetail::DnsQueryStartFailed,
-        })?;
         let qname = DnsWireName::https_qname(host, port).ok_or(DnsError {
             kind: DnsErrorKind::UnresolvedHost,
             detail: NetworkErrorDetail::DnsQueryStartFailed,
@@ -54,7 +50,7 @@ where
         let resolver = self.resolver_endpoint()?;
         let socket = self.open_resolver_socket(resolver)?;
         let result = self
-            .resolve_https_through(&socket, &origin, qname, deadline_nanos)
+            .resolve_https_through(&socket, qname, deadline_nanos)
             .await;
         self.close_resolver_socket(&socket);
         result
@@ -63,7 +59,6 @@ where
     async fn resolve_https_through(
         &self,
         socket: &ResolverSocket,
-        origin: &DnsWireName,
         mut qname: DnsWireName,
         deadline_nanos: u64,
     ) -> Result<Option<HttpsRecord>, DnsError> {
@@ -91,7 +86,7 @@ where
                             socket,
                             query_id,
                             &qname,
-                            origin,
+                            hops_remaining,
                             &mut next_alias,
                         )?
                     } else {
@@ -112,7 +107,7 @@ where
                             socket,
                             query_id,
                             &qname,
-                            origin,
+                            hops_remaining,
                             &mut next_alias,
                         )?
                     }
@@ -1312,7 +1307,7 @@ impl NetworkShard {
         socket: &ResolverSocket,
         query_id: u16,
         qname: &DnsWireName,
-        origin: &DnsWireName,
+        max_hops: usize,
         alias_out: &mut DnsWireName,
     ) -> Result<Option<PolledHttpsResponse>, DnsError> {
         let socket = socket.stack_socket;
@@ -1330,7 +1325,7 @@ impl NetworkShard {
             if response.id() != query_id {
                 continue;
             }
-            let Some(outcome) = response.https_outcome(qname, origin) else {
+            let Some(outcome) = response.https_outcome(qname, max_hops) else {
                 continue;
             };
             resolved = Some(match outcome {

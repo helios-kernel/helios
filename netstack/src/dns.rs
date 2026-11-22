@@ -426,7 +426,8 @@ impl<'a> DnsResponse<'a> {
     }
 
     /// Evaluates this response against a Type 65 (`HTTPS`) question for
-    /// `qname` serving `origin` (RFC 9460).
+    /// `qname` (RFC 9460), following at most `max_hops` `CNAME`/`AliasMode`
+    /// transitions (capped at [`DNS_MAX_CNAME_CHAIN`]).
     ///
     /// Returns `None` when the packet does not echo `(qname, HTTPS, IN)` as
     /// its sole question or when any answer record header runs past the end
@@ -435,7 +436,7 @@ impl<'a> DnsResponse<'a> {
     pub fn https_outcome(
         self,
         qname: &DnsWireName,
-        origin: &DnsWireName,
+        max_hops: usize,
     ) -> Option<DnsHttpsOutcome<'a>> {
         let bytes = self.bytes;
         let question_count = read_u16(bytes, 4)?;
@@ -469,6 +470,7 @@ impl<'a> DnsResponse<'a> {
             DnsRcode::NoError => {}
         }
 
+        let max_hops = max_hops.min(DNS_MAX_CNAME_CHAIN);
         let mut owners: ArrayVec<usize, { DNS_MAX_CNAME_CHAIN + 1 }> = ArrayVec::new();
         owners.push(question_name);
         let mut chain_min_ttl: Option<u32> = None;
@@ -491,7 +493,7 @@ impl<'a> DnsResponse<'a> {
                 }
             }
             if let Some((target, ttl)) = cname_step {
-                if owners.is_full() || is_owner(bytes, &owners, target)? {
+                if owners.len() > max_hops || is_owner(bytes, &owners, target)? {
                     return Some(DnsHttpsOutcome::NoRecord);
                 }
                 chain_min_ttl = Some(chain_min_ttl.map_or(ttl, |min| min.min(ttl)));
@@ -521,7 +523,7 @@ impl<'a> DnsResponse<'a> {
                 if is_root {
                     return Some(DnsHttpsOutcome::NoRecord);
                 }
-                if owners.is_full() || is_owner(bytes, &owners, target_offset)? {
+                if owners.len() > max_hops || is_owner(bytes, &owners, target_offset)? {
                     return Some(DnsHttpsOutcome::NoRecord);
                 }
                 let next_ttl = chain_min_ttl.map_or(ttl, |min| min.min(ttl));
@@ -563,10 +565,7 @@ impl<'a> DnsResponse<'a> {
                 continue;
             };
             rrset_min_ttl = Some(rrset_min_ttl.map_or(record.ttl, |min| min.min(record.ttl)));
-            // `HttpsRecord` carries no alternative target host, so only
-            // endpoints on `.` or the queried/aliased host itself are usable
-            // (matching `zenwave`'s same-host origin security rule).
-            if !compatible || !service_target_matches(bytes, record.data_offset + 2, end, origin)? {
+            if !compatible {
                 continue;
             }
             if best
@@ -719,27 +718,15 @@ fn parse_https_rdata<'a>(data: &'a [u8]) -> Option<ParsedHttpsRdata<'a>> {
     let target_wire = data.get(2..)?;
     let target_len = skip_uncompressed_name(target_wire)?;
     let is_root = target_len == 1;
-    let mut params = data.get(2 + target_len..)?;
 
     if priority == 0 {
-        // RFC 9460 §2.4.2: AliasMode ignores any SvcParams that are present,
-        // while §2.2 still requires any trailing SvcParams to frame cleanly
-        // in strictly increasing key order.
-        let mut prev_key: Option<u16> = None;
-        while !params.is_empty() {
-            let key = read_u16(params, 0)?;
-            let value_len = usize::from(read_u16(params, 2)?);
-            let value_end = 4usize.checked_add(value_len)?;
-            params = params.get(value_end..)?;
-            if let Some(prev) = prev_key
-                && key <= prev
-            {
-                return None;
-            }
-            prev_key = Some(key);
-        }
+        // RFC 9460 §2.4.2: recipients MUST ignore any SvcParams present in an
+        // AliasMode record, and §2.4.1 voids sibling ServiceMode records
+        // regardless of trailing SvcParams bytes.
         return Some(ParsedHttpsRdata::Alias { is_root });
     }
+
+    let mut params = data.get(2 + target_len..)?;
 
     let mut prev_key: Option<u16> = None;
     let mut mandatory_supported_mask: u8 = 0;
@@ -955,52 +942,6 @@ fn has_cname_or_https_for(
         }
     }
     Some(false)
-}
-
-/// Whether `target_offset` (a validated uncompressed `ServiceMode`
-/// `TargetName`) names `.`, `origin`, `owner`, or `owner` stripped of a
-/// leading `_<port>._https.` service prefix.
-fn service_target_matches(
-    bytes: &[u8],
-    target_offset: usize,
-    owner_offset: usize,
-    origin: &DnsWireName,
-) -> Option<bool> {
-    if bytes.get(target_offset).copied() == Some(0) {
-        return Some(true);
-    }
-    if name_equals_wire(bytes, target_offset, origin)?
-        || names_equal(bytes, target_offset, owner_offset)?
-    {
-        return Some(true);
-    }
-    let mut owner_labels = Labels::new(bytes, owner_offset);
-    let Some(Ok(first)) = owner_labels.next() else {
-        return Some(false);
-    };
-    let Some(Ok(second)) = owner_labels.next() else {
-        return Some(false);
-    };
-    let is_port_prefix = first.first() == Some(&b'_')
-        && (2..=6).contains(&first.len())
-        && first[1..].iter().all(u8::is_ascii_digit)
-        && second.eq_ignore_ascii_case(b"_https");
-    if !is_port_prefix {
-        return Some(false);
-    }
-    let mut target_labels = Labels::new(bytes, target_offset);
-    loop {
-        match (target_labels.next(), owner_labels.next()) {
-            (None, None) => return Some(true),
-            (Some(Ok(left)), Some(Ok(right))) => {
-                if !left.eq_ignore_ascii_case(right) {
-                    return Some(false);
-                }
-            }
-            (Some(Err(MalformedName)), _) | (_, Some(Err(MalformedName))) => return None,
-            (Some(Ok(_)), None) | (None, Some(Ok(_))) => return Some(false),
-        }
-    }
 }
 
 fn encode_u16_decimal(mut value: u16, out: &mut [u8; 5]) -> usize {
@@ -1739,10 +1680,18 @@ mod tests {
         bytes
     }
 
-    fn parse_https<'a>(bytes: &'a [u8], host: &str, port: u16) -> Option<DnsHttpsOutcome<'a>> {
+    fn parse_https_with_budget<'a>(
+        bytes: &'a [u8],
+        host: &str,
+        port: u16,
+        max_hops: usize,
+    ) -> Option<DnsHttpsOutcome<'a>> {
         let qname = DnsWireName::https_qname(host, port)?;
-        let origin = DnsWireName::from_host(host)?;
-        DnsResponse::parse(bytes).and_then(|response| response.https_outcome(&qname, &origin))
+        DnsResponse::parse(bytes).and_then(|response| response.https_outcome(&qname, max_hops))
+    }
+
+    fn parse_https<'a>(bytes: &'a [u8], host: &str, port: u16) -> Option<DnsHttpsOutcome<'a>> {
+        parse_https_with_budget(bytes, host, port, DNS_MAX_CNAME_CHAIN)
     }
 
     #[test]
@@ -2106,5 +2055,159 @@ mod tests {
             parse_https(&missing_mandatory, "example.com", 443),
             Some(DnsHttpsOutcome::NoRecord)
         );
+    }
+
+    #[test]
+    fn https_max_hops_caps_in_packet_cname_and_alias_chains() {
+        let h3 = alpn_param(&["h3"]);
+        let two_hop_chain = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_CNAME,
+                    120,
+                    wire_name("alias.edge.example"),
+                ),
+                (
+                    Owner::Name("alias.edge.example"),
+                    TYPE_HTTPS,
+                    90,
+                    https_rdata(0, "svc.edge.example", &[]),
+                ),
+                (
+                    Owner::Name("svc.edge.example"),
+                    TYPE_HTTPS,
+                    300,
+                    https_rdata(1, ".", &[(1, &h3)]),
+                ),
+            ],
+        );
+
+        let Some(DnsHttpsOutcome::Service(record)) =
+            parse_https_with_budget(&two_hop_chain, "example.com", 443, 2)
+        else {
+            panic!("2-hop chain must succeed with max_hops = 2");
+        };
+        assert_eq!(record.alpn.as_slice(), &["h3"]);
+        assert_eq!(record.ttl_seconds, 90);
+        assert_eq!(
+            parse_https_with_budget(&two_hop_chain, "example.com", 443, 1),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+        assert_eq!(
+            parse_https_with_budget(&two_hop_chain, "example.com", 443, 0),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        // Zero remaining hops still permits a direct ServiceMode answer on the
+        // queried name, while rejecting a 1-hop external AliasMode transition.
+        let direct = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                120,
+                https_rdata(1, ".", &[(1, &h3)]),
+            )],
+        );
+        assert!(matches!(
+            parse_https_with_budget(&direct, "example.com", 443, 0),
+            Some(DnsHttpsOutcome::Service(_))
+        ));
+        let external_alias = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                120,
+                https_rdata(0, "next.example", &[]),
+            )],
+        );
+        assert_eq!(
+            parse_https_with_budget(&external_alias, "example.com", 443, 0),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+    }
+
+    #[test]
+    fn https_alias_mode_ignores_trailing_svc_params_and_voids_service_records() {
+        let h3 = alpn_param(&["h3"]);
+        let port = 8443u16.to_be_bytes();
+
+        // RFC 9460 §2.4.1 / §2.4.2: AliasMode with non-empty or malformed
+        // trailing SvcParams must still be treated as AliasMode and void
+        // sibling ServiceMode records rather than falling through to them.
+        let mut malformed_root_alias = alloc::vec![0, 0, 0]; // priority=0, target="."
+        malformed_root_alias.extend_from_slice(&[0, 3, 0, 10, 0xff]); // truncated SvcParam
+        let root_void = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    300,
+                    https_rdata(1, ".", &[(1, &h3)]),
+                ),
+                (Owner::Question, TYPE_HTTPS, 300, malformed_root_alias),
+            ],
+        );
+        assert_eq!(
+            parse_https(&root_void, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        let non_empty_alias = https_rdata(0, "real.example", &[(3, &port), (1, &h3)]);
+        let follow_alias = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    300,
+                    https_rdata(1, ".", &[(1, &h3)]),
+                ),
+                (Owner::Question, TYPE_HTTPS, 180, non_empty_alias),
+            ],
+        );
+        let Some(DnsHttpsOutcome::Alias {
+            target,
+            ttl_seconds,
+            hops,
+        }) = parse_https(&follow_alias, "example.com", 443)
+        else {
+            panic!("AliasMode with trailing SvcParams must take precedence over ServiceMode");
+        };
+        assert_eq!(target, DnsWireName::from_host("real.example").unwrap());
+        assert_eq!(ttl_seconds, 180);
+        assert_eq!(hops, 1);
+    }
+
+    #[test]
+    fn https_service_mode_accepts_explicit_cross_host_target_name() {
+        let h3 = alpn_param(&["h3", "h2"]);
+        let port = 8443u16.to_be_bytes();
+        let bytes = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                240,
+                https_rdata(1, "edge.cdn.example", &[(1, &h3), (3, &port)]),
+            )],
+        );
+
+        let Some(DnsHttpsOutcome::Service(record)) = parse_https(&bytes, "example.com", 443) else {
+            panic!("ServiceMode with explicit cross-host TargetName must resolve cleanly");
+        };
+        assert_eq!(record.alpn.as_slice(), &["h3", "h2"]);
+        assert_eq!(record.port, Some(8443));
+        assert_eq!(record.ttl_seconds, 240);
     }
 }

@@ -7394,4 +7394,85 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn dns_resolve_https_enforces_combined_cross_packet_and_in_packet_hop_budget() {
+        let (service, device, local, resolver) = configure_ipv4_dns_service();
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        // 1 external AliasMode hop + `DNS_MAX_CNAME_CHAIN` in-packet CNAME hops
+        // totals `DNS_MAX_CNAME_CHAIN + 1` hops and must resolve to `Ok(None)`.
+        for (in_packet_cnames, expect_some) in [
+            (super::DNS_MAX_CNAME_CHAIN, false),
+            (super::DNS_MAX_CNAME_CHAIN - 1, true),
+        ] {
+            let before = device.transmitted_frames().len();
+            let mut fut = core::pin::pin!(service.dns_resolve_https("start.test", 443, SECOND));
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (client_port, first_id, _) = tx[before..]
+                .iter()
+                .rev()
+                .find_map(|frame| decode_transmitted_udp_dns(frame))
+                .expect("expected initial query");
+
+            let mut alias_rdata = alloc::vec![0, 0];
+            alias_rdata.extend_from_slice(
+                super::DnsWireName::from_host("hop1.test")
+                    .expect("valid host")
+                    .as_wire(),
+            );
+            let first_reply = encode_https_reply_payload(
+                first_id,
+                "start.test",
+                0x8180,
+                &[("start.test", 65, 120, alias_rdata)],
+            );
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &first_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let before_second = device.transmitted_frames().len();
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            let tx = device.transmitted_frames();
+            let (_, second_id, _) = tx[before_second..]
+                .iter()
+                .rev()
+                .find_map(|frame| decode_transmitted_udp_dns(frame))
+                .expect("expected follow-up query");
+
+            let names: alloc::vec::Vec<alloc::string::String> = (1..=in_packet_cnames + 1)
+                .map(|idx| alloc::format!("hop{idx}.test"))
+                .collect();
+            let mut records = alloc::vec::Vec::new();
+            for pair in names.windows(2) {
+                records.push((
+                    pair[0].as_str(),
+                    5u16,
+                    120u32,
+                    super::DnsWireName::from_host(&pair[1])
+                        .expect("valid host")
+                        .as_wire()
+                        .to_vec(),
+                ));
+            }
+            records.push((
+                names[in_packet_cnames].as_str(),
+                65u16,
+                120u32,
+                alloc::vec![0, 1, 0, 0, 1, 0, 3, 2, b'h', b'3'],
+            ));
+            let second_reply = encode_https_reply_payload(second_id, "hop1.test", 0x8180, &records);
+            let (frame, len) =
+                ipv4_udp_frame(resolver, super::DNS_PORT, local, client_port, &second_reply);
+            device.deliver_on(0, &frame[..len]);
+
+            let core::task::Poll::Ready(outcome) = fut.as_mut().poll(&mut cx) else {
+                panic!("expected Ready after second DNS response");
+            };
+            let record = outcome.expect("chain budget check must not fail with DnsError");
+            assert_eq!(record.is_some(), expect_some);
+        }
+    }
 }
