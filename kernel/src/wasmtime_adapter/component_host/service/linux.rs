@@ -508,6 +508,8 @@ where
         executable: LinuxExecutable,
         argv: Vec<String>,
         env: Vec<String>,
+        credentials: syscall::Credentials,
+        secure: bool,
     },
     Wasm {
         executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
@@ -2775,20 +2777,41 @@ fn map_program_error_to_exec(error: &ProgramExecError) -> ExecError {
     }
 }
 
+enum ExecTarget {
+    Path { base_dir: String, raw_path: String },
+    Resolved(String),
+}
+
+fn map_fs_op_error_to_exec(error: syscall::FsOpError) -> ExecError {
+    match error {
+        syscall::FsOpError::Fs(error) => map_fs_error_to_exec(error),
+        syscall::FsOpError::PermissionDenied | syscall::FsOpError::NoDevice => ExecError::Access,
+        syscall::FsOpError::NoData | syscall::FsOpError::Range | syscall::FsOpError::ArgTooBig => {
+            ExecError::Io
+        }
+    }
+}
+
 fn resolve_exec_spec_base<Net: ComponentHostNetwork>(
     spec: &ExecSpec,
     cwd: &Arc<spin::Mutex<String>>,
     descriptors: &Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
-) -> Result<(String, String), ExecError> {
+) -> Result<ExecTarget, ExecError> {
     const AT_FDCWD: i32 = -100;
     if spec.path.starts_with('/') {
-        return Ok((String::from("/"), spec.path.clone()));
+        return Ok(ExecTarget::Path {
+            base_dir: String::from("/"),
+            raw_path: spec.path.clone(),
+        });
     }
     if spec.dirfd == AT_FDCWD {
         if spec.path.is_empty() {
             return Err(ExecError::NoEntry);
         }
-        return Ok((cwd.lock().clone(), spec.path.clone()));
+        return Ok(ExecTarget::Path {
+            base_dir: cwd.lock().clone(),
+            raw_path: spec.path.clone(),
+        });
     }
     let entry = descriptors
         .lock()
@@ -2813,18 +2836,22 @@ fn resolve_exec_spec_base<Net: ComponentHostNetwork>(
         if desc.kind == crate::ComponentFsNodeKind::Directory {
             return Err(ExecError::Access);
         }
-        return Ok((String::from("/"), desc.path.clone()));
+        return Ok(ExecTarget::Resolved(desc.path.clone()));
     }
     if desc.kind != crate::ComponentFsNodeKind::Directory {
         return Err(ExecError::NotDir);
     }
-    Ok((desc.path.clone(), spec.path.clone()))
+    Ok(ExecTarget::Path {
+        base_dir: desc.path.clone(),
+        raw_path: spec.path.clone(),
+    })
 }
 
 async fn prepare_exec_in_container<CpuImpl, Net, StorageImpl>(
     shared: &LinuxShared<CpuImpl, Net, StorageImpl, <CpuImpl::Native as NativeExecution>::Space>,
     cwd: &Arc<spin::Mutex<String>>,
     descriptors: &Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+    credentials: &Arc<spin::Mutex<syscall::Credentials>>,
     spec: ExecSpec,
 ) -> Result<PreparedExec<CpuImpl, Net, StorageImpl>, ExecError>
 where
@@ -2833,40 +2860,45 @@ where
     StorageImpl: crate::Storage,
 {
     const MAX_SHEBANG_DEPTH: usize = 4;
-    let (mut base_dir, mut raw_path) = resolve_exec_spec_base(&spec, cwd, descriptors)?;
+    let current_creds = credentials.lock().clone();
+    let mut target = resolve_exec_spec_base(&spec, cwd, descriptors)?;
     let mut argv = spec.argv;
     let envp = spec.envp;
     let mut nofollow = spec.flags & AT_SYMLINK_NOFOLLOW != 0;
 
     for depth in 0..=MAX_SHEBANG_DEPTH {
         let fs = shared.container.filesystem();
-        let (resolved, trailing_slash) = fs
-            .walk_path(&base_dir, &raw_path, !nofollow)
-            .await
-            .map_err(map_fs_error_to_exec)?;
+        let (resolved, trailing_slash) = match &target {
+            ExecTarget::Resolved(path) => (fs.resolve(path).map_err(map_fs_error_to_exec)?, false),
+            ExecTarget::Path { base_dir, raw_path } => fs
+                .walk_path_for(base_dir, raw_path, !nofollow, &current_creds)
+                .await
+                .map_err(map_fs_op_error_to_exec)?,
+        };
         let meta = resolved
             .fs()
             .stat(resolved.fs_path())
             .await
             .map_err(map_fs_error_to_exec)?;
-        if nofollow {
-            nofollow = false;
-            if meta.kind == NodeKind::Symlink {
-                return Err(ExecError::Loop);
-            }
+        if meta.kind == NodeKind::Symlink {
+            return Err(ExecError::Loop);
         }
+        nofollow = false;
         if meta.kind == NodeKind::Directory {
             return Err(ExecError::Access);
         }
         if trailing_slash {
             return Err(ExecError::NotDir);
         }
+        if meta.kind != NodeKind::File {
+            return Err(ExecError::Access);
+        }
         let current_path = resolved.container_path().to_owned();
 
-        let contents = fs
-            .read_executable(&current_path)
+        let contents = resolved
+            .check_exec_and_read(&current_creds)
             .await
-            .map_err(map_fs_error_to_exec)?;
+            .map_err(map_fs_op_error_to_exec)?;
 
         let raw_slice = match &contents {
             FileContents::Boot(boot) => boot.as_slice(),
@@ -2886,8 +2918,10 @@ where
                 next_argv.extend(argv.into_iter().skip(1));
             }
             argv = next_argv;
-            base_dir = String::from("/");
-            raw_path = interp;
+            target = ExecTarget::Path {
+                base_dir: String::from("/"),
+                raw_path: interp,
+            };
             continue;
         }
 
@@ -2896,6 +2930,15 @@ where
             ProgramSource::LinuxElf(bytes) => {
                 let executable = LinuxExecutable::load(&shared.cpu, bytes)
                     .map_err(|error| map_program_error_to_exec(&error))?;
+                // Compute post-execve credentials strictly for the final binary
+                // (never an intermediate `#!` script, `fs/binfmt_script.c`),
+                // respecting `NO_SUID`, `PR_SET_NO_NEW_PRIVS`, and the
+                // container's `ProcessAuthority` capability ceiling.
+                let next_creds = resolved
+                    .exec_credentials(&current_creds, shared.container.authority_cap_ceiling())
+                    .await
+                    .map_err(map_fs_op_error_to_exec)?;
+                let secure = syscall::permissions::exec_is_secure(&current_creds, &next_creds);
                 if argv.is_empty() {
                     argv.push(current_path);
                 }
@@ -2903,6 +2946,8 @@ where
                     executable,
                     argv,
                     env: envp,
+                    credentials: next_creds,
+                    secure,
                 });
             }
             other => {
@@ -2962,6 +3007,7 @@ where
     shared: &'a Arc<LinuxShared<CpuImpl, Net, StorageImpl, Context::Space>>,
     cwd: Arc<spin::Mutex<String>>,
     descriptors: Arc<spin::Mutex<Descriptors<LinuxResources<Net>>>>,
+    credentials: Arc<spin::Mutex<syscall::Credentials>>,
     prepared_exec: &'a mut Option<Box<PreparedExec<CpuImpl, Net, StorageImpl>>>,
 }
 
@@ -3167,8 +3213,14 @@ where
     }
 
     async fn prepare_exec(&mut self, spec: ExecSpec) -> Result<(), ExecError> {
-        let prepared =
-            prepare_exec_in_container(self.shared, &self.cwd, &self.descriptors, spec).await?;
+        let prepared = Box::pin(prepare_exec_in_container(
+            self.shared,
+            &self.cwd,
+            &self.descriptors,
+            &self.credentials,
+            spec,
+        ))
+        .await?;
         *self.prepared_exec = Some(Box::new(prepared));
         Ok(())
     }
@@ -3492,6 +3544,7 @@ where
                         shared: &shared,
                         cwd: process.cwd_handle(),
                         descriptors: process.descriptors_handle(),
+                        credentials: process.credentials_handle(),
                         prepared_exec: &mut prepared_exec,
                     };
                     let mut call = core::pin::pin!(syscall::dispatch(
@@ -3801,6 +3854,8 @@ fn map_linux_image<Native: NativeExecution>(
     executable: &LinuxExecutable,
     argv: &[String],
     environment: &[String],
+    credentials: &syscall::Credentials,
+    secure: bool,
 ) -> Result<MappedLinuxImage<Native>, ProgramExecError> {
     let image =
         Image::parse(&executable.image, executable.abi, user_end(native)).map_err(image_error)?;
@@ -3840,6 +3895,11 @@ fn map_linux_image<Native: NativeExecution>(
             arguments: &arguments,
             environment: &variables,
             executable: executable_name,
+            uid: credentials.user.real,
+            euid: credentials.user.effective,
+            gid: credentials.group.real,
+            egid: credentials.group.effective,
+            secure,
         },
         top,
     )
@@ -3974,6 +4034,8 @@ where
                     executable,
                     argv,
                     env,
+                    credentials,
+                    secure,
                 } => {
                     let native = cpu.native().map_err(native_unavailable)?;
                     let mapped = map_linux_image(
@@ -3982,8 +4044,10 @@ where
                         &executable,
                         &argv,
                         &env,
+                        &credentials,
+                        secure,
                     )?;
-                    exec_proc.commit_linux_exec(mapped.program_break);
+                    exec_proc.commit_linux_exec(mapped.program_break, credentials);
                     let next_shared = Arc::new(LinuxShared {
                         cpu: shared.cpu.clone(),
                         timer: shared.timer.clone(),
@@ -4190,12 +4254,18 @@ where
             variable
         })
         .collect();
+    let mut credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
+    container.clamp_credentials(&mut credentials);
+    let initial_secure = credentials.user.effective != credentials.user.real
+        || credentials.group.effective != credentials.group.real;
     let mapped = map_linux_image(
         native,
         exec_context.runtime_state.root_entropy(),
         &executable,
         &argv,
         &environment,
+        &credentials,
+        initial_secure,
     )?;
 
     let process_guard = container.allocate_process().map_err(|_| ProgramExecError {
@@ -4209,8 +4279,6 @@ where
         Some(table) => table.into_slots(),
         None => syscall::standard_streams::<LinuxResources<Net>>(),
     };
-    let mut credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
-    container.clamp_credentials(&mut credentials);
     let initial_cwd = container
         .authority()
         .cwd()

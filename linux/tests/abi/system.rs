@@ -470,6 +470,7 @@ fn credentials() -> Credentials {
         },
         supplementary_groups: vec![10, 20, 30],
         capabilities: helios_linux::syscall::LinuxCapabilities::for_uid(1001),
+        no_new_privs: false,
     }
 }
 

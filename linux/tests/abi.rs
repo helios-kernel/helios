@@ -452,6 +452,11 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
         arguments: &arguments,
         environment: &environment,
         executable: b"/bin/args",
+        uid: 1000,
+        euid: 0,
+        gid: 100,
+        egid: 200,
+        secure: true,
     };
     let top = 0x7fff_0000_0000;
     let stack = helios_linux::stack::build(&startup, top).unwrap();
@@ -463,7 +468,7 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
         .as_chunks::<8>()
         .0
         .iter()
-        .take(24)
+        .take(34)
         .map(|word| u64::from_le_bytes(*word))
         .collect();
     let string = |address: u64| {
@@ -479,14 +484,17 @@ fn initial_stack_is_aligned_and_contains_linux_arguments() {
     assert_eq!(string(words[6]), environment[0]);
     assert_eq!(words[7], 0);
     assert_eq!(
-        &words[8..18],
-        &[3, 0x400040, 4, 56, 5, 3, 6, 4096, 9, 0x401000]
+        &words[8..28],
+        &[
+            3, 0x400040, 4, 56, 5, 3, 6, 4096, 9, 0x401000, 11, 1000, 12, 0, 13, 100, 14, 200, 23,
+            1
+        ]
     );
-    assert_eq!(words[18], 25);
-    assert_eq!(&stack.bytes[at(words[19])..at(words[19]) + 16], &[7; 16]);
-    assert_eq!(words[20], 31);
-    assert_eq!(string(words[21]), b"/bin/args");
-    assert_eq!(&words[22..24], &[0, 0]);
+    assert_eq!(words[28], 25);
+    assert_eq!(&stack.bytes[at(words[29])..at(words[29]) + 16], &[7; 16]);
+    assert_eq!(words[30], 31);
+    assert_eq!(string(words[31]), b"/bin/args");
+    assert_eq!(&words[32..34], &[0, 0]);
     let bad: [&[u8]; 1] = [b"bad\0arg"];
     let refused = helios_linux::stack::Startup {
         arguments: &bad,

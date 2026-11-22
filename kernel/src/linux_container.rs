@@ -385,6 +385,63 @@ impl<'a, S: Storage> ContainerResolved<'a, S> {
             .flatten()
     }
 
+    /// Checks that `creds` may execute this resolved regular file (enforcing
+    /// mount `READ | EXECUTE` authority and private-mount `MAY_EXEC` DAC/ACL
+    /// rules) and reads its entire image (`fs/exec.c` `do_open_execat`).
+    pub async fn check_exec_and_read(
+        &self,
+        creds: &Credentials,
+    ) -> Result<FileContents, FsOpError> {
+        let required = DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE;
+        if !self.authority_rights().contains(required) {
+            return Err(FsError::NotPermitted.into());
+        }
+        let meta = self.inode_meta().await?;
+        if meta.kind != NodeKind::File {
+            return Err(FsError::NotPermitted.into());
+        }
+        self.check_permission(creds, permissions::MAY_EXEC).await?;
+        Ok(self.fs().read_whole(self.fs_path()).await?)
+    }
+
+    /// Computes the post-`execve` [`Credentials`] for executing this resolved
+    /// regular file (`fs/exec.c` `bprm_fill_uid` + `security/commoncap.c`
+    /// `cap_bprm_creds_from_file`), bounded by `authority_cap_ceiling`, the
+    /// mount's `NO_SUID` flag, and `creds.no_new_privs`.
+    pub async fn exec_credentials(
+        &self,
+        creds: &Credentials,
+        authority_cap_ceiling: u64,
+    ) -> Result<Credentials, FsOpError> {
+        let required = DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE;
+        if !self.authority_rights().contains(required) {
+            return Err(FsError::NotPermitted.into());
+        }
+        let meta = self.inode_meta().await?;
+        if meta.kind != NodeKind::File {
+            return Err(FsError::NotPermitted.into());
+        }
+        self.check_permission(creds, permissions::MAY_EXEC).await?;
+        let honours = self.flags().honours_exec_privileges();
+        let cap_bytes = if honours && !creds.no_new_privs && self.is_private() {
+            self.fs()
+                .xattr(self.fs_path(), permissions::XATTR_SECURITY_CAPABILITY)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let effective_cap = self.file_capability(cap_bytes.as_deref());
+        Ok(permissions::apply_exec_credentials(
+            creds,
+            meta,
+            effective_cap,
+            honours,
+            authority_cap_ceiling,
+        ))
+    }
+
     async fn check_permission(&self, creds: &Credentials, want: u32) -> Result<(), FsOpError> {
         if !self.is_private() {
             return Ok(());
@@ -2022,7 +2079,8 @@ impl<S: Storage> ContainerFilesystem<S> {
     /// mount rights and private-mount DAC/ACL rules), and computes the
     /// post-`execve` [`Credentials`] (`fs/exec.c` `bprm_fill_uid` +
     /// `security/commoncap.c` `cap_bprm_creds_from_file`), bounded by
-    /// `authority_cap_ceiling` and the mount's `NO_SUID` flag.
+    /// `authority_cap_ceiling`, the mount's `NO_SUID` flag, and
+    /// `creds.no_new_privs`.
     pub async fn exec_credentials_at(
         &self,
         base_dir: &str,
@@ -2031,36 +2089,9 @@ impl<S: Storage> ContainerFilesystem<S> {
         authority_cap_ceiling: u64,
     ) -> Result<Credentials, FsOpError> {
         let (resolved, _) = self.walk_path_for(base_dir, raw_path, true, creds).await?;
-        let required = DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE;
-        if !resolved.authority_rights().contains(required) {
-            return Err(FsError::NotPermitted.into());
-        }
-        let meta = resolved.inode_meta().await?;
-        if meta.kind != NodeKind::File {
-            return Err(FsError::NotPermitted.into());
-        }
         resolved
-            .check_permission(creds, permissions::MAY_EXEC)
-            .await?;
-        let honours = resolved.flags().honours_exec_privileges();
-        let cap_bytes = if honours && resolved.is_private() {
-            resolved
-                .fs()
-                .xattr(resolved.fs_path(), permissions::XATTR_SECURITY_CAPABILITY)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        let effective_cap = resolved.file_capability(cap_bytes.as_deref());
-        Ok(permissions::apply_exec_credentials(
-            creds,
-            meta,
-            effective_cap,
-            honours,
-            authority_cap_ceiling,
-        ))
+            .exec_credentials(creds, authority_cap_ceiling)
+            .await
     }
 
     /// Lists entries in `container_path` along with `(self_inode, parent_inode)`.
