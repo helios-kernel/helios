@@ -30,8 +30,8 @@ use crate::space::{DATA, SpaceError};
 use crate::tree::write::WriteError;
 use crate::{Compression, Error, FileKind, Key, Timestamp};
 
-const HEAD_BYTES: usize = size_of::<RawFileExtentHead>();
-const REGULAR_BYTES: usize = HEAD_BYTES + size_of::<RawFileExtentBody>();
+pub(super) const HEAD_BYTES: usize = size_of::<RawFileExtentHead>();
+pub(super) const REGULAR_BYTES: usize = HEAD_BYTES + size_of::<RawFileExtentBody>();
 
 /// `BTRFS_DEFAULT_MAX_INLINE`, 2048 bytes in `fs/btrfs/fs.h`: the default of
 /// Linux's `max_inline` mount option.
@@ -449,7 +449,7 @@ impl<S: BlockSink> Transaction<S> {
         Ok(end)
     }
 
-    async fn dirty_exact(
+    pub(super) async fn dirty_exact(
         &mut self,
         tree: u64,
         inode: u64,
@@ -712,7 +712,7 @@ impl<S: BlockSink> Transaction<S> {
     /// when [`Self::may_inline`] allows the stored length, and otherwise as a
     /// dirty page for writeback. `inline` is the ram size of the inline item
     /// it replaces.
-    async fn store_first_sector(
+    pub(super) async fn store_first_sector(
         &mut self,
         file: FileId,
         mut content: Vec<u8>,

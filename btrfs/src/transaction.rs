@@ -8,6 +8,7 @@
 pub(crate) mod acl;
 pub(crate) mod chunks;
 mod extents;
+pub(crate) mod fallocate;
 pub(crate) mod file;
 pub(crate) mod namespace;
 pub(crate) mod ownership;

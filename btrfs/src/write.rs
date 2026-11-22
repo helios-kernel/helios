@@ -52,6 +52,7 @@ pub use crate::fs::writer::{
 };
 pub use crate::space::{SpaceDefect, SpaceError};
 pub use crate::transaction::chunks::ChunkError;
+pub use crate::transaction::fallocate::AllocateMode;
 pub use crate::transaction::file::DEFAULT_MAX_INLINE;
 pub use crate::transaction::replay::LogReplayError;
 pub use crate::transaction::xattr::XattrMode;

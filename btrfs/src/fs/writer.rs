@@ -44,6 +44,8 @@ use crate::compress::policy::Compressor;
 use crate::ondisk::objectid;
 use crate::retirement::Retirements;
 use crate::source::BlockSink;
+use crate::space::{DATA, SpaceError};
+use crate::transaction::fallocate::AllocateMode;
 use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
@@ -784,6 +786,47 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         operation.accept()
     }
 
+    /// Preallocates space, punches holes or zeroes a byte range of `file`, as
+    /// Linux's `btrfs_fallocate` (`fs/btrfs/file.c`).
+    pub async fn fallocate(
+        &mut self,
+        file: &InodeHandle,
+        offset: u64,
+        length: u64,
+        mode: AllocateMode,
+        when: Timestamp,
+    ) -> Result<(), WriteError> {
+        self.checked(file).await?;
+        let id = file.id;
+        self.inner().roots.check_writable(id.tree)?;
+        let max_inline = self.writer.max_inline;
+        let units = self
+            .reserve_with_data(DataReservation::Fallocate {
+                file: id,
+                offset,
+                length,
+                mode,
+                max_inline,
+            })
+            .await?;
+        let mut operation = Mutation::new(self, units).await?;
+        operation.checked(file).await?;
+        let (inner, compressor, concurrency, max_inline) = operation.split();
+        inner
+            .fallocate(
+                id,
+                offset,
+                length,
+                mode,
+                when,
+                compressor,
+                concurrency,
+                max_inline,
+            )
+            .await?;
+        operation.accept()
+    }
+
     pub async fn set_times(
         &mut self,
         file: &InodeHandle,
@@ -1125,6 +1168,22 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
                         .clone_reservation(source, destination, offset, length)
                         .await?
                 }
+                DataReservation::Fallocate {
+                    file,
+                    offset,
+                    length,
+                    mode,
+                    max_inline,
+                } => {
+                    let bytes = self
+                        .inner()
+                        .fallocate_reservation(file, offset, length, mode, max_inline)
+                        .await?;
+                    if bytes > self.inner().volume.superblock().total_bytes() {
+                        return Err(SpaceError::Exhausted { bytes, flags: DATA }.into());
+                    }
+                    bytes
+                }
             };
             self.reserve_data(reservation).await?;
             let units = match operation {
@@ -1150,6 +1209,9 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
                     }
                 }
                 DataReservation::Clone { .. } => Units::CLONE,
+                DataReservation::Fallocate { mode, .. } => {
+                    self.inner().fallocate_units(mode, reservation)
+                }
             };
             if self.inner().reserves(units) {
                 return Ok(units);
@@ -1229,6 +1291,13 @@ enum DataReservation {
         destination: FileId,
         offset: u64,
         length: u64,
+    },
+    Fallocate {
+        file: FileId,
+        offset: u64,
+        length: u64,
+        mode: AllocateMode,
+        max_inline: u64,
     },
 }
 

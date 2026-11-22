@@ -9,7 +9,10 @@
 //! lacks the feature, and nothing else:
 //!
 //! - `setattr` changing the file flags: `EOPNOTSUPP`
-//! - `fallocate`: `EOPNOTSUPP`
+//! - `fallocate` with modes Linux's btrfs refuses (`COLLAPSE_RANGE`,
+//!   `INSERT_RANGE`, `UNSHARE_RANGE`, `NO_HIDE_STALE`, unknown bits):
+//!   `EOPNOTSUPP`; invalid combinations (`PUNCH_HOLE` without `KEEP_SIZE`,
+//!   `PUNCH_HOLE | ZERO_RANGE`): `EINVAL`
 //! - `rename` with `RENAME_WHITEOUT`, or with both `RENAME_NOREPLACE` and
 //!   `RENAME_EXCHANGE`: `EINVAL`
 //!
@@ -27,7 +30,7 @@ use fuser::{
     WriteFlags,
 };
 use futures_lite::future::block_on;
-use helios_btrfs::write::Special;
+use helios_btrfs::write::{AllocateMode, Special};
 use helios_btrfs::{DeviceNumber, Timestamp};
 use helios_hal::fs::RenameMode;
 
@@ -515,14 +518,21 @@ impl Filesystem for Daemon {
     fn fallocate(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
-        _offset: u64,
-        _length: u64,
-        _mode: i32,
+        offset: u64,
+        length: u64,
+        mode: i32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::EOPNOTSUPP);
+        let mode = match decode_fallocate_mode(mode) {
+            Ok(mode) => mode,
+            Err(errno) => return reply.error(errno),
+        };
+        finish(
+            self.run(|state| block_on(state.fallocate(ino, offset, length, mode, now()))),
+            reply,
+        );
     }
 }
 
@@ -553,9 +563,74 @@ fn caller(req: &Request, umask: u32) -> Owner {
     }
 }
 
+fn decode_fallocate_mode(mode: i32) -> Result<AllocateMode, Errno> {
+    const KEEP_SIZE: i32 = libc::FALLOC_FL_KEEP_SIZE;
+    const PUNCH_HOLE: i32 = libc::FALLOC_FL_PUNCH_HOLE;
+    const ZERO_RANGE: i32 = libc::FALLOC_FL_ZERO_RANGE;
+    const SUPPORTED: i32 = KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE;
+
+    if mode & !SUPPORTED != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    match mode {
+        0 => Ok(AllocateMode::Allocate),
+        KEEP_SIZE => Ok(AllocateMode::KeepSize),
+        m if m == PUNCH_HOLE | KEEP_SIZE => Ok(AllocateMode::PunchHole),
+        ZERO_RANGE => Ok(AllocateMode::ZeroRange),
+        m if m == ZERO_RANGE | KEEP_SIZE => Ok(AllocateMode::ZeroRangeKeepSize),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 fn finish(result: Result<(), Errno>, reply: ReplyEmpty) {
     match result {
         Ok(()) => reply.ok(),
         Err(errno) => reply.error(errno),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_fallocate_modes() {
+        assert_eq!(decode_fallocate_mode(0), Ok(AllocateMode::Allocate));
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_KEEP_SIZE),
+            Ok(AllocateMode::KeepSize)
+        );
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE),
+            Ok(AllocateMode::PunchHole)
+        );
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_ZERO_RANGE),
+            Ok(AllocateMode::ZeroRange)
+        );
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE),
+            Ok(AllocateMode::ZeroRangeKeepSize)
+        );
+        assert_eq!(
+            decode_fallocate_mode(libc::FALLOC_FL_PUNCH_HOLE),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            decode_fallocate_mode(
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE
+            ),
+            Err(Errno::EINVAL)
+        );
+        for unsupported in [
+            libc::FALLOC_FL_COLLAPSE_RANGE,
+            libc::FALLOC_FL_INSERT_RANGE,
+            libc::FALLOC_FL_UNSHARE_RANGE,
+            // `FALLOC_FL_NO_HIDE_STALE` in `include/uapi/linux/falloc.h`.
+            0x04,
+            1 << 20,
+        ] {
+            assert_eq!(decode_fallocate_mode(unsupported), Err(Errno::EOPNOTSUPP));
+        }
     }
 }

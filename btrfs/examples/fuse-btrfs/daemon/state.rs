@@ -20,8 +20,8 @@ use fuser::{
 };
 use futures_lite::future::block_on;
 use helios_btrfs::write::{
-    Attributes, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, Special,
-    WriteError, Writer, XattrMode, default_dirty_data_limit,
+    AllocateMode, Attributes, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name,
+    RootUuids, Special, WriteError, Writer, XattrMode, default_dirty_data_limit,
 };
 use helios_btrfs::{
     BlockSink, BlockSource, DirBound, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode,
@@ -915,6 +915,28 @@ impl<S: BlockSink, B> State<S, B> {
         self.settle().await?;
         Ok(u32::try_from(written)
             .expect("a write is never longer than the request that asked for it"))
+    }
+
+    pub async fn fallocate(
+        &mut self,
+        ino: INodeNo,
+        offset: u64,
+        length: u64,
+        mode: AllocateMode,
+        now: Timestamp,
+    ) -> Result<(), Errno> {
+        self.writable()?;
+        let file = self.inodes.handle(ino)?;
+        let mut transaction = self
+            .writable_writer()?
+            .join()
+            .await
+            .map_err(|error| write_errno(&error))?;
+        transaction
+            .fallocate(&file, offset, length, mode, now)
+            .await
+            .map_err(|error| write_errno(&error))?;
+        self.settle().await
     }
 
     pub async fn create(
@@ -1896,6 +1918,43 @@ mod tests {
         assert_eq!(
             block_on(state.readdir(dir, fh, 0, |_, _, _, _| false)),
             Err(Errno::EBADF)
+        );
+    }
+
+    #[test]
+    fn fallocate_preallocates_punches_and_zeroes_through_state() {
+        let (_image, mut state) = test_state();
+        let owner = Owner {
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+        let (attr, _) = block_on(state.create(
+            INodeNo::ROOT,
+            OsStr::new("alloc"),
+            Node::File,
+            0o644,
+            owner,
+            WHEN,
+        ))
+        .expect("create alloc");
+        let ino = attr.ino;
+
+        block_on(state.fallocate(ino, 0, 16384, AllocateMode::Allocate, WHEN)).expect("allocate");
+        assert_eq!(block_on(state.getattr(ino)).unwrap().size, 16384);
+        assert_eq!(block_on(state.read(ino, 0, 16384)).unwrap(), vec![0; 16384]);
+
+        block_on(state.write(ino, 0, &[0x55; 16384], WHEN)).expect("write");
+        block_on(state.fallocate(ino, 4096, 4096, AllocateMode::PunchHole, WHEN)).expect("punch");
+        block_on(state.fallocate(ino, 12288, 4096, AllocateMode::ZeroRange, WHEN)).expect("zero");
+        let mut expected = vec![0x55; 16384];
+        expected[4096..8192].fill(0);
+        expected[12288..16384].fill(0);
+        assert_eq!(block_on(state.read(ino, 0, 16384)).unwrap(), expected);
+
+        assert_eq!(
+            block_on(state.fallocate(ino, 0, 0, AllocateMode::Allocate, WHEN)),
+            Err(Errno::EINVAL)
         );
     }
 }
