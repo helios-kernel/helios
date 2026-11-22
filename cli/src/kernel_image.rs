@@ -68,7 +68,12 @@ pub enum KernelImageError {
 pub struct KernelImageKey {
     /// One field of the build's description, in order. The inspector
     /// names the cargo command line and the environment that reaches it.
-    #[arg(long = "field", value_name = "TEXT", required = true)]
+    #[arg(
+        long = "field",
+        value_name = "TEXT",
+        required = true,
+        allow_hyphen_values = true
+    )]
     fields: Vec<String>,
     /// The trusted root public key file the kernel build embeds.
     #[arg(long, value_name = "FILE")]
@@ -239,5 +244,37 @@ mod tests {
         );
         write_image(&path, b"other").expect("another image replaces it");
         assert_eq!(fs::read(&path).expect("the image"), b"other");
+    }
+
+    #[test]
+    fn hyphenated_cargo_flags_parse_as_field_values() {
+        let parsed = KernelImageRestore::try_parse_from([
+            "kernel-image-restore",
+            "--public-key",
+            "helios-root-public.key",
+            "--image",
+            "helios",
+            "--field",
+            "cargo",
+            "--field",
+            "build",
+            "--field",
+            "--target",
+            "--field",
+            "x86_64-unknown-none",
+            "--field",
+            "-Zbuild-std=core,alloc",
+        ])
+        .expect("cargo flags starting with hyphens are field values");
+        assert_eq!(
+            parsed.key.fields,
+            [
+                "cargo",
+                "build",
+                "--target",
+                "x86_64-unknown-none",
+                "-Zbuild-std=core,alloc"
+            ]
+        );
     }
 }

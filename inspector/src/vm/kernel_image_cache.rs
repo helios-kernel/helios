@@ -192,7 +192,7 @@ impl KernelImageCache {
             .arg("--image")
             .arg(&self.image);
         for field in &self.fields {
-            command.arg("--field").arg(field);
+            command.arg(format!("--field={field}"));
         }
         command
     }
