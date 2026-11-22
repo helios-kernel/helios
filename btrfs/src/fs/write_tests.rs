@@ -7303,3 +7303,190 @@ fn stamp_of(seconds: i64) -> crate::Timestamp {
         nanoseconds: 0,
     }
 }
+
+#[cfg(feature = "write")]
+#[test]
+fn parent_resolves_directories_subvolumes_and_renamed_parents() {
+    use ferrosys::btrfs::SubvolumeRequest;
+
+    block_on(async {
+        let timestamp = Timestamp::from_secs(1_700_000_000);
+        let dir_meta = Metadata::new(0o755, timestamp);
+        let tree = TreeBuilder::new()
+            .root(dir_meta)
+            .directory("/sub", dir_meta);
+        let options = FormatOptions::new([0x53; 16], timestamp)
+            .subvolume(SubvolumeRequest::new(b"/sub".to_vec(), [0x51; 16]));
+        let (_, image) = filesystem_image_options(tree, tempfile::tempfile().unwrap(), options);
+        let mut writer = mount_writer(Disk(image)).await.unwrap();
+        let when = stamp_of(1_700_000_010);
+        let attrs = super::writer::Attributes {
+            permissions: 0o755,
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+
+        let (top_id, child_id, file_id) = {
+            let mut tx = writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let top = tx
+                .create_directory(
+                    super::writer::Name {
+                        parent: &root,
+                        bytes: b"top",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            let other = tx
+                .create_directory(
+                    super::writer::Name {
+                        parent: &root,
+                        bytes: b"other",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            let child = tx
+                .create_directory(
+                    super::writer::Name {
+                        parent: &top,
+                        bytes: b"child",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            let file = tx
+                .create_file(
+                    super::writer::Name {
+                        parent: &child,
+                        bytes: b"leaf",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            // Move `child` under `other` to verify `parent()` tracks renames.
+            tx.rename(
+                super::writer::Name {
+                    parent: &top,
+                    bytes: b"child",
+                },
+                super::writer::Name {
+                    parent: &other,
+                    bytes: b"moved",
+                },
+                RenameMode::Replace,
+                when,
+            )
+            .await
+            .unwrap();
+            let ids = (
+                (other.tree(), other.number()),
+                (child.tree(), child.number()),
+                (file.tree(), file.number()),
+            );
+            tx.commit().await.unwrap();
+            ids
+        };
+
+        let snapshot = writer.snapshot().unwrap();
+        let root = snapshot.root().await.unwrap();
+        assert!(snapshot.parent(&root).await.unwrap().is_none());
+
+        let child = snapshot.inode(child_id.0, child_id.1).await.unwrap();
+        let parent = snapshot.parent(&child).await.unwrap().unwrap();
+        assert_eq!((parent.tree(), parent.number()), top_id);
+        let grandparent = snapshot.parent(&parent).await.unwrap().unwrap();
+        assert_eq!(
+            (grandparent.tree(), grandparent.number()),
+            (root.tree(), root.number())
+        );
+
+        let sub = snapshot.lookup(&root, b"sub").await.unwrap().unwrap();
+        let sub_parent = snapshot.parent(&sub).await.unwrap().unwrap();
+        assert_eq!(
+            (sub_parent.tree(), sub_parent.number()),
+            (root.tree(), root.number())
+        );
+
+        let file = snapshot.inode(file_id.0, file_id.1).await.unwrap();
+        assert!(matches!(
+            snapshot.parent(&file).await,
+            Err(crate::Error::WrongKind {
+                expected: crate::FileKind::Directory,
+                found: crate::FileKind::Regular,
+                ..
+            })
+        ));
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn transaction_inode_reloads_handle_by_identity_after_remount() {
+    block_on(async {
+        let (_, image) = filesystem_image();
+        let backing = image.try_clone().unwrap();
+        let when = stamp_of(1_700_000_020);
+        let attrs = super::writer::Attributes {
+            permissions: 0o644,
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+        let (tree, number) = {
+            let mut writer = mount_writer(Disk(image)).await.unwrap();
+            let mut tx = writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let file = tx
+                .create_file(
+                    super::writer::Name {
+                        parent: &root,
+                        bytes: b"persisted",
+                    },
+                    attrs,
+                    when,
+                )
+                .await
+                .unwrap();
+            let id = (file.tree(), file.number());
+            tx.commit().await.unwrap();
+            id
+        };
+
+        let mut reopened = mount_writer(Disk(backing)).await.unwrap();
+        let mut tx = reopened.join().await.unwrap();
+        assert!(
+            tx.inode(crate::ondisk::objectid::EXTENT_TREE, number)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(tx.inode(tree, number + 100).await.unwrap().is_none());
+        let handle = tx.inode(tree, number).await.unwrap().unwrap();
+        tx.write_file(
+            &handle,
+            0,
+            b"reopened",
+            WriteOptions::plain(when, NonZeroUsize::MIN),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let snapshot = reopened.snapshot().unwrap();
+        let inode = snapshot.inode(tree, number).await.unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(snapshot.read(&inode, 0, &mut buf).await.unwrap(), 8);
+        assert_eq!(&buf, b"reopened");
+    });
+}

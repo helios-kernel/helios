@@ -74,13 +74,19 @@ fn permissions(mode: u32) -> u32 {
 impl Filesystem for Daemon {
     /// Asks for `FUSE_POSIX_ACL`, under which the kernel enforces POSIX ACLs
     /// with `default_permissions` as it does for a local filesystem
-    /// (`process_init_reply` in `fs/fuse/inode.c` sets both), and
-    /// `FUSE_DONT_MASK`, so a creation arrives with its umask unapplied for
-    /// the writer's `posix_acl_create`. A kernel without either fails the
-    /// mount rather than serve ACLs it cannot enforce.
+    /// (`process_init_reply` in `fs/fuse/inode.c` sets both), `FUSE_DONT_MASK`,
+    /// so a creation arrives with its umask unapplied for the writer's
+    /// `posix_acl_create`, and `FUSE_EXPORT_SUPPORT`, so `open_by_handle_at`
+    /// resolves evicted inodes and parents through `lookup` of `.` and `..`.
+    /// A kernel without any of them fails the mount rather than serve a
+    /// degraded contract.
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         config
-            .add_capabilities(InitFlags::FUSE_POSIX_ACL | InitFlags::FUSE_DONT_MASK)
+            .add_capabilities(
+                InitFlags::FUSE_POSIX_ACL
+                    | InitFlags::FUSE_DONT_MASK
+                    | InitFlags::FUSE_EXPORT_SUPPORT,
+            )
             .map_err(|missing| {
                 std::io::Error::other(format!("the kernel's FUSE lacks {missing:?}"))
             })
