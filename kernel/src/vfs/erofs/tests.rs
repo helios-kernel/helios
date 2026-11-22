@@ -553,6 +553,34 @@ fn a_disk_mount_request_attaches_the_image_read_only() {
 }
 
 #[test]
+fn erofs_unix_attributes_preserve_stored_mode_and_owner() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let script = root.join("run.sh");
+    fs::write(&script, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
+    let host_meta = fs::metadata(&script).unwrap();
+    let image_path = scratch.path().join("attrs.erofs");
+    Options::default()
+        .compression(Compression::None)
+        .build_from_directory(&root, &image_path)
+        .unwrap();
+    let image = fs::read(image_path).unwrap();
+    let fs = mount(&image).expect("erofs mounts");
+    assert_eq!(
+        block_on(fs.unix_attributes(FsPath::new("run.sh").unwrap())).expect("unix attrs"),
+        crate::UnixAttributes {
+            permissions: 0o750,
+            uid: host_meta.uid(),
+            gid: host_meta.gid(),
+        }
+    );
+}
+
+#[test]
 fn a_corrupted_disk_fails_the_mount_request_with_the_image_error() {
     let mut image = built(Compression::None);
     image[VOLUME_NAME] ^= 0x5a;

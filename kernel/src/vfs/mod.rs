@@ -373,6 +373,10 @@ const SLOT_EMPTY: u8 = 0;
 const SLOT_LIVE: u8 = 1;
 const SLOT_RETIRING: u8 = 2;
 
+/// Shared lock slot tracking the single container holding a
+/// [`MountSharing::Private`] mount: `Some((container_id, claim_count))`.
+type PrivateMountOwner = Arc<spin::Mutex<Option<(u64, usize)>>>;
+
 struct Mount<S: Storage> {
     point: String,
     grant: MountGrant,
@@ -380,6 +384,49 @@ struct Mount<S: Storage> {
     /// The table's own share of the mount's hold; any other share is a
     /// descriptor or stream that keeps the mount from being unmounted.
     hold: MountHold,
+    /// Exclusive container owner for [`MountSharing::Private`] mounts:
+    /// `Some((container_id, claim_count))` while claimed by one container.
+    /// `None` for [`MountSharing::Shared`] mounts.
+    private_owner: Option<PrivateMountOwner>,
+}
+
+/// Why claiming a [`MountSharing::Private`] mount for a container failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum PrivateMountClaimError {
+    #[error("mount is shared and cannot be claimed exclusively as private")]
+    NotPrivate,
+    #[error("private mount is already claimed by another container")]
+    AlreadyClaimed,
+}
+
+/// Exclusive ownership claim a container holds on a [`MountSharing::Private`]
+/// mount. Released automatically when the container drops.
+pub struct PrivateMountClaim {
+    owner_slot: PrivateMountOwner,
+    owner: u64,
+}
+
+impl core::fmt::Debug for PrivateMountClaim {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PrivateMountClaim")
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
+impl Drop for PrivateMountClaim {
+    fn drop(&mut self) {
+        let mut slot = self.owner_slot.lock();
+        if let Some((owner, count)) = slot.as_mut()
+            && *owner == self.owner
+        {
+            *count -= 1;
+            if *count == 0 {
+                *slot = None;
+            }
+        }
+    }
 }
 
 /// What an open descriptor or file stream keeps of the mount it resolved
@@ -812,6 +859,8 @@ impl<S: Storage> MountTable<S> {
                 grant,
                 fs,
                 hold: MountHold::new(),
+                private_owner: (grant.sharing == MountSharing::Private)
+                    .then(|| Arc::new(spin::Mutex::new(None))),
             });
         }
         slot.point_len.store(point.len(), AtomicOrdering::Relaxed);
@@ -920,6 +969,8 @@ pub struct Resolved<'a, S: Storage> {
     /// The mount's hold; `None` for the namespace's root, which is never
     /// unmounted.
     hold: Option<&'a MountHold>,
+    /// Exclusive container owner slot for [`MountSharing::Private`] mounts.
+    private_owner: Option<&'a PrivateMountOwner>,
     /// The pin on the mount's slot; `None` for the root, and for a view
     /// of a [`HeldPath`], which owns what it uses.
     _pin: Option<SlotPin<'a>>,
@@ -980,6 +1031,33 @@ impl<'a, S: Storage> Resolved<'a, S> {
         self.hold.cloned()
     }
 
+    /// Claims exclusive ownership of a [`MountSharing::Private`] mount for the
+    /// container identified by `owner`.
+    pub fn claim_private(&self, owner: u64) -> Result<PrivateMountClaim, PrivateMountClaimError> {
+        if self.grant.sharing != MountSharing::Private {
+            return Err(PrivateMountClaimError::NotPrivate);
+        }
+        let Some(owner_slot) = self.private_owner else {
+            return Err(PrivateMountClaimError::NotPrivate);
+        };
+        let mut slot = owner_slot.lock();
+        match slot.as_mut() {
+            None => {
+                *slot = Some((owner, 1));
+            }
+            Some((existing, count)) if *existing == owner => {
+                *count += 1;
+            }
+            Some(_) => {
+                return Err(PrivateMountClaimError::AlreadyClaimed);
+            }
+        }
+        Ok(PrivateMountClaim {
+            owner_slot: owner_slot.clone(),
+            owner,
+        })
+    }
+
     /// Whether the path names the root of its mount.
     pub fn is_mount_root(&self) -> bool {
         self.path().is_root()
@@ -995,21 +1073,14 @@ impl<'a, S: Storage> Resolved<'a, S> {
             absolute: String::from(&*self.absolute),
             point_len: self.point_len,
             hold: self.hold(),
+            private_owner: self.private_owner.cloned(),
         }))
     }
 
     /// The whole of the regular file at this path, with the provenance of
     /// the layer that produced the bytes.
     pub async fn read_whole(&self) -> FsResult<FileContents> {
-        let path = self.path();
-        match self.fs {
-            MountedFs::Root(root) => root.read_whole(path).await,
-            MountedFs::Boot(boot) => boot.file_contents(path).map(FileContents::Boot),
-            MountedFs::Memory(fs) => read_all(fs, path).await.map(FileContents::Written),
-            MountedFs::Host(fs) => read_all(fs, path).await.map(FileContents::Written),
-            MountedFs::Erofs(fs) => read_all(fs, path).await.map(FileContents::Written),
-            MountedFs::Btrfs(fs) => read_all(fs, path).await.map(FileContents::Written),
-        }
+        self.fs.read_whole(self.path()).await
     }
 }
 
@@ -1024,6 +1095,7 @@ struct HeldInner<S: Storage> {
     absolute: String,
     point_len: usize,
     hold: Option<MountHold>,
+    private_owner: Option<PrivateMountOwner>,
 }
 
 impl<S: Storage> Clone for HeldPath<S> {
@@ -1042,6 +1114,7 @@ impl<S: Storage> HeldPath<S> {
             absolute: Cow::Borrowed(&held.absolute),
             point_len: held.point_len,
             hold: held.hold.as_ref(),
+            private_owner: held.private_owner.as_ref(),
             _pin: None,
         }
     }
@@ -1134,6 +1207,37 @@ impl<S: Storage> Clone for Namespace<S> {
 }
 
 impl<S: Storage> MountedFs<S> {
+    /// The whole of the regular file at `path`, with the provenance of the
+    /// layer that produced the bytes.
+    pub async fn read_whole(&self, path: FsPath<'_>) -> FsResult<FileContents> {
+        match self {
+            Self::Root(root) => root.read_whole(path).await,
+            Self::Boot(boot) => boot.file_contents(path).map(FileContents::Boot),
+            Self::Memory(fs) => read_all(fs, path).await.map(FileContents::Written),
+            Self::Host(fs) => read_all(fs, path).await.map(FileContents::Written),
+            Self::Erofs(fs) => read_all(fs, path).await.map(FileContents::Written),
+            Self::Btrfs(fs) => read_all(fs, path).await.map(FileContents::Written),
+        }
+    }
+
+    /// The stored Unix attributes for `path` on every filesystem that records
+    /// them (`MemoryFs`, `RootFs`, `HostShare`, `ErofsFs`, `BtrfsFs`), or
+    /// default boot-image attributes for `BootFs` which stores no Unix
+    /// ownership or mode bits.
+    pub async fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<UnixAttributes> {
+        match self {
+            Self::Memory(fs) => Ok(fs.unix_metadata(path)?.attributes),
+            Self::Root(root) => root.unix_attributes(path),
+            Self::Host(share) => share.unix_attributes(path).await,
+            Self::Erofs(fs) => fs.unix_attributes(path).await,
+            Self::Btrfs(fs) => fs.unix_attributes(path).await,
+            Self::Boot(_) => {
+                let meta = self.stat(path).await?;
+                Ok(root::BOOT_UNIX.inherited(meta.kind))
+            }
+        }
+    }
+
     /// Ends the filesystem as it leaves the mount table: a writable btrfs
     /// mount commits and lets its device go first.
     async fn unmount(&self) {
@@ -1259,6 +1363,7 @@ impl<S: Storage> Namespace<S> {
                 absolute,
                 point_len,
                 hold: Some(&mount.hold),
+                private_owner: mount.private_owner.as_ref(),
                 _pin: Some(pin),
             },
             None => Resolved {
@@ -1267,6 +1372,7 @@ impl<S: Storage> Namespace<S> {
                 absolute,
                 point_len: 0,
                 hold: None,
+                private_owner: None,
                 _pin: None,
             },
         };

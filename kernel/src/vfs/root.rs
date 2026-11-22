@@ -46,7 +46,7 @@ use crate::BootFs;
 
 /// The Unix attributes the boot image's directories hold; its files and
 /// links take [`UnixAttributes::inherited`] from this.
-const BOOT_UNIX: UnixAttributes = UnixAttributes {
+pub(super) const BOOT_UNIX: UnixAttributes = UnixAttributes {
     permissions: 0o755,
     uid: 0,
     gid: 0,

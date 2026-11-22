@@ -539,6 +539,19 @@ fn nanos(time: Timestamp) -> FsResult<u64> {
         .ok_or(FsError::Overflow)
 }
 
+impl<Device: BlockDevice<Buffer = BlockPages> + 'static> BtrfsFs<Device> {
+    /// The stored Unix ownership and mode bits of the inode at `path`.
+    pub async fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<super::UnixAttributes> {
+        let inode = self.inode(&self.snapshot(), path).await?;
+        let meta = inode.metadata();
+        Ok(super::UnixAttributes {
+            permissions: meta.permissions & 0o7777,
+            uid: meta.uid,
+            gid: meta.gid,
+        })
+    }
+}
+
 impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<Device> {
     type Write = BtrfsWrite<Device>;
 
