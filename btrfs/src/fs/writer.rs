@@ -42,10 +42,55 @@ use crate::source::BlockSink;
 use crate::transaction::file::WriteOptions;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
+use crate::transaction::replay::PendingLog;
 use crate::transaction::reserve::Units;
+use crate::transaction::xattr::XattrMode;
 use crate::transaction::{Checkpoint, Transaction};
 use crate::tree::write::WriteError;
-use crate::{Error, FileKind, Metadata, Timestamp};
+use crate::{DeviceNumber, Error, FileKind, Metadata, Timestamp};
+
+/// What a mount's options give each of its data mutations: Linux's
+/// `compress=` and `max_inline=`, with the caller's time and concurrency.
+/// The encoder is chosen per inode: one that Linux does not compress
+/// (`NODATASUM`, `NODATACOW` or `NOCOMPRESS`) is written uncompressed, where
+/// the [`WriteOptions`] forms refuse a compressing encoder for it.
+pub struct MountPolicy<'a> {
+    pub when: Timestamp,
+    pub concurrency: NonZeroUsize,
+    pub compressor: &'a mut Compressor,
+    /// Linux's `max_inline` mount option; see [`WriteOptions::max_inline`].
+    pub max_inline: u64,
+}
+
+/// Evaluates `$body` with `$options`, the [`WriteOptions`] `$policy` gives an
+/// inode that compresses when `$compresses`.
+macro_rules! with_policy {
+    ($policy:expr, $compresses:expr, |$options:ident| $body:expr) => {{
+        let MountPolicy {
+            when,
+            concurrency,
+            compressor,
+            max_inline,
+        } = $policy;
+        macro_rules! run {
+            ($encoder:expr) => {{
+                let $options = WriteOptions {
+                    when,
+                    concurrency,
+                    encoder: $encoder,
+                    max_inline,
+                };
+                $body
+            }};
+        }
+        match compressor {
+            Compressor::Zlib(encoder) if $compresses => run!(encoder),
+            Compressor::Lzo(encoder) if $compresses => run!(encoder),
+            Compressor::Zstd(encoder) if $compresses => run!(&mut **encoder),
+            _ => run!(Plain),
+        }
+    }};
+}
 
 /// The dirty metadata a running transaction holds before it is committed,
 /// unless the mount's operator chose another bound: Linux's
@@ -90,16 +135,30 @@ impl InodeHandle {
 }
 
 /// Permissions and ownership for a newly created entry. File type is selected
-/// by create_file, create_directory or symlink, never by permission bits.
+/// by create_file, create_directory, symlink or create_special, never by
+/// permission bits. Every bit of `07777` is stored as given, the set-id and
+/// sticky bits included, on every kind of inode.
 #[derive(Clone, Copy, Debug)]
 pub struct Attributes {
+    /// The mode bits asked for, before the umask.
     pub permissions: u32,
     pub uid: u32,
+    /// The creating process's group; overridden by the parent directory's
+    /// when the parent carries `S_ISGID`, as `inode_init_owner` does.
     pub gid: u32,
+    /// The creating process's umask. As in Linux's `posix_acl_create`, it
+    /// narrows `permissions` only when the parent directory has no default
+    /// ACL; a default ACL narrows them instead, and the new inode inherits
+    /// it.
+    pub umask: u32,
 }
 
 impl Attributes {
     fn raw(self, kind: u32) -> Result<RawAttributes, WriteError> {
+        self.raw_with_device(kind, 0)
+    }
+
+    fn raw_with_device(self, kind: u32, rdev: u64) -> Result<RawAttributes, WriteError> {
         if self.permissions & !0o7777 != 0 {
             return Err(WriteError::InvalidPermissions {
                 permissions: self.permissions,
@@ -109,7 +168,31 @@ impl Attributes {
             mode: kind | self.permissions,
             uid: self.uid,
             gid: self.gid,
+            rdev,
+            umask: self.umask,
         })
+    }
+}
+
+/// A node `mknod` makes that holds no data: a device node, a FIFO or a
+/// socket, as `btrfs_mknod` in `fs/btrfs/inode.c` creates them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Special {
+    CharDevice(DeviceNumber),
+    BlockDevice(DeviceNumber),
+    Fifo,
+    Socket,
+}
+
+impl Special {
+    /// The file type bits of the mode, and the inode item's `rdev`.
+    fn mode_and_rdev(self) -> (u32, u64) {
+        match self {
+            Self::CharDevice(device) => (0o020_000, device.inode_item()),
+            Self::BlockDevice(device) => (0o060_000, device.inode_item()),
+            Self::Fifo => (0o010_000, 0),
+            Self::Socket => (0o140_000, 0),
+        }
     }
 }
 
@@ -176,9 +259,25 @@ struct Running<S> {
 impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// Mounts `source` for writing. Every commit takes root UUIDs from
     /// `uuids` and keeps at most `concurrency` block writes in flight.
-    pub async fn mount(source: S, uuids: U, concurrency: NonZeroUsize) -> Result<Self, WriteError> {
-        let current = Filesystem::mount(Arc::new(source)).await?;
+    ///
+    /// A log tree a crash left behind an fsync is replayed first, in one
+    /// transaction that this call commits before it returns, as Linux's
+    /// `btrfs_recover_log_trees` does at mount; `now` is the time that
+    /// replay stamps on what its unlinks change. A log that cannot be
+    /// replayed refuses the mount, and the device keeps its last committed
+    /// generation.
+    pub async fn mount(
+        source: S,
+        uuids: U,
+        concurrency: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<Self, WriteError> {
+        let current = Filesystem::mount_committed(Arc::new(source)).await?;
         current.superblock().check_writable()?;
+        let log = current
+            .superblock()
+            .log_tree()
+            .map(|(bytenr, level)| PendingLog { bytenr, level });
         // Linux enables quotas by creating the quota tree. Its qgroup counts
         // go stale under any write this writer makes, so refuse until the
         // writer maintains them (lexoliu/helios#1043).
@@ -194,7 +293,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             Err(error) => return Err(error.into()),
         }
         let allocation = Allocation::load(&current.volume, current.snapshot.root_tree).await?;
-        Ok(Self {
+        let mut writer = Self {
             committed: Some(current),
             allocation,
             retirements: Retirements::default(),
@@ -202,7 +301,27 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             mount: Arc::new(MountIdentity),
             uuids,
             concurrency,
-        })
+        };
+        if let Some(log) = log {
+            writer.replay(log, now).await?;
+        }
+        Ok(writer)
+    }
+
+    /// Replays `log` in a transaction of its own and commits it, which
+    /// clears the superblock's log root even when the replay changed
+    /// nothing else. Linux reserves nothing up front for it
+    /// (`btrfs_start_transaction(tree_root, 0)`), so only the commit's own
+    /// hold is checked.
+    async fn replay(&mut self, log: PendingLog, now: Timestamp) -> Result<(), WriteError> {
+        self.start().await?;
+        let running = self
+            .running
+            .as_mut()
+            .expect("a transaction runs once started");
+        running.inner.replay_log(log, now).await?;
+        running.inner.check_commit_hold(Units::default())?;
+        self.commit_running().await
     }
 
     /// The space the filesystem has, and what it uses once the running
@@ -287,16 +406,28 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// the future before it finishes, poisons the writer instead of
     /// discarding them; the device keeps the previous generation.
     pub async fn commit(&mut self) -> Result<(), WriteError> {
+        if self.committed.is_none() {
+            return Err(WriteError::WriterPoisoned);
+        }
+        if self
+            .running
+            .as_ref()
+            .is_none_or(|running| running.inner.dirty_metadata_bytes() == 0)
+        {
+            // A clean transaction holds nothing the last commit did not.
+            self.running = None;
+            return Ok(());
+        }
+        self.commit_running().await
+    }
+
+    /// Commits the running transaction, whatever it holds.
+    async fn commit_running(&mut self) -> Result<(), WriteError> {
         let mut current = self.committed.take().ok_or(WriteError::WriterPoisoned)?;
-        let Some(running) = self
+        let running = self
             .running
             .take()
-            .filter(|running| running.inner.dirty_metadata_bytes() != 0)
-        else {
-            // A clean transaction holds nothing the last commit did not.
-            self.committed = Some(current);
-            return Ok(());
-        };
+            .expect("the caller commits a running transaction");
         let uuids = &mut self.uuids;
         let mut committed = running
             .inner
@@ -426,6 +557,30 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         .await
     }
 
+    /// A handle on inode `number` of subvolume `tree`, `None` when no such
+    /// inode exists in the running transaction. For a caller that resolves a
+    /// persisted inode identity without walking from the root, such as a FUSE
+    /// or NFS export lookup.
+    pub async fn inode(&self, tree: u64, number: u64) -> Result<Option<InodeHandle>, WriteError> {
+        if !super::is_subvolume(tree) {
+            return Ok(None);
+        }
+        match self
+            .load_handle(FileId {
+                tree,
+                inode: number,
+            })
+            .await
+        {
+            Ok(handle) => Ok(Some(handle)),
+            Err(
+                WriteError::Read(Error::MissingInode { .. })
+                | WriteError::Read(Error::MissingRoot { .. }),
+            ) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn metadata(&self, handle: &InodeHandle) -> Result<Metadata, WriteError> {
         self.checked(handle).await
     }
@@ -480,48 +635,28 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         Ok(written)
     }
 
-    /// [`Self::write_file`] with the mount's compression policy. An inode that
-    /// Linux does not compress (`NODATASUM`, `NODATACOW` or `NOCOMPRESS`) is
-    /// written uncompressed, where `write_file` with an encoder refuses it.
+    /// [`Self::write_file`] under the mount's policy.
     pub async fn write_file_with_policy(
         &mut self,
         file: &InodeHandle,
         offset: u64,
         data: &[u8],
-        when: Timestamp,
-        concurrency: NonZeroUsize,
-        compressor: &mut Compressor,
+        policy: MountPolicy<'_>,
     ) -> Result<usize, WriteError> {
         let compresses = inode_compresses(self.metadata(file).await?.flags);
-        macro_rules! write {
-            ($encoder:expr) => {
-                self.write_file(
-                    file,
-                    offset,
-                    data,
-                    WriteOptions {
-                        when,
-                        concurrency,
-                        encoder: $encoder,
-                    },
-                )
-                .await
-            };
-        }
-        match compressor {
-            Compressor::Zlib(encoder) if compresses => write!(encoder),
-            Compressor::Lzo(encoder) if compresses => write!(encoder),
-            Compressor::Zstd(encoder) if compresses => write!(&mut **encoder),
-            _ => write!(Plain),
-        }
+        with_policy!(policy, compresses, |options| self
+            .write_file(file, offset, data, options)
+            .await)
     }
 
-    pub async fn truncate_file(
+    /// Sets the size of `file`, as `truncate(2)`. `options` stores the data
+    /// left in the first sector when Linux would write it back: a grown or
+    /// compressed inline file.
+    pub async fn truncate_file<E: Encoder>(
         &mut self,
         file: &InodeHandle,
         size: u64,
-        when: Timestamp,
-        concurrency: NonZeroUsize,
+        options: WriteOptions<E>,
     ) -> Result<(), WriteError> {
         let mut operation = Mutation::new(self, Units::TRUNCATE).await?;
         operation.checked(file).await?;
@@ -529,16 +664,44 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         operation.inner_mut().roots.check_writable(file.tree)?;
         operation
             .inner_mut()
-            .truncate_file(file.tree, file.inode, size, when, concurrency)
+            .truncate_file(file.tree, file.inode, size, options)
             .await?;
         operation.accept()
     }
 
-    pub async fn clone_range(
+    /// [`Self::truncate_file`] under the mount's policy.
+    pub async fn truncate_file_with_policy(
+        &mut self,
+        file: &InodeHandle,
+        size: u64,
+        policy: MountPolicy<'_>,
+    ) -> Result<(), WriteError> {
+        let compresses = inode_compresses(self.metadata(file).await?.flags);
+        with_policy!(policy, compresses, |options| self
+            .truncate_file(file, size, options)
+            .await)
+    }
+
+    /// [`Self::clone_range`] under the mount's policy, which the destination's
+    /// flags select the encoder of.
+    pub async fn clone_range_with_policy(
         &mut self,
         range: CloneRange<'_>,
-        when: Timestamp,
-        concurrency: NonZeroUsize,
+        policy: MountPolicy<'_>,
+    ) -> Result<(), WriteError> {
+        let compresses = inode_compresses(self.metadata(range.destination).await?.flags);
+        with_policy!(policy, compresses, |options| self
+            .clone_range(range, options)
+            .await)
+    }
+
+    /// Shares `range` of one file's extents into another, as `FICLONERANGE`.
+    /// `options` writes what cannot be shared: an inline source, and inline
+    /// destination data the shared extents replace.
+    pub async fn clone_range<E: Encoder>(
+        &mut self,
+        range: CloneRange<'_>,
+        options: WriteOptions<E>,
     ) -> Result<(), WriteError> {
         let mut operation = Mutation::new(self, Units::CLONE).await?;
         operation.checked(range.source).await?;
@@ -554,10 +717,7 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
             .inner_mut()
             .roots
             .check_writable(range.destination.tree)?;
-        operation
-            .inner_mut()
-            .clone_range(range, when, concurrency)
-            .await?;
+        operation.inner_mut().clone_range(range, options).await?;
         operation.accept()
     }
 
@@ -579,15 +739,16 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         operation.accept()
     }
 
-    /// Replaces the permission bits (`07777`, with the set-id bits refused on
-    /// a non-directory with [`WriteError::SetId`]) and stamps `changed`.
+    /// Replaces the permission bits (`07777`, the set-id and sticky bits
+    /// included on every kind of inode) and stamps `changed`. An access ACL's
+    /// base entries follow the new bits.
     pub async fn set_permissions(
         &mut self,
         file: &InodeHandle,
         permissions: u32,
         changed: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self, Units::INODE_UPDATE).await?;
+        let mut operation = Mutation::new(self, Units::MODE).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner_mut().roots.check_writable(file.tree)?;
@@ -599,7 +760,8 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     /// Changes the owner and the group, each left as it is when `None`, and
-    /// stamps `changed`. A non-directory loses its set-id bits.
+    /// stamps `changed`. A non-directory loses its set-id bits and its
+    /// `security.capability`.
     pub async fn set_owner(
         &mut self,
         file: &InodeHandle,
@@ -607,13 +769,90 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         gid: Option<u32>,
         changed: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self, Units::INODE_UPDATE).await?;
+        let mut operation = Mutation::new(self, Units::OWNER).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner_mut().roots.check_writable(file.tree)?;
         operation
             .inner_mut()
             .set_owner(file.tree, file.inode, uid, gid, changed)
+            .await?;
+        operation.accept()
+    }
+
+    /// `getxattr(2)`: the length of `name`'s value, which is also copied to
+    /// `output` unless `output` is empty (a size query). A nonempty `output`
+    /// shorter than the value is [`WriteError::XattrBuffer`] (`ERANGE`), a
+    /// bare handler prefix is [`WriteError::XattrName`] (`EINVAL`), an
+    /// unhandled namespace is [`WriteError::XattrNamespace`] (`EOPNOTSUPP`),
+    /// and an absent attribute is [`WriteError::XattrMissing`] (`ENODATA`).
+    pub async fn xattr(
+        &self,
+        file: &InodeHandle,
+        name: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, WriteError> {
+        self.checked(file).await?;
+        self.inner()
+            .xattr(file.tree(), file.number(), name, output)
+            .await
+    }
+
+    /// `listxattr(2)`: every attribute name of `file`, each followed by a NUL,
+    /// copied to `output` unless it is empty (a size query). Returns the
+    /// bytes the names take.
+    pub async fn list_xattrs(
+        &self,
+        file: &InodeHandle,
+        output: &mut [u8],
+    ) -> Result<usize, WriteError> {
+        self.checked(file).await?;
+        self.inner()
+            .list_xattrs(file.tree(), file.number(), output)
+            .await
+    }
+
+    /// `setxattr(2)`. Every namespace Linux's btrfs stores is written:
+    /// `user.*` (on regular files, directories and sockets only, else
+    /// [`WriteError::XattrNotPermitted`]), `security.*`, `trusted.*` and the
+    /// two POSIX ACL names, which are validated, stored in the encoding
+    /// `posix_acl_to_xattr` produces and, for the access ACL, set the mode's
+    /// permission bits as `btrfs_set_acl` does. Any other namespace is
+    /// [`WriteError::XattrNamespace`]. The inode's ctime becomes `changed`.
+    /// Whether the caller may write the namespace is not checked here.
+    pub async fn set_xattr(
+        &mut self,
+        file: &InodeHandle,
+        name: &[u8],
+        value: &[u8],
+        mode: XattrMode,
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self, Units::XATTR).await?;
+        operation.checked(file).await?;
+        operation.inner_mut().roots.check_writable(file.tree())?;
+        operation
+            .inner_mut()
+            .set_xattr(file.tree(), file.number(), name, value, mode, changed)
+            .await?;
+        operation.accept()
+    }
+
+    /// `removexattr(2)`, under the rules of [`Self::set_xattr`]; an absent
+    /// attribute is [`WriteError::XattrMissing`], except an absent ACL,
+    /// whose removal succeeds as `vfs_remove_acl`'s does.
+    pub async fn remove_xattr(
+        &mut self,
+        file: &InodeHandle,
+        name: &[u8],
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self, Units::XATTR).await?;
+        operation.checked(file).await?;
+        operation.inner_mut().roots.check_writable(file.tree())?;
+        operation
+            .inner_mut()
+            .remove_xattr(file.tree(), file.number(), name, changed)
             .await?;
         operation.accept()
     }
@@ -636,13 +875,37 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         self.create(name, attributes.raw(0o040000)?, when).await
     }
 
+    /// Creates a device node, a FIFO or a socket, as `mknod`. The node holds
+    /// no data; a device node keeps the number it names.
+    pub async fn create_special(
+        &mut self,
+        name: Name<'_>,
+        special: Special,
+        attributes: Attributes,
+        when: Timestamp,
+    ) -> Result<InodeHandle, WriteError> {
+        let (kind, rdev) = special.mode_and_rdev();
+        self.create(name, attributes.raw_with_device(kind, rdev)?, when)
+            .await
+    }
+
     async fn create(
         &mut self,
         name: Name<'_>,
         attributes: RawAttributes,
         when: Timestamp,
     ) -> Result<InodeHandle, WriteError> {
-        let mut operation = Mutation::new(self, Units::CREATE).await?;
+        let parent = self.entry_name(name).await?;
+        let units = if self
+            .inner()
+            .has_default_acl(parent.tree, parent.parent)
+            .await?
+        {
+            Units::CREATE_INHERITING_ACLS
+        } else {
+            Units::CREATE
+        };
+        let mut operation = Mutation::new(self, units).await?;
         let name = operation.entry_name(name).await?;
         operation.inner_mut().roots.check_writable(name.tree)?;
         let inode = operation

@@ -8,7 +8,7 @@ use crate::error::{Compression, FileKind, ItemDefect};
 use crate::key::Key;
 use crate::ondisk::{
     MAX_COMPRESSED_EXTENT, MAX_LEVEL, NAME_MAX, RawDirItem, RawFileExtentBody, RawFileExtentHead,
-    RawInodeItem, RawRootItem, RawTimespec, item_type, view,
+    RawInodeItem, RawRootItem, RawRootRef, RawTimespec, item_type, view,
 };
 use crate::tree::TreeRoot;
 
@@ -31,6 +31,69 @@ impl Timestamp {
             seconds: raw.sec.get() as i64,
             nanoseconds,
         })
+    }
+}
+
+/// A device node's number, as Linux's `dev_t` names it: a 12-bit major and a
+/// 20-bit minor (`MINORBITS` in `include/linux/kdev_t.h`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DeviceNumber {
+    major: u32,
+    minor: u32,
+}
+
+impl DeviceNumber {
+    /// Bits of the minor in the kernel's `dev_t`, `MINORBITS`.
+    const MINOR_BITS: u32 = 20;
+    /// Bits of the major: what `dev_t`'s 32 bits leave after the minor.
+    const MAJOR_BITS: u32 = 32 - Self::MINOR_BITS;
+
+    /// `None` when either number is wider than `dev_t` holds.
+    pub const fn new(major: u32, minor: u32) -> Option<Self> {
+        if major >> Self::MAJOR_BITS != 0 || minor >> Self::MINOR_BITS != 0 {
+            return None;
+        }
+        Some(Self { major, minor })
+    }
+
+    pub const fn major(self) -> u32 {
+        self.major
+    }
+
+    pub const fn minor(self) -> u32 {
+        self.minor
+    }
+
+    /// The number an inode item's `rdev` holds. Linux's btrfs stores the
+    /// kernel's own `dev_t` there (`MKDEV`, written from `i_rdev` by
+    /// `fill_inode_item` in `fs/btrfs/inode.c`), and reads it back into
+    /// `i_rdev`, which keeps the item's low 32 bits.
+    pub(crate) const fn from_inode_item(rdev: u64) -> Self {
+        let kernel = rdev as u32;
+        Self {
+            major: kernel >> Self::MINOR_BITS,
+            minor: kernel & ((1 << Self::MINOR_BITS) - 1),
+        }
+    }
+
+    /// The `rdev` an inode item stores for this number.
+    #[cfg(feature = "write")]
+    pub(crate) const fn inode_item(self) -> u64 {
+        ((self.major << Self::MINOR_BITS) | self.minor) as u64
+    }
+
+    /// The encoding `stat` reports and `mknod` takes, `new_encode_dev` in
+    /// `include/linux/kdev_t.h`.
+    pub const fn encode(self) -> u32 {
+        (self.minor & 0xff) | (self.major << 8) | ((self.minor & !0xff) << 12)
+    }
+
+    /// The number a `stat` or `mknod` encoding names, `new_decode_dev`.
+    pub const fn decode(encoded: u32) -> Self {
+        Self {
+            major: (encoded & 0xfff00) >> 8,
+            minor: (encoded & 0xff) | ((encoded >> 12) & 0xfff00),
+        }
     }
 }
 
@@ -60,7 +123,9 @@ pub struct Metadata {
     pub size: u64,
     /// Bytes of storage charged to the inode.
     pub nbytes: u64,
-    pub rdev: u64,
+    /// The device a character or block device node names; zero for every
+    /// other kind.
+    pub rdev: DeviceNumber,
     /// The `BTRFS_INODE_*` flags.
     pub flags: u64,
     pub generation: u64,
@@ -95,7 +160,7 @@ impl Metadata {
             nlink: raw.nlink.get(),
             size: raw.size.get(),
             nbytes: raw.nbytes.get(),
-            rdev: raw.rdev.get(),
+            rdev: DeviceNumber::from_inode_item(raw.rdev.get()),
             flags: raw.flags.get(),
             generation: raw.generation.get(),
             atime: Timestamp::parse(&raw.atime)?,
@@ -273,6 +338,27 @@ impl RootRecord {
             root_dirid: raw.root_dirid.get(),
         })
     }
+}
+
+/// The parent directory inode id recorded in a `ROOT_BACKREF` item.
+pub(crate) fn root_backref_dirid(payload: &[u8]) -> Result<u64, ItemDefect> {
+    let header_bytes = size_of::<RawRootRef>();
+    let raw: &RawRootRef = view(payload).ok_or(ItemDefect::Size {
+        needed: header_bytes,
+        found: payload.len(),
+    })?;
+    let name_len = usize::from(raw.name_len.get());
+    if name_len == 0 || name_len > NAME_MAX {
+        return Err(ItemDefect::NameLength(name_len));
+    }
+    let needed = header_bytes + name_len;
+    if payload.len() != needed {
+        return Err(ItemDefect::Size {
+            needed,
+            found: payload.len(),
+        });
+    }
+    Ok(raw.dirid.get())
 }
 
 /// What a file extent item stores for its range.

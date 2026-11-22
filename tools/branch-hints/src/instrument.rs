@@ -385,7 +385,8 @@ fn mem_i64(offset: u64) -> MemArg {
     MemArg {
         offset,
         align: 3,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     }
 }
 
@@ -393,7 +394,8 @@ fn mem_i32(offset: u64) -> MemArg {
     MemArg {
         offset,
         align: 2,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     }
 }
 
@@ -401,7 +403,8 @@ fn mem_i8(offset: u64) -> MemArg {
     MemArg {
         offset,
         align: 0,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     }
 }
 

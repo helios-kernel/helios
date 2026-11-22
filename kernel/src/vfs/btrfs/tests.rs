@@ -8,15 +8,15 @@ use ferrosys::btrfs::{FormatOptions, SubvolumeRequest, format_to};
 use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
-    BlockSerial, DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind,
-    OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress, write_with,
+    BlockSerial, DeviceId, DirCookie, DirStream, FileSystem, FilledWrite, FsError, FsPath, Landed,
+    NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress, write_with,
 };
 
 use super::BtrfsFs;
 use crate::io::{MemoryDisk, cache_over};
 use crate::test_support::UnsupportedHostFileSystem;
 use crate::vfs::{
-    AttachedStorage, BOOT_DEVICE, Follow, MountSource, MountTable, Namespace, Storage,
+    AttachedStorage, BOOT_DEVICE, Follow, MountRequest, MountSource, MountTable, Namespace, Storage,
 };
 use crate::{BootFs, EmbeddedBootDirectory, EmbeddedBootFs, ProcessAuthority, request_mount};
 
@@ -26,6 +26,28 @@ struct MemoryStorage;
 impl Storage for MemoryStorage {
     type HostShare = UnsupportedHostFileSystem;
     type Disk = MemoryDisk;
+}
+
+/// A shared mount of `source` at `/mnt` with `write`.
+fn mount_request(
+    source: MountSource,
+    read_only: bool,
+    write: crate::vfs::BtrfsWriteOptions,
+) -> MountRequest<'static> {
+    MountRequest {
+        source,
+        point: "/mnt",
+        read_only,
+        sharing: crate::MountSharing::Shared,
+        write,
+    }
+}
+
+/// The btrfs image on the test disk.
+fn btrfs_source() -> MountSource {
+    MountSource::Btrfs {
+        serial: BlockSerial::new(b"btrfs-test").unwrap(),
+    }
 }
 
 fn options(time: Timestamp) -> FormatOptions {
@@ -49,21 +71,26 @@ fn formatted_cache(
     options: FormatOptions,
     read_only: bool,
 ) -> crate::BlockCache<MemoryDisk> {
-    // ferrosys' default geometry requires a volume above 109 MiB.
-    let size = 128 << 20;
+    cache_over(&formatted_disk(tree, options, read_only), 256, 1)
+}
+
+/// The bytes of a formatted volume: ferrosys' default geometry requires a
+/// volume above 109 MiB.
+const FORMATTED_BYTES: usize = 128 << 20;
+
+fn formatted_disk(tree: TreeBuilder, options: FormatOptions, read_only: bool) -> MemoryDisk {
+    let size = FORMATTED_BYTES as u64;
     let mut image = tempfile::tempfile().expect("image file");
     image.set_len(size).expect("image length");
     format_to(&mut image, tree, size, options).expect("formats btrfs");
     image.seek(SeekFrom::Start(0)).expect("rewinds");
     let mut bytes = Vec::new();
     image.read_to_end(&mut bytes).expect("reads image");
-    let disk = if read_only {
+    if read_only {
         MemoryDisk::holding("btrfs-test", &bytes, false)
     } else {
         MemoryDisk::holding_writable("btrfs-test", &bytes)
-    };
-    drop(bytes);
-    cache_over(&disk, 256, 1)
+    }
 }
 
 fn path(value: &str) -> FsPath<'_> {
@@ -85,6 +112,8 @@ fn write_options(
         concurrency: core::num::NonZeroUsize::new(concurrency).unwrap(),
         compress,
         commit: None,
+        max_inline: None,
+        now: 1_700_000_000_000_000_000,
     }
 }
 
@@ -246,9 +275,10 @@ fn special_nodes_are_listed_and_statted_and_never_opened() {
     ];
 
     let mut listed = Vec::new();
+    let dir = block_on(fs.open_dir(path(""))).expect("opens root");
     let mut cookie = DirCookie::new(0);
     loop {
-        let entries = block_on(fs.read_dir(path(""), cookie, 2)).expect("directory page");
+        let entries = block_on(dir.read(cookie, 2)).expect("directory page");
         let Some(last) = entries.last() else {
             break;
         };
@@ -350,9 +380,10 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
     );
 
     let mut names = BTreeSet::new();
+    let dir = block_on(fs.open_dir(path(""))).expect("opens root");
     let mut cookie = DirCookie::new(0);
     loop {
-        let entries = block_on(fs.read_dir(path(""), cookie, 1)).expect("directory page");
+        let entries = block_on(dir.read(cookie, 1)).expect("directory page");
         let Some(entry) = entries.first() else {
             break;
         };
@@ -374,17 +405,7 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
             host_share: None,
             disks: Some(cache),
         },
-        MountSource::Btrfs {
-            serial: BlockSerial::new(b"btrfs-test").unwrap(),
-        },
-        "/mnt",
-        true,
-        crate::vfs::BtrfsWriteOptions {
-            entropy: crate::test_support::test_root_entropy(),
-            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-            compress: None,
-            commit: None,
-        },
+        mount_request(btrfs_source(), true, write_options(1, None)),
     ))
     .expect("mount request");
     let resolved = namespace.resolve("/mnt/hello").expect("mounted file");
@@ -420,17 +441,7 @@ fn a_writable_mount_links_a_file_created_through_the_namespace() {
             host_share: None,
             disks: Some(cache),
         },
-        MountSource::Btrfs {
-            serial: BlockSerial::new(b"btrfs-test").unwrap(),
-        },
-        "/mnt",
-        false,
-        crate::vfs::BtrfsWriteOptions {
-            entropy: crate::test_support::test_root_entropy(),
-            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-            compress: None,
-            commit: None,
-        },
+        mount_request(btrfs_source(), false, write_options(1, None)),
     ))
     .expect("mount request")
     .expect("a writable btrfs mount returns its service");
@@ -675,6 +686,146 @@ fn writable_service_publishes_namespace_and_survives_remount() {
             reopened.read_link(path("dir/symlink")).await.unwrap(),
             "moved"
         );
+    });
+}
+
+/// The device's bytes as a source the btrfs reader mounts, to read back the
+/// Unix metadata the filesystem contract does not report.
+struct Bytes(Vec<u8>);
+
+impl helios_btrfs::BlockSource for Bytes {
+    fn size_bytes(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    async fn read_at(&self, offset: u64, output: &mut [u8]) -> helios_hal::io::IoResult<()> {
+        let start = offset as usize;
+        output.copy_from_slice(&self.0[start..start + output.len()]);
+        Ok(())
+    }
+}
+
+/// A node created through the filesystem contract, which carries no creator
+/// identity, takes its owner and group from its parent directory, and its
+/// mode from the parent's with the execute bits cleared for a regular file
+/// (lexoliu/helios#1037).
+#[test]
+fn a_node_created_without_an_identity_inherits_from_its_parent() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let directories: [(&str, u16, u32, u32); 3] = [
+        ("中文目录", 0o2775, 1000, 100),
+        ("日本語のディレクトリ", 0o1777, 0, 0),
+        ("한국어디렉터리", 0o750, 7, 8),
+    ];
+    let mut tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+    for (name, mode, uid, gid) in directories {
+        tree = tree.directory(
+            alloc::format!("/{name}"),
+            Metadata::new(mode, time).owned_by(uid, gid),
+        );
+    }
+    let disk = formatted_disk(tree, FormatOptions::new([0x63; 16], time), false);
+    let cache = cache_over(&disk, 256, 1);
+    block_on(async {
+        let (fs, service) =
+            BtrfsFs::mount_writable(cache.disk(0), || DeviceId::new(120), write_options(1, None))
+                .await
+                .expect("writable mount");
+        let client = async move {
+            for (name, ..) in directories {
+                let file = alloc::format!("{name}/ファイル");
+                fs.open(path(&file), OpenFlags::CREATE, 1_000_000_000)
+                    .await
+                    .expect("create");
+                let child = alloc::format!("{name}/하위");
+                fs.create_directory(path(&child), 1_000_000_000)
+                    .await
+                    .expect("mkdir");
+                let link = alloc::format!("{name}/链接");
+                fs.symlink("ファイル", path(&link), 1_000_000_000)
+                    .await
+                    .expect("symlink");
+            }
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+    });
+    let view = block_on(helios_btrfs::Filesystem::mount(Bytes(
+        disk.bytes_at(0, FORMATTED_BYTES),
+    )))
+    .expect("the committed image mounts");
+    for (name, mode, uid, gid) in directories {
+        let parent = block_on(view.resolve(alloc::format!("/{name}").as_bytes())).unwrap();
+        let made = |child: &str| {
+            let inode = block_on(view.lookup(&parent, child.as_bytes()))
+                .unwrap()
+                .expect("created");
+            let metadata = *inode.metadata();
+            (metadata.permissions, metadata.uid, metadata.gid)
+        };
+        let mode = u32::from(mode);
+        // Execute cleared, and no set-id or sticky bit, for the file.
+        assert_eq!(made("ファイル"), (mode & 0o666, uid, gid), "{name}");
+        // The directory keeps the set-group-id bit and only that.
+        assert_eq!(made("하위"), (mode & 0o2777, uid, gid), "{name}");
+        assert_eq!(made("链接"), (0o777, uid, gid), "{name}");
+    }
+}
+
+#[test]
+fn writable_mount_refuses_to_open_special_nodes_and_keeps_them_across_writes() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new()
+        .root(Metadata::new(0o755, time))
+        .char_device("/chr", 1, 3, Metadata::new(0o660, time))
+        .block_device("/blk", 8, 0, Metadata::new(0o660, time))
+        .fifo("/fifo", Metadata::new(0o640, time))
+        .socket("/sock", Metadata::new(0o600, time));
+    let disk = formatted_disk(tree, FormatOptions::new([0x64; 16], time), false);
+    let cache = cache_over(&disk, 256, 1);
+    block_on(async {
+        let (fs, service) =
+            BtrfsFs::mount_writable(cache.disk(0), || DeviceId::new(121), write_options(1, None))
+                .await
+                .expect("writable mount");
+        let client = async move {
+            for (name, expected_kind, expected_err) in [
+                (
+                    "chr",
+                    helios_hal::fs::NodeKind::CharacterDevice,
+                    helios_hal::fs::FsError::NotPermitted,
+                ),
+                (
+                    "blk",
+                    helios_hal::fs::NodeKind::BlockDevice,
+                    helios_hal::fs::FsError::NotPermitted,
+                ),
+                (
+                    "fifo",
+                    helios_hal::fs::NodeKind::Fifo,
+                    helios_hal::fs::FsError::Unsupported,
+                ),
+                (
+                    "sock",
+                    helios_hal::fs::NodeKind::Socket,
+                    helios_hal::fs::FsError::Unsupported,
+                ),
+            ] {
+                assert_eq!(fs.stat(path(name)).await.unwrap().kind, expected_kind);
+                assert_eq!(
+                    fs.open(path(name), OpenFlags::empty(), 1_000_000_000)
+                        .await
+                        .map(drop),
+                    Err(expected_err),
+                    "{name}"
+                );
+            }
+            fs.open(path("neighbor"), OpenFlags::CREATE, 1_000_000_000)
+                .await
+                .expect("creates regular file beside special nodes");
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
     });
 }
 
@@ -1183,15 +1334,14 @@ fn request_writable(
             host_share: None,
             disks: Some(cache_over(disk, 256, 1)),
         },
-        MountSource::Btrfs {
-            serial: BlockSerial::new(b"btrfs-test").unwrap(),
-        },
-        "/mnt",
-        false,
-        crate::vfs::BtrfsWriteOptions {
-            commit,
-            ..write_options(1, None)
-        },
+        mount_request(
+            btrfs_source(),
+            false,
+            crate::vfs::BtrfsWriteOptions {
+                commit,
+                ..write_options(1, None)
+            },
+        ),
     ))
     .expect("mount request")
     .expect("a writable btrfs mount returns its service")
@@ -1322,14 +1472,231 @@ fn the_commit_option_of_a_mount_request_sets_its_interval() {
                 host_share: None,
                 disks: None,
             },
-            MountSource::Memory,
-            "/mnt",
-            false,
-            crate::vfs::BtrfsWriteOptions {
-                commit: Some(CommitPolicy::from_commit_option(5)),
-                ..write_options(1, None)
-            },
+            mount_request(
+                MountSource::Memory,
+                false,
+                crate::vfs::BtrfsWriteOptions {
+                    commit: Some(CommitPolicy::from_commit_option(5)),
+                    ..write_options(1, None)
+                },
+            ),
         )),
         Err(crate::MountRequestError::CommitUnsupported)
     ));
+}
+
+/// A mount's `max_inline` decides which small files its writes keep inline,
+/// and its operator changes it on the running mount, as Linux's
+/// `remount,max_inline=`. A source other than btrfs refuses the option.
+#[test]
+fn the_max_inline_option_bounds_inline_files_and_follows_its_operator() {
+    use helios_btrfs::ExtentKind;
+
+    let disk = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    // Between the two limits the test sets: 45 lines of 33 bytes.
+    let contents = "内联 インライン 인라인\n".repeat(45);
+    assert_eq!(contents.len(), 1485);
+    const BEFORE: &str = "之前-前-이전";
+    const AFTER: &str = "之后-後-이후";
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache_over(&disk, 256, 1).disk(0),
+            || DeviceId::new(100),
+            crate::vfs::BtrfsWriteOptions {
+                max_inline: Some(1024),
+                ..write_options(1, None)
+            },
+        )
+        .await
+        .expect("writable mount");
+        let contents = contents.as_bytes();
+        let client = async move {
+            assert_eq!(fs.max_inline(), Some(1024));
+            for (name, max_inline) in [(BEFORE, 1024), (AFTER, 2048)] {
+                fs.set_max_inline(max_inline).expect("writable mount");
+                fs.open(path(name), OpenFlags::CREATE, 1_000_000_000)
+                    .await
+                    .expect("create");
+                write_with(
+                    &fs,
+                    path(name),
+                    WritePosition::At(0),
+                    contents.len(),
+                    1_000_000_001,
+                    |offset, bytes| bytes.copy_from_slice(&contents[offset..offset + bytes.len()]),
+                )
+                .await
+                .expect("write");
+            }
+            assert_eq!(fs.max_inline(), Some(2048));
+            fs.sync(path(AFTER)).await.expect("sync");
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+    });
+    let reopened = mount(&cache_over(&disk, 256, 1));
+    let snapshot = reopened.inner.reader.lock().clone();
+    for (name, kind) in [(BEFORE, ExtentKind::Regular), (AFTER, ExtentKind::Inline)] {
+        assert_eq!(
+            block_on(reopened.read_at(path(name), 0, contents.len())).unwrap(),
+            contents.as_bytes()
+        );
+        let inode = block_on(snapshot.resolve(alloc::format!("/{name}").as_bytes())).unwrap();
+        let extents = block_on(snapshot.file_extents(&inode)).unwrap();
+        assert_eq!(extents.len(), 1, "{name}: {extents:?}");
+        assert_eq!(extents[0].kind, kind, "{name}: {extents:?}");
+    }
+    assert_eq!(reopened.max_inline(), None, "a read-only mount has none");
+
+    let namespace = mount_point_namespace();
+    assert!(matches!(
+        block_on(request_mount(
+            &ProcessAuthority::root(),
+            &namespace,
+            AttachedStorage {
+                host_share: None,
+                disks: None,
+            },
+            mount_request(
+                MountSource::Memory,
+                false,
+                crate::vfs::BtrfsWriteOptions {
+                    max_inline: Some(2048),
+                    ..write_options(1, None)
+                },
+            ),
+        )),
+        Err(crate::MountRequestError::MaxInlineUnsupported)
+    ));
+}
+
+/// Opening a btrfs directory stream records the upper `DIR_INDEX` bound so
+/// renaming entries (`entry -> TEMPFILE -> entry`) while iterating finishes
+/// in bounded entries, and `rewind` refreshes the bound for newly created
+/// entries.
+#[test]
+fn open_dir_bounds_iteration_during_renames_and_refreshes_on_rewind() {
+    let disk = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache_over(&disk, 256, 1).disk(0),
+            || DeviceId::new(100),
+            write_options(1, None),
+        )
+        .await
+        .expect("writable mount");
+        let client = async move {
+            fs.create_directory(path("work"), 1_000_000_000)
+                .await
+                .expect("mkdir work");
+            fs.create_directory(path("empty"), 1_000_000_000)
+                .await
+                .expect("mkdir empty");
+            let mut expected = Vec::new();
+            for name in ["中文", "日本語", "한국어"] {
+                let full = alloc::format!("work/{name}");
+                fs.open(path(&full), OpenFlags::CREATE, 1_000_000_001)
+                    .await
+                    .expect("create cjk file");
+                expected.push(alloc::string::String::from(name));
+            }
+            for i in 0..32 {
+                let name = alloc::format!("entry-{i:02}");
+                let full = alloc::format!("work/{name}");
+                fs.open(path(&full), OpenFlags::CREATE, 1_000_000_001)
+                    .await
+                    .expect("create file");
+                expected.push(name);
+            }
+
+            // Opening a non-directory fails with `NotDirectory`.
+            assert_eq!(
+                fs.open_dir(path("work/entry-00")).await.map(drop),
+                Err(FsError::NotDirectory)
+            );
+
+            // An open stream on an empty directory sees nothing added after
+            // open until `rewind` refreshes its bound.
+            let mut empty_stream = fs.open_dir(path("empty")).await.expect("open empty");
+            fs.open(path("empty/added"), OpenFlags::CREATE, 1_000_000_002)
+                .await
+                .expect("create after open");
+            assert!(
+                empty_stream
+                    .read(DirCookie::START, 8)
+                    .await
+                    .expect("read empty")
+                    .is_empty()
+            );
+            empty_stream.rewind().await.expect("rewind empty");
+            let after_rewind = empty_stream
+                .read(DirCookie::START, 8)
+                .await
+                .expect("read after rewind");
+            assert_eq!(after_rewind.len(), 1);
+            assert_eq!(after_rewind[0].name, "added");
+
+            // Rename every yielded entry (`entry -> TEMPFILE -> entry`) while
+            // paging through `work`; iteration terminates with the initial set.
+            let mut stream = fs.open_dir(path("work")).await.expect("open work");
+            let mut cookie = DirCookie::START;
+            let mut seen = Vec::new();
+            let safety_cap = expected.len() * 3;
+            loop {
+                let batch = stream.read(cookie, 2).await.expect("read page");
+                let Some(last) = batch.last() else {
+                    break;
+                };
+                cookie = last.next;
+                for entry in batch {
+                    let from = alloc::format!("work/{}", entry.name);
+                    fs.rename(
+                        path(&from),
+                        path("work/TEMPFILE"),
+                        RenameMode::Replace,
+                        1_000_000_003,
+                    )
+                    .await
+                    .expect("rename to TEMPFILE");
+                    fs.rename(
+                        path("work/TEMPFILE"),
+                        path(&from),
+                        RenameMode::Replace,
+                        1_000_000_004,
+                    )
+                    .await
+                    .expect("rename back");
+                    seen.push(entry.name);
+                    assert!(
+                        seen.len() <= safety_cap,
+                        "directory stream looped past safety cap ({safety_cap})"
+                    );
+                }
+            }
+            seen.sort();
+            expected.sort();
+            assert_eq!(seen, expected);
+
+            // After adding a new entry and calling `rewind`, the new entry appears.
+            fs.open(path("work/after"), OpenFlags::CREATE, 1_000_000_005)
+                .await
+                .expect("create after");
+            stream.rewind().await.expect("rewind work");
+            let mut refreshed = Vec::new();
+            let mut cookie = DirCookie::START;
+            loop {
+                let batch = stream.read(cookie, 16).await.expect("read refreshed");
+                let Some(last) = batch.last() else {
+                    break;
+                };
+                cookie = last.next;
+                refreshed.extend(batch.into_iter().map(|entry| entry.name));
+            }
+            assert!(refreshed.iter().any(|name| name == "after"));
+            drop(stream);
+            drop(empty_stream);
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+    });
 }

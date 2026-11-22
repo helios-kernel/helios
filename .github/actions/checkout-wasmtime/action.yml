@@ -15,6 +15,6 @@ runs:
     - uses: actions/checkout@v4
       with:
         repository: lexoliu/wasmtime
-        # Branch `helios/realloc-task-context`.
-        ref: a5decfb590ab82212c6946f8b13de9cf7004da2c
+        # Branch `helios/sync-main-52`.
+        ref: 83843e3ad9613bf4d9f5a860ef8bb5aa5d9a9de5
         path: ${{ inputs.path }}

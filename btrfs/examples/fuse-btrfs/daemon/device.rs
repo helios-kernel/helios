@@ -19,6 +19,13 @@ struct Aligned([u8; BLOCK]);
 
 /// A block device opened for the writer.
 ///
+/// `buffered` is an exclusive open (`O_EXCL` on a block device, open(2)):
+/// while it is open the kernel refuses every other exclusive claim on the
+/// device, another daemon's included, with `EBUSY`, as it does for a mounted
+/// device. So two daemons never write one device, and nothing that claims
+/// a device before changing it (mkfs, `wipefs`, a device-mapper target)
+/// does so under a running daemon.
+///
 /// Staged blocks and every read go through the page cache of `buffered`.
 /// The superblock goes through `durable`, a descriptor opened
 /// `O_DIRECT | O_DSYNC`: the kernel submits that write to the device as a
@@ -36,13 +43,31 @@ pub struct Device {
 
 impl Device {
     pub fn open(path: &Path) -> io::Result<Self> {
-        let buffered = OpenOptions::new().read(true).write(true).open(path)?;
+        let buffered = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_EXCL)
+            .open(path)?;
+        // Not exclusive: the claim `buffered` holds would refuse it.
         let durable = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_DIRECT | libc::O_DSYNC)
             .open(path)?;
         // A block device's metadata length is zero; its end is where it seeks to.
+        let len = (&buffered).seek(SeekFrom::End(0))?;
+        Ok(Self {
+            buffered,
+            durable,
+            len,
+            poisoned: AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn open_for_test(path: &Path) -> io::Result<Self> {
+        let buffered = OpenOptions::new().read(true).write(true).open(path)?;
+        let durable = buffered.try_clone()?;
         let len = (&buffered).seek(SeekFrom::End(0))?;
         Ok(Self {
             buffered,
@@ -65,6 +90,28 @@ impl Device {
             .checked_mul(READ_ALIGNMENT)
             .filter(|offset| offset.saturating_add(READ_ALIGNMENT) <= self.len)
             .ok_or(IoError::OutOfBounds)
+    }
+}
+
+/// The daemon's hold on its device, which whoever unmounts it waits for.
+///
+/// A plain FUSE unmount returns without waiting for the daemon, which
+/// commits what it still holds as its session ends, and an exclusive open
+/// cannot be waited for. So the daemon also holds an exclusive `flock` on
+/// the device node, the lock systemd's block device locking protocol has a
+/// writer take, from before it serves until after it has committed, closed
+/// [`Device`] and ended its FUSE session. A shared `flock` on the node
+/// returns once the daemon has let go of the device.
+pub struct Hold(#[expect(dead_code, reason = "held for its lock, never read")] File);
+
+impl Hold {
+    /// Locks the node of the device [`Device::open`] has already claimed, so
+    /// only a daemon in the last moment of its exit, or a waiter's shared
+    /// lock, can stand in the way, and either lets go at once.
+    pub fn acquire(path: &Path) -> io::Result<Self> {
+        let node = File::open(path)?;
+        node.lock()?;
+        Ok(Self(node))
     }
 }
 

@@ -2612,7 +2612,6 @@ fn build_environment(
     } else {
         environment.push(("CARGO_PROFILE_DEV_OPT_LEVEL", "z".to_owned()));
         environment.push(("CARGO_PROFILE_DEV_DEBUG", "0".to_owned()));
-        environment.push(("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1".to_owned()));
         environment.push(("CARGO_PROFILE_DEV_PANIC", "abort".to_owned()));
     }
     // The flags carry link arguments with spaces in them, so they go as

@@ -9,6 +9,7 @@ mod memory;
 use memory::*;
 mod descriptor;
 use descriptor::*;
+pub(crate) use descriptor::{Preview1SignalExit, WasixSignalState};
 mod display;
 pub(super) use display::add_display_to_linker;
 pub use display::{DisplayHandle, SurfaceHandle};
@@ -53,13 +54,21 @@ use wasix_proc::*;
 mod wasix_thread;
 use wasix_thread::*;
 mod wasix_net;
+#[cfg(test)]
+mod wasix_shared_state_tests;
+#[cfg(test)]
+mod wasix_signal_tests;
 use wasix_net::*;
 mod wasix_epoll;
 use wasix_epoll::*;
 #[cfg(feature = "linux")]
 mod linux;
+#[cfg(test)]
+mod stdin_inheritance_tests;
 #[cfg(feature = "linux")]
 use linux::*;
+#[cfg(test)]
+mod child_exit_tests;
 
 use super::*;
 use crate::isa::GuestIsa;
@@ -518,7 +527,7 @@ impl ChildHandle {
 #[derive(Clone, Debug)]
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
-    pub exit_code: u32,
+    pub termination: helios_unix::ChildTermination,
     filesystem: Option<MemoryFs>,
 }
 
@@ -1607,13 +1616,33 @@ where
         let (stdout, (stderr, exit)) =
             futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
         let exit = exit?;
+        let exit_code = match exit.termination {
+            helios_unix::ChildTermination::Exited(code) => code,
+            helios_unix::ChildTermination::Signaled(sig) => {
+                128u32.saturating_add(u32::from(sig.signal))
+            }
+            helios_unix::ChildTermination::Trapped => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: ProgramExecErrorDetail::ChildTrapped,
+                });
+            }
+            helios_unix::ChildTermination::Killed => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: ProgramExecErrorDetail::ChildKilled,
+                });
+            }
+        };
 
-        Ok(ExecResult {
-            instance_id: exit.instance_id,
-            exit_code: exit.exit_code,
-            output: crate::ExecOutput { stdout, stderr },
-        })
-        .map(|result| (result, exit.filesystem))
+        Ok((
+            ExecResult {
+                instance_id: exit.instance_id,
+                exit_code,
+                output: crate::ExecOutput { stdout, stderr },
+            },
+            exit.filesystem,
+        ))
     }
 
     pub(crate) async fn aot(
@@ -2651,7 +2680,11 @@ const WASIX_JOIN_FLAG_NON_BLOCKING: u32 = 1 << 0;
 const WASIX_JOIN_FLAGS_SUPPORTED: u32 = WASIX_JOIN_FLAG_NON_BLOCKING | (1 << 1);
 const WASIX_JOIN_STATUS_NOTHING: u8 = 0;
 const WASIX_JOIN_STATUS_EXIT_NORMAL: u8 = 1;
+const WASIX_JOIN_STATUS_EXIT_SIGNAL: u8 = 2;
 const WASIX_JOIN_STATUS_UNION_OFFSET: u32 = 2;
+const WASIX_ERRNO_SIGNAL_SIGNAL_OFFSET: u32 = 4;
+const WASIX_SIGABRT: u8 = 6;
+const WASIX_SIGKILL: u8 = 9;
 const WASIX_SOCK_TYPE_STREAM: i32 = 1;
 const WASIX_SOCK_TYPE_DGRAM: i32 = 2;
 const WASIX_SOCK_STATUS_OPENED: u8 = 1;
@@ -3174,10 +3207,10 @@ mod tests {
         let mode = table
             .component_output_mode(&session)
             .expect("closed slots are closed streams");
-        let OutputMode::RoutedChild { stdin_rx, .. } = &mode else {
+        let OutputMode::RoutedChild { stdin, .. } = &mode else {
             panic!("a redirected table routes each stream");
         };
-        assert!(matches!(stdin_rx.try_read(), crate::io::TryRead::Eof));
+        assert!(matches!(stdin, crate::ComponentInputRoute::Closed));
         let stdout = component_channel(&mode, crate::ComponentOutputStreamKind::Stdout);
         assert!(matches!(
             stdout.try_write(Bytes::from_static(b"lost\n")),
@@ -3389,14 +3422,7 @@ mod tests {
 
     #[test]
     fn socket_descriptor_accepts_only_nonblock_fdflag() {
-        let (writer, reader) = crate::byte_channel();
-        let socket = Preview1Descriptor::Socket(UnixSocket::Pair {
-            reader,
-            writer,
-            carry: Bytes::new(),
-            options: unix_socket_options::<TestNet>(),
-            kind: SocketKind::Stream,
-        });
+        let socket = Preview1Descriptor::Socket(UnixSocket::<TestNet>::pair(SocketKind::Stream).0);
         let mut table: TestDescriptorTable = Preview1DescriptorTable::from_entries(vec![Some(
             Preview1DescriptorEntry::new(socket, false),
         )]);
@@ -3812,7 +3838,7 @@ mod tests {
 
     #[test]
     fn wasix_socket_operations_select_network_authority_by_socket_kind() {
-        let tcp = Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Connected {
+        let tcp = Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
             family: SocketFamily::Ipv4,
             stream: OwnedTcpStream::new(
                 crate::UnixNetwork::new(crate::test_support::test_network_service()),
@@ -3822,7 +3848,7 @@ mod tests {
             peer_port: 80,
             options: unix_socket_options::<TestNet>(),
         }));
-        let udp_bound = Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Bound {
+        let udp_bound = Preview1Descriptor::Socket(UnixSocket::from_udp(UnixUdpSocket::Bound {
             family: SocketFamily::Ipv4,
             socket: OwnedUdpSocket::new(
                 crate::UnixNetwork::new(crate::test_support::test_network_service()),
@@ -3833,10 +3859,7 @@ mod tests {
             options: unix_socket_options::<TestNet>(),
         }));
         let udp_unbound: TestDescriptor =
-            Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound {
-                family: SocketFamily::Ipv4,
-                options: unix_socket_options::<TestNet>(),
-            }));
+            Preview1Descriptor::Socket(UnixSocket::udp(SocketFamily::Ipv4));
         let pair: TestDescriptor =
             Preview1Descriptor::Socket(TestSocketDescriptor::pair(SocketKind::Stream).0);
         let nonsocket: TestDescriptor = Preview1Descriptor::Stdout;
@@ -3917,16 +3940,8 @@ mod tests {
 
     #[test]
     fn wasix_multicast_preflight_accepts_udp_sockets_only() {
-        let udp: TestDescriptor =
-            Preview1Descriptor::Socket(UnixSocket::Udp(UnixUdpSocket::Unbound {
-                family: SocketFamily::Ipv4,
-                options: unix_socket_options::<TestNet>(),
-            }));
-        let tcp: TestDescriptor =
-            Preview1Descriptor::Socket(UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-                family: SocketFamily::Ipv4,
-                options: unix_socket_options::<TestNet>(),
-            }));
+        let udp: TestDescriptor = Preview1Descriptor::Socket(UnixSocket::udp(SocketFamily::Ipv4));
+        let tcp: TestDescriptor = Preview1Descriptor::Socket(UnixSocket::tcp(SocketFamily::Ipv4));
         let file: TestDescriptor = Preview1Descriptor::Stdout;
 
         assert_eq!(
@@ -4207,14 +4222,9 @@ mod tests {
             WASIX_EPOLL_TYPE_EPOLLIN
         );
 
-        let (pair_writer, pair_reader) = crate::byte_channel();
-        let pair: TestDescriptor = Preview1Descriptor::Socket(UnixSocket::Pair {
-            reader: pair_reader,
-            writer: pair_writer.clone(),
-            carry: Bytes::new(),
-            options: unix_socket_options::<TestNet>(),
-            kind: SocketKind::Stream,
-        });
+        let (pair_socket, pair_peer) = TestSocketDescriptor::pair(SocketKind::Stream);
+        let pair_writer = pair_peer.pair_writer().expect("pair peer has writer");
+        let pair: TestDescriptor = Preview1Descriptor::Socket(pair_socket);
         assert_eq!(local_epoll_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         assert_eq!(
             pair_writer.try_write(Bytes::from_static(b"pair")),
@@ -4243,7 +4253,7 @@ mod tests {
             maximum_pages: 1,
         };
         let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
-        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        let memory = SharedMemory::new(&engine, spec.memory_type().unwrap()).unwrap();
         let ptr = memory.data().as_ptr().cast::<u8>() as *mut u8;
         unsafe {
             ptr.write(0xa5);
@@ -4274,7 +4284,7 @@ mod tests {
             maximum_pages: 1,
         };
         let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
-        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        let memory = SharedMemory::new(&engine, spec.memory_type().unwrap()).unwrap();
         assert!(pool.reserve_for_recycle(spec, &memory));
         futures_lite::future::block_on(scrub_shared_memory(&memory));
         pool.finish_recycle(spec, memory);
@@ -4288,10 +4298,7 @@ mod tests {
 
     #[test]
     fn wasix_socket_size_options_are_descriptor_local_state() {
-        let mut descriptor: TestSocketDescriptor = UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            family: SocketFamily::Ipv4,
-            options: unix_socket_options::<TestNet>(),
-        });
+        let descriptor: TestSocketDescriptor = UnixSocket::tcp(SocketFamily::Ipv4);
 
         // The defaults a WASIX program reads back before setting anything.
         assert_eq!(
@@ -4309,19 +4316,19 @@ mod tests {
         );
 
         assert_eq!(
-            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE, 4096),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE, 4096),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, 8192),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, 8192),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_RECV_LOWAT, 2),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_RECV_LOWAT, 2),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_TTL, 128),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_TTL, 128),
             p1::errno::SUCCESS
         );
 
@@ -4337,7 +4344,7 @@ mod tests {
         );
         assert_eq!(
             wasix_socket_set_size(
-                &mut descriptor,
+                &descriptor,
                 WASIX_SOCK_OPTION_TYPE,
                 WASIX_SOCK_TYPE_STREAM as u64
             ),
@@ -4351,17 +4358,14 @@ mod tests {
 
     #[test]
     fn wasix_socket_flag_options_are_descriptor_local_state() {
-        let mut descriptor: TestSocketDescriptor = UnixSocket::Udp(UnixUdpSocket::Unbound {
-            family: SocketFamily::Ipv4,
-            options: unix_socket_options::<TestNet>(),
-        });
+        let descriptor: TestSocketDescriptor = UnixSocket::udp(SocketFamily::Ipv4);
 
         assert_eq!(
-            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_BROADCAST, true),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_BROADCAST, true),
             p1::errno::SUCCESS
         );
         assert_eq!(
-            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_REUSE_ADDR, true),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_REUSE_ADDR, true),
             p1::errno::SUCCESS
         );
         assert_eq!(
@@ -4378,7 +4382,7 @@ mod tests {
         );
 
         assert_eq!(
-            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_BROADCAST, false),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_BROADCAST, false),
             p1::errno::SUCCESS
         );
         assert_eq!(
@@ -4399,13 +4403,10 @@ mod tests {
     /// connections are being probed or coalesced when they are not.
     #[test]
     fn wasix_socket_rejects_flags_the_netstack_cannot_honour() {
-        let mut descriptor: TestSocketDescriptor = UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            family: SocketFamily::Ipv4,
-            options: unix_socket_options::<TestNet>(),
-        });
+        let descriptor: TestSocketDescriptor = UnixSocket::tcp(SocketFamily::Ipv4);
 
         assert_eq!(
-            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE, true),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE, true),
             p1::errno::NOTSUP
         );
         assert_eq!(
@@ -4413,12 +4414,12 @@ mod tests {
             Ok(false)
         );
         assert_eq!(
-            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE, false),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_KEEP_ALIVE, false),
             p1::errno::SUCCESS
         );
 
         assert_eq!(
-            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_NO_DELAY, true),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_NO_DELAY, true),
             p1::errno::SUCCESS
         );
         assert_eq!(
@@ -4426,7 +4427,7 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            wasix_socket_set_flag(&mut descriptor, WASIX_SOCK_OPTION_NO_DELAY, false),
+            wasix_socket_set_flag(&descriptor, WASIX_SOCK_OPTION_NO_DELAY, false),
             p1::errno::NOTSUP
         );
         assert_eq!(
@@ -4439,13 +4440,10 @@ mod tests {
     /// a TTL outside the IP header's range is rejected instead of truncated.
     #[test]
     fn wasix_socket_size_options_clamp_to_netstack_capacity() {
-        let mut descriptor: TestSocketDescriptor = UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            family: SocketFamily::Ipv4,
-            options: unix_socket_options::<TestNet>(),
-        });
+        let descriptor: TestSocketDescriptor = UnixSocket::tcp(SocketFamily::Ipv4);
 
         assert_eq!(
-            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE, u64::MAX),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_RECV_BUF_SIZE, u64::MAX),
             p1::errno::SUCCESS
         );
         assert_eq!(
@@ -4453,7 +4451,7 @@ mod tests {
             helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64
         );
         assert_eq!(
-            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, u64::MAX),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, u64::MAX),
             p1::errno::SUCCESS
         );
         assert_eq!(
@@ -4462,11 +4460,11 @@ mod tests {
         );
 
         assert_eq!(
-            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_TTL, 0),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_TTL, 0),
             p1::errno::INVAL
         );
         assert_eq!(
-            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_TTL, 256),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_TTL, 256),
             p1::errno::INVAL
         );
         assert_eq!(
@@ -4474,7 +4472,7 @@ mod tests {
             helios_netstack::DEFAULT_HOP_LIMIT
         );
         assert_eq!(
-            wasix_socket_set_size(&mut descriptor, WASIX_SOCK_OPTION_TTL, 9),
+            wasix_socket_set_size(&descriptor, WASIX_SOCK_OPTION_TTL, 9),
             p1::errno::SUCCESS
         );
         assert_eq!(descriptor.options().hop_limit(), 9);
@@ -4521,17 +4519,14 @@ mod tests {
 
     #[test]
     fn wasix_socket_time_options_are_descriptor_local_state() {
-        let mut descriptor: TestSocketDescriptor = UnixSocket::Tcp(UnixTcpSocket::Unconnected {
-            family: SocketFamily::Ipv4,
-            options: unix_socket_options::<TestNet>(),
-        });
+        let descriptor: TestSocketDescriptor = UnixSocket::tcp(SocketFamily::Ipv4);
 
         assert_eq!(
             wasix_socket_time(&descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT),
             Ok(None)
         );
         assert_eq!(
-            wasix_socket_set_time(&mut descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT, Some(1_000)),
+            wasix_socket_set_time(&descriptor, WASIX_SOCK_OPTION_RECV_TIMEOUT, Some(1_000)),
             p1::errno::SUCCESS
         );
         assert_eq!(
@@ -4539,7 +4534,7 @@ mod tests {
             Ok(Some(1_000))
         );
         assert_eq!(
-            wasix_socket_set_time(&mut descriptor, WASIX_SOCK_OPTION_LINGER, Some(2_000)),
+            wasix_socket_set_time(&descriptor, WASIX_SOCK_OPTION_LINGER, Some(2_000)),
             p1::errno::SUCCESS
         );
         assert_eq!(
@@ -4547,7 +4542,7 @@ mod tests {
             Ok(Some(2_000))
         );
         assert_eq!(
-            wasix_socket_set_time(&mut descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
+            wasix_socket_set_time(&descriptor, WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
             p1::errno::INVAL
         );
     }

@@ -94,6 +94,7 @@ mod views;
 mod vsock;
 pub(crate) use views::{caller_memory, guest_memory, view_trap};
 
+pub use helios_unix::{ChildTermination, SignalTermination};
 pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientImageSurfaceHandle, ClientSurfaceHandle,
     CommandBufferHandle, ContextHandle, DisplayHandle, GpuHandle, InputDeviceHandle,
@@ -101,7 +102,9 @@ pub use service::{
     install_program_service, run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
-pub(crate) use service::{ProgramArgv, ProgramExecContext, ProgramSource};
+pub(crate) use service::{
+    Preview1SignalExit, ProgramArgv, ProgramExecContext, ProgramSource, WasixSignalState,
+};
 pub use topology::{
     ComponentHostProcessorRole, component_host_processor_role, component_host_processors_to_start,
     component_host_system_processor, component_host_worker_count, system_component_should_run_on,
@@ -300,10 +303,36 @@ macro_rules! impl_program_bindings {
                 };
                 match wait_future.await {
                     Ok(result) => match result {
-                        Ok(exit) => Ok(Ok($bindings::helios::system::programs::ExitStatus {
-                            instance_id: exit.instance_id.raw(),
-                            code: exit.exit_code,
-                        })),
+                        Ok(exit) => {
+                            let termination = match exit.termination {
+                                ChildTermination::Exited(code) => {
+                                    $bindings::helios::system::programs::ChildTermination::Exited(
+                                        code,
+                                    )
+                                }
+                                ChildTermination::Signaled(SignalTermination {
+                                    signal,
+                                    core_dumped,
+                                }) => {
+                                    $bindings::helios::system::programs::ChildTermination::Signaled(
+                                        $bindings::helios::system::programs::SignalTermination {
+                                            signal,
+                                            core_dumped,
+                                        },
+                                    )
+                                }
+                                ChildTermination::Trapped => {
+                                    $bindings::helios::system::programs::ChildTermination::Trapped
+                                }
+                                ChildTermination::Killed => {
+                                    $bindings::helios::system::programs::ChildTermination::Killed
+                                }
+                            };
+                            Ok(Ok($bindings::helios::system::programs::ExitStatus {
+                                instance_id: exit.instance_id.raw(),
+                                termination,
+                            }))
+                        }
                         Err(error) => Ok(Err($convert_error(error))),
                     },
                     Err(_) => Ok(Err($bindings::helios::system::programs::SpawnError {
@@ -1972,11 +2001,102 @@ pub(crate) fn deliver_kill<CpuImpl, Net, StorageImpl>(
     }
 }
 
+/// Turn epilogue for a component store: drains retired sockets on every
+/// turn and, when the component was launched as a child program, wakes and
+/// stops the store on a pending signal raised by its parent.
+pub(crate) struct ComponentStoreEpilogue {
+    retirement: crate::SocketRetirementQueue,
+    signal_state: Option<WasixSignalState>,
+}
+
+impl ComponentStoreEpilogue {
+    pub(crate) fn new(
+        retirement: crate::SocketRetirementQueue,
+        signal_state: Option<WasixSignalState>,
+    ) -> Self {
+        Self {
+            retirement,
+            signal_state,
+        }
+    }
+}
+
+fn take_component_signal_stop(signal_state: &WasixSignalState) -> Option<wasmtime::Error> {
+    signal_state
+        .sweep_pending(|signal| match signal.default_action() {
+            helios_unix::DefaultSignalAction::Ignore
+            | helios_unix::DefaultSignalAction::Continue => helios_unix::SignalSweep::Drop,
+            helios_unix::DefaultSignalAction::Terminate
+            | helios_unix::DefaultSignalAction::CoreDump
+            | helios_unix::DefaultSignalAction::Stop => helios_unix::SignalSweep::Take,
+        })
+        .map(|signal| {
+            wasmtime::Error::new(Preview1SignalExit {
+                signal: signal.raw(),
+            })
+        })
+}
+
+impl crate::component::StopWake for ComponentStoreEpilogue {
+    type Wait = Option<crate::NotifyWaiter>;
+
+    fn arm_stop_wait(&self) -> Self::Wait {
+        self.signal_state.as_ref().map(WasixSignalState::wait_state)
+    }
+
+    fn poll_stop_wait(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        wait: &mut Self::Wait,
+    ) -> core::task::Poll<()> {
+        match (&self.signal_state, wait) {
+            (Some(signals), Some(wait)) => signals.poll_changed(cx, wait),
+            _ => core::task::Poll::Pending,
+        }
+    }
+}
+
+impl<RuntimeStateImpl> crate::component::TurnEpilogue<RuntimeStateImpl, wasmtime::Error>
+    for ComponentStoreEpilogue
+where
+    RuntimeStateImpl: crate::ComponentRuntimeState,
+{
+    fn end_turn(&self, runtime_state: &RuntimeStateImpl) {
+        if !self.retirement.is_empty() {
+            runtime_state.retire_network_handles(&self.retirement);
+        }
+    }
+
+    fn take_stop(&self) -> Option<wasmtime::Error> {
+        self.signal_state
+            .as_ref()
+            .and_then(take_component_signal_stop)
+    }
+}
+
 /// A component store on `engine`, with the interrupt route the
 /// end of a time slice, a kill and the drive of its calls go through.
 pub(crate) fn store_with_state<CpuImpl, Net, StorageImpl>(
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     state: StoreData<CpuImpl, Net, StorageImpl>,
+) -> (
+    Store<StoreData<CpuImpl, Net, StorageImpl>>,
+    crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>,
+)
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    store_with_signal_state(engine, state, None)
+}
+
+/// A component store on `engine` that also answers to `signal_state` when
+/// launched as a child program.
+pub(crate) fn store_with_signal_state<CpuImpl, Net, StorageImpl>(
+    engine: &crate::wasmtime_adapter::WasmtimeEngine,
+    state: StoreData<CpuImpl, Net, StorageImpl>,
+    signal_state: Option<WasixSignalState>,
 ) -> (
     Store<StoreData<CpuImpl, Net, StorageImpl>>,
     crate::wasmtime_adapter::preemption::StoreInterrupts<CpuImpl>,
@@ -2002,14 +2122,18 @@ where
     // which is where `GuestTurns::drive` wraps the call that drives
     // this store.
     //
-    // An interruption is where a condemned instance traps: a CPU-bound
-    // guest makes no host call at all (an AOT compile, say), and the
-    // kill interrupts every store of its victim, so a guest that is
+    // An interruption is where a pending signal or a condemned instance
+    // stops a running guest: a CPU-bound guest makes no host call at all
+    // (an AOT compile, say), and raising a signal or condemning an
+    // instance interrupts every store of its target, so a guest that is
     // running meets this at its next function entry or loop header.
     // Cancelling the future instead would surface a bare interrupt trap
-    // that loses the kill reason (OOM vs supervisor restart). Any other
-    // interruption ends a time slice, and the guest yields.
-    store.interrupt_callback(|caller| {
+    // that loses the signal or kill reason. Any other interruption ends
+    // a time slice, and the guest yields.
+    store.interrupt_callback(move |caller| {
+        if let Some(stop) = signal_state.as_ref().and_then(take_component_signal_stop) {
+            return Err(stop);
+        }
         crate::wasmtime_adapter::preemption::kill_or_yield(caller.data().pending_kill())
     });
     let interrupts = engine

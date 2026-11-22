@@ -1871,12 +1871,14 @@ impl crate::HostFileSystem for UnsupportedHostFileSystem {
     fn create_file(
         &self,
         _path: &str,
+        _creation: crate::HostCreation,
     ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
         unsupported_host_fs()
     }
     fn create_directory(
         &self,
         _path: &str,
+        _creation: crate::HostCreation,
     ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
         unsupported_host_fs()
     }
@@ -1905,6 +1907,7 @@ impl crate::HostFileSystem for UnsupportedHostFileSystem {
         &self,
         _target: &str,
         _link_path: &str,
+        _gid: u32,
     ) -> impl core::future::Future<Output = Result<(), crate::HostFsError>> + Send + '_ {
         unsupported_host_fs()
     }

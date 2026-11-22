@@ -8,9 +8,7 @@
 //! lacks the feature, and nothing else:
 //!
 //! - `setattr` changing the file flags: `EOPNOTSUPP`
-//! - `setattr` or a creation giving a non-directory S_ISUID or S_ISGID: `EPERM`
-//! - `mknod` of anything but a regular file: `EPERM`
-//! - `setxattr`, `removexattr`, `fallocate`: `EOPNOTSUPP`
+//! - `fallocate`: `EOPNOTSUPP`
 //! - `rename` with `RENAME_WHITEOUT`, or with both `RENAME_NOREPLACE` and
 //!   `RENAME_EXCHANGE`: `EINVAL`
 //!
@@ -22,12 +20,13 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, LockOwner, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, InitFlags, KernelConfig,
+    LockOwner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use futures_lite::future::block_on;
-use helios_btrfs::Timestamp;
+use helios_btrfs::write::Special;
+use helios_btrfs::{DeviceNumber, Timestamp};
 use helios_hal::fs::RenameMode;
 
 use super::state::{Node, Owner, Setattr, State, target_bytes, timestamp};
@@ -64,12 +63,35 @@ fn now() -> Timestamp {
     timestamp(SystemTime::now())
 }
 
-/// A new node's permission bits: what the caller asked for, less its umask.
-fn permissions(mode: u32, umask: u32) -> u32 {
-    mode & !umask & 0o7777
+/// A new node's permission bits as the caller asked for them. The kernel
+/// leaves the umask to the filesystem (`FUSE_DONT_MASK`), which applies it
+/// as Linux's `posix_acl_create` does: only when the parent has no default
+/// ACL.
+fn permissions(mode: u32) -> u32 {
+    mode & 0o7777
 }
 
 impl Filesystem for Daemon {
+    /// Asks for `FUSE_POSIX_ACL`, under which the kernel enforces POSIX ACLs
+    /// with `default_permissions` as it does for a local filesystem
+    /// (`process_init_reply` in `fs/fuse/inode.c` sets both), `FUSE_DONT_MASK`,
+    /// so a creation arrives with its umask unapplied for the writer's
+    /// `posix_acl_create`, and `FUSE_EXPORT_SUPPORT`, so `open_by_handle_at`
+    /// resolves evicted inodes and parents through `lookup` of `.` and `..`.
+    /// A kernel without any of them fails the mount rather than serve a
+    /// degraded contract.
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        config
+            .add_capabilities(
+                InitFlags::FUSE_POSIX_ACL
+                    | InitFlags::FUSE_DONT_MASK
+                    | InitFlags::FUSE_EXPORT_SUPPORT,
+            )
+            .map_err(|missing| {
+                std::io::Error::other(format!("the kernel's FUSE lacks {missing:?}"))
+            })
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.run(|state| block_on(state.lookup(parent, name))) {
             Ok((attr, generation)) => reply.entry(&TTL, &attr, generation),
@@ -137,18 +159,28 @@ impl Filesystem for Daemon {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        _rdev: u32,
+        rdev: u32,
         reply: ReplyEntry,
     ) {
-        if mode & libc::S_IFMT != libc::S_IFREG {
-            return reply.error(Errno::EPERM);
-        }
+        // The kernel sends `mknod`'s own encoding of the number
+        // (`fuse_mknod` in `fs/fuse/dir.c` applies `new_encode_dev`).
+        let device = DeviceNumber::decode(rdev);
+        let node = match mode & libc::S_IFMT {
+            libc::S_IFREG => Node::File,
+            libc::S_IFCHR => Node::Special(Special::CharDevice(device)),
+            libc::S_IFBLK => Node::Special(Special::BlockDevice(device)),
+            libc::S_IFIFO => Node::Special(Special::Fifo),
+            libc::S_IFSOCK => Node::Special(Special::Socket),
+            // `vfs_mknod` refuses every other type before it reaches a
+            // filesystem.
+            _ => return reply.error(Errno::EINVAL),
+        };
         self.create_entry(
-            req,
             parent,
             name,
-            Node::File,
-            permissions(mode, umask),
+            node,
+            permissions(mode),
+            caller(req, umask),
             reply,
         );
     }
@@ -163,11 +195,11 @@ impl Filesystem for Daemon {
         reply: ReplyEntry,
     ) {
         self.create_entry(
-            req,
             parent,
             name,
             Node::Directory,
-            permissions(mode, umask),
+            permissions(mode),
+            caller(req, umask),
             reply,
         );
     }
@@ -181,11 +213,12 @@ impl Filesystem for Daemon {
         reply: ReplyEntry,
     ) {
         self.create_entry(
-            req,
             parent,
             link_name,
             Node::Symlink(target_bytes(target)),
             0o777,
+            // `posix_acl_create` leaves a symlink's mode alone.
+            caller(req, 0),
             reply,
         );
     }
@@ -200,11 +233,8 @@ impl Filesystem for Daemon {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let owner = Owner {
-            uid: req.uid(),
-            gid: req.gid(),
-        };
-        let permissions = permissions(mode, umask);
+        let owner = caller(req, umask);
+        let permissions = permissions(mode);
         match self.run(|state| {
             block_on(state.create(parent, name, Node::File, permissions, owner, now()))
         }) {
@@ -253,9 +283,8 @@ impl Filesystem for Daemon {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        // Both flags together, `RENAME_WHITEOUT` (a whiteout is a device
-        // node, which the writer cannot create) and unknown bits are `EINVAL`
-        // as on Linux.
+        // Both flags together, `RENAME_WHITEOUT` (which `rename` does not
+        // implement) and unknown bits are `EINVAL` as on Linux.
         let mode = if flags.is_empty() {
             RenameMode::Replace
         } else if flags == RenameFlags::RENAME_NOREPLACE {
@@ -358,16 +387,23 @@ impl Filesystem for Daemon {
         }
     }
 
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+        match self.run(|state| block_on(state.opendir(ino))) {
+            Ok(fh) => reply.opened(fh, FopenFlags::empty()),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
     fn readdir(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let listed = self.run(|state| {
-            block_on(state.readdir(ino, offset, |entry, cookie, kind, name| {
+            block_on(state.readdir(ino, fh, offset, |entry, cookie, kind, name| {
                 reply.add(entry, cookie, kind, name)
             }))
         });
@@ -375,6 +411,18 @@ impl Filesystem for Daemon {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: fuser::OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.run(|state| state.releasedir(fh));
+        reply.ok();
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
@@ -397,7 +445,6 @@ impl Filesystem for Daemon {
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         match self.run(|state| block_on(state.getxattr(ino, name, size))) {
             Ok((length, _)) if size == 0 => reply.size(length as u32),
-            Ok((length, _)) if length > size as usize => reply.error(Errno::ERANGE),
             Ok((_, value)) => reply.data(&value),
             Err(errno) => reply.error(errno),
         }
@@ -415,18 +462,25 @@ impl Filesystem for Daemon {
     fn setxattr(
         &self,
         _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        // Only macOS sets a position, in resource forks.
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::EOPNOTSUPP);
+        match self.run(|state| block_on(state.setxattr(ino, name, value, flags, now()))) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
     }
 
-    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::EOPNOTSUPP);
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.run(|state| block_on(state.removexattr(ino, name, now()))) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
     }
 
     fn fallocate(
@@ -446,23 +500,27 @@ impl Filesystem for Daemon {
 impl Daemon {
     fn create_entry(
         &self,
-        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         node: Node<'_>,
         permissions: u32,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
-        let owner = Owner {
-            uid: req.uid(),
-            gid: req.gid(),
-        };
         match self
             .run(|state| block_on(state.create(parent, name, node, permissions, owner, now())))
         {
             Ok((attr, generation)) => reply.entry(&TTL, &attr, generation),
             Err(errno) => reply.error(errno),
         }
+    }
+}
+
+fn caller(req: &Request, umask: u32) -> Owner {
+    Owner {
+        uid: req.uid(),
+        gid: req.gid(),
+        umask,
     }
 }
 

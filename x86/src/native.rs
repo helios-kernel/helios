@@ -77,13 +77,14 @@ impl NativeExecution for X86Native {
     }
 
     fn create_space(&self) -> Result<X86Space, NativeError> {
-        let tables = X86Tables {
+        let mut tables = X86Tables {
             root: Box::new(PageTable::new()),
             tables: Tables {
                 frames: Vec::new(),
                 offset: smp::current_runtime().physical_memory_offset,
             },
         };
+        tables.sync_kernel_half();
         Ok(NativeSpace::new(tables, PAGE_BYTES, USER_END))
     }
 
@@ -222,15 +223,30 @@ unsafe impl UserTranslation for X86Tables {
 }
 
 impl X86Tables {
-    /// The physical root for a slice, with the kernel's current upper half.
-    fn root(&mut self) -> u64 {
+    /// Copies any newly populated upper-half PML4 entries from the current
+    /// kernel `CR3` with single 64-bit volatile writes so concurrent slices on
+    /// other processors never observe torn or cleared upper-half descriptors.
+    fn sync_kernel_half(&mut self) {
         let kernel = Cr3::read().0.start_address().as_u64() as usize + self.tables.offset;
         // SAFETY: the current CR3 is a live kernel root, mapped through the
-        // direct map.
-        let kernel = unsafe { &*(kernel as *const PageTable) };
-        for index in 256..512 {
-            self.root[index] = kernel[index].clone();
+        // direct map; both tables hold 512 64-bit entries.
+        let kernel_words = unsafe { &*(kernel as *const [u64; 512]) };
+        let root_words = core::ptr::from_mut(&mut *self.root).cast::<u64>();
+        for (index, &entry) in kernel_words.iter().enumerate().skip(256) {
+            // SAFETY: `index < 512` and `self.root` is uniquely borrowed under
+            // the space lock.
+            unsafe {
+                let slot = root_words.add(index);
+                if slot.read_volatile() != entry {
+                    slot.write_volatile(entry);
+                }
+            }
         }
+    }
+
+    /// The physical root for a slice, with the kernel's current upper half.
+    fn root(&mut self) -> u64 {
+        self.sync_kernel_half();
         &*self.root as *const PageTable as u64 - self.tables.offset as u64
     }
 }
@@ -447,6 +463,42 @@ unsafe impl UserContext for X86Context {
         Ok(())
     }
 
+    fn try_clone(&self) -> Result<Self, NativeError> {
+        let size = self._user_xstate.layout.size();
+        let user = AlignedBytes::new(size, 64)?;
+        let kernel = AlignedBytes::new(size, 64)?;
+        let entry_stack = AlignedBytes::new(exceptions::EXCEPTION_STACK_BYTES, 16)?;
+        // SAFETY: both XSAVE buffers are uniquely owned and `size` bytes long.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self._user_xstate.pointer.as_ptr(),
+                user.pointer.as_ptr(),
+                size,
+            );
+        }
+        Ok(Self {
+            switch: Switch {
+                registers: Registers {
+                    ..self.switch.registers
+                },
+                user_xstate: user.pointer.as_ptr() as u64,
+                kernel_xstate: kernel.pointer.as_ptr() as u64,
+                kernel_rsp: 0,
+                kernel_cr3: 0,
+                kernel_fs: 0,
+                user_fs: self.switch.user_fs,
+                kernel_gs: 0,
+                entry_stack: entry_stack.pointer.as_ptr() as u64 + entry_stack.layout.size() as u64,
+                scratch_rsp: 0,
+                user_cr3: 0,
+                self_pointer: 0,
+            },
+            _user_xstate: user,
+            _kernel_xstate: kernel,
+            _entry_stack: entry_stack,
+        })
+    }
+
     fn resume(&mut self, space: &X86Space) -> Stop {
         // SYSCALL can save a noncanonical next RIP or stack. Refuse it before
         // IRET, whose fault would otherwise occur at kernel privilege.
@@ -607,7 +659,9 @@ pub(crate) fn verify_user_isolation(isolation: UserIsolation) {
         .unwrap_or_else(|error| panic!("x86 isolation check could not create a space: {error}"));
     for (page, contents, flags) in [
         (code, &[RET][..], PageFlags::READ | PageFlags::EXECUTE),
-        (data, &[][..], PageFlags::READ | PageFlags::WRITE),
+        // Non-empty contents commit the data page's PTE up front so the ring-0
+        // probe tests a CR4.SMAP permission fault on a present translation.
+        (data, &[0][..], PageFlags::READ | PageFlags::WRITE),
     ] {
         space
             .map(VirtRange::new(page, PAGE_BYTES as usize), contents, flags)

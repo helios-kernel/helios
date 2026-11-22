@@ -1,27 +1,330 @@
 use super::*;
 #[derive(Clone)]
-pub(super) struct SignalTarget {
-    pub(super) interrupts: Arc<GuestInterrupts>,
-    pub(super) instance: crate::InstanceId,
+pub(crate) struct SignalTarget {
+    pub(crate) interrupts: Arc<GuestInterrupts>,
+    pub(crate) instance: crate::InstanceId,
 }
 impl helios_unix::InterruptTarget for SignalTarget {
     fn interrupt(&self) {
         self.interrupts.interrupt_instance(self.instance);
     }
 }
-pub(super) type WasixSignalState = helios_unix::SignalState<SignalTarget>;
+pub(crate) type WasixSignalState = helios_unix::SignalState<SignalTarget>;
 pub(super) type WasixProcessThreads<Image> =
     helios_unix::ProcessThreads<SignalTarget, Image, ProgramExecError>;
 pub(super) type WasixProcessEnd<Image> = helios_unix::ProcessEnd<Image, ProgramExecError>;
 pub(super) type WasixThreadExit = helios_unix::ThreadExit;
 pub(super) type EventFd = helios_unix::EventFd;
 
-pub(super) struct WasixChildProcess {
+/// The exit report a child's launch task sends its parent.
+pub(super) type WasixChildExit =
+    futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>;
+
+/// A process's children, in spawn order, until each one is joined.
+///
+/// Owned by the process and shared by every store of the process (`Arc::clone`),
+/// so a child spawned on any thread can be joined or signaled by any other
+/// thread of the process.
+///
+/// # Concurrency contract
+///
+/// Every caller runs in task context (never an interrupt handler). The
+/// `spin::Mutex` guards only in-memory table reads, inserts, `try_recv`
+/// probes, and synchronous `oneshot` polls, and is always dropped before any
+/// `.await`, filesystem layer adoption, or waiter wakeup.
+///
+/// Non-blocking probes ([`Self::poll_signal_target`] and [`Self::try_join`])
+/// inspect `oneshot::Receiver::try_recv` rather than polling with a no-op
+/// waker, so they never overwrite a waker registered by another thread
+/// blocked in `proc_join`. Whenever a child is inserted, transitions to
+/// `Completed`, is reaped, or a blocking joiner returns or drops (through
+/// [`WasixChildrenJoinGuard`]), `changed.notify_all()` wakes any remaining
+/// blocking joiners so they re-register their wakers on the remaining running
+/// children without lost wakeups.
+#[derive(Clone)]
+pub(super) struct WasixChildren {
+    inner: Arc<WasixChildrenInner>,
+}
+
+struct WasixChildrenInner {
+    table: Mutex<Vec<WasixChildProcess>>,
+    changed: crate::Notify,
+}
+
+/// RAII guard held by a blocking `proc_join` future. Dropping it wakes any
+/// sibling thread also blocked in `proc_join` so it re-registers its waker
+/// on the remaining children's `oneshot` receivers if this joiner overwrote
+/// them before returning, returning `EINTR`, or being cancelled.
+pub(super) struct WasixChildrenJoinGuard {
+    children: WasixChildren,
+}
+
+impl Drop for WasixChildrenJoinGuard {
+    fn drop(&mut self) {
+        self.children.inner.changed.notify_all();
+    }
+}
+
+struct WasixChildProcess {
+    pid: u32,
+    signal_state: WasixSignalState,
+    state: WasixChildState,
+}
+
+enum WasixChildState {
+    Running(WasixChildExit),
+    /// Completed and not joined yet: either how the child ended or the
+    /// errno its failed launch or lost report gives the joiner.
+    Completed(Result<helios_unix::ChildTermination, i32>),
+}
+
+/// The child a join took off the table, and what came of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WasixJoinedChild {
     pub(super) pid: u32,
-    pub(super) signal_state: WasixSignalState,
-    pub(super) exit:
-        Option<futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>>,
-    pub(super) completed: Option<u32>,
+    pub(super) outcome: Result<helios_unix::ChildTermination, i32>,
+}
+
+impl WasixChildren {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Arc::new(WasixChildrenInner {
+                table: Mutex::new(Vec::new()),
+                changed: crate::Notify::new(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.inner.table.lock().is_empty()
+    }
+
+    pub(super) fn insert(&self, pid: u32, signal_state: WasixSignalState, exit: WasixChildExit) {
+        self.inner.table.lock().push(WasixChildProcess {
+            pid,
+            signal_state,
+            state: WasixChildState::Running(exit),
+        });
+        self.inner.changed.notify_all();
+    }
+
+    /// Arms a change waiter and a drop guard for a blocking `proc_join`.
+    pub(super) fn begin_blocking_join(&self) -> (crate::NotifyWaiter, WasixChildrenJoinGuard) {
+        (
+            self.inner.changed.waiter(),
+            WasixChildrenJoinGuard {
+                children: self.clone(),
+            },
+        )
+    }
+
+    /// The signal mailbox of child `pid` while it is still running: `None`
+    /// for a pid that names no child and for a child whose completion has
+    /// already arrived on its exit channel. Any completion observed here is
+    /// recorded in place without reaping the child, so a subsequent
+    /// [`Self::poll_join`] still reports its termination or launch error.
+    pub(super) fn poll_signal_target(
+        &self,
+        pid: u32,
+        mut adopt: impl FnMut(MemoryFs),
+    ) -> Option<WasixSignalState> {
+        let mut adopted = None;
+        let mut completed_now = false;
+        let mailbox = {
+            let mut table = self.inner.table.lock();
+            let child = table.iter_mut().find(|child| child.pid == pid)?;
+            if let WasixChildState::Running(exit) = &mut child.state {
+                match exit.try_recv() {
+                    Ok(Some(result)) => {
+                        child.state = WasixChildState::Completed(child_exit_outcome(
+                            Ok(result),
+                            &mut |layer| adopted = Some(layer),
+                        ));
+                        completed_now = true;
+                    }
+                    Err(canceled) => {
+                        child.state = WasixChildState::Completed(child_exit_outcome(
+                            Err(canceled),
+                            &mut |layer| adopted = Some(layer),
+                        ));
+                        completed_now = true;
+                    }
+                    Ok(None) => {}
+                }
+            }
+            matches!(child.state, WasixChildState::Running(_)).then(|| child.signal_state.clone())
+        };
+        if let Some(layer) = adopted {
+            adopt(layer);
+        }
+        if completed_now {
+            self.inner.changed.notify_all();
+        }
+        mailbox
+    }
+
+    /// Non-blocking join (`WNOHANG`) of `pid`, or any child for `None`.
+    /// Uses `try_recv` so it never clobbers a blocking joiner's waker.
+    pub(super) fn try_join(
+        &self,
+        pid: Option<u32>,
+        mut adopt: impl FnMut(MemoryFs),
+    ) -> Poll<Option<WasixJoinedChild>> {
+        let mut adopted: SmallVec<[MemoryFs; 1]> = SmallVec::new();
+        let mut changed = false;
+        let outcome = {
+            let mut table = self.inner.table.lock();
+            let mut named = false;
+            let mut completed = None;
+            for (index, child) in table.iter_mut().enumerate() {
+                if pid.is_some_and(|pid| child.pid != pid) {
+                    continue;
+                }
+                named = true;
+                if let WasixChildState::Running(exit) = &mut child.state {
+                    match exit.try_recv() {
+                        Ok(Some(result)) => {
+                            child.state = WasixChildState::Completed(child_exit_outcome(
+                                Ok(result),
+                                &mut |layer| adopted.push(layer),
+                            ));
+                            changed = true;
+                        }
+                        Err(canceled) => {
+                            child.state = WasixChildState::Completed(child_exit_outcome(
+                                Err(canceled),
+                                &mut |layer| adopted.push(layer),
+                            ));
+                            changed = true;
+                        }
+                        Ok(None) => {}
+                    }
+                }
+                if completed.is_none() && matches!(child.state, WasixChildState::Completed(_)) {
+                    completed = Some(index);
+                }
+            }
+            match completed {
+                Some(index) => {
+                    let child = table.remove(index);
+                    let WasixChildState::Completed(outcome) = child.state else {
+                        unreachable!("a joined child was just seen to have completed");
+                    };
+                    changed = true;
+                    Poll::Ready(Some(WasixJoinedChild {
+                        pid: child.pid,
+                        outcome,
+                    }))
+                }
+                None if named => Poll::Pending,
+                None => Poll::Ready(None),
+            }
+        };
+        for layer in adopted {
+            adopt(layer);
+        }
+        if changed {
+            self.inner.changed.notify_all();
+        }
+        outcome
+    }
+
+    /// Joins the child `pid` names, or any child for `None`.
+    ///
+    /// Every running child the join names is polled, so each completion
+    /// that has arrived is recorded and `cx` is registered with every
+    /// child still running: an any-child join takes the oldest child
+    /// that has completed, never waits on one child while another has
+    /// already completed, and is woken by whichever completes first. A
+    /// shell reaps each foreground command this way while its background
+    /// jobs, older children, keep running.
+    ///
+    /// `Ready(None)` when `pid` names no child, `Ready(Some)` with the
+    /// child taken off the table once one it names has completed, and
+    /// `Pending` while every child it names is still running. `adopt`
+    /// receives the filesystem layer each exit observed here hands back
+    /// to the parent.
+    pub(super) fn poll_join(
+        &self,
+        pid: Option<u32>,
+        cx: &mut Context<'_>,
+        wait: &mut crate::NotifyWaiter,
+        mut adopt: impl FnMut(MemoryFs),
+    ) -> Poll<Option<WasixJoinedChild>> {
+        loop {
+            let mut adopted: SmallVec<[MemoryFs; 1]> = SmallVec::new();
+            let mut changed = false;
+            let outcome = {
+                let mut table = self.inner.table.lock();
+                let mut named = false;
+                let mut completed = None;
+                for (index, child) in table.iter_mut().enumerate() {
+                    if pid.is_some_and(|pid| child.pid != pid) {
+                        continue;
+                    }
+                    named = true;
+                    if let WasixChildState::Running(exit) = &mut child.state
+                        && let Poll::Ready(result) = Pin::new(exit).poll(cx)
+                    {
+                        child.state =
+                            WasixChildState::Completed(child_exit_outcome(result, &mut |layer| {
+                                adopted.push(layer)
+                            }));
+                        changed = true;
+                    }
+                    if completed.is_none() && matches!(child.state, WasixChildState::Completed(_)) {
+                        completed = Some(index);
+                    }
+                }
+                match completed {
+                    Some(index) => {
+                        let child = table.remove(index);
+                        let WasixChildState::Completed(outcome) = child.state else {
+                            unreachable!("a joined child was just seen to have completed");
+                        };
+                        changed = true;
+                        Poll::Ready(Some(WasixJoinedChild {
+                            pid: child.pid,
+                            outcome,
+                        }))
+                    }
+                    None if named => Poll::Pending,
+                    None => Poll::Ready(None),
+                }
+            };
+            for layer in adopted {
+                adopt(layer);
+            }
+            if changed {
+                self.inner.changed.notify_all();
+            }
+            if outcome.is_ready() {
+                return outcome;
+            }
+            if self.inner.changed.poll_notified(cx, wait).is_pending() {
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+/// What a child's exit report gives its parent: the child's termination,
+/// or the errno for a launch failure or dropped exit channel.
+fn child_exit_outcome(
+    result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
+    adopt: &mut impl FnMut(MemoryFs),
+) -> Result<helios_unix::ChildTermination, i32> {
+    match result {
+        Ok(Ok(exit)) => {
+            if let Some(filesystem) = exit.filesystem {
+                adopt(filesystem);
+            }
+            Ok(exit.termination)
+        }
+        Ok(Err(error)) => Err(p1_errno_from_program_exec_error(&error)),
+        Err(_) => Err(p1::errno::IO),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +337,106 @@ pub(super) struct WasixSignalDisposition {
 pub(super) enum WasixSignalDispositionAction {
     Default,
     Ignore,
+}
+
+/// Process-wide WASIX signal state shared by every thread of one process
+/// image: the initial `Ignore` set inherited from spawn or exec plus the guest
+/// handler export registered through `callback_signal`, if any.
+///
+/// # Concurrency
+///
+/// Any thread of the process may register or clear `callback_signal`, and any
+/// thread's store may sample the state at an interrupt check, turn epilogue,
+/// or safe point. Every caller runs in task context (never an interrupt
+/// handler), copies an 8-byte [`helios_unix::SignalSet`] and optional
+/// [`Arc<str>`] under the spin lock, and drops the guard before any `.await`
+/// or guest call.
+#[derive(Clone, Default)]
+pub(super) struct WasixProcessSignals {
+    inner: Arc<Mutex<WasixProcessSignalsState>>,
+}
+
+#[derive(Default)]
+struct WasixProcessSignalsState {
+    ignored: helios_unix::SignalSet,
+    callback: Option<Arc<str>>,
+}
+
+impl WasixProcessSignals {
+    pub(super) fn from_dispositions(dispositions: &[WasixSignalDisposition]) -> Self {
+        let mut ignored = helios_unix::SignalSet::EMPTY;
+        for disposition in dispositions {
+            let Some(signal) = helios_unix::Signal::from_standard(disposition.signal) else {
+                continue;
+            };
+            if signal.is_uncatchable() {
+                continue;
+            }
+            match disposition.action {
+                WasixSignalDispositionAction::Ignore => ignored.insert(signal),
+                WasixSignalDispositionAction::Default => {
+                    ignored.remove(signal);
+                }
+            }
+        }
+        Self {
+            inner: Arc::new(Mutex::new(WasixProcessSignalsState {
+                ignored,
+                callback: None,
+            })),
+        }
+    }
+
+    pub(super) fn set_callback(&self, callback: Option<Arc<str>>) {
+        self.inner.lock().callback = callback;
+    }
+
+    pub(super) fn callback(&self) -> Option<Arc<str>> {
+        self.inner.lock().callback.clone()
+    }
+
+    fn summary(&self) -> (helios_unix::SignalSet, bool) {
+        let state = self.inner.lock();
+        (state.ignored, state.callback.is_some())
+    }
+
+    fn snapshot(&self) -> (helios_unix::SignalSet, Option<Arc<str>>) {
+        let state = self.inner.lock();
+        (state.ignored, state.callback.clone())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WasixResolvedAction<H> {
+    Ignore,
+    Catch(H),
+    Terminate,
+}
+
+fn resolve_wasix_signal<H: Copy>(
+    signal: helios_unix::Signal,
+    ignored: helios_unix::SignalSet,
+    callback: Option<H>,
+) -> WasixResolvedAction<H> {
+    let disposition = if ignored.contains(signal) {
+        helios_unix::SignalDisposition::Ignore
+    } else if let Some(handler) = callback {
+        helios_unix::SignalDisposition::Catch(handler)
+    } else {
+        helios_unix::SignalDisposition::Default
+    };
+    match signal.resolve(disposition) {
+        helios_unix::ResolvedSignal::Ignore
+        | helios_unix::ResolvedSignal::Default(
+            helios_unix::DefaultSignalAction::Ignore | helios_unix::DefaultSignalAction::Continue,
+        ) => WasixResolvedAction::Ignore,
+        helios_unix::ResolvedSignal::Catch(handler) => WasixResolvedAction::Catch(handler),
+        helios_unix::ResolvedSignal::Default(
+            helios_unix::DefaultSignalAction::Terminate
+            | helios_unix::DefaultSignalAction::CoreDump
+            | helios_unix::DefaultSignalAction::Stop,
+        ) => WasixResolvedAction::Terminate,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +457,166 @@ pub(super) struct WasixTtyState {
 pub(super) struct Preview1Cwd {
     pub(super) guest_name: String,
     pub(super) descriptor: FsDescriptor,
+}
+
+/// Process-wide working directory shared by every store of one WASIX process.
+///
+/// # Concurrency contract
+///
+/// Every caller runs in task context (never an interrupt handler). The
+/// `spin::Mutex` is held only to clone or replace `Option<Preview1Cwd>` and
+/// is always dropped before any `.await` (path resolution and `stat_path`
+/// run outside the lock).
+#[derive(Clone)]
+pub(super) struct SharedCwd {
+    inner: Arc<Mutex<Option<Preview1Cwd>>>,
+}
+
+impl SharedCwd {
+    pub(super) fn new(cwd: Option<Preview1Cwd>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(cwd)),
+        }
+    }
+
+    pub(super) fn get(&self) -> Option<Preview1Cwd> {
+        self.inner.lock().clone()
+    }
+
+    pub(super) fn set(&self, cwd: Option<Preview1Cwd>) {
+        *self.inner.lock() = cwd;
+    }
+
+    pub(super) fn with<R>(&self, f: impl FnOnce(Option<&Preview1Cwd>) -> R) -> R {
+        f(self.inner.lock().as_ref())
+    }
+}
+
+/// Process-wide descriptor table shared by every store of one WASIX process.
+///
+/// # Concurrency contract
+///
+/// Every caller runs in task context (never an interrupt handler). The
+/// `spin::Mutex` guards only in-memory slot lookups, insertions,
+/// duplications, flag reads/writes, closes, and table snapshots, and is
+/// always dropped before any `.await` or guest call. Open file descriptions
+/// (`OpenFile` with its async `RawMutex` position lock, `FileDescriptorEntry`'s
+/// atomic `fdflags`, and shared `Socket` handles) are cloned out under the
+/// lock so concurrent I/O across threads shares offsets, status flags, and
+/// socket state without holding the table spin lock across `.await`.
+pub(super) struct SharedDescriptorTable<Net: ComponentHostNetwork> {
+    inner: Arc<Mutex<Preview1DescriptorTable<Net>>>,
+}
+
+impl<Net: ComponentHostNetwork> Clone for SharedDescriptorTable<Net> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<Net: ComponentHostNetwork> SharedDescriptorTable<Net> {
+    pub(super) fn new(table: Preview1DescriptorTable<Net>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(table)),
+        }
+    }
+
+    pub(super) fn with<R>(&self, f: impl FnOnce(&Preview1DescriptorTable<Net>) -> R) -> R {
+        f(&self.inner.lock())
+    }
+
+    pub(super) fn with_mut<R>(&self, f: impl FnOnce(&mut Preview1DescriptorTable<Net>) -> R) -> R {
+        f(&mut self.inner.lock())
+    }
+
+    /// Clones a descriptor handle out of slot `fd` and drops the table lock
+    /// immediately so callers can await I/O on the handle without holding the
+    /// spin lock.
+    pub(super) fn get_cloned(&self, fd: i32) -> Option<Preview1Descriptor<Net>> {
+        self.inner.lock().get(fd).cloned()
+    }
+
+    /// Point-in-time snapshot of the process's descriptor table (preserving
+    /// open-file-description sharing on every slot) for `fork`, `proc_snapshot`,
+    /// or `proc_spawn2` fd-op evaluation.
+    pub(super) fn snapshot(&self) -> Preview1DescriptorTable<Net> {
+        self.inner.lock().clone()
+    }
+
+    /// Snapshot with `close_on_exec` slots cleared for `proc_exec*` from any
+    /// thread of the process.
+    pub(super) fn clone_for_exec(&self) -> Preview1DescriptorTable<Net> {
+        self.inner.lock().clone_for_exec()
+    }
+
+    pub(super) fn insert(&self, descriptor: Preview1Descriptor<Net>) -> Result<u32, i32> {
+        self.inner.lock().insert(descriptor)
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_with_close_on_exec(
+        &self,
+        descriptor: Preview1Descriptor<Net>,
+        close_on_exec: bool,
+    ) -> Result<u32, i32> {
+        self.inner
+            .lock()
+            .insert_with_close_on_exec(descriptor, close_on_exec)
+    }
+
+    pub(super) fn insert_with_fdflags(
+        &self,
+        descriptor: Preview1Descriptor<Net>,
+        close_on_exec: bool,
+        fdflags: u16,
+    ) -> Result<u32, i32> {
+        self.inner
+            .lock()
+            .insert_with_fdflags(descriptor, close_on_exec, fdflags)
+    }
+
+    pub(super) fn dup(&self, fd: i32) -> Result<u32, i32> {
+        self.inner.lock().dup(fd)
+    }
+
+    pub(super) fn dup2(&self, from: i32, to: i32) -> i32 {
+        self.inner.lock().dup2(from, to)
+    }
+
+    pub(super) fn dup_to(&self, fd: i32, to_fd: i32, close_on_exec: bool) -> Result<u32, i32> {
+        self.inner.lock().dup_to(fd, to_fd, close_on_exec)
+    }
+
+    pub(super) fn renumber(&self, from: i32, to: i32) -> i32 {
+        self.inner.lock().renumber(from, to)
+    }
+
+    pub(super) fn close(&self, fd: i32) -> i32 {
+        self.inner.lock().close(fd)
+    }
+
+    pub(super) fn fdflags(&self, fd: i32) -> Result<u16, i32> {
+        self.inner.lock().fdflags(fd)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_fdflags(&self, fd: i32, fdflags: u16) -> i32 {
+        self.inner.lock().set_fdflags(fd, fdflags)
+    }
+
+    pub(super) fn close_on_exec(&self, fd: i32) -> Result<bool, i32> {
+        self.inner.lock().close_on_exec(fd)
+    }
+
+    pub(super) fn set_close_on_exec(&self, fd: i32, close_on_exec: bool) -> i32 {
+        self.inner.lock().set_close_on_exec(fd, close_on_exec)
+    }
+
+    pub(super) fn limit(&self) -> helios_unix::DescriptorLimit {
+        self.inner.lock().limit
+    }
 }
 
 #[derive(Clone)]
@@ -180,26 +743,30 @@ impl P1WaitSet {
     }
 }
 
-/// Sleep until a watched descriptor wakes us, the re-probe cadence elapses,
-/// or `remaining` runs out.
+/// Sleep until a watched descriptor wakes us, a catchable handled signal
+/// arrives, the re-probe cadence elapses, or `remaining` runs out.
 ///
 /// The caller re-probes after every step, so this only has to guarantee that
 /// it yields control and comes back when something might have changed.
 /// `remaining` of `None` means "no deadline": block until a descriptor makes
-/// progress.
+/// progress or a handled signal interrupts the wait.
 pub(super) async fn p1_wait_step<CpuImpl>(
     timer: &crate::Timer<CpuImpl>,
     wait: &mut P1WaitSet,
     remaining: Option<Duration>,
-) where
+    signals: &WasixStoreSignals,
+    active_handlers: helios_unix::SignalSet,
+) -> bool
+where
     CpuImpl: Cpu + Clone,
 {
+    let mut catch_signal = core::pin::pin!(signals.wait_for_catch_signal(active_handlers));
     if wait.is_empty() && remaining.is_none() {
         // Nothing subscribed can ever become ready and no deadline will end
-        // the call. Park rather than spin; the task is dropped with the
-        // instance.
-        core::future::pending::<()>().await;
-        return;
+        // the call; only a caught signal (or a fatal stop on the outer turn)
+        // can wake it.
+        catch_signal.await;
+        return true;
     }
 
     // A descriptor without a wakeup source needs us back on a fixed cadence;
@@ -209,36 +776,56 @@ pub(super) async fn p1_wait_step<CpuImpl>(
         (true, None) => P1_READINESS_REPOLL_INTERVAL,
         (false, Some(remaining)) => remaining,
         (false, None) => {
-            // Every subscribed descriptor can wake us, so wait on them alone.
+            // Every subscribed descriptor can wake us, so wait on them and
+            // any caught signal.
             let targets = &mut wait.notified;
-            core::future::poll_fn(|cx| poll_epoll_wait_targets(targets, cx)).await;
-            return;
+            return core::future::poll_fn(|cx| {
+                if catch_signal.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                if poll_epoll_wait_targets(targets, cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                Poll::Pending
+            })
+            .await;
         }
     };
 
     if sleep.is_zero() {
-        return;
+        return signals.has_deliverable_catch(active_handlers);
     }
 
     let mut timer = core::pin::pin!(timer.sleep_for(sleep));
     if wait.notified.is_empty() {
-        timer.await;
-        return;
+        return core::future::poll_fn(|cx| {
+            if catch_signal.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(true);
+            }
+            if timer.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(false);
+            }
+            Poll::Pending
+        })
+        .await;
     }
 
-    // Race the wakeup sources against the sleep: whichever comes first ends
-    // this step and sends the caller back to re-probe.
+    // Race the wakeup sources against the sleep and caught signals: whichever
+    // comes first ends this step and sends the caller back to re-probe.
     let targets = &mut wait.notified;
     core::future::poll_fn(|cx| {
+        if catch_signal.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(true);
+        }
         if poll_epoll_wait_targets(targets, cx).is_ready() {
-            return Poll::Ready(());
+            return Poll::Ready(false);
         }
         if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(());
+            return Poll::Ready(false);
         }
         Poll::Pending
     })
-    .await;
+    .await
 }
 
 /// Register whatever wakes `fd` into `wait`.
@@ -256,66 +843,77 @@ pub(super) fn p1_add_wait_target<CpuImpl, Net, StorageImpl>(
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match store.descriptors.get(fd) {
-        Some(Preview1Descriptor::PipeRead { reader }) if event_type == P1_EVENTTYPE_FD_READ => {
-            wait.notified.push(EpollWaitTarget::ByteReader {
-                reader: reader.clone(),
-                wait: reader.wait_state(),
-            });
-        }
-        Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. }))
-            if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
-        {
-            wait.notified.push(EpollWaitTarget::ByteReader {
-                reader: reader.clone(),
-                wait: reader.wait_state(),
-            });
-        }
-        Some(Preview1Descriptor::PipeWrite { writer })
-        | Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. }))
-            if event_type == P1_EVENTTYPE_FD_WRITE && !writer.is_writable() =>
-        {
-            wait.notified.push(EpollWaitTarget::ByteWriter {
-                writer: writer.clone(),
-                wait: writer.wait_state(),
-            });
-        }
-        Some(Preview1Descriptor::Event(event))
-            if event_type == P1_EVENTTYPE_FD_READ && !event.is_readable() =>
-        {
-            wait.notified.push(EpollWaitTarget::Event {
-                event: event.clone(),
-                wait: event.wait_state(),
-            });
-        }
-        Some(Preview1Descriptor::Stdin { carry })
-            if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
-        {
-            match &store.output_mode {
-                // A child's stdin is a byte channel, so it can wake us.
-                OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                    wait.notified.push(EpollWaitTarget::ByteReader {
-                        reader: stdin_rx.clone(),
-                        wait: stdin_rx.wait_state(),
-                    });
-                }
-                // The serial console's receive signal is the wakeup
-                // source, parked on the same way a channel's is.
-                OutputMode::Serial => wait.notified.push(EpollWaitTarget::SerialInput {
-                    serial: store.write_serial,
-                    wait: store.write_serial.debug_serial_input_waiter(),
-                }),
-                // Trace output never delivers input; the probe reports it as
-                // an immediate hangup, so there is nothing to wait for.
-                OutputMode::Trace => {}
+    store
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::PipeRead { reader }) if event_type == P1_EVENTTYPE_FD_READ => {
+                wait.notified.push(EpollWaitTarget::ByteReader {
+                    reader: reader.clone(),
+                    wait: reader.wait_state(),
+                });
             }
-        }
-        Some(Preview1Descriptor::Socket(
-            UnixSocket::Tcp(UnixTcpSocket::Connected { .. } | UnixTcpSocket::Listening { .. })
-            | UnixSocket::Udp(UnixUdpSocket::Bound { .. }),
-        )) => wait.repoll = true,
-        _ => {}
-    }
+            Some(Preview1Descriptor::Socket(socket)) => {
+                if let Some((reader, carry_len)) = socket.pair_read_probe() {
+                    if event_type == P1_EVENTTYPE_FD_READ && carry_len == 0 {
+                        wait.notified.push(EpollWaitTarget::ByteReader {
+                            reader: reader.clone(),
+                            wait: reader.wait_state(),
+                        });
+                    } else if event_type == P1_EVENTTYPE_FD_WRITE
+                        && let Some(writer) = socket.pair_writer()
+                        && !writer.is_writable()
+                    {
+                        wait.notified.push(EpollWaitTarget::ByteWriter {
+                            writer: writer.clone(),
+                            wait: writer.wait_state(),
+                        });
+                    }
+                } else if socket.handle().is_some() {
+                    wait.repoll = true;
+                }
+            }
+            Some(Preview1Descriptor::PipeWrite { writer })
+                if event_type == P1_EVENTTYPE_FD_WRITE && !writer.is_writable() =>
+            {
+                wait.notified.push(EpollWaitTarget::ByteWriter {
+                    writer: writer.clone(),
+                    wait: writer.wait_state(),
+                });
+            }
+            Some(Preview1Descriptor::Event(event))
+                if event_type == P1_EVENTTYPE_FD_READ && !event.is_readable() =>
+            {
+                wait.notified.push(EpollWaitTarget::Event {
+                    event: event.clone(),
+                    wait: event.wait_state(),
+                });
+            }
+            Some(Preview1Descriptor::Stdin { carry })
+                if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
+            {
+                match store.output_mode.stdin_route() {
+                    // A child's stdin is a byte channel, so it can wake us.
+                    crate::ComponentInputRoute::Child(stdin_rx) => {
+                        wait.notified.push(EpollWaitTarget::ByteReader {
+                            wait: stdin_rx.wait_state(),
+                            reader: stdin_rx,
+                        });
+                    }
+                    // The serial console's receive signal is the wakeup
+                    // source, parked on the same way a channel's is.
+                    crate::ComponentInputRoute::Serial => {
+                        wait.notified.push(EpollWaitTarget::SerialInput {
+                            serial: store.write_serial,
+                            wait: store.write_serial.debug_serial_input_waiter(),
+                        })
+                    }
+                    // Trace or closed input never delivers input; the probe reports
+                    // it as an immediate hangup, so there is nothing to wait for.
+                    crate::ComponentInputRoute::Closed => {}
+                }
+            }
+            _ => {}
+        });
 }
 
 /// Resolve a descriptor's readiness, consulting the network service when the
@@ -331,14 +929,17 @@ where
     StorageImpl: crate::Storage,
 {
     if event_type == P1_EVENTTYPE_FD_READ
-        && matches!(
-            caller.data().descriptors.get(fd),
-            Some(Preview1Descriptor::Stdin { .. })
-        )
+        && caller.data().descriptors.with(|descriptors| {
+            matches!(descriptors.get(fd), Some(Preview1Descriptor::Stdin { .. }))
+        })
     {
         return Ok(caller.data_mut().probe_stdin(fd));
     }
-    let probe = match p1_probe_descriptor(caller.data().descriptors.get(fd), event_type)? {
+    let probe = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| p1_probe_descriptor(descriptors.get(fd), event_type))?
+    {
         P1Probe::Local(readiness) => return Ok(readiness),
         P1Probe::Network(probe) => probe,
     };
@@ -411,33 +1012,26 @@ impl WasixThreadExitRequested {
 }
 
 /// A pending WASIX signal raised on the process ended the guest. The
-/// program exits with `128 + signal`, whatever the guest asked for
-/// before it, and on any thread the whole process does.
+/// program ends with that signal, whatever the guest asked for before it,
+/// and on any thread the whole process does.
 #[derive(Debug, Error)]
 #[error("guest ended by wasix signal {signal}")]
-pub(super) struct Preview1SignalExit {
-    pub(super) signal: u32,
-}
-
-impl Preview1SignalExit {
-    pub(super) fn exit_code(&self) -> u32 {
-        128u32.saturating_add(self.signal)
-    }
+pub(crate) struct Preview1SignalExit {
+    pub(crate) signal: u8,
 }
 
 /// A WASIX signal raised on one thread alone (`thread_signal`) ended
-/// that thread's call. The thread exits with `128 + signal`, whatever it
-/// asked for before; a spawned thread ends alone, so a joiner sees the
-/// status, and main ends the image with it.
+/// that thread's call. A spawned thread ends alone with `128 + signal`,
+/// so a joiner sees the status, and main ends the image with the signal.
 #[derive(Debug, Error)]
 #[error("wasix thread ended by thread-directed signal {signal}")]
 pub(super) struct WasixThreadSignalExit {
-    pub(super) signal: u32,
+    pub(super) signal: u8,
 }
 
 impl WasixThreadSignalExit {
     pub(super) fn exit_code(&self) -> u32 {
-        128u32.saturating_add(self.signal)
+        128u32.saturating_add(u32::from(self.signal))
     }
 }
 
@@ -461,70 +1055,254 @@ impl WasixThreadEnded {
     }
 }
 
-/// The exit status of a program whose call ended in `error`, given the
+/// The termination of a program whose call ended in `error`, given the
 /// status the guest `requested` before: the signal that ended it, raised
-/// on its process or its thread, otherwise the requested status,
-/// otherwise none, and the error is a failure.
-pub(super) fn preview1_exit_status(error: &wasmtime::Error, requested: Option<u32>) -> Option<u32> {
+/// on its process or its thread, otherwise an owner kill, otherwise the
+/// requested exit status, otherwise none.
+pub(super) fn preview1_exit_status(
+    error: &wasmtime::Error,
+    requested: Option<u32>,
+) -> Option<helios_unix::ChildTermination> {
     if let Some(exit) = error.downcast_ref::<Preview1SignalExit>() {
-        return Some(exit.exit_code());
+        return Some(helios_unix::ChildTermination::Signaled(
+            helios_unix::SignalTermination {
+                signal: exit.signal,
+                core_dumped: false,
+            },
+        ));
     }
     if let Some(exit) = error.downcast_ref::<WasixThreadSignalExit>() {
-        return Some(exit.exit_code());
+        return Some(helios_unix::ChildTermination::Signaled(
+            helios_unix::SignalTermination {
+                signal: exit.signal,
+                core_dumped: false,
+            },
+        ));
     }
-    requested
+    if let Some(killed) = error.downcast_ref::<crate::InstanceKilled>() {
+        return match killed.reason {
+            crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                Some(helios_unix::ChildTermination::Killed)
+            }
+            crate::KillReason::OutOfMemory
+            | crate::KillReason::SupervisorRestart
+            | crate::KillReason::StoreFailed => None,
+        };
+    }
+    if caused_by_out_of_memory(error) {
+        return None;
+    }
+    requested.map(helios_unix::ChildTermination::Exited)
 }
 
-/// How a process ends when one of its calls ended in `error`, given the
-/// status the guest `requested` before: the exit status
-/// [`preview1_exit_status`] finds, otherwise the failure the error is
-/// (a trap, an out-of-memory kill, any other runtime error). Main's own
-/// end and a spawned thread's end of its process both report through
-/// this, so a trap ends the process the same way on any thread.
+/// How a running process ends when one of its guest calls ended in `error`,
+/// given the status the guest `requested` before: the signal, owner kill or
+/// requested exit [`preview1_exit_status`] finds, otherwise an out-of-memory
+/// or supervisor failure when condemned for one, otherwise a guest trap.
+/// Main's own end, a spawned thread's end of its process, and a component's
+/// `run` all report through this, so every guest kind classifies endings
+/// identically.
 pub(super) fn preview1_process_end(
     error: wasmtime::Error,
     requested: Option<u32>,
-) -> Result<u32, ProgramExecError> {
-    match preview1_exit_status(&error, requested) {
-        Some(code) => Ok(code),
-        None => Err(map_program_runtime_error(error)),
+) -> Result<helios_unix::ChildTermination, ProgramExecError> {
+    if let Some(termination) = preview1_exit_status(&error, requested) {
+        return Ok(termination);
     }
+    if caused_by_out_of_memory(&error) || error.downcast_ref::<crate::InstanceKilled>().is_some() {
+        return Err(map_program_runtime_error(error));
+    }
+    tracing::debug!(?error, "guest program trapped");
+    Ok(helios_unix::ChildTermination::Trapped)
+}
+
+/// Next safe-point signal action claimed from a store's mailboxes.
+pub(super) enum WasixPendingDelivery {
+    ThreadEnded,
+    TerminateThread(u8),
+    TerminateProcess(u8),
+    Catch {
+        signal: helios_unix::Signal,
+        callback: Arc<str>,
+        thread_directed: bool,
+    },
 }
 
 /// The signals one store answers to: those raised on its own thread and
-/// those raised on its process. A thread-directed raise reaches only this
+/// those raised on its process, resolved through the process's shared
+/// [`WasixProcessSignals`]. A thread-directed raise reaches only this
 /// store's turn; a process-directed one goes to whichever store of the
 /// process takes it first.
 ///
 /// # Concurrency
 ///
-/// As [`WasixSignalState`]: either mailbox is raised from any processor,
-/// and one turn of this store at a time takes.
+/// As [`WasixSignalState`] and [`WasixProcessSignals`]: either mailbox is
+/// raised from any processor, dispositions are sampled under a short
+/// task-context spin lock never held across `.await`, and atomic bitmask
+/// compare-exchange ensures each signal is claimed once.
 #[derive(Clone)]
 pub(super) struct WasixStoreSignals {
     thread: WasixSignalState,
     process: WasixSignalState,
+    dispositions: WasixProcessSignals,
 }
 
 impl WasixStoreSignals {
+    #[cfg(test)]
     pub(super) fn new(thread: WasixSignalState, process: WasixSignalState) -> Self {
-        Self { thread, process }
+        Self::with_dispositions(thread, process, WasixProcessSignals::default())
     }
 
-    /// The stop this store owes its guest, if any: the end of its
-    /// thread's process, which stays owed, then a pending signal, which
-    /// is delivered once. The interrupt callback and the turn both read
-    /// it, so a running guest and a suspended one meet the same stop.
+    pub(super) fn with_dispositions(
+        thread: WasixSignalState,
+        process: WasixSignalState,
+        dispositions: WasixProcessSignals,
+    ) -> Self {
+        Self {
+            thread,
+            process,
+            dispositions,
+        }
+    }
+
+    /// The fatal stop this store owes its guest now, if any: the end of its
+    /// thread's process, which stays owed, then a pending signal whose
+    /// disposition is to terminate. Ignored signals are dropped in place and
+    /// caught signals stay pending in the bitmask until the next safe point.
     pub(super) fn owed_stop(&self) -> Option<wasmtime::Error> {
         if self.thread.thread_ended() {
             return Some(wasmtime::Error::new(WasixThreadEnded));
         }
-        if let Some(signal) = self.thread.take_pending() {
-            return Some(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+        let (ignored, has_callback) = self.dispositions.summary();
+        let classify = |signal: helios_unix::Signal| match resolve_wasix_signal(
+            signal,
+            ignored,
+            has_callback.then_some(()),
+        ) {
+            WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Retain,
+            WasixResolvedAction::Terminate => helios_unix::SignalSweep::Take,
+        };
+        if let Some(signal) = self.thread.sweep_pending(classify) {
+            return Some(wasmtime::Error::new(WasixThreadSignalExit {
+                signal: signal.raw(),
+            }));
+        }
+        self.process.sweep_pending(classify).map(|signal| {
+            wasmtime::Error::new(Preview1SignalExit {
+                signal: signal.raw(),
+            })
+        })
+    }
+
+    /// Claims the next deliverable action at a safe point, prioritizing fatal
+    /// signals ahead of caught handlers and skipping caught signals already
+    /// masked in `active_handlers` while their own callback runs.
+    pub(super) fn take_next_delivery(
+        &self,
+        active_handlers: helios_unix::SignalSet,
+    ) -> Option<WasixPendingDelivery> {
+        if self.thread.thread_ended() {
+            return Some(WasixPendingDelivery::ThreadEnded);
+        }
+        let (ignored, callback) = self.dispositions.snapshot();
+        let has_callback = callback.is_some();
+        let classify_fatal = |signal: helios_unix::Signal| match resolve_wasix_signal(
+            signal,
+            ignored,
+            has_callback.then_some(()),
+        ) {
+            WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Retain,
+            WasixResolvedAction::Terminate => helios_unix::SignalSweep::Take,
+        };
+        if let Some(signal) = self.thread.sweep_pending(classify_fatal) {
+            return Some(WasixPendingDelivery::TerminateThread(signal.raw()));
+        }
+        if let Some(signal) = self.process.sweep_pending(classify_fatal) {
+            return Some(WasixPendingDelivery::TerminateProcess(signal.raw()));
+        }
+        let callback = callback?;
+        let classify_catch =
+            |signal: helios_unix::Signal| match resolve_wasix_signal(signal, ignored, Some(())) {
+                WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+                WasixResolvedAction::Terminate => helios_unix::SignalSweep::Retain,
+                WasixResolvedAction::Catch(()) if active_handlers.contains(signal) => {
+                    helios_unix::SignalSweep::Retain
+                }
+                WasixResolvedAction::Catch(()) => helios_unix::SignalSweep::Take,
+            };
+        if let Some(signal) = self.thread.sweep_pending(classify_catch) {
+            return Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed: true,
+            });
         }
         self.process
-            .take_pending()
-            .map(|signal| wasmtime::Error::new(Preview1SignalExit { signal }))
+            .sweep_pending(classify_catch)
+            .map(|signal| WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed: false,
+            })
+    }
+
+    /// Sweeps any ignored signals and reports whether an unmasked caught
+    /// signal is waiting for safe-point delivery.
+    pub(super) fn has_deliverable_catch(&self, active_handlers: helios_unix::SignalSet) -> bool {
+        if self.thread.thread_ended() {
+            return false;
+        }
+        let (ignored, has_callback) = self.dispositions.summary();
+        let drop_ignored = |signal: helios_unix::Signal| match resolve_wasix_signal(
+            signal,
+            ignored,
+            has_callback.then_some(()),
+        ) {
+            WasixResolvedAction::Ignore => helios_unix::SignalSweep::Drop,
+            WasixResolvedAction::Catch(()) | WasixResolvedAction::Terminate => {
+                helios_unix::SignalSweep::Retain
+            }
+        };
+        let _ = self.thread.sweep_pending(drop_ignored);
+        let _ = self.process.sweep_pending(drop_ignored);
+        if !has_callback {
+            return false;
+        }
+        let mut candidates = self
+            .thread
+            .pending_set()
+            .union(self.process.pending_set())
+            .difference(active_handlers);
+        while let Some(signal) = candidates.take_first() {
+            if matches!(
+                resolve_wasix_signal(signal, ignored, Some(())),
+                WasixResolvedAction::Catch(())
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Waits until an unmasked caught signal is ready for safe-point delivery,
+    /// arming its broadcast waiter before inspecting the mailboxes.
+    pub(super) async fn wait_for_catch_signal(&self, active_handlers: helios_unix::SignalSet) {
+        use crate::component::StopWake as _;
+
+        let mut wait = self.arm_stop_wait();
+        core::future::poll_fn(|cx| {
+            loop {
+                if self.has_deliverable_catch(active_handlers) {
+                    return Poll::Ready(());
+                }
+                if self.poll_stop_wait(cx, &mut wait).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+        })
+        .await;
     }
 }
 
@@ -875,7 +1653,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
             return Ok(inherited.clone());
         }
         Ok(OutputMode::RoutedChild {
-            stdin_rx: self.component_stdin(inherited)?,
+            stdin: self.component_stdin(inherited)?,
             stdout: self.component_output(1, inherited)?,
             stderr: self.component_output(2, inherited)?,
         })
@@ -884,14 +1662,15 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
     fn component_stdin(
         &self,
         inherited: &OutputMode,
-    ) -> Result<crate::ByteReader, ComponentStdioRefusal> {
-        let closed = || crate::byte_channel().1;
+    ) -> Result<crate::ComponentInputRoute, ComponentStdioRefusal> {
         match self.get(0) {
-            None | Some(Preview1Descriptor::NullDevice) => Ok(closed()),
+            None | Some(Preview1Descriptor::NullDevice) => Ok(crate::ComponentInputRoute::Closed),
             Some(Preview1Descriptor::Stdin { carry }) if carry.is_empty() => {
-                Ok(inherited.child_stdin().cloned().unwrap_or_else(closed))
+                Ok(inherited.stdin_route())
             }
-            Some(Preview1Descriptor::PipeRead { reader }) => Ok(reader.clone()),
+            Some(Preview1Descriptor::PipeRead { reader }) => {
+                Ok(crate::ComponentInputRoute::Child(reader.clone()))
+            }
             Some(descriptor) => Err(ComponentStdioRefusal {
                 fd: 0,
                 held: unbindable_stdio(descriptor),
@@ -1212,13 +1991,13 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
                 P1Readiness::Pending
             })
         }
-        (
-            Some(Preview1Descriptor::Socket(UnixSocket::Pair { reader, carry, .. })),
-            P1_EVENTTYPE_FD_READ,
-        ) => {
-            if !carry.is_empty() {
+        (Some(Preview1Descriptor::Socket(socket)), P1_EVENTTYPE_FD_READ) if socket.is_pair() => {
+            let Some((reader, carry_len)) = socket.pair_read_probe() else {
+                return Err(p1::errno::INVAL);
+            };
+            if carry_len != 0 {
                 return local(P1Readiness::Ready {
-                    bytes: carry.len() as u64,
+                    bytes: carry_len as u64,
                 });
             }
             // `is_readable` covers queued bytes and a closed writer alike;
@@ -1255,11 +2034,19 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // guest that polls for `POLLOUT` sleeps instead of spinning on a
         // full pipe. `is_writable` also covers a vanished peer, where the
         // write itself reports the error.
-        (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE)
-        | (
-            Some(Preview1Descriptor::Socket(UnixSocket::Pair { writer, .. })),
-            P1_EVENTTYPE_FD_WRITE,
-        ) => {
+        (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE) => {
+            if writer.is_writable() {
+                local(P1Readiness::Ready {
+                    bytes: usize::MAX as u64,
+                })
+            } else {
+                local(P1Readiness::Pending)
+            }
+        }
+        (Some(Preview1Descriptor::Socket(socket)), P1_EVENTTYPE_FD_WRITE) if socket.is_pair() => {
+            let Some(writer) = socket.pair_writer() else {
+                return Err(p1::errno::INVAL);
+            };
             if writer.is_writable() {
                 local(P1Readiness::Ready {
                     bytes: usize::MAX as u64,
@@ -1285,11 +2072,9 @@ pub(super) fn p1_probe_descriptor<Net: ComponentHostNetwork>(
         // progress; it is not an error to poll it, it simply never becomes
         // ready.
         (
-            Some(Preview1Descriptor::Socket(
-                socket @ (UnixSocket::<Net>::Tcp(_) | UnixSocket::<Net>::Udp(_)),
-            )),
+            Some(Preview1Descriptor::Socket(socket)),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => match socket.handle() {
+        ) if !socket.is_pair() => match socket.handle() {
             Some(handle) => Ok(P1Probe::Network(handle)),
             None => local(P1Readiness::Pending),
         },

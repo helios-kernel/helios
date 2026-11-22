@@ -6,6 +6,7 @@
 //! transaction commits on `fsync`, `fsyncdir` and unmount, and when its dirty
 //! metadata reaches Linux's bound.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
@@ -14,13 +15,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, TimeOrNow};
+use fuser::{Errno, FileAttr, FileHandle, FileType, Generation, INodeNo, TimeOrNow};
 use futures_lite::future::block_on;
 use helios_btrfs::write::{
-    Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, WriteOptions, Writer,
+    Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, Special, WriteOptions,
+    Writer, XattrMode,
 };
 use helios_btrfs::{
-    DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
+    BlockSink, BlockSource, DirBound, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode,
+    Metadata, Timestamp,
 };
 use helios_hal::fs::RenameMode;
 
@@ -43,7 +46,7 @@ const DOT_COOKIES: u64 = 2;
 /// `S_IALLUGO`: the permission, sticky and set-id bits of a mode.
 const PERMISSION_BITS: u32 = 0o7777;
 
-type Snapshot = Filesystem<Arc<Device>>;
+type Snapshot<S> = Filesystem<Arc<S>>;
 
 /// The attributes a `setattr` request changes; `None` leaves one alone.
 #[derive(Default)]
@@ -61,12 +64,17 @@ pub enum Node<'a> {
     File,
     Directory,
     Symlink(&'a [u8]),
+    Special(Special),
 }
 
 /// The caller a creation is made for.
+#[derive(Clone, Copy)]
 pub struct Owner {
     pub uid: u32,
     pub gid: u32,
+    /// The caller's umask, which the writer applies as `posix_acl_create`
+    /// does.
+    pub umask: u32,
 }
 
 pub struct Statfs {
@@ -75,20 +83,38 @@ pub struct Statfs {
     pub block_size: u32,
 }
 
-pub struct State {
-    writer: Writer<Device, RandomUuids>,
+/// State of an open directory stream (`FUSE_OPENDIR` .. `FUSE_RELEASEDIR`),
+/// following Linux's `btrfs_opendir` and `btrfs_real_readdir`
+/// (`fs/btrfs/inode.c`, commit `9b378f6ad48c`, refreshed on rewind as
+/// commit `fd968e683bd9`).
+#[derive(Clone, Copy)]
+struct OpenDir {
+    bound: DirBound,
+    /// Whether this stream has already served a `readdir`. Linux FUSE handles
+    /// `lseek(dirfd, 0, SEEK_SET)` (`rewinddir(3)`) in the VFS without sending
+    /// a request, so a `readdir` at offset `0` once `started` is true signals
+    /// a rewind and refreshes `bound`, while the initial `readdir(0)` keeps
+    /// the bound captured at `opendir`.
+    started: bool,
+}
+
+pub struct State<S = Device> {
+    writer: Writer<S, RandomUuids>,
     inodes: Inodes,
+    open_dirs: HashMap<u64, OpenDir>,
+    next_dir_handle: u64,
     concurrency: NonZeroUsize,
     read_only: bool,
 }
 
-impl State {
-    pub fn open(
-        device: Device,
-        concurrency: NonZeroUsize,
-        read_only: bool,
-    ) -> Result<Self, OpenError> {
-        let mut writer = block_on(Writer::mount(device, RandomUuids, concurrency))?;
+impl<S: BlockSink> State<S> {
+    pub fn open(device: S, concurrency: NonZeroUsize, read_only: bool) -> Result<Self, OpenError> {
+        let mut writer = block_on(Writer::mount(
+            device,
+            RandomUuids,
+            concurrency,
+            timestamp(SystemTime::now()),
+        ))?;
         let snapshot = writer.snapshot()?;
         let root = block_on(snapshot.root())?;
         let handle = {
@@ -102,6 +128,8 @@ impl State {
         Ok(Self {
             writer,
             inodes: Inodes::new(identity, root.metadata().generation, handle),
+            open_dirs: HashMap::new(),
+            next_dir_handle: 1,
             concurrency,
             read_only,
         })
@@ -111,7 +139,7 @@ impl State {
         self.inodes.forget(ino, count);
     }
 
-    fn snapshot(&self) -> Result<Snapshot, Errno> {
+    fn snapshot(&self) -> Result<Snapshot<S>, Errno> {
         self.writer.snapshot().map_err(|error| write_errno(&error))
     }
 
@@ -124,32 +152,34 @@ impl State {
 
     /// The inode `ino` names in `snapshot`; `ESTALE` once it was deleted or
     /// its number reused.
-    async fn open_inode(&self, snapshot: &Snapshot, ino: INodeNo) -> Result<Inode, Errno> {
+    async fn open_inode(&self, snapshot: &Snapshot<S>, ino: INodeNo) -> Result<Inode, Errno> {
         let (identity, generation) = self.inodes.identity(ino)?;
         let inode = match snapshot.inode(identity.tree, identity.number).await {
             Ok(inode) => inode,
-            Err(Error::MissingInode { .. }) => return Err(Errno::ESTALE),
+            Err(Error::MissingInode { .. } | Error::MissingRoot { .. }) => {
+                return Err(Errno::ESTALE);
+            }
             Err(error) => return Err(read_errno(&error)),
         };
-        if generation.is_some_and(|generation| generation != inode.metadata().generation) {
+        if inode.metadata().generation != generation || inode.metadata().nlink == 0 {
             return Err(Errno::ESTALE);
         }
         Ok(inode)
     }
 
-    /// The writer's handle for the entry `name` of directory `parent`.
-    async fn handle_of(&mut self, parent: INodeNo, name: &[u8]) -> Result<InodeHandle, Errno> {
-        let parent = self.inodes.handle(parent)?;
+    /// The writer's handle for `identity`, refreshed from the running
+    /// transaction.
+    async fn handle_for(&mut self, identity: Identity) -> Result<InodeHandle, Errno> {
         let transaction = self
             .writer
             .join()
             .await
             .map_err(|error| write_errno(&error))?;
         transaction
-            .lookup(&parent, name)
+            .inode(identity.tree, identity.number)
             .await
             .map_err(|error| write_errno(&error))?
-            .ok_or(Errno::ENOENT)
+            .ok_or(Errno::ESTALE)
     }
 
     /// Makes every change so far durable: `fsync`, `fsyncdir` and unmount.
@@ -181,15 +211,90 @@ impl State {
         let snapshot = self.snapshot()?;
         let inode = match snapshot.inode(identity.tree, identity.number).await {
             Ok(inode) => inode,
-            Err(Error::MissingInode { .. }) => return Err(Errno::ESTALE),
+            Err(Error::MissingInode { .. } | Error::MissingRoot { .. }) => {
+                return Err(Errno::ESTALE);
+            }
             Err(error) => return Err(read_errno(&error)),
         };
+        let ino = self.inodes.encode(identity)?;
         let generation = inode.metadata().generation;
-        let ino = self.inodes.record(identity, generation, handle);
+        self.inodes.record(ino, generation, handle);
         Ok((
             attr(ino, inode.metadata(), &snapshot),
-            Generation(generation),
+            fuse_generation(ino, generation),
         ))
+    }
+
+    async fn register_lookup(
+        &mut self,
+        snapshot: &Snapshot<S>,
+        inode: &Inode,
+    ) -> Result<(FileAttr, Generation), Errno> {
+        let identity = Identity {
+            tree: inode.tree(),
+            number: inode.number(),
+        };
+        let ino = self.inodes.encode(identity)?;
+        let generation = inode.metadata().generation;
+        let handle = if self.inodes.has_handle(ino, generation) {
+            None
+        } else {
+            Some(self.handle_for(identity).await?)
+        };
+        self.inodes.record(ino, generation, handle);
+        Ok((
+            attr(ino, inode.metadata(), snapshot),
+            fuse_generation(ino, generation),
+        ))
+    }
+
+    /// Export handle resolution (`FUSE_LOOKUP(nodeid, ".")` in
+    /// `fs/fuse/inode.c`): resolves `ino` directly from its stable identity
+    /// even after `FUSE_FORGET` or remount, and refreshes the writer handle.
+    async fn lookup_self(
+        &mut self,
+        snapshot: &Snapshot<S>,
+        ino: INodeNo,
+    ) -> Result<(FileAttr, Generation), Errno> {
+        let identity = self.inodes.decode(ino)?;
+        let inode = match snapshot.inode(identity.tree, identity.number).await {
+            Ok(inode) => inode,
+            Err(Error::MissingInode { .. } | Error::MissingRoot { .. }) => {
+                return Err(Errno::ESTALE);
+            }
+            Err(error) => return Err(read_errno(&error)),
+        };
+        if inode.metadata().nlink == 0 {
+            return Err(Errno::ESTALE);
+        }
+        if let Some(known) = self.inodes.generation(ino)
+            && known != inode.metadata().generation
+        {
+            return Err(Errno::ESTALE);
+        }
+        self.register_lookup(snapshot, &inode).await
+    }
+
+    /// Export path reconnection (`fuse_get_parent` -> `FUSE_LOOKUP(ino, "..")`
+    /// in `fs/fuse/inode.c`): resolves a directory's parent from its on-disk
+    /// backreference.
+    async fn lookup_parent(
+        &mut self,
+        snapshot: &Snapshot<S>,
+        ino: INodeNo,
+    ) -> Result<(FileAttr, Generation), Errno> {
+        let directory = self.open_inode(snapshot, ino).await?;
+        if ino == INodeNo::ROOT {
+            return self.register_lookup(snapshot, &directory).await;
+        }
+        let parent = match snapshot.parent(&directory).await {
+            Ok(Some(parent)) => parent,
+            Ok(None) | Err(Error::MissingInode { .. } | Error::MissingRoot { .. }) => {
+                return Err(Errno::ESTALE);
+            }
+            Err(error) => return Err(read_errno(&error)),
+        };
+        self.register_lookup(snapshot, &parent).await
     }
 
     pub async fn lookup(
@@ -199,27 +304,19 @@ impl State {
     ) -> Result<(FileAttr, Generation), Errno> {
         let name = entry_name(name)?;
         let snapshot = self.snapshot()?;
+        if name == b"." {
+            return self.lookup_self(&snapshot, parent).await;
+        }
+        if name == b".." {
+            return self.lookup_parent(&snapshot, parent).await;
+        }
         let directory = self.open_inode(&snapshot, parent).await?;
         let child = snapshot
             .lookup(&directory, name)
             .await
             .map_err(|error| read_errno(&error))?
             .ok_or(Errno::ENOENT)?;
-        let identity = Identity {
-            tree: child.tree(),
-            number: child.number(),
-        };
-        let generation = child.metadata().generation;
-        let handle = if self.inodes.has_handle(identity, generation) {
-            None
-        } else {
-            Some(self.handle_of(parent, name).await?)
-        };
-        let ino = self.inodes.record(identity, generation, handle);
-        Ok((
-            attr(ino, child.metadata(), &snapshot),
-            Generation(generation),
-        ))
+        self.register_lookup(&snapshot, &child).await
     }
 
     pub async fn getattr(&self, ino: INodeNo) -> Result<FileAttr, Errno> {
@@ -278,7 +375,7 @@ impl State {
         }
         if let Some(size) = size {
             transaction
-                .truncate_file(&file, size, now, concurrency)
+                .truncate_file(&file, size, WriteOptions::plain(now, concurrency))
                 .await
                 .map_err(|error| write_errno(&error))?;
         }
@@ -328,29 +425,95 @@ impl State {
         Ok(data)
     }
 
-    /// Hands the entries of directory `ino` after cookie `offset` to `emit`
-    /// until it returns true, meaning its reply is full.
+    /// Opens a directory stream and records its upper `DIR_INDEX` bound as of
+    /// open time (`btrfs_opendir` in Linux `fs/btrfs/inode.c`, commit
+    /// `9b378f6ad48c`).
+    pub async fn opendir(&mut self, ino: INodeNo) -> Result<FileHandle, Errno> {
+        let snapshot = self.snapshot()?;
+        let directory = self.open_inode(&snapshot, ino).await?;
+        let bound = snapshot
+            .dir_bound(&directory)
+            .await
+            .map_err(|error| read_errno(&error))?;
+        let handle = self.next_dir_handle;
+        self.next_dir_handle += 1;
+        self.open_dirs.insert(
+            handle,
+            OpenDir {
+                bound,
+                started: false,
+            },
+        );
+        Ok(FileHandle(handle))
+    }
+
+    /// Releases a directory stream opened by [`Self::opendir`].
+    pub fn releasedir(&mut self, fh: FileHandle) {
+        self.open_dirs.remove(&fh.0);
+    }
+
+    /// Hands the entries of directory `ino` after cookie `offset` up to the
+    /// open stream's upper `DIR_INDEX` bound to `emit` until it returns true,
+    /// meaning its reply is full.
     pub async fn readdir(
         &mut self,
         ino: INodeNo,
+        fh: FileHandle,
         offset: u64,
         mut emit: impl FnMut(INodeNo, u64, FileType, &OsStr) -> bool,
     ) -> Result<(), Errno> {
         let snapshot = self.snapshot()?;
         let directory = self.open_inode(&snapshot, ino).await?;
+        let parent_ino = if ino == INodeNo::ROOT {
+            INodeNo::ROOT
+        } else {
+            match snapshot.parent(&directory).await {
+                Ok(Some(parent)) => self.inodes.encode(Identity {
+                    tree: parent.tree(),
+                    number: parent.number(),
+                })?,
+                Ok(None) => ino,
+                Err(error) => return Err(read_errno(&error)),
+            }
+        };
+        let open = *self.open_dirs.get(&fh.0).ok_or(Errno::EBADF)?;
+        let bound = if offset == 0 && open.started {
+            // Refresh the upper `DIR_INDEX` bound on rewind (`rewinddir(3)` ->
+            // `lseek(dirfd, 0, SEEK_SET)` in the Linux VFS, which FUSE does not
+            // forward to the daemon), matching Linux `fs/btrfs/inode.c`, commit
+            // `fd968e683bd9`.
+            let refreshed = snapshot
+                .dir_bound(&directory)
+                .await
+                .map_err(|error| read_errno(&error))?;
+            self.open_dirs
+                .get_mut(&fh.0)
+                .expect("open directory handle checked above")
+                .bound = refreshed;
+            refreshed
+        } else {
+            if !open.started {
+                self.open_dirs
+                    .get_mut(&fh.0)
+                    .expect("open directory handle checked above")
+                    .started = true;
+            }
+            open.bound
+        };
         // The format stores neither `.` nor `..`; the kernel reports both.
-        // The parent is not recorded, so `..` carries the directory's own number.
-        for (cookie, name) in [(1, "."), (2, "..")] {
-            if offset < cookie && emit(ino, cookie, FileType::Directory, OsStr::new(name)) {
+        for (cookie, entry_ino, name) in [(1, ino, "."), (2, parent_ino, "..")] {
+            if offset < cookie && emit(entry_ino, cookie, FileType::Directory, OsStr::new(name)) {
                 return Ok(());
             }
         }
         let tree = directory.tree();
-        let inodes = &mut self.inodes;
+        let inodes = &self.inodes;
+        let mut encode_error = None;
         snapshot
             .read_dir(
                 &directory,
                 DirPosition(offset.saturating_sub(DOT_COOKIES)),
+                bound,
                 |entry| {
                     let identity = match entry.target {
                         EntryTarget::Inode(number) => Identity { tree, number },
@@ -359,7 +522,13 @@ impl State {
                             number: SUBVOLUME_ROOT_INODE,
                         },
                     };
-                    let listed = inodes.listed(identity);
+                    let listed = match inodes.encode(identity) {
+                        Ok(listed) => listed,
+                        Err(error) => {
+                            encode_error = Some(error);
+                            return ControlFlow::Break(());
+                        }
+                    };
                     let cookie = entry.position.0.saturating_add(DOT_COOKIES + 1);
                     if emit(
                         listed,
@@ -375,6 +544,9 @@ impl State {
             )
             .await
             .map_err(|error| read_errno(&error))?;
+        if let Some(error) = encode_error {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -427,11 +599,17 @@ impl State {
             permissions,
             uid: owner.uid,
             gid: owner.gid,
+            umask: owner.umask,
         };
         let created = match node {
             Node::File => transaction.create_file(at, attributes, now).await,
             Node::Directory => transaction.create_directory(at, attributes, now).await,
             Node::Symlink(target) => transaction.symlink(at, target, attributes, now).await,
+            Node::Special(special) => {
+                transaction
+                    .create_special(at, special, attributes, now)
+                    .await
+            }
         }
         .map_err(|error| write_errno(&error))?;
         self.settle().await?;
@@ -569,24 +747,79 @@ impl State {
         })
     }
 
-    /// The value of extended attribute `name`; its full length even when
-    /// `size` is too small to hold it, and nothing when `size` is zero.
+    /// `getxattr(2)`: the attribute's length when `size` is zero, or its
+    /// bytes when `size` holds them (`ERANGE` when `size` is too small).
     pub async fn getxattr(
-        &self,
+        &mut self,
         ino: INodeNo,
         name: &OsStr,
         size: u32,
     ) -> Result<(usize, Vec<u8>), Errno> {
-        let snapshot = self.snapshot()?;
-        let inode = self.open_inode(&snapshot, ino).await?;
-        let mut value = vec![0; size as usize];
-        let length = snapshot
-            .xattr(&inode, name.as_bytes(), &mut value)
+        // Linux's FUSE client (`fs/fuse/xattr.c` in torvalds/linux) uses a
+        // catch-all `.prefix = ""` handler, so non-ACL `getxattr` requests
+        // reach the daemon for namespace and bare-prefix validation.
+        let file = self.inodes.handle(ino)?;
+        let transaction = self
+            .writer
+            .join()
             .await
-            .map_err(|error| read_errno(&error))?
-            .ok_or(Errno::NO_XATTR)?;
+            .map_err(|error| write_errno(&error))?;
+        let mut value = vec![0; size as usize];
+        let length = transaction
+            .xattr(&file, name.as_bytes(), &mut value)
+            .await
+            .map_err(|error| write_errno(&error))?;
         value.truncate(length.min(value.len()));
         Ok((length, value))
+    }
+
+    /// `setxattr(2)`: `flags` is `XATTR_CREATE` or `XATTR_REPLACE` or neither.
+    pub async fn setxattr(
+        &mut self,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        now: Timestamp,
+    ) -> Result<(), Errno> {
+        let mode = match flags {
+            0 => XattrMode::Set,
+            libc::XATTR_CREATE => XattrMode::Create,
+            libc::XATTR_REPLACE => XattrMode::Replace,
+            _ => return Err(Errno::EINVAL),
+        };
+        self.writable()?;
+        let file = self.inodes.handle(ino)?;
+        let mut transaction = self
+            .writer
+            .join()
+            .await
+            .map_err(|error| write_errno(&error))?;
+        transaction
+            .set_xattr(&file, name.as_bytes(), value, mode, now)
+            .await
+            .map_err(|error| write_errno(&error))?;
+        self.settle().await
+    }
+
+    pub async fn removexattr(
+        &mut self,
+        ino: INodeNo,
+        name: &OsStr,
+        now: Timestamp,
+    ) -> Result<(), Errno> {
+        self.writable()?;
+        let file = self.inodes.handle(ino)?;
+        let mut transaction = self
+            .writer
+            .join()
+            .await
+            .map_err(|error| write_errno(&error))?;
+        transaction
+            .remove_xattr(&file, name.as_bytes(), now)
+            .await
+            .map_err(|error| write_errno(&error))?;
+        self.settle().await
     }
 
     /// The names of the extended attributes, each followed by a NUL.
@@ -679,7 +912,17 @@ pub fn timestamp(time: SystemTime) -> Timestamp {
     }
 }
 
-fn attr(ino: INodeNo, metadata: &Metadata, snapshot: &Snapshot) -> FileAttr {
+/// Linux's `fuse_lookup_name` requires generation 0 for `FUSE_ROOT_ID`
+/// (`fs/fuse/dir.c`).
+fn fuse_generation(ino: INodeNo, generation: u64) -> Generation {
+    if ino == INodeNo::ROOT {
+        Generation(0)
+    } else {
+        Generation(generation)
+    }
+}
+
+fn attr<S: BlockSource>(ino: INodeNo, metadata: &Metadata, snapshot: &Snapshot<S>) -> FileAttr {
     FileAttr {
         ino,
         size: metadata.size,
@@ -694,8 +937,591 @@ fn attr(ino: INodeNo, metadata: &Metadata, snapshot: &Snapshot) -> FileAttr {
         nlink: metadata.nlink,
         uid: metadata.uid,
         gid: metadata.gid,
-        rdev: metadata.rdev as u32,
+        // FUSE carries `stat`'s encoding, which the kernel decodes with
+        // `new_decode_dev` (`fuse_fillattr` in `fs/fuse/inode.c`).
+        rdev: metadata.rdev.encode(),
         blksize: snapshot.superblock().sectorsize(),
         flags: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
+    use ferrosys::btrfs::{FormatOptions, SubvolumeRequest, format_to};
+    use ferrosys::{Metadata as FerrosysMetadata, Timestamp as FerrosysTimestamp, TreeBuilder};
+    use helios_btrfs::READ_ALIGNMENT;
+    use helios_hal::io::{IoError, IoResult};
+
+    use super::*;
+
+    struct TempDisk {
+        file: File,
+        len: u64,
+    }
+
+    impl TempDisk {
+        fn new(tree: TreeBuilder, options: FormatOptions) -> (Self, File) {
+            let len = 128 << 20;
+            let mut file = tempfile::tempfile().unwrap();
+            file.set_len(len).unwrap();
+            format_to(&mut file, tree, len, options).unwrap();
+            let backing = file.try_clone().unwrap();
+            (Self { file, len }, backing)
+        }
+
+        fn from_file(file: File) -> Self {
+            let len = file.metadata().unwrap().len();
+            Self { file, len }
+        }
+    }
+
+    impl BlockSource for TempDisk {
+        fn size_bytes(&self) -> u64 {
+            self.len
+        }
+
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+            self.file
+                .read_exact_at(buf, offset)
+                .map_err(|_| IoError::DeviceFault)
+        }
+    }
+
+    impl BlockSink for TempDisk {
+        async fn stage(&self, block: u64, bytes: &[u8; READ_ALIGNMENT as usize]) -> IoResult<()> {
+            self.file
+                .write_all_at(bytes, block * READ_ALIGNMENT)
+                .map_err(|_| IoError::DeviceFault)
+        }
+
+        async fn commit(&self, block: u64, bytes: &[u8; READ_ALIGNMENT as usize]) -> IoResult<()> {
+            self.file
+                .write_all_at(bytes, block * READ_ALIGNMENT)
+                .map_err(|_| IoError::DeviceFault)
+        }
+    }
+
+    fn empty_image() -> (TempDisk, File) {
+        let timestamp = FerrosysTimestamp::from_secs(1_700_000_000);
+        let tree = TreeBuilder::new().root(FerrosysMetadata::new(0o755, timestamp));
+        let options = FormatOptions::new([0x53; 16], timestamp);
+        TempDisk::new(tree, options)
+    }
+
+    fn open_state(disk: TempDisk) -> State<TempDisk> {
+        State::open(disk, NonZeroUsize::MIN, false).unwrap()
+    }
+
+    fn test_owner() -> Owner {
+        Owner {
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        }
+    }
+
+    fn test_time() -> Timestamp {
+        Timestamp {
+            seconds: 1_700_000_001,
+            nanoseconds: 0,
+        }
+    }
+
+    #[test]
+    fn stable_inode_numbers_and_dot_lookup_survive_forget_and_remount() {
+        block_on(async {
+            let (disk, backing) = empty_image();
+            let mut state = open_state(disk);
+
+            let (dir_attr, dir_gen) = state
+                .create(
+                    INodeNo::ROOT,
+                    OsStr::new("dir"),
+                    Node::Directory,
+                    0o755,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            let (file_attr, file_gen) = state
+                .create(
+                    dir_attr.ino,
+                    OsStr::new("file"),
+                    Node::File,
+                    0o644,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                state
+                    .write(file_attr.ino, 0, b"hello", test_time())
+                    .await
+                    .unwrap(),
+                5
+            );
+            state.sync().await.unwrap();
+
+            // Drop both entries via FUSE_FORGET (drop_caches) and resolve via
+            // FUSE_LOOKUP(nodeid, ".").
+            state.forget(file_attr.ino, 1);
+            state.forget(dir_attr.ino, 1);
+            assert_eq!(state.getattr(file_attr.ino).await, Err(Errno::ESTALE));
+
+            let (resolved_file, resolved_file_gen) =
+                state.lookup(file_attr.ino, OsStr::new(".")).await.unwrap();
+            assert_eq!(resolved_file.ino, file_attr.ino);
+            assert_eq!(resolved_file_gen, file_gen);
+            assert_eq!(state.read(file_attr.ino, 0, 16).await.unwrap(), b"hello");
+            // Writer handle was refreshed by lookup(".", ...), so mutations work.
+            assert_eq!(
+                state
+                    .write(file_attr.ino, 5, b"-world", test_time())
+                    .await
+                    .unwrap(),
+                6
+            );
+
+            let (resolved_dir, resolved_dir_gen) =
+                state.lookup(dir_attr.ino, OsStr::new(".")).await.unwrap();
+            assert_eq!(resolved_dir.ino, dir_attr.ino);
+            assert_eq!(resolved_dir_gen, dir_gen);
+            let (parent_attr, parent_gen) =
+                state.lookup(dir_attr.ino, OsStr::new("..")).await.unwrap();
+            assert_eq!(parent_attr.ino, INodeNo::ROOT);
+            assert_eq!(parent_gen, Generation(0));
+            state.sync().await.unwrap();
+            drop(state);
+
+            // Simulate a full unmount + remount: fresh State with an empty cache.
+            let mut remounted = open_state(TempDisk::from_file(backing));
+            let (after_file, after_file_gen) = remounted
+                .lookup(file_attr.ino, OsStr::new("."))
+                .await
+                .unwrap();
+            assert_eq!(after_file.ino, file_attr.ino);
+            assert_eq!(after_file_gen, file_gen);
+            assert_eq!(
+                remounted.read(file_attr.ino, 0, 16).await.unwrap(),
+                b"hello-world"
+            );
+            assert_eq!(
+                remounted
+                    .write(file_attr.ino, 11, b"!", test_time())
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            let (after_dir, after_dir_gen) = remounted
+                .lookup(dir_attr.ino, OsStr::new("."))
+                .await
+                .unwrap();
+            assert_eq!(after_dir.ino, dir_attr.ino);
+            assert_eq!(after_dir_gen, dir_gen);
+            let (after_child, _) = remounted
+                .create(
+                    dir_attr.ino,
+                    OsStr::new("second"),
+                    Node::File,
+                    0o644,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(after_child.ino, file_attr.ino);
+
+            // Normal path lookup after remount returns the exact same INodeNo.
+            let (by_name_dir, _) = remounted
+                .lookup(INodeNo::ROOT, OsStr::new("dir"))
+                .await
+                .unwrap();
+            assert_eq!(by_name_dir.ino, dir_attr.ino);
+            let (by_name_file, _) = remounted
+                .lookup(dir_attr.ino, OsStr::new("file"))
+                .await
+                .unwrap();
+            assert_eq!(by_name_file.ino, file_attr.ino);
+        });
+    }
+
+    #[test]
+    fn dotdot_reconnects_nested_and_renamed_directories_after_remount() {
+        block_on(async {
+            let (disk, backing) = empty_image();
+            let mut state = open_state(disk);
+
+            let (top, top_gen) = state
+                .create(
+                    INodeNo::ROOT,
+                    OsStr::new("top"),
+                    Node::Directory,
+                    0o755,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            let (nested, nested_gen) = state
+                .create(
+                    top.ino,
+                    OsStr::new("nested"),
+                    Node::Directory,
+                    0o755,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            let (leaf, _) = state
+                .create(
+                    nested.ino,
+                    OsStr::new("leaf"),
+                    Node::File,
+                    0o644,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            state
+                .rename(
+                    top.ino,
+                    OsStr::new("nested"),
+                    top.ino,
+                    OsStr::new("nested-renamed"),
+                    RenameMode::Replace,
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            state.sync().await.unwrap();
+            drop(state);
+
+            let mut remounted = open_state(TempDisk::from_file(backing));
+            let (resolved_nested, resolved_gen) =
+                remounted.lookup(nested.ino, OsStr::new(".")).await.unwrap();
+            assert_eq!(resolved_nested.ino, nested.ino);
+            assert_eq!(resolved_gen, nested_gen);
+
+            let (parent, parent_gen) = remounted
+                .lookup(nested.ino, OsStr::new(".."))
+                .await
+                .unwrap();
+            assert_eq!(parent.ino, top.ino);
+            assert_eq!(parent_gen, top_gen);
+
+            let (grandparent, grandparent_gen) =
+                remounted.lookup(top.ino, OsStr::new("..")).await.unwrap();
+            assert_eq!(grandparent.ino, INodeNo::ROOT);
+            assert_eq!(grandparent_gen, Generation(0));
+
+            let (root_parent, root_parent_gen) = remounted
+                .lookup(INodeNo::ROOT, OsStr::new(".."))
+                .await
+                .unwrap();
+            assert_eq!(root_parent.ino, INodeNo::ROOT);
+            assert_eq!(root_parent_gen, Generation(0));
+
+            // readdir on `top` reports the stable inode number matching `nested`
+            // so Linux exportfs `get_name` can match it back to `nested-renamed`.
+            let top_fh = remounted.opendir(top.ino).await.unwrap();
+            let mut entries = Vec::new();
+            remounted
+                .readdir(top.ino, top_fh, 0, |ino, _cookie, _kind, name| {
+                    entries.push((name.to_os_string(), ino));
+                    false
+                })
+                .await
+                .unwrap();
+            remounted.releasedir(top_fh);
+            assert!(entries.contains(&(OsStr::new("..").to_os_string(), INodeNo::ROOT)));
+            assert!(entries.contains(&(OsStr::new("nested-renamed").to_os_string(), nested.ino)));
+
+            // `..` on a non-directory fails with ENOTDIR.
+            remounted.lookup(leaf.ino, OsStr::new(".")).await.unwrap();
+            assert_eq!(
+                remounted.lookup(leaf.ino, OsStr::new("..")).await,
+                Err(Errno::ENOTDIR)
+            );
+        });
+    }
+
+    #[test]
+    fn dot_lookup_returns_estale_after_unlink_and_reports_recycled_generation() {
+        block_on(async {
+            let (disk, backing) = empty_image();
+            let mut state = open_state(disk);
+
+            let (file, old_gen) = state
+                .create(
+                    INodeNo::ROOT,
+                    OsStr::new("ephemeral"),
+                    Node::File,
+                    0o644,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            state.sync().await.unwrap();
+
+            state
+                .remove(INodeNo::ROOT, OsStr::new("ephemeral"), false, test_time())
+                .await
+                .unwrap();
+            assert_eq!(
+                state.lookup(file.ino, OsStr::new(".")).await,
+                Err(Errno::ESTALE)
+            );
+            state.forget(file.ino, 1);
+            assert_eq!(
+                state.lookup(file.ino, OsStr::new(".")).await,
+                Err(Errno::ESTALE)
+            );
+            state.sync().await.unwrap();
+
+            // Invalid node IDs fail with ESTALE.
+            assert_eq!(
+                state.lookup(INodeNo(0), OsStr::new(".")).await,
+                Err(Errno::ESTALE)
+            );
+            assert_eq!(
+                state
+                    .lookup(INodeNo(SUBVOLUME_ROOT_INODE), OsStr::new("."))
+                    .await,
+                Err(Errno::ESTALE)
+            );
+
+            // Committing the deletion lets the next transaction reuse the freed
+            // highest inode number with a strictly higher generation.
+            let (recycled, new_gen) = state
+                .create(
+                    INodeNo::ROOT,
+                    OsStr::new("recycled"),
+                    Node::File,
+                    0o644,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(recycled.ino, file.ino);
+            assert_ne!(new_gen, old_gen);
+            state.sync().await.unwrap();
+            drop(state);
+
+            // After remount, lookup(nodeid, ".") returns the new generation so
+            // Linux's fuse_get_dentry rejects the old handle with ESTALE.
+            let mut remounted = open_state(TempDisk::from_file(backing));
+            let (after, after_gen) = remounted.lookup(file.ino, OsStr::new(".")).await.unwrap();
+            assert_eq!(after.ino, file.ino);
+            assert_eq!(after_gen, new_gen);
+            assert_ne!(after_gen, old_gen);
+
+            // If a stale entry for the old generation is still cached in
+            // `inodes`, lookup(nodeid, ".") rejects it directly with ESTALE.
+            let stale_handle = remounted.inodes.handle(file.ino).unwrap();
+            remounted.forget(file.ino, 1);
+            remounted
+                .inodes
+                .record(file.ino, old_gen.0, Some(stale_handle));
+            assert_eq!(
+                remounted.lookup(file.ino, OsStr::new(".")).await,
+                Err(Errno::ESTALE)
+            );
+        });
+    }
+
+    #[test]
+    fn nested_subvolume_has_distinct_stable_inode_and_resolves_parent() {
+        block_on(async {
+            let timestamp = FerrosysTimestamp::from_secs(1_700_000_000);
+            let dir_meta = FerrosysMetadata::new(0o755, timestamp);
+            let tree = TreeBuilder::new()
+                .root(dir_meta)
+                .directory("/sub", dir_meta);
+            let options = FormatOptions::new([0x53; 16], timestamp)
+                .subvolume(SubvolumeRequest::new(b"/sub".to_vec(), [0x42; 16]));
+            let (disk, backing) = TempDisk::new(tree, options);
+            let mut state = open_state(disk);
+
+            let (sub, sub_gen) = state
+                .lookup(INodeNo::ROOT, OsStr::new("sub"))
+                .await
+                .unwrap();
+            assert_ne!(sub.ino, INodeNo::ROOT);
+            state.forget(sub.ino, 1);
+            drop(state);
+
+            let mut remounted = open_state(TempDisk::from_file(backing));
+            let (resolved, resolved_gen) =
+                remounted.lookup(sub.ino, OsStr::new(".")).await.unwrap();
+            assert_eq!(resolved.ino, sub.ino);
+            assert_eq!(resolved_gen, sub_gen);
+
+            let (parent, parent_gen) = remounted.lookup(sub.ino, OsStr::new("..")).await.unwrap();
+            assert_eq!(parent.ino, INodeNo::ROOT);
+            assert_eq!(parent_gen, Generation(0));
+        });
+    }
+
+    const WHEN: Timestamp = Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 0,
+    };
+
+    fn test_state() -> (tempfile::NamedTempFile, State) {
+        let time = FerrosysTimestamp::from_secs(1_700_000_000);
+        let mut named = tempfile::NamedTempFile::new().expect("temp image");
+        // ferrosys' default single-device geometry needs at least 109 MiB.
+        let size = 128 << 20;
+        named.as_file_mut().set_len(size).expect("set_len");
+        let tree = TreeBuilder::new().root(FerrosysMetadata::new(0o755, time));
+        format_to(
+            named.as_file_mut(),
+            tree,
+            size,
+            FormatOptions::new([0x44; 16], time),
+        )
+        .expect("format btrfs");
+        let device = Device::open_for_test(named.path()).expect("open test device");
+        let state = State::open(device, NonZeroUsize::new(1).unwrap(), false).expect("open state");
+        (named, state)
+    }
+
+    fn list_names(state: &mut State, ino: INodeNo, fh: FileHandle) -> Vec<OsString> {
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let mut batch = Vec::new();
+            block_on(state.readdir(ino, fh, offset, |_, cookie, _, name| {
+                if batch.len() == 2 {
+                    return true;
+                }
+                batch.push((cookie, name.to_os_string()));
+                false
+            }))
+            .expect("readdir");
+            let Some((last_cookie, _)) = batch.last() else {
+                break;
+            };
+            offset = *last_cookie;
+            names.extend(batch.into_iter().map(|(_, name)| name));
+        }
+        names
+    }
+
+    #[test]
+    fn opendir_keeps_open_bound_on_first_readdir_and_refreshes_on_rewind() {
+        let (_image, mut state) = test_state();
+        let owner = Owner {
+            uid: 0,
+            gid: 0,
+            umask: 0,
+        };
+        let (dir_attr, _) = block_on(state.create(
+            INodeNo::ROOT,
+            OsStr::new("work"),
+            Node::Directory,
+            0o755,
+            owner,
+            WHEN,
+        ))
+        .expect("mkdir work");
+        let dir = dir_attr.ino;
+        for name in ["文件", "ファイル", "파일"] {
+            block_on(state.create(dir, OsStr::new(name), Node::File, 0o644, owner, WHEN))
+                .expect("create initial cjk");
+        }
+
+        // Open `work`, then add an entry before the first `readdir(0)`. The
+        // open-time bound hides the entry added after `opendir`.
+        let fh = block_on(state.opendir(dir)).expect("opendir");
+        block_on(state.create(
+            dir,
+            OsStr::new("after-open"),
+            Node::File,
+            0o644,
+            owner,
+            WHEN,
+        ))
+        .expect("create after-open");
+        let first_pass = list_names(&mut state, dir, fh);
+        assert!(
+            !first_pass.iter().any(|name| name == "after-open"),
+            "first readdir(0) must keep opendir's bound: {first_pass:?}"
+        );
+
+        // A second `readdir(0)` on the same handle (`rewinddir(3)`) refreshes
+        // the bound and makes `after-open` visible.
+        let rewound = list_names(&mut state, dir, fh);
+        assert!(
+            rewound.iter().any(|name| name == "after-open"),
+            "rewound readdir(0) must see entries added since opendir: {rewound:?}"
+        );
+
+        // Renaming every yielded entry (`entry -> TEMPFILE -> entry`) while
+        // paging through `work` terminates in bounded entries.
+        let mut offset = 0;
+        let mut seen = Vec::new();
+        let safety_cap = 20;
+        loop {
+            let mut batch = Vec::new();
+            block_on(state.readdir(dir, fh, offset, |_, cookie, _, name| {
+                if batch.len() == 2 {
+                    return true;
+                }
+                batch.push((cookie, name.to_os_string()));
+                false
+            }))
+            .expect("readdir page");
+            let Some((last_cookie, _)) = batch.last() else {
+                break;
+            };
+            offset = *last_cookie;
+            for (_, name) in batch {
+                if name == "." || name == ".." {
+                    continue;
+                }
+                block_on(state.rename(
+                    dir,
+                    &name,
+                    dir,
+                    OsStr::new("TEMPFILE"),
+                    RenameMode::Replace,
+                    WHEN,
+                ))
+                .expect("rename to TEMPFILE");
+                block_on(state.rename(
+                    dir,
+                    OsStr::new("TEMPFILE"),
+                    dir,
+                    &name,
+                    RenameMode::Replace,
+                    WHEN,
+                ))
+                .expect("rename back");
+                seen.push(name);
+                assert!(
+                    seen.len() <= safety_cap,
+                    "fuse-btrfs readdir looped past safety cap ({safety_cap})"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 4, "expected 4 entries, got {seen:?}");
+
+        state.releasedir(fh);
+        assert_eq!(
+            block_on(state.readdir(dir, fh, 0, |_, _, _, _| false)),
+            Err(Errno::EBADF)
+        );
     }
 }

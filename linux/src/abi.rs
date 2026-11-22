@@ -38,6 +38,15 @@ pub enum Operation {
     Brk,
     Ioctl,
     Writev,
+    SchedYield,
+    SchedGetaffinity,
+    Nanosleep,
+    ClockNanosleep,
+    Clone,
+    Clone3,
+    Futex,
+    SetRobustList,
+    GetRobustList,
     Getpid,
     Gettid,
     SetTidAddress,
@@ -69,6 +78,18 @@ pub enum Operation {
     Unknown,
 }
 
+/// Decoded arguments of the legacy `clone` system call, whose `tls` and
+/// `child_tid` positions differ between x86-64 and `CONFIG_CLONE_BACKWARDS`
+/// architectures such as AArch64 (`kernel/fork.c` `SYSCALL_DEFINE5(clone)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloneRegisters {
+    pub flags: u64,
+    pub stack: u64,
+    pub parent_tid: u64,
+    pub child_tid: u64,
+    pub tls: u64,
+}
+
 impl Abi {
     /// The Linux ABI of `isa`, or `None` where this crate decodes none.
     pub fn for_instruction_set(isa: InstructionSet) -> Option<Self> {
@@ -94,11 +115,14 @@ impl Abi {
                 16 => Operation::Ioctl,
                 20 => Operation::Writev,
                 22 => Operation::Pipe,
+                24 => Operation::SchedYield,
                 25 => Operation::Mremap,
                 28 => Operation::Madvise,
                 32 => Operation::Dup,
                 33 => Operation::Dup2,
+                35 => Operation::Nanosleep,
                 39 => Operation::Getpid,
+                56 => Operation::Clone,
                 60 => Operation::Exit,
                 63 => Operation::Uname,
                 72 => Operation::Fcntl,
@@ -119,14 +143,19 @@ impl Abi {
                 160 => Operation::Setrlimit,
                 186 => Operation::Gettid,
                 201 => Operation::Time,
+                202 => Operation::Futex,
+                204 => Operation::SchedGetaffinity,
                 213 => Operation::EpollCreate,
                 218 => Operation::SetTidAddress,
                 227 => Operation::ClockSettime,
                 228 => Operation::ClockGettime,
                 229 => Operation::ClockGetres,
+                230 => Operation::ClockNanosleep,
                 231 => Operation::ExitGroup,
                 232 => Operation::EpollWait,
                 233 => Operation::EpollCtl,
+                273 => Operation::SetRobustList,
+                274 => Operation::GetRobustList,
                 281 => Operation::EpollPwait,
                 284 => Operation::Eventfd,
                 290 => Operation::Eventfd2,
@@ -135,6 +164,7 @@ impl Abi {
                 293 => Operation::Pipe2,
                 302 => Operation::Prlimit64,
                 318 => Operation::Getrandom,
+                435 => Operation::Clone3,
                 _ => Operation::Unknown,
             },
             // include/uapi/asm-generic/unistd.h, which has none of the
@@ -157,9 +187,16 @@ impl Abi {
                 93 => Operation::Exit,
                 94 => Operation::ExitGroup,
                 96 => Operation::SetTidAddress,
+                98 => Operation::Futex,
+                99 => Operation::SetRobustList,
+                100 => Operation::GetRobustList,
+                101 => Operation::Nanosleep,
                 112 => Operation::ClockSettime,
                 113 => Operation::ClockGettime,
                 114 => Operation::ClockGetres,
+                115 => Operation::ClockNanosleep,
+                123 => Operation::SchedGetaffinity,
+                124 => Operation::SchedYield,
                 140 => Operation::Setpriority,
                 141 => Operation::Getpriority,
                 148 => Operation::Getresuid,
@@ -180,11 +217,13 @@ impl Abi {
                 214 => Operation::Brk,
                 215 => Operation::Munmap,
                 216 => Operation::Mremap,
+                220 => Operation::Clone,
                 222 => Operation::Mmap,
                 226 => Operation::Mprotect,
                 233 => Operation::Madvise,
                 261 => Operation::Prlimit64,
                 278 => Operation::Getrandom,
+                435 => Operation::Clone3,
                 _ => Operation::Unknown,
             },
         }
@@ -221,6 +260,36 @@ impl Abi {
                     RegisterId::Aarch64X(5),
                 ],
                 result: RegisterId::Aarch64X(0),
+            },
+        }
+    }
+
+    /// The user stack-pointer register of this ABI.
+    pub fn stack_pointer_register(self) -> RegisterId {
+        match self {
+            Self::X86_64 => RegisterId::X86Gpr(4),
+            Self::Aarch64 => RegisterId::Aarch64Sp,
+        }
+    }
+
+    /// Decodes the register order of `clone(2)` (`kernel/fork.c`
+    /// `SYSCALL_DEFINE5(clone)`): `CONFIG_CLONE_BACKWARDS` on arm64 swaps
+    /// `tls` and `child_tid` relative to x86-64.
+    pub fn clone_registers(self, args: [u64; 6]) -> CloneRegisters {
+        match self {
+            Self::X86_64 => CloneRegisters {
+                flags: args[0],
+                stack: args[1],
+                parent_tid: args[2],
+                child_tid: args[3],
+                tls: args[4],
+            },
+            Self::Aarch64 => CloneRegisters {
+                flags: args[0],
+                stack: args[1],
+                parent_tid: args[2],
+                tls: args[3],
+                child_tid: args[4],
             },
         }
     }
@@ -269,8 +338,10 @@ pub struct SystemCallRegisters {
 // Linux uapi/asm-generic/signal.h numbers, shared by x86-64.
 pub const SIGILL: u8 = 4;
 pub const SIGTRAP: u8 = 5;
+pub const SIGABRT: u8 = 6;
 pub const SIGBUS: u8 = 7;
 pub const SIGFPE: u8 = 8;
+pub const SIGKILL: u8 = 9;
 pub const SIGSEGV: u8 = 11;
 
 /// The signal Linux raises for a user fault of `kind`
@@ -286,8 +357,47 @@ pub fn fault_signal(kind: FaultKind) -> u8 {
     }
 }
 
-/// The exit status a parent reads for a process a signal ended, as a POSIX
-/// shell reports it: 128 plus the signal number.
-pub fn signal_exit_status(signal: u32) -> u32 {
-    128 + signal
+/// Encodes `termination` into the 16-bit status word `wait4(2)` writes
+/// (`kernel/exit.c` `wait_task_zombie`, `include/uapi/linux/wait.h`):
+/// `(code & 0xff) << 8` on exit, `(signal & 0x7f) | (core_dumped << 7)`
+/// on signal death, `SIGABRT` on a trap, and `SIGKILL` on an owner kill.
+pub fn wait_status(termination: helios_unix::ChildTermination) -> i32 {
+    match termination {
+        helios_unix::ChildTermination::Exited(code) => ((code & 0xff) as i32) << 8,
+        helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+            signal,
+            core_dumped,
+        }) => i32::from(signal & 0x7f) | (i32::from(core_dumped) << 7),
+        helios_unix::ChildTermination::Trapped => i32::from(SIGABRT),
+        helios_unix::ChildTermination::Killed => i32::from(SIGKILL),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_unix::{ChildTermination, SignalTermination};
+
+    #[test]
+    fn wait_status_encodes_each_termination_kind() {
+        assert_eq!(wait_status(ChildTermination::Exited(0)), 0);
+        assert_eq!(wait_status(ChildTermination::Exited(42)), 42 << 8);
+        assert_eq!(wait_status(ChildTermination::Exited(0x1ff)), 0xff << 8);
+        assert_eq!(
+            wait_status(ChildTermination::Signaled(SignalTermination {
+                signal: SIGSEGV,
+                core_dumped: false,
+            })),
+            i32::from(SIGSEGV),
+        );
+        assert_eq!(
+            wait_status(ChildTermination::Signaled(SignalTermination {
+                signal: SIGSEGV,
+                core_dumped: true,
+            })),
+            i32::from(SIGSEGV) | 0x80,
+        );
+        assert_eq!(wait_status(ChildTermination::Trapped), i32::from(SIGABRT));
+        assert_eq!(wait_status(ChildTermination::Killed), i32::from(SIGKILL));
+    }
 }

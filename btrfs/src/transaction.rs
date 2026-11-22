@@ -5,13 +5,16 @@
 //! is visible through [`Transaction::view`] at once, and a commit writes them
 //! all durably as one generation.
 
+pub(crate) mod acl;
 pub(crate) mod chunks;
 mod extents;
 pub(crate) mod file;
 pub(crate) mod namespace;
 pub(crate) mod ownership;
 pub(crate) mod reflink;
+pub(crate) mod replay;
 pub(crate) mod reserve;
+pub(crate) mod xattr;
 
 use core::num::NonZeroUsize;
 use futures::future;

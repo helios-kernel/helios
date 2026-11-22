@@ -34,7 +34,7 @@ fn test_program_store(
     );
     let registry = InstanceRegistry::new();
     let instance = registry.register("path-lookup-test", 0);
-    let mut store = Preview1ProgramStore::new(
+    let store = Preview1ProgramStore::new(
         cpu,
         executor.timer(cpu),
         executor
@@ -60,7 +60,7 @@ fn test_program_store(
         wasix_abi,
         WasixImageThreads::new(),
     );
-    store.cwd = cwd;
+    store.cwd.set(cwd);
     store
 }
 
@@ -117,7 +117,7 @@ fn wasix_relative_paths_use_cwd_only_for_at_fdcwd_and_honor_explicit_dirfd() {
         guest_name: String::from("/workspace/sub"),
         descriptor: dir_descriptor("/workspace/sub"),
     };
-    let mut store = test_program_store(true, Some(cwd), descriptors);
+    let store = test_program_store(true, Some(cwd), descriptors);
 
     // AT_FDCWD (-2) resolves relative paths against cwd.
     let (base, rel) = store
@@ -169,7 +169,7 @@ fn wasix_relative_paths_use_cwd_only_for_at_fdcwd_and_honor_explicit_dirfd() {
     assert_eq!(rel, "other/file");
 
     // AT_FDCWD with no cwd fails with BADF.
-    store.cwd = None;
+    store.cwd.set(None);
     assert_eq!(
         store
             .resolve_wasix_path_base(
@@ -217,7 +217,10 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
         ns.mount(
             &cap,
             mem_fs,
-            FileSystemRights::READ | FileSystemRights::WRITE,
+            crate::MountGrant {
+                rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                sharing: crate::MountSharing::Shared,
+            },
         )
         .await
         .expect("mount");

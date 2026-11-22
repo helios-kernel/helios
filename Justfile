@@ -102,6 +102,10 @@ clippy-host:
 clippy-programs:
     #!/usr/bin/env bash
     set -euo pipefail
+    # `helios-venus` generates its protocol module from the pinned
+    # venus-protocol inputs when `helios-gpu-test` or `helios-webgpu-provider`
+    # builds.
+    {{ cli }} venus-protocol-fetch
     # One program per invocation: they select mutually exclusive
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.
@@ -228,8 +232,16 @@ warm-test-host-tools:
 
 # Mount the images `mkfs.btrfs --rootdir` builds, one per checksum type and
 # node size. Needs btrfs-progs on PATH; CI's test-libraries lane installs it.
+# The log replay of images Linux leaves pending runs in
+# `test-btrfs-log-replay`, which needs those images.
 test-btrfs-mkfs:
-    cargo nextest run -p helios-btrfs --features write --run-ignored ignored-only
+    cargo nextest run -p helios-btrfs --features write --run-ignored ignored-only -E 'not test(/^log_replay::/)'
+
+# Replay the images `tools/btrfs/fstests/log-replay.sh` makes from Linux's
+# own btrfs into `images` (run.sh calls it in test-btrfs-fstests), and hold
+# each replay to Linux's. Needs btrfs-progs on PATH.
+test-btrfs-log-replay images:
+    HELIOS_BTRFS_LOG_IMAGES="{{ images }}" cargo nextest run -p helios-btrfs --features write --test images --run-ignored ignored-only -E 'test(/^log_replay::/)'
 # Fetch the ACPI tables `acpi/tests/qemu-tables.sha256` pins — QEMU's own
 # expected tables for its q35 machine, from its `tests/data/acpi` at the
 # v9.2.0 commit — into `target/acpi-tables` (or `$HELIOS_ACPI_TABLES_DIR`).

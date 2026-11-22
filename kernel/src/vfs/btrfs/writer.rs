@@ -33,16 +33,17 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use futures::channel::oneshot;
 use futures::future::{Either, select};
 use helios_btrfs::write::{
-    Attributes, ChunkError, Compressor, InodeHandle, Name, RootUuids, SpaceError, WriteError,
-    WriteTransaction, Writer,
+    Attributes, ChunkError, Compressor, InodeHandle, MountPolicy, Name, RootUuids, SpaceError,
+    WriteError, WriteTransaction, Writer,
 };
 use helios_btrfs::{BlockSink, Error, FileKind, Timestamp};
 use helios_hal::cpu::{Cpu, Instant};
 use helios_hal::fs::{
-    BlockDevice, FsError, FsResult, Landed, OpenFlags, RenameMode, WritePosition,
+    BlockDevice, FsError, FsResult, Landed, NodeKind, OpenFlags, RenameMode, WritePosition,
 };
 use triomphe::Arc;
 
+use super::super::UnixAttributes;
 use super::{Image, LivePolicy, Snapshot};
 use crate::component::{ProviderReceiver, ProviderSender, provider_channel};
 use crate::{BlockPages, ProgressSignal, RootEntropyHandle, Timer};
@@ -325,6 +326,8 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
         };
         let mut replies = Vec::with_capacity(requests.len());
         let mut syncs = Vec::new();
+        // An operator's change applies from the next batch.
+        let max_inline = self.policy.max_inline();
         for request in requests {
             if request.reply.is_canceled() {
                 continue;
@@ -337,6 +340,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                 request.operation,
                 concurrency,
                 &mut self.compressor,
+                max_inline,
             )
             .await;
             match result {
@@ -408,7 +412,30 @@ async fn parent<'a, S: BlockSink, U: RootUuids>(
     Ok((inode(transaction, directory).await?, name.as_bytes()))
 }
 
-fn timestamp(nanos: u64) -> Timestamp {
+/// The attributes a node of `kind` made in `parent` takes. A request
+/// reaching the writer carries no creator identity, so the node inherits
+/// from its directory ([`UnixAttributes::inherited`]).
+async fn inherited<S: BlockSink, U: RootUuids>(
+    transaction: &WriteTransaction<'_, S, U>,
+    parent: &InodeHandle,
+    kind: NodeKind,
+) -> FsResult<Attributes> {
+    let directory = transaction.metadata(parent).await.map_err(fs_error)?;
+    let node = UnixAttributes {
+        permissions: directory.permissions,
+        uid: directory.uid,
+        gid: directory.gid,
+    }
+    .inherited(kind);
+    Ok(Attributes {
+        permissions: node.permissions,
+        uid: node.uid,
+        gid: node.gid,
+        umask: 0,
+    })
+}
+
+pub(super) fn timestamp(nanos: u64) -> Timestamp {
     Timestamp {
         seconds: (nanos / 1_000_000_000) as i64,
         nanoseconds: (nanos % 1_000_000_000) as u32,
@@ -422,8 +449,15 @@ async fn apply<S: BlockSink, U: RootUuids>(
     operation: Operation,
     concurrency: NonZeroUsize,
     compressor: &mut Compressor,
+    max_inline: u64,
 ) -> FsResult<Response> {
     let when = timestamp(now);
+    let policy = |compressor| MountPolicy {
+        when,
+        concurrency,
+        compressor,
+        max_inline,
+    };
     match operation {
         Operation::Write {
             inode,
@@ -439,7 +473,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .checked_add(bytes.len() as u64)
                 .ok_or(FsError::Overflow)?;
             let written = transaction
-                .write_file_with_policy(&inode, offset, &bytes, when, concurrency, compressor)
+                .write_file_with_policy(&inode, offset, &bytes, policy(&mut *compressor))
                 .await
                 .map_err(fs_error)?;
             // A device with no more free sectors stores a prefix, which the
@@ -469,17 +503,14 @@ async fn apply<S: BlockSink, U: RootUuids>(
                         return Err(FsError::NotDirectory);
                     }
                     let (parent, bytes) = parent(transaction, path).await?;
+                    let attributes = inherited(transaction, &parent, NodeKind::File).await?;
                     transaction
                         .create_file(
                             Name {
                                 parent: &parent,
                                 bytes,
                             },
-                            Attributes {
-                                permissions: 0o644,
-                                uid: 0,
-                                gid: 0,
-                            },
+                            attributes,
                             when,
                         )
                         .await
@@ -488,12 +519,15 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 Err(error) => return Err(error),
             };
             let metadata = transaction.metadata(&file).await.map_err(fs_error)?;
+            if let Some(refusal) = super::node_kind(metadata.kind)?.open_refusal() {
+                return Err(refusal);
+            }
             if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != FileKind::Directory {
                 return Err(FsError::NotDirectory);
             }
             if flags.contains(OpenFlags::TRUNCATE) {
                 transaction
-                    .truncate_file(&file, 0, when, concurrency)
+                    .truncate_file_with_policy(&file, 0, policy(&mut *compressor))
                     .await
                     .map_err(fs_error)?;
             }
@@ -509,28 +543,17 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 parent: &parent,
                 bytes,
             };
-            // The VFS has no ownership/mode input yet; use its existing new-node
-            // defaults, with the inode type supplied by the operation.
-            let attributes = Attributes {
-                permissions: 0o755,
-                uid: 0,
-                gid: 0,
-            };
             match operation {
                 Operation::Symlink { target } => {
+                    let attributes = inherited(transaction, &parent, NodeKind::Symlink).await?;
                     transaction
-                        .symlink(
-                            name,
-                            target.as_bytes(),
-                            Attributes {
-                                permissions: 0o777,
-                                ..attributes
-                            },
-                            when,
-                        )
+                        .symlink(name, target.as_bytes(), attributes, when)
                         .await
                 }
-                _ => transaction.create_directory(name, attributes, when).await,
+                _ => {
+                    let attributes = inherited(transaction, &parent, NodeKind::Directory).await?;
+                    transaction.create_directory(name, attributes, when).await
+                }
             }
             .map_err(fs_error)?;
         }
@@ -592,7 +615,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
         Operation::Truncate { size } => {
             let file = inode(transaction, path).await?;
             transaction
-                .truncate_file(&file, size, when, concurrency)
+                .truncate_file_with_policy(&file, size, policy(&mut *compressor))
                 .await
                 .map_err(fs_error)?;
         }
@@ -618,9 +641,7 @@ pub(super) fn fs_error(error: WriteError) -> FsError {
         WriteError::Exists { .. } => FsError::Exists,
         WriteError::NotEmpty { .. } => FsError::NotEmpty,
         WriteError::ReadOnlySubvolume { .. } => FsError::ReadOnly,
-        WriteError::InodeFlags { .. } | WriteError::SetId { .. } | WriteError::DirectoryLink => {
-            FsError::NotPermitted
-        }
+        WriteError::InodeFlags { .. } | WriteError::DirectoryLink => FsError::NotPermitted,
         WriteError::CrossSubvolume => FsError::CrossDevice,
         WriteError::InvalidName | WriteError::DirectoryCycle | WriteError::SymlinkTarget { .. } => {
             FsError::Invalid

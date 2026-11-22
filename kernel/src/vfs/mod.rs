@@ -44,18 +44,20 @@ mod node;
 mod request;
 mod root;
 mod storage;
+mod unix;
 
 use btrfs::WritableMount;
 pub use btrfs::{BtrfsFs, BtrfsMountError, BtrfsService, BtrfsWriteOptions, CommitPolicy};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
-pub use memory::{MemoryFs, MemoryWrite};
+pub use memory::{MemoryFs, MemoryUnixMetadata, MemoryWrite, XattrSetMode};
 pub use node::{FsDescriptor, FsDescriptorFlags};
 pub use request::{
-    AttachedStorage, MountRequestError, MountSource, request_mount, request_unmount,
+    AttachedStorage, MountRequest, MountRequestError, MountSource, request_mount, request_unmount,
 };
 pub use root::{RootFs, RootWrite};
 pub use storage::{NoDisks, Storage};
+pub use unix::{MountFlags, MountGrant, MountSharing, SharedOwner, UnixAttributes};
 
 use alloc::borrow::{Cow, ToOwned};
 use alloc::boxed::Box;
@@ -73,8 +75,8 @@ use bytes::{Bytes, BytesMut};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FilledWrite, FsError, FsPath,
-    FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition,
+    DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FileSystemRights, FilledWrite, FsError,
+    FsPath, FsResult, Metadata, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition,
     WriteProgress,
 };
 use thiserror::Error;
@@ -97,6 +99,13 @@ pub const BOOT_DEVICE: DeviceId = DeviceId::new(AuthorityDomain::GUEST_BOOTFS.ra
 /// each other's layer, so they share the number the way two containers'
 /// root filesystems may.
 pub const ROOT_LAYER_DEVICE: DeviceId = DeviceId::new(AuthorityDomain::GUEST_ROOT_LAYER.raw());
+
+/// What a namespace's root grants: the boot image under the tree's own
+/// writable layer, seen by every program of the tree, so shared.
+pub const ROOT_GRANT: MountGrant = MountGrant {
+    rights: FileSystemRights::READ.union(FileSystemRights::WRITE),
+    sharing: MountSharing::Shared,
+};
 
 /// The deepest chain of symbolic links one resolution follows.
 pub const MAX_SYMLINK_DEPTH: usize = 16;
@@ -122,6 +131,7 @@ macro_rules! mount_kinds {
 
         impl<S: Storage> FileSystem for MountedFs<S> {
             type Write = MountedWrite<S>;
+            type Dir = MountedDir<S>;
 
             async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
                 match self { $(Self::$kind(fs) => fs.stat(path).await,)+ }
@@ -172,13 +182,10 @@ macro_rules! mount_kinds {
                 }
             }
 
-            async fn read_dir(
-                &self,
-                path: FsPath<'_>,
-                cookie: DirCookie,
-                max_entries: usize,
-            ) -> FsResult<Vec<DirEntry>> {
-                match self { $(Self::$kind(fs) => fs.read_dir(path, cookie, max_entries).await,)+ }
+            async fn open_dir(&self, path: FsPath<'_>) -> FsResult<MountedDir<S>> {
+                match self {
+                    $(Self::$kind(fs) => fs.open_dir(path).await.map(MountedDir::$kind),)+
+                }
             }
 
             async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -227,6 +234,21 @@ macro_rules! mount_kinds {
         /// A write staged by whichever kind a [`MountedFs`] holds.
         pub enum MountedWrite<S: Storage> {
             $($kind(<$fs as FileSystem>::Write),)+
+        }
+
+        /// A directory stream opened by whichever kind a [`MountedFs`] holds.
+        pub enum MountedDir<S: Storage> {
+            $($kind(<$fs as FileSystem>::Dir),)+
+        }
+
+        impl<S: Storage> DirStream for MountedDir<S> {
+            async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+                match self { $(Self::$kind(dir) => dir.read(cookie, max_entries).await,)+ }
+            }
+
+            async fn rewind(&mut self) -> FsResult<()> {
+                match self { $(Self::$kind(dir) => dir.rewind().await,)+ }
+            }
         }
 
         impl<S: Storage> PreparedWrite for MountedWrite<S> {
@@ -366,7 +388,7 @@ const SLOT_RETIRING: u8 = 2;
 
 struct Mount<S: Storage> {
     point: String,
-    rights: FileSystemRights,
+    grant: MountGrant,
     fs: MountedFs<S>,
     /// The table's own share of the mount's hold; any other share is a
     /// descriptor or stream that keeps the mount from being unmounted.
@@ -752,7 +774,8 @@ impl<S: Storage> MountTable<S> {
         )
     }
 
-    /// Mounts `fs` at `point`.
+    /// Mounts `fs` at `point`, granting what `grant` says for as long as
+    /// the mount exists.
     ///
     /// Checks only the table: the namespace that asks checks the point
     /// against the filesystem beneath it first (see [`Namespace::mount`]).
@@ -760,7 +783,7 @@ impl<S: Storage> MountTable<S> {
         &self,
         point: &str,
         fs: MountedFs<S>,
-        rights: FileSystemRights,
+        grant: MountGrant,
     ) -> Result<(), MountError> {
         if !valid_point(point) {
             return Err(MountError::InvalidPoint(point.to_owned()));
@@ -799,7 +822,7 @@ impl<S: Storage> MountTable<S> {
         unsafe {
             *slot.mount.get() = Some(Mount {
                 point: point.to_owned(),
-                rights,
+                grant,
                 fs,
                 hold: MountHold::new(),
             });
@@ -903,7 +926,7 @@ impl<S: Storage> MountTable<S> {
 /// polls) keeps a [`HeldPath`] instead.
 pub struct Resolved<'a, S: Storage> {
     fs: &'a MountedFs<S>,
-    rights: FileSystemRights,
+    grant: MountGrant,
     absolute: Cow<'a, str>,
     /// Length of the mount point in `absolute`; `0` for the root mount.
     point_len: usize,
@@ -921,9 +944,15 @@ impl<'a, S: Storage> Resolved<'a, S> {
         self.fs
     }
 
+    /// What the mount this resolved through grants: its rights, and
+    /// whether it is private or shared.
+    pub fn grant(&self) -> MountGrant {
+        self.grant
+    }
+
     /// The filesystem, for changing: refused when the mount is read-only.
     pub fn writable(&self) -> FsResult<&'a MountedFs<S>> {
-        if self.rights.contains(FileSystemRights::WRITE) {
+        if self.grant.rights.contains(FileSystemRights::WRITE) {
             Ok(self.fs)
         } else {
             Err(FsError::ReadOnly)
@@ -975,7 +1004,7 @@ impl<'a, S: Storage> Resolved<'a, S> {
     pub fn held(&self) -> HeldPath<S> {
         HeldPath(Arc::new(HeldInner {
             fs: self.fs.clone(),
-            rights: self.rights,
+            grant: self.grant,
             absolute: String::from(&*self.absolute),
             point_len: self.point_len,
             hold: self.hold(),
@@ -1004,7 +1033,7 @@ pub struct HeldPath<S: Storage>(Arc<HeldInner<S>>);
 
 struct HeldInner<S: Storage> {
     fs: MountedFs<S>,
-    rights: FileSystemRights,
+    grant: MountGrant,
     absolute: String,
     point_len: usize,
     hold: Option<MountHold>,
@@ -1022,7 +1051,7 @@ impl<S: Storage> HeldPath<S> {
         let held = &*self.0;
         Resolved {
             fs: &held.fs,
-            rights: held.rights,
+            grant: held.grant,
             absolute: Cow::Borrowed(&held.absolute),
             point_len: held.point_len,
             hold: held.hold.as_ref(),
@@ -1239,7 +1268,7 @@ impl<S: Storage> Namespace<S> {
                 pin,
             }) => Resolved {
                 fs: &mount.fs,
-                rights: mount.rights,
+                grant: mount.grant,
                 absolute,
                 point_len,
                 hold: Some(&mount.hold),
@@ -1247,7 +1276,7 @@ impl<S: Storage> Namespace<S> {
             },
             None => Resolved {
                 fs: &self.root,
-                rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                grant: ROOT_GRANT,
                 absolute,
                 point_len: 0,
                 hold: None,
@@ -1307,13 +1336,11 @@ impl<S: Storage> Namespace<S> {
         /// Entries one listing request asks for.
         const BATCH: usize = 256;
         let resolved = self.resolve(absolute)?;
+        let dir = resolved.fs().open_dir(resolved.path()).await?;
         let mut entries: Vec<DirEntry> = Vec::new();
         let mut cookie = DirCookie::START;
         loop {
-            let batch = resolved
-                .fs()
-                .read_dir(resolved.path(), cookie, BATCH)
-                .await?;
+            let batch = dir.read(cookie, BATCH).await?;
             let complete = batch.len() < BATCH;
             if let Some(last) = batch.last() {
                 cookie = last.next;
@@ -1408,7 +1435,7 @@ impl<S: Storage> Namespace<S> {
         &self,
         cap: &MountCap,
         fs: MountedFs<S>,
-        rights: FileSystemRights,
+        grant: MountGrant,
     ) -> Result<(), MountError> {
         let point = cap.point();
         if !valid_point(point) {
@@ -1436,7 +1463,7 @@ impl<S: Storage> Namespace<S> {
             Ok(_) | Err(FsError::NoEntry) => {}
             Err(error) => return Err(refuse(error)),
         }
-        self.own.mount(point, fs, rights)
+        self.own.mount(point, fs, grant)
     }
 
     /// Unmounts the filesystem this tree mounted at the point `cap` names,

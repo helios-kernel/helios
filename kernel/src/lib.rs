@@ -80,20 +80,20 @@ pub(crate) use component::ComponentCache;
 pub use component::{
     COMPONENT_ASYNC_STACK_SIZE, CompiledComponent, ComponentExecContext, ComponentExecutor,
     ComponentExitStatus, ComponentFsNodeKind, ComponentFsPathError, ComponentFsResourceError,
-    ComponentOutputMode, ComponentOutputRoute, ComponentOutputSink, ComponentOutputStreamKind,
-    ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
-    ComponentRawRwLockWriteGuard, ComponentResourceTableError, ComponentRunResult,
-    ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentRuntimeState, ComponentSerialPort,
-    ComponentStoreData, ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend,
-    ComponentUdpSocket, ComponentWorld, InstanceKilled, LocalOutputSink, PerProcessorProvider,
-    ProviderAlreadyInstalled, ProviderError, ProviderReceiver, ProviderSender, ProviderSlot,
-    RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, RetiredNetworkHandle, SerialPortResource, SocketRetirementQueue,
-    SocketRetirementSender, StoreSocketRetirement, TcpStreamResource, UdpSocketResource,
-    directory_prefix, map_resource_table_error, parent_path, path_is_within_directory,
-    provider_channel, resolve_absolute_path, resolve_child_path, resolve_guest_path,
-    retire_queued_handles, store_kernel_heap_bytes, strip_directory_prefix,
-    wait_until_runtime_deadline,
+    ComponentInputRoute, ComponentOutputMode, ComponentOutputRoute, ComponentOutputSink,
+    ComponentOutputStreamKind, ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock,
+    ComponentRawRwLockReadGuard, ComponentRawRwLockWriteGuard, ComponentResourceTableError,
+    ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentRuntimeState,
+    ComponentSerialPort, ComponentStoreData, ComponentTcpBackend, ComponentTcpStream,
+    ComponentUdpBackend, ComponentUdpSocket, ComponentWorld, InstanceKilled, LocalOutputSink,
+    PerProcessorProvider, ProviderAlreadyInstalled, ProviderError, ProviderReceiver,
+    ProviderSender, ProviderSlot, RawMutexGuardResource, RawMutexResource,
+    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource,
+    RetiredNetworkHandle, SerialPortResource, SocketRetirementQueue, SocketRetirementSender,
+    StoreSocketRetirement, TcpStreamResource, UdpSocketResource, directory_prefix,
+    map_resource_table_error, parent_path, path_is_within_directory, provider_channel,
+    resolve_absolute_path, resolve_child_path, resolve_guest_path, retire_queued_handles,
+    store_kernel_heap_bytes, strip_directory_prefix, wait_until_runtime_deadline,
 };
 pub use device::{
     DEFAULT_DMA_BUDGET_BYTES, DeviceGrant, DeviceGrantRegistry, DeviceInterruptHooks,
@@ -238,9 +238,9 @@ pub use profiling::{
 };
 pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
-    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostDirLimit, HostFileSystem,
-    HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite,
-    HttpsRecord, Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress,
+    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostCreation, HostDirEntry, HostDirLimit,
+    HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
+    HostWrite, HttpsRecord, Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress,
     NetworkPacketPump, ObjectIdentity, PingError, PingErrorKind, PingReply,
     RegisteredTcpReadBuffer, RuntimeState, SocketReadiness, TcpAccepted, TcpError, TcpErrorKind,
     TcpListener, TcpReadInto, TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError,
@@ -259,10 +259,11 @@ pub use surface::{
 pub use vfs::{
     AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow,
     FsDescriptor, FsDescriptorFlags, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
-    MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError, MountHold, MountRequestError,
-    MountSource, MountTable, MountedFs, MountedWrite, Namespace, NoDisks, ROOT_LAYER_DEVICE,
-    ReaderError, Resolved, RootFs, RootWrite, Storage, object_identity, request_mount,
-    request_unmount, symlink_target, within_directory,
+    MAX_SYMLINK_DEPTH, MemoryFs, MemoryUnixMetadata, MemoryWrite, MountError, MountFlags,
+    MountGrant, MountHold, MountRequest, MountRequestError, MountSharing, MountSource, MountTable,
+    MountedFs, MountedWrite, Namespace, NoDisks, ROOT_GRANT, ROOT_LAYER_DEVICE, ReaderError,
+    Resolved, RootFs, RootWrite, SharedOwner, Storage, UnixAttributes, XattrSetMode,
+    object_identity, request_mount, request_unmount, symlink_target, within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
@@ -271,10 +272,10 @@ pub use vsock::{
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{
-    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostProcessorRole, HostRuntimeState,
-    UserProgramService, component_host_processor_role, component_host_processors_to_start,
-    component_host_system_processor, component_host_worker_count,
-    install_component_host_program_service, install_program_service,
+    ChildExit, ChildHandle, ChildTermination, ComponentBindingSet, ComponentHostProcessorRole,
+    HostRuntimeState, SignalTermination, UserProgramService, component_host_processor_role,
+    component_host_processors_to_start, component_host_system_processor,
+    component_host_worker_count, install_component_host_program_service, install_program_service,
     run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever, system_component_should_run_on,
 };

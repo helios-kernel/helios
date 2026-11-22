@@ -484,6 +484,30 @@ pub struct DirEntry {
     pub next: DirCookie,
 }
 
+/// An open directory listing stream.
+///
+/// Opened by [`FileSystem::open_dir`], which records any open-time state
+/// the filesystem needs so concurrent insertions or renames do not repeat
+/// entries indefinitely across batches.
+///
+/// Concurrency: owned by the task that opened it, never shared; it may move
+/// across processors between calls.
+pub trait DirStream: Send + Sized {
+    /// Lists at most `max_entries` entries resuming at `cookie`. Fewer than
+    /// `max_entries` means the listing is complete. `.` and `..` are not
+    /// listed.
+    fn read(
+        &self,
+        cookie: DirCookie,
+        max_entries: usize,
+    ) -> impl Future<Output = FsResult<Vec<DirEntry>>> + Send + '_;
+
+    /// Refreshes any open-time bound to the directory's current state, as
+    /// POSIX `rewinddir(3)` does so entries added since open become visible
+    /// on the next read from [`DirCookie::START`].
+    fn rewind(&mut self) -> impl Future<Output = FsResult<()>> + Send + '_;
+}
+
 /// A path relative to the root of one filesystem.
 ///
 /// Holds no leading `/`, no empty segment, and no `.` or `..`: those are
@@ -620,15 +644,17 @@ pub trait FileSystem: Clone + Send + Sync + 'static {
         now: u64,
     ) -> impl Future<Output = FsResult<()>> + Send + 'a;
 
-    /// Lists at most `max_entries` entries of the directory at `path`,
-    /// resuming at `cookie`. Fewer than `max_entries` means the listing is
-    /// complete. `.` and `..` are not listed.
-    fn read_dir<'a>(
+    /// The directory stream [`Self::open_dir`] opens.
+    type Dir: DirStream + 'static;
+
+    /// Opens a directory listing stream for the directory at `path`,
+    /// recording any open-time bound the filesystem needs so concurrent
+    /// insertions or renames cannot repeat entries indefinitely across
+    /// batches.
+    fn open_dir<'a>(
         &'a self,
         path: FsPath<'a>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> impl Future<Output = FsResult<Vec<DirEntry>>> + Send + 'a;
+    ) -> impl Future<Output = FsResult<Self::Dir>> + Send + 'a;
 
     fn create_directory<'a>(
         &'a self,

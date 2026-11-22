@@ -16,12 +16,12 @@ use core::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use helios_btrfs::{
-    BlockSink, BlockSource, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode,
+    BlockSink, BlockSource, DirBound, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode,
     READ_ALIGNMENT, Timestamp,
 };
 use helios_hal::fs::{
-    BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult,
-    Metadata, NodeId, NodeKind, OpenFlags, RenameMode, WritePosition,
+    BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError,
+    FsPath, FsResult, Metadata, NodeId, NodeKind, OpenFlags, RenameMode, WritePosition,
 };
 use helios_hal::io::{IoError, IoResult};
 use triomphe::Arc;
@@ -30,7 +30,8 @@ use crate::{
     BlockCacheError, BlockPages, CACHE_BLOCK_BYTES, CachedDisk, ProgressSignal, RootEntropyHandle,
 };
 use helios_btrfs::write::{
-    CompressionPolicy, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, EncodeError, WriteError, Writer,
+    CompressionPolicy, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, DEFAULT_MAX_INLINE, EncodeError,
+    WriteError, Writer,
 };
 
 mod prepared;
@@ -53,6 +54,15 @@ pub struct BtrfsWriteOptions {
     /// refused. The mount takes it as its starting value;
     /// [`BtrfsFs::set_commit_policy`] changes it later.
     pub commit: Option<CommitPolicy>,
+    /// Linux's `max_inline=` mount option, in bytes: the most a file's
+    /// stored data may keep inline in its metadata item. `None` takes
+    /// Linux's default ([`DEFAULT_MAX_INLINE`]), and a request naming it for
+    /// a source other than btrfs is refused. [`BtrfsFs::set_max_inline`]
+    /// changes it later.
+    pub max_inline: Option<u64>,
+    /// Wall-clock nanoseconds since the Unix epoch at the mount request:
+    /// what the replay of a log tree a crash left stamps on what it unlinks.
+    pub now: u64,
 }
 
 /// What the machine keeps of a writable btrfs mount, whatever its device
@@ -131,25 +141,34 @@ impl Default for CommitPolicy {
     }
 }
 
-/// A mount's [`CommitPolicy`] as it stands. The operator writes it from any
-/// processor; the mount's service reads it and re-reads it on every change,
-/// which applies the new values to the running transaction at once.
+/// A mount's operator settings as they stand: its [`CommitPolicy`] and its
+/// `max_inline`. The operator writes them from any processor. The mount's
+/// service re-reads the commit policy on every change, which applies the new
+/// values to the running transaction at once, and reads `max_inline` for
+/// every batch of mutations.
 struct LivePolicy {
     interval_nanos: AtomicU64,
     dirty_metadata_limit: AtomicU64,
-    /// Raised after every change, so the service re-arms its deadline.
+    max_inline: AtomicU64,
+    /// Raised after every commit policy change, so the service re-arms its
+    /// deadline.
     changed: ProgressSignal,
 }
 
 impl LivePolicy {
-    fn new(policy: CommitPolicy) -> Self {
+    fn new(policy: CommitPolicy, max_inline: u64) -> Self {
         let live = Self {
             interval_nanos: AtomicU64::new(0),
             dirty_metadata_limit: AtomicU64::new(0),
+            max_inline: AtomicU64::new(max_inline),
             changed: ProgressSignal::new(),
         };
         live.store(policy);
         live
+    }
+
+    fn max_inline(&self) -> u64 {
+        self.max_inline.load(Ordering::Acquire)
     }
 
     fn store(&self, policy: CommitPolicy) {
@@ -320,6 +339,8 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             concurrency,
             compress,
             commit,
+            max_inline,
+            now,
         } = options;
         let compressor = Compressor::new(compress)?;
         let serial = disk.serial();
@@ -331,6 +352,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             },
             writer::EntropyUuids(entropy),
             concurrency,
+            writer::timestamp(now),
         )
         .await?;
         let reader = writer.snapshot()?;
@@ -342,7 +364,10 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             .await?;
         let reader = Arc::new(spin::Mutex::new(reader));
         let (client, receiver, exit) = writer::channel(concurrency);
-        let policy = Arc::new(LivePolicy::new(commit.unwrap_or_default()));
+        let policy = Arc::new(LivePolicy::new(
+            commit.unwrap_or_default(),
+            max_inline.unwrap_or(DEFAULT_MAX_INLINE),
+        ));
         let service = BtrfsService {
             writer,
             receiver,
@@ -382,6 +407,25 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             .as_ref()
             .ok_or(FsError::ReadOnly)?
             .store(policy);
+        Ok(())
+    }
+
+    /// The `max_inline` of a writable mount; `None` for a read-only one.
+    pub fn max_inline(&self) -> Option<u64> {
+        self.inner.policy.as_ref().map(|policy| policy.max_inline())
+    }
+
+    /// Changes a writable mount's `max_inline`, as Linux's
+    /// `mount -o remount,max_inline=`: the next mutation stores inline data
+    /// under the new limit, and what is already stored stays as it is. A
+    /// read-only mount has none to change.
+    pub fn set_max_inline(&self, bytes: u64) -> FsResult<()> {
+        self.inner
+            .policy
+            .as_ref()
+            .ok_or(FsError::ReadOnly)?
+            .max_inline
+            .store(bytes, Ordering::Release);
         Ok(())
     }
 
@@ -495,8 +539,93 @@ fn nanos(time: Timestamp) -> FsResult<u64> {
         .ok_or(FsError::Overflow)
 }
 
+/// An open btrfs directory stream, bounded at the last `DIR_INDEX` present
+/// when it was opened (`btrfs_opendir` and `btrfs_real_readdir` in Linux
+/// `fs/btrfs/inode.c`, commit `9b378f6ad48c`, refreshed on `rewind` as commit
+/// `fd968e683bd9`).
+///
+/// Holds only the directory's inode identity and bound, never a `Snapshot`, so
+/// keeping a stream open pins no retired CoW blocks.
+pub struct BtrfsDir<Device: BlockDevice<Buffer = BlockPages>> {
+    fs: BtrfsFs<Device>,
+    tree: u64,
+    number: u64,
+    bound: DirBound,
+}
+
+impl<Device: BlockDevice<Buffer = BlockPages> + 'static> DirStream for BtrfsDir<Device> {
+    async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+        let reader = self.fs.snapshot();
+        let inode = match reader.inode(self.tree, self.number).await {
+            Ok(inode) => inode,
+            Err(Error::MissingInode { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(self.fs.fs_error(error)),
+        };
+        let mut entries = Vec::new();
+        let mut failure = None;
+        reader
+            .read_dir(&inode, DirPosition(cookie.raw()), self.bound, |entry| {
+                if entries.len() == max_entries {
+                    return ControlFlow::Break(());
+                }
+                let convert = || -> FsResult<DirEntry> {
+                    let number = match entry.target {
+                        EntryTarget::Inode(number) => number,
+                        EntryTarget::Subvolume(tree) => {
+                            self.fs.inner.devices.get(&tree).ok_or(FsError::Io)?.1
+                        }
+                    };
+                    Ok(DirEntry {
+                        name: String::from_utf8(entry.name.to_vec())
+                            .map_err(|_| FsError::IllegalByteSequence)?,
+                        kind: node_kind(entry.kind)?,
+                        inode: number,
+                        next: DirCookie::new(
+                            entry.position.0.checked_add(1).ok_or(FsError::Overflow)?,
+                        ),
+                    })
+                };
+                match convert() {
+                    Ok(entry) => {
+                        entries.push(entry);
+                        ControlFlow::Continue(())
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        ControlFlow::Break(())
+                    }
+                }
+            })
+            .await
+            .map_err(|e| self.fs.fs_error(e))?;
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(entries),
+        }
+    }
+
+    async fn rewind(&mut self) -> FsResult<()> {
+        let reader = self.fs.snapshot();
+        match reader.inode(self.tree, self.number).await {
+            Ok(inode) => {
+                self.bound = reader
+                    .dir_bound(&inode)
+                    .await
+                    .map_err(|e| self.fs.fs_error(e))?;
+                Ok(())
+            }
+            Err(Error::MissingInode { .. }) => {
+                self.bound = DirBound::EMPTY;
+                Ok(())
+            }
+            Err(error) => Err(self.fs.fs_error(error)),
+        }
+    }
+}
+
 impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<Device> {
     type Write = BtrfsWrite<Device>;
+    type Dir = BtrfsDir<Device>;
 
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.metadata(&self.inode(&self.snapshot(), path).await?)
@@ -558,55 +687,19 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         Ok(bytes.freeze())
     }
 
-    async fn read_dir(
-        &self,
-        path: FsPath<'_>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> FsResult<Vec<DirEntry>> {
+    async fn open_dir(&self, path: FsPath<'_>) -> FsResult<BtrfsDir<Device>> {
         let reader = self.snapshot();
         let inode = self.inode(&reader, path).await?;
-        let mut entries = Vec::new();
-        let mut failure = None;
-        reader
-            .read_dir(&inode, DirPosition(cookie.raw()), |entry| {
-                if entries.len() == max_entries {
-                    return ControlFlow::Break(());
-                }
-                let convert = || -> FsResult<DirEntry> {
-                    let number = match entry.target {
-                        EntryTarget::Inode(number) => number,
-                        EntryTarget::Subvolume(tree) => {
-                            self.inner.devices.get(&tree).ok_or(FsError::Io)?.1
-                        }
-                    };
-                    Ok(DirEntry {
-                        name: String::from_utf8(entry.name.to_vec())
-                            .map_err(|_| FsError::IllegalByteSequence)?,
-                        kind: node_kind(entry.kind)?,
-                        inode: number,
-                        next: DirCookie::new(
-                            entry.position.0.checked_add(1).ok_or(FsError::Overflow)?,
-                        ),
-                    })
-                };
-                match convert() {
-                    Ok(entry) => {
-                        entries.push(entry);
-                        ControlFlow::Continue(())
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        ControlFlow::Break(())
-                    }
-                }
-            })
+        let bound = reader
+            .dir_bound(&inode)
             .await
             .map_err(|e| self.fs_error(e))?;
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(entries),
-        }
+        Ok(BtrfsDir {
+            fs: self.clone(),
+            tree: inode.tree(),
+            number: inode.number(),
+            bound,
+        })
     }
 
     async fn read_link(&self, path: FsPath<'_>) -> FsResult<String> {
