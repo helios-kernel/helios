@@ -486,7 +486,7 @@ impl Client {
         when: u64,
         operation: Operation,
     ) -> FsResult<Response> {
-        self.execute_unix(path, when, operation)
+        self.execute_target(Target::Path(String::from(path)), when, operation)
             .await
             .map_err(UnixFsError::into_fs_error)
     }
@@ -497,7 +497,7 @@ impl Client {
         when: u64,
         operation: Operation,
     ) -> FsResult<Response> {
-        self.execute_inode_unix(inode, when, operation)
+        self.execute_target(Target::Inode(inode), when, operation)
             .await
             .map_err(UnixFsError::into_fs_error)
     }
@@ -1353,13 +1353,13 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                 continue;
             }
             let sync = matches!(request.operation, Operation::Sync);
-            let result = apply(
+            let result = Box::pin(apply(
                 &mut transaction,
                 &self.releases,
                 request.target,
                 request.when,
                 request.operation,
-            )
+            ))
             .await;
             match result {
                 Ok(_) if sync => syncs.push(request.reply),
@@ -1498,111 +1498,228 @@ fn require_path(target: &Target) -> &str {
     }
 }
 
-async fn apply<S: BlockSink, U: RootUuids>(
+/// Constructs a future inside an out-of-line frame and pins it on the heap so
+/// a dispatching coroutine's state machine and stack frame hold only the
+/// closure arguments and a `Pin<Box<_>>` pointer, never every arm's unboxed
+/// sub-future at once.
+#[inline(never)]
+async fn boxed<F: core::future::Future>(make: impl FnOnce() -> F) -> F::Output {
+    Box::pin(make()).await
+}
+
+#[inline(never)]
+async fn apply_write<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    target: &Target,
+    position: WritePosition,
+    bytes: bytes::Bytes,
+    when: Timestamp,
+) -> Result<Response, UnixFsError> {
+    let inode = resolve_target(transaction, target).await?;
+    let metadata = transaction.metadata(&inode).await.map_err(unix_error)?;
+    let offset = match position {
+        WritePosition::At(offset) => offset,
+        WritePosition::End => metadata.size,
+    };
+    offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(FsError::Overflow)?;
+    let written = transaction
+        .write_file(&inode, offset, &bytes, when)
+        .await
+        .map_err(unix_error)?;
+    // A device with no more free sectors stores a prefix, which the
+    // transaction keeps and the caller learns the length of.
+    if written != bytes.len() {
+        tracing::warn!(
+            written,
+            requested = bytes.len(),
+            "btrfs write ran out of space"
+        );
+    }
+    Ok(Response::Written(Landed {
+        offset,
+        len: written,
+    }))
+}
+
+#[inline(never)]
+async fn apply_open<S: BlockSink, U: RootUuids>(
     transaction: &mut WriteTransaction<'_, S, U>,
     releases: &SharedArc<PendingReleases>,
-    target: Target,
-    now: u64,
-    operation: Operation,
+    target: &Target,
+    flags: OpenFlags,
+    attributes: Option<Attributes>,
+    when: Timestamp,
 ) -> Result<Response, UnixFsError> {
-    let when = timestamp(now);
-    match operation {
-        Operation::Write { position, bytes } => {
-            let inode = resolve_target(transaction, &target).await?;
-            let metadata = transaction.metadata(&inode).await.map_err(unix_error)?;
-            let offset = match position {
-                WritePosition::At(offset) => offset,
-                WritePosition::End => metadata.size,
-            };
-            offset
-                .checked_add(bytes.len() as u64)
-                .ok_or(FsError::Overflow)?;
-            let written = transaction
-                .write_file(&inode, offset, &bytes, when)
-                .await
-                .map_err(unix_error)?;
-            // A device with no more free sectors stores a prefix, which the
-            // transaction keeps and the caller learns the length of.
-            if written != bytes.len() {
-                tracing::warn!(
-                    written,
-                    requested = bytes.len(),
-                    "btrfs write ran out of space"
-                );
+    let path = require_path(target);
+    let file = match inode(transaction, path).await {
+        Ok(file) => {
+            if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
+                return Err(FsError::Exists.into());
             }
-            return Ok(Response::Written(Landed {
-                offset,
-                len: written,
-            }));
+            file
         }
-        Operation::Open { flags, attributes } => {
-            let path = require_path(&target);
-            let file = match inode(transaction, path).await {
-                Ok(file) => {
-                    if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
-                        return Err(FsError::Exists.into());
-                    }
-                    file
-                }
-                Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
-                    if flags.contains(OpenFlags::DIRECTORY) {
-                        return Err(FsError::NotDirectory.into());
-                    }
-                    let (parent, bytes) = parent(transaction, path).await?;
-                    let attributes = match attributes {
-                        Some(attributes) => attributes,
-                        None => inherited(transaction, &parent, NodeKind::File).await?,
-                    };
-                    transaction
-                        .create_file(
-                            Name {
-                                parent: &parent,
-                                bytes,
-                            },
-                            attributes,
-                            when,
-                        )
-                        .await
-                        .map_err(unix_error)?
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let metadata = transaction.metadata(&file).await.map_err(unix_error)?;
-            if let Some(refusal) = super::node_kind(metadata.kind)?.open_refusal() {
-                return Err(refusal.into());
-            }
-            if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != FileKind::Directory {
+        Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
+            if flags.contains(OpenFlags::DIRECTORY) {
                 return Err(FsError::NotDirectory.into());
             }
-            if flags.contains(OpenFlags::TRUNCATE) {
-                transaction
-                    .truncate_file(&file, 0, when)
-                    .await
-                    .map_err(unix_error)?;
-            }
-            let metadata = transaction.metadata(&file).await.map_err(unix_error)?;
-            transaction.open_inode(&file).await.map_err(unix_error)?;
-            return Ok(Response::Opened {
-                handle: BtrfsOpenHandle::writable(file, releases.clone()),
-                metadata,
-            });
+            let (parent, bytes) = parent(transaction, path).await?;
+            let attributes = match attributes {
+                Some(attributes) => attributes,
+                None => inherited(transaction, &parent, NodeKind::File).await?,
+            };
+            transaction
+                .create_file(
+                    Name {
+                        parent: &parent,
+                        bytes,
+                    },
+                    attributes,
+                    when,
+                )
+                .await
+                .map_err(unix_error)?
         }
-        Operation::CreateTmpfile { exclusive } => {
-            let path = require_path(&target);
-            let directory = inode(transaction, path).await?;
-            let attributes = inherited(transaction, &directory, NodeKind::File).await?;
-            let file = transaction
-                .create_tmpfile(&directory, attributes, !exclusive, when)
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = transaction.metadata(&file).await.map_err(unix_error)?;
+    if let Some(refusal) = super::node_kind(metadata.kind)?.open_refusal() {
+        return Err(refusal.into());
+    }
+    if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != FileKind::Directory {
+        return Err(FsError::NotDirectory.into());
+    }
+    if flags.contains(OpenFlags::TRUNCATE) {
+        transaction
+            .truncate_file(&file, 0, when)
+            .await
+            .map_err(unix_error)?;
+    }
+    let metadata = transaction.metadata(&file).await.map_err(unix_error)?;
+    transaction.open_inode(&file).await.map_err(unix_error)?;
+    Ok(Response::Opened {
+        handle: BtrfsOpenHandle::writable(file, releases.clone()),
+        metadata,
+    })
+}
+
+enum UnixMetadataOp {
+    CreateSpecial {
+        special: Special,
+        attributes: Attributes,
+    },
+    SetPermissions {
+        permissions: u32,
+    },
+    SetOwner {
+        uid: Option<u32>,
+        gid: Option<u32>,
+    },
+    SetXattr {
+        name: String,
+        value: bytes::Bytes,
+        mode: XattrMode,
+    },
+    RemoveXattr {
+        name: String,
+    },
+}
+
+/// Applies Unix special-node, ownership/mode, and extended-attribute mutations.
+/// Boxed from [`apply`] so infrequent metadata state machines do not inflate
+/// `apply_batch`'s stack frame on bare-metal tasks or debug test threads.
+#[inline(never)]
+async fn apply_unix_metadata<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    target: &Target,
+    when: Timestamp,
+    op: UnixMetadataOp,
+) -> Result<Response, UnixFsError> {
+    match op {
+        UnixMetadataOp::CreateSpecial {
+            special,
+            attributes,
+        } => {
+            let path = require_path(target);
+            let (parent, bytes) = parent(transaction, path).await?;
+            transaction
+                .create_special(
+                    Name {
+                        parent: &parent,
+                        bytes,
+                    },
+                    special,
+                    attributes,
+                    when,
+                )
                 .await
                 .map_err(unix_error)?;
-            let metadata = transaction.metadata(&file).await.map_err(unix_error)?;
-            return Ok(Response::Opened {
-                handle: BtrfsOpenHandle::writable(file, releases.clone()),
-                metadata,
-            });
         }
+        UnixMetadataOp::SetPermissions { permissions } => {
+            let file = resolve_target(transaction, target).await?;
+            transaction
+                .set_permissions(&file, permissions, when)
+                .await
+                .map_err(unix_error)?;
+        }
+        UnixMetadataOp::SetOwner { uid, gid } => {
+            let file = resolve_target(transaction, target).await?;
+            transaction
+                .set_owner(&file, uid, gid, when)
+                .await
+                .map_err(unix_error)?;
+        }
+        UnixMetadataOp::SetXattr { name, value, mode } => {
+            let file = resolve_target(transaction, target).await?;
+            transaction
+                .set_xattr(&file, name.as_bytes(), &value, mode, when)
+                .await
+                .map_err(unix_error)?;
+        }
+        UnixMetadataOp::RemoveXattr { name } => {
+            let file = resolve_target(transaction, target).await?;
+            transaction
+                .remove_xattr(&file, name.as_bytes(), when)
+                .await
+                .map_err(unix_error)?;
+        }
+    }
+    Ok(Response::Done)
+}
+
+#[inline(never)]
+async fn apply_create_tmpfile<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    releases: &SharedArc<PendingReleases>,
+    target: &Target,
+    exclusive: bool,
+    when: Timestamp,
+) -> Result<Response, UnixFsError> {
+    let path = require_path(target);
+    let directory = inode(transaction, path).await?;
+    let attributes = inherited(transaction, &directory, NodeKind::File).await?;
+    let file = transaction
+        .create_tmpfile(&directory, attributes, !exclusive, when)
+        .await
+        .map_err(unix_error)?;
+    let metadata = transaction.metadata(&file).await.map_err(unix_error)?;
+    Ok(Response::Opened {
+        handle: BtrfsOpenHandle::writable(file, releases.clone()),
+        metadata,
+    })
+}
+
+#[inline(never)]
+async fn apply_tree_op<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    target: &Target,
+    when: Timestamp,
+    operation: Operation,
+) -> Result<Response, UnixFsError> {
+    match operation {
         Operation::CreateDirectory { attributes } => {
-            let path = require_path(&target);
+            let path = require_path(target);
             let (parent, bytes) = parent(transaction, path).await?;
             let name = Name {
                 parent: &parent,
@@ -1621,7 +1738,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
             target: link_target,
             attributes,
         } => {
-            let path = require_path(&target);
+            let path = require_path(target);
             let (parent, bytes) = parent(transaction, path).await?;
             let name = Name {
                 parent: &parent,
@@ -1636,27 +1753,8 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .await
                 .map_err(unix_error)?;
         }
-        Operation::CreateSpecial {
-            special,
-            attributes,
-        } => {
-            let path = require_path(&target);
-            let (parent, bytes) = parent(transaction, path).await?;
-            transaction
-                .create_special(
-                    Name {
-                        parent: &parent,
-                        bytes,
-                    },
-                    special,
-                    attributes,
-                    when,
-                )
-                .await
-                .map_err(unix_error)?;
-        }
         Operation::Rename { destination, mode } => {
-            let path = require_path(&target);
+            let path = require_path(target);
             let (source, source_name) = parent(transaction, path).await?;
             let (destination, destination_name) = parent(transaction, &destination).await?;
             transaction
@@ -1676,7 +1774,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .map_err(unix_error)?;
         }
         Operation::Link { destination } => {
-            let file = resolve_target(transaction, &target).await?;
+            let file = resolve_target(transaction, target).await?;
             let (parent, bytes) = parent(transaction, &destination).await?;
             transaction
                 .hard_link(
@@ -1691,7 +1789,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .map_err(unix_error)?;
         }
         Operation::Remove { directory } => {
-            let path = require_path(&target);
+            let path = require_path(target);
             let file = inode(transaction, path).await?;
             let kind = transaction.metadata(&file).await.map_err(unix_error)?.kind;
             if directory && kind != FileKind::Directory {
@@ -1713,53 +1811,110 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .map_err(unix_error)?;
         }
         Operation::Truncate { size } => {
-            let file = resolve_target(transaction, &target).await?;
+            let file = resolve_target(transaction, target).await?;
             transaction
                 .truncate_file(&file, size, when)
                 .await
                 .map_err(unix_error)?;
         }
         Operation::Times { access, modified } => {
-            let file = resolve_target(transaction, &target).await?;
+            let file = resolve_target(transaction, target).await?;
             transaction
                 .set_times(&file, access.map(timestamp), modified.map(timestamp), when)
                 .await
                 .map_err(unix_error)?;
         }
-        Operation::SetPermissions { permissions } => {
-            let file = resolve_target(transaction, &target).await?;
-            transaction
-                .set_permissions(&file, permissions, when)
-                .await
-                .map_err(unix_error)?;
-        }
-        Operation::SetOwner { uid, gid } => {
-            let file = resolve_target(transaction, &target).await?;
-            transaction
-                .set_owner(&file, uid, gid, when)
-                .await
-                .map_err(unix_error)?;
-        }
-        Operation::SetXattr { name, value, mode } => {
-            let file = resolve_target(transaction, &target).await?;
-            transaction
-                .set_xattr(&file, name.as_bytes(), &value, mode, when)
-                .await
-                .map_err(unix_error)?;
-        }
-        Operation::RemoveXattr { name } => {
-            let file = resolve_target(transaction, &target).await?;
-            transaction
-                .remove_xattr(&file, name.as_bytes(), when)
-                .await
-                .map_err(unix_error)?;
-        }
         Operation::Sync => {
-            let file = resolve_target(transaction, &target).await?;
+            let file = resolve_target(transaction, target).await?;
             transaction.metadata(&file).await.map_err(unix_error)?;
         }
+        _ => unreachable!("handled by apply"),
     }
     Ok(Response::Done)
+}
+
+#[inline(never)]
+async fn apply<S: BlockSink, U: RootUuids>(
+    transaction: &mut WriteTransaction<'_, S, U>,
+    releases: &SharedArc<PendingReleases>,
+    target: Target,
+    now: u64,
+    operation: Operation,
+) -> Result<Response, UnixFsError> {
+    let when = timestamp(now);
+    match operation {
+        Operation::Write { position, bytes } => {
+            boxed(|| apply_write(transaction, &target, position, bytes, when)).await
+        }
+        Operation::Open { flags, attributes } => {
+            boxed(|| apply_open(transaction, releases, &target, flags, attributes, when)).await
+        }
+        Operation::CreateTmpfile { exclusive } => {
+            boxed(|| apply_create_tmpfile(transaction, releases, &target, exclusive, when)).await
+        }
+        Operation::CreateSpecial {
+            special,
+            attributes,
+        } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::CreateSpecial {
+                        special,
+                        attributes,
+                    },
+                )
+            })
+            .await
+        }
+        Operation::SetPermissions { permissions } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::SetPermissions { permissions },
+                )
+            })
+            .await
+        }
+        Operation::SetOwner { uid, gid } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::SetOwner { uid, gid },
+                )
+            })
+            .await
+        }
+        Operation::SetXattr { name, value, mode } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::SetXattr { name, value, mode },
+                )
+            })
+            .await
+        }
+        Operation::RemoveXattr { name } => {
+            boxed(|| {
+                apply_unix_metadata(
+                    transaction,
+                    &target,
+                    when,
+                    UnixMetadataOp::RemoveXattr { name },
+                )
+            })
+            .await
+        }
+        other => boxed(|| apply_tree_op(transaction, &target, when, other)).await,
+    }
 }
 
 pub(super) fn volume_error(error: WriteError) -> VolumeManagementError {
