@@ -10,14 +10,14 @@
 
 use helios_hal::fs::{
     FileSystem, FilledWrite, FsError as VfsError, FsResult, Landed, Metadata, NodeKind, OpenFlags,
-    PreparedWrite, RenameMode, WritePosition, WriteProgress,
+    Opened, PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 use pin_project_lite::pin_project;
 
 use super::fs_types::DescriptorFlags as WasiDescriptorFlags;
 use crate::{
-    ComponentHostNetwork, FileContents, Follow, HeldPath, MountedWrite, Namespace, Resolved,
-    object_identity,
+    ComponentHostNetwork, FileContents, Follow, HeldPath, MountedOpenHandle, MountedWrite,
+    Namespace, Resolved, object_identity,
 };
 
 use super::*;
@@ -263,7 +263,7 @@ where
         .await
         .map_err(fs_error_code)?;
     let fs = resolved.fs();
-    let (metadata, flags) = match fs.stat(resolved.path()).await {
+    let (opened, flags) = match fs.stat(resolved.path()).await {
         Ok(existing) => {
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
@@ -286,7 +286,18 @@ where
             let flags =
                 effective_open_descriptor_flags(base.flags, requested, node_kind(existing.kind))?;
             match truncate {
-                None => (existing, flags),
+                None => {
+                    let open_mode = if directory {
+                        OpenFlags::DIRECTORY
+                    } else {
+                        OpenFlags::empty()
+                    };
+                    let opened = fs
+                        .open(resolved.path(), open_mode, now)
+                        .await
+                        .map_err(fs_error_code)?;
+                    (opened, flags)
+                }
                 Some(rights) => {
                     if existing.kind != NodeKind::File {
                         return Err(fs_types::ErrorCode::IsDirectory);
@@ -307,13 +318,14 @@ where
         }
         Err(error) => return Err(fs_error_code(error)),
     };
-    let kind = node_kind(metadata.kind);
+    let kind = node_kind(opened.metadata.kind);
     Ok(FsDescriptor {
         path: String::from(resolved.absolute()),
         kind,
         flags,
-        identity: Some(object_identity(&metadata)),
+        identity: Some(object_identity(&opened.metadata)),
         mount: resolved.hold(),
+        open: Some(opened.handle),
     })
 }
 
@@ -390,7 +402,7 @@ async fn create_file<StorageImpl>(
     resolved: &Resolved<'_, StorageImpl>,
     _mutate: Granted<'_, Directory, Mutate>,
     now: u64,
-) -> FsOpResult<Metadata>
+) -> FsOpResult<Opened<MountedOpenHandle>>
 where
     StorageImpl: crate::Storage,
 {
@@ -411,7 +423,7 @@ async fn truncate_file<StorageImpl>(
         Granted<'_, Directory, Write>,
     ),
     now: u64,
-) -> FsOpResult<Metadata>
+) -> FsOpResult<Opened<MountedOpenHandle>>
 where
     StorageImpl: crate::Storage,
 {
@@ -453,6 +465,26 @@ where
         .stat(absolute, follow)
         .await
         .map_err(fs_error_code)
+}
+
+/// Describes an open descriptor, using its open handle when present so
+/// unlinked or unnamed files still report live metadata (`nlink == 0`).
+pub(crate) async fn stat_descriptor<StorageImpl>(
+    namespace: &Namespace<StorageImpl>,
+    descriptor: &FsDescriptor,
+) -> FsOpResult<Metadata>
+where
+    StorageImpl: crate::Storage,
+{
+    if let Some(handle) = descriptor.open.as_ref() {
+        let resolved = resolve(namespace, &descriptor.path)?;
+        return resolved
+            .fs()
+            .stat_handle(handle)
+            .await
+            .map_err(fs_error_code);
+    }
+    stat_path(namespace, &descriptor.path, Follow::No).await
 }
 
 /// The metadata of `path` below `base`, which must be readable.
@@ -547,8 +579,9 @@ pub(crate) async fn read<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
+    let descriptor = file.descriptor();
     read_resolved(
-        &resolve(namespace, &file.descriptor().path)?,
+        &resolve(namespace, &descriptor.path)?.with_open(descriptor.open.as_ref()),
         offset,
         max_bytes,
     )
@@ -563,7 +596,8 @@ pub(crate) fn read_stream_target<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    resolve(namespace, &file.descriptor().path).map(|resolved| resolved.held())
+    let descriptor = file.descriptor();
+    resolve(namespace, &descriptor.path).map(|resolved| resolved.held_open(descriptor.open.clone()))
 }
 
 /// The file a stream writes across polls.
@@ -574,7 +608,8 @@ pub(crate) fn write_stream_target<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    resolve(namespace, &file.descriptor().path).map(|resolved| resolved.held())
+    let descriptor = file.descriptor();
+    resolve(namespace, &descriptor.path).map(|resolved| resolved.held_open(descriptor.open.clone()))
 }
 
 /// One positional read through `resolved`.
@@ -586,11 +621,21 @@ pub(crate) async fn read_resolved<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    resolved
-        .fs()
-        .read_at(resolved.path(), offset, max_bytes)
-        .await
-        .map_err(fs_error_code)
+    let result = match resolved.open() {
+        Some(handle) => {
+            resolved
+                .fs()
+                .read_handle_at(handle, offset, max_bytes)
+                .await
+        }
+        None => {
+            resolved
+                .fs()
+                .read_at(resolved.path(), offset, max_bytes)
+                .await
+        }
+    };
+    result.map_err(fs_error_code)
 }
 
 /// One positional read through a held path, for a stream that must own
@@ -634,7 +679,9 @@ pub(crate) fn writable_file<'a, StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    resolve(namespace, &file.descriptor().path)
+    let descriptor = file.descriptor();
+    resolve(namespace, &descriptor.path)
+        .map(|resolved| resolved.with_open(descriptor.open.as_ref()))
 }
 
 /// Writes `bytes` through `resolved`, and resolves with where they landed
@@ -669,12 +716,12 @@ pub(crate) async fn prepare_resolved_write<'a, StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .prepare_write(resolved.path(), position, len, now)
-        .await
-        .map_err(fs_error_code)
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    let result = match resolved.open() {
+        Some(handle) => fs.prepare_write_handle(handle, position, len, now).await,
+        None => fs.prepare_write(resolved.path(), position, len, now).await,
+    };
+    result.map_err(fs_error_code)
 }
 
 /// Writes `len` bytes that `source` copies straight into the
@@ -701,9 +748,13 @@ where
     S: FnMut(usize, &mut [u8]),
 {
     let fs = resolved.writable().map_err(fs_error_code)?;
-    helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source)
-        .await
-        .map_err(fs_error_code)
+    let result = match resolved.open() {
+        Some(handle) => {
+            helios_hal::fs::write_handle_with(fs, handle, position, len, now, source).await
+        }
+        None => helios_hal::fs::write_with(fs, resolved.path(), position, len, now, source).await,
+    };
+    result.map_err(fs_error_code)
 }
 
 pub(crate) async fn set_size<StorageImpl>(
@@ -715,13 +766,14 @@ pub(crate) async fn set_size<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    let resolved = resolve(namespace, &file.descriptor().path)?;
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .set_size(resolved.path(), size, now)
-        .await
-        .map_err(fs_error_code)
+    let descriptor = file.descriptor();
+    let resolved = resolve(namespace, &descriptor.path)?;
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    let result = match descriptor.open.as_ref() {
+        Some(handle) => fs.set_size_handle(handle, size, now).await,
+        None => fs.set_size(resolved.path(), size, now).await,
+    };
+    result.map_err(fs_error_code)
 }
 
 /// Sets the times of the object `target` names; `None` leaves one alone.
@@ -735,9 +787,19 @@ pub(crate) async fn set_times<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
+    let descriptor = target.descriptor();
+    if let Some(handle) = descriptor.open.as_ref() {
+        let resolved = resolve(namespace, &descriptor.path)?;
+        return resolved
+            .writable()
+            .map_err(fs_error_code)?
+            .set_times_handle(handle, access_nanos, modified_nanos, now)
+            .await
+            .map_err(fs_error_code);
+    }
     set_times_of(
         namespace,
-        &target.descriptor().path,
+        &descriptor.path,
         Follow::No,
         access_nanos,
         modified_nanos,
@@ -848,9 +910,12 @@ pub(crate) async fn read_directory<StorageImpl>(
 where
     StorageImpl: crate::Storage,
 {
-    let mut entries: Vec<fs_types::DirectoryEntry> = namespace
-        .list(&directory.descriptor().path)
-        .await
+    let descriptor = directory.descriptor();
+    let listed = match descriptor.open.as_ref() {
+        Some(handle) => namespace.list_open(&descriptor.path, handle).await,
+        None => namespace.list(&descriptor.path).await,
+    };
+    let mut entries: Vec<fs_types::DirectoryEntry> = listed
         .map_err(fs_error_code)?
         .into_iter()
         .map(|entry| fs_types::DirectoryEntry {
@@ -1206,10 +1271,11 @@ where
 {
     let resolved = resolve(namespace, &descriptor.path)?;
     let fs = resolved.fs();
-    if data_only {
-        fs.sync_data(resolved.path()).await
-    } else {
-        fs.sync(resolved.path()).await
+    match (descriptor.open.as_ref(), data_only) {
+        (Some(handle), true) => fs.sync_data_handle(handle).await,
+        (Some(handle), false) => fs.sync_handle(handle).await,
+        (None, true) => fs.sync_data(resolved.path()).await,
+        (None, false) => fs.sync(resolved.path()).await,
     }
     .map_err(fs_error_code)
 }
@@ -1274,12 +1340,12 @@ async fn prepare_stream_write<S: crate::Storage>(
     now: u64,
 ) -> FsOpResult<MountedWrite<S>> {
     let resolved = held.resolved();
-    resolved
-        .writable()
-        .map_err(fs_error_code)?
-        .prepare_write(resolved.path(), mode, len, now)
-        .await
-        .map_err(fs_error_code)
+    let fs = resolved.writable().map_err(fs_error_code)?;
+    let result = match resolved.open() {
+        Some(handle) => fs.prepare_write_handle(handle, mode, len, now).await,
+        None => fs.prepare_write(resolved.path(), mode, len, now).await,
+    };
+    result.map_err(fs_error_code)
 }
 
 async fn submit_stream_write<S: crate::Storage>(
@@ -1673,6 +1739,7 @@ pub(crate) fn preopen_descriptor(preopen: &crate::DirectoryPreopen) -> FsDescrip
         flags: descriptor_flags_from_authority(preopen.rights()),
         identity: None,
         mount: None,
+        open: None,
     }
 }
 
@@ -2015,7 +2082,7 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (descriptor, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = stat_path(&namespace, &descriptor.path, Follow::No)
+        let result = stat_descriptor(&namespace, &descriptor)
             .await
             .map(|metadata| descriptor_stat(&metadata));
         record_component_fs_profile(profile, "stat");
@@ -2285,7 +2352,7 @@ where
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let (descriptor, namespace) =
             accessor.with(|mut access| descriptor_in(access.get(), &descriptor))?;
-        let result = stat_path(&namespace, &descriptor.path, Follow::No)
+        let result = stat_descriptor(&namespace, &descriptor)
             .await
             .map(|metadata| self::metadata_hash(&metadata));
         record_component_fs_profile(profile, "metadata-hash");
@@ -2644,6 +2711,7 @@ mod borrowed_request_tests {
                 | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         let directory = String::from("中文-日本語-한국어");
         let create =
@@ -2765,6 +2833,7 @@ mod borrowed_request_tests {
                 | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         drop(
             PreparedCreateDirectoryAt::new(
@@ -2827,6 +2896,7 @@ mod borrowed_request_tests {
                     | FsDescriptorFlags::MUTATE_DIRECTORY,
                 identity: None,
                 mount: None,
+                open: None,
             })
             .unwrap();
         let path = String::from("中文-日本語-한국어");

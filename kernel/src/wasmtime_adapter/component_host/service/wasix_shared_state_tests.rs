@@ -295,6 +295,7 @@ fn seed_workspace_dirs(ns: &Namespace<UnsupportedStorage>) {
                 | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         let grant = p1_grant(&root_dir).expect("root grant");
         wasi_fs::create_directory_at(ns, grant, "workspace", 0)
@@ -308,6 +309,7 @@ fn seed_workspace_dirs(ns: &Namespace<UnsupportedStorage>) {
                 | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         let ws_grant = p1_grant(&workspace_dir).expect("workspace grant");
         wasi_fs::create_directory_at(ns, ws_grant, "sub", 0)

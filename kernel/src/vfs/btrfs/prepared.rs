@@ -13,14 +13,13 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc as MutexArc;
 use bytes::BytesMut;
 use helios_btrfs::FileKind;
-use helios_btrfs::write::InodeHandle;
 use helios_hal::fs::{
     BlockDevice, FilledWrite, FsError, FsPath, FsResult, Landed, OpenFlags, PreparedWrite,
     WritePosition, WriteProgress,
 };
 use triomphe::Arc;
 
-use super::{BtrfsFs, Operation, Response};
+use super::{BtrfsFs, BtrfsOpenHandle, Operation, Response};
 use crate::{BlockPages, OwnedRawMutexLease, RawMutex};
 
 pub(super) type Leases = Arc<spin::Mutex<BTreeMap<(u64, u64), MutexArc<RawMutex>>>>;
@@ -44,10 +43,10 @@ impl Drop for Lease {
     }
 }
 
-/// One staged round, retaining its inode identity across namespace changes.
+/// One staged round, retaining its open inode handle across namespace changes.
 pub struct BtrfsWrite<Device: BlockDevice<Buffer = BlockPages>> {
     fs: BtrfsFs<Device>,
-    inode: InodeHandle,
+    handle: BtrfsOpenHandle,
     position: WritePosition,
     start: Option<u64>,
     completed: usize,
@@ -65,7 +64,7 @@ pub(super) async fn prepare<Device: BlockDevice<Buffer = BlockPages>>(
     now: u64,
 ) -> FsResult<BtrfsWrite<Device>> {
     let writer = fs.inner.writer.as_ref().ok_or(FsError::ReadOnly)?;
-    let Response::Opened { inode, metadata } = writer
+    let Response::Opened { handle, metadata } = writer
         .execute(
             path.as_str(),
             now,
@@ -82,7 +81,39 @@ pub(super) async fn prepare<Device: BlockDevice<Buffer = BlockPages>>(
         FileKind::Directory => return Err(FsError::IsDirectory),
         _ => return Err(FsError::Invalid),
     }
-    let key = (inode.tree(), inode.number());
+    stage(fs, handle, position, len, now)
+}
+
+pub(super) async fn prepare_handle<Device: BlockDevice<Buffer = BlockPages>>(
+    fs: &BtrfsFs<Device>,
+    handle: &BtrfsOpenHandle,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+) -> FsResult<BtrfsWrite<Device>> {
+    if fs.inner.writer.is_none() || handle.inode_handle().is_none() {
+        return Err(FsError::ReadOnly);
+    }
+    let reader = fs.snapshot();
+    let inode = fs
+        .inode_by_id(&reader, handle.tree(), handle.number())
+        .await?;
+    match inode.kind() {
+        FileKind::Regular => {}
+        FileKind::Directory => return Err(FsError::IsDirectory),
+        _ => return Err(FsError::Invalid),
+    }
+    stage(fs, handle.clone(), position, len, now)
+}
+
+fn stage<Device: BlockDevice<Buffer = BlockPages>>(
+    fs: &BtrfsFs<Device>,
+    handle: BtrfsOpenHandle,
+    position: WritePosition,
+    len: usize,
+    now: u64,
+) -> FsResult<BtrfsWrite<Device>> {
+    let key = (handle.tree(), handle.number());
     let mutex = fs
         .inner
         .writes
@@ -98,7 +129,7 @@ pub(super) async fn prepare<Device: BlockDevice<Buffer = BlockPages>>(
     };
     Ok(BtrfsWrite {
         fs: fs.clone(),
-        inode,
+        handle,
         position,
         start: None,
         completed: 0,
@@ -144,12 +175,16 @@ impl<Device: BlockDevice<Buffer = BlockPages>> FilledWrite for BtrfsFilled<Devic
             .writer
             .as_ref()
             .expect("prepared on writable mount");
+        let inode = this
+            .handle
+            .inode_handle()
+            .expect("prepared on writable mount")
+            .clone();
         let written = writer
-            .execute(
-                "",
+            .execute_inode(
+                inode,
                 this.now,
                 Operation::Write {
-                    inode: this.inode.clone(),
                     position: this.position,
                     bytes,
                 },

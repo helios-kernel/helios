@@ -73,6 +73,7 @@ fn dir_descriptor(path: &str) -> FsDescriptor {
             | FsDescriptorFlags::MUTATE_DIRECTORY,
         identity: None,
         mount: None,
+        open: None,
     }
 }
 
@@ -83,6 +84,7 @@ fn file_descriptor(path: &str) -> FsDescriptor {
         flags: FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
         identity: None,
         mount: None,
+        open: None,
     }
 }
 

@@ -77,6 +77,8 @@ pub fn write_errno(error: &WriteError) -> Errno {
         } if length > maximum => Errno::ENAMETOOLONG,
         WriteError::SymlinkTarget { .. } => Errno::EINVAL,
         WriteError::DirectoryLink => Errno::EPERM,
+        WriteError::UnlinkedInode { .. } => Errno::ENOENT,
+        WriteError::NotOpen { .. } => defect("NotOpen", error),
         WriteError::XattrNameLength { .. } => Errno::ERANGE,
         WriteError::XattrName => Errno::EINVAL,
         WriteError::XattrValueTooBig { .. } => Errno::E2BIG,

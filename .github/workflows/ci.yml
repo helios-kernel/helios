@@ -384,6 +384,14 @@ jobs:
         with:
           workspaces: helios
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+      # Pinned `wasi-sdk-34` used by `helios-cli wasm-build` to cross-compile
+      # BoringSSL for `programs/http-client`; restored read-only on PRs and
+      # populated on `dev` pushes.
+      - name: Restore wasi-sdk-34 toolchain cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: helios/target/wasi-sdk-34
+          key: helios-wasi-sdk-34-${{ runner.os }}-${{ runner.arch }}
       # The guest programs build in the profile the matrix names; the tool
       # that drives them is the debug one every check lane runs.
       - uses: ./helios/.github/actions/helios-cli

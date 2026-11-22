@@ -26,6 +26,7 @@
 //!   generation. A writeback that failed would fail again in the commit, so
 //!   the mount stops taking writes it cannot make durable.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc as SharedArc;
 use alloc::vec::Vec;
@@ -50,25 +51,137 @@ use triomphe::Arc;
 use super::super::UnixAttributes;
 use super::{Image, LivePolicy, Snapshot};
 use crate::component::{ProviderReceiver, ProviderSender, provider_channel};
-use crate::{BlockPages, ProgressSignal, RootEntropyHandle, Timer};
+use crate::{BlockPages, ProgressMark, ProgressSignal, RootEntropyHandle, Timer};
+
+/// Pending inode releases enqueued by dropped [`BtrfsOpenHandle`]s.
+///
+/// # Concurrency contract
+///
+/// Any processor may push a dropped inode handle under the short `spin::Mutex`
+/// (held only for `Vec::push`, never across `.await`) and raise `signal`. Only
+/// [`BtrfsService`] drains the queue: on wakeup from `signal`, at the start of
+/// each batch before applying new requests, and before the unmount commit.
+pub(super) struct PendingReleases {
+    inodes: spin::Mutex<Vec<InodeHandle>>,
+    signal: ProgressSignal,
+}
+
+impl PendingReleases {
+    pub(super) fn new() -> Self {
+        Self {
+            inodes: spin::Mutex::new(Vec::new()),
+            signal: ProgressSignal::new(),
+        }
+    }
+
+    pub(super) fn push(&self, inode: InodeHandle) {
+        self.inodes.lock().push(inode);
+        self.signal.signal();
+    }
+
+    pub(super) fn drain(&self) -> Vec<InodeHandle> {
+        core::mem::take(&mut *self.inodes.lock())
+    }
+
+    pub(super) fn has_pending(&self) -> bool {
+        !self.inodes.lock().is_empty()
+    }
+
+    pub(super) fn mark(&self) -> ProgressMark {
+        self.signal.mark()
+    }
+
+    pub(super) async fn changed(&self, mark: ProgressMark) {
+        self.signal.changed(mark).await;
+    }
+}
+
+struct BtrfsOpenGuard {
+    inode: InodeHandle,
+    releases: SharedArc<PendingReleases>,
+}
+
+impl Drop for BtrfsOpenGuard {
+    fn drop(&mut self) {
+        self.releases.push(self.inode.clone());
+    }
+}
+
+#[derive(Clone)]
+enum BtrfsOpenInner {
+    Writable(SharedArc<BtrfsOpenGuard>),
+    ReadOnly { tree: u64, number: u64 },
+}
+
+/// An open inode handle on a [`super::BtrfsFs`] mount.
+///
+/// Clones share one underlying open registration; dropping the final clone
+/// schedules an asynchronous inode release on [`BtrfsService`] so an unlinked
+/// or `O_TMPFILE` inode is deleted once no handle retains it.
+#[derive(Clone)]
+pub struct BtrfsOpenHandle {
+    inner: BtrfsOpenInner,
+}
+
+impl BtrfsOpenHandle {
+    pub(super) fn writable(inode: InodeHandle, releases: SharedArc<PendingReleases>) -> Self {
+        Self {
+            inner: BtrfsOpenInner::Writable(SharedArc::new(BtrfsOpenGuard { inode, releases })),
+        }
+    }
+
+    pub(super) fn read_only(tree: u64, number: u64) -> Self {
+        Self {
+            inner: BtrfsOpenInner::ReadOnly { tree, number },
+        }
+    }
+
+    pub(super) fn tree(&self) -> u64 {
+        match &self.inner {
+            BtrfsOpenInner::Writable(guard) => guard.inode.tree(),
+            BtrfsOpenInner::ReadOnly { tree, .. } => *tree,
+        }
+    }
+
+    pub(super) fn number(&self) -> u64 {
+        match &self.inner {
+            BtrfsOpenInner::Writable(guard) => guard.inode.number(),
+            BtrfsOpenInner::ReadOnly { number, .. } => *number,
+        }
+    }
+
+    pub(super) fn inode_handle(&self) -> Option<&InodeHandle> {
+        match &self.inner {
+            BtrfsOpenInner::Writable(guard) => Some(&guard.inode),
+            BtrfsOpenInner::ReadOnly { .. } => None,
+        }
+    }
+}
 
 pub(super) enum Response {
     Done,
     Written(Landed),
     Opened {
-        inode: InodeHandle,
+        handle: BtrfsOpenHandle,
         metadata: helios_btrfs::Metadata,
     },
 }
 
+pub(super) enum Target {
+    Path(String),
+    Inode(InodeHandle),
+}
+
 pub(super) enum Operation {
     Write {
-        inode: InodeHandle,
         position: WritePosition,
         bytes: bytes::Bytes,
     },
     Open {
         flags: OpenFlags,
+    },
+    CreateTmpfile {
+        exclusive: bool,
     },
     CreateDirectory,
     Remove {
@@ -95,7 +208,7 @@ pub(super) enum Operation {
 }
 
 pub(super) struct Request {
-    path: String,
+    target: Target,
     when: u64,
     operation: Operation,
     reply: oneshot::Sender<FsResult<Response>>,
@@ -187,10 +300,30 @@ impl Client {
         when: u64,
         operation: Operation,
     ) -> FsResult<Response> {
+        self.execute_target(Target::Path(String::from(path)), when, operation)
+            .await
+    }
+
+    pub(super) async fn execute_inode(
+        &self,
+        inode: InodeHandle,
+        when: u64,
+        operation: Operation,
+    ) -> FsResult<Response> {
+        self.execute_target(Target::Inode(inode), when, operation)
+            .await
+    }
+
+    async fn execute_target(
+        &self,
+        target: Target,
+        when: u64,
+        operation: Operation,
+    ) -> FsResult<Response> {
         let (reply, result) = oneshot::channel();
         self.sender
             .send(Request {
-                path: String::from(path),
+                target,
                 when,
                 operation,
                 reply,
@@ -221,6 +354,7 @@ pub struct BtrfsService<Device: BlockDevice<Buffer = BlockPages>> {
     pub(super) writer: Writer<Image<Device>, EntropyUuids>,
     pub(super) receiver: ProviderReceiver<Request>,
     pub(super) published: Arc<spin::Mutex<Snapshot<Device>>>,
+    pub(super) releases: SharedArc<PendingReleases>,
     pub(super) concurrency: NonZeroUsize,
     pub(super) policy: Arc<LivePolicy>,
     /// Last, so the end is reported only once everything above has gone.
@@ -233,8 +367,9 @@ type SyncWaiter = oneshot::Sender<FsResult<Response>>;
 /// What woke the service.
 enum Wake {
     Request(Option<Request>),
-    /// The commit deadline passed, or the operator changed the policy.
-    Policy,
+    /// The commit deadline passed, the operator changed the policy, or an open
+    /// handle was dropped.
+    Wakeup,
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
@@ -245,6 +380,16 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
         // runs from here, as Linux's from the transaction's `start_time`.
         let mut dirty_since: Option<Instant> = None;
         loop {
+            let release_mark = self.releases.mark();
+            if self.releases.has_pending() {
+                if !Box::pin(self.drain_releases()).await {
+                    return;
+                }
+                if !self.writer.dirty().is_clean() && dirty_since.is_none() {
+                    dirty_since = Some(timer.now());
+                }
+                continue;
+            }
             // Armed before the policy is read, so a change made while the
             // service decides is not missed.
             let mark = self.policy.changed.mark();
@@ -260,13 +405,13 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                 && (dirty.metadata_bytes >= policy.dirty_metadata_limit
                     || deadline.is_some_and(|deadline| deadline <= timer.now()))
             {
-                if !self.commit(Vec::new(), &mut dirty_since).await {
+                if !Box::pin(self.commit(Vec::new(), &mut dirty_since)).await {
                     return;
                 }
                 continue;
             }
             if dirty.data_bytes != 0 && dirty.data_bytes >= policy.dirty_data_limit {
-                if !self.writeback().await {
+                if !Box::pin(self.writeback()).await {
                     return;
                 }
                 continue;
@@ -280,21 +425,28 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                     }
                 });
                 let changed = pin!(self.policy.changed.changed(mark));
-                match select(request, select(due, changed)).await {
+                let released = pin!(self.releases.changed(release_mark));
+                match select(request, select(released, select(due, changed))).await {
                     Either::Left((request, _)) => Wake::Request(request),
-                    Either::Right(_) => Wake::Policy,
+                    Either::Right(_) => Wake::Wakeup,
                 }
             };
             match wake {
-                Wake::Policy => {}
+                Wake::Wakeup => {}
                 Wake::Request(None) => {
-                    // Unmounted: what the running transaction holds becomes
-                    // durable before the device is let go.
-                    self.commit(Vec::new(), &mut dirty_since).await;
+                    // Unmounted: release any dropped handles, then make what
+                    // the running transaction holds durable before releasing
+                    // the device.
+                    if Box::pin(self.drain_releases()).await {
+                        Box::pin(self.commit(Vec::new(), &mut dirty_since)).await;
+                    }
                     return;
                 }
                 Wake::Request(Some(first)) => {
-                    let Some(syncs) = self.apply_batch(first).await else {
+                    if !Box::pin(self.drain_releases()).await {
+                        return;
+                    }
+                    let Some(syncs) = Box::pin(self.apply_batch(first)).await else {
                         return;
                     };
                     if self.writer.dirty().is_clean() {
@@ -307,13 +459,46 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
                     let dirty = self.writer.dirty();
                     if (!syncs.is_empty()
                         || dirty.metadata_bytes >= self.policy.load().dirty_metadata_limit)
-                        && !self.commit(syncs, &mut dirty_since).await
+                        && !Box::pin(self.commit(syncs, &mut dirty_since)).await
                     {
                         return;
                     }
                 }
             }
         }
+    }
+
+    /// Processes all dropped [`BtrfsOpenHandle`]s queued in [`Self::releases`],
+    /// publishing a fresh snapshot if any orphan inode was deleted. Returns
+    /// `false` once the writer is poisoned.
+    async fn drain_releases(&mut self) -> bool {
+        let pending = self.releases.drain();
+        if pending.is_empty() {
+            return true;
+        }
+        let mut transaction = match self.writer.join().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                tracing::error!(%error, "btrfs join for inode release failed");
+                return false;
+            }
+        };
+        let mut deleted_any = false;
+        for inode in pending {
+            match transaction.release_inode(&inode).await {
+                Ok(deleted) => deleted_any |= deleted,
+                Err(error) => {
+                    tracing::warn!(%error, "releasing open btrfs inode failed");
+                }
+            }
+        }
+        if deleted_any {
+            *self.published.lock() = self
+                .writer
+                .snapshot()
+                .expect("the writer joined above is not poisoned");
+        }
+        true
     }
 
     /// Applies `first` and what else is queued, up to `concurrency`
@@ -351,7 +536,8 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsService<Device> {
             let sync = matches!(request.operation, Operation::Sync);
             let result = apply(
                 &mut transaction,
-                &request.path,
+                &self.releases,
+                request.target,
                 request.when,
                 request.operation,
             )
@@ -474,19 +660,34 @@ pub(super) fn timestamp(nanos: u64) -> Timestamp {
     }
 }
 
+async fn resolve_target<S: BlockSink, U: RootUuids>(
+    transaction: &WriteTransaction<'_, S, U>,
+    target: &Target,
+) -> FsResult<InodeHandle> {
+    match target {
+        Target::Path(path) => inode(transaction, path).await,
+        Target::Inode(handle) => Ok(handle.clone()),
+    }
+}
+
+fn require_path(target: &Target) -> &str {
+    match target {
+        Target::Path(path) => path,
+        Target::Inode(_) => unreachable!("path operation always carries Target::Path"),
+    }
+}
+
 async fn apply<S: BlockSink, U: RootUuids>(
     transaction: &mut WriteTransaction<'_, S, U>,
-    path: &str,
+    releases: &SharedArc<PendingReleases>,
+    target: Target,
     now: u64,
     operation: Operation,
 ) -> FsResult<Response> {
     let when = timestamp(now);
     match operation {
-        Operation::Write {
-            inode,
-            position,
-            bytes,
-        } => {
+        Operation::Write { position, bytes } => {
+            let inode = resolve_target(transaction, &target).await?;
             let metadata = transaction.metadata(&inode).await.map_err(fs_error)?;
             let offset = match position {
                 WritePosition::At(offset) => offset,
@@ -514,6 +715,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
             }));
         }
         Operation::Open { flags } => {
+            let path = require_path(&target);
             let file = match inode(transaction, path).await {
                 Ok(file) => {
                     if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
@@ -555,12 +757,28 @@ async fn apply<S: BlockSink, U: RootUuids>(
                     .map_err(fs_error)?;
             }
             let metadata = transaction.metadata(&file).await.map_err(fs_error)?;
+            transaction.open_inode(&file).await.map_err(fs_error)?;
             return Ok(Response::Opened {
-                inode: file,
+                handle: BtrfsOpenHandle::writable(file, releases.clone()),
+                metadata,
+            });
+        }
+        Operation::CreateTmpfile { exclusive } => {
+            let path = require_path(&target);
+            let directory = inode(transaction, path).await?;
+            let attributes = inherited(transaction, &directory, NodeKind::File).await?;
+            let file = transaction
+                .create_tmpfile(&directory, attributes, !exclusive, when)
+                .await
+                .map_err(fs_error)?;
+            let metadata = transaction.metadata(&file).await.map_err(fs_error)?;
+            return Ok(Response::Opened {
+                handle: BtrfsOpenHandle::writable(file, releases.clone()),
                 metadata,
             });
         }
         Operation::CreateDirectory | Operation::Symlink { .. } => {
+            let path = require_path(&target);
             let (parent, bytes) = parent(transaction, path).await?;
             let name = Name {
                 parent: &parent,
@@ -581,6 +799,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
             .map_err(fs_error)?;
         }
         Operation::Rename { destination, mode } => {
+            let path = require_path(&target);
             let (source, source_name) = parent(transaction, path).await?;
             let (destination, destination_name) = parent(transaction, &destination).await?;
             transaction
@@ -600,7 +819,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .map_err(fs_error)?;
         }
         Operation::Link { destination } => {
-            let file = inode(transaction, path).await?;
+            let file = resolve_target(transaction, &target).await?;
             let (parent, bytes) = parent(transaction, &destination).await?;
             transaction
                 .hard_link(
@@ -615,6 +834,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .map_err(fs_error)?;
         }
         Operation::Remove { directory } => {
+            let path = require_path(&target);
             let file = inode(transaction, path).await?;
             let kind = transaction.metadata(&file).await.map_err(fs_error)?.kind;
             if directory && kind != FileKind::Directory {
@@ -636,21 +856,22 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 .map_err(fs_error)?;
         }
         Operation::Truncate { size } => {
-            let file = inode(transaction, path).await?;
+            let file = resolve_target(transaction, &target).await?;
             transaction
                 .truncate_file(&file, size, when)
                 .await
                 .map_err(fs_error)?;
         }
         Operation::Times { access, modified } => {
-            let file = inode(transaction, path).await?;
+            let file = resolve_target(transaction, &target).await?;
             transaction
                 .set_times(&file, access.map(timestamp), modified.map(timestamp), when)
                 .await
                 .map_err(fs_error)?;
         }
         Operation::Sync => {
-            inode(transaction, path).await?;
+            let file = resolve_target(transaction, &target).await?;
+            transaction.metadata(&file).await.map_err(fs_error)?;
         }
     }
     Ok(Response::Done)
@@ -660,6 +881,7 @@ pub(super) fn fs_error(error: WriteError) -> FsError {
     match error {
         WriteError::NoEntry { .. }
         | WriteError::StaleHandle { .. }
+        | WriteError::UnlinkedInode { .. }
         | WriteError::Read(Error::NotFound { .. }) => FsError::NoEntry,
         WriteError::Exists { .. } => FsError::Exists,
         WriteError::NotEmpty { .. } => FsError::NotEmpty,

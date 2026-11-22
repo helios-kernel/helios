@@ -38,7 +38,7 @@ use helios_btrfs::{
 };
 use helios_hal::fs::{
     BlockDevice, BlockSerial, DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError,
-    FsPath, FsResult, Metadata, NodeId, NodeKind, OpenFlags, RenameMode, WritePosition,
+    FsPath, FsResult, Metadata, NodeId, NodeKind, OpenFlags, Opened, RenameMode, WritePosition,
 };
 use helios_hal::io::{IoError, IoResult};
 use triomphe::Arc;
@@ -54,8 +54,8 @@ use helios_btrfs::write::{
 mod prepared;
 mod writer;
 pub use prepared::BtrfsWrite;
-pub use writer::BtrfsService;
-use writer::{Operation, Response};
+pub use writer::{BtrfsOpenHandle, BtrfsService};
+use writer::{Operation, PendingReleases, Response};
 
 /// Runtime inputs for writable disk mounts.
 #[derive(Clone)]
@@ -409,6 +409,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             writer,
             receiver,
             published: reader.clone(),
+            releases: SharedArc::new(PendingReleases::new()),
             concurrency,
             policy: policy.clone(),
             _exit: exit,
@@ -503,12 +504,65 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
         Ok(inode)
     }
 
+    async fn inode_by_id(
+        &self,
+        reader: &Snapshot<Device>,
+        tree: u64,
+        number: u64,
+    ) -> FsResult<Inode> {
+        match reader.inode(tree, number).await {
+            Ok(inode) => Ok(inode),
+            Err(Error::MissingInode { .. } | Error::MissingRoot { .. }) => Err(FsError::NoEntry),
+            Err(error) => Err(self.fs_error(error)),
+        }
+    }
+
+    async fn read_inode_at(
+        &self,
+        reader: &Snapshot<Device>,
+        inode: &Inode,
+        offset: u64,
+        max_bytes: usize,
+    ) -> FsResult<Bytes> {
+        node_kind(inode.kind())?.require_regular()?;
+        let len = inode
+            .metadata()
+            .size
+            .saturating_sub(offset)
+            .min(max_bytes as u64) as usize;
+        let mut bytes = BytesMut::zeroed(len);
+        let count = reader
+            .read(inode, offset, &mut bytes)
+            .await
+            .map_err(|e| self.fs_error(e))?;
+        if count != len {
+            return Err(FsError::Io);
+        }
+        Ok(bytes.freeze())
+    }
+
     async fn mutate(&self, path: FsPath<'_>, now: u64, operation: Operation) -> FsResult<()> {
         self.inner
             .writer
             .as_ref()
             .ok_or(FsError::ReadOnly)?
             .execute(path.as_str(), now, operation)
+            .await
+            .map(drop)
+    }
+
+    async fn mutate_handle(
+        &self,
+        handle: &BtrfsOpenHandle,
+        now: u64,
+        operation: Operation,
+    ) -> FsResult<()> {
+        let inode = handle.inode_handle().ok_or(FsError::ReadOnly)?.clone();
+        self.inner
+            .writer
+            .as_ref()
+            .ok_or(FsError::ReadOnly)?
+            .execute_inode(inode, now, operation)
             .await
             .map(drop)
     }
@@ -600,6 +654,7 @@ pub struct BtrfsDir<Device: BlockDevice<Buffer = BlockPages>> {
     tree: u64,
     number: u64,
     bound: DirBound,
+    _open: Option<BtrfsOpenHandle>,
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages> + 'static> DirStream for BtrfsDir<Device> {
@@ -673,6 +728,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> DirStream for BtrfsDir<
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<Device> {
+    type OpenHandle = BtrfsOpenHandle;
     type Write = BtrfsWrite<Device>;
     type Dir = BtrfsDir<Device>;
 
@@ -680,27 +736,43 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         self.metadata(&self.inode(&self.snapshot(), path).await?)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
+    async fn stat_handle(&self, handle: &Self::OpenHandle) -> FsResult<Metadata> {
+        let reader = self.snapshot();
+        let inode = self
+            .inode_by_id(&reader, handle.tree(), handle.number())
+            .await?;
+        self.metadata(&inode)
+    }
+
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        now: u64,
+    ) -> FsResult<Opened<Self::OpenHandle>> {
         if let Some(writer) = &self.inner.writer {
             return match writer
                 .execute(path.as_str(), now, Operation::Open { flags })
                 .await?
             {
-                Response::Opened { inode, metadata } => {
-                    self.inode_metadata(inode.tree(), inode.number(), metadata)
+                Response::Opened { handle, metadata } => {
+                    let metadata = self.inode_metadata(handle.tree(), handle.number(), metadata)?;
+                    Ok(Opened { metadata, handle })
                 }
                 Response::Done | Response::Written(_) => {
                     unreachable!("open request returns inode metadata")
                 }
             };
         }
-        let metadata = match self.stat(path).await {
-            Ok(metadata) => metadata,
+        let reader = self.snapshot();
+        let inode = match self.inode(&reader, path).await {
+            Ok(inode) => inode,
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
                 return Err(FsError::ReadOnly);
             }
             Err(error) => return Err(error),
         };
+        let metadata = self.metadata(&inode)?;
         if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
             return Err(FsError::Exists);
         }
@@ -713,32 +785,66 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         if flags.contains(OpenFlags::TRUNCATE) {
             return Err(FsError::ReadOnly);
         }
-        Ok(metadata)
+        Ok(Opened {
+            metadata,
+            handle: BtrfsOpenHandle::read_only(inode.tree(), inode.number()),
+        })
+    }
+
+    async fn open_tmpfile(
+        &self,
+        directory: FsPath<'_>,
+        exclusive: bool,
+        now: u64,
+    ) -> FsResult<Opened<Self::OpenHandle>> {
+        let writer = self.inner.writer.as_ref().ok_or(FsError::ReadOnly)?;
+        match writer
+            .execute(
+                directory.as_str(),
+                now,
+                Operation::CreateTmpfile { exclusive },
+            )
+            .await?
+        {
+            Response::Opened { handle, metadata } => {
+                let metadata = self.inode_metadata(handle.tree(), handle.number(), metadata)?;
+                Ok(Opened { metadata, handle })
+            }
+            Response::Done | Response::Written(_) => {
+                unreachable!("tmpfile request returns inode metadata")
+            }
+        }
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
         let reader = self.snapshot();
         let inode = self.inode(&reader, path).await?;
-        node_kind(inode.kind())?.require_regular()?;
-        let len = inode
-            .metadata()
-            .size
-            .saturating_sub(offset)
-            .min(max_bytes as u64) as usize;
-        let mut bytes = BytesMut::zeroed(len);
-        let count = reader
-            .read(&inode, offset, &mut bytes)
-            .await
-            .map_err(|e| self.fs_error(e))?;
-        if count != len {
-            return Err(FsError::Io);
-        }
-        Ok(bytes.freeze())
+        self.read_inode_at(&reader, &inode, offset, max_bytes).await
+    }
+
+    async fn read_handle_at(
+        &self,
+        handle: &Self::OpenHandle,
+        offset: u64,
+        max_bytes: usize,
+    ) -> FsResult<Bytes> {
+        let reader = self.snapshot();
+        let inode = self
+            .inode_by_id(&reader, handle.tree(), handle.number())
+            .await?;
+        self.read_inode_at(&reader, &inode, offset, max_bytes).await
     }
 
     async fn open_dir(&self, path: FsPath<'_>) -> FsResult<BtrfsDir<Device>> {
+        let opened = self.open(path, OpenFlags::DIRECTORY, 0).await?;
+        self.open_dir_handle(&opened.handle).await
+    }
+
+    async fn open_dir_handle(&self, handle: &Self::OpenHandle) -> FsResult<BtrfsDir<Device>> {
         let reader = self.snapshot();
-        let inode = self.inode(&reader, path).await?;
+        let inode = self
+            .inode_by_id(&reader, handle.tree(), handle.number())
+            .await?;
         let bound = reader
             .dir_bound(&inode)
             .await
@@ -748,6 +854,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
             tree: inode.tree(),
             number: inode.number(),
             bound,
+            _open: Some(handle.clone()),
         })
     }
 
@@ -779,8 +886,26 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
     ) -> FsResult<Self::Write> {
         prepared::prepare(self, path, position, len, now).await
     }
+    async fn prepare_write_handle(
+        &self,
+        handle: &Self::OpenHandle,
+        position: WritePosition,
+        len: usize,
+        now: u64,
+    ) -> FsResult<Self::Write> {
+        prepared::prepare_handle(self, handle, position, len, now).await
+    }
     async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
         self.mutate(path, now, Operation::Truncate { size }).await
+    }
+    async fn set_size_handle(
+        &self,
+        handle: &Self::OpenHandle,
+        size: u64,
+        now: u64,
+    ) -> FsResult<()> {
+        self.mutate_handle(handle, now, Operation::Truncate { size })
+            .await
     }
     async fn set_times(
         &self,
@@ -790,6 +915,16 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         now: u64,
     ) -> FsResult<()> {
         self.mutate(path, now, Operation::Times { access, modified })
+            .await
+    }
+    async fn set_times_handle(
+        &self,
+        handle: &Self::OpenHandle,
+        access: Option<u64>,
+        modified: Option<u64>,
+        now: u64,
+    ) -> FsResult<()> {
+        self.mutate_handle(handle, now, Operation::Times { access, modified })
             .await
     }
     async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -830,6 +965,21 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
         )
         .await
     }
+    async fn link_handle(
+        &self,
+        handle: &Self::OpenHandle,
+        destination: FsPath<'_>,
+        now: u64,
+    ) -> FsResult<()> {
+        self.mutate_handle(
+            handle,
+            now,
+            Operation::Link {
+                destination: String::from(destination.as_str()),
+            },
+        )
+        .await
+    }
     async fn symlink(&self, target: &str, path: FsPath<'_>, now: u64) -> FsResult<()> {
         self.mutate(
             path,
@@ -847,8 +997,20 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
             self.inode(&self.snapshot(), path).await.map(drop)
         }
     }
+    async fn sync_handle(&self, handle: &Self::OpenHandle) -> FsResult<()> {
+        if self.inner.writer.is_some() {
+            self.mutate_handle(handle, 0, Operation::Sync).await
+        } else {
+            self.inode_by_id(&self.snapshot(), handle.tree(), handle.number())
+                .await
+                .map(drop)
+        }
+    }
     async fn sync_data(&self, path: FsPath<'_>) -> FsResult<()> {
         self.sync(path).await
+    }
+    async fn sync_data_handle(&self, handle: &Self::OpenHandle) -> FsResult<()> {
+        self.sync_handle(handle).await
     }
 }
 

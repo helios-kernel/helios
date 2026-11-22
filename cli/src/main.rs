@@ -40,6 +40,7 @@ use wit_component::ComponentEncoder;
 mod artifact_cache;
 mod boot_kernel;
 mod venus_fetch;
+mod wasi_sdk;
 
 /// Why a `helios-cli` invocation did not do what it was asked.
 ///
@@ -183,6 +184,8 @@ enum WasmBuildError {
     },
     #[error(transparent)]
     VenusInputs(#[from] venus_fetch::VenusFetchError),
+    #[error(transparent)]
+    WasiSdk(#[from] wasi_sdk::WasiSdkError),
     #[error(transparent)]
     Workspace(#[from] WorkspaceRootError),
     #[error("crate manifest {path} is missing")]
@@ -1967,10 +1970,12 @@ fn run_wasm_build(
     programs.sort();
     let mut groups = BTreeMap::<String, Vec<(usize, ProgramManifest)>>::new();
     let mut venus_protocol = false;
+    let mut boringssl = false;
     for (index, (command_name, path)) in programs.into_iter().enumerate() {
         let manifest = read_program_manifest(&command_name, &path.join("Cargo.toml"))?;
         let requirements = read_wasm_requirements(&manifest.manifest_path)?;
         venus_protocol |= requirements.venus_protocol;
+        boringssl |= requirements.boringssl;
         groups
             .entry(component_target_dir(&requirements))
             .or_default()
@@ -1981,6 +1986,9 @@ fn run_wasm_build(
     // the cache directory together.
     if venus_protocol {
         venus_fetch::run(workspace_root.path()).map_err(WasmBuildError::from)?;
+    }
+    if boringssl {
+        wasi_sdk::ensure(workspace_root.path(), COMPONENT_TRIPLE).map_err(WasmBuildError::from)?;
     }
     let jobs = std::iter::once(WasmJob::CompilerPlugin)
         .chain(groups.into_values().map(WasmJob::Programs))
@@ -2534,14 +2542,15 @@ const COMPONENT_TRIPLE: &str = "wasm32-wasip3";
 /// crate, std included, with other flags, so they get a directory of their
 /// own rather than invalidating the shared one on every switch.
 fn component_target_dir(requirements: &WasmRequirements) -> String {
-    if requirements.target_features.is_empty() {
-        COMPONENT_PROGRAMS_TARGET_DIR.to_owned()
-    } else {
-        format!(
-            "{COMPONENT_PROGRAMS_TARGET_DIR}-{}",
-            requirements.target_features.join("-")
-        )
+    let mut dir = COMPONENT_PROGRAMS_TARGET_DIR.to_owned();
+    if !requirements.target_features.is_empty() {
+        dir.push('-');
+        dir.push_str(&requirements.target_features.join("-"));
     }
+    if requirements.boringssl {
+        dir.push_str("-boringssl");
+    }
+    dir
 }
 
 /// What `package.metadata.helios` asks of the wasm build of the crate at
@@ -2588,6 +2597,8 @@ struct WasmMetadata {
 struct WasmRequirements {
     #[serde(default)]
     venus_protocol: bool,
+    #[serde(default)]
+    boringssl: bool,
     #[serde(default)]
     target_features: Vec<String>,
 }
@@ -2677,7 +2688,7 @@ impl WasmBuilder<'_> {
         let cache = match self.cache {
             Some(cache) => Some((
                 cache,
-                self.cache_key(manifest_path, target_triple, &environment)?,
+                self.cache_key(manifest_path, target_triple, &environment, requirements)?,
             )),
             None => None,
         };
@@ -2726,15 +2737,21 @@ impl WasmBuilder<'_> {
         }
         command.envs(environment);
         command.env_remove("RUSTFLAGS");
-        // C code a program links (ring's, for one) is archived by `cc`, which
-        // falls back to the host's `ar` for a wasm target; that archive carries
-        // no symbol index wasm-ld can read, and the link then misses every C
-        // symbol. The toolchain's own llvm-ar writes one. Its path follows the
-        // toolchain, which `rustc -vV` in the cache key already names.
-        command.env(
-            format!("AR_{}", target_triple.replace('-', "_")),
-            toolchain_llvm_ar()?,
-        );
+        if requirements.boringssl {
+            let sdk = wasi_sdk::ensure(self.workspace_root.path(), target_triple)?;
+            let toolchain = wasi_sdk::materialize_toolchain_cmake(&target_dir)?;
+            command.envs(wasi_sdk::boringssl_env(&sdk, target_triple, &toolchain));
+        } else {
+            // C code a program links (ring's, for one) is archived by `cc`, which
+            // falls back to the host's `ar` for a wasm target; that archive carries
+            // no symbol index wasm-ld can read, and the link then misses every C
+            // symbol. The toolchain's own llvm-ar writes one. Its path follows the
+            // toolchain, which `rustc -vV` in the cache key already names.
+            command.env(
+                format!("AR_{}", target_triple.replace('-', "_")),
+                toolchain_llvm_ar()?,
+            );
+        }
         let status = command
             .status()
             .map_err(|source| WasmBuildError::SpawnCargo {
@@ -2781,6 +2798,7 @@ impl WasmBuilder<'_> {
         manifest_path: &Path,
         target_triple: &str,
         environment: &[(&'static str, String)],
+        requirements: &WasmRequirements,
     ) -> Result<artifact_cache::Key, WasmBuildError> {
         let root = self.workspace_root.path();
         let relative = manifest_path.strip_prefix(root).map_err(|_| {
@@ -2809,6 +2827,12 @@ impl WasmBuilder<'_> {
             .field(target_triple);
         for (name, value) in environment {
             key = key.field(name).field(value);
+        }
+        if requirements.boringssl {
+            key = key
+                .field("boringssl")
+                .field(wasi_sdk::WASI_SDK_TAG)
+                .field(wasi_sdk::BORINGSSL_TOOLCHAIN_CMAKE);
         }
         // Only the lockfile entries the program resolves through: a line
         // about the kernel's dependencies must not rebuild every program.
@@ -3449,11 +3473,76 @@ mod tests {
         let gpu: WasmBuildSettings =
             toml::from_str(include_str!("../../programs/gpu-test/Cargo.toml")).unwrap();
         assert!(gpu.package.metadata.helios.venus_protocol);
+        assert!(!gpu.package.metadata.helios.boringssl);
         assert_eq!(gpu.package.metadata.helios.target_features, ["atomics"]);
+        let http_client: WasmBuildSettings =
+            toml::from_str(include_str!("../../programs/http-client/Cargo.toml")).unwrap();
+        assert!(!http_client.package.metadata.helios.venus_protocol);
+        assert!(http_client.package.metadata.helios.boringssl);
+        assert_eq!(
+            component_target_dir(&http_client.package.metadata.helios),
+            format!("{COMPONENT_PROGRAMS_TARGET_DIR}-boringssl")
+        );
         let init: WasmBuildSettings =
             toml::from_str(include_str!("../../programs/init/Cargo.toml")).unwrap();
         assert!(!init.package.metadata.helios.venus_protocol);
+        assert!(!init.package.metadata.helios.boringssl);
         assert!(init.package.metadata.helios.target_features.is_empty());
+        assert_eq!(
+            component_target_dir(&init.package.metadata.helios),
+            COMPONENT_PROGRAMS_TARGET_DIR
+        );
+    }
+
+    #[test]
+    fn boringssl_changes_wasm_cache_key_independently_of_output_path() {
+        let workspace_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli crate lives under the workspace root");
+        let root = WorkspaceRoot::resolve(Some(workspace_dir)).expect("resolve workspace root");
+        let manifest = root.join(Path::new("programs/http-client/Cargo.toml"));
+        let plain = WasmRequirements::default();
+        let boring = WasmRequirements {
+            boringssl: true,
+            ..WasmRequirements::default()
+        };
+        let env_plain = build_environment("debug", COMPONENT_TRIPLE, &plain);
+        let env_boring = build_environment("debug", COMPONENT_TRIPLE, &boring);
+
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let builder_a = WasmBuilder {
+            cargo: Path::new("cargo"),
+            profile: "debug",
+            out_dir: dir_a.path(),
+            workspace_root: &root,
+            cache: None,
+        };
+        let builder_b = WasmBuilder {
+            cargo: Path::new("cargo"),
+            profile: "debug",
+            out_dir: dir_b.path(),
+            workspace_root: &root,
+            cache: None,
+        };
+
+        let key_plain = builder_a
+            .cache_key(&manifest, COMPONENT_TRIPLE, &env_plain, &plain)
+            .expect("plain key");
+        let key_boring_a = builder_a
+            .cache_key(&manifest, COMPONENT_TRIPLE, &env_boring, &boring)
+            .expect("boring key a");
+        let key_boring_b = builder_b
+            .cache_key(&manifest, COMPONENT_TRIPLE, &env_boring, &boring)
+            .expect("boring key b");
+        assert_ne!(
+            key_plain, key_boring_a,
+            "boringssl requirement must change wasm cache key"
+        );
+        assert_eq!(
+            key_boring_a, key_boring_b,
+            "boringssl wasm cache key must be portable across runner paths"
+        );
     }
 
     #[test]

@@ -3,6 +3,8 @@ extern crate std;
 #[cfg(feature = "write")]
 mod fallocate;
 #[cfg(feature = "write")]
+mod orphan;
+#[cfg(feature = "write")]
 mod xattr;
 
 use alloc::collections::BTreeMap;

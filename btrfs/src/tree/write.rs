@@ -79,6 +79,10 @@ pub enum WriteError {
     SymlinkTarget { length: usize, maximum: usize },
     #[error("directory hard links are not permitted")]
     DirectoryLink,
+    #[error("inode {inode} in tree {tree} has no links and cannot be linked again")]
+    UnlinkedInode { tree: u64, inode: u64 },
+    #[error("inode {inode} in tree {tree} has no open handle to release")]
+    NotOpen { tree: u64, inode: u64 },
 
     #[error("extended attribute names are 1..=255 bytes (got {length})")]
     XattrNameLength { length: usize },
