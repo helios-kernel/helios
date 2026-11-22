@@ -111,6 +111,7 @@ async fn replay_case(case: &Path) {
         open_rw(replayed.path()),
         no_uuid as fn() -> [u8; 16],
         std::thread::available_parallelism().unwrap(),
+        helios_btrfs::write::Compressor::Plain,
         MOUNTED,
     )
     .await

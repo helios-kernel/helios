@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use alloc::boxed::Box;
 
-use super::write::{EncodeError, Lzo, Zlib, Zstd};
+use super::write::{EncodeError, Encoded, Encoder, Lzo, Zlib, Zstd};
 use crate::Compression;
 
 /// The levels an algorithm accepts, from its `struct btrfs_compress_levels`.
@@ -172,6 +172,32 @@ impl Compressor {
                 level,
             }) => Self::Zstd(Box::new(Zstd::new(level)?)),
         })
+    }
+
+    /// The algorithm the mount compresses new data with; `None` when it
+    /// stores everything uncompressed.
+    pub fn algorithm(&self) -> Option<Compression> {
+        match self {
+            Self::Plain => None,
+            Self::Zlib(_) => Some(Zlib::ALGORITHM),
+            Self::Lzo(_) => Some(Lzo::ALGORITHM),
+            Self::Zstd(_) => Some(Zstd::ALGORITHM),
+        }
+    }
+
+    /// Encodes one extent's data with the mount's algorithm; `None` when
+    /// the mount does not compress or the encoding cannot save space.
+    pub(crate) fn encode(
+        &mut self,
+        input: &[u8],
+        sector: usize,
+    ) -> Result<Option<Encoded<'_>>, EncodeError> {
+        match self {
+            Self::Plain => Ok(None),
+            Self::Zlib(encoder) => encoder.encode(input, sector),
+            Self::Lzo(encoder) => encoder.encode(input, sector),
+            Self::Zstd(encoder) => encoder.encode(input, sector),
+        }
     }
 }
 

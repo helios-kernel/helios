@@ -18,10 +18,12 @@ use super::write_tests::{
     Disk, FixtureUuids, assert_btrfs_check, filesystem_image_tree_file, mount_writer,
 };
 use super::writer::Writer;
+use crate::compress::policy::Compressor;
 use crate::source::BlockSink;
 use crate::transaction::Transaction;
-use crate::transaction::file::WriteOptions;
+use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes, Name};
+use crate::transaction::reflink::FileId;
 use crate::tree::write::WriteError;
 use crate::{DirBound, DirPosition, Error, FileKind, Timestamp as When};
 
@@ -74,14 +76,14 @@ async fn create(
         .await
         .unwrap();
     if let Some(content) = content {
-        let concurrency = std::thread::available_parallelism().unwrap();
         edits
             .write_file(
-                tree,
-                inode,
+                FileId { tree, inode },
                 0,
                 content,
-                WriteOptions::plain(WHEN, concurrency),
+                WHEN,
+                &mut Compressor::Plain,
+                DEFAULT_MAX_INLINE,
             )
             .await
             .unwrap();

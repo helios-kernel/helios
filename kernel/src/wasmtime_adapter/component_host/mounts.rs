@@ -174,7 +174,10 @@ macro_rules! impl_mount_bindings {
                                 compress,
                                 commit: request
                                     .commit
-                                    .map(crate::vfs::CommitPolicy::from_commit_option),
+                                    .map(|seconds| {
+                                        crate::vfs::CommitPolicy::machine_default()
+                                            .with_commit_option(seconds)
+                                    }),
                                 max_inline: request.max_inline,
                                 now: store.now_nanos(),
                             },
