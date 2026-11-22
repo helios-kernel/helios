@@ -97,9 +97,10 @@ pub(crate) use views::{caller_memory, guest_memory, view_trap};
 pub use helios_unix::{ChildTermination, SignalTermination};
 pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientImageSurfaceHandle, ClientSurfaceHandle,
-    CommandBufferHandle, ContextHandle, DisplayHandle, GpuHandle, InputDeviceHandle,
-    PlaybackHandle, SurfaceHandle, UserProgramService, install_component_host_program_service,
-    install_program_service, run_component_host_processor_forever, run_embedded_component_forever,
+    CommandBufferHandle, ContainerHandle, ContextHandle, DisplayHandle, GpuHandle,
+    InputDeviceHandle, PlaybackHandle, SurfaceHandle, UserProgramService,
+    install_component_host_program_service, install_program_service,
+    run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
 pub(crate) use service::{
@@ -240,7 +241,14 @@ impl_requested_aot_hint!(debugger_bindings);
 impl_requested_aot_hint!(program_bindings);
 
 macro_rules! impl_program_bindings {
-    ($bindings:ident, $convert_result:ident, $convert_error:ident, $build_authority:ident) => {
+    (
+        $bindings:ident,
+        $convert_result:ident,
+        $convert_error:ident,
+        $build_authority:ident,
+        $convert_container_config:ident,
+        $convert_container_credentials:ident
+    ) => {
         impl<CpuImpl, Net, StorageImpl> $bindings::helios::system::programs::Host
             for StoreData<CpuImpl, Net, StorageImpl>
         where
@@ -248,6 +256,273 @@ macro_rules! impl_program_bindings {
             Net: ComponentHostNetwork,
             StorageImpl: crate::Storage,
         {
+        }
+
+        impl<CpuImpl, Net, StorageImpl> $bindings::helios::system::programs::HostContainer
+            for StoreData<CpuImpl, Net, StorageImpl>
+        where
+            CpuImpl: Cpu + Clone,
+            Net: ComponentHostNetwork,
+            StorageImpl: crate::Storage,
+        {
+        }
+
+        impl<CpuImpl, Net, StorageImpl, U>
+            $bindings::helios::system::programs::HostContainerWithStore<U>
+            for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
+        where
+            CpuImpl: Cpu + Clone,
+            Net: ComponentHostNetwork,
+            StorageImpl: crate::Storage,
+        {
+            fn drop(
+                mut access: Access<'_, U, Self>,
+                container: wasmtime::component::Resource<ContainerHandle>,
+            ) -> wasmtime::Result<()> {
+                let mut handle = access.get().table.delete(container)?;
+                if let Some(service) = access.get().runtime_state.program_service() {
+                    service.remove_container(&mut handle);
+                }
+                Ok(())
+            }
+
+            fn spawn(
+                accessor: &Accessor<U, Self>,
+                container: wasmtime::component::Resource<ContainerHandle>,
+                request: $bindings::helios::system::programs::ContainerSpawnRequest,
+            ) -> impl core::future::Future<
+                Output = wasmtime::Result<
+                    Result<
+                        wasmtime::component::Resource<ChildHandle>,
+                        $bindings::helios::system::programs::SpawnError,
+                    >,
+                >,
+            > + Send {
+                #[cfg(not(feature = "linux"))]
+                {
+                    let _ = (accessor, container, request);
+                    async move {
+                        Ok(Err($bindings::helios::system::programs::SpawnError {
+                            kind: $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
+                            detail: "linux subsystem is not enabled in this kernel".to_owned(),
+                        }))
+                    }
+                }
+                #[cfg(feature = "linux")]
+                {
+                    let snapshot = accessor.with(|mut access| {
+                        let service = access.get().runtime_state.program_service();
+                        let context = ProgramExecContext::from_store(access.get());
+                        let caller_authority = access.get().process_authority().clone();
+                        let cpu = access.get().cpu.clone();
+                        let resolved_container = match service.as_ref() {
+                            Some(service) => {
+                                let handle = access
+                                    .get()
+                                    .table
+                                    .get(&container)
+                                    .map_err(wasmtime::Error::from)?;
+                                Some(service.get_container(handle))
+                            }
+                            None => None,
+                        };
+                        Ok::<_, wasmtime::Error>((
+                            service,
+                            context,
+                            caller_authority,
+                            cpu,
+                            resolved_container,
+                        ))
+                    });
+                    async move {
+                        let (service, context, caller_authority, cpu, resolved_container) =
+                            snapshot?;
+                        let mut launch =
+                            phases::Trace::begin(cpu, "container-spawn", &request.path);
+                        let (Some(service), Some(container_result)) =
+                            (service, resolved_container)
+                        else {
+                            launch.refused(ProgramExecErrorKind::Unavailable);
+                            return Ok(Err($bindings::helios::system::programs::SpawnError {
+                                kind:
+                                    $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
+                                detail: "program spawn is unavailable on this machine".to_owned(),
+                            }));
+                        };
+                        if let Err(error) = require_spawn_authority(&caller_authority) {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                        let container = match container_result {
+                            Ok(container) => container,
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
+                        let credentials = match request
+                            .credentials
+                            .map($convert_container_credentials)
+                            .transpose()
+                        {
+                            Ok(credentials) => credentials,
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
+                        let spawned = match service
+                            .spawn_in_container(
+                                context,
+                                &request.path,
+                                service::ProgramLaunch::in_container(
+                                    ProgramArgv::launched(request.name, request.args),
+                                    request.env,
+                                    container,
+                                    credentials,
+                                )
+                                .with_timeline(launch.timeline().for_task()),
+                            )
+                            .await
+                        {
+                            Ok(child) => {
+                                launch.set_instance(child.instance_id);
+                                launch.disarm();
+                                let handle = accessor.with(|mut access| {
+                                    access
+                                        .get()
+                                        .table
+                                        .push(child)
+                                        .map_err(wasmtime::Error::from)
+                                })?;
+                                Ok(Ok(handle))
+                            }
+                            Err(error) => {
+                                launch.exit_error(&error);
+                                Ok(Err($convert_error(error)))
+                            }
+                        };
+                        launch.record(LaunchPhase::Reply);
+                        spawned
+                    }
+                }
+            }
+
+            fn exec(
+                accessor: &Accessor<U, Self>,
+                container: wasmtime::component::Resource<ContainerHandle>,
+                request: $bindings::helios::system::programs::ContainerExecRequest,
+            ) -> impl core::future::Future<
+                Output = wasmtime::Result<
+                    Result<
+                        $bindings::helios::system::programs::ExecResult,
+                        $bindings::helios::system::programs::ExecError,
+                    >,
+                >,
+            > + Send {
+                #[cfg(not(feature = "linux"))]
+                {
+                    let _ = (accessor, container, request);
+                    async move {
+                        Ok(Err($bindings::helios::system::programs::ExecError {
+                            kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
+                            detail: "linux subsystem is not enabled in this kernel".to_owned(),
+                        }))
+                    }
+                }
+                #[cfg(feature = "linux")]
+                {
+                    let snapshot = accessor.with(|mut access| {
+                        let service = access.get().runtime_state.program_service();
+                        let context = ProgramExecContext::from_store(access.get());
+                        let caller_authority = access.get().process_authority().clone();
+                        let cpu = access.get().cpu.clone();
+                        let resolved_container = match service.as_ref() {
+                            Some(service) => {
+                                let handle = access
+                                    .get()
+                                    .table
+                                    .get(&container)
+                                    .map_err(wasmtime::Error::from)?;
+                                Some(service.get_container(handle))
+                            }
+                            None => None,
+                        };
+                        Ok::<_, wasmtime::Error>((
+                            service,
+                            context,
+                            caller_authority,
+                            cpu,
+                            resolved_container,
+                        ))
+                    });
+                    async move {
+                        let (service, context, caller_authority, cpu, resolved_container) =
+                            snapshot?;
+                        let clock = phases::LaunchClock::arrive(&cpu);
+                        let launch = phases::Trace::begin_timed(
+                            cpu,
+                            "container-exec",
+                            &request.path,
+                            &clock,
+                        );
+                        let (Some(service), Some(container_result)) =
+                            (service, resolved_container)
+                        else {
+                            launch.refused(ProgramExecErrorKind::Unavailable);
+                            return Ok(Err($bindings::helios::system::programs::ExecError {
+                                kind:
+                                    $bindings::helios::system::programs::ExecErrorKind::Unavailable,
+                                detail: "program exec is unavailable on this machine".to_owned(),
+                            }));
+                        };
+                        if let Err(error) = require_exec_authority(&caller_authority) {
+                            launch.refused(error.kind);
+                            return Ok(Err($convert_error(error)));
+                        }
+                        let container = match container_result {
+                            Ok(container) => container,
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
+                        let credentials = match request
+                            .credentials
+                            .map($convert_container_credentials)
+                            .transpose()
+                        {
+                            Ok(credentials) => credentials,
+                            Err(error) => {
+                                launch.refused(error.kind);
+                                return Ok(Err($convert_error(error)));
+                            }
+                        };
+                        let executed = service
+                            .exec_in_container(
+                                context,
+                                &request.path,
+                                request.stdin,
+                                service::ProgramLaunch::in_container(
+                                    ProgramArgv::launched(request.name, request.args),
+                                    request.env,
+                                    container,
+                                    credentials,
+                                )
+                                .with_timeline(launch.timeline().clone()),
+                            )
+                            .await;
+                        match &executed {
+                            Ok(result) => launch.set_instance(result.instance_id),
+                            Err(error) => launch.exit_error(error),
+                        }
+                        let launch_nanos = launch.replied(&clock);
+                        Ok(executed
+                            .map(|result| $convert_result(result, launch_nanos))
+                            .map_err($convert_error))
+                    }
+                }
+            }
         }
 
         impl<CpuImpl, Net, StorageImpl> $bindings::helios::system::programs::HostChild
@@ -454,6 +729,77 @@ macro_rules! impl_program_bindings {
             Net: ComponentHostNetwork,
             StorageImpl: crate::Storage,
         {
+            fn create_container(
+                accessor: &Accessor<U, Self>,
+                config: $bindings::helios::system::programs::ContainerConfig,
+            ) -> impl core::future::Future<
+                Output = wasmtime::Result<
+                    Result<
+                        wasmtime::component::Resource<ContainerHandle>,
+                        $bindings::helios::system::programs::SpawnError,
+                    >,
+                >,
+            > + Send {
+                #[cfg(not(feature = "linux"))]
+                {
+                    let _ = (accessor, config);
+                    async move {
+                        Ok(Err($bindings::helios::system::programs::SpawnError {
+                            kind: $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
+                            detail: "linux subsystem is not enabled in this kernel".to_owned(),
+                        }))
+                    }
+                }
+                #[cfg(feature = "linux")]
+                {
+                    let snapshot = accessor.with(|mut access| {
+                        Ok::<_, wasmtime::Error>((
+                            access.get().runtime_state.program_service(),
+                            access.get().process_authority().clone(),
+                            access.get().filesystem().clone(),
+                        ))
+                    });
+                    async move {
+                        let (service, caller_authority, caller_namespace) = snapshot?;
+                        let Some(service) = service else {
+                            return Ok(Err($bindings::helios::system::programs::SpawnError {
+                                kind:
+                                    $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
+                                detail: "program service is unavailable on this machine".to_owned(),
+                            }));
+                        };
+                        if let Err(error) = require_launch_authority(&caller_authority) {
+                            return Ok(Err($convert_error(error)));
+                        }
+                        let (non_fs_authority, container_config) =
+                            match $convert_container_config(&caller_authority, config) {
+                                Ok(pair) => pair,
+                                Err(error) => return Ok(Err($convert_error(error))),
+                            };
+                        let container = match service
+                            .create_container(
+                                &caller_authority,
+                                &caller_namespace,
+                                non_fs_authority,
+                                container_config,
+                            )
+                            .await
+                        {
+                            Ok(container) => container,
+                            Err(error) => return Ok(Err($convert_error(error))),
+                        };
+                        let handle = accessor.with(|mut access| {
+                            access
+                                .get()
+                                .table
+                                .push(container)
+                                .map_err(wasmtime::Error::from)
+                        })?;
+                        Ok(Ok(handle))
+                    }
+                }
+            }
+
             fn spawn(
                 accessor: &Accessor<U, Self>,
                 request: $bindings::helios::system::programs::SpawnRequest,
@@ -1019,6 +1365,121 @@ macro_rules! impl_authority_conversion {
 impl_authority_conversion!(build_debugger_child_authority, debugger_bindings);
 impl_authority_conversion!(build_program_child_authority, program_bindings);
 
+#[cfg(feature = "linux")]
+macro_rules! impl_container_config_conversion {
+    ($config_fn:ident, $creds_fn:ident, $bindings:ident, $build_authority:ident) => {
+        fn $creds_fn(
+            credentials: $bindings::helios::system::programs::ContainerCredentials,
+        ) -> Result<helios_linux::syscall::Credentials, ProgramExecError> {
+            helios_linux::syscall::Credentials::try_for_ids(
+                credentials.uid,
+                credentials.gid,
+                credentials.supplementary_groups,
+            )
+            .map_err(|error| ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidPath,
+                detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(error)),
+            })
+        }
+
+        fn $config_fn(
+            caller_authority: &ProcessAuthority,
+            config: $bindings::helios::system::programs::ContainerConfig,
+        ) -> Result<(ProcessAuthority, crate::ContainerConfig), ProgramExecError> {
+            fn convert_mount(
+                mount: $bindings::helios::system::programs::ContainerMount,
+            ) -> crate::ContainerMountSpec {
+                let mut rights = DirectoryAuthorityRights::empty();
+                for right in mount.rights {
+                    rights |= match right {
+                        $bindings::helios::system::programs::FilesystemRight::Read => {
+                            DirectoryAuthorityRights::READ
+                        }
+                        $bindings::helios::system::programs::FilesystemRight::Write => {
+                            DirectoryAuthorityRights::WRITE
+                        }
+                        $bindings::helios::system::programs::FilesystemRight::MutateDirectory => {
+                            DirectoryAuthorityRights::MUTATE_DIRECTORY
+                        }
+                        $bindings::helios::system::programs::FilesystemRight::Execute => {
+                            DirectoryAuthorityRights::EXECUTE
+                        }
+                    };
+                }
+                let sharing = match mount.sharing {
+                    $bindings::helios::system::programs::ContainerMountSharing::Private => {
+                        crate::MountSharing::Private
+                    }
+                    $bindings::helios::system::programs::ContainerMountSharing::Shared => {
+                        crate::MountSharing::Shared
+                    }
+                };
+                crate::ContainerMountSpec {
+                    source_path: mount.source_path,
+                    target_path: mount.target_path,
+                    rights,
+                    sharing,
+                }
+            }
+
+            if config.capability_grants.iter().any(|grant| {
+                matches!(
+                    grant,
+                    $bindings::helios::system::programs::CapabilityGrant::Directory(_)
+                )
+            }) {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::PermissionDenied,
+                    detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(
+                        "container capability grants cannot include directory grants; configure filesystem access via root and mounts",
+                    )),
+                });
+            }
+            let non_fs_authority = $build_authority(caller_authority, config.capability_grants)?;
+            let hostname = helios_linux::syscall::UtsField::from_configured(&config.hostname)
+                .map_err(|error| ProgramExecError {
+                    kind: ProgramExecErrorKind::InvalidPath,
+                    detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(
+                        error,
+                    )),
+                })?;
+            let domainname = helios_linux::syscall::UtsField::from_configured(&config.domainname)
+                .map_err(|error| ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidPath,
+                detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(error)),
+            })?;
+            let credentials = $creds_fn(config.credentials)?;
+            let container_config = crate::ContainerConfig {
+                root: convert_mount(config.root),
+                mounts: config.mounts.into_iter().map(convert_mount).collect(),
+                shared_owner: crate::SharedOwner {
+                    uid: config.shared_owner.uid,
+                    gid: config.shared_owner.gid,
+                },
+                credentials,
+                hostname,
+                domainname,
+            };
+            Ok((non_fs_authority, container_config))
+        }
+    };
+}
+
+#[cfg(feature = "linux")]
+impl_container_config_conversion!(
+    convert_debugger_container_config,
+    convert_debugger_container_credentials,
+    debugger_bindings,
+    build_debugger_child_authority
+);
+#[cfg(feature = "linux")]
+impl_container_config_conversion!(
+    convert_program_container_config,
+    convert_program_container_credentials,
+    program_bindings,
+    build_program_child_authority
+);
+
 fn require_spawn_authority(
     caller_authority: &ProcessAuthority,
 ) -> Result<SpawnAuthority, crate::ProgramExecError> {
@@ -1033,6 +1494,20 @@ fn require_exec_authority(
     caller_authority
         .derive_exec_authority()
         .map_err(map_process_authority_error)
+}
+
+/// A container creation or AOT compile may be started by a caller that holds
+/// `SPAWN` or `EXEC`; a caller holding neither is refused as `spawn` and
+/// `exec` refuse it.
+#[cfg(feature = "linux")]
+fn require_launch_authority(
+    caller_authority: &ProcessAuthority,
+) -> Result<(), crate::ProgramExecError> {
+    if caller_authority.derive_spawn_authority().is_ok() {
+        Ok(())
+    } else {
+        require_exec_authority(caller_authority).map(|_| ())
+    }
 }
 
 /// A compile may be started by a caller that may spawn or exec; a caller
@@ -1052,13 +1527,17 @@ impl_program_bindings!(
     debugger_bindings,
     convert_launch_result,
     convert_launch_error,
-    build_debugger_child_authority
+    build_debugger_child_authority,
+    convert_debugger_container_config,
+    convert_debugger_container_credentials
 );
 impl_program_bindings!(
     program_bindings,
     convert_program_launch_result,
     convert_program_launch_error,
-    build_program_child_authority
+    build_program_child_authority,
+    convert_program_container_config,
+    convert_program_container_credentials
 );
 
 #[cfg(test)]

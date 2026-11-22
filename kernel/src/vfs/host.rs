@@ -80,6 +80,21 @@ impl<H: HostFileSystem> HostShare<H> {
             gid: node.gid,
         })
     }
+
+    /// The stored Unix ownership and mode bits reported by the host share for
+    /// `path`.
+    pub async fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<UnixAttributes> {
+        let metadata = self
+            .client
+            .stat_path(host_path(path))
+            .await
+            .map_err(fs_error_from_host)?;
+        Ok(UnixAttributes {
+            permissions: metadata.mode & 0o7777,
+            uid: metadata.uid,
+            gid: metadata.gid,
+        })
+    }
 }
 
 pub(crate) fn fs_error_from_host(error: HostFsError) -> FsError {
@@ -474,5 +489,134 @@ mod tests {
             let metadata = metadata_from_host(&host_metadata(identity, 0, mode)).expect("a kind");
             assert_eq!(metadata.kind, kind, "mode {mode:o}");
         }
+    }
+
+    #[test]
+    fn host_share_unix_attributes_returns_stored_mode_uid_and_gid() {
+        use alloc::string::String;
+        use alloc::vec::Vec;
+        use helios_hal::fs::{FsPath, WritePosition};
+
+        use super::{HostCreation, HostFileSystem, HostShare, UnixAttributes};
+        use crate::runtime::{HostDirEntry, HostDirLimit, HostShareRestore};
+
+        #[derive(Clone)]
+        struct StubHost(HostMetadata);
+
+        impl HostFileSystem for StubHost {
+            type Write = core::convert::Infallible;
+
+            fn cache_stats(&self) -> Option<crate::HostFsCacheStats> {
+                None
+            }
+            async fn after_machine_restore(&self, _restore: HostShareRestore) {}
+            async fn prepare_snapshot(&self) {}
+            fn snapshot_finished(&self) {}
+            async fn stat_path(&self, _path: &str) -> Result<HostMetadata, HostFsError> {
+                Ok(self.0.clone())
+            }
+            async fn read_dir(
+                &self,
+                _path: &str,
+                _limit: HostDirLimit,
+            ) -> Result<Vec<HostDirEntry>, HostFsError> {
+                unreachable!()
+            }
+            async fn read_file(&self, _path: &str) -> Result<Vec<u8>, HostFsError> {
+                unreachable!()
+            }
+            async fn read_file_range(
+                &self,
+                _path: &str,
+                _offset: u64,
+                _max_bytes: u32,
+            ) -> Result<Vec<u8>, HostFsError> {
+                unreachable!()
+            }
+            async fn prepare_write(
+                &self,
+                _path: &str,
+                _position: WritePosition,
+                _len: usize,
+            ) -> Result<Self::Write, HostFsError> {
+                unreachable!()
+            }
+            async fn sync_file(&self, _path: &str) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn truncate_file(&self, _path: &str) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn set_file_size(&self, _path: &str, _size: u64) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn set_times(
+                &self,
+                _path: &str,
+                _access_nanos: Option<u64>,
+                _modified_nanos: Option<u64>,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn create_file(
+                &self,
+                _path: &str,
+                _creation: HostCreation,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn create_directory(
+                &self,
+                _path: &str,
+                _creation: HostCreation,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn remove(&self, _path: &str, _directory: bool) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn rename(&self, _source: &str, _destination: &str) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn hard_link(
+                &self,
+                _source: &str,
+                _destination: &str,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn symlink(
+                &self,
+                _target: &str,
+                _link_path: &str,
+                _gid: u32,
+            ) -> Result<(), HostFsError> {
+                unreachable!()
+            }
+            async fn read_link(&self, _path: &str) -> Result<String, HostFsError> {
+                unreachable!()
+            }
+        }
+
+        let mut meta = host_metadata(
+            ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 77),
+            0,
+            0o104_755,
+        );
+        meta.uid = 1234;
+        meta.gid = 5678;
+        let share = HostShare::new(StubHost(meta));
+        let attrs = futures_lite::future::block_on(
+            share.unix_attributes(FsPath::new("suid-tool").unwrap()),
+        )
+        .expect("unix attributes");
+        assert_eq!(
+            attrs,
+            UnixAttributes {
+                permissions: 0o4755,
+                uid: 1234,
+                gid: 5678,
+            }
+        );
     }
 }

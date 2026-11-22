@@ -248,6 +248,7 @@ pub(super) async fn run_program_executable<CpuImpl, Net, StorageImpl>(
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
+    #[cfg(feature = "linux")] container: Option<LinuxContainerLaunch<StorageImpl>>,
     spawner: crate::InstanceSpawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     executable: ProgramExecutable<CpuImpl, Net, StorageImpl>,
@@ -329,14 +330,17 @@ where
             .await
         }
         // A Linux process holds the descriptor table it is handed as its
-        // own, and its standard streams lead where the launch routes them.
+        // own, runs inside its container, and its standard streams lead where
+        // the launch routes them.
         #[cfg(feature = "linux")]
         ProgramExecutable::Linux(executable) => {
+            let launch = container.expect("every Linux launch carries a container");
             run_linux_process(
                 exec_context,
                 argv,
                 env,
-                authority,
+                launch.container,
+                launch.credentials,
                 descriptors,
                 signal_state,
                 spawner,
@@ -1106,6 +1110,36 @@ where
         CoreModuleRunCompletion::Exec(replacement) => {
             let replacement_state = replacement_state
                 .expect("core module without WASIX imports requested exec replacement");
+            #[cfg(feature = "linux")]
+            let replacement_container =
+                if matches!(replacement.executable, ProgramExecutable::Linux(_)) {
+                    let id = replacement_state
+                        .exec_context
+                        .runtime_state
+                        .program_service()
+                        .map(|service| service.allocate_container_id())
+                        .unwrap_or_else(|| {
+                            crate::ContainerId::new(
+                                core::num::NonZeroU64::new(1).expect("nonzero container id"),
+                            )
+                        });
+                    let namespace = replacement.filesystem.as_ref().unwrap_or_else(|| {
+                        replacement_state
+                            .exec_context
+                            .runtime_state
+                            .root_namespace()
+                    });
+                    Some(LinuxContainerLaunch {
+                        container: Arc::new(crate::LinuxContainer::ephemeral(
+                            id,
+                            replacement.authority.clone(),
+                            namespace,
+                        )),
+                        credentials: None,
+                    })
+                } else {
+                    None
+                };
             Box::pin(run_program_executable(
                 replacement_state.exec_context,
                 replacement.argv,
@@ -1115,6 +1149,8 @@ where
                 replacement.descriptors,
                 replacement.signal_state,
                 replacement.signal_dispositions,
+                #[cfg(feature = "linux")]
+                replacement_container,
                 spawner,
                 progress,
                 replacement.executable,

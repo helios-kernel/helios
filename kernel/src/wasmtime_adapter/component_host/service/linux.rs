@@ -313,11 +313,14 @@ where
     output_mode: OutputMode,
     launched_instance: crate::RegisteredInstance,
     signal_state: WasixSignalState,
+    container: Arc<crate::LinuxContainer<StorageImpl>>,
+    /// Keeps this process's container-local PID reserved until every thread
+    /// task has exited and dropped `LinuxShared`.
+    _process_guard: crate::ContainerProcessGuard,
     grants: LinuxGrants,
     /// The process's view of wall time, which `clock_settime` moves as
     /// WASIX's `clock_time_set` moves a program's. Never held across `.await`.
     clock: spin::Mutex<crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>>,
-    instances: crate::InstanceRegistry,
     abi: Abi,
     registers: abi::SystemCallRegisters,
     user: VirtRange,
@@ -577,11 +580,29 @@ where
     }
 
     fn process_count(&self) -> u32 {
-        u32::try_from(self.shared.instances.count()).unwrap_or(u32::MAX)
+        self.shared.container.process_count()
     }
 
     fn kernel_version(&self) -> &str {
         concat!("#1 Helios ", env!("CARGO_PKG_VERSION"))
+    }
+
+    fn hostname(&self) -> syscall::UtsField {
+        self.shared.container.hostname()
+    }
+
+    fn domainname(&self) -> syscall::UtsField {
+        self.shared.container.domainname()
+    }
+
+    fn set_hostname(&mut self, name: syscall::UtsField) -> Result<(), Denied> {
+        self.shared.container.set_hostname(name);
+        Ok(())
+    }
+
+    fn set_domainname(&mut self, name: syscall::UtsField) -> Result<(), Denied> {
+        self.shared.container.set_domainname(name);
+        Ok(())
     }
 }
 
@@ -899,8 +920,9 @@ async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
     }
 }
 
-/// Runs a Linux process to its end: maps `executable`, builds its initial
-/// stack from `argv` and `env`, drives `main` and every thread spawned via
+/// Runs a Linux process inside `container` to its end: maps `executable`,
+/// builds its initial stack from `argv` and `env`, allocates its container-local
+/// PID (starting at 1), drives `main` and every thread spawned via
 /// `clone` / `clone3`, and returns once every thread task has exited and
 /// released the process's resources.
 #[allow(clippy::too_many_arguments)]
@@ -908,7 +930,8 @@ pub(super) async fn run_linux_process<CpuImpl, Net, StorageImpl>(
     exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
     argv: ProgramArgv,
     env: Vec<(String, String)>,
-    authority: ProcessAuthority,
+    container: Arc<crate::LinuxContainer<StorageImpl>>,
+    credentials: Option<syscall::Credentials>,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
     spawner: crate::InstanceSpawner<CpuImpl>,
@@ -998,27 +1021,34 @@ where
         )
         .map_err(native_error)?;
 
-    let pid = u32::try_from(instance_id.raw())
-        .ok()
-        .and_then(NonZeroU32::new)
-        .expect("an instance id is a nonzero process id below 2^32");
+    let process_guard = container.allocate_process().map_err(|_| ProgramExecError {
+        kind: ProgramExecErrorKind::OutOfMemory,
+        detail: ProgramExecErrorDetail::ContainerRefused(crate::RuntimeMessage::of(
+            "container PID namespace exhausted",
+        )),
+    })?;
+    let pid = process_guard.pid();
     let table = match descriptors {
         Some(table) => table.into_slots(),
         None => syscall::standard_streams::<LinuxResources<Net>>(),
     };
-    // The launch hands a process no user or group IDs, so it reports zero
-    // ones; the machine's memory sizes the limits Linux derives from it.
+    let credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
     let process = Process::<LinuxResources<Net>>::with_descriptors(
         executable.abi,
         pid,
         image.program_break(PhysFrame::SIZE as u64),
         table,
         Start {
+            credentials,
             memory_bytes: crate::machine_memory().usable_bytes as u64,
+            futex: container.futex_table().clone(),
+            pids: Some(container.pid_namespace().clone()),
+            memory_id: Some(instance_id.raw()),
             ..Start::default()
         },
     );
     let observer = process.observer();
+    let grants = LinuxGrants::derive(container.authority());
     let shared = Arc::new(LinuxShared {
         cpu: cpu.clone(),
         timer: exec_context.timer.clone(),
@@ -1029,12 +1059,13 @@ where
         output_mode,
         launched_instance,
         signal_state,
-        grants: LinuxGrants::derive(&authority),
+        container,
+        _process_guard: process_guard,
+        grants,
         clock: spin::Mutex::new(crate::KernelClock::new(
             cpu.clone(),
             exec_context.runtime_state.clone(),
         )),
-        instances: exec_context.instance_registry.clone(),
         abi: executable.abi,
         registers: executable.abi.system_call_registers(),
         user,

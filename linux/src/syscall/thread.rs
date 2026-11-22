@@ -4,6 +4,7 @@
 //! Flag rules and argument layouts follow Linux v6.12 (`kernel/fork.c`,
 //! `kernel/sched/syscalls.c` and `kernel/time/posix-timers.c`).
 
+use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -92,6 +93,134 @@ const ESRCH: u64 = 3;
 const E2BIG: u64 = 7;
 const EAGAIN: u64 = 11;
 
+struct PidNamespaceState {
+    next_pid: u32,
+    allocated: BTreeSet<u32>,
+    live_processes: u32,
+}
+
+impl PidNamespaceState {
+    fn allocate_raw(&mut self) -> Result<NonZeroU32, u64> {
+        let mut scanned = 0u32;
+        while scanned < FUTEX_TID_MASK {
+            let candidate = self.next_pid;
+            self.next_pid = if candidate >= FUTEX_TID_MASK {
+                1
+            } else {
+                candidate + 1
+            };
+            scanned += 1;
+            if self.allocated.insert(candidate) {
+                return Ok(NonZeroU32::new(candidate).expect("candidate is in 1..=FUTEX_TID_MASK"));
+            }
+        }
+        Err(EAGAIN)
+    }
+}
+
+/// Container-local PID and TID allocator (`kernel/pid.c`).
+///
+/// Process and thread IDs start at 1 within each container, never collide
+/// across processes or threads inside the container, and are never visible
+/// from another container.
+///
+/// # Concurrency contract
+///
+/// Synchronized by a short synchronous `spin::Mutex`, never held across an
+/// `.await`.
+#[derive(Clone)]
+pub struct PidNamespace {
+    inner: Arc<spin::Mutex<PidNamespaceState>>,
+}
+
+impl core::fmt::Debug for PidNamespace {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let state = self.inner.lock();
+        formatter
+            .debug_struct("PidNamespace")
+            .field("live_processes", &state.live_processes)
+            .field("allocated", &state.allocated.len())
+            .finish()
+    }
+}
+
+impl Default for PidNamespace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PidNamespace {
+    /// A fresh PID namespace whose first process receives PID 1.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(spin::Mutex::new(PidNamespaceState {
+                next_pid: 1,
+                allocated: BTreeSet::new(),
+                live_processes: 0,
+            })),
+        }
+    }
+
+    /// A private namespace seeded with one process `leader`, for standalone
+    /// tests that construct [`Process`] without a container.
+    pub(super) fn standalone(leader: NonZeroU32) -> Self {
+        let next_pid = leader
+            .get()
+            .checked_add(1)
+            .filter(|&id| id <= FUTEX_TID_MASK)
+            .unwrap_or(1);
+        let mut allocated = BTreeSet::new();
+        allocated.insert(leader.get());
+        Self {
+            inner: Arc::new(spin::Mutex::new(PidNamespaceState {
+                next_pid,
+                allocated,
+                live_processes: 1,
+            })),
+        }
+    }
+
+    /// Allocates a new process (thread-group leader) ID starting at 1 and
+    /// increments the container's live process count.
+    pub fn allocate_process(&self) -> Result<NonZeroU32, u64> {
+        let mut state = self.inner.lock();
+        let pid = state.allocate_raw()?;
+        state.live_processes = state.live_processes.saturating_add(1);
+        Ok(pid)
+    }
+
+    /// Releases a process (thread-group leader) ID once every thread of the
+    /// process has exited and decrements the container's live process count.
+    pub fn release_process(&self, pid: NonZeroU32) {
+        let mut state = self.inner.lock();
+        if state.allocated.remove(&pid.get()) {
+            state.live_processes = state.live_processes.saturating_sub(1);
+        }
+    }
+
+    /// Allocates a thread ID inside this namespace for a cloned thread.
+    pub fn allocate_tid(&self) -> Result<NonZeroU32, u64> {
+        self.inner.lock().allocate_raw()
+    }
+
+    /// Releases a non-leader thread ID when the thread exits.
+    pub fn release_tid(&self, tid: NonZeroU32) {
+        self.inner.lock().allocated.remove(&tid.get());
+    }
+
+    /// Whether `pid` is currently live in this namespace.
+    pub fn contains(&self, pid: u32) -> bool {
+        self.inner.lock().allocated.contains(&pid)
+    }
+
+    /// Number of live processes (thread groups) in this namespace, as
+    /// `sysinfo().procs` reports.
+    pub fn process_count(&self) -> u32 {
+        self.inner.lock().live_processes
+    }
+}
+
 struct LiveThread {
     tid: NonZeroU32,
     robust_list: Arc<AtomicU64>,
@@ -99,7 +228,8 @@ struct LiveThread {
 
 /// Shared membership and termination state of one Linux thread group.
 pub(super) struct ThreadGroup {
-    next_tid: u32,
+    leader: NonZeroU32,
+    pids: PidNamespace,
     live: Vec<LiveThread>,
     /// Closed once `exit_group`, a fatal signal, a fault or an owner kill
     /// condemns the thread group; no further threads are admitted.
@@ -113,14 +243,10 @@ pub(super) struct ThreadGroup {
 }
 
 impl ThreadGroup {
-    pub(super) fn new(leader: NonZeroU32, robust_list: Arc<AtomicU64>) -> Self {
-        let next_tid = leader
-            .get()
-            .checked_add(1)
-            .filter(|&id| id <= FUTEX_TID_MASK)
-            .unwrap_or(1);
+    pub(super) fn new(leader: NonZeroU32, pids: PidNamespace, robust_list: Arc<AtomicU64>) -> Self {
         Self {
-            next_tid,
+            leader,
+            pids,
             live: vec![LiveThread {
                 tid: leader,
                 robust_list,
@@ -157,38 +283,27 @@ impl ThreadGroup {
 
     /// Admits a new thread into the group, enforcing `max_threads`
     /// (`RLIMIT_NPROC`) and allocating a unique nonzero TID within
-    /// `FUTEX_TID_MASK`.
+    /// `FUTEX_TID_MASK` from the container's PID namespace.
     pub(super) fn admit(
         &mut self,
-        tgid: NonZeroU32,
+        _tgid: NonZeroU32,
         max_threads: u64,
         robust_list: Arc<AtomicU64>,
     ) -> Result<NonZeroU32, u64> {
         if self.closed || self.live.len() as u64 >= max_threads {
             return Err(EAGAIN);
         }
-        let mut scanned = 0u32;
-        while scanned < FUTEX_TID_MASK {
-            let candidate = self.next_tid;
-            self.next_tid = if candidate >= FUTEX_TID_MASK {
-                1
-            } else {
-                candidate + 1
-            };
-            scanned += 1;
-            if candidate == tgid.get() || self.contains(candidate) {
-                continue;
-            }
-            let tid = NonZeroU32::new(candidate).expect("candidate is in 1..=FUTEX_TID_MASK");
-            self.live.push(LiveThread { tid, robust_list });
-            return Ok(tid);
-        }
-        Err(EAGAIN)
+        let tid = self.pids.allocate_tid()?;
+        self.live.push(LiveThread { tid, robust_list });
+        Ok(tid)
     }
 
     pub(super) fn withdraw(&mut self, tid: NonZeroU32) -> bool {
         if let Some(pos) = self.live.iter().position(|thread| thread.tid == tid) {
             self.live.swap_remove(pos);
+            if tid != self.leader {
+                self.pids.release_tid(tid);
+            }
         }
         self.live.is_empty()
     }

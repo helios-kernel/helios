@@ -22,9 +22,13 @@ mod thread;
 pub use crate::abi::{Abi, Operation};
 pub use io::Clock;
 pub use system::{
-    Credentials, Ids, MemoryTotals, NR_OPEN_DEFAULT, RELEASE, RLIM_INFINITY, Resource, Rlimit,
-    Start, System,
+    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_KILL,
+    CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_BROADCAST, CAP_NET_RAW, CAP_SETGID, CAP_SETUID,
+    CAP_SYS_ADMIN, CAP_SYS_CHROOT, CAP_SYS_NICE, CAP_SYS_RESOURCE, CAP_SYS_TIME, Credentials,
+    CredentialsError, Ids, LinuxCapabilities, MemoryTotals, NGROUPS_MAX, NR_OPEN_DEFAULT, RELEASE,
+    RLIM_INFINITY, Resource, Rlimit, Start, System, UTS_FIELD_MAX, UtsField, UtsNameError,
 };
+pub use thread::PidNamespace;
 
 /// The platform objects a process's descriptors can hold besides the UNIX
 /// objects `helios-unix` owns (pipes, eventfds, epoll sets, sockets): the
@@ -386,6 +390,11 @@ impl<R: Resources> Process<R> {
     ) -> Self {
         let open_files = descriptors.limit;
         let futex = start.futex.clone();
+        let pids = start
+            .pids
+            .clone()
+            .unwrap_or_else(|| PidNamespace::standalone(id));
+        let memory_id = ProcessMemoryIdentity::new(start.memory_id.unwrap_or(u64::from(id.get())));
         let mut initial_stdin_carry = Bytes::new();
         for slot in descriptors.entries.iter_mut().flatten() {
             if let Descriptor::<R>::Stdin { carry } = &mut slot.descriptor
@@ -397,14 +406,14 @@ impl<R: Resources> Process<R> {
         }
         let robust_list = Arc::new(AtomicU64::new(0));
         let lifecycle = Arc::new(GroupLifecycle {
-            threads: spin::Mutex::new(thread::ThreadGroup::new(id, robust_list.clone())),
+            threads: spin::Mutex::new(thread::ThreadGroup::new(id, pids, robust_list.clone())),
             changed: Notify::new(),
         });
         Self {
             shared: Arc::new(ProcessShared {
                 abi,
                 identity: ProcessIdentity::new(id.into()),
-                memory_id: ProcessMemoryIdentity::new(u64::from(id.get())),
+                memory_id,
                 futex,
                 descriptors: spin::Mutex::new(descriptors),
                 stdin_lock: RawMutex::new(),
@@ -621,11 +630,30 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
         }
         Operation::ClockGettime => system::clock_gettime(arguments, memory, output),
         Operation::ClockGetres => system::clock_getres(arguments, memory),
-        Operation::ClockSettime => system::clock_settime(arguments, memory, output),
+        Operation::ClockSettime => {
+            let has_cap = process
+                .shared
+                .attributes
+                .lock()
+                .credentials
+                .capabilities
+                .has_effective(CAP_SYS_TIME);
+            system::clock_settime(arguments, has_cap, memory, output)
+        }
         Operation::Gettimeofday => system::gettimeofday(arguments, memory, output),
         Operation::Time => system::time(arguments, memory, output),
         Operation::Getrandom => system::getrandom(arguments, memory, output).await,
         Operation::Uname => system::uname(abi, arguments, memory, output),
+        operation @ (Operation::Sethostname | Operation::Setdomainname) => {
+            let has_cap = process
+                .shared
+                .attributes
+                .lock()
+                .credentials
+                .capabilities
+                .has_effective(CAP_SYS_ADMIN);
+            system::set_uts_name(operation, has_cap, arguments, memory, output)
+        }
         Operation::Sysinfo => system::sysinfo(arguments, memory, output),
         operation @ (Operation::Getuid
         | Operation::Geteuid
@@ -641,6 +669,48 @@ pub async fn dispatch<R: Resources, M: VirtualMemory, T: Thread<R>, O: Stdio + C
             let credentials = process.shared.attributes.lock().credentials.clone();
             credentials.resolve(abi.operation(call.number), arguments, memory)
         }
+        Operation::Setuid => process
+            .shared
+            .attributes
+            .lock()
+            .credentials
+            .setuid(arguments),
+        Operation::Setgid => process
+            .shared
+            .attributes
+            .lock()
+            .credentials
+            .setgid(arguments),
+        Operation::Setreuid => process
+            .shared
+            .attributes
+            .lock()
+            .credentials
+            .setreuid(arguments),
+        Operation::Setregid => process
+            .shared
+            .attributes
+            .lock()
+            .credentials
+            .setregid(arguments),
+        Operation::Setresuid => process
+            .shared
+            .attributes
+            .lock()
+            .credentials
+            .setresuid(arguments),
+        Operation::Setresgid => process
+            .shared
+            .attributes
+            .lock()
+            .credentials
+            .setresgid(arguments),
+        Operation::Setgroups => process
+            .shared
+            .attributes
+            .lock()
+            .credentials
+            .setgroups(arguments, memory),
         operation @ (Operation::Prlimit64 | Operation::Getrlimit | Operation::Setrlimit) => {
             process.rlimit(operation, arguments, memory)
         }

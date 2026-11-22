@@ -3601,6 +3601,8 @@ where
                 filesystem,
                 descriptors,
                 signal_dispositions,
+                #[cfg(feature = "linux")]
+                container: None,
                 timeline: trace.timeline().for_task(),
             },
             prepared_io.output_mode,

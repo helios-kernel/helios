@@ -17,6 +17,7 @@ pub mod debugger {
             exports: { default: async },
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
+                "helios:system/programs.container": crate::ContainerHandle,
                 "helios:system/serial.serial-port": crate::ComponentSerialPort,
                 "helios:system/vsock.vsock-stream": crate::wasmtime_adapter::component_host::ComponentVsockStream,
                 "helios:system/vsock.vsock-listener": crate::wasmtime_adapter::component_host::ComponentVsockListener,
@@ -52,6 +53,7 @@ pub mod program {
             exports: { default: async },
             with: {
                 "helios:system/programs.child": crate::ChildHandle,
+                "helios:system/programs.container": crate::ContainerHandle,
                 "helios:system/serial.serial-port": crate::ComponentSerialPort,
                 "helios:system/vsock.vsock-stream": crate::wasmtime_adapter::component_host::ComponentVsockStream,
                 "helios:system/vsock.vsock-listener": crate::wasmtime_adapter::component_host::ComponentVsockListener,
