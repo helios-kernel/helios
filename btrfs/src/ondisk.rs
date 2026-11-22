@@ -66,7 +66,6 @@ pub(crate) mod objectid {
 /// Item types the read path consults.
 pub(crate) mod item_type {
     pub(crate) const INODE_ITEM: u8 = 1;
-    #[cfg(feature = "write")]
     pub(crate) const INODE_REF: u8 = 12;
     #[cfg(feature = "write")]
     pub(crate) const INODE_EXTREF: u8 = 13;
@@ -76,6 +75,7 @@ pub(crate) mod item_type {
     pub(crate) const EXTENT_DATA: u8 = 108;
     pub(crate) const EXTENT_CSUM: u8 = 128;
     pub(crate) const ROOT_ITEM: u8 = 132;
+    pub(crate) const ROOT_BACKREF: u8 = 144;
     #[cfg(feature = "write")]
     pub(crate) const EXTENT_ITEM: u8 = 168;
     #[cfg(feature = "write")]
@@ -333,6 +333,15 @@ pub(crate) struct RawRootTail {
     pub(crate) reserved: [U64; 8],
 }
 
+/// `btrfs_root_ref`, followed by the entry name in the parent directory.
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+#[repr(C)]
+pub(crate) struct RawRootRef {
+    pub(crate) dirid: U64,
+    pub(crate) sequence: U64,
+    pub(crate) name_len: U16,
+}
+
 /// `btrfs_dir_item`, without its trailing name and data.
 #[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 #[repr(C)]
@@ -408,6 +417,7 @@ const _: () = {
     assert!(size_of::<RawInodeItem>() == 160);
     assert!(size_of::<RawRootItem>() == 239);
     assert!(size_of::<RawRootTail>() == 200);
+    assert!(size_of::<RawRootRef>() == 18);
     assert!(size_of::<RawDirItem>() == 30);
     assert!(size_of::<RawFileExtentHead>() == 21);
     assert!(size_of::<RawFileExtentBody>() == 32);

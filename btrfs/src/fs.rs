@@ -14,6 +14,7 @@ use crate::csum::name_hash;
 use crate::error::{Error, FileKind, ItemDefect};
 use crate::items::{
     DirRecord, EntryTarget, Metadata, RecordKind, RootRecord, dir_index_record, dir_records,
+    root_backref_dirid,
 };
 use crate::key::Key;
 use crate::ondisk::{NAME_MAX, SYMLINK_MAX, item_type, objectid};
@@ -375,10 +376,7 @@ impl<S: BlockSource> Filesystem<S> {
             Cursor::ceiling(&nodes, self.snapshot.root_tree, Key::new(0, 0, 0)).await?;
         let mut previous: Option<(u64, u64)> = None;
         while let (Some(key), Some(item)) = (cursor.key(), cursor.item()) {
-            if key.item_type == item_type::ROOT_ITEM
-                && (key.objectid == objectid::FS_TREE
-                    || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&key.objectid))
-            {
+            if key.item_type == item_type::ROOT_ITEM && is_subvolume(key.objectid) {
                 let record = RootRecord::parse(key, item, self.volume.superblock().sectorsize())
                     .map_err(|defect| Error::Item {
                         tree: self.snapshot.root_tree.tree,
@@ -422,9 +420,56 @@ impl<S: BlockSource> Filesystem<S> {
     /// that holds an inode's identity across views and needs its current
     /// state, such as a network or FUSE server.
     pub async fn inode(&self, tree: u64, number: u64) -> Result<Inode, Error> {
+        if !is_subvolume(tree) {
+            return Err(Error::MissingRoot { tree });
+        }
         let nodes = self.snapshot.nodes(&self.volume);
         let record = self.snapshot.find_root(&nodes, tree).await?;
         self.load_inode(record.root, number, &self.snapshot).await
+    }
+
+    /// The parent directory of `dir`, or `None` when `dir` is the mount's root
+    /// directory or has no parent reference.
+    pub async fn parent(&self, dir: &Inode) -> Result<Option<Inode>, Error> {
+        dir.expect_kind(FileKind::Directory)?;
+        let default_root = dir.snapshot.default_subvolume;
+        if dir.root.tree == default_root.root.tree && dir.number == default_root.root_dirid {
+            return Ok(None);
+        }
+        let nodes = dir.snapshot.nodes(&self.volume);
+        let key = Key::new(dir.number, item_type::INODE_REF, 0);
+        let cursor = Cursor::ceiling(&nodes, dir.root, key).await?;
+        let Some(found) = cursor
+            .key()
+            .filter(|k| k.is(dir.number, item_type::INODE_REF))
+        else {
+            return Ok(None);
+        };
+        if found.offset != dir.number {
+            return self
+                .load_inode(dir.root, found.offset, &dir.snapshot)
+                .await
+                .map(Some);
+        }
+        // A subvolume root's `INODE_REF` points to itself; its parent lives in
+        // the root tree's `ROOT_BACKREF` item.
+        let backref_key = Key::new(dir.root.tree, item_type::ROOT_BACKREF, 0);
+        let cursor = Cursor::ceiling(&nodes, dir.snapshot.root_tree, backref_key).await?;
+        let (Some(found), Some(item)) = (cursor.key(), cursor.item()) else {
+            return Ok(None);
+        };
+        if !found.is(dir.root.tree, item_type::ROOT_BACKREF) {
+            return Ok(None);
+        }
+        let parent_inode = root_backref_dirid(item).map_err(|defect| Error::Item {
+            tree: dir.snapshot.root_tree.tree,
+            key: found,
+            defect,
+        })?;
+        let record = dir.snapshot.find_root(&nodes, found.offset).await?;
+        self.load_inode(record.root, parent_inode, &dir.snapshot)
+            .await
+            .map(Some)
     }
 
     async fn load_inode(
@@ -818,9 +863,7 @@ async fn default_subvolume<S: BlockSource>(
         Some(record) => record.location.objectid,
         None => objectid::FS_TREE,
     };
-    let is_subvolume =
-        tree == objectid::FS_TREE || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&tree);
-    if !is_subvolume {
+    if !is_subvolume(tree) {
         return Err(Error::Item {
             tree: objectid::ROOT_TREE,
             key,
@@ -828,6 +871,11 @@ async fn default_subvolume<S: BlockSource>(
         });
     }
     Ok(tree)
+}
+
+/// Whether `tree` is a subvolume tree id (`FS_TREE` or a free objectid).
+pub(crate) fn is_subvolume(tree: u64) -> bool {
+    tree == objectid::FS_TREE || (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(&tree)
 }
 
 #[cfg(all(test, feature = "write"))]

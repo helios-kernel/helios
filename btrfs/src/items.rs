@@ -8,7 +8,7 @@ use crate::error::{Compression, FileKind, ItemDefect};
 use crate::key::Key;
 use crate::ondisk::{
     MAX_COMPRESSED_EXTENT, MAX_LEVEL, NAME_MAX, RawDirItem, RawFileExtentBody, RawFileExtentHead,
-    RawInodeItem, RawRootItem, RawTimespec, item_type, view,
+    RawInodeItem, RawRootItem, RawRootRef, RawTimespec, item_type, view,
 };
 use crate::tree::TreeRoot;
 
@@ -273,6 +273,27 @@ impl RootRecord {
             root_dirid: raw.root_dirid.get(),
         })
     }
+}
+
+/// The parent directory inode id recorded in a `ROOT_BACKREF` item.
+pub(crate) fn root_backref_dirid(payload: &[u8]) -> Result<u64, ItemDefect> {
+    let header_bytes = size_of::<RawRootRef>();
+    let raw: &RawRootRef = view(payload).ok_or(ItemDefect::Size {
+        needed: header_bytes,
+        found: payload.len(),
+    })?;
+    let name_len = usize::from(raw.name_len.get());
+    if name_len == 0 || name_len > NAME_MAX {
+        return Err(ItemDefect::NameLength(name_len));
+    }
+    let needed = header_bytes + name_len;
+    if payload.len() != needed {
+        return Err(ItemDefect::Size {
+            needed,
+            found: payload.len(),
+        });
+    }
+    Ok(raw.dirid.get())
 }
 
 /// What a file extent item stores for its range.
