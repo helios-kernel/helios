@@ -1,5 +1,13 @@
-//! Per-inode write leases keep append rounds contiguous without parking the
-//! mount service or excluding writes to unrelated inodes.
+//! Staged multi-round writes over a writable btrfs mount.
+//!
+//! # Concurrency contract
+//!
+//! Lookup of an inode's write mutex takes a short `spin::Mutex` on the mount's
+//! lease table (never held across `.await`), and the entry is removed on drop
+//! when no other handle references it. The first `submit` acquires that
+//! inode's async `RawMutex` and holds the owned lease across all remaining
+//! rounds of the write, keeping append and multi-round offsets contiguous while
+//! allowing writes to other inodes and snapshot reads to proceed concurrently.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc as MutexArc;

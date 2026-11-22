@@ -200,40 +200,53 @@ impl<S: crate::source::BlockSink> Volume<S> {
         bytes: &[u8],
         concurrency: core::num::NonZeroUsize,
     ) -> Result<(), crate::tree::write::WriteError> {
+        self.stage_pieces(logical, &[bytes], concurrency).await
+    }
+
+    /// [`Self::stage`] for an allocation whose bytes are `pieces` laid end
+    /// to end, each a whole number of blocks.
+    pub(crate) async fn stage_pieces<P: AsRef<[u8]> + Sync>(
+        &self,
+        logical: u64,
+        pieces: &[P],
+        concurrency: core::num::NonZeroUsize,
+    ) -> Result<(), crate::tree::write::WriteError> {
         use crate::source::{PendingWrites, READ_ALIGNMENT};
         use crate::tree::write::WriteError;
 
-        if bytes.is_empty()
+        let length: usize = pieces.iter().map(|piece| piece.as_ref().len()).sum();
+        if length == 0
             || !logical.is_multiple_of(READ_ALIGNMENT)
-            || !bytes.len().is_multiple_of(READ_ALIGNMENT as usize)
+            || pieces
+                .iter()
+                .any(|piece| !piece.as_ref().len().is_multiple_of(READ_ALIGNMENT as usize))
         {
             return Err(WriteError::StagingRange {
                 logical,
-                bytes: bytes.len(),
+                bytes: length,
             });
         }
-        let copies = self.chunks().map(logical, bytes.len() as u64)?;
+        let copies = self.chunks().map(logical, length as u64)?;
         let mut writes = PendingWrites::new(concurrency);
         for physical in copies {
-            for (index, bytes) in bytes
-                .as_chunks::<{ READ_ALIGNMENT as usize }>()
-                .0
-                .iter()
-                .enumerate()
-            {
-                let offset = physical + index as u64 * READ_ALIGNMENT;
-                writes
-                    .push(async move {
-                        self.source
-                            .stage(offset / READ_ALIGNMENT, bytes)
-                            .await
-                            .map_err(|source| Error::Io {
-                                offset,
-                                len: bytes.len(),
-                                source,
-                            })
-                    })
-                    .await?;
+            let mut next = physical;
+            for piece in pieces {
+                for bytes in piece.as_ref().as_chunks::<{ READ_ALIGNMENT as usize }>().0 {
+                    let offset = next;
+                    next += READ_ALIGNMENT;
+                    writes
+                        .push(async move {
+                            self.source
+                                .stage(offset / READ_ALIGNMENT, bytes)
+                                .await
+                                .map_err(|source| Error::Io {
+                                    offset,
+                                    len: bytes.len(),
+                                    source,
+                                })
+                        })
+                        .await?;
+                }
             }
         }
         writes.finish().await?;

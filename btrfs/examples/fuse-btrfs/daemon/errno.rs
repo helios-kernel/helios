@@ -113,7 +113,6 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::Space(SpaceError::NotFree { .. }) => defect("Space::NotFree", error),
         WriteError::ForeignHandle => defect("ForeignHandle", error),
         WriteError::Encode(_) => defect("Encode", error),
-        WriteError::CompressionWithoutChecksums => defect("CompressionWithoutChecksums", error),
         WriteError::NamespaceMismatch { .. } => defect("NamespaceMismatch", error),
         WriteError::NotRegularExtent { .. } => defect("NotRegularExtent", error),
         WriteError::WriterPoisoned => defect("WriterPoisoned", error),

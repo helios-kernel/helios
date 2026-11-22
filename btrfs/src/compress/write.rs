@@ -32,24 +32,9 @@ pub struct Encoded<'a> {
 }
 
 pub trait Encoder: Send {
-    const ALGORITHM: Option<Compression>;
+    const ALGORITHM: Compression;
     /// None means that this encoding cannot save space for the supplied input.
     fn encode(&mut self, input: &[u8], sector: usize) -> Result<Option<Encoded<'_>>, EncodeError>;
-}
-
-impl<E: Encoder> Encoder for &mut E {
-    const ALGORITHM: Option<Compression> = E::ALGORITHM;
-    fn encode(&mut self, input: &[u8], sector: usize) -> Result<Option<Encoded<'_>>, EncodeError> {
-        E::encode(self, input, sector)
-    }
-}
-
-pub struct Plain;
-impl Encoder for Plain {
-    const ALGORITHM: Option<Compression> = None;
-    fn encode(&mut self, _: &[u8], _: usize) -> Result<Option<Encoded<'_>>, EncodeError> {
-        Ok(None)
-    }
 }
 
 pub struct Zlib {
@@ -75,7 +60,7 @@ impl Zlib {
 }
 
 impl Encoder for Zlib {
-    const ALGORITHM: Option<Compression> = Some(Compression::Zlib);
+    const ALGORITHM: Compression = Compression::Zlib;
     fn encode(&mut self, input: &[u8], _: usize) -> Result<Option<Encoded<'_>>, EncodeError> {
         self.state.reset();
         self.output.clear();
@@ -121,7 +106,7 @@ impl Default for Lzo {
 }
 
 impl Encoder for Lzo {
-    const ALGORITHM: Option<Compression> = Some(Compression::Lzo);
+    const ALGORITHM: Compression = Compression::Lzo;
     fn encode(&mut self, input: &[u8], sector: usize) -> Result<Option<Encoded<'_>>, EncodeError> {
         // Btrfs LZO wraps each sector's stream in a little-endian u32 length.
         // The container starts with its total length, including these headers.
@@ -171,7 +156,7 @@ impl Zstd {
 }
 
 impl Encoder for Zstd {
-    const ALGORITHM: Option<Compression> = Some(Compression::Zstd);
+    const ALGORITHM: Compression = Compression::Zstd;
     fn encode(&mut self, input: &[u8], _: usize) -> Result<Option<Encoded<'_>>, EncodeError> {
         // A frame as large as its input cannot save a sector. Bound the output
         // to that size instead of allocating space for an expanded frame.

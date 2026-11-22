@@ -1,26 +1,32 @@
 //! Mounts a btrfs block device through FUSE and serves it with the writer.
 
+mod control;
 mod device;
 mod errno;
 mod filesystem;
 mod inodes;
+mod remount;
 mod state;
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use fuser::{Config, MountOption, Session, SessionACL};
 use helios_btrfs::write::WriteError;
 use thiserror::Error;
 use tracing::info;
 
-use device::{Device, Hold};
+use crate::options::{AtimeMode, MountOptions, SyncMode};
+
+use control::ControlServer;
+use device::{Claim, Hold};
 use filesystem::Daemon;
-use state::State;
+use state::{SharedState, State};
 
 /// `mount(8)` exit code for incorrect invocation (`MNT_EX_USAGE` in
 /// `util-linux`'s `include/mount-api-utils.h`).
@@ -32,6 +38,8 @@ const MNT_EX_FAIL: u8 = 32;
 
 #[derive(Debug, Error)]
 pub enum OpenError {
+    #[error(transparent)]
+    Device(#[from] io::Error),
     #[error(transparent)]
     Write(#[from] WriteError),
     #[error(transparent)]
@@ -62,6 +70,10 @@ pub enum Error {
         path: PathBuf,
         source: io::Error,
     },
+    #[error("binding the control socket for {path}: {source}")]
+    Control { path: PathBuf, source: io::Error },
+    #[error("remounting {path}: {detail}")]
+    Remount { path: PathBuf, detail: String },
     #[error("leaving the caller's working directory: {0}")]
     WorkingDirectory(io::Error),
     #[error("announcing the mount on stdout: {0}")]
@@ -80,6 +92,8 @@ impl Error {
             | Self::Open { .. }
             | Self::Parallelism(_)
             | Self::Mount { .. }
+            | Self::Control { .. }
+            | Self::Remount { .. }
             | Self::WorkingDirectory(_)
             | Self::Announce(_)
             | Self::Serve(_) => MNT_EX_FAIL,
@@ -91,7 +105,7 @@ impl Error {
     }
 
     /// The diagnostic line `mount.fuse.helios-btrfs` forwards to `mount(8)`'s
-    /// stderr when startup fails before the mount is up.
+    /// stderr when startup or remount fails.
     fn mount_diagnostic(&self) -> String {
         match self {
             // Matches util-linux's `mount(8)` message for `EBUSY`
@@ -113,23 +127,32 @@ impl Error {
                     path.display(),
                 )
             }
+            Self::Remount { detail, .. } => detail.clone(),
             other => format!("mount.fuse.helios-btrfs: {other}"),
         }
     }
 }
 
-struct Arguments {
-    source_spec: PathBuf,
-    target_spec: PathBuf,
-    device: PathBuf,
-    mountpoint: PathBuf,
-    read_only: bool,
-    mount_options: Vec<MountOption>,
+enum Invocation {
+    Mount {
+        source_spec: PathBuf,
+        target_spec: PathBuf,
+        device: PathBuf,
+        mountpoint: PathBuf,
+        read_only: bool,
+        mount_options: Vec<MountOption>,
+    },
+    Remount {
+        source_spec: PathBuf,
+        target_spec: PathBuf,
+        mountpoint: PathBuf,
+        options: MountOptions,
+    },
 }
 
 /// `fuse-btrfs <block-device> <mountpoint> [-o option[,option...]]`, the
 /// shape `mount(8)` gives a `mount.<type>` helper.
-fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Arguments, Error> {
+fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Invocation, Error> {
     let arguments: Vec<OsString> = arguments.into_iter().collect();
     let (device, mountpoint, options) = match arguments.as_slice() {
         [device, mountpoint] => (device, mountpoint, None),
@@ -138,6 +161,21 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Arguments, Err
     };
     let source_spec = PathBuf::from(device);
     let target_spec = PathBuf::from(mountpoint);
+    let raw_options = options.map(|options| options.to_string_lossy().into_owned());
+    let parsed_options = MountOptions::parse(raw_options.as_deref()).map_err(Error::Option)?;
+    let mountpoint = std::fs::canonicalize(&target_spec).map_err(|source| Error::Mount {
+        device: source_spec.clone(),
+        path: target_spec.clone(),
+        source,
+    })?;
+    if parsed_options.remount {
+        return Ok(Invocation::Remount {
+            source_spec,
+            target_spec,
+            mountpoint,
+            options: parsed_options,
+        });
+    }
     // Resolve `source_spec` to an absolute path without following symlinks for
     // `FSName` so `/proc/self/mountinfo` preserves device-mapper symlinks such
     // as `/dev/mapper/flakey-test.*` that `umount <dev>` matches literally,
@@ -154,42 +192,17 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Arguments, Err
         mountpoint: target_spec.clone(),
         source,
     })?;
-    let mountpoint = std::fs::canonicalize(&target_spec).map_err(|source| Error::Mount {
-        device: source_spec.clone(),
-        path: target_spec.clone(),
-        source,
-    })?;
-    let mut read_only = false;
-    // Block-filesystem defaults (`mount(8)`): `suid`, `dev` and `exec` are on
-    // unless `-o` clears them, whereas fuser's own default sets `MS_NOSUID`
-    // and `MS_NODEV` unless told otherwise. Resolving the final state of each
-    // pair also avoids handing conflicting flags to fuser.
-    let mut suid = true;
-    let mut dev = true;
-    let mut exec = true;
-    let mut atime: Option<bool> = None;
-    let options = options.map(|options| options.to_string_lossy().into_owned());
-    for option in options.iter().flat_map(|options| options.split(',')) {
-        match option {
-            "defaults" => {
-                read_only = false;
-                suid = true;
-                dev = true;
-                exec = true;
-            }
-            "ro" => read_only = true,
-            "rw" => read_only = false,
-            "suid" => suid = true,
-            "nosuid" => suid = false,
-            "dev" => dev = true,
-            "nodev" => dev = false,
-            "exec" => exec = true,
-            "noexec" => exec = false,
-            "atime" => atime = Some(true),
-            "noatime" => atime = Some(false),
-            other => return Err(Error::Option(other.to_owned())),
-        }
-    }
+    Ok(Invocation::Mount {
+        mount_options: fuser_mount_options(&fs_name, &parsed_options),
+        read_only: parsed_options.read_only.unwrap_or(false),
+        source_spec,
+        target_spec,
+        device,
+        mountpoint,
+    })
+}
+
+fn fuser_mount_options(fs_name: &Path, options: &MountOptions) -> Vec<MountOption> {
     // The kernel checks permissions from the modes the filesystem reports, and
     // any user may reach the mount. The mount's type stays plain `fuse`, with
     // no subtype and no `blkdev`: fstests' init_rc refuses a TEST_DEV whose
@@ -198,62 +211,78 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Arguments, Err
     // complete committed tree, and the unmount's commit runs as the session
     // ends: what was written before the unmount is durable once the daemon
     // lets go of its `Hold`.
-    let mut mount_options = vec![
+    //
+    // Block-filesystem defaults (`mount(8)`): `suid`, `dev` and `exec` are on
+    // unless `-o` clears them, whereas fuser's own default sets `MS_NOSUID`
+    // and `MS_NODEV` unless told otherwise.
+    let mut out = vec![
         MountOption::FSName(fs_name.to_string_lossy().into_owned()),
         MountOption::DefaultPermissions,
-        if read_only {
+        if options.read_only.unwrap_or(false) {
             MountOption::RO
         } else {
             MountOption::RW
         },
-        if suid {
+        if options.suid.unwrap_or(true) {
             MountOption::Suid
         } else {
             MountOption::NoSuid
         },
-        if dev {
+        if options.dev.unwrap_or(true) {
             MountOption::Dev
         } else {
             MountOption::NoDev
         },
-        if exec {
+        if options.exec.unwrap_or(true) {
             MountOption::Exec
         } else {
             MountOption::NoExec
         },
     ];
-    match atime {
-        Some(true) => mount_options.push(MountOption::Atime),
-        Some(false) => mount_options.push(MountOption::NoAtime),
-        None => {}
+    if let Some(atime) = options.atime {
+        match atime {
+            AtimeMode::Atime => out.push(MountOption::Atime),
+            AtimeMode::NoAtime => out.push(MountOption::NoAtime),
+            AtimeMode::Relatime
+            | AtimeMode::NoRelatime
+            | AtimeMode::StrictAtime
+            | AtimeMode::NoStrictAtime => {}
+        }
     }
-    Ok(Arguments {
-        source_spec,
-        target_spec,
-        device,
-        mountpoint,
-        read_only,
-        mount_options,
-    })
+    if let Some(sync) = options.sync {
+        out.push(match sync {
+            SyncMode::Sync => MountOption::Sync,
+            SyncMode::Async => MountOption::Async,
+        });
+    }
+    if options.dirsync {
+        out.push(MountOption::DirSync);
+    }
+    out
 }
 
-/// Opens the device, mounts the FUSE session and announces readiness on
-/// stdout. Returning an error drops any `Device` and `Hold` before the caller
+struct Started {
+    session: Session<Daemon>,
+    control: ControlServer,
+    hold: Hold,
+    mountpoint: PathBuf,
+}
+
+/// Opens the device, mounts the FUSE session, binds the control socket and
+/// announces readiness on stdout. Returning an error drops the control server,
+/// session, `Device`/`Claim` and `Hold` in reverse order before the caller
 /// reports the failure to `mount.fuse.helios-btrfs`.
 fn start(
-    arguments: impl IntoIterator<Item = OsString>,
-) -> Result<(Session<Daemon>, Hold, PathBuf), Error> {
-    let Arguments {
-        source_spec,
-        target_spec,
-        device,
-        mountpoint,
-        read_only,
-        mount_options,
-    } = parse(arguments)?;
+    source_spec: PathBuf,
+    target_spec: PathBuf,
+    device: PathBuf,
+    mountpoint: PathBuf,
+    read_only: bool,
+    mount_options: Vec<MountOption>,
+) -> Result<Started, Error> {
     // The claim first: a device another daemon still serves fails here with
     // `EBUSY`, before anything reads it.
-    let block_device = Device::open(&device).map_err(|source| Error::Device {
+    let claim = Claim::open(&device, read_only).map_err(|source| Error::Device {
         path: source_spec.clone(),
         mountpoint: target_spec.clone(),
         source,
@@ -263,52 +292,117 @@ fn start(
         source,
     })?;
     let concurrency = std::thread::available_parallelism().map_err(Error::Parallelism)?;
-    let state =
-        State::open(block_device, concurrency, read_only).map_err(|source| Error::Open {
+    let state = State::open(claim, device.clone(), concurrency, read_only).map_err(|source| {
+        Error::Open {
             path: device.clone(),
             source,
-        })?;
+        }
+    })?;
+    let shared = Arc::new(SharedState::new(state));
     let mut config = Config::default();
     config.mount_options = mount_options;
     config.acl = SessionACL::All;
     // `Session::new` returns once the kernel has completed the INIT
     // handshake, so the mount serves requests from here on.
     let session =
-        Session::new(Daemon::new(state), &mountpoint, &config).map_err(|source| Error::Mount {
-            device: source_spec,
-            path: target_spec,
-            source,
+        Session::new(Daemon::new(Arc::clone(&shared)), &mountpoint, &config).map_err(|source| {
+            Error::Mount {
+                device: source_spec,
+                path: target_spec,
+                source,
+            }
         })?;
+    let control =
+        ControlServer::start(&mountpoint, &device, Arc::clone(&shared)).map_err(|source| {
+            Error::Control {
+                path: mountpoint.clone(),
+                source,
+            }
+        })?;
+    // Drop our local `Arc<SharedState>` so only `session` and `control` retain
+    // references to `State` (and `Claim`/`Device`).
+    drop(shared);
     std::env::set_current_dir("/").map_err(Error::WorkingDirectory)?;
     announce().map_err(Error::Announce)?;
-    info!(device = %device.display(), mountpoint = %mountpoint.display(), "serving");
-    Ok((session, hold, mountpoint))
+    info!(device = %device.display(), mountpoint = %mountpoint.display(), read_only, "serving");
+    Ok(Started {
+        session,
+        control,
+        hold,
+        mountpoint,
+    })
 }
 
-/// Serves the filesystem in the foreground until it is unmounted. Writes one
-/// handshake line to stdout before replacing stdout with `/dev/null`:
-/// `mounted` once the mount is up, or `failed <code> <message>` if startup
-/// failed before then.
+/// Serves the filesystem in the foreground until it is unmounted, or handles
+/// an in-place `-o remount,...` synchronously against the running daemon.
+///
+/// For initial mounts, writes one handshake line to stdout before replacing
+/// stdout with `/dev/null`: `mounted` once the mount is up, or
+/// `failed <code> <message>` if startup failed before then. For remounts,
+/// writes nothing on success or `failed <code> <message>` on failure.
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), Error> {
-    let (session, hold, mountpoint) = match start(arguments) {
-        Ok(started) => started,
+    let invocation = match parse(arguments) {
+        Ok(invocation) => invocation,
         Err(error) => {
-            if !matches!(error, Error::Announce(_)) {
-                let _ = report_startup_failure(&error);
-            }
+            let _ = report_startup_failure(&error);
             return Err(error);
         }
     };
-    // The session ends with the unmount. By then `Filesystem::destroy` has
-    // committed and dropped the filesystem, closing the device, and fuser
-    // has finished its own unmount of the mountpoint, so letting go of the
-    // hold only afterwards keeps that unmount from reaching a mount made
-    // after this one.
-    let served = session.run().map_err(Error::Serve);
-    drop(hold);
-    served?;
-    info!(mountpoint = %mountpoint.display(), "unmounted");
-    Ok(())
+    match invocation {
+        Invocation::Remount {
+            source_spec,
+            target_spec,
+            mountpoint,
+            options,
+        } => {
+            if let Err(error) = remount::run(&source_spec, &target_spec, &mountpoint, &options) {
+                let _ = report_startup_failure(&error);
+                return Err(error);
+            }
+            Ok(())
+        }
+        Invocation::Mount {
+            source_spec,
+            target_spec,
+            device,
+            mountpoint,
+            read_only,
+            mount_options,
+        } => {
+            let Started {
+                session,
+                control,
+                hold,
+                mountpoint,
+            } = match start(
+                source_spec,
+                target_spec,
+                device,
+                mountpoint,
+                read_only,
+                mount_options,
+            ) {
+                Ok(started) => started,
+                Err(error) => {
+                    if !matches!(error, Error::Announce(_)) {
+                        let _ = report_startup_failure(&error);
+                    }
+                    return Err(error);
+                }
+            };
+            // The session ends with the unmount. By then `Filesystem::destroy`
+            // has committed and dropped the filesystem, and fuser has finished
+            // its own unmount of the mountpoint. Shut down the control server
+            // next so its `Arc<SharedState>` (holding `Claim` and `Device`)
+            // drops before `hold` is released for `umount.fuse`.
+            let served = session.run().map_err(Error::Serve);
+            control.shutdown();
+            drop(hold);
+            served?;
+            info!(mountpoint = %mountpoint.display(), "unmounted");
+            Ok(())
+        }
+    }
 }
 
 /// Writes `mounted\n` to stdout for `mount.fuse.helios-btrfs` and redirects
@@ -329,9 +423,9 @@ fn announce() -> io::Result<()> {
     Ok(())
 }
 
-/// Reports a startup failure on stdout so `mount.fuse.helios-btrfs` can write
-/// it to `mount(8)`'s stderr and exit with `mount(8)`'s status code while
-/// `tracing` stays routed to `HELIOS_FUSE_BTRFS_LOG`.
+/// Reports a startup or remount failure on stdout so `mount.fuse.helios-btrfs`
+/// can write it to `mount(8)`'s stderr and exit with `mount(8)`'s status code
+/// while `tracing` stays routed to `HELIOS_FUSE_BTRFS_LOG`.
 fn report_startup_failure(error: &Error) -> io::Result<()> {
     let code = error.exit_status();
     let message = error.mount_diagnostic().replace(['\r', '\n'], " ");

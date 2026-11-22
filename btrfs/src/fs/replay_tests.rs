@@ -26,6 +26,7 @@ use super::writer::Writer;
 use super::{Filesystem, find_root};
 use crate::accounting::Allocation;
 use crate::checksums;
+use crate::compress::policy::Compressor;
 use crate::csum::{inode_ref_hash, name_hash};
 use crate::ondisk::{
     RawDirItem, RawFileExtentBody, RawFileExtentHead, RawInodeExtref, RawInodeItem, RawInodeRef,
@@ -36,13 +37,14 @@ use crate::source::BlockSink;
 use crate::space::Space;
 use crate::superblock::MIRROR_OFFSETS;
 use crate::transaction::Transaction;
-use crate::transaction::file::WriteOptions;
+use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes, Name};
+use crate::transaction::reflink::FileId;
 use crate::transaction::replay::{LogReplayError, PendingLog};
 use crate::tree::edit::{Header, Leaf};
 use crate::tree::write::{MetadataAllocator, WriteError};
 use crate::tree::{Cursor, Expected, Node};
-use crate::{DirPosition, Error, FileKind, Key, Timestamp};
+use crate::{DirBound, DirPosition, Error, FileKind, Key, Timestamp};
 
 /// When the baselines' files were made.
 const WHEN: Timestamp = Timestamp {
@@ -132,14 +134,14 @@ async fn create<S: BlockSink>(
         .await
         .unwrap();
     if let Some(content) = content {
-        let concurrency = std::thread::available_parallelism().unwrap();
         edits
             .write_file(
-                tree,
-                inode,
+                FileId { tree, inode },
                 0,
                 content,
-                WriteOptions::plain(WHEN, concurrency),
+                WHEN,
+                &mut Compressor::Plain,
+                DEFAULT_MAX_INLINE,
             )
             .await
             .unwrap();
@@ -807,7 +809,7 @@ async fn directories(check: bool) {
     let emptied = fs.resolve("/父".as_bytes()).await.unwrap();
     assert_eq!(emptied.metadata().size, 0);
     let mut entries = 0;
-    fs.read_dir(&emptied, DirPosition::START, |_| {
+    fs.read_dir(&emptied, DirPosition::START, DirBound::UNBOUNDED, |_| {
         entries += 1;
         ControlFlow::Continue(())
     })
@@ -1071,6 +1073,7 @@ fn replay_never_allocates_over_a_log_block() {
             fs.snapshot.clone(),
             &mut retirements,
             &allocation,
+            false,
         )
         .await
         .unwrap();

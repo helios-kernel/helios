@@ -1,15 +1,40 @@
-//! The bidirectional map between btrfs inodes and FUSE inode numbers.
+//! The deterministic map between btrfs inodes and FUSE inode numbers.
 //!
-//! The kernel names a file by the `ino` of a past lookup and expects it to
-//! stay valid until it forgets it, so the map outlives any one snapshot or
-//! transaction. An entry holds the writer's [`InodeHandle`] for the inode:
-//! the writer only hands one out through a transaction's lookup or creation,
-//! and a mutation needs one.
+//! Linux FUSE's `fuse_export_operations` encodes `(nodeid, generation)` into
+//! file handles and re-resolves evicted inodes with `FUSE_LOOKUP(nodeid, ".")`,
+//! across both `FUSE_FORGET` (`drop_caches`) and full remount. So `INodeNo` is
+//! derived deterministically from the inode's `(tree, number)` relative to the
+//! mount's root subvolume, never from a sequential counter:
+//!
+//! - The mount's root directory is `INodeNo::ROOT` (`1`).
+//! - Any other inode in the mount's default subvolume keeps its btrfs inode
+//!   number in the low 48 bits (`slot = 0`).
+//! - An inode in any other subvolume encodes its tree id in the high 16 bits
+//!   (`slot = 1` for `FS_TREE`, `slot = 2 + (tree - FIRST_FREE)` for other
+//!   subvolumes) and its inode number in the low 48 bits.
+//!
+//! Every live entry in [`Inodes`] holds the writer's [`InodeHandle`] once
+//! writable, the inode's creation generation and the kernel's outstanding
+//! lookup count.
 
 use std::collections::HashMap;
 
 use fuser::{Errno, INodeNo};
 use helios_btrfs::write::InodeHandle;
+
+/// `BTRFS_FS_TREE_OBJECTID` in `include/uapi/linux/btrfs_tree.h`.
+const FS_TREE: u64 = 5;
+
+/// `BTRFS_FIRST_FREE_OBJECTID` in `include/uapi/linux/btrfs_tree.h`.
+const FIRST_FREE: u64 = 256;
+
+/// Low 48 bits hold the btrfs inode number (up to 2^48 - 1); high 16 bits hold
+/// the subvolume slot.
+const INODE_BITS: u32 = 48;
+const INODE_MASK: u64 = (1 << INODE_BITS) - 1;
+const SLOT_MAX: u64 = u16::MAX as u64;
+const FS_TREE_SLOT: u64 = 1;
+const FIRST_SUBVOL_SLOT: u64 = 2;
 
 /// An inode within its subvolume tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -18,115 +43,188 @@ pub struct Identity {
     pub number: u64,
 }
 
+/// A cached inode that needs a live writer [`InodeHandle`] attached after
+/// upgrading a read-only mount to writable.
+pub struct PendingHandle {
+    pub ino: INodeNo,
+    pub identity: Identity,
+    pub generation: u64,
+}
+
+fn encode_identity(root: Identity, identity: Identity) -> Result<INodeNo, Errno> {
+    if identity == root {
+        return Ok(INodeNo::ROOT);
+    }
+    if identity.number < FIRST_FREE || identity.number > INODE_MASK {
+        return Err(Errno::EOVERFLOW);
+    }
+    let slot = if identity.tree == root.tree {
+        0
+    } else if identity.tree == FS_TREE {
+        FS_TREE_SLOT
+    } else if let Some(offset) = identity.tree.checked_sub(FIRST_FREE) {
+        FIRST_SUBVOL_SLOT
+            .checked_add(offset)
+            .filter(|&slot| slot <= SLOT_MAX)
+            .ok_or(Errno::EOVERFLOW)?
+    } else {
+        return Err(Errno::EIO);
+    };
+    Ok(INodeNo((slot << INODE_BITS) | identity.number))
+}
+
+fn decode_ino(root: Identity, ino: INodeNo) -> Result<Identity, Errno> {
+    if ino == INodeNo::ROOT {
+        return Ok(root);
+    }
+    let slot = ino.0 >> INODE_BITS;
+    let number = ino.0 & INODE_MASK;
+    if number < FIRST_FREE {
+        return Err(Errno::ESTALE);
+    }
+    match slot {
+        0 => {
+            if number == root.number {
+                return Err(Errno::ESTALE);
+            }
+            Ok(Identity {
+                tree: root.tree,
+                number,
+            })
+        }
+        FS_TREE_SLOT => {
+            if root.tree == FS_TREE {
+                return Err(Errno::ESTALE);
+            }
+            Ok(Identity {
+                tree: FS_TREE,
+                number,
+            })
+        }
+        slot => {
+            let tree = FIRST_FREE + (slot - FIRST_SUBVOL_SLOT);
+            if tree == root.tree {
+                return Err(Errno::ESTALE);
+            }
+            Ok(Identity { tree, number })
+        }
+    }
+}
+
 struct Entry {
-    identity: Identity,
-    /// The generation the inode was created in, once a lookup or creation
-    /// has seen it; a directory listing alone does not know it.
-    generation: Option<u64>,
+    generation: u64,
     handle: Option<InodeHandle>,
     /// Lookups the kernel has not yet forgotten.
     lookups: u64,
 }
 
 pub struct Inodes {
-    by_identity: HashMap<Identity, u64>,
+    root: Identity,
     entries: HashMap<u64, Entry>,
-    next: u64,
 }
 
 impl Inodes {
-    pub fn new(root: Identity, generation: u64, handle: InodeHandle) -> Self {
-        let mut inodes = Self {
-            by_identity: HashMap::new(),
-            entries: HashMap::new(),
-            next: INodeNo::ROOT.0 + 1,
-        };
-        inodes.by_identity.insert(root, INodeNo::ROOT.0);
-        inodes.entries.insert(
+    pub fn new(root: Identity, generation: u64, handle: Option<InodeHandle>) -> Self {
+        let mut entries = HashMap::new();
+        entries.insert(
             INodeNo::ROOT.0,
             Entry {
-                identity: root,
-                generation: Some(generation),
-                handle: Some(handle),
+                generation,
+                handle,
                 // The kernel never forgets the root.
                 lookups: 1,
             },
         );
-        inodes
+        Self { root, entries }
+    }
+
+    pub fn encode(&self, identity: Identity) -> Result<INodeNo, Errno> {
+        encode_identity(self.root, identity)
+    }
+
+    pub fn decode(&self, ino: INodeNo) -> Result<Identity, Errno> {
+        decode_ino(self.root, ino)
+    }
+
+    /// Cached entries that still need a writer [`InodeHandle`] after upgrading
+    /// a read-only mount to writable.
+    pub fn pending_handles(&self) -> Vec<PendingHandle> {
+        self.entries
+            .iter()
+            .filter_map(|(&ino, entry)| {
+                if entry.handle.is_some() {
+                    return None;
+                }
+                let ino = INodeNo(ino);
+                let identity = self.decode(ino).expect("recorded ino decodes");
+                Some(PendingHandle {
+                    ino,
+                    identity,
+                    generation: entry.generation,
+                })
+            })
+            .collect()
+    }
+
+    /// Attaches a live writer [`InodeHandle`] to `ino` after upgrading a
+    /// read-only mount to a writable [`helios_btrfs::write::Writer`].
+    pub fn attach_handle(&mut self, ino: INodeNo, handle: InodeHandle) {
+        if let Some(entry) = self.entries.get_mut(&ino.0) {
+            entry.handle = Some(handle);
+        }
     }
 
     fn entry(&self, ino: INodeNo) -> Result<&Entry, Errno> {
         self.entries.get(&ino.0).ok_or(Errno::ESTALE)
     }
 
-    /// The inode `ino` named, and the generation it must still have.
-    pub fn identity(&self, ino: INodeNo) -> Result<(Identity, Option<u64>), Errno> {
+    /// The inode `ino` names, and the generation it must still have.
+    pub fn identity(&self, ino: INodeNo) -> Result<(Identity, u64), Errno> {
         let entry = self.entry(ino)?;
-        Ok((entry.identity, entry.generation))
+        Ok((self.decode(ino)?, entry.generation))
+    }
+
+    /// The recorded generation of `ino` if the kernel still holds a lookup on it.
+    pub fn generation(&self, ino: INodeNo) -> Option<u64> {
+        self.entries.get(&ino.0).map(|entry| entry.generation)
     }
 
     pub fn handle(&self, ino: INodeNo) -> Result<InodeHandle, Errno> {
         self.entry(ino)?.handle.clone().ok_or(Errno::ESTALE)
     }
 
-    /// Whether a lookup of `identity` at `generation` already has its handle.
-    pub fn has_handle(&self, identity: Identity, generation: u64) -> bool {
-        self.by_identity
-            .get(&identity)
-            .and_then(|ino| self.entries.get(ino))
-            .is_some_and(|entry| entry.generation == Some(generation) && entry.handle.is_some())
+    /// Whether a live lookup of `ino` at `generation` already holds its handle.
+    pub fn has_handle(&self, ino: INodeNo, generation: u64) -> bool {
+        self.entries
+            .get(&ino.0)
+            .is_some_and(|entry| entry.generation == generation && entry.handle.is_some())
     }
 
-    /// Records a lookup or creation of `identity` at `generation` and returns
-    /// its FUSE inode number. A recycled inode number has a different
-    /// generation and gets a fresh FUSE number; the old one now fails with
-    /// `ESTALE`.
-    pub fn record(
-        &mut self,
-        identity: Identity,
-        generation: u64,
-        handle: Option<InodeHandle>,
-    ) -> INodeNo {
-        let known = self
-            .by_identity
-            .get(&identity)
-            .copied()
-            .filter(|ino| self.entries[ino].generation.is_none_or(|g| g == generation));
-        let ino = known.unwrap_or_else(|| self.allocate(identity));
-        let entry = self.entries.get_mut(&ino).expect("recorded entry exists");
-        entry.generation = Some(generation);
-        if handle.is_some() {
-            entry.handle = handle;
+    /// Records a lookup or creation of `ino` at `generation`. Read-only mounts
+    /// pass `None` for `handle` until an upgrade to writable attaches live
+    /// writer handles.
+    pub fn record(&mut self, ino: INodeNo, generation: u64, handle: Option<InodeHandle>) {
+        match self.entries.get_mut(&ino.0) {
+            Some(entry) => {
+                if entry.generation != generation {
+                    entry.generation = generation;
+                    entry.handle = handle;
+                } else if let Some(handle) = handle {
+                    entry.handle = Some(handle);
+                }
+                entry.lookups += 1;
+            }
+            None => {
+                self.entries.insert(
+                    ino.0,
+                    Entry {
+                        generation,
+                        handle,
+                        lookups: 1,
+                    },
+                );
+            }
         }
-        entry.lookups += 1;
-        INodeNo(ino)
-    }
-
-    /// The FUSE inode number to report for a directory entry the kernel has
-    /// not looked up. It carries no lookup count, so the kernel never
-    /// forgets it; the cost is one small entry per listed inode.
-    pub fn listed(&mut self, identity: Identity) -> INodeNo {
-        let ino = match self.by_identity.get(&identity) {
-            Some(ino) => *ino,
-            None => self.allocate(identity),
-        };
-        INodeNo(ino)
-    }
-
-    fn allocate(&mut self, identity: Identity) -> u64 {
-        let ino = self.next;
-        self.next += 1;
-        self.by_identity.insert(identity, ino);
-        self.entries.insert(
-            ino,
-            Entry {
-                identity,
-                generation: None,
-                handle: None,
-                lookups: 0,
-            },
-        );
-        ino
     }
 
     pub fn forget(&mut self, ino: INodeNo, count: u64) {
@@ -135,11 +233,130 @@ impl Inodes {
         };
         entry.lookups = entry.lookups.saturating_sub(count);
         if entry.lookups == 0 && ino != INodeNo::ROOT {
-            let identity = entry.identity;
             self.entries.remove(&ino.0);
-            if self.by_identity.get(&identity) == Some(&ino.0) {
-                self.by_identity.remove(&identity);
-            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_root_encoding_is_bijective_and_alias_free() {
+        let root = Identity {
+            tree: FS_TREE,
+            number: FIRST_FREE,
+        };
+        assert_eq!(encode_identity(root, root), Ok(INodeNo::ROOT));
+        assert_eq!(decode_ino(root, INodeNo::ROOT), Ok(root));
+
+        let file = Identity {
+            tree: FS_TREE,
+            number: FIRST_FREE + 1,
+        };
+        let file_ino = encode_identity(root, file).unwrap();
+        assert_eq!(file_ino, INodeNo(FIRST_FREE + 1));
+        assert_eq!(decode_ino(root, file_ino), Ok(file));
+
+        let subvol_root = Identity {
+            tree: FIRST_FREE,
+            number: FIRST_FREE,
+        };
+        let subvol_file = Identity {
+            tree: FIRST_FREE,
+            number: FIRST_FREE + 1,
+        };
+        let second_subvol = Identity {
+            tree: FIRST_FREE + 1,
+            number: FIRST_FREE + 1,
+        };
+        let subvol_root_ino = encode_identity(root, subvol_root).unwrap();
+        let subvol_file_ino = encode_identity(root, subvol_file).unwrap();
+        let second_subvol_ino = encode_identity(root, second_subvol).unwrap();
+        assert_ne!(subvol_root_ino, INodeNo::ROOT);
+        assert_ne!(subvol_file_ino, file_ino);
+        assert_ne!(subvol_file_ino, second_subvol_ino);
+        assert_eq!(decode_ino(root, subvol_root_ino), Ok(subvol_root));
+        assert_eq!(decode_ino(root, subvol_file_ino), Ok(subvol_file));
+        assert_eq!(decode_ino(root, second_subvol_ino), Ok(second_subvol));
+
+        // Invalid and non-canonical node IDs must fail with ESTALE rather than
+        // alias the root or an unused slot.
+        assert_eq!(decode_ino(root, INodeNo(0)), Err(Errno::ESTALE));
+        assert_eq!(decode_ino(root, INodeNo(2)), Err(Errno::ESTALE));
+        assert_eq!(decode_ino(root, INodeNo(FIRST_FREE)), Err(Errno::ESTALE));
+        assert_eq!(
+            decode_ino(root, INodeNo((FS_TREE_SLOT << INODE_BITS) | FIRST_FREE)),
+            Err(Errno::ESTALE)
+        );
+    }
+
+    #[test]
+    fn non_default_subvolume_root_encoding_avoids_collisions() {
+        let root = Identity {
+            tree: FIRST_FREE,
+            number: FIRST_FREE,
+        };
+        assert_eq!(encode_identity(root, root), Ok(INodeNo::ROOT));
+        assert_eq!(decode_ino(root, INodeNo::ROOT), Ok(root));
+
+        let fs_tree_root = Identity {
+            tree: FS_TREE,
+            number: FIRST_FREE,
+        };
+        let fs_tree_ino = encode_identity(root, fs_tree_root).unwrap();
+        assert_eq!(
+            fs_tree_ino,
+            INodeNo((FS_TREE_SLOT << INODE_BITS) | FIRST_FREE)
+        );
+        assert_eq!(decode_ino(root, fs_tree_ino), Ok(fs_tree_root));
+
+        // Slot 2 corresponds to tree FIRST_FREE, which is already in slot 0.
+        assert_eq!(
+            decode_ino(
+                root,
+                INodeNo((FIRST_SUBVOL_SLOT << INODE_BITS) | (FIRST_FREE + 1))
+            ),
+            Err(Errno::ESTALE)
+        );
+    }
+
+    #[test]
+    fn encoding_rejects_out_of_range_identities() {
+        let root = Identity {
+            tree: FS_TREE,
+            number: FIRST_FREE,
+        };
+        assert_eq!(
+            encode_identity(
+                root,
+                Identity {
+                    tree: FS_TREE,
+                    number: INODE_MASK + 1,
+                }
+            ),
+            Err(Errno::EOVERFLOW)
+        );
+        assert_eq!(
+            encode_identity(
+                root,
+                Identity {
+                    tree: FIRST_FREE + (SLOT_MAX - FIRST_SUBVOL_SLOT) + 1,
+                    number: FIRST_FREE,
+                }
+            ),
+            Err(Errno::EOVERFLOW)
+        );
+        assert_eq!(
+            encode_identity(
+                root,
+                Identity {
+                    tree: 2,
+                    number: FIRST_FREE,
+                }
+            ),
+            Err(Errno::EIO)
+        );
     }
 }

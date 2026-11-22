@@ -6,6 +6,7 @@
 
 extern crate std;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
@@ -19,10 +20,11 @@ use super::write_tests::{
 };
 use super::writer::{Attributes, CloneRange, InodeHandle, Name, WriteTransaction, Writer};
 use crate::Compression;
-use crate::compress::write::{Encoder, Plain, Zstd};
+use crate::compress::policy::Compressor;
+use crate::compress::write::{Encoder, Zstd};
 use crate::fs::{ExtentInfo, ExtentKind};
 use crate::ondisk::{RawFileExtentHead, RawHeader, RawItem};
-use crate::transaction::file::{DEFAULT_MAX_INLINE, WriteOptions};
+use crate::transaction::file::DEFAULT_MAX_INLINE;
 
 const WHEN: crate::Timestamp = crate::Timestamp {
     seconds: 1_700_000_100,
@@ -58,24 +60,8 @@ fn attributes() -> Attributes {
     }
 }
 
-fn concurrency() -> core::num::NonZeroUsize {
-    std::thread::available_parallelism().unwrap()
-}
-
-fn plain(max_inline: u64) -> WriteOptions<Plain> {
-    WriteOptions {
-        max_inline,
-        ..WriteOptions::plain(WHEN, concurrency())
-    }
-}
-
-fn zstd(encoder: &mut Zstd, max_inline: u64) -> WriteOptions<&mut Zstd> {
-    WriteOptions {
-        when: WHEN,
-        concurrency: concurrency(),
-        encoder,
-        max_inline,
-    }
+fn zstd_compressor() -> Compressor {
+    Compressor::Zstd(Box::new(Zstd::new(3).unwrap()))
 }
 
 /// Text that compresses well: Chinese, Japanese and Korean.
@@ -209,132 +195,107 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
         named.reopen().unwrap(),
     ));
     let mut writer = mount_writer(Disk(named.reopen().unwrap())).await.unwrap();
-    let mut encoder = Zstd::new(3).unwrap();
     let mut expected = Expected::default();
     let compressed = Layout::Inline(Some(Compression::Zstd));
 
     // Writes. `max_inline` is Linux's default unless the name says otherwise.
     let mut tx = writer.join().await.unwrap();
-    for (name, content, options, layout) in [
+    for (name, content, max_inline, layout) in [
         // At and across `max_inline`.
-        (
-            "上限-上限-상한",
-            noise(2048, 1),
-            plain(2048),
-            Layout::Inline(None),
-        ),
-        (
-            "超过-超過-초과",
-            noise(2049, 2),
-            plain(2048),
-            Layout::Regular,
-        ),
+        ("上限-上限-상한", noise(2048, 1), 2048, Layout::Inline(None)),
+        ("超过-超過-초과", noise(2049, 2), 2048, Layout::Regular),
         // A full sector never stays inline uncompressed: the bad item.
         (
             "一扇区-一セクタ-한섹터",
             noise(4096, 3),
-            plain(2048),
+            2048,
             Layout::Regular,
         ),
         // An operator's larger `max_inline` still stops below a sector.
         (
             "扇区减一-セクタ未満-섹터미만",
             noise(4095, 4),
-            plain(4096),
+            4096,
             Layout::Inline(None),
         ),
         (
             "整扇区-全セクタ-전섹터",
             noise(4096, 5),
-            plain(4096),
+            4096,
             Layout::Regular,
         ),
         // `max_inline=0` stores nothing inline.
-        ("禁止-禁止-금지", noise(10, 6), plain(0), Layout::Regular),
+        ("禁止-禁止-금지", noise(10, 6), 0, Layout::Regular),
         // Written past its start, a small file is still one inline item.
         (
             "偏移-オフセット-오프셋",
             noise(100, 7),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
-        (
-            "追加-追記-추가",
-            noise(2000, 8),
-            plain(2048),
-            Layout::Inline(None),
-        ),
+        ("追加-追記-추가", noise(2000, 8), 2048, Layout::Inline(None)),
         (
             "追加上限-追記上限-추가상한",
             noise(2000, 17),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
         (
             "追加越界-追記越界-추가초과",
             noise(2000, 18),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
         (
             "追加后方-追記後方-추가후방",
             noise(100, 19),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
-        (
-            "缩小-縮小-축소",
-            noise(2000, 9),
-            plain(2048),
-            Layout::Inline(None),
-        ),
-        (
-            "伸长-伸長-신장",
-            noise(100, 10),
-            plain(2048),
-            Layout::Inline(None),
-        ),
+        ("缩小-縮小-축소", noise(2000, 9), 2048, Layout::Inline(None)),
+        ("伸长-伸長-신장", noise(100, 10), 2048, Layout::Inline(None)),
         (
             "伸长超过-伸長超過-신장초과",
             noise(100, 11),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
         (
             "伸长整扇-伸長全扇-신장전섹터",
             noise(100, 20),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
         (
             "大伸长-大伸長-대신장",
             noise(100, 12),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
         (
             "小的-小さい-작은",
             noise(100, 13),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
         (
             "小的后方-小さい後方-작은후방",
             noise(100, 21),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
         (
             "覆盖小-上書き小-덮어쓰기작은",
             noise(100, 22),
-            plain(2048),
+            2048,
             Layout::Inline(None),
         ),
     ] {
         let file = create(&mut tx, name).await;
         let offset = if name.starts_with("偏移") { 40 } else { 0 };
         let data = &content[offset..];
-        tx.write_file(&file, offset as u64, data, options)
+        tx.set_max_inline(max_inline);
+        tx.write_file(&file, offset as u64, data, WHEN)
             .await
             .unwrap();
         let mut stored = content;
@@ -344,6 +305,8 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
     // Compressed: a compressible sector stays inline, its ram size at the
     // sector bound; data compression cannot shrink falls back to its plain
     // size, here past `max_inline`.
+    tx.set_compressor(zstd_compressor()).await.unwrap();
+    tx.set_max_inline(DEFAULT_MAX_INLINE);
     for (name, content, layout) in [
         ("压缩-圧縮-압축", text(4096), compressed),
         (
@@ -388,9 +351,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
         ("乱码-乱数-난수", noise(3000, 14), Layout::Regular),
     ] {
         let file = create(&mut tx, name).await;
-        tx.write_file(&file, 0, &content, zstd(&mut encoder, DEFAULT_MAX_INLINE))
-            .await
-            .unwrap();
+        tx.write_file(&file, 0, &content, WHEN).await.unwrap();
         expected.set(name, content, layout);
     }
     // At and across `max_inline` by compressed length.
@@ -401,14 +362,15 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
         ("压缩超过-圧縮超過-압축초과", length - 1, Layout::Regular),
     ] {
         let file = create(&mut tx, name).await;
-        tx.write_file(&file, 0, &content, zstd(&mut encoder, max_inline))
-            .await
-            .unwrap();
+        tx.set_max_inline(max_inline);
+        tx.write_file(&file, 0, &content, WHEN).await.unwrap();
         expected.set(name, content.clone(), layout);
     }
     // A file filling its sector is regular, whatever stores the next one.
+    tx.set_compressor(Compressor::Plain).await.unwrap();
+    tx.set_max_inline(2048);
     let file = create(&mut tx, "大的-大きい-큰").await;
-    tx.write_file(&file, 0, &noise(3000, 15), plain(2048))
+    tx.write_file(&file, 0, &noise(3000, 15), WHEN)
         .await
         .unwrap();
     expected.set("大的-大きい-큰", noise(3000, 15), Layout::Regular);
@@ -416,8 +378,9 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
 
     // Appends and truncation.
     let mut tx = writer.join().await.unwrap();
+    tx.set_max_inline(2048);
     let file = open(&tx, "追加-追記-추가").await;
-    tx.write_file(&file, 2000, &noise(100, 16), plain(2048))
+    tx.write_file(&file, 2000, &noise(100, 16), WHEN)
         .await
         .unwrap();
     let mut content = noise(2000, 8);
@@ -426,7 +389,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
 
     // Uncompressed append at `max_inline` stays inline; one more byte converts.
     let file = open(&tx, "追加上限-追記上限-추가상한").await;
-    tx.write_file(&file, 2000, &noise(48, 23), plain(2048))
+    tx.write_file(&file, 2000, &noise(48, 23), WHEN)
         .await
         .unwrap();
     let mut content = noise(2000, 17);
@@ -434,10 +397,10 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
     expected.set("追加上限-追記上限-추가상한", content, Layout::Inline(None));
 
     let file = open(&tx, "追加越界-追記越界-추가초과").await;
-    tx.write_file(&file, 2000, &noise(48, 24), plain(2048))
+    tx.write_file(&file, 2000, &noise(48, 24), WHEN)
         .await
         .unwrap();
-    tx.write_file(&file, 2048, &noise(1, 25), plain(2048))
+    tx.write_file(&file, 2048, &noise(1, 25), WHEN)
         .await
         .unwrap();
     let mut content = noise(2000, 18);
@@ -447,7 +410,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
 
     // Writing past the first sector promotes an existing inline item.
     let file = open(&tx, "追加后方-追記後方-추가후방").await;
-    tx.write_file(&file, SECTOR, &noise(100, 26), plain(2048))
+    tx.write_file(&file, SECTOR, &noise(100, 26), WHEN)
         .await
         .unwrap();
     let mut content = noise(100, 19);
@@ -456,36 +419,31 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
     expected.set("追加后方-追記後方-추가후방", content, Layout::Regular);
 
     // Compressed appends: within limit, across `max_inline`, incompressible, and past sector.
+    tx.set_compressor(zstd_compressor()).await.unwrap();
+    tx.set_max_inline(DEFAULT_MAX_INLINE);
     let file = open(&tx, "压缩追加-圧縮追記-압축추가").await;
     let tail = text(2096);
-    tx.write_file(&file, 2000, &tail, zstd(&mut encoder, DEFAULT_MAX_INLINE))
-        .await
-        .unwrap();
+    tx.write_file(&file, 2000, &tail, WHEN).await.unwrap();
     let mut joined = text(2000);
     joined.extend_from_slice(&tail);
     expected.set("压缩追加-圧縮追記-압축추가", joined.clone(), compressed);
 
     let joined_len = zstd_length(&joined);
     let file = open(&tx, "压缩追加超过-圧縮追記超過-압축추가초과").await;
-    tx.write_file(&file, 2000, &tail, zstd(&mut encoder, joined_len - 1))
-        .await
-        .unwrap();
+    tx.set_max_inline(joined_len - 1);
+    tx.write_file(&file, 2000, &tail, WHEN).await.unwrap();
     expected.set(
         "压缩追加超过-圧縮追記超過-압축추가초과",
         joined,
         Layout::Regular,
     );
 
+    tx.set_max_inline(DEFAULT_MAX_INLINE);
     let file = open(&tx, "压缩追加乱码-圧縮追記乱数-압축추가난수").await;
     let random_tail = noise(2096, 27);
-    tx.write_file(
-        &file,
-        2000,
-        &random_tail,
-        zstd(&mut encoder, DEFAULT_MAX_INLINE),
-    )
-    .await
-    .unwrap();
+    tx.write_file(&file, 2000, &random_tail, WHEN)
+        .await
+        .unwrap();
     let mut content = text(2000);
     content.extend_from_slice(&random_tail);
     expected.set(
@@ -496,9 +454,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
 
     let file = open(&tx, "压缩追加超扇-圧縮追記超扇-압축추가초과섹터").await;
     let one = text(1);
-    tx.write_file(&file, SECTOR, &one, zstd(&mut encoder, DEFAULT_MAX_INLINE))
-        .await
-        .unwrap();
+    tx.write_file(&file, SECTOR, &one, WHEN).await.unwrap();
     let mut content = text(4096);
     content.extend_from_slice(&one);
     expected.set(
@@ -508,8 +464,10 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
     );
 
     // Uncompressed inline shrinks in place.
+    tx.set_compressor(Compressor::Plain).await.unwrap();
+    tx.set_max_inline(2048);
     let file = open(&tx, "缩小-縮小-축소").await;
-    tx.truncate_file(&file, 1000, plain(2048)).await.unwrap();
+    tx.truncate_file(&file, 1000, WHEN).await.unwrap();
     expected.set("缩小-縮小-축소", noise(1000, 9), Layout::Inline(None));
 
     // Growth stores the zero-extended file afresh: at and across the limit,
@@ -533,9 +491,8 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
         ("大伸长-大伸長-대신장", 12, 8192, 2048, Layout::Regular),
     ] {
         let file = open(&tx, name).await;
-        tx.truncate_file(&file, size, plain(max_inline))
-            .await
-            .unwrap();
+        tx.set_max_inline(max_inline);
+        tx.truncate_file(&file, size, WHEN).await.unwrap();
         let mut content = noise(100, seed);
         content.resize(size as usize, 0);
         expected.set(name, content, layout);
@@ -543,13 +500,15 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
 
     // A compressed item cannot be cut: its first `size` bytes are stored
     // again, as plain bytes past the limit or compressed inline.
+    tx.set_max_inline(2048);
     let file = open(&tx, "压缩缩小-圧縮縮小-압축축소").await;
-    tx.truncate_file(&file, 3000, plain(2048)).await.unwrap();
+    tx.truncate_file(&file, 3000, WHEN).await.unwrap();
     expected.set("压缩缩小-圧縮縮小-압축축소", text(3000), Layout::Regular);
+
+    tx.set_compressor(zstd_compressor()).await.unwrap();
+    tx.set_max_inline(DEFAULT_MAX_INLINE);
     let file = open(&tx, "压缩重压-圧縮再圧縮-압축재압축").await;
-    tx.truncate_file(&file, 3000, zstd(&mut encoder, DEFAULT_MAX_INLINE))
-        .await
-        .unwrap();
+    tx.truncate_file(&file, 3000, WHEN).await.unwrap();
     expected.set("压缩重压-圧縮再圧縮-압축재압축", text(3000), compressed);
 
     let mut padded_4096 = text(2000);
@@ -582,13 +541,13 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
         ),
     ] {
         let file = open(&tx, name).await;
-        tx.truncate_file(&file, size, zstd(&mut encoder, max_inline))
-            .await
-            .unwrap();
+        tx.set_max_inline(max_inline);
+        tx.truncate_file(&file, size, WHEN).await.unwrap();
         let mut content = text(2000);
         content.resize(size as usize, 0);
         expected.set(name, content, layout);
     }
+    tx.set_compressor(Compressor::Plain).await.unwrap();
     commit(&mut writer, &expected, named.path(), &mut check).await;
 
     // Reflink. An inline source lands as its own item at offset 0 of an
@@ -643,6 +602,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
         let from = open(&tx, source).await;
         let to = create(&mut tx, destination).await;
         let length = expected.0[source].0.len() as u64;
+        tx.set_max_inline(max_inline);
         tx.clone_range(
             CloneRange {
                 source: &from,
@@ -651,7 +611,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
                 destination_offset: offset,
                 length,
             },
-            plain(max_inline),
+            WHEN,
         )
         .await
         .unwrap();
@@ -660,6 +620,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
         expected.set(destination, content, layout);
     }
     // Inline source replacing a smaller inline destination stays inline.
+    tx.set_max_inline(2048);
     let from = open(&tx, "上限-上限-상한").await;
     let to = open(&tx, "覆盖小-上書き小-덮어쓰기작은").await;
     tx.clone_range(
@@ -670,7 +631,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
             destination_offset: 0,
             length: 2048,
         },
-        plain(2048),
+        WHEN,
     )
     .await
     .unwrap();
@@ -692,7 +653,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
             destination_offset: 0,
             length: 3000,
         },
-        plain(2048),
+        WHEN,
     )
     .await
     .unwrap();
@@ -707,7 +668,7 @@ async fn exercise(mut check: impl FnMut(&std::path::Path)) {
             destination_offset: SECTOR,
             length: 3000,
         },
-        plain(2048),
+        WHEN,
     )
     .await
     .unwrap();

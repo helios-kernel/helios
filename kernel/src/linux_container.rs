@@ -40,8 +40,8 @@ use alloc::vec::Vec;
 use core::num::{NonZeroU32, NonZeroU64};
 
 use helios_hal::fs::{
-    DirCookie, DirEntry, FileSystem, FileSystemRights, FsError, FsPath, FsResult, Metadata,
-    NodeKind,
+    DirCookie, DirEntry, DirStream, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
+    Metadata, NodeKind,
 };
 use helios_linux::syscall::{Credentials, PidNamespace, UtsField};
 use helios_unix::FutexTable;
@@ -328,13 +328,11 @@ impl<S: Storage> ContainerFilesystem<S> {
         {
             return Err(FsError::NotPermitted);
         }
+        let dir_stream = resolved.fs().open_dir(resolved.fs_path()).await?;
         let mut entries = Vec::new();
         let mut cookie = DirCookie::START;
         loop {
-            let batch = resolved
-                .fs()
-                .read_dir(resolved.fs_path(), cookie, BATCH)
-                .await?;
+            let batch = dir_stream.read(cookie, BATCH).await?;
             let complete = batch.len() < BATCH;
             if let Some(last) = batch.last() {
                 cookie = last.next;

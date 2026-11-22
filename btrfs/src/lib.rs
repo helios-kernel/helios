@@ -34,8 +34,9 @@
 //! The `write` feature exposes `write::Writer` and its running transaction,
 //! with per-operation rollback. As Linux's btrfs, a change is visible at once
 //! and durable at commit: every accepted mutation publishes a new immutable
-//! view of the transaction's private CoW blocks, and a commit writes them and
-//! then the superblocks. Existing readers retain the complete mapping and
+//! view of the transaction's private CoW blocks and dirty file data, and a
+//! commit writes the data back into extents, then the blocks, and then the
+//! superblocks. Existing readers retain the complete mapping and
 //! checksum roots of their view; blocks it reaches cannot be reused while any
 //! reader still holds it.
 
@@ -55,6 +56,8 @@ mod commit;
 mod compress;
 mod csum;
 mod data;
+#[cfg(feature = "write")]
+mod delalloc;
 mod error;
 #[cfg(feature = "write")]
 mod free_space;
@@ -84,7 +87,7 @@ pub use error::{
     ChunkDefect, Compression, DecompressDefect, Error, FileKind, ItemDefect, NodeDefect,
     SuperblockDefect,
 };
-pub use fs::{DirEntry, DirPosition, Filesystem, Inode, MAX_SYMLINK_FOLLOWS};
+pub use fs::{DirBound, DirEntry, DirPosition, Filesystem, Inode, MAX_SYMLINK_FOLLOWS};
 #[cfg(feature = "test-support")]
 pub use fs::{ExtentInfo, ExtentKind};
 pub use items::{DeviceNumber, EntryTarget, Metadata, Timestamp};
