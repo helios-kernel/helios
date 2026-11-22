@@ -65,6 +65,29 @@ use crate::{
     ProcessAuthority, ProcessAuthorityError,
 };
 
+fn authority_cap_ceiling_for(authority: &ProcessAuthority) -> u64 {
+    let mut mask = CAP_FULL_SET;
+    if !authority
+        .clock_rights()
+        .contains(ClockAuthorityRights::SET_WALL_CLOCK)
+    {
+        mask &= !(1u64 << CAP_SYS_TIME);
+    }
+    if !authority
+        .network_rights()
+        .contains(NetworkAuthorityRights::PRIVILEGED_BIND)
+    {
+        mask &= !(1u64 << CAP_NET_BIND_SERVICE);
+    }
+    if !authority
+        .network_rights()
+        .contains(NetworkAuthorityRights::ADMIN)
+    {
+        mask &= !((1u64 << CAP_NET_ADMIN) | (1u64 << CAP_NET_RAW));
+    }
+    mask
+}
+
 fn unix_to_op(error: UnixFsError) -> FsOpError {
     match error {
         UnixFsError::Fs(error) => FsOpError::Fs(error),
@@ -73,6 +96,28 @@ fn unix_to_op(error: UnixFsError) -> FsOpError {
         UnixFsError::Range => FsOpError::Range,
         UnixFsError::ArgTooBig => FsOpError::ArgTooBig,
     }
+}
+
+/// Masks a non-directory creation mode to `S_IALLUGO` (`0o7777`) and clears
+/// `S_ISGID` when the new inode inherits a group the caller neither belongs to
+/// nor overrides with `CAP_FSETID` (`fs/inode.c` `inode_init_owner`, Linux
+/// v6.12).
+fn sanitize_create_mode(
+    mode: u32,
+    parent: Option<permissions::InodeMeta>,
+    creds: &Credentials,
+) -> u32 {
+    let mut perm = mode & permissions::S_IALLUGO;
+    if let Some(parent) = parent
+        && (parent.mode & permissions::S_ISGID) != 0
+        && (perm & (permissions::S_ISGID | permissions::S_IXGRP))
+            == (permissions::S_ISGID | permissions::S_IXGRP)
+        && !creds.in_group(parent.gid)
+        && !creds.capabilities.has_effective(CAP_FSETID)
+    {
+        perm &= !permissions::S_ISGID;
+    }
+    perm
 }
 
 fn resolve_time_update(update: TimeUpdate, now: u64) -> Option<u64> {
@@ -749,7 +794,9 @@ impl<S: Storage> ContainerFilesystem<S> {
     }
 
     /// Resolves and stats `raw_path` relative to `base_dir`, returning both
-    /// container-visible metadata and the normalized container path.
+    /// container-visible metadata and the normalized container path. An empty
+    /// `raw_path` operates directly on `base_dir` without directory search
+    /// (`AT_EMPTY_PATH` on `AT_FDCWD`, `fs/stat.c` `vfs_statx`).
     pub async fn stat_at(
         &self,
         base_dir: &str,
@@ -757,9 +804,13 @@ impl<S: Storage> ContainerFilesystem<S> {
         follow_final: bool,
         creds: &Credentials,
     ) -> Result<(ContainerNodeInfo, String), FsOpError> {
-        let (resolved, _) = self
-            .walk_path_for(base_dir, raw_path, follow_final, creds)
-            .await?;
+        let resolved = if raw_path.is_empty() {
+            self.resolve(base_dir)?
+        } else {
+            self.walk_path_for(base_dir, raw_path, follow_final, creds)
+                .await?
+                .0
+        };
         resolved.require_read()?;
         let info = resolved.describe().await?;
         Ok((info, resolved.container_path().to_owned()))
@@ -877,10 +928,27 @@ impl<S: Storage> ContainerFilesystem<S> {
                     return Err(FsError::Loop.into());
                 }
                 if matches!(meta.kind, NodeKind::CharacterDevice | NodeKind::BlockDevice) {
+                    if request.directory || trailing_slash {
+                        return Err(FsError::NotDirectory.into());
+                    }
                     if !resolved.flags().opens_devices() {
                         // `fs/namei.c` `may_open_dev`: `MNT_NODEV` returns `EACCES`.
                         return Err(FsError::NotPermitted.into());
                     }
+                    if request.read {
+                        resolved.require_read()?;
+                    }
+                    if request.write || request.truncate {
+                        resolved.require_write()?;
+                    }
+                    let mut want = 0u32;
+                    if request.read {
+                        want |= permissions::MAY_READ;
+                    }
+                    if request.write || request.truncate {
+                        want |= permissions::MAY_WRITE;
+                    }
+                    resolved.check_permission(creds, want).await?;
                     return Err(FsOpError::NoDevice);
                 }
                 if meta.kind == NodeKind::Directory {
@@ -933,12 +1001,13 @@ impl<S: Storage> ContainerFilesystem<S> {
                 if request.write {
                     resolved.require_write()?;
                 }
-                self.check_parent_permission(
-                    resolved.container_path(),
-                    creds,
-                    permissions::MAY_WRITE | permissions::MAY_EXEC,
-                )
-                .await?;
+                let parent_meta = self
+                    .check_parent_permission(
+                        resolved.container_path(),
+                        creds,
+                        permissions::MAY_WRITE | permissions::MAY_EXEC,
+                    )
+                    .await?;
                 let mut flags = OpenFlags::CREATE;
                 if request.exclusive {
                     flags |= OpenFlags::EXCLUSIVE;
@@ -948,7 +1017,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                 }
                 if resolved.is_private() {
                     let attrs = BtrfsAttributes {
-                        permissions: request.mode & 0o777,
+                        permissions: sanitize_create_mode(request.mode, parent_meta, creds),
                         uid: creds.user.effective,
                         gid: creds.group.effective,
                         umask: request.umask,
@@ -1184,7 +1253,7 @@ impl<S: Storage> ContainerFilesystem<S> {
         .await?;
         if resolved.is_private() {
             let attrs = BtrfsAttributes {
-                permissions: mode & 0o777,
+                permissions: mode & (0o777 | permissions::S_ISVTX),
                 uid: creds.user.effective,
                 gid: creds.group.effective,
                 umask,
@@ -1235,14 +1304,15 @@ impl<S: Storage> ContainerFilesystem<S> {
         {
             return Err(FsOpError::PermissionDenied);
         }
-        self.check_parent_permission(
-            resolved.container_path(),
-            creds,
-            permissions::MAY_WRITE | permissions::MAY_EXEC,
-        )
-        .await?;
+        let parent_meta = self
+            .check_parent_permission(
+                resolved.container_path(),
+                creds,
+                permissions::MAY_WRITE | permissions::MAY_EXEC,
+            )
+            .await?;
         let attrs = BtrfsAttributes {
-            permissions: mode & 0o777,
+            permissions: sanitize_create_mode(mode, parent_meta, creds),
             uid: creds.user.effective,
             gid: creds.group.effective,
             umask,
@@ -1437,11 +1507,21 @@ impl<S: Storage> ContainerFilesystem<S> {
                 permissions::MAY_WRITE | permissions::MAY_EXEC,
             )
             .await?;
+        let old_parent = crate::parent_path(old_resolved.container_path());
+        let new_parent = crate::parent_path(new_resolved.container_path());
+        let dst_exists = new_resolved.fs().stat(new_resolved.fs_path()).await.is_ok();
+        if mode == RenameMode::NoReplace && dst_exists {
+            // `fs/namei.c` `do_renameat2`: `RENAME_NOREPLACE` fails with
+            // `EEXIST` before checking sticky-bit deletion rights on the
+            // existing target.
+            return Err(FsError::Exists.into());
+        }
+        if mode == RenameMode::Exchange && !dst_exists {
+            return Err(FsError::NoEntry.into());
+        }
         if let Some(old_parent_meta) = old_parent_meta {
             let src_unix = old_resolved.inode_meta().await?;
             permissions::check_sticky(creds, old_parent_meta, src_unix.uid)?;
-            let old_parent = crate::parent_path(old_resolved.container_path());
-            let new_parent = crate::parent_path(new_resolved.container_path());
             if src_unix.kind == NodeKind::Directory && old_parent != new_parent {
                 old_resolved
                     .check_permission(creds, permissions::MAY_WRITE)
@@ -1449,9 +1529,20 @@ impl<S: Storage> ContainerFilesystem<S> {
             }
         }
         if let Some(new_parent_meta) = new_parent_meta
-            && let Ok(dst_unix) = new_resolved.inode_meta().await
+            && dst_exists
         {
+            let dst_unix = new_resolved.inode_meta().await?;
             permissions::check_sticky(creds, new_parent_meta, dst_unix.uid)?;
+            if mode == RenameMode::Exchange
+                && dst_unix.kind == NodeKind::Directory
+                && old_parent != new_parent
+            {
+                // `fs/namei.c` `vfs_rename`: exchanging a directory across
+                // parents rewrites its `..` entry, requiring `MAY_WRITE` on it.
+                new_resolved
+                    .check_permission(creds, permissions::MAY_WRITE)
+                    .await?;
+            }
         }
         Ok(old_resolved
             .fs()
@@ -1565,6 +1656,8 @@ impl<S: Storage> ContainerFilesystem<S> {
     }
 
     /// Changes permission bits at `raw_path` (`chmod`/`fchmodat`/`fchmodat2`).
+    /// An empty `raw_path` operates directly on `base_dir` without directory
+    /// search (`AT_EMPTY_PATH` on `AT_FDCWD`).
     #[allow(clippy::too_many_arguments)]
     pub async fn chmod_at(
         &self,
@@ -1575,9 +1668,13 @@ impl<S: Storage> ContainerFilesystem<S> {
         creds: &Credentials,
         now: u64,
     ) -> Result<(), FsOpError> {
-        let (resolved, _) = self
-            .walk_path_for(base_dir, raw_path, follow_final, creds)
-            .await?;
+        let resolved = if raw_path.is_empty() {
+            self.resolve(base_dir)?
+        } else {
+            self.walk_path_for(base_dir, raw_path, follow_final, creds)
+                .await?
+                .0
+        };
         self.apply_chmod(&resolved, mode, creds, now).await
     }
 
@@ -1620,7 +1717,9 @@ impl<S: Storage> ContainerFilesystem<S> {
             .map_err(unix_to_op)
     }
 
-    /// Changes owner/group at `raw_path` (`chown`/`lchown`/`fchownat`).
+    /// Changes owner/group at `raw_path` (`chown`/`lchown`/`fchownat`). An
+    /// empty `raw_path` operates directly on `base_dir` without directory
+    /// search (`AT_EMPTY_PATH` on `AT_FDCWD`).
     #[allow(clippy::too_many_arguments)]
     pub async fn chown_at(
         &self,
@@ -1632,9 +1731,13 @@ impl<S: Storage> ContainerFilesystem<S> {
         creds: &Credentials,
         now: u64,
     ) -> Result<(), FsOpError> {
-        let (resolved, _) = self
-            .walk_path_for(base_dir, raw_path, follow_final, creds)
-            .await?;
+        let resolved = if raw_path.is_empty() {
+            self.resolve(base_dir)?
+        } else {
+            self.walk_path_for(base_dir, raw_path, follow_final, creds)
+                .await?
+                .0
+        };
         self.apply_chown(&resolved, uid, gid, creds, now).await
     }
 
@@ -2091,6 +2194,11 @@ impl<S: Storage> LinuxContainer<S> {
             mounts.push(mount);
         }
 
+        let mut default_credentials = config.credentials;
+        default_credentials
+            .capabilities
+            .clamp(authority_cap_ceiling_for(&authority));
+
         Ok(Self {
             id,
             authority,
@@ -2099,7 +2207,7 @@ impl<S: Storage> LinuxContainer<S> {
                 shared_owner: config.shared_owner,
             },
             shared_owner: config.shared_owner,
-            default_credentials: config.credentials,
+            default_credentials,
             uts: spin::Mutex::new(ContainerUts {
                 hostname: config.hostname,
                 domainname: config.domainname,
@@ -2193,6 +2301,10 @@ impl<S: Storage> LinuxContainer<S> {
             }
         }
         let shared_owner = SharedOwner { uid: 0, gid: 0 };
+        let mut default_credentials = Credentials::root();
+        default_credentials
+            .capabilities
+            .clamp(authority_cap_ceiling_for(&authority));
         Self {
             id,
             authority,
@@ -2201,7 +2313,7 @@ impl<S: Storage> LinuxContainer<S> {
                 shared_owner,
             },
             shared_owner,
-            default_credentials: Credentials::root(),
+            default_credentials,
             uts: spin::Mutex::new(ContainerUts {
                 hostname: UtsField::UNSET,
                 domainname: UtsField::UNSET,
@@ -2224,29 +2336,14 @@ impl<S: Storage> LinuxContainer<S> {
     /// `uid 0`, setuid binaries, and file capabilities inside this container
     /// never exceed this ceiling.
     pub fn authority_cap_ceiling(&self) -> u64 {
-        let mut mask = CAP_FULL_SET;
-        if !self
-            .authority
-            .clock_rights()
-            .contains(ClockAuthorityRights::SET_WALL_CLOCK)
-        {
-            mask &= !(1u64 << CAP_SYS_TIME);
-        }
-        if !self
-            .authority
-            .network_rights()
-            .contains(NetworkAuthorityRights::PRIVILEGED_BIND)
-        {
-            mask &= !(1u64 << CAP_NET_BIND_SERVICE);
-        }
-        if !self
-            .authority
-            .network_rights()
-            .contains(NetworkAuthorityRights::ADMIN)
-        {
-            mask &= !((1u64 << CAP_NET_ADMIN) | (1u64 << CAP_NET_RAW));
-        }
-        mask
+        authority_cap_ceiling_for(&self.authority)
+    }
+
+    /// Clamps `creds`' capability sets to this container's
+    /// [`Self::authority_cap_ceiling`], ensuring neither initial process
+    /// credentials nor overrides exceed the container's [`ProcessAuthority`].
+    pub fn clamp_credentials(&self, creds: &mut Credentials) {
+        creds.capabilities.clamp(self.authority_cap_ceiling());
     }
 
     /// This container's isolated filesystem (root and mounts).
@@ -4102,6 +4199,7 @@ mod private_btrfs_tests {
     const ENXIO: u64 = 6;
     const EACCES: u64 = 13;
     const EEXIST: u64 = 17;
+    const ENOTDIR: u64 = 20;
     const EINVAL: u64 = 22;
     const EROFS: u64 = 30;
     const ENODATA: u64 = 61;
@@ -4109,6 +4207,9 @@ mod private_btrfs_tests {
     const AT_FDCWD: u64 = (-100i32) as u32 as u64;
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     const AT_EACCESS: u64 = 0x200;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const RENAME_NOREPLACE: u64 = 1;
+    const RENAME_EXCHANGE: u64 = 2;
 
     fn make_proc(id: u32, creds: Credentials) -> Process<TestRes> {
         let start = Start {
@@ -5574,6 +5675,577 @@ mod private_btrfs_tests {
                         .unix
                         .permissions
                         & 0o2000,
+                    0
+                );
+
+                // --- 9. Review regressions: authority cap clamp, create special bits, device DAC,
+                // AT_EMPTY_PATH on AT_FDCWD, and renameat2 NOREPLACE/EXCHANGE checks ---
+                // 9a. Container default_credentials and clamp_credentials enforce authority ceiling.
+                let expected_ceiling = container.authority_cap_ceiling();
+                assert_ne!(expected_ceiling & (1u64 << CAP_NET_BIND_SERVICE), 0);
+                assert_eq!(expected_ceiling & (1u64 << CAP_SYS_TIME), 0);
+                assert_eq!(expected_ceiling & (1u64 << CAP_NET_ADMIN), 0);
+                assert_eq!(expected_ceiling & (1u64 << CAP_NET_RAW), 0);
+                let default_caps = container.default_credentials().capabilities;
+                assert_eq!(default_caps.effective, expected_ceiling);
+                assert_eq!(default_caps.permitted, expected_ceiling);
+                assert_eq!(default_caps.bounding, expected_ceiling);
+
+                let mut override_creds = Credentials::root();
+                container.clamp_credentials(&mut override_creds);
+                assert_eq!(override_creds.capabilities.effective, expected_ceiling);
+                assert_eq!(override_creds.capabilities.permitted, expected_ceiling);
+                assert_eq!(override_creds.capabilities.bounding, expected_ceiling);
+
+                let mut clamped_root = make_proc(7, container.default_credentials().clone());
+                let mut cap_hdr = [0u8; 8];
+                cap_hdr[0..4].copy_from_slice(&0x2008_0522u32.to_le_bytes()); // _LINUX_CAPABILITY_VERSION_3
+                mem.write_bytes(0x4700, &cap_hdr);
+                mem.write_bytes(0x4710, &[0u8; 24]);
+                assert_eq!(
+                    call(
+                        &mut clamped_root,
+                        Operation::Capget,
+                        [0x4700, 0x4710, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                let mut cap_data = [0u8; 24];
+                mem.read(0x4710, &mut cap_data).unwrap();
+                let eff_lo = u32::from_le_bytes(cap_data[0..4].try_into().unwrap()) as u64;
+                let eff_hi = u32::from_le_bytes(cap_data[12..16].try_into().unwrap()) as u64;
+                let perm_lo = u32::from_le_bytes(cap_data[4..8].try_into().unwrap()) as u64;
+                let perm_hi = u32::from_le_bytes(cap_data[16..20].try_into().unwrap()) as u64;
+                assert_eq!(eff_lo | (eff_hi << 32), expected_ceiling);
+                assert_eq!(perm_lo | (perm_hi << 32), expected_ceiling);
+                // Trying to raise CAP_SYS_TIME back via capset fails with EPERM.
+                let raised = expected_ceiling | (1u64 << CAP_SYS_TIME);
+                cap_data[0..4].copy_from_slice(&(raised as u32).to_le_bytes());
+                cap_data[4..8].copy_from_slice(&(raised as u32).to_le_bytes());
+                cap_data[12..16].copy_from_slice(&((raised >> 32) as u32).to_le_bytes());
+                cap_data[16..20].copy_from_slice(&((raised >> 32) as u32).to_le_bytes());
+                mem.write_bytes(0x4710, &cap_data);
+                assert_eq!(
+                    call(
+                        &mut clamped_root,
+                        Operation::Capset,
+                        [0x4700, 0x4710, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+
+                let ephemeral = LinuxContainer::ephemeral(
+                    ContainerId::new(NonZeroU64::new(43).unwrap()),
+                    ProcessAuthority::empty(),
+                    &host_ns,
+                );
+                let eph_eff = ephemeral.default_credentials().capabilities.effective;
+                assert_eq!(eph_eff & (1u64 << CAP_SYS_TIME), 0);
+                assert_eq!(eph_eff & (1u64 << CAP_NET_BIND_SERVICE), 0);
+                assert_eq!(eph_eff & (1u64 << CAP_NET_ADMIN), 0);
+                assert_eq!(eph_eff & (1u64 << CAP_NET_RAW), 0);
+
+                // 9b. mkdirat/openat/mknodat preserve S_ISVTX / S_IALLUGO and strip S_ISGID
+                // on non-dir creation when inheriting an unowned group without CAP_FSETID.
+                mem.write_cstr(0x1b00, "/sticky_direct");
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Mkdirat,
+                        [AT_FDCWD, 0x1b00, 0o1777, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // Default umask 0o022 narrows 0o1777 -> 0o1755 while preserving S_ISVTX.
+                assert_eq!(
+                    container
+                        .filesystem()
+                        .stat_resolved("/sticky_direct")
+                        .await
+                        .unwrap()
+                        .unix
+                        .permissions,
+                    0o1755
+                );
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Chmod,
+                        [0x1b00, 0o1777, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+
+                // Allow u1000 to create inside /sticky_direct.
+                mem.write_cstr(0x1b20, "/sticky_direct/suid_created");
+                let sfd = call(
+                    &mut u1000,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1b20, 0x42, 0o4755, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(sfd < 1024);
+                call(
+                    &mut u1000,
+                    Operation::Close,
+                    [sfd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert_eq!(
+                    container
+                        .filesystem()
+                        .stat_resolved("/sticky_direct/suid_created")
+                        .await
+                        .unwrap()
+                        .unix
+                        .permissions,
+                    0o4755
+                );
+
+                mem.write_cstr(0x1b60, "/sticky_direct/sgid_fifo");
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Mknodat,
+                        [AT_FDCWD, 0x1b60, 0o010_000 | 0o2644, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    container
+                        .filesystem()
+                        .stat_resolved("/sticky_direct/sgid_fifo")
+                        .await
+                        .unwrap()
+                        .unix
+                        .permissions,
+                    0o2644
+                );
+
+                // S_ISGID parent owned by group 999: u1000 (not in gid 999, no CAP_FSETID)
+                // creating a non-directory with S_ISGID | S_IXGRP has S_ISGID stripped.
+                mem.write_cstr(0x1ba0, "/sgid_strip_dir");
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Mkdirat,
+                        [AT_FDCWD, 0x1ba0, 0o777, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Chown,
+                        [0x1ba0, 0, 999, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Chmod,
+                        [0x1ba0, 0o2777, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                mem.write_cstr(0x1bc0, "/sgid_strip_dir/exec_file");
+                let efd = call(
+                    &mut u1000,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1bc0, 0x42, 0o2755, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(efd < 1024);
+                call(
+                    &mut u1000,
+                    Operation::Close,
+                    [efd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                let exec_stat = container
+                    .filesystem()
+                    .stat_resolved("/sgid_strip_dir/exec_file")
+                    .await
+                    .unwrap();
+                assert_eq!(exec_stat.unix.gid, 999);
+                assert_eq!(exec_stat.unix.permissions, 0o0755);
+
+                mem.write_cstr(0x1c00, "/sgid_strip_dir/exec_fifo");
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Mknodat,
+                        [AT_FDCWD, 0x1c00, 0o010_000 | 0o2755, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                let fifo_stat = container
+                    .filesystem()
+                    .stat_resolved("/sgid_strip_dir/exec_fifo")
+                    .await
+                    .unwrap();
+                assert_eq!(fifo_stat.unix.gid, 999);
+                assert_eq!(fifo_stat.unix.permissions, 0o0755);
+
+                // 9c. Device-node open enforces O_DIRECTORY and DAC before returning ENXIO.
+                mem.write_cstr(0x1c40, "/dev_perm_test");
+                let rdev = DeviceNumber::new(1, 3).unwrap().encode() as u64;
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Mknodat,
+                        [AT_FDCWD, 0x1c40, 0o020_000 | 0o600, rdev, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // O_DIRECTORY fails with ENOTDIR.
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Openat,
+                        [AT_FDCWD, 0x1c40, Abi::X86_64.o_directory(), 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(ENOTDIR)
+                );
+                // u1000 lacks read permission on 0o600 root-owned char device -> EACCES, not ENXIO.
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Openat,
+                        [AT_FDCWD, 0x1c40, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+                // Root passes DAC and reaches ENXIO.
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Openat,
+                        [AT_FDCWD, 0x1c40, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(ENXIO)
+                );
+                // After chmod 0o644, u1000 O_RDONLY passes DAC -> ENXIO, O_WRONLY -> EACCES.
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Chmod,
+                        [0x1c40, 0o644, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Openat,
+                        [AT_FDCWD, 0x1c40, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(ENXIO)
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Openat,
+                        [AT_FDCWD, 0x1c40, 1, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+
+                // 9d. AT_EMPTY_PATH on AT_FDCWD operates on cwd without directory search.
+                mem.write_cstr(0x1c80, "/cwd_noexec");
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Mkdirat,
+                        [AT_FDCWD, 0x1c80, 0o700, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Chown,
+                        [0x1c80, 1000, 100, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Chdir,
+                        [0x1c80, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Chmod,
+                        [0x1c80, 0o000, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                mem.write_cstr(0x1ca0, ".");
+                mem.write_cstr(0x1ca8, "");
+                // "." traverses cwd and requires MAY_EXEC -> EACCES.
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Newfstatat,
+                        [AT_FDCWD, 0x1ca0, 0x5200, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+                // "" with AT_EMPTY_PATH operates directly on cwd -> succeeds for stat/statx/chown/chmod.
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Newfstatat,
+                        [AT_FDCWD, 0x1ca8, 0x5200, AT_EMPTY_PATH, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Statx,
+                        [AT_FDCWD, 0x1ca8, AT_EMPTY_PATH, 0x07ff, 0x5300, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Fchownat,
+                        [AT_FDCWD, 0x1ca8, 1000, 100, AT_EMPTY_PATH, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Fchmodat2,
+                        [AT_FDCWD, 0x1ca8, 0o700, AT_EMPTY_PATH, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // Restore u1000 cwd to "/".
+                mem.write_cstr(0x1cb0, "/");
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Chdir,
+                        [0x1cb0, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+
+                // 9e. renameat2 RENAME_NOREPLACE returns EEXIST before sticky-bit EPERM,
+                // and RENAME_EXCHANGE across parents requires MAY_WRITE on destination dir.
+                mem.write_cstr(0x1cc0, "/sticky_direct/a");
+                mem.write_cstr(0x1ce0, "/sticky_direct/b");
+                let afd = call(
+                    &mut u1000,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1cc0, 0x42, 0o644, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(afd < 1024);
+                call(
+                    &mut u1000,
+                    Operation::Close,
+                    [afd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                let bfd = call(
+                    &mut u1001,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1ce0, 0x42, 0o644, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(bfd < 1024);
+                call(
+                    &mut u1001,
+                    Operation::Close,
+                    [bfd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Renameat2,
+                        [AT_FDCWD, 0x1cc0, AT_FDCWD, 0x1ce0, RENAME_NOREPLACE, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EEXIST)
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Renameat2,
+                        [AT_FDCWD, 0x1cc0, AT_FDCWD, 0x1ce0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+
+                // Set umask 0 on root_full so 0o777 test directories are world-writable.
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Umask,
+                        [0, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0o022
+                );
+                mem.write_cstr(0x1d00, "/ex_p1");
+                mem.write_cstr(0x1d10, "/ex_p2");
+                mem.write_cstr(0x1d20, "/ex_p1/src_dir");
+                mem.write_cstr(0x1d40, "/ex_p2/ro_dst_dir");
+                mem.write_cstr(0x1d60, "/ex_p2/sib_dir");
+                for (path_addr, mode) in [
+                    (0x1d00, 0o777),
+                    (0x1d10, 0o777),
+                    (0x1d20, 0o777),
+                    (0x1d40, 0o555),
+                    (0x1d60, 0o777),
+                ] {
+                    assert_eq!(
+                        call(
+                            &mut root_full,
+                            Operation::Mkdirat,
+                            [AT_FDCWD, path_addr, mode, 0, 0, 0],
+                            &mut mem,
+                            &mut host
+                        )
+                        .await,
+                        0
+                    );
+                }
+                // Cross-parent RENAME_EXCHANGE onto read-only destination dir fails with EACCES.
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Renameat2,
+                        [AT_FDCWD, 0x1d20, AT_FDCWD, 0x1d40, RENAME_EXCHANGE, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+                // Same-parent RENAME_EXCHANGE of read-only dir does not rewrite `..` -> succeeds.
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Renameat2,
+                        [AT_FDCWD, 0x1d60, AT_FDCWD, 0x1d40, RENAME_EXCHANGE, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
                     0
                 );
 

@@ -348,6 +348,16 @@ impl LinuxCapabilities {
         cap <= CAP_LAST_CAP && (self.effective & (1u64 << cap)) != 0
     }
 
+    /// Clamps every capability set to `ceiling` (bounded by [`CAP_FULL_SET`]).
+    pub const fn clamp(&mut self, ceiling: u64) {
+        let mask = ceiling & CAP_FULL_SET;
+        self.effective &= mask;
+        self.permitted &= mask;
+        self.inheritable &= mask;
+        self.bounding &= mask;
+        self.ambient &= mask;
+    }
+
     /// `security/commoncap.c` `cap_emulate_setxuid`: drops capabilities when
     /// transitioning from UID 0 to all non-zero UIDs, and adjusts the
     /// effective set on `euid` transitions between 0 and non-zero.

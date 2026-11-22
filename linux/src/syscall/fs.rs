@@ -187,7 +187,7 @@ pub struct OpenRequest {
     pub append: bool,
     pub sync: bool,
     pub dsync: bool,
-    /// Raw creation permissions (`mode & 0o777`) before applying `umask`.
+    /// Raw creation permissions (`mode & 0o7777`) before applying `umask`.
     pub mode: u32,
     /// Calling process's `umask` (`0o777`), skipped when the parent directory
     /// carries a POSIX default ACL (`fs/posix_acl.c` `posix_acl_create`).
@@ -939,7 +939,7 @@ pub(super) async fn openat<R: Resources, M: UserMemory, F: Filesystem<R>>(
     let flags = args[2] as u32 as u64;
     let raw_mode = args[3] as u32;
     let umask = process.shared.attributes.lock().umask;
-    let mode = raw_mode & 0o777;
+    let mode = raw_mode & permissions::S_IALLUGO;
 
     let path_only = flags & O_PATH != 0;
     let accmode = flags & O_ACCMODE;
@@ -1137,7 +1137,7 @@ pub(super) async fn newfstatat<R: Resources, M: UserMemory, F: Filesystem<R>, T:
         if dirfd == AT_FDCWD {
             let cwd = process.shared.cwd.lock().clone();
             let creds = process_creds(process);
-            match fs.stat_path(None, &cwd, ".", true, &creds).await {
+            match fs.stat_path(None, &cwd, "", true, &creds).await {
                 Ok((stat, _)) => stat,
                 Err(error) => return fs_errno(error),
             }
@@ -1218,7 +1218,7 @@ pub(super) async fn statx<R: Resources, M: UserMemory, F: Filesystem<R>, T: tty:
         if dirfd == AT_FDCWD {
             let cwd = process.shared.cwd.lock().clone();
             let creds = process_creds(process);
-            match fs.stat_path(None, &cwd, ".", true, &creds).await {
+            match fs.stat_path(None, &cwd, "", true, &creds).await {
                 Ok((stat, _)) => stat,
                 Err(error) => return fs_errno(error),
             }
@@ -1385,7 +1385,8 @@ pub(super) async fn mkdirat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         return errno(ENOENT);
     }
     let umask = process.shared.attributes.lock().umask;
-    let mode = (args[2] as u32) & 0o777;
+    // `fs/namei.c` `do_mkdirat`: preserves `0o777 | S_ISVTX` (`0o1777`).
+    let mode = (args[2] as u32) & (0o777 | permissions::S_ISVTX);
     let base = match dirfd_file(process, dirfd, &path, false, fs) {
         Ok(base) => base,
         Err(err) => return err,
@@ -2673,7 +2674,7 @@ pub(super) async fn fchmodat2<R: Resources, M: UserMemory, F: Filesystem<R>>(
         }
         if dirfd == AT_FDCWD {
             let cwd = process.shared.cwd.lock().clone();
-            return match fs.chmod_path(None, &cwd, ".", true, mode, &creds).await {
+            return match fs.chmod_path(None, &cwd, "", true, mode, &creds).await {
                 Ok(()) => 0,
                 Err(error) => fs_errno(error),
             };
@@ -2769,7 +2770,7 @@ pub(super) async fn fchownat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         }
         if dirfd == AT_FDCWD {
             let cwd = process.shared.cwd.lock().clone();
-            return match fs.chown_path(None, &cwd, ".", true, uid, gid, &creds).await {
+            return match fs.chown_path(None, &cwd, "", true, uid, gid, &creds).await {
                 Ok(()) => 0,
                 Err(error) => fs_errno(error),
             };
@@ -2865,7 +2866,7 @@ pub(super) async fn mknodat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Err(error) => return fs_errno(error),
     };
     let umask = process.shared.attributes.lock().umask;
-    let mode = raw_mode & 0o777;
+    let mode = raw_mode & permissions::S_IALLUGO;
     let base = match dirfd_file(process, dirfd, &path, false, fs) {
         Ok(base) => base,
         Err(err) => return err,

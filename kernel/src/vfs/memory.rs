@@ -455,10 +455,10 @@ impl MemoryFs {
         let permissions = match kind {
             NodeKind::Symlink => 0o777,
             NodeKind::Directory => {
-                ((attributes.permissions & 0o777) & !attributes.umask)
+                ((attributes.permissions & 0o1777) & !(attributes.umask & 0o777))
                     | if parent_sgid { S_ISGID } else { 0 }
             }
-            _ => (attributes.permissions & 0o777) & !attributes.umask,
+            _ => (attributes.permissions & S_IALLUGO) & !(attributes.umask & 0o777),
         };
         Ok(UnixAttributes {
             permissions,

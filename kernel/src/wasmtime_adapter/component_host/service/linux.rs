@@ -3161,7 +3161,8 @@ where
         Some(table) => table.into_slots(),
         None => syscall::standard_streams::<LinuxResources<Net>>(),
     };
-    let credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
+    let mut credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
+    container.clamp_credentials(&mut credentials);
     let initial_cwd = container
         .authority()
         .cwd()
