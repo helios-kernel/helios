@@ -504,35 +504,60 @@ impl<S: Storage> LinuxContainer<S> {
 
     /// Creates a single-process container for a direct Linux ELF launch
     /// (such as through a shell or direct program exec), bounded by
-    /// `authority` and rooted at `namespace`'s root (`MountSharing::Shared`),
-    /// attaching any additional non-`"/"` directory preopens from `authority`
-    /// that resolve in `namespace` as `MountSharing::Shared`.
+    /// `authority` and rooted at the `guest_name == "/"` preopen's
+    /// `source_path` in `namespace` (or `namespace`'s `"/"` with empty rights
+    /// when no resolvable `"/"` preopen was granted), attaching any additional
+    /// non-`"/"` directory preopens from `authority` that resolve in
+    /// `namespace`, all pinned to `MountSharing::Shared`.
     pub fn ephemeral(
         id: ContainerId,
         authority: ProcessAuthority,
         namespace: &Namespace<S>,
     ) -> Self {
-        let root_resolved = namespace
-            .resolve("/")
-            .expect("every namespace resolves its root \"/\"");
-        let root_rights = authority
-            .directory_preopens()
-            .iter()
-            .filter(|preopen| preopen.guest_name() == "/")
-            .fold(DirectoryAuthorityRights::empty(), |acc, preopen| {
-                acc | preopen.rights()
-            });
-        let fs_rights = effective_fs_rights(root_rights, root_resolved.grant().rights);
-        let mut mounts = vec![ContainerMount {
-            target: String::from("/"),
-            backing: root_resolved.held(),
-            grant: MountGrant {
-                rights: fs_rights,
-                sharing: MountSharing::Shared,
-            },
-            authority_rights: root_rights,
-            _private_claim: None,
-        }];
+        let root_mount = {
+            let root_binding = authority
+                .directory_preopens()
+                .iter()
+                .filter(|preopen| preopen.guest_name() == "/")
+                .find_map(|preopen| {
+                    namespace
+                        .resolve(preopen.source_path())
+                        .ok()
+                        .map(|resolved| (preopen.source_path(), resolved))
+                });
+            let (root_resolved, root_rights) = match root_binding {
+                Some((root_source, resolved)) => {
+                    let rights = authority
+                        .directory_preopens()
+                        .iter()
+                        .filter(|preopen| {
+                            preopen.guest_name() == "/" && preopen.source_path() == root_source
+                        })
+                        .fold(DirectoryAuthorityRights::empty(), |acc, preopen| {
+                            acc | preopen.rights()
+                        });
+                    (resolved, rights)
+                }
+                None => (
+                    namespace
+                        .resolve("/")
+                        .expect("every namespace resolves its root \"/\""),
+                    DirectoryAuthorityRights::empty(),
+                ),
+            };
+            let fs_rights = effective_fs_rights(root_rights, root_resolved.grant().rights);
+            ContainerMount {
+                target: String::from("/"),
+                backing: root_resolved.held(),
+                grant: MountGrant {
+                    rights: fs_rights,
+                    sharing: MountSharing::Shared,
+                },
+                authority_rights: root_rights,
+                _private_claim: None,
+            }
+        };
+        let mut mounts = vec![root_mount];
         for preopen in authority.directory_preopens() {
             if preopen.guest_name() == "/" {
                 continue;
@@ -1307,6 +1332,28 @@ mod tests {
         assert!(block_on(container.filesystem().read_executable("/opt/tool")).is_ok());
         assert!(matches!(
             block_on(container.filesystem().read_executable("/shared/tool")),
+            Err(FsError::NoEntry)
+        ));
+
+        // A sandboxed `"/"` preopen (`source_path != "/"`) binds `"/"` to that
+        // source directory alone and never widens access to the host `"/"`.
+        let host_secret = mount_memory(&host_ns, "/host-secret", rw, MountSharing::Shared);
+        block_on(create_file(&host_secret, "secret", b"\x7fELF-secret"));
+        let mut sandboxed_authority = ProcessAuthority::empty();
+        sandboxed_authority
+            .insert_directory_preopen(DirectoryPreopen::new("/shared", "/", RX).unwrap());
+        let sandboxed = LinuxContainer::ephemeral(
+            ContainerId::new(NonZeroU64::new(8).unwrap()),
+            sandboxed_authority,
+            &host_ns,
+        );
+        assert!(block_on(sandboxed.filesystem().read_executable("/tool")).is_ok());
+        assert!(matches!(
+            block_on(
+                sandboxed
+                    .filesystem()
+                    .read_executable("/host-secret/secret")
+            ),
             Err(FsError::NoEntry)
         ));
     }
