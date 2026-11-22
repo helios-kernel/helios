@@ -815,6 +815,40 @@ fn node_kind_to_component(kind: NodeKind) -> ComponentFsNodeKind {
     }
 }
 
+fn join_synthetic_etc_path(base_dir: &str, path: &str) -> Option<String> {
+    // Reject `..` components so `/nonexistent/../etc/hosts` cannot lexically
+    // collapse onto a synthetic `/etc` entry.
+    if path.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    let combined = if path.starts_with('/') {
+        String::from(path)
+    } else if base_dir.ends_with('/') {
+        alloc::format!("{base_dir}{path}")
+    } else {
+        alloc::format!("{base_dir}/{path}")
+    };
+    Some(combined)
+}
+
+fn synthetic_etc_stat(path: &str, size: u64) -> FileStat {
+    let ino = if path.ends_with("/resolv.conf") { 1 } else { 2 };
+    FileStat {
+        dev: u64::MAX,
+        ino,
+        kind: NodeKind::File,
+        permissions: 0o444,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        size,
+        access_nanos: 0,
+        modified_nanos: 0,
+        status_nanos: 0,
+    }
+}
+
 fn container_info_to_stat(info: &crate::ContainerNodeInfo) -> FileStat {
     FileStat {
         dev: info.metadata.id.device.raw(),
@@ -947,12 +981,53 @@ where
     ) -> Result<FsDescriptor, FsError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
-        let (info, container_path, mount_hold) = self
+        let opened = self
             .shared
             .container
             .filesystem()
             .open_at(base_dir, path, request, now)
-            .await?;
+            .await;
+        let (info, container_path, mount_hold) = match opened {
+            Ok(ok) => ok,
+            Err(FsError::NoEntry) => {
+                let Some(combined) = join_synthetic_etc_path(base_dir, path) else {
+                    return Err(FsError::NoEntry);
+                };
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if self
+                    .shared
+                    .container
+                    .synthetic_etc_file(&combined, &servers)
+                    .is_some()
+                {
+                    if request.directory {
+                        return Err(FsError::NotDirectory);
+                    }
+                    if request.write || request.truncate || request.create || request.exclusive {
+                        return Err(FsError::ReadOnly);
+                    }
+                    let mut flags = FsDescriptorFlags::empty();
+                    if request.read {
+                        flags |= FsDescriptorFlags::READ;
+                    }
+                    return Ok(FsDescriptor {
+                        path: combined,
+                        kind: ComponentFsNodeKind::File,
+                        flags,
+                        identity: None,
+                        mount: None,
+                        open: None,
+                    });
+                }
+                return Err(FsError::NoEntry);
+            }
+            Err(error) => return Err(error),
+        };
         let mut flags = FsDescriptorFlags::empty();
         if request.read {
             flags |= FsDescriptorFlags::READ;
@@ -987,23 +1062,64 @@ where
         follow: bool,
     ) -> Result<(FileStat, String), FsError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
-        let (info, resolved_path) = self
+        match self
             .shared
             .container
             .filesystem()
             .stat_at(base_dir, path, follow)
-            .await?;
-        Ok((container_info_to_stat(&info), resolved_path))
+            .await
+        {
+            Ok((info, resolved_path)) => Ok((container_info_to_stat(&info), resolved_path)),
+            Err(FsError::NoEntry) => {
+                let Some(combined) = join_synthetic_etc_path(base_dir, path) else {
+                    return Err(FsError::NoEntry);
+                };
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if let Some(bytes) = self
+                    .shared
+                    .container
+                    .synthetic_etc_file(&combined, &servers)
+                {
+                    return Ok((synthetic_etc_stat(&combined, bytes.len() as u64), combined));
+                }
+                Err(FsError::NoEntry)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn stat_file(&self, file: &FsDescriptor) -> Result<FileStat, FsError> {
-        let info = self
+        match self
             .shared
             .container
             .filesystem()
             .stat_resolved(&file.path)
-            .await?;
-        Ok(container_info_to_stat(&info))
+            .await
+        {
+            Ok(info) => Ok(container_info_to_stat(&info)),
+            Err(FsError::NoEntry) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if let Some(bytes) = self
+                    .shared
+                    .container
+                    .synthetic_etc_file(&file.path, &servers)
+                {
+                    return Ok(synthetic_etc_stat(&file.path, bytes.len() as u64));
+                }
+                Err(FsError::NoEntry)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn access_path(
@@ -1014,11 +1130,42 @@ where
         check: AccessCheck,
     ) -> Result<(), FsError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
-        self.shared
+        match self
+            .shared
             .container
             .filesystem()
             .access_at(base_dir, path, check)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(FsError::NoEntry) => {
+                let Some(combined) = join_synthetic_etc_path(base_dir, path) else {
+                    return Err(FsError::NoEntry);
+                };
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if self
+                    .shared
+                    .container
+                    .synthetic_etc_file(&combined, &servers)
+                    .is_some()
+                {
+                    if check.write {
+                        return Err(FsError::ReadOnly);
+                    }
+                    if check.exec {
+                        return Err(FsError::NotPermitted);
+                    }
+                    return Ok(());
+                }
+                Err(FsError::NoEntry)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn read_at(
@@ -1027,11 +1174,36 @@ where
         offset: u64,
         max_bytes: usize,
     ) -> Result<Bytes, FsError> {
-        self.shared
+        match self
+            .shared
             .container
             .filesystem()
             .read_at(&file.path, offset, max_bytes)
             .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(FsError::NoEntry) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if let Some(bytes) = self
+                    .shared
+                    .container
+                    .synthetic_etc_file(&file.path, &servers)
+                {
+                    let start = usize::try_from(offset)
+                        .unwrap_or(bytes.len())
+                        .min(bytes.len());
+                    let end = start.saturating_add(max_bytes).min(bytes.len());
+                    return Ok(Bytes::copy_from_slice(&bytes[start..end]));
+                }
+                Err(FsError::NoEntry)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn write_at(

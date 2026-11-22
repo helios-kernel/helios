@@ -1287,9 +1287,9 @@ pub async fn dispatch<
         Operation::Shutdown => SyscallOutcome::Return(
             socket::shutdown::<R, _>(&process.shared.descriptors, arguments, output).await,
         ),
-        Operation::Sendfile => {
-            SyscallOutcome::Return(socket::sendfile::<R, _>(process, arguments, output).await)
-        }
+        Operation::Sendfile => SyscallOutcome::Return(
+            socket::sendfile::<R, _, _>(process, arguments, memory, output).await,
+        ),
         Operation::Setsockopt => SyscallOutcome::Return(
             socket::setsockopt::<R, _, _>(&process.shared.descriptors, arguments, memory, output)
                 .await,

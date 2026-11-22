@@ -960,7 +960,7 @@ fn udp_recvmsg_sets_msg_trunc_and_recvmmsg_enforces_timeout_and_multicast_u8_opt
 }
 
 #[test]
-fn sendfile_validates_fds_before_reading_and_honours_nonblocking_pipes() {
+fn sendfile_rejects_pipe_inputs_with_espipe_or_einval_without_consuming() {
     let mut proc = new_process(Abi::X86_64);
     let mut mem = Memory::new(4096);
     let mut plat = Platform {
@@ -984,21 +984,8 @@ fn sendfile_validates_fds_before_reading_and_honours_nonblocking_pipes() {
     let pr = i32::from_le_bytes(pfds[0..4].try_into().unwrap()) as u64;
     let pw = i32::from_le_bytes(pfds[4..8].try_into().unwrap()) as u64;
 
-    // Non-blocking empty pipe -> sendfile returns EAGAIN instead of blocking.
-    assert_eq!(
-        call_op(
-            &mut proc,
-            Abi::X86_64,
-            Operation::Sendfile,
-            [1, pr, 0, 8, 0, 0],
-            &mut mem,
-            &mut plat,
-        ),
-        EAGAIN.wrapping_neg()
-    );
-
-    // Write bytes to pipe, then call sendfile with an invalid out_fd (pr is read-only):
-    // must return EINVAL (22) without consuming bytes from the pipe.
+    // Write bytes to pipe, then call sendfile with non-NULL offset -> ESPIPE (29),
+    // and NULL offset -> EINVAL (22), without consuming bytes from the pipe.
     mem.write(128, b"keep").unwrap();
     assert_eq!(
         call_op(
@@ -1011,12 +998,24 @@ fn sendfile_validates_fds_before_reading_and_honours_nonblocking_pipes() {
         ),
         4
     );
+    mem.write(160, &0i64.to_le_bytes()).unwrap();
     assert_eq!(
         call_op(
             &mut proc,
             Abi::X86_64,
             Operation::Sendfile,
-            [pr, pr, 0, 4, 0, 0],
+            [1, pr, 160, 4, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        29u64.wrapping_neg()
+    );
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Sendfile,
+            [1, pr, 0, 4, 0, 0],
             &mut mem,
             &mut plat,
         ),
