@@ -28,7 +28,10 @@
 //!   and stops running slices at the next timer preemption.
 
 use super::*;
-use crate::{SetWallClockCap, TerminalInputCap, TerminalOutputCap};
+use crate::{
+    MulticastCap, PrivilegedBindCap, SetWallClockCap, TcpCap, TerminalInputCap, TerminalOutputCap,
+    UdpCap,
+};
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -103,6 +106,10 @@ struct LinuxGrants {
     terminal_output: Option<TerminalOutputCap>,
     /// What WASIX's `clock_time_set` derives, for `clock_settime`.
     set_wall_clock: Option<SetWallClockCap>,
+    tcp: Option<TcpCap>,
+    udp: Option<UdpCap>,
+    privileged_bind: Option<PrivilegedBindCap>,
+    multicast: Option<MulticastCap>,
 }
 
 impl LinuxGrants {
@@ -111,6 +118,10 @@ impl LinuxGrants {
             terminal_input: authority.derive_terminal_input_cap().ok(),
             terminal_output: authority.derive_terminal_output_cap().ok(),
             set_wall_clock: authority.derive_set_wall_clock_cap().ok(),
+            tcp: authority.derive_tcp_cap().ok(),
+            udp: authority.derive_udp_cap().ok(),
+            privileged_bind: authority.derive_privileged_bind_cap().ok(),
+            multicast: authority.derive_multicast_cap().ok(),
         }
     }
 }
@@ -661,6 +672,613 @@ where
     fn set_domainname(&mut self, name: syscall::UtsField) -> Result<(), Denied> {
         self.shared.container.set_domainname(name);
         Ok(())
+    }
+}
+
+fn linux_to_network_ip(ip: syscall::IpAddr) -> crate::NetworkIpAddress {
+    match ip {
+        syscall::IpAddr::V4(octets) => {
+            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new(octets))
+        }
+        syscall::IpAddr::V6(octets) => {
+            crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new(octets))
+        }
+    }
+}
+
+fn network_to_linux_ip(address: crate::NetworkIpAddress) -> syscall::IpAddr {
+    match address {
+        crate::NetworkIpAddress::Ipv4(addr) => syscall::IpAddr::V4(addr.octets()),
+        crate::NetworkIpAddress::Ipv6(addr) => syscall::IpAddr::V6(addr.octets()),
+    }
+}
+
+fn linux_errno_from_tcp_error(error: crate::TcpError) -> u64 {
+    const EACCES: u64 = 13;
+    const EIO: u64 = 5;
+    match error.detail {
+        crate::NetworkErrorDetail::AddressNotAvailable => return syscall::EADDRNOTAVAIL,
+        crate::NetworkErrorDetail::TcpRemotePortUnreachable => return syscall::ECONNREFUSED,
+        crate::NetworkErrorDetail::TcpRemoteNetworkUnreachable => return syscall::ENETUNREACH,
+        crate::NetworkErrorDetail::TcpRemoteHostUnreachable => return syscall::EHOSTUNREACH,
+        crate::NetworkErrorDetail::TcpRemoteCommunicationProhibited => return EACCES,
+        crate::NetworkErrorDetail::TcpClosedDuringConnect => return syscall::ECONNREFUSED,
+        crate::NetworkErrorDetail::TcpListenStartFailed => return syscall::EADDRINUSE,
+        crate::NetworkErrorDetail::TcpNoLongerWritable => return syscall::EPIPE,
+        _ => {}
+    }
+    match error.kind {
+        crate::TcpErrorKind::UnresolvedHost => syscall::EHOSTUNREACH,
+        crate::TcpErrorKind::Timeout => syscall::ETIMEDOUT,
+        crate::TcpErrorKind::ConnectionReset => syscall::ECONNRESET,
+        crate::TcpErrorKind::ConnectionAborted => syscall::ECONNABORTED,
+        crate::TcpErrorKind::PermissionDenied => EACCES,
+        crate::TcpErrorKind::Unavailable => syscall::ENETDOWN,
+        crate::TcpErrorKind::Internal => EIO,
+    }
+}
+
+fn linux_errno_from_udp_error(error: crate::UdpError) -> u64 {
+    const EACCES: u64 = 13;
+    const EIO: u64 = 5;
+    const EINVAL: u64 = 22;
+    const EOPNOTSUPP: u64 = 95;
+    match error.detail {
+        crate::NetworkErrorDetail::AddressNotAvailable
+        | crate::NetworkErrorDetail::UdpMulticastInterfaceUnavailable => {
+            return syscall::EADDRNOTAVAIL;
+        }
+        crate::NetworkErrorDetail::UdpPortInUse => return syscall::EADDRINUSE,
+        crate::NetworkErrorDetail::UdpDatagramTooLarge => return syscall::EMSGSIZE,
+        crate::NetworkErrorDetail::UdpRemotePortUnreachable => return syscall::ECONNREFUSED,
+        crate::NetworkErrorDetail::UdpRemoteNetworkUnreachable => return syscall::ENETUNREACH,
+        crate::NetworkErrorDetail::UdpRemoteHostUnreachable => return syscall::EHOSTUNREACH,
+        crate::NetworkErrorDetail::UdpRemoteCommunicationProhibited => return EACCES,
+        crate::NetworkErrorDetail::UnsupportedAddressFamily => return syscall::EAFNOSUPPORT,
+        crate::NetworkErrorDetail::UdpMulticastJoinFailed
+        | crate::NetworkErrorDetail::UdpMulticastLeaveFailed => return EINVAL,
+        _ => {}
+    }
+    match error.kind {
+        crate::UdpErrorKind::UnresolvedHost => syscall::EHOSTUNREACH,
+        crate::UdpErrorKind::Unsupported => EOPNOTSUPP,
+        crate::UdpErrorKind::Timeout => syscall::ETIMEDOUT,
+        crate::UdpErrorKind::PermissionDenied => EACCES,
+        crate::UdpErrorKind::Unavailable => syscall::ENETDOWN,
+        crate::UdpErrorKind::Internal => EIO,
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> syscall::Network<crate::UnixNetwork<Net>>
+    for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn to_ip(&self, address: crate::NetworkIpAddress) -> syscall::IpAddr {
+        network_to_linux_ip(address)
+    }
+
+    fn encode_ip(&self, ip: syscall::IpAddr) -> crate::NetworkIpAddress {
+        linux_to_network_ip(ip)
+    }
+
+    fn check_tcp_open(&self) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.tcp.is_none() {
+            return Err(EACCES);
+        }
+        if self.shared.runtime_state.network_service().is_none() {
+            return Err(syscall::ENETDOWN);
+        }
+        Ok(())
+    }
+
+    fn check_udp_open(&self) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.udp.is_none() {
+            return Err(EACCES);
+        }
+        if self.shared.runtime_state.network_service().is_none() {
+            return Err(syscall::ENETDOWN);
+        }
+        Ok(())
+    }
+
+    fn check_tcp_bind(&self, local_port: u16) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        self.check_tcp_open()?;
+        if local_port != 0 && local_port < 1024 && self.shared.grants.privileged_bind.is_none() {
+            return Err(EACCES);
+        }
+        Ok(())
+    }
+
+    fn check_udp_bind(&self, local_port: u16) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        self.check_udp_open()?;
+        if local_port != 0 && local_port < 1024 && self.shared.grants.privileged_bind.is_none() {
+            return Err(EACCES);
+        }
+        Ok(())
+    }
+
+    async fn tcp_listen(
+        &self,
+        local: syscall::SocketAddr,
+        backlog: u16,
+        hop_limit: u8,
+    ) -> Result<(Arc<OwnedTcpListener<crate::UnixNetwork<Net>>>, u16), u64> {
+        self.check_tcp_bind(local.port)?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let bound = service
+            .tcp_listen(
+                linux_to_network_ip(local.ip),
+                local.port,
+                backlog,
+                hop_limit,
+            )
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        let owned = OwnedTcpListener::new(crate::UnixNetwork::new(service), bound.listener);
+        Ok((owned, bound.local_port))
+    }
+
+    async fn tcp_accept(
+        &self,
+        listener: Net::TcpListener,
+        timeout_nanos: u64,
+    ) -> Result<
+        (
+            Arc<OwnedTcpStream<crate::UnixNetwork<Net>>>,
+            syscall::SocketAddr,
+        ),
+        u64,
+    > {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let accepted = service
+            .tcp_accept(listener, timeout_nanos)
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        let owned = OwnedTcpStream::new(crate::UnixNetwork::new(service), accepted.stream);
+        Ok((
+            owned,
+            syscall::SocketAddr {
+                ip: network_to_linux_ip(accepted.address),
+                port: accepted.port,
+            },
+        ))
+    }
+
+    async fn tcp_connect(
+        &self,
+        remote: syscall::SocketAddr,
+        local_port: u16,
+        hop_limit: u8,
+        timeout_nanos: u64,
+    ) -> Result<Arc<OwnedTcpStream<crate::UnixNetwork<Net>>>, u64> {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let stream = service
+            .tcp_connect_address(
+                linux_to_network_ip(remote.ip),
+                remote.port,
+                local_port,
+                hop_limit,
+                timeout_nanos,
+            )
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        Ok(OwnedTcpStream::new(
+            crate::UnixNetwork::new(service),
+            stream,
+        ))
+    }
+
+    async fn tcp_connect_start(
+        &self,
+        remote: syscall::SocketAddr,
+        local_port: u16,
+        hop_limit: u8,
+    ) -> Result<
+        (
+            Arc<OwnedTcpStream<crate::UnixNetwork<Net>>>,
+            syscall::ConnectProgress,
+        ),
+        u64,
+    > {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let (stream, progress) = service
+            .tcp_connect_start(
+                linux_to_network_ip(remote.ip),
+                remote.port,
+                local_port,
+                hop_limit,
+            )
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        let owned = OwnedTcpStream::new(crate::UnixNetwork::new(service), stream);
+        let progress = match progress {
+            crate::TcpConnectPoll::Pending => syscall::ConnectProgress::Pending,
+            crate::TcpConnectPoll::Connected => syscall::ConnectProgress::Connected,
+        };
+        Ok((owned, progress))
+    }
+
+    async fn tcp_connect_poll(
+        &self,
+        stream: Net::TcpStream,
+    ) -> Result<syscall::ConnectProgress, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        match service
+            .tcp_connect_poll(stream)
+            .await
+            .map_err(linux_errno_from_tcp_error)?
+        {
+            crate::TcpConnectPoll::Pending => Ok(syscall::ConnectProgress::Pending),
+            crate::TcpConnectPoll::Connected => Ok(syscall::ConnectProgress::Connected),
+        }
+    }
+
+    fn tcp_local_endpoint(
+        &self,
+        stream: Net::TcpStream,
+    ) -> Result<Option<syscall::SocketAddr>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        Ok(service
+            .tcp_local_endpoint(stream)
+            .map_err(linux_errno_from_tcp_error)?
+            .map(|(ip, port)| syscall::SocketAddr {
+                ip: network_to_linux_ip(ip),
+                port,
+            }))
+    }
+
+    fn tcp_set_hop_limit(&self, stream: Net::TcpStream, hop_limit: u8) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .tcp_set_hop_limit(stream, hop_limit)
+            .map_err(linux_errno_from_tcp_error)
+    }
+
+    fn tcp_listener_set_hop_limit(
+        &self,
+        listener: Net::TcpListener,
+        hop_limit: u8,
+    ) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .tcp_listener_set_hop_limit(listener, hop_limit)
+            .map_err(linux_errno_from_tcp_error)
+    }
+
+    async fn tcp_read(
+        &self,
+        stream: Net::TcpStream,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<Bytes>, u64> {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        if !peek {
+            return service
+                .tcp_read(stream, max_bytes, timeout_nanos)
+                .await
+                .map_err(linux_errno_from_tcp_error);
+        }
+        let cap = (max_bytes as usize).min(65_536);
+        let mut storage = alloc::vec![0u8; cap];
+        let ranges = [(0usize, storage.len())];
+        // SAFETY: `storage` is a live, exclusively owned heap buffer that stays
+        // in place for the duration of `tcp_peek_into`, and no page of it can
+        // be swapped out (`residency = None`).
+        let mut buffer = unsafe {
+            crate::RegisteredTcpReadBuffer::new(storage.as_mut_ptr() as usize, &ranges, None)
+        };
+        match service
+            .tcp_peek_into(stream, &mut buffer, timeout_nanos)
+            .await
+            .map_err(linux_errno_from_tcp_error)?
+        {
+            crate::TcpReadInto::Data(n) => {
+                storage.truncate(n);
+                Ok(Some(Bytes::from(storage)))
+            }
+            crate::TcpReadInto::Eof => Ok(None),
+            crate::TcpReadInto::PageLost(_) => Err(5),
+        }
+    }
+
+    async fn tcp_write(
+        &self,
+        stream: Net::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, u64> {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .tcp_write_some_bytes(stream, bytes, timeout_nanos)
+            .await
+            .map_err(linux_errno_from_tcp_error)
+    }
+
+    async fn tcp_shutdown_send(&self, stream: Net::TcpStream) -> Result<(), u64> {
+        self.check_tcp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .tcp_shutdown_send(stream)
+            .await
+            .map_err(linux_errno_from_tcp_error)
+    }
+
+    async fn tcp_readiness(&self, stream: Net::TcpStream) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let r = service
+            .tcp_readiness(stream)
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        Ok(syscall::SocketReady {
+            readable: r.readable,
+            writable: r.writable,
+            hangup: r.hangup,
+        })
+    }
+
+    async fn tcp_listener_readiness(
+        &self,
+        listener: Net::TcpListener,
+    ) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let r = service
+            .tcp_listener_readiness(listener)
+            .await
+            .map_err(linux_errno_from_tcp_error)?;
+        Ok(syscall::SocketReady {
+            readable: r.readable,
+            writable: r.writable,
+            hangup: r.hangup,
+        })
+    }
+
+    async fn udp_bind(
+        &self,
+        local: syscall::SocketAddr,
+        hop_limit: u8,
+    ) -> Result<(Arc<OwnedUdpSocket<crate::UnixNetwork<Net>>>, u16), u64> {
+        self.check_udp_bind(local.port)?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let bound = service
+            .udp_bind(linux_to_network_ip(local.ip), local.port)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        let owned = OwnedUdpSocket::new(crate::UnixNetwork::new(service.clone()), bound.socket);
+        service
+            .udp_set_hop_limit(bound.socket, hop_limit)
+            .map_err(linux_errno_from_udp_error)?;
+        Ok((owned, bound.local_port))
+    }
+
+    fn udp_connect(&self, socket: Net::UdpSocket, remote: syscall::SocketAddr) -> Result<(), u64> {
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_connect(socket, linux_to_network_ip(remote.ip), remote.port)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    fn udp_disconnect(&self, socket: Net::UdpSocket) -> Result<(), u64> {
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_disconnect(socket)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    fn udp_set_hop_limit(&self, socket: Net::UdpSocket, hop_limit: u8) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_set_hop_limit(socket, hop_limit)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn udp_send<'a>(
+        &'a self,
+        socket: Net::UdpSocket,
+        remote: syscall::SocketAddr,
+        bytes: &'a [u8],
+        timeout_nanos: u64,
+    ) -> Result<usize, u64> {
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let sent = service
+            .udp_send_address(
+                socket,
+                linux_to_network_ip(remote.ip),
+                remote.port,
+                bytes,
+                timeout_nanos,
+            )
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(sent as usize)
+    }
+
+    async fn udp_receive(
+        &self,
+        socket: Net::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<(Bytes, syscall::SocketAddr, usize)>, u64> {
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let datagram = if peek {
+            service
+                .udp_peek(socket, max_bytes, timeout_nanos)
+                .await
+                .map_err(linux_errno_from_udp_error)?
+        } else {
+            service
+                .udp_receive(socket, max_bytes, timeout_nanos)
+                .await
+                .map_err(linux_errno_from_udp_error)?
+        };
+        Ok(datagram.map(|d| {
+            (
+                d.bytes,
+                syscall::SocketAddr {
+                    ip: network_to_linux_ip(d.address),
+                    port: d.port,
+                },
+                d.original_len,
+            )
+        }))
+    }
+
+    async fn udp_readiness(&self, socket: Net::UdpSocket) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let r = service
+            .udp_readiness(socket)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(syscall::SocketReady {
+            readable: r.readable,
+            writable: r.writable,
+            hangup: r.hangup,
+        })
+    }
+
+    async fn udp_join_multicast_v4(&self, group: [u8; 4], interface: [u8; 4]) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.multicast.is_none() {
+            return Err(EACCES);
+        }
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_join_multicast_v4(
+                crate::Ipv4Address::new(group),
+                crate::Ipv4Address::new(interface),
+            )
+            .await
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn udp_leave_multicast_v4(&self, group: [u8; 4], interface: [u8; 4]) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.multicast.is_none() {
+            return Err(EACCES);
+        }
+        self.check_udp_open()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .udp_leave_multicast_v4(
+                crate::Ipv4Address::new(group),
+                crate::Ipv4Address::new(interface),
+            )
+            .await
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    fn check_multicast_v6(&self) -> Result<(), u64> {
+        const EACCES: u64 = 13;
+        if self.shared.grants.multicast.is_none() {
+            return Err(EACCES);
+        }
+        self.check_udp_open()
     }
 }
 
@@ -1642,6 +2260,14 @@ mod tests {
         }
 
         struct DummyOutput;
+        impl syscall::Network<helios_unix::NoNetwork> for DummyOutput {
+            fn to_ip(&self, address: core::convert::Infallible) -> syscall::IpAddr {
+                match address {}
+            }
+            fn encode_ip(&self, _: syscall::IpAddr) -> core::convert::Infallible {
+                unreachable!()
+            }
+        }
         impl Stdio for DummyOutput {
             async fn write(&mut self, _: Stream, _: &[u8]) -> Result<usize, WriteError> {
                 Err(WriteError::Io)

@@ -22,7 +22,11 @@ use helios_linux::syscall::{
     VirtualMemory, WriteError, dispatch as raw_dispatch,
 };
 
-async fn dispatch<M: VirtualMemory, T: Thread<NoBacking>, O: Stdio + Clock + System>(
+async fn dispatch<
+    M: VirtualMemory,
+    T: Thread<NoBacking>,
+    O: Stdio + Clock + System + helios_linux::syscall::Network<helios_unix::NoNetwork>,
+>(
     process: &mut Process<NoBacking>,
     call: Call,
     memory: &mut M,
@@ -261,6 +265,15 @@ impl Clock for Platform {
         } else {
             self.monotonic.store(deadline, Ordering::Relaxed);
         }
+    }
+}
+
+impl helios_linux::syscall::Network<helios_unix::NoNetwork> for Platform {
+    fn to_ip(&self, address: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+        match address {}
+    }
+    fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+        unreachable!()
     }
 }
 

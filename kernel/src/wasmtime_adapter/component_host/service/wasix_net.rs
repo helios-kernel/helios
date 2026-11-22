@@ -1763,6 +1763,7 @@ where
                         socket: owned,
                         local_address: address,
                         local_port: binding.local_port,
+                        peer: None,
                         options,
                     };
                     p1::errno::SUCCESS
@@ -2067,7 +2068,9 @@ where
             options.hop_limit(),
             family,
         ),
-        UnixTcpSocket::Connected { .. } | UnixTcpSocket::Listening { .. } => {
+        UnixTcpSocket::Connected { .. }
+        | UnixTcpSocket::Connecting { .. }
+        | UnixTcpSocket::Listening { .. } => {
             return p1::errno::INVAL;
         }
     };
@@ -2107,7 +2110,9 @@ where
                 };
                 p1::errno::SUCCESS
             }
-            UnixTcpSocket::Connected { .. } | UnixTcpSocket::Listening { .. } => p1::errno::INVAL,
+            UnixTcpSocket::Connected { .. }
+            | UnixTcpSocket::Connecting { .. }
+            | UnixTcpSocket::Listening { .. } => p1::errno::INVAL,
         })
         .unwrap_or(p1::errno::INVAL)
 }
@@ -2404,6 +2409,7 @@ where
                                 socket: owned,
                                 local_address,
                                 local_port: binding.local_port,
+                                peer: None,
                                 options,
                             };
                             (id, send_timeout)

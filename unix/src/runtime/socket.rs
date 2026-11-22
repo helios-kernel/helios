@@ -26,6 +26,7 @@
 use alloc::sync::Arc;
 use bytes::Bytes;
 use core::convert::Infallible;
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use helios_sync::{ByteReader, ByteWriter, RawMutex, TryRead, byte_channel};
 use spin::Mutex;
 use thiserror::Error;
@@ -233,6 +234,13 @@ pub enum TcpSocket<Net: SocketNetwork> {
         local_port: u16,
         options: SocketOptions,
     },
+    Connecting {
+        family: SocketFamily,
+        stream: Arc<OwnedTcpStream<Net>>,
+        peer_address: Net::Address,
+        peer_port: u16,
+        options: SocketOptions,
+    },
     Connected {
         family: SocketFamily,
         stream: Arc<OwnedTcpStream<Net>>,
@@ -253,6 +261,7 @@ pub enum UdpSocket<Net: SocketNetwork> {
         socket: Arc<OwnedUdpSocket<Net>>,
         local_address: Net::Address,
         local_port: u16,
+        peer: Option<(Net::Address, u16)>,
         options: SocketOptions,
     },
 }
@@ -281,6 +290,10 @@ enum SocketBody<Net: SocketNetwork> {
 struct SharedSocket<Net: SocketNetwork> {
     kind: SocketKind,
     protocol: Option<TransportProtocol>,
+    nonblocking: AtomicBool,
+    pending_error: AtomicI32,
+    shutdown_read: AtomicBool,
+    shutdown_write: AtomicBool,
     body: SocketBody<Net>,
 }
 
@@ -291,13 +304,16 @@ struct SharedSocket<Net: SocketNetwork> {
 /// Clones share one [`SharedSocket`] via `Arc`. No operation fans out to other
 /// processors, and no interrupt handler touches a `Socket` lock.
 ///
-/// - **Lock-free**: immutable metadata and channel-end clones
-///   (`same_description`, `kind`, `protocol`, `is_tcp`, `is_udp`, `is_pair`,
-///   `pair_ends`, `pair_writer`).
+/// - **Lock-free**: immutable metadata, channel-end clones, and atomic status
+///   words (`same_description`, `kind`, `protocol`, `is_tcp`, `is_udp`,
+///   `is_pair`, `pair_ends`, `pair_writer`, `is_nonblocking`,
+///   `set_nonblocking`, `take_pending_error`, `set_pending_error`,
+///   `is_shutdown_read`, `mark_shutdown_read`, `is_shutdown_write`,
+///   `mark_shutdown_write`).
 /// - **Synchronous `spin::Mutex`** (short critical section, never held across
 ///   `.await`): state and option reads/transitions (`tcp_state`, `udp_state`,
 ///   `with_tcp_mut`, `with_udp_mut`, `options`, `set_flag`, `set_size`,
-///   `set_time`, `handle`, `pair_read_probe`, and `carry` updates).
+///   `set_time`, `handle`, `family`, `pair_read_probe`, and `carry` updates).
 /// - **Async [`helios_sync::RawMutex`]**: `recv_pair` serializes concurrent
 ///   socket-pair readers across duplicates (`try_lock` when non-blocking,
 ///   `lock().await` when blocking) and acquires the `carry` spin lock only
@@ -402,6 +418,10 @@ impl<Net: SocketNetwork> Socket<Net> {
         Self(Arc::new(SharedSocket {
             kind: SocketKind::Stream,
             protocol: Some(TransportProtocol::Tcp),
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
             body: SocketBody::Tcp(Mutex::new(tcp)),
         }))
     }
@@ -411,6 +431,10 @@ impl<Net: SocketNetwork> Socket<Net> {
         Self(Arc::new(SharedSocket {
             kind: SocketKind::Datagram,
             protocol: Some(TransportProtocol::Udp),
+            nonblocking: AtomicBool::new(false),
+            pending_error: AtomicI32::new(0),
+            shutdown_read: AtomicBool::new(false),
+            shutdown_write: AtomicBool::new(false),
             body: SocketBody::Udp(Mutex::new(udp)),
         }))
     }
@@ -423,6 +447,10 @@ impl<Net: SocketNetwork> Socket<Net> {
             Self(Arc::new(SharedSocket {
                 kind,
                 protocol: None,
+                nonblocking: AtomicBool::new(false),
+                pending_error: AtomicI32::new(0),
+                shutdown_read: AtomicBool::new(false),
+                shutdown_write: AtomicBool::new(false),
                 body: SocketBody::Pair {
                     reader,
                     writer,
@@ -436,6 +464,55 @@ impl<Net: SocketNetwork> Socket<Net> {
             end(left_reader, left_writer),
             end(right_reader, right_writer),
         )
+    }
+
+    /// Whether `O_NONBLOCK` / `SOCK_NONBLOCK` is set on this open description.
+    pub fn is_nonblocking(&self) -> bool {
+        self.0.nonblocking.load(Ordering::Acquire)
+    }
+
+    /// Sets or clears `O_NONBLOCK` on this open description.
+    pub fn set_nonblocking(&self, nonblocking: bool) {
+        self.0.nonblocking.store(nonblocking, Ordering::Release);
+    }
+
+    /// Reads and clears the latched asynchronous socket error (`SO_ERROR`).
+    pub fn take_pending_error(&self) -> i32 {
+        self.0.pending_error.swap(0, Ordering::AcqRel)
+    }
+
+    /// Latches an asynchronous socket error (`SO_ERROR`) for a later read.
+    pub fn set_pending_error(&self, errno: i32) {
+        self.0.pending_error.store(errno, Ordering::Release);
+    }
+
+    /// Whether the receive half has been shut down locally (`SHUT_RD`).
+    pub fn is_shutdown_read(&self) -> bool {
+        self.0.shutdown_read.load(Ordering::Acquire)
+    }
+
+    /// Marks the receive half as locally shut down (`SHUT_RD`).
+    pub fn mark_shutdown_read(&self) {
+        self.0.shutdown_read.store(true, Ordering::Release);
+    }
+
+    /// Whether the send half has been shut down locally (`SHUT_WR`).
+    pub fn is_shutdown_write(&self) -> bool {
+        self.0.shutdown_write.load(Ordering::Acquire)
+    }
+
+    /// Marks the send half as locally shut down (`SHUT_WR`).
+    pub fn mark_shutdown_write(&self) {
+        self.0.shutdown_write.store(true, Ordering::Release);
+    }
+
+    /// The IP address family of this socket, or `None` for a Unix socket pair.
+    pub fn family(&self) -> Option<SocketFamily> {
+        match &self.0.body {
+            SocketBody::Tcp(tcp) => Some(tcp.lock().family()),
+            SocketBody::Udp(udp) => Some(udp.lock().family()),
+            SocketBody::Pair { .. } => None,
+        }
     }
 
     /// Whether `self` and `other` refer to the same open socket description.
@@ -602,7 +679,9 @@ impl<Net: SocketNetwork> Socket<Net> {
     pub fn handle(&self) -> Option<SocketHandle<Net>> {
         match &self.0.body {
             SocketBody::Tcp(tcp) => match &*tcp.lock() {
-                TcpSocket::Connected { stream, .. } => Some(SocketHandle::TcpStream(stream.id())),
+                TcpSocket::Connected { stream, .. } | TcpSocket::Connecting { stream, .. } => {
+                    Some(SocketHandle::TcpStream(stream.id()))
+                }
                 TcpSocket::Listening { listener, .. } => {
                     Some(SocketHandle::TcpListener(listener.id()))
                 }
@@ -681,6 +760,7 @@ impl<Net: SocketNetwork> TcpSocket<Net> {
             Self::Unconnected { options, .. }
             | Self::Bound { options, .. }
             | Self::Listening { options, .. }
+            | Self::Connecting { options, .. }
             | Self::Connected { options, .. } => options,
         }
     }
@@ -690,6 +770,7 @@ impl<Net: SocketNetwork> TcpSocket<Net> {
             Self::Unconnected { options, .. }
             | Self::Bound { options, .. }
             | Self::Listening { options, .. }
+            | Self::Connecting { options, .. }
             | Self::Connected { options, .. } => options,
         }
     }
@@ -699,6 +780,7 @@ impl<Net: SocketNetwork> TcpSocket<Net> {
             Self::Unconnected { family, .. }
             | Self::Bound { family, .. }
             | Self::Listening { family, .. }
+            | Self::Connecting { family, .. }
             | Self::Connected { family, .. } => *family,
         }
     }
