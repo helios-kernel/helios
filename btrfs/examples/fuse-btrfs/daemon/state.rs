@@ -89,7 +89,12 @@ pub struct State<S = Device> {
 
 impl<S: BlockSink> State<S> {
     pub fn open(device: S, concurrency: NonZeroUsize, read_only: bool) -> Result<Self, OpenError> {
-        let mut writer = block_on(Writer::mount(device, RandomUuids, concurrency))?;
+        let mut writer = block_on(Writer::mount(
+            device,
+            RandomUuids,
+            concurrency,
+            timestamp(SystemTime::now()),
+        ))?;
         let snapshot = writer.snapshot()?;
         let root = block_on(snapshot.root())?;
         let handle = {
