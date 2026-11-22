@@ -167,16 +167,10 @@ impl KernelImageCache {
     /// Stores the image the build linked, with the files it read.
     pub(crate) fn store(&self) -> Result<(), KernelImageCacheError> {
         let subcommand = "kernel-image-store";
-        let artifact_dir = self
-            .image
-            .parent()
-            .expect("a kernel image lies in its profile's directory");
         let status = self
             .command(subcommand)
             .arg("--target")
             .arg(self.target)
-            .arg("--artifact-dir")
-            .arg(artifact_dir)
             .arg("--target-dir")
             .arg(&self.target_dir)
             .status()
