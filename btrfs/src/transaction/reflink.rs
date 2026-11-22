@@ -382,8 +382,7 @@ impl<S: BlockSink> Transaction<S> {
             )
             .await?;
             self.write_file(
-                destination.tree,
-                destination.inode,
+                destination,
                 destination_offset + position,
                 &bytes,
                 when,

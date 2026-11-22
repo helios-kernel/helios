@@ -501,7 +501,7 @@ async fn exercise_reflink(
         let id = ids[name];
         let (edits, compressor, _, max_inline) = tx.split();
         edits
-            .write_file(id.tree, id.inode, 0, bytes, when, compressor, max_inline)
+            .write_file(id, 0, bytes, when, compressor, max_inline)
             .await
             .unwrap();
     }
@@ -618,15 +618,7 @@ async fn exercise_reflink(
         let id = ids[name];
         let (edits, compressor, _, max_inline) = tx.split();
         edits
-            .write_file(
-                id.tree,
-                id.inode,
-                offset as u64,
-                &bytes,
-                when,
-                compressor,
-                max_inline,
-            )
+            .write_file(id, offset as u64, &bytes, when, compressor, max_inline)
             .await
             .unwrap();
         expected.get_mut(name).unwrap()[offset..offset + bytes.len()].copy_from_slice(&bytes);
@@ -750,8 +742,7 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
     let content = vec![0x37; 12307];
     edits
         .write_file(
-            tree,
-            file,
+            crate::transaction::reflink::FileId { tree, inode: file },
             0,
             &content,
             when,
@@ -762,8 +753,10 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
         .unwrap();
     edits
         .write_file(
-            tree,
-            target,
+            crate::transaction::reflink::FileId {
+                tree,
+                inode: target,
+            },
             0,
             b"replaced",
             when,
@@ -934,8 +927,7 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
     let content: Vec<_> = (0..12307).map(|index| (index % 251) as u8).collect();
     edits
         .write_file(
-            tree,
-            inode,
+            crate::transaction::reflink::FileId { tree, inode },
             0,
             &content,
             when,
@@ -1282,8 +1274,10 @@ async fn exercise_file_writes(
             assert_eq!(
                 edits
                     .write_file(
-                        inode.tree(),
-                        inode.number(),
+                        crate::transaction::reflink::FileId {
+                            tree: inode.tree(),
+                            inode: inode.number(),
+                        },
                         offset as u64,
                         &bytes,
                         when,
@@ -7401,4 +7395,239 @@ fn stamp_of(seconds: i64) -> crate::Timestamp {
         seconds,
         nanoseconds: 0,
     }
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn write_after_metadata_flush_reclaims_unused_data_group_still_allocates_data() {
+    use super::writer::{Attributes, Name};
+    use crate::space::DATA;
+    use crate::transaction::file::DEFAULT_MAX_INLINE;
+    use crate::transaction::reflink::FileId;
+    use ferrosys::btrfs::Profile;
+
+    block_on(async {
+        let (_, image) = profile_image(Profile::Dup, Profile::Single);
+        let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        let when = stamp_of(1_700_000_000);
+        let attrs = Attributes {
+            permissions: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+
+        // Fill the mkfs data group completely so no bytes remain in it.
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let anchor = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "锚-アンカー-앵커".as_bytes(),
+                },
+                attrs,
+                when,
+            )
+            .await
+            .unwrap();
+        let initial_free = tx.edits().data_budget() as usize;
+        assert!(initial_free > 0);
+        let filler = vec![0x3c; initial_free];
+        assert_eq!(
+            tx.write_file(&anchor, 0, &filler, when).await.unwrap(),
+            initial_free
+        );
+        tx.commit().await.unwrap();
+
+        // Publish an empty second data group: the next commit will delete it
+        // via remove_unused_groups, shrinking data_budget back to zero.
+        let mut tx = writer.join().await.unwrap();
+        assert_eq!(tx.edits().data_budget(), 0);
+        tx.edits().allocate_chunk(DATA).await.unwrap();
+        tx.commit().await.unwrap();
+
+        // Start a transaction with the target file holding a 1-byte inline
+        // extent so a 4 MiB write at offset 4096 requires more metadata units
+        // than Units::CREATE, ensuring the write triggers the metadata flush.
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let target = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "重分配-再割当-재할당".as_bytes(),
+                },
+                attrs,
+                when,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx.write_file(&target, 0, b"x", when).await.unwrap(), 1);
+
+        let payload = vec![0x5a; 4 << 20];
+        let start_gen = tx.edits().trees.generation();
+        assert!(tx.edits().data_budget() >= payload.len() as u64);
+
+        let target_id = FileId {
+            tree: target.tree(),
+            inode: target.number(),
+        };
+        let mut index = 0usize;
+        loop {
+            let units = tx
+                .edits()
+                .write_units(target_id, 4096, payload.len() as u64, DEFAULT_MAX_INLINE)
+                .await
+                .unwrap();
+            if !tx.edits().reserves(units) {
+                break;
+            }
+            let name = std::format!("f-{index}");
+            tx.create_file(
+                Name {
+                    parent: &root,
+                    bytes: name.as_bytes(),
+                },
+                attrs,
+                when,
+            )
+            .await
+            .unwrap();
+            index += 1;
+            assert!(
+                tx.edits().trees.generation() == start_gen,
+                "setup create_file must not flush before write_file does"
+            );
+        }
+        assert!(tx.edits().data_budget() >= payload.len() as u64);
+
+        // write_file must survive the metadata-flush commit deleting the empty
+        // data group by re-reserving data space on the restarted transaction.
+        let written = tx.write_file(&target, 4096, &payload, when).await.unwrap();
+        assert_eq!(written, payload.len());
+        assert!(
+            tx.edits().trees.generation() > start_gen,
+            "write_file must have triggered the metadata-flush commit"
+        );
+        tx.commit().await.unwrap();
+
+        let fresh = Filesystem::mount(Disk(image)).await.unwrap();
+        let read_target = fresh
+            .resolve("/重分配-再割当-재할당".as_bytes())
+            .await
+            .unwrap();
+        let mut out = vec![0u8; payload.len()];
+        assert_eq!(
+            fresh.read(&read_target, 4096, &mut out).await.unwrap(),
+            out.len()
+        );
+        assert_eq!(out, payload);
+    });
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn large_extent_checksum_items_stay_within_linux_max_csum_items() {
+    use super::writer::{Attributes, Name};
+    use crate::checksums::max_csum_items;
+    use crate::ondisk::{item_type, objectid};
+    use crate::tree::Cursor;
+    use ferrosys::btrfs::Profile;
+
+    block_on(async {
+        // 512 MiB Single-data image allocates a ~51 MiB data chunk so a 20 MiB
+        // uncompressed write forms one contiguous extent (> 4057 sectors).
+        let timestamp = Timestamp::from_secs(1_700_000_000);
+        let mut options = FormatOptions::new([0x53; 16], timestamp);
+        options.chunk_tree_uuid = [0x71; 16];
+        options.device_uuid = [0x29; 16];
+        options.plan.metadata_profile = Profile::Dup;
+        options.plan.data_profile = Profile::Single;
+        let mut image = tempfile::tempfile().unwrap();
+        let disk_size = 512 << 20;
+        image.set_len(disk_size).unwrap();
+        format_to(
+            &mut image,
+            TreeBuilder::new().root(Metadata::new(0o755, timestamp)),
+            disk_size,
+            options,
+        )
+        .unwrap();
+
+        let mut writer = mount_writer(Disk(image.try_clone().unwrap()))
+            .await
+            .unwrap();
+        let when = stamp_of(1_700_000_000);
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let file = tx
+            .create_file(
+                Name {
+                    parent: &root,
+                    bytes: "校验-チェックサム-체크섬".as_bytes(),
+                },
+                Attributes {
+                    permissions: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                when,
+            )
+            .await
+            .unwrap();
+        let payload = vec![0xa5; 20 << 20];
+        assert_eq!(
+            tx.write_file(&file, 0, &payload, when).await.unwrap(),
+            payload.len()
+        );
+        tx.commit().await.unwrap();
+
+        let fresh = Filesystem::mount(Disk(image)).await.unwrap();
+        let superblock = fresh.superblock();
+        let limit = max_csum_items(superblock);
+        let digest = superblock.csum_type().size();
+        let mut max_seen = 0usize;
+        let mut total_sectors = 0usize;
+        let mut cursor = Cursor::ceiling(
+            &fresh.volume,
+            fresh.snapshot.csum_tree,
+            Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, 0),
+        )
+        .await
+        .unwrap();
+        while let Some(key) = cursor.key() {
+            if !key.is(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM) {
+                break;
+            }
+            let bytes = cursor.item().unwrap();
+            assert_eq!(bytes.len() % digest, 0);
+            let entries = bytes.len() / digest;
+            assert!(
+                entries <= limit,
+                "EXTENT_CSUM item at {} has {entries} entries, exceeding Linux __MAX_CSUM_ITEMS ({limit})",
+                key.offset
+            );
+            max_seen = max_seen.max(entries);
+            total_sectors += entries;
+            cursor.advance(&fresh.volume).await.unwrap();
+        }
+        assert_eq!(
+            max_seen, limit,
+            "20 MiB extent must split at Linux __MAX_CSUM_ITEMS"
+        );
+        assert!(total_sectors >= payload.len() / superblock.sectorsize() as usize);
+
+        let read_file = fresh
+            .resolve("/校验-チェックサム-체크섬".as_bytes())
+            .await
+            .unwrap();
+        let mut out = vec![0u8; payload.len()];
+        assert_eq!(
+            fresh.read(&read_file, 0, &mut out).await.unwrap(),
+            out.len()
+        );
+        assert_eq!(out, payload);
+    });
 }

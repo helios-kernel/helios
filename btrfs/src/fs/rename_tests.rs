@@ -20,6 +20,7 @@ use crate::source::BlockSink;
 use crate::transaction::Transaction;
 use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes, Name};
+use crate::transaction::reflink::FileId;
 use crate::tree::write::WriteError;
 use crate::{FileKind, Timestamp as When};
 
@@ -72,8 +73,7 @@ async fn create(
     if let Some(content) = content {
         edits
             .write_file(
-                tree,
-                inode,
+                FileId { tree, inode },
                 0,
                 content,
                 WHEN,

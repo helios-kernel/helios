@@ -8,9 +8,19 @@ use crate::Key;
 use crate::ondisk::{RawHeader, RawItem, item_type, objectid};
 use crate::source::BlockSource;
 use crate::space::Space;
+use crate::superblock::Superblock;
 use crate::tree::TreeRoot;
 use crate::tree::write::{Trees, WriteError};
 use crate::volume::Volume;
+
+/// Linux's `__MAX_CSUM_ITEMS` (`fs/btrfs/file-item.h`): the most checksum
+/// entries one `EXTENT_CSUM` item may hold, which `btrfs check` enforces
+/// (`check/main.c`).
+pub(crate) fn max_csum_items(superblock: &Superblock) -> usize {
+    let leaf_data = superblock.nodesize() as usize - size_of::<RawHeader>();
+    let item_space = leaf_data - 2 * size_of::<RawItem>();
+    (item_space / superblock.csum_type().size()) - 1
+}
 
 #[derive(Clone)]
 pub(crate) struct Checksums {
@@ -35,10 +45,7 @@ impl Checksums {
             .checked_add(length as u64)
             .ok_or(WriteError::Checksum { key: key(logical) })?;
         self.remove(volume, trees, space, logical..end).await?;
-        let per_item = (volume.superblock().nodesize() as usize
-            - size_of::<RawHeader>()
-            - size_of::<RawItem>())
-            / algorithm.size();
+        let per_item = max_csum_items(volume.superblock());
         let mut digests = Vec::with_capacity(length / sector * algorithm.size());
         for piece in pieces {
             for sector in piece.chunks_exact(sector) {

@@ -591,30 +591,19 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         let id = file.id;
         self.inner().roots.check_writable(id.tree)?;
         let max_inline = self.writer.max_inline;
-        let reservation = self
-            .inner()
-            .write_reservation(id, offset, data.len() as u64, max_inline)
+        let units = self
+            .reserve_with_data(DataReservation::Write {
+                file: id,
+                offset,
+                length: data.len() as u64,
+                max_inline,
+            })
             .await?;
-        self.reserve_data(reservation).await?;
-        let mut units = self
-            .inner()
-            .write_units(id, offset, data.len() as u64, max_inline)
-            .await?;
-        if !self.inner().reserves(units) && !self.writer.dirty().is_clean() {
-            self.writer.commit().await?;
-            self.writer.start().await?;
-            units = self
-                .inner()
-                .write_units(id, offset, data.len() as u64, max_inline)
-                .await?;
-        }
         let mut operation = Mutation::new(self, units).await?;
         operation.checked(file).await?;
         let (inner, compressor, _, max_inline) = operation.split();
         let written = inner
-            .write_file(
-                id.tree, id.inode, offset, data, when, compressor, max_inline,
-            )
+            .write_file(id, offset, data, when, compressor, max_inline)
             .await?;
         operation.accept()?;
         Ok(written)
@@ -630,20 +619,13 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     ) -> Result<(), WriteError> {
         self.checked(file).await?;
         let max_inline = self.writer.max_inline;
-        let reservation = self
-            .inner()
-            .truncate_reservation(file.id, size, max_inline)
+        let units = self
+            .reserve_with_data(DataReservation::Truncate {
+                file: file.id,
+                size,
+                max_inline,
+            })
             .await?;
-        self.reserve_data(reservation).await?;
-        let units = if reservation == 0 {
-            Units::TRUNCATE
-        } else {
-            Units {
-                insert: 4,
-                update: 1,
-                frees: false,
-            }
-        };
         let mut operation = Mutation::new(self, units).await?;
         operation.checked(file).await?;
         let file = file.id;
@@ -665,17 +647,15 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     ) -> Result<(), WriteError> {
         self.checked(range.source).await?;
         self.checked(range.destination).await?;
-        let reservation = self
-            .inner()
-            .clone_reservation(
-                range.source.id,
-                range.destination.id,
-                range.destination_offset,
-                range.length,
-            )
+        let units = self
+            .reserve_with_data(DataReservation::Clone {
+                source: range.source.id,
+                destination: range.destination.id,
+                offset: range.destination_offset,
+                length: range.length,
+            })
             .await?;
-        self.reserve_data(reservation).await?;
-        let mut operation = Mutation::new(self, Units::CLONE).await?;
+        let mut operation = Mutation::new(self, units).await?;
         operation.checked(range.source).await?;
         operation.checked(range.destination).await?;
         let range = RawCloneRange {
@@ -897,6 +877,88 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         Err(self.inner().exhausted(units))
     }
 
+    /// Reserves both data and metadata space for an operation that may dirty
+    /// file pages. A metadata-flush commit can delete an empty data block group
+    /// (`remove_unused_groups`), shrinking [`Transaction::data_budget`] below
+    /// the data reservation, so data space is re-ensured after that commit.
+    async fn reserve_with_data(&mut self, operation: DataReservation) -> Result<Units, WriteError> {
+        let mut flushed = false;
+        loop {
+            let reservation = match operation {
+                DataReservation::Write {
+                    file,
+                    offset,
+                    length,
+                    max_inline,
+                } => {
+                    self.inner()
+                        .write_reservation(file, offset, length, max_inline)
+                        .await?
+                }
+                DataReservation::Truncate {
+                    file,
+                    size,
+                    max_inline,
+                } => {
+                    self.inner()
+                        .truncate_reservation(file, size, max_inline)
+                        .await?
+                }
+                DataReservation::Clone {
+                    source,
+                    destination,
+                    offset,
+                    length,
+                } => {
+                    self.inner()
+                        .clone_reservation(source, destination, offset, length)
+                        .await?
+                }
+            };
+            self.reserve_data(reservation).await?;
+            let units = match operation {
+                DataReservation::Write {
+                    file,
+                    offset,
+                    length,
+                    max_inline,
+                } => {
+                    self.inner()
+                        .write_units(file, offset, length, max_inline)
+                        .await?
+                }
+                DataReservation::Truncate { .. } => {
+                    if reservation == 0 {
+                        Units::TRUNCATE
+                    } else {
+                        Units {
+                            insert: 4,
+                            update: 1,
+                            frees: false,
+                        }
+                    }
+                }
+                DataReservation::Clone { .. } => Units::CLONE,
+            };
+            if self.inner().reserves(units) {
+                return Ok(units);
+            }
+            if !flushed && !self.writer.dirty().is_clean() {
+                self.writer.commit().await?;
+                self.writer.start().await?;
+                flushed = true;
+                continue;
+            }
+            let mut chunk = Mutation::checkpointed(self, Units::default());
+            chunk.inner_mut().force_metadata_chunk().await?;
+            chunk.accept()?;
+            if self.inner().reserves(units) {
+                return Ok(units);
+            }
+            return Err(self.inner().exhausted(units));
+        }
+    }
+
     /// Makes room for a mutation that may dirty `bytes` of data, in the
     /// order of Linux's data space flush (`priority_reclaim_data_space` and
     /// `data_flush_states` in `fs/btrfs/space-info.c`): data chunks while
@@ -906,14 +968,7 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     /// transaction released. What still does not fit makes the write short,
     /// or refuses it when not one sector does.
     async fn reserve_data(&mut self, bytes: u64) -> Result<(), WriteError> {
-        while self.inner().data_budget() < bytes {
-            let mut chunk = Mutation::checkpointed(self, Units::default());
-            let grew = chunk.inner_mut().grow_data().await?;
-            chunk.accept()?;
-            if !grew {
-                break;
-            }
-        }
+        self.grow_data_to(bytes).await?;
         if self.inner().data_budget() >= bytes {
             return Ok(());
         }
@@ -926,9 +981,44 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         if !self.writer.dirty().is_clean() {
             self.writer.commit().await?;
             self.writer.start().await?;
+            // A commit can delete unused groups and return device extents.
+            self.grow_data_to(bytes).await?;
         }
         Ok(())
     }
+
+    async fn grow_data_to(&mut self, bytes: u64) -> Result<(), WriteError> {
+        while self.inner().data_budget() < bytes {
+            let mut chunk = Mutation::checkpointed(self, Units::default());
+            let grew = chunk.inner_mut().grow_data().await?;
+            chunk.accept()?;
+            if !grew {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DataReservation {
+    Write {
+        file: FileId,
+        offset: u64,
+        length: u64,
+        max_inline: u64,
+    },
+    Truncate {
+        file: FileId,
+        size: u64,
+        max_inline: u64,
+    },
+    Clone {
+        source: FileId,
+        destination: FileId,
+        offset: u64,
+        length: u64,
+    },
 }
 
 /// The mutation future owns this guard. Its drop restores the complete private

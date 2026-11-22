@@ -47,12 +47,10 @@ use crate::tree::write::WriteError;
 /// `BTRFS_MAX_LEVEL`.
 const MAX_LEVEL: u64 = 8;
 
-/// Checksums one leaf item holds: `csums_per_leaf` in
-/// `btrfs_csum_bytes_to_leaves`, `BTRFS_MAX_ITEM_SIZE / csum_size`.
+/// Checksums one `EXTENT_CSUM` item holds: Linux's `__MAX_CSUM_ITEMS`
+/// (`fs/btrfs/file-item.h`), bounding `btrfs_csum_bytes_to_leaves`.
 pub(crate) fn csums_per_leaf(superblock: &Superblock) -> u64 {
-    let item_space =
-        u64::from(superblock.nodesize()) - (size_of::<RawHeader>() + size_of::<RawItem>()) as u64;
-    item_space / superblock.csum_type().size() as u64
+    crate::checksums::max_csum_items(superblock) as u64
 }
 
 /// `BTRFS_UNLINK_METADATA_UNITS` in `fs/btrfs/fs.h`.

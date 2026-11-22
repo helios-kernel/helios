@@ -120,17 +120,16 @@ impl<S: BlockSink> Transaction<S> {
     /// `data.len()` only when the data space ran out partway, never zero for
     /// a nonempty write, which fails instead. A file small enough to be
     /// inline is written inline at once; any other write dirties pages.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_file(
         &mut self,
-        tree: u64,
-        inode: u64,
+        file: FileId,
         offset: u64,
         data: &[u8],
         when: Timestamp,
         compressor: &mut Compressor,
         max_inline: u64,
     ) -> Result<usize, WriteError> {
+        let FileId { tree, inode } = file;
         let (mut raw, metadata) = self.file_inode(tree, inode).await?;
         check_flags(
             tree,
@@ -166,10 +165,8 @@ impl<S: BlockSink> Transaction<S> {
             let mut content = vec![0; size as usize];
             self.read_file(tree, inode, 0, &mut content).await?;
             content[offset as usize..end as usize].copy_from_slice(data);
-            self.store_first_sector(
-                tree, inode, content, inline, &mut raw, compressor, max_inline,
-            )
-            .await?;
+            self.store_first_sector(file, content, inline, &mut raw, compressor, max_inline)
+                .await?;
         } else {
             if let Some(inline_bytes) = inline {
                 self.promote_inline(tree, inode, inline_bytes, offset..end, &mut raw)
@@ -536,8 +533,7 @@ impl<S: BlockSink> Transaction<S> {
                     .await?;
                 if size <= sector {
                     self.store_first_sector(
-                        tree,
-                        inode,
+                        FileId { tree, inode },
                         content,
                         Some(inline_bytes),
                         &mut raw,
@@ -716,17 +712,16 @@ impl<S: BlockSink> Transaction<S> {
     /// when [`Self::may_inline`] allows the stored length, and otherwise as a
     /// dirty page for writeback. `inline` is the ram size of the inline item
     /// it replaces.
-    #[allow(clippy::too_many_arguments)]
     async fn store_first_sector(
         &mut self,
-        tree: u64,
-        inode: u64,
+        file: FileId,
         mut content: Vec<u8>,
         inline: Option<u64>,
         raw: &mut RawInodeItem,
         compressor: &mut Compressor,
         max_inline: u64,
     ) -> Result<(), WriteError> {
+        let FileId { tree, inode } = file;
         let size = content.len() as u64;
         let sector = u64::from(self.volume.superblock().sectorsize());
         let generation = self.trees.generation();
