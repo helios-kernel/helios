@@ -337,6 +337,13 @@ impl ProcessorIdt {
             install_interrupt(table, SCI_INTERRUPT_VECTOR, helios_x86_interrupt_sci);
             #[cfg(feature = "native-users")]
             {
+                // Ring-3 `int3` (`0xCC`) checks `CPL <= IDT[3].DPL` before
+                // delivering `#BP`, matching Linux `arch/x86/kernel/idt.c`
+                // (`SYSG(X86_TRAP_BP, ...)`).
+                table
+                    .breakpoint
+                    .set_handler_addr(handler_address(helios_x86_exception_breakpoint))
+                    .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
                 table
                     .debug
                     .set_handler_addr(handler_address(helios_x86_exception_debug));

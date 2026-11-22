@@ -172,6 +172,7 @@ impl SocketNetwork for MockNet {
     type TcpStream = u64;
     type TcpListener = u64;
     type UdpSocket = u64;
+    type PacketSocket = u64;
     type Address = IpAddr;
     const LIMITS: SocketLimits = SocketLimits {
         receive_buffer_bytes: 256 * 1024,
@@ -181,6 +182,7 @@ impl SocketNetwork for MockNet {
     fn tcp_close(&self, _: u64) {}
     fn tcp_listener_close(&self, _: u64) {}
     fn udp_close(&self, _: u64) {}
+    fn packet_close(&self, _: u64) {}
 }
 
 struct MockResources;

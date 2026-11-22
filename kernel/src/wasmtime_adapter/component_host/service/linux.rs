@@ -29,9 +29,10 @@
 
 use super::*;
 use crate::{
-    ComponentFsNodeKind, LinkSourceCap, MulticastCap, PrivilegedBindCap, SetWallClockCap,
-    SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap,
-    TerminalOutputCap, TtyControlCap, UdpCap,
+    ComponentFsNodeKind, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route, LinkSourceCap,
+    MulticastCap, NetworkAdminCap, NetworkControlError, NetworkPortId, PrivilegedBindCap,
+    SetWallClockCap, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
+    TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
 };
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
@@ -119,6 +120,7 @@ struct LinuxGrants {
     udp: Option<UdpCap>,
     privileged_bind: Option<PrivilegedBindCap>,
     multicast: Option<MulticastCap>,
+    network_admin: Option<NetworkAdminCap>,
 }
 
 impl LinuxGrants {
@@ -135,6 +137,7 @@ impl LinuxGrants {
             udp: authority.derive_udp_cap().ok(),
             privileged_bind: authority.derive_privileged_bind_cap().ok(),
             multicast: authority.derive_multicast_cap().ok(),
+            network_admin: authority.derive_network_admin_cap().ok(),
         }
     }
 }
@@ -1969,6 +1972,230 @@ where
         }
         self.check_udp_open()
     }
+
+    async fn interface_mac(&self) -> Result<[u8; 6], u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .mac_address(NetworkPortId::new(0))
+            .await
+            .map(crate::MacAddress::octets)
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn list_ipv4_addresses(&self) -> Result<Vec<syscall::Ipv4InterfaceAddress>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let addrs = service
+            .list_addresses(NetworkPortId::new(0))
+            .await
+            .map_err(linux_errno_from_control_error)?;
+        Ok(addrs
+            .into_iter()
+            .map(|cidr| syscall::Ipv4InterfaceAddress {
+                address: cidr.address().octets(),
+                prefix: cidr.prefix_len(),
+            })
+            .collect())
+    }
+
+    async fn add_ipv4_address(&self, address: syscall::Ipv4InterfaceAddress) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(address.address), address.prefix);
+        service
+            .add_address(NetworkPortId::new(0), cidr)
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn remove_ipv4_address(&self, address: syscall::Ipv4InterfaceAddress) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(address.address), address.prefix);
+        service
+            .remove_address(NetworkPortId::new(0), cidr)
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn list_ipv4_routes(&self) -> Result<Vec<syscall::Ipv4RouteEntry>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let routes = service
+            .list_routes(NetworkPortId::new(0))
+            .await
+            .map_err(linux_errno_from_control_error)?;
+        Ok(routes
+            .into_iter()
+            .map(|route| {
+                let gw = route.gateway().octets();
+                syscall::Ipv4RouteEntry {
+                    destination: route.destination().address().octets(),
+                    prefix: route.destination().prefix_len(),
+                    gateway: if gw == [0, 0, 0, 0] { None } else { Some(gw) },
+                }
+            })
+            .collect())
+    }
+
+    async fn add_ipv4_route(&self, route: syscall::Ipv4RouteEntry) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(route.destination), route.prefix);
+        let gw = crate::Ipv4Address::new(route.gateway.unwrap_or([0, 0, 0, 0]));
+        service
+            .add_route(NetworkPortId::new(0), KernelIpv4Route::new(cidr, gw))
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    async fn remove_ipv4_route(&self, route: syscall::Ipv4RouteEntry) -> Result<(), u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let cidr = KernelIpv4Cidr::new(crate::Ipv4Address::new(route.destination), route.prefix);
+        let gw = crate::Ipv4Address::new(route.gateway.unwrap_or([0, 0, 0, 0]));
+        service
+            .remove_route(NetworkPortId::new(0), KernelIpv4Route::new(cidr, gw))
+            .await
+            .map_err(linux_errno_from_control_error)
+    }
+
+    fn check_net_admin(&self) -> Result<(), u64> {
+        const EPERM: u64 = 1;
+        if self.shared.grants.network_admin.is_none() {
+            return Err(EPERM);
+        }
+        Ok(())
+    }
+
+    fn packet_open(
+        &self,
+        protocol: u16,
+    ) -> Result<Arc<helios_unix::OwnedPacketSocket<crate::UnixNetwork<Net>>>, u64> {
+        self.check_net_admin()?;
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let id = service
+            .packet_open(protocol)
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(helios_unix::OwnedPacketSocket::new(
+            crate::UnixNetwork::new(service),
+            id,
+        ))
+    }
+
+    fn packet_bind(&self, socket: u64, protocol: u16, ifindex: u32) -> Result<(), u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .packet_bind(socket, protocol, ifindex)
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn packet_send<'a>(
+        &'a self,
+        socket: u64,
+        ifindex: u32,
+        frame: &'a [u8],
+    ) -> Result<usize, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        service
+            .packet_send(socket, ifindex, frame)
+            .await
+            .map_err(linux_errno_from_udp_error)
+    }
+
+    async fn packet_receive(
+        &self,
+        socket: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        peek: bool,
+    ) -> Result<Option<syscall::PacketFrameData>, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let frame = service
+            .packet_receive(socket, max_bytes, timeout_nanos, peek)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(frame.map(|f| syscall::PacketFrameData {
+            ifindex: f.ifindex,
+            protocol: f.protocol,
+            bytes: f.bytes,
+            original_len: f.original_len,
+        }))
+    }
+
+    async fn packet_readiness(&self, socket: u64) -> Result<syscall::SocketReady, u64> {
+        let service = self
+            .shared
+            .runtime_state
+            .network_service()
+            .ok_or(syscall::ENETDOWN)?;
+        let ready = service
+            .packet_readiness(socket)
+            .await
+            .map_err(linux_errno_from_udp_error)?;
+        Ok(syscall::SocketReady {
+            readable: ready.readable,
+            writable: ready.writable,
+            hangup: ready.hangup,
+        })
+    }
+}
+
+fn linux_errno_from_control_error(error: NetworkControlError) -> u64 {
+    const EINVAL: u64 = 22;
+    const EIO: u64 = 5;
+    const EOPNOTSUPP: u64 = 95;
+    match error {
+        NetworkControlError::PortUnavailable => syscall::ENODEV,
+        NetworkControlError::BridgeUnavailable => EOPNOTSUPP,
+        NetworkControlError::InvalidBridgeRequest
+        | NetworkControlError::InvalidAddress
+        | NetworkControlError::InvalidRoute
+        | NetworkControlError::RouteTimestampOutOfRange => EINVAL,
+        NetworkControlError::BackendFault => EIO,
+    }
 }
 
 /// Calling thread's context view for `arch_prctl` and `clone` / `clone3`.
@@ -2577,6 +2804,30 @@ async fn drive_real_timer<CpuImpl, Net, StorageImpl>(
     }
 }
 
+/// Computes the initial stack top and, when `abi` supplies a sigreturn
+/// trampoline (AArch64), maps it at the top of `user` above an unmapped guard
+/// page so it never collides with `brk` growth at `image_end`.
+fn map_sigreturn_trampoline<Space: UserSpace>(
+    space: &Space,
+    user: VirtRange,
+    abi: Abi,
+) -> Result<(u64, u64), NativeError> {
+    if let Some(code) = abi.sigreturn_trampoline_code() {
+        let trampoline = VirtAddr::new(user.end().raw() - PhysFrame::SIZE);
+        space.map(
+            VirtRange::new(trampoline, PhysFrame::SIZE),
+            code,
+            PageFlags::READ | PageFlags::EXECUTE,
+        )?;
+        Ok((
+            (user.end().raw() - 2 * PhysFrame::SIZE) as u64,
+            trampoline.raw() as u64,
+        ))
+    } else {
+        Ok(((user.end().raw() - PhysFrame::SIZE) as u64, 0))
+    }
+}
+
 /// Runs a Linux process inside `container` to its end: maps `executable`,
 /// builds its initial stack from `argv` and `env`, allocates its container-local
 /// PID (starting at 1), drives `main` and every thread spawned via
@@ -2644,8 +2895,8 @@ where
     let mut random = [0; 16];
     exec_context.runtime_state.root_entropy().fill(&mut random);
     let user = native.user_range();
-    // One unmapped guard page above the stack.
-    let top = (user.end().raw() - PhysFrame::SIZE) as u64;
+    let (top, sigreturn_trampoline) =
+        map_sigreturn_trampoline(&*space, user, executable.abi).map_err(native_error)?;
     let stack = helios_linux::stack::build(
         &helios_linux::stack::Startup {
             entry: image.entry(),
@@ -2671,24 +2922,6 @@ where
             PageFlags::READ | PageFlags::WRITE,
         )
         .map_err(native_error)?;
-    let sigreturn_trampoline = if let Some(code) = executable.abi.sigreturn_trampoline_code() {
-        let addr = space
-            .free_range(
-                VirtAddr::new(image_end.max(PhysFrame::SIZE)),
-                PhysFrame::SIZE,
-            )
-            .ok_or_else(|| native_error(NativeError::OutOfMemory))?;
-        space
-            .map(
-                VirtRange::new(addr, PhysFrame::SIZE),
-                code,
-                PageFlags::READ | PageFlags::EXECUTE,
-            )
-            .map_err(native_error)?;
-        addr.raw() as u64
-    } else {
-        0
-    };
     let context = native
         .create_context(
             VirtAddr::new(image.entry() as usize),
@@ -2939,78 +3172,84 @@ mod tests {
         );
     }
 
+    struct DummyThread;
+
+    impl Thread for DummyThread {
+        fn thread_pointer(&self) -> u64 {
+            0
+        }
+        fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+            Err(Denied)
+        }
+        fn spawn_thread(
+            &mut self,
+            _: Process<helios_linux::syscall::NoBacking>,
+            _: SpawnedThread,
+        ) -> Result<(), SpawnError> {
+            unreachable!("no thread spawned")
+        }
+    }
+
+    struct DummyOutput;
+
+    impl syscall::Network<helios_unix::NoNetwork> for DummyOutput {
+        fn to_ip(&self, address: core::convert::Infallible) -> syscall::IpAddr {
+            match address {}
+        }
+        fn encode_ip(&self, _: syscall::IpAddr) -> core::convert::Infallible {
+            unreachable!()
+        }
+    }
+
+    impl Stdio for DummyOutput {
+        async fn write(&mut self, _: Stream, _: &[u8]) -> Result<usize, WriteError> {
+            Err(WriteError::Io)
+        }
+        async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+            Err(Denied)
+        }
+    }
+
+    impl syscall::Clock for DummyOutput {
+        fn now_nanos(&self) -> u64 {
+            0
+        }
+        async fn sleep_until(&self, _: u64) {}
+    }
+
+    impl System for DummyOutput {
+        fn realtime_nanos(&self) -> u64 {
+            0
+        }
+        fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+            Err(Denied)
+        }
+        fn cpu_nanos(&self) -> u64 {
+            0
+        }
+        fn fill_random(&mut self, _: &mut [u8]) {}
+        fn memory(&self) -> MemoryTotals {
+            MemoryTotals {
+                total_bytes: 0,
+                free_bytes: 0,
+            }
+        }
+        fn process_count(&self) -> u32 {
+            1
+        }
+        fn kernel_version(&self) -> &str {
+            "test"
+        }
+    }
+
+    impl Filesystem<syscall::NoBacking> for DummyOutput {}
+    impl Tty for DummyOutput {}
+
     #[test]
     fn linux_mmap_brk_and_mremap_commit_only_touched_pages() {
         use core::future::Future;
         use core::task::{Context, Poll, Waker};
-        use helios_linux::syscall::{Clock, NoBacking, dispatch};
-
-        struct DummyThread;
-        impl Thread for DummyThread {
-            fn thread_pointer(&self) -> u64 {
-                0
-            }
-            fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
-                Err(Denied)
-            }
-            fn spawn_thread(
-                &mut self,
-                _: Process<NoBacking>,
-                _: SpawnedThread,
-            ) -> Result<(), SpawnError> {
-                unreachable!("no thread spawned")
-            }
-        }
-
-        struct DummyOutput;
-        impl syscall::Network<helios_unix::NoNetwork> for DummyOutput {
-            fn to_ip(&self, address: core::convert::Infallible) -> syscall::IpAddr {
-                match address {}
-            }
-            fn encode_ip(&self, _: syscall::IpAddr) -> core::convert::Infallible {
-                unreachable!()
-            }
-        }
-        impl Stdio for DummyOutput {
-            async fn write(&mut self, _: Stream, _: &[u8]) -> Result<usize, WriteError> {
-                Err(WriteError::Io)
-            }
-            async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
-                Err(Denied)
-            }
-        }
-        impl Clock for DummyOutput {
-            fn now_nanos(&self) -> u64 {
-                0
-            }
-            async fn sleep_until(&self, _: u64) {}
-        }
-        impl System for DummyOutput {
-            fn realtime_nanos(&self) -> u64 {
-                0
-            }
-            fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
-                Err(Denied)
-            }
-            fn cpu_nanos(&self) -> u64 {
-                0
-            }
-            fn fill_random(&mut self, _: &mut [u8]) {}
-            fn memory(&self) -> MemoryTotals {
-                MemoryTotals {
-                    total_bytes: 0,
-                    free_bytes: 0,
-                }
-            }
-            fn process_count(&self) -> u32 {
-                1
-            }
-            fn kernel_version(&self) -> &str {
-                "test"
-            }
-        }
-        impl Filesystem<NoBacking> for DummyOutput {}
-        impl Tty for DummyOutput {}
+        use helios_linux::syscall::dispatch;
 
         const MMAP: u64 = 9;
         const MUNMAP: u64 = 11;
@@ -3136,5 +3375,89 @@ mod tests {
         assert_eq!(call(MUNMAP, [moved, grown_len, 0, 0, 0, 0]), 0);
         assert_eq!(call(BRK, [brk_start, 0, 0, 0, 0, 0]), brk_start);
         assert_eq!(crate::memory::user_heap_stats().allocated_bytes, baseline);
+    }
+
+    #[test]
+    fn aarch64_sigreturn_trampoline_sits_above_stack_guard_and_leaves_brk_free() {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        use helios_linux::syscall::dispatch;
+
+        ensure_pool();
+        let page = PhysFrame::SIZE;
+        let start = page;
+        let end = 1usize << 32;
+        let user = VirtRange::new(VirtAddr::new(start), end - start);
+
+        // x86-64 needs no kernel trampoline and keeps one guard page above the stack.
+        let x86_space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let (x86_top, x86_tramp) = map_sigreturn_trampoline(&x86_space, user, Abi::X86_64).unwrap();
+        assert_eq!(x86_tramp, 0);
+        assert_eq!(x86_top, (end - page) as u64);
+        assert_eq!(
+            x86_space.mapping(VirtRange::new(VirtAddr::new(end - page), page)),
+            None
+        );
+
+        // AArch64 maps the RX trampoline at the very top page, keeps an unmapped
+        // guard page between the stack and the trampoline, and leaves `brk`
+        // growth right at `image_end` unblocked.
+        let arm_space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let image_end = 0x41_0000usize;
+        arm_space
+            .map(
+                VirtRange::new(VirtAddr::new(0x40_0000), image_end - 0x40_0000),
+                &[],
+                PageFlags::READ | PageFlags::EXECUTE,
+            )
+            .unwrap();
+        let (arm_top, arm_tramp) =
+            map_sigreturn_trampoline(&arm_space, user, Abi::Aarch64).unwrap();
+        assert_eq!(arm_tramp, (end - page) as u64);
+        assert_eq!(arm_top, (end - 2 * page) as u64);
+        assert_eq!(
+            arm_space
+                .mapping(VirtRange::new(VirtAddr::new(end - page), page))
+                .map(|m| m.flags),
+            Some(PageFlags::READ | PageFlags::EXECUTE)
+        );
+        assert_eq!(
+            arm_space.mapping(VirtRange::new(VirtAddr::new(end - 2 * page), page)),
+            None
+        );
+
+        let expected_code = Abi::Aarch64.sigreturn_trampoline_code().unwrap();
+        let mut actual_code = vec![0u8; expected_code.len()];
+        arm_space
+            .read(VirtAddr::new(arm_tramp as usize), &mut actual_code)
+            .unwrap();
+        assert_eq!(actual_code.as_slice(), expected_code);
+
+        // Growing `brk` directly above `image_end` must succeed without colliding.
+        const AARCH64_BRK: u64 = 214;
+        let mut memory = LinuxMemory {
+            space: &arm_space,
+            user,
+            stack_growth: None,
+        };
+        let mut process = Process::new(Abi::Aarch64, NonZeroU32::new(1).unwrap(), image_end as u64);
+        let (mut thread, mut output) = (DummyThread, DummyOutput);
+        let grown = image_end as u64 + 4 * page as u64;
+        let mut fut = core::pin::pin!(dispatch(
+            &mut process,
+            Call {
+                number: AARCH64_BRK,
+                arguments: [grown, 0, 0, 0, 0, 0],
+            },
+            &mut memory,
+            &mut thread,
+            &mut output,
+        ));
+        match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(ControlFlow::Continue(SyscallOutcome::Return(result))) => {
+                assert_eq!(result, grown);
+            }
+            other => panic!("unexpected aarch64 brk outcome: {other:?}"),
+        }
     }
 }

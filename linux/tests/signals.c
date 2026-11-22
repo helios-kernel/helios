@@ -646,20 +646,21 @@ static void test_fault_signals(void) {
     CHECK(*cell == 0x13572468U);
     CHECK(munmap(g_ro_page, g_page_size) == 0);
 
-    /* 2. Catchable SIGSEGV (SEGV_MAPERR) via sigsetjmp/siglongjmp. */
+    /* 2. Catchable SIGSEGV (SEGV_MAPERR) via sigsetjmp/siglongjmp on the
+     * freshly unmapped page (cannot collide with allocator mmap placements). */
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = fault_longjmp_handler;
     sa.sa_flags = SA_SIGINFO;
     CHECK(sigaction(SIGSEGV, &sa, NULL) == 0);
     int jumped = sigsetjmp(g_jump_env, 1);
     if (jumped == 0) {
-        volatile char *bad = (volatile char *)0x1000;
+        volatile char *bad = (volatile char *)g_ro_page;
         (void)*bad;
         CHECK(0);
     }
     CHECK(jumped == SIGSEGV);
     CHECK(g_fault_code == SEGV_MAPERR);
-    CHECK(g_fault_addr == 0x1000);
+    CHECK(g_fault_addr == (uintptr_t)g_ro_page);
 
     /* 3. Catchable SIGILL via sigsetjmp/siglongjmp. */
     CHECK(sigaction(SIGILL, &sa, NULL) == 0);
@@ -761,7 +762,7 @@ int main(int argc, char **argv) {
         sigemptyset(&block);
         sigaddset(&block, SIGSEGV);
         CHECK(sigprocmask(SIG_BLOCK, &block, NULL) == 0);
-        volatile char *bad = (volatile char *)0x1000;
+        volatile char *bad = (volatile char *)UNMAPPED;
         (void)*bad;
         return 0;
     }

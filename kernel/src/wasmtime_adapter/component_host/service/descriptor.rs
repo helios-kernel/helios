@@ -959,6 +959,10 @@ where
             .udp_readiness(socket)
             .await
             .map_err(p1_errno_from_udp_error)?,
+        UnixSocketHandle::<Net>::PacketSocket(socket) => service
+            .packet_readiness(socket)
+            .await
+            .map_err(p1_errno_from_udp_error)?,
     };
     Ok(p1_readiness_from_socket(readiness, event_type))
 }
