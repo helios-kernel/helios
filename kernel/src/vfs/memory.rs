@@ -30,16 +30,16 @@ use core::ops::Bound;
 use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use helios_btrfs::DeviceNumber;
-use helios_btrfs::write::Special;
+use helios_btrfs::write::{Attributes, Special};
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError, FsPath, FsResult, Landed,
-    Metadata, NodeId, NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition,
-    WriteProgress,
+    Metadata, NodeId, NodeKind, OpenFlags, Opened, OwnedFsPath, PreparedWrite, RenameMode,
+    WritePosition, WriteProgress,
 };
 use spin::Mutex;
 use triomphe::Arc;
 
-use super::{UnixAttributes, cmp_to_children};
+use super::{UnixAttributes, UnixFsError, UnixNodeMetadata, cmp_to_children};
 
 const ROOT_INODE: u64 = 1;
 const ROOT_UNIX: UnixAttributes = UnixAttributes {
@@ -433,6 +433,212 @@ impl MemoryFs {
             inode.status_nanos = now;
         }
         Ok(removed)
+    }
+
+    fn resolve_create_unix(
+        state: &MemoryState,
+        path: FsPath<'_>,
+        kind: NodeKind,
+        attributes: Attributes,
+    ) -> FsResult<UnixAttributes> {
+        let (parent, _) = path.split_last().ok_or(FsError::Exists)?;
+        let (_, parent_inode) = state.inode(parent)?;
+        if parent_inode.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        let parent_sgid = (parent_inode.unix.permissions & S_ISGID) != 0;
+        let gid = if parent_sgid {
+            parent_inode.unix.gid
+        } else {
+            attributes.gid
+        };
+        let permissions = match kind {
+            NodeKind::Symlink => 0o777,
+            NodeKind::Directory => {
+                ((attributes.permissions & 0o777) & !attributes.umask)
+                    | if parent_sgid { S_ISGID } else { 0 }
+            }
+            _ => (attributes.permissions & 0o777) & !attributes.umask,
+        };
+        Ok(UnixAttributes {
+            permissions,
+            uid: attributes.uid,
+            gid,
+        })
+    }
+
+    pub fn open_unix(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<Opened<OwnedFsPath>, UnixFsError> {
+        let mut state = self.state.lock();
+        let metadata = match state.metadata(self.device, path) {
+            Ok(metadata) => {
+                if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
+                    return Err(FsError::Exists.into());
+                }
+                metadata
+            }
+            Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
+                if flags.contains(OpenFlags::DIRECTORY) {
+                    return Err(FsError::NotDirectory.into());
+                }
+                let unix = Self::resolve_create_unix(&state, path, NodeKind::File, attributes)?;
+                state.require_new_name(path)?;
+                state.insert(
+                    path,
+                    NodeKind::File,
+                    unix,
+                    DeviceNumber::default(),
+                    Bytes::new(),
+                    now,
+                );
+                state.metadata(self.device, path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(refusal) = metadata.kind.open_refusal() {
+            return Err(refusal.into());
+        }
+        if flags.contains(OpenFlags::DIRECTORY) && metadata.kind != NodeKind::Directory {
+            return Err(FsError::NotDirectory.into());
+        }
+        if flags.contains(OpenFlags::TRUNCATE) {
+            let inode = state.inode_mut(path)?;
+            if inode.kind == NodeKind::Directory {
+                return Err(FsError::IsDirectory.into());
+            }
+            inode.contents.clear();
+            inode.modified_nanos = now;
+            inode.status_nanos = now;
+        }
+        let metadata = state.metadata(self.device, path)?;
+        Ok(Opened {
+            metadata,
+            handle: path.into(),
+        })
+    }
+
+    pub fn create_directory_unix(
+        &self,
+        path: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mut state = self.state.lock();
+        let unix = Self::resolve_create_unix(&state, path, NodeKind::Directory, attributes)?;
+        state.require_new_name(path)?;
+        state.insert(
+            path,
+            NodeKind::Directory,
+            unix,
+            DeviceNumber::default(),
+            Bytes::new(),
+            now,
+        );
+        Ok(())
+    }
+
+    pub fn symlink_unix(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mut state = self.state.lock();
+        let unix = Self::resolve_create_unix(&state, link, NodeKind::Symlink, attributes)?;
+        state.require_new_name(link)?;
+        state.insert(
+            link,
+            NodeKind::Symlink,
+            unix,
+            DeviceNumber::default(),
+            Bytes::copy_from_slice(target.as_bytes()),
+            now,
+        );
+        Ok(())
+    }
+
+    pub fn create_special_unix(
+        &self,
+        path: FsPath<'_>,
+        special: Special,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let (kind, rdev) = match special {
+            Special::CharDevice(device) => (NodeKind::CharacterDevice, device),
+            Special::BlockDevice(device) => (NodeKind::BlockDevice, device),
+            Special::Fifo => (NodeKind::Fifo, DeviceNumber::default()),
+            Special::Socket => (NodeKind::Socket, DeviceNumber::default()),
+        };
+        let mut state = self.state.lock();
+        let unix = Self::resolve_create_unix(&state, path, kind, attributes)?;
+        state.require_new_name(path)?;
+        state.insert(path, kind, unix, rdev, Bytes::new(), now);
+        Ok(())
+    }
+
+    pub fn unix_node_metadata(&self, path: FsPath<'_>) -> Result<UnixNodeMetadata, UnixFsError> {
+        let md = self.unix_metadata(path)?;
+        Ok(UnixNodeMetadata {
+            kind: md.kind,
+            attributes: md.attributes,
+            rdev: md.rdev.encode(),
+        })
+    }
+
+    pub fn set_xattr_unix(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        if value.len() > XATTR_SIZE_MAX {
+            return Err(UnixFsError::ArgTooBig);
+        }
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Set).map_err(|e| match e {
+            FsError::NameTooLong => UnixFsError::Range,
+            FsError::NotPermitted => UnixFsError::PermissionDenied,
+            other => UnixFsError::Fs(other),
+        })?;
+        let exists = inode.xattrs.contains_key(name);
+        match (mode, exists) {
+            (XattrSetMode::Create, true) => return Err(FsError::Exists.into()),
+            (XattrSetMode::Replace, false) => return Err(UnixFsError::NoData),
+            _ => {}
+        }
+        inode.xattrs.insert(String::from(name), value);
+        inode.status_nanos = now;
+        Ok(())
+    }
+
+    pub fn remove_xattr_unix(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, XattrOp::Remove).map_err(|e| match e {
+            FsError::NameTooLong => UnixFsError::Range,
+            FsError::NotPermitted => UnixFsError::PermissionDenied,
+            other => UnixFsError::Fs(other),
+        })?;
+        if inode.xattrs.remove(name).is_none() {
+            return Err(UnixFsError::NoData);
+        }
+        inode.status_nanos = now;
+        Ok(())
     }
 
     /// Removes the object at `path` (a directory when `directory`, which

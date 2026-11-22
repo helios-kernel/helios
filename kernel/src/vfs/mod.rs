@@ -61,7 +61,10 @@ pub use request::{
 };
 pub use root::{RootFs, RootWrite};
 pub use storage::{NoDisks, Storage};
-pub use unix::{MountFlags, MountGrant, MountSharing, SharedOwner, UnixAttributes};
+pub use unix::{
+    MountFlags, MountGrant, MountSharing, SharedOwner, UnixAttributes, UnixFsError,
+    UnixNodeMetadata,
+};
 
 use alloc::borrow::{Cow, ToOwned};
 use alloc::boxed::Box;
@@ -590,6 +593,377 @@ mount_kinds! {
     Erofs(ErofsFs<S::Disk> => OwnedFsPath),
     /// A btrfs image on a mount-source disk.
     Btrfs(BtrfsFs<S::Disk> => BtrfsOpenHandle),
+}
+
+impl<S: Storage> MountedFs<S> {
+    pub async fn unix_metadata(&self, path: FsPath<'_>) -> Result<UnixNodeMetadata, UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.unix_metadata(path).await,
+            Self::Memory(fs) => fs.unix_node_metadata(path),
+            Self::Root(fs) => fs.unix_node_metadata(path),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => {
+                let md = self.stat(path).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes: UnixAttributes {
+                        permissions: if md.kind == NodeKind::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        },
+                        uid: 0,
+                        gid: 0,
+                    },
+                    rdev: 0,
+                })
+            }
+        }
+    }
+
+    pub async fn unix_metadata_handle(
+        &self,
+        handle: &MountedOpenHandle,
+    ) -> Result<UnixNodeMetadata, UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => fs.unix_metadata_handle(h).await,
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => fs.unix_node_metadata(p.as_path()),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.unix_node_metadata(p.as_path()),
+            (Self::Boot(fs), MountedOpenHandle::Boot(p)) => {
+                let md = fs.stat(p.as_path()).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes: UnixAttributes {
+                        permissions: if md.kind == NodeKind::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        },
+                        uid: 0,
+                        gid: 0,
+                    },
+                    rdev: 0,
+                })
+            }
+            (Self::Host(fs), MountedOpenHandle::Host(p)) => {
+                let md = fs.stat(p.as_path()).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes: UnixAttributes {
+                        permissions: if md.kind == NodeKind::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        },
+                        uid: 0,
+                        gid: 0,
+                    },
+                    rdev: 0,
+                })
+            }
+            (Self::Erofs(fs), MountedOpenHandle::Erofs(p)) => {
+                let md = fs.stat(p.as_path()).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes: UnixAttributes {
+                        permissions: if md.kind == NodeKind::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        },
+                        uid: 0,
+                        gid: 0,
+                    },
+                    rdev: 0,
+                })
+            }
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn open_unix(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        attributes: helios_btrfs::write::Attributes,
+        now: u64,
+    ) -> Result<Opened<MountedOpenHandle>, UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs
+                .open_unix(path, flags, attributes, now)
+                .await
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Btrfs(o.handle),
+                }),
+            Self::Memory(fs) => fs.open_unix(path, flags, attributes, now).map(|o| Opened {
+                metadata: o.metadata,
+                handle: MountedOpenHandle::Memory(o.handle),
+            }),
+            Self::Root(fs) => fs.open_unix(path, flags, attributes, now).map(|o| Opened {
+                metadata: o.metadata,
+                handle: MountedOpenHandle::Root(o.handle),
+            }),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => {
+                self.open(path, flags, now).await.map_err(UnixFsError::Fs)
+            }
+        }
+    }
+
+    pub async fn create_directory_unix(
+        &self,
+        path: FsPath<'_>,
+        attributes: helios_btrfs::write::Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.create_directory_unix(path, attributes, now).await,
+            Self::Memory(fs) => fs.create_directory_unix(path, attributes, now),
+            Self::Root(fs) => fs.create_directory_unix(path, attributes, now),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
+                .create_directory(path, now)
+                .await
+                .map_err(UnixFsError::Fs),
+        }
+    }
+
+    pub async fn symlink_unix(
+        &self,
+        target: &str,
+        path: FsPath<'_>,
+        attributes: helios_btrfs::write::Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.symlink_unix(target, path, attributes, now).await,
+            Self::Memory(fs) => fs.symlink_unix(target, path, attributes, now),
+            Self::Root(fs) => fs.symlink_unix(target, path, attributes, now),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
+                .symlink(target, path, now)
+                .await
+                .map_err(UnixFsError::Fs),
+        }
+    }
+
+    pub async fn create_special(
+        &self,
+        path: FsPath<'_>,
+        special: helios_btrfs::write::Special,
+        attributes: helios_btrfs::write::Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.create_special(path, special, attributes, now).await,
+            Self::Memory(fs) => fs.create_special_unix(path, special, attributes, now),
+            Self::Root(fs) => fs.create_special_unix(path, special, attributes, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn set_permissions(
+        &self,
+        path: FsPath<'_>,
+        permissions: u32,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.set_permissions(path, permissions, now).await,
+            Self::Memory(fs) => Ok(fs.set_permissions(path, permissions, now)?),
+            Self::Root(fs) => fs.set_permissions(path, permissions, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn set_permissions_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        permissions: u32,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
+                fs.set_permissions_handle(h, permissions, now).await
+            }
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => {
+                Ok(fs.set_permissions(p.as_path(), permissions, now)?)
+            }
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => {
+                fs.set_permissions(p.as_path(), permissions, now)
+            }
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn set_owner(
+        &self,
+        path: FsPath<'_>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.set_owner(path, uid, gid, now).await,
+            Self::Memory(fs) => Ok(fs.set_owner(path, uid, gid, now)?),
+            Self::Root(fs) => fs.set_owner(path, uid, gid, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn set_owner_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
+                fs.set_owner_handle(h, uid, gid, now).await
+            }
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => {
+                Ok(fs.set_owner(p.as_path(), uid, gid, now)?)
+            }
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => {
+                fs.set_owner(p.as_path(), uid, gid, now)
+            }
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn xattr(&self, path: FsPath<'_>, name: &str) -> Result<Option<Bytes>, UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.xattr(path, name).await,
+            Self::Memory(fs) => Ok(fs.xattr(path, name)?),
+            Self::Root(fs) => fs.xattr(path, name),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn xattr_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        name: &str,
+    ) -> Result<Option<Bytes>, UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => fs.xattr_handle(h, name).await,
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => Ok(fs.xattr(p.as_path(), name)?),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.xattr(p.as_path(), name),
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Host(_), MountedOpenHandle::Host(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn list_xattrs(&self, path: FsPath<'_>) -> Result<Vec<String>, UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.list_xattrs(path).await,
+            Self::Memory(fs) => Ok(fs.list_xattrs(path)?),
+            Self::Root(fs) => fs.list_xattrs(path),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn list_xattrs_handle(
+        &self,
+        handle: &MountedOpenHandle,
+    ) -> Result<Vec<String>, UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => fs.list_xattrs_handle(h).await,
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => Ok(fs.list_xattrs(p.as_path())?),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.list_xattrs(p.as_path()),
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Host(_), MountedOpenHandle::Host(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn set_xattr(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.set_xattr(path, name, value, mode, now).await,
+            Self::Memory(fs) => fs.set_xattr_unix(path, name, value, mode, now),
+            Self::Root(fs) => fs.set_xattr(path, name, value, mode, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn set_xattr_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
+                fs.set_xattr_handle(h, name, value, mode, now).await
+            }
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => {
+                fs.set_xattr_unix(p.as_path(), name, value, mode, now)
+            }
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => {
+                fs.set_xattr(p.as_path(), name, value, mode, now)
+            }
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn remove_xattr(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.remove_xattr(path, name, now).await,
+            Self::Memory(fs) => fs.remove_xattr_unix(path, name, now),
+            Self::Root(fs) => fs.remove_xattr(path, name, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn remove_xattr_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        name: &str,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
+                fs.remove_xattr_handle(h, name, now).await
+            }
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => {
+                fs.remove_xattr_unix(p.as_path(), name, now)
+            }
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.remove_xattr(p.as_path(), name, now),
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
 }
 
 /// Why a mount or unmount was refused.

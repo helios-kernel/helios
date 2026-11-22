@@ -296,6 +296,7 @@ pub const CAP_FSETID: u32 = 4;
 pub const CAP_KILL: u32 = 5;
 pub const CAP_SETGID: u32 = 6;
 pub const CAP_SETUID: u32 = 7;
+pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_NET_BIND_SERVICE: u32 = 10;
 pub const CAP_NET_BROADCAST: u32 = 11;
 pub const CAP_NET_ADMIN: u32 = 12;
@@ -305,8 +306,10 @@ pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;
 pub const CAP_SYS_TIME: u32 = 25;
-const CAP_LAST_CAP: u32 = 40;
-const CAP_FULL_SET: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+pub const CAP_MKNOD: u32 = 27;
+pub const CAP_SETFCAP: u32 = 31;
+pub const CAP_LAST_CAP: u32 = 40;
+pub const CAP_FULL_SET: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
 
 /// Process Linux capability sets (`include/linux/cred.h`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -459,6 +462,28 @@ impl Credentials {
     pub fn for_ids(uid: u32, gid: u32, supplementary_groups: Vec<u32>) -> Self {
         Self::try_for_ids(uid, gid, supplementary_groups)
             .expect("trusted credentials satisfy Linux ID invariants")
+    }
+
+    /// Whether `gid` matches the effective GID or any supplementary group
+    /// (`kernel/groups.c` `in_group_p`).
+    pub fn in_group(&self, gid: u32) -> bool {
+        self.group.effective == gid || self.supplementary_groups.contains(&gid)
+    }
+
+    /// Temporary credential override used by `access(2)` / `faccessat(2)`
+    /// without `AT_EACCESS` (`fs/open.c` `do_faccessat`, Linux v6.12): uses
+    /// real UID/GID and resets effective capabilities to permitted when real
+    /// UID is 0 or empty otherwise.
+    pub fn for_real_access(&self) -> Self {
+        let mut out = self.clone();
+        out.user.effective = self.user.real;
+        out.group.effective = self.group.real;
+        out.capabilities.effective = if self.user.real == 0 {
+            self.capabilities.permitted
+        } else {
+            0
+        };
+        out
     }
 }
 
@@ -1137,6 +1162,143 @@ impl Credentials {
             groups.push(gid);
         }
         self.supplementary_groups = groups;
+        0
+    }
+}
+
+// `include/uapi/linux/capability.h` (Linux v6.12).
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+fn cap_validate_magic<M: UserMemory>(hdr_addr: u64, memory: &mut M) -> Result<(usize, i32), u64> {
+    let mut raw = [0u8; 8];
+    if memory.read(hdr_addr, &mut raw).is_err() {
+        return Err(errno(EFAULT));
+    }
+    let version = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+    let pid = i32::from_le_bytes(raw[4..8].try_into().unwrap());
+    let tocopy = match version {
+        LINUX_CAPABILITY_VERSION_1 => 1,
+        LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => 2,
+        _ => {
+            if memory
+                .write(hdr_addr, &LINUX_CAPABILITY_VERSION_3.to_le_bytes())
+                .is_err()
+            {
+                return Err(errno(EFAULT));
+            }
+            return Err(errno(EINVAL));
+        }
+    };
+    Ok((tocopy, pid))
+}
+
+impl<R: Resources> Process<R> {
+    /// `kernel/capability.c` `sys_capget` (Linux v6.12).
+    pub(super) fn capget<M: UserMemory>(&self, args: [u64; 6], memory: &mut M) -> u64 {
+        let hdr_addr = args[0];
+        let data_addr = args[1];
+        let (tocopy, pid) = match cap_validate_magic(hdr_addr, memory) {
+            Ok(pair) => pair,
+            Err(err) => {
+                // `sys_capget`: probing version with `dataptr == NULL` succeeds
+                // after writing `_LINUX_CAPABILITY_VERSION_3`.
+                if data_addr == 0 && err == errno(EINVAL) {
+                    return 0;
+                }
+                return err;
+            }
+        };
+        if data_addr == 0 {
+            return 0;
+        }
+        if pid < 0 {
+            return errno(EINVAL);
+        }
+        if !self.names_self(pid) {
+            return errno(ESRCH);
+        }
+        let caps = self.shared.credentials.lock().capabilities;
+        let words = [
+            [
+                caps.effective as u32,
+                caps.permitted as u32,
+                caps.inheritable as u32,
+            ],
+            [
+                (caps.effective >> 32) as u32,
+                (caps.permitted >> 32) as u32,
+                (caps.inheritable >> 32) as u32,
+            ],
+        ];
+        let mut buf = [0u8; 24];
+        for (slot, triple) in words.iter().take(tocopy).enumerate() {
+            let base = slot * 12;
+            buf[base..base + 4].copy_from_slice(&triple[0].to_le_bytes());
+            buf[base + 4..base + 8].copy_from_slice(&triple[1].to_le_bytes());
+            buf[base + 8..base + 12].copy_from_slice(&triple[2].to_le_bytes());
+        }
+        write_result(memory, data_addr, &buf[..tocopy * 12])
+    }
+
+    /// `kernel/capability.c` `sys_capset` + `security/commoncap.c` `cap_capset`
+    /// (Linux v6.12).
+    pub(super) fn capset<M: UserMemory>(&mut self, args: [u64; 6], memory: &mut M) -> u64 {
+        let hdr_addr = args[0];
+        let data_addr = args[1];
+        let (tocopy, pid) = match cap_validate_magic(hdr_addr, memory) {
+            Ok(pair) => pair,
+            Err(err) => return err,
+        };
+        if pid != 0 && pid as u32 != self.tid.get() {
+            return errno(EPERM);
+        }
+        if data_addr == 0 {
+            return errno(EFAULT);
+        }
+        let mut buf = [0u8; 24];
+        if memory.read(data_addr, &mut buf[..tocopy * 12]).is_err() {
+            return errno(EFAULT);
+        }
+        let read_u32 = |off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let mut effective = u64::from(read_u32(0));
+        let mut permitted = u64::from(read_u32(4));
+        let mut inheritable = u64::from(read_u32(8));
+        if tocopy == 2 {
+            effective |= u64::from(read_u32(12)) << 32;
+            permitted |= u64::from(read_u32(16)) << 32;
+            inheritable |= u64::from(read_u32(20)) << 32;
+        }
+        let mut creds = self.shared.credentials.lock();
+        let old = creds.capabilities;
+        // `security/commoncap.c` `cap_capset`:
+        // 1. Inheritable cannot grow beyond old.inheritable | old.permitted
+        //    without CAP_SETPCAP, nor beyond old.inheritable | old.bounding.
+        let allowed_inheritable = if old.has_effective(CAP_SETPCAP) {
+            old.inheritable | old.permitted | old.bounding
+        } else {
+            old.inheritable | old.permitted
+        };
+        if (inheritable & !allowed_inheritable) != 0 {
+            return errno(EPERM);
+        }
+        if (inheritable & !(old.inheritable | old.bounding)) != 0 {
+            return errno(EPERM);
+        }
+        // 2. Permitted cannot grow beyond old.permitted.
+        if (permitted & !old.permitted) != 0 {
+            return errno(EPERM);
+        }
+        // 3. Effective must be a subset of the new permitted set.
+        if (effective & !permitted) != 0 {
+            return errno(EPERM);
+        }
+        creds.capabilities.effective = effective & CAP_FULL_SET;
+        creds.capabilities.permitted = permitted & CAP_FULL_SET;
+        creds.capabilities.inheritable = inheritable & CAP_FULL_SET;
+        // `cap_capset` clears ambient bits not in both new permitted & inheritable.
+        creds.capabilities.ambient &= creds.capabilities.permitted & creds.capabilities.inheritable;
         0
     }
 }

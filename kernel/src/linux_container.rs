@@ -40,20 +40,56 @@ use alloc::vec::Vec;
 use bytes::Bytes;
 use core::num::{NonZeroU32, NonZeroU64};
 
+use helios_btrfs::DeviceNumber;
+use helios_btrfs::write::{Attributes as BtrfsAttributes, Special};
 use helios_hal::fs::{
     DirCookie, DirEntry, DirStream, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
     Landed, Metadata, NodeKind, OpenFlags, RenameMode, WritePosition, write_with,
 };
-use helios_linux::syscall::{AccessCheck, Credentials, OpenRequest, PidNamespace, UtsField};
+use helios_linux::syscall::{
+    AccessCheck, CAP_FSETID, CAP_FULL_SET, CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_RAW,
+    CAP_SYS_TIME, Credentials, FsOpError, OpenRequest, PidNamespace, TimeUpdate, UtsField,
+    XattrSetMode as LinuxXattrSetMode, permissions,
+};
 use helios_unix::FutexTable;
 use thiserror::Error;
 
 use crate::vfs::{
     FileContents, Follow, HeldPath, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MountFlags, MountGrant,
     MountHold, MountSharing, MountedFs, Namespace, PrivateMountClaim, PrivateMountClaimError,
-    SharedOwner, Storage, UnixAttributes, join_fs_path, within_directory,
+    SharedOwner, Storage, UnixAttributes, UnixFsError, XattrSetMode, join_fs_path,
+    within_directory,
 };
-use crate::{DirectoryAuthorityRights, DirectoryPreopen, ProcessAuthority, ProcessAuthorityError};
+use crate::{
+    ClockAuthorityRights, DirectoryAuthorityRights, DirectoryPreopen, NetworkAuthorityRights,
+    ProcessAuthority, ProcessAuthorityError,
+};
+
+fn unix_to_op(error: UnixFsError) -> FsOpError {
+    match error {
+        UnixFsError::Fs(error) => FsOpError::Fs(error),
+        UnixFsError::PermissionDenied => FsOpError::PermissionDenied,
+        UnixFsError::NoData => FsOpError::NoData,
+        UnixFsError::Range => FsOpError::Range,
+        UnixFsError::ArgTooBig => FsOpError::ArgTooBig,
+    }
+}
+
+fn resolve_time_update(update: TimeUpdate, now: u64) -> Option<u64> {
+    match update {
+        TimeUpdate::Omit => None,
+        TimeUpdate::Now => Some(now),
+        TimeUpdate::Set(nanos) => Some(nanos),
+    }
+}
+
+fn to_vfs_xattr_mode(mode: LinuxXattrSetMode) -> XattrSetMode {
+    match mode {
+        LinuxXattrSetMode::CreateOrReplace => XattrSetMode::Any,
+        LinuxXattrSetMode::Create => XattrSetMode::Create,
+        LinuxXattrSetMode::Replace => XattrSetMode::Replace,
+    }
+}
 
 /// Unique identifier of a [`LinuxContainer`] within one kernel instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -278,13 +314,87 @@ impl<'a, S: Storage> ContainerResolved<'a, S> {
         Ok(())
     }
 
+    fn is_private(&self) -> bool {
+        self.mount.grant.sharing == MountSharing::Private
+    }
+
+    async fn inode_meta(&self) -> Result<permissions::InodeMeta, FsOpError> {
+        let md = self
+            .fs()
+            .unix_metadata(self.fs_path())
+            .await
+            .map_err(unix_to_op)?;
+        Ok(permissions::InodeMeta {
+            kind: md.kind,
+            mode: md.attributes.permissions,
+            uid: md.attributes.uid,
+            gid: md.attributes.gid,
+        })
+    }
+
+    async fn access_acl(&self) -> Option<Bytes> {
+        self.fs()
+            .xattr(self.fs_path(), permissions::XATTR_POSIX_ACL_ACCESS)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn check_permission(&self, creds: &Credentials, want: u32) -> Result<(), FsOpError> {
+        if !self.is_private() {
+            return Ok(());
+        }
+        let meta = self.inode_meta().await?;
+        let acl = self.access_acl().await;
+        permissions::generic_permission(creds, meta, acl.as_deref(), want)
+    }
+
+    /// Strips `S_ISUID`/`S_ISGID` (without `CAP_FSETID`) and
+    /// `security.capability` on writes and truncates of regular files on a
+    /// private mount (`fs/inode.c` `file_remove_privs`, Linux v6.12).
+    async fn strip_privs_on_write(&self, creds: &Credentials, now: u64) -> Result<(), FsOpError> {
+        if !self.is_private() {
+            return Ok(());
+        }
+        let meta = self.inode_meta().await?;
+        if meta.kind != NodeKind::File {
+            return Ok(());
+        }
+        if let Some(new_mode) = permissions::stripped_mode_on_write(creds, meta) {
+            self.fs()
+                .set_permissions(self.fs_path(), new_mode, now)
+                .await
+                .map_err(unix_to_op)?;
+        }
+        match self
+            .fs()
+            .remove_xattr(self.fs_path(), permissions::XATTR_SECURITY_CAPABILITY, now)
+            .await
+        {
+            Ok(()) | Err(UnixFsError::NoData) | Err(UnixFsError::Fs(FsError::Unsupported)) => {
+                Ok(())
+            }
+            Err(error) => Err(unix_to_op(error)),
+        }
+    }
+
     async fn describe(&self) -> FsResult<ContainerNodeInfo> {
         let metadata = self.fs().stat(self.fs_path()).await?;
-        let stored = self.fs().unix_attributes(self.fs_path()).await?;
-        let unix = self.container_view(metadata.kind, stored);
+        let unix_md = self
+            .fs()
+            .unix_metadata(self.fs_path())
+            .await
+            .map_err(UnixFsError::into_fs_error)?;
+        let unix = self.container_view(metadata.kind, unix_md.attributes);
+        let rdev = if self.is_private() {
+            u64::from(unix_md.rdev)
+        } else {
+            0
+        };
         Ok(ContainerNodeInfo {
             metadata,
             unix,
+            rdev,
             flags: self.flags(),
             mount_point: self.mount_point().to_owned(),
             grant: self.grant(),
@@ -297,6 +407,9 @@ impl<'a, S: Storage> ContainerResolved<'a, S> {
 pub struct ContainerNodeInfo {
     pub metadata: Metadata,
     pub unix: UnixAttributes,
+    /// Encoded device number (`new_encode_dev`) on private mounts; zero on
+    /// shared mounts.
+    pub rdev: u64,
     pub flags: MountFlags,
     pub mount_point: String,
     pub grant: MountGrant,
@@ -371,11 +484,21 @@ impl<S: Storage> ContainerFilesystem<S> {
             return Err(FsError::NotPermitted);
         }
         let metadata = resolved.fs().stat(resolved.fs_path()).await?;
-        let stored = resolved.fs().unix_attributes(resolved.fs_path()).await?;
-        let unix = resolved.container_view(metadata.kind, stored);
+        let unix_md = resolved
+            .fs()
+            .unix_metadata(resolved.fs_path())
+            .await
+            .map_err(UnixFsError::into_fs_error)?;
+        let unix = resolved.container_view(metadata.kind, unix_md.attributes);
+        let rdev = if resolved.is_private() {
+            u64::from(unix_md.rdev)
+        } else {
+            0
+        };
         Ok(ContainerNodeInfo {
             metadata,
             unix,
+            rdev,
             flags: resolved.flags(),
             mount_point: resolved.mount_point().to_owned(),
             grant: resolved.grant(),
@@ -448,19 +571,55 @@ impl<S: Storage> ContainerFilesystem<S> {
         })
     }
 
-    /// Walks `raw_path` component by component relative to `base_dir` (a
-    /// normalized absolute container path) strictly within this container's
-    /// root. Enforces intermediate directory existence, intermediate symlink
-    /// expansion (`ELOOP` past `MAX_SYMLINK_DEPTH`), and trailing-slash
-    /// directory checks. Returns `(resolved, trailing_slash)`.
+    async fn check_parent_permission(
+        &self,
+        child_path: &str,
+        creds: &Credentials,
+        want: u32,
+    ) -> Result<Option<permissions::InodeMeta>, FsOpError> {
+        let parent_path = crate::parent_path(child_path);
+        let parent = self.resolve(parent_path)?;
+        if !parent.is_private() {
+            return Ok(None);
+        }
+        let meta = parent.inode_meta().await?;
+        let acl = parent.access_acl().await;
+        permissions::generic_permission(creds, meta, acl.as_deref(), want)?;
+        Ok(Some(meta))
+    }
+
+    /// Walks `raw_path` relative to `base_dir` with root credentials.
     pub async fn walk_path(
         &self,
         base_dir: &str,
         raw_path: &str,
         follow_final: bool,
     ) -> FsResult<(ContainerResolved<'_, S>, bool)> {
+        self.walk_path_for(base_dir, raw_path, follow_final, &Credentials::root())
+            .await
+            .map_err(|error| match error {
+                FsOpError::Fs(fs_err) => fs_err,
+                FsOpError::PermissionDenied => FsError::NotPermitted,
+                FsOpError::NoData => FsError::NoEntry,
+                FsOpError::Range | FsOpError::ArgTooBig => FsError::Overflow,
+                FsOpError::NoDevice => FsError::Invalid,
+            })
+    }
+
+    /// Walks `raw_path` component by component relative to `base_dir` (a
+    /// normalized absolute container path) strictly within this container's
+    /// root, checking `MAY_EXEC` search permission on every traversed
+    /// directory that resides on a [`MountSharing::Private`] mount.
+    /// Returns `(resolved, trailing_slash)`.
+    pub async fn walk_path_for(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        creds: &Credentials,
+    ) -> Result<(ContainerResolved<'_, S>, bool), FsOpError> {
         if raw_path.is_empty() || raw_path.as_bytes().contains(&0) {
-            return Err(FsError::Invalid);
+            return Err(FsError::Invalid.into());
         }
         let mut trailing_slash = raw_path.ends_with('/');
         let mut segments: Vec<String> = if raw_path.starts_with('/') {
@@ -487,13 +646,28 @@ impl<S: Storage> ContainerFilesystem<S> {
         let mut symlink_expansions = 0usize;
         while let Some(component) = pending.pop() {
             let is_final = pending.is_empty();
+            // Every lookup inside a directory requires search (`MAY_EXEC`)
+            // permission on that directory (`fs/namei.c` `may_lookup`).
+            let cur_dir_path = build_container_path(&segments);
+            let cur_dir = self.resolve(&cur_dir_path)?;
+            if cur_dir.is_private() {
+                let dir_meta = cur_dir.inode_meta().await?;
+                if dir_meta.kind != NodeKind::Directory {
+                    return Err(FsError::NotDirectory.into());
+                }
+                let acl = cur_dir.access_acl().await;
+                permissions::generic_permission(
+                    creds,
+                    dir_meta,
+                    acl.as_deref(),
+                    permissions::MAY_EXEC,
+                )?;
+            }
             match component.as_str() {
                 "." | ".." => {
-                    let cur_path = build_container_path(&segments);
-                    let cur = self.resolve(&cur_path)?;
-                    let meta = cur.fs().stat(cur.fs_path()).await?;
+                    let meta = cur_dir.fs().stat(cur_dir.fs_path()).await?;
                     if meta.kind != NodeKind::Directory {
-                        return Err(FsError::NotDirectory);
+                        return Err(FsError::NotDirectory.into());
                     }
                     if component == ".." {
                         segments.pop();
@@ -501,7 +675,7 @@ impl<S: Storage> ContainerFilesystem<S> {
                 }
                 name => {
                     if name.len() > 255 {
-                        return Err(FsError::NameTooLong);
+                        return Err(FsError::NameTooLong.into());
                     }
                     segments.push(component);
                     let cur_path = build_container_path(&segments);
@@ -513,11 +687,11 @@ impl<S: Storage> ContainerFilesystem<S> {
                             NodeKind::Symlink => {
                                 symlink_expansions += 1;
                                 if symlink_expansions > MAX_SYMLINK_DEPTH {
-                                    return Err(FsError::Loop);
+                                    return Err(FsError::Loop.into());
                                 }
                                 let target = resolved.fs().read_link(resolved.fs_path()).await?;
                                 if target.is_empty() || target.as_bytes().contains(&0) {
-                                    return Err(FsError::Invalid);
+                                    return Err(FsError::Invalid.into());
                                 }
                                 segments.pop();
                                 if target.starts_with('/') {
@@ -531,18 +705,18 @@ impl<S: Storage> ContainerFilesystem<S> {
                                 parts.reverse();
                                 pending.extend(parts);
                             }
-                            _ => return Err(FsError::NotDirectory),
+                            _ => return Err(FsError::NotDirectory.into()),
                         }
                     } else if follow_final || trailing_slash {
                         match resolved.fs().stat(resolved.fs_path()).await {
                             Ok(meta) if meta.kind == NodeKind::Symlink => {
                                 symlink_expansions += 1;
                                 if symlink_expansions > MAX_SYMLINK_DEPTH {
-                                    return Err(FsError::Loop);
+                                    return Err(FsError::Loop.into());
                                 }
                                 let target = resolved.fs().read_link(resolved.fs_path()).await?;
                                 if target.is_empty() || target.as_bytes().contains(&0) {
-                                    return Err(FsError::Invalid);
+                                    return Err(FsError::Invalid.into());
                                 }
                                 segments.pop();
                                 if target.starts_with('/') {
@@ -560,10 +734,10 @@ impl<S: Storage> ContainerFilesystem<S> {
                                 pending.extend(parts);
                             }
                             Ok(meta) if trailing_slash && meta.kind != NodeKind::Directory => {
-                                return Err(FsError::NotDirectory);
+                                return Err(FsError::NotDirectory.into());
                             }
                             Ok(_) | Err(FsError::NoEntry) => {}
-                            Err(error) => return Err(error),
+                            Err(error) => return Err(error.into()),
                         }
                     }
                 }
@@ -581,8 +755,11 @@ impl<S: Storage> ContainerFilesystem<S> {
         base_dir: &str,
         raw_path: &str,
         follow_final: bool,
-    ) -> FsResult<(ContainerNodeInfo, String)> {
-        let (resolved, _) = self.walk_path(base_dir, raw_path, follow_final).await?;
+        creds: &Credentials,
+    ) -> Result<(ContainerNodeInfo, String), FsOpError> {
+        let (resolved, _) = self
+            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .await?;
         resolved.require_read()?;
         let info = resolved.describe().await?;
         Ok((info, resolved.container_path().to_owned()))
@@ -590,20 +767,43 @@ impl<S: Storage> ContainerFilesystem<S> {
 
     /// Stats an already-resolved container path (used for `fstat` on open
     /// descriptors, including `O_PATH | O_NOFOLLOW` symlink descriptors).
-    pub async fn stat_resolved(&self, container_path: &str) -> FsResult<ContainerNodeInfo> {
+    pub async fn stat_resolved(
+        &self,
+        container_path: &str,
+    ) -> Result<ContainerNodeInfo, FsOpError> {
         let resolved = self.resolve(container_path)?;
-        resolved.describe().await
+        Ok(resolved.describe().await?)
+    }
+
+    /// Checks directory search permission (`MAY_EXEC`) for `fchdir(2)`.
+    pub async fn can_chdir(
+        &self,
+        container_path: &str,
+        creds: &Credentials,
+    ) -> Result<(), FsOpError> {
+        let resolved = self.resolve(container_path)?;
+        resolved
+            .check_permission(creds, permissions::MAY_EXEC)
+            .await
     }
 
     /// Checks access permissions for `raw_path` relative to `base_dir` within
-    /// the container's authority ceiling.
+    /// the container's authority ceiling (`fs/open.c` `do_faccessat`).
     pub async fn access_at(
         &self,
         base_dir: &str,
         raw_path: &str,
         check: AccessCheck,
-    ) -> FsResult<()> {
-        let (resolved, _) = self.walk_path(base_dir, raw_path, check.follow).await?;
+        creds: &Credentials,
+    ) -> Result<(), FsOpError> {
+        let eff = if check.use_effective {
+            creds.clone()
+        } else {
+            creds.for_real_access()
+        };
+        let (resolved, _) = self
+            .walk_path_for(base_dir, raw_path, check.follow, &eff)
+            .await?;
         let info = resolved.describe().await?;
         if check.read {
             resolved.require_read()?;
@@ -611,16 +811,30 @@ impl<S: Storage> ContainerFilesystem<S> {
         if check.write {
             resolved.require_write()?;
         }
-        if check.exec {
-            if !resolved
+        if check.exec
+            && !resolved
                 .authority_rights()
                 .contains(DirectoryAuthorityRights::EXECUTE)
-            {
-                return Err(FsError::NotPermitted);
+        {
+            return Err(FsError::NotPermitted.into());
+        }
+        if resolved.is_private() {
+            let mut want = 0u32;
+            if check.read {
+                want |= permissions::MAY_READ;
             }
-            if info.metadata.kind == NodeKind::File && (info.unix.permissions & 0o111) == 0 {
-                return Err(FsError::NotPermitted);
+            if check.write {
+                want |= permissions::MAY_WRITE;
             }
+            if check.exec {
+                want |= permissions::MAY_EXEC;
+            }
+            resolved.check_permission(&eff, want).await?;
+        } else if check.exec
+            && info.metadata.kind == NodeKind::File
+            && (info.unix.permissions & 0o111) == 0
+        {
+            return Err(FsError::NotPermitted.into());
         }
         Ok(())
     }
@@ -631,16 +845,19 @@ impl<S: Storage> ContainerFilesystem<S> {
         base_dir: &str,
         raw_path: &str,
         request: OpenRequest,
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<(ContainerNodeInfo, String, Option<MountHold>)> {
+    ) -> Result<(ContainerNodeInfo, String, Option<MountHold>), FsOpError> {
         let follow_final = !(request.nofollow || (request.create && request.exclusive));
-        let (resolved, trailing_slash) = self.walk_path(base_dir, raw_path, follow_final).await?;
+        let (resolved, trailing_slash) = self
+            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .await?;
         let existing = resolved.fs().stat(resolved.fs_path()).await;
 
         if request.path_only {
             let meta = existing?;
             if (request.directory || trailing_slash) && meta.kind != NodeKind::Directory {
-                return Err(FsError::NotDirectory);
+                return Err(FsError::NotDirectory.into());
             }
             let info = resolved.describe().await?;
             return Ok((
@@ -651,28 +868,49 @@ impl<S: Storage> ContainerFilesystem<S> {
         }
 
         if request.create && request.exclusive && existing.is_ok() {
-            return Err(FsError::Exists);
+            return Err(FsError::Exists.into());
         }
 
         match existing {
             Ok(meta) => {
                 if meta.kind == NodeKind::Symlink {
-                    return Err(FsError::Loop);
+                    return Err(FsError::Loop.into());
+                }
+                if matches!(meta.kind, NodeKind::CharacterDevice | NodeKind::BlockDevice) {
+                    if !resolved.flags().opens_devices() {
+                        // `fs/namei.c` `may_open_dev`: `MNT_NODEV` returns `EACCES`.
+                        return Err(FsError::NotPermitted.into());
+                    }
+                    return Err(FsOpError::NoDevice);
                 }
                 if meta.kind == NodeKind::Directory {
                     if request.write || request.truncate {
-                        return Err(FsError::IsDirectory);
+                        return Err(FsError::IsDirectory.into());
                     }
                     resolved.require_read()?;
+                    resolved
+                        .check_permission(creds, permissions::MAY_READ)
+                        .await?;
                 } else {
                     if request.directory || trailing_slash {
-                        return Err(FsError::NotDirectory);
+                        return Err(FsError::NotDirectory.into());
                     }
                     if request.read {
                         resolved.require_read()?;
                     }
                     if request.write || request.truncate {
                         resolved.require_write()?;
+                    }
+                    let mut want = 0u32;
+                    if request.read {
+                        want |= permissions::MAY_READ;
+                    }
+                    if request.write || request.truncate {
+                        want |= permissions::MAY_WRITE;
+                    }
+                    resolved.check_permission(creds, want).await?;
+                    if request.truncate {
+                        resolved.strip_privs_on_write(creds, now).await?;
                     }
                     let mut flags = OpenFlags::empty();
                     if request.truncate {
@@ -683,18 +921,24 @@ impl<S: Storage> ContainerFilesystem<S> {
             }
             Err(FsError::NoEntry) => {
                 if !request.create {
-                    return Err(FsError::NoEntry);
+                    return Err(FsError::NoEntry.into());
                 }
                 if trailing_slash {
-                    return Err(FsError::IsDirectory);
+                    return Err(FsError::IsDirectory.into());
                 }
                 if request.directory {
-                    return Err(FsError::NotDirectory);
+                    return Err(FsError::NotDirectory.into());
                 }
                 resolved.require_mutate_dir()?;
                 if request.write {
                     resolved.require_write()?;
                 }
+                self.check_parent_permission(
+                    resolved.container_path(),
+                    creds,
+                    permissions::MAY_WRITE | permissions::MAY_EXEC,
+                )
+                .await?;
                 let mut flags = OpenFlags::CREATE;
                 if request.exclusive {
                     flags |= OpenFlags::EXCLUSIVE;
@@ -702,12 +946,28 @@ impl<S: Storage> ContainerFilesystem<S> {
                 if request.truncate {
                     flags |= OpenFlags::TRUNCATE;
                 }
-                resolved.fs().open(resolved.fs_path(), flags, now).await?;
-                resolved
-                    .fs()
-                    .apply_created_permissions(resolved.fs_path(), request.mode, now);
+                if resolved.is_private() {
+                    let attrs = BtrfsAttributes {
+                        permissions: request.mode & 0o777,
+                        uid: creds.user.effective,
+                        gid: creds.group.effective,
+                        umask: request.umask,
+                    };
+                    resolved
+                        .fs()
+                        .open_unix(resolved.fs_path(), flags, attrs, now)
+                        .await
+                        .map_err(unix_to_op)?;
+                } else {
+                    resolved.fs().open(resolved.fs_path(), flags, now).await?;
+                    resolved.fs().apply_created_permissions(
+                        resolved.fs_path(),
+                        (request.mode & 0o777) & !request.umask,
+                        now,
+                    );
+                }
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
 
         let info = resolved.describe().await?;
@@ -724,26 +984,29 @@ impl<S: Storage> ContainerFilesystem<S> {
         container_path: &str,
         offset: u64,
         max_bytes: usize,
-    ) -> FsResult<Bytes> {
+    ) -> Result<Bytes, FsOpError> {
         let resolved = self.resolve(container_path)?;
         resolved.require_read()?;
-        resolved
+        Ok(resolved
             .fs()
             .read_at(resolved.fs_path(), offset, max_bytes)
-            .await
+            .await?)
     }
 
-    /// Writes `bytes` to `container_path` at `position`.
+    /// Writes `bytes` to `container_path` at `position`, stripping set-id bits
+    /// and `security.capability` on private mounts (`fs/inode.c`
+    /// `file_remove_privs`).
     pub async fn write_at(
         &self,
         container_path: &str,
         position: WritePosition,
         bytes: &[u8],
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<Landed> {
+    ) -> Result<Landed, FsOpError> {
         let resolved = self.resolve(container_path)?;
         resolved.require_write()?;
-        write_with(
+        let landed = write_with(
             resolved.fs(),
             resolved.fs_path(),
             position,
@@ -753,14 +1016,28 @@ impl<S: Storage> ContainerFilesystem<S> {
                 destination.copy_from_slice(&bytes[at..at + destination.len()]);
             },
         )
-        .await
+        .await?;
+        if landed.len > 0 {
+            resolved.strip_privs_on_write(creds, now).await?;
+        }
+        Ok(landed)
     }
 
     /// Truncates or zero-extends an open file at `container_path`.
-    pub async fn set_size(&self, container_path: &str, size: u64, now: u64) -> FsResult<()> {
+    pub async fn set_size(
+        &self,
+        container_path: &str,
+        size: u64,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
         resolved.require_write()?;
-        resolved.fs().set_size(resolved.fs_path(), size, now).await
+        resolved.strip_privs_on_write(creds, now).await?;
+        Ok(resolved
+            .fs()
+            .set_size(resolved.fs_path(), size, now)
+            .await?)
     }
 
     /// Truncates or zero-extends the file at `raw_path` relative to `base_dir`.
@@ -769,73 +1046,119 @@ impl<S: Storage> ContainerFilesystem<S> {
         base_dir: &str,
         raw_path: &str,
         size: u64,
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<()> {
-        let (resolved, _) = self.walk_path(base_dir, raw_path, true).await?;
+    ) -> Result<(), FsOpError> {
+        let (resolved, _) = self.walk_path_for(base_dir, raw_path, true, creds).await?;
         resolved.require_write()?;
-        resolved.fs().set_size(resolved.fs_path(), size, now).await
+        resolved
+            .check_permission(creds, permissions::MAY_WRITE)
+            .await?;
+        resolved.strip_privs_on_write(creds, now).await?;
+        Ok(resolved
+            .fs()
+            .set_size(resolved.fs_path(), size, now)
+            .await?)
     }
 
     /// Updates access/modified timestamps at `raw_path` relative to `base_dir`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_times_at(
         &self,
         base_dir: &str,
         raw_path: &str,
         follow_final: bool,
-        access: Option<u64>,
-        modified: Option<u64>,
+        access: TimeUpdate,
+        modified: TimeUpdate,
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<()> {
-        let (resolved, _) = self.walk_path(base_dir, raw_path, follow_final).await?;
+    ) -> Result<(), FsOpError> {
+        let (resolved, _) = self
+            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .await?;
+        if access == TimeUpdate::Omit && modified == TimeUpdate::Omit {
+            let _ = resolved.fs().stat(resolved.fs_path()).await?;
+            return Ok(());
+        }
         resolved.require_write()?;
-        resolved
+        if resolved.is_private() {
+            let meta = resolved.inode_meta().await?;
+            let acl = resolved.access_acl().await;
+            permissions::check_utimens(creds, meta, acl.as_deref(), access, modified)?;
+        }
+        Ok(resolved
             .fs()
-            .set_times(resolved.fs_path(), access, modified, now)
-            .await
+            .set_times(
+                resolved.fs_path(),
+                resolve_time_update(access, now),
+                resolve_time_update(modified, now),
+                now,
+            )
+            .await?)
     }
 
     /// Updates access/modified timestamps on an already-resolved container path.
     pub async fn set_times_resolved(
         &self,
         container_path: &str,
-        access: Option<u64>,
-        modified: Option<u64>,
+        access: TimeUpdate,
+        modified: TimeUpdate,
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<()> {
+    ) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
+        if access == TimeUpdate::Omit && modified == TimeUpdate::Omit {
+            return Ok(());
+        }
         resolved.require_write()?;
-        resolved
+        if resolved.is_private() {
+            let meta = resolved.inode_meta().await?;
+            let acl = resolved.access_acl().await;
+            permissions::check_utimens(creds, meta, acl.as_deref(), access, modified)?;
+        }
+        Ok(resolved
             .fs()
-            .set_times(resolved.fs_path(), access, modified, now)
-            .await
+            .set_times(
+                resolved.fs_path(),
+                resolve_time_update(access, now),
+                resolve_time_update(modified, now),
+                now,
+            )
+            .await?)
     }
 
     /// Syncs data (and metadata if `!data_only`) for `container_path`.
-    pub async fn sync(&self, container_path: &str, data_only: bool) -> FsResult<()> {
+    pub async fn sync(&self, container_path: &str, data_only: bool) -> Result<(), FsOpError> {
         let resolved = self.resolve(container_path)?;
         if data_only {
-            resolved.fs().sync_data(resolved.fs_path()).await
+            Ok(resolved.fs().sync_data(resolved.fs_path()).await?)
         } else {
-            resolved.fs().sync(resolved.fs_path()).await
+            Ok(resolved.fs().sync(resolved.fs_path()).await?)
         }
     }
 
     /// Reads the symbolic link target at `raw_path` relative to `base_dir`.
-    pub async fn read_link_at(&self, base_dir: &str, raw_path: &str) -> FsResult<String> {
-        let (resolved, trailing_slash) = self.walk_path(base_dir, raw_path, false).await?;
+    pub async fn read_link_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        creds: &Credentials,
+    ) -> Result<String, FsOpError> {
+        let (resolved, trailing_slash) =
+            self.walk_path_for(base_dir, raw_path, false, creds).await?;
         resolved.require_read()?;
         if trailing_slash {
-            return Err(FsError::Invalid);
+            return Err(FsError::Invalid.into());
         }
-        resolved.fs().read_link(resolved.fs_path()).await
+        Ok(resolved.fs().read_link(resolved.fs_path()).await?)
     }
 
     /// Reads the symbolic link target for an already-resolved container path
     /// (used by `readlinkat(fd, "", ...)` on an `O_PATH | O_NOFOLLOW` symlink).
-    pub async fn read_link_resolved(&self, container_path: &str) -> FsResult<String> {
+    pub async fn read_link_resolved(&self, container_path: &str) -> Result<String, FsOpError> {
         let resolved = self.resolve(container_path)?;
         resolved.require_read()?;
-        resolved.fs().read_link(resolved.fs_path()).await
+        Ok(resolved.fs().read_link(resolved.fs_path()).await?)
     }
 
     /// Creates a directory at `raw_path` relative to `base_dir`.
@@ -844,20 +1167,147 @@ impl<S: Storage> ContainerFilesystem<S> {
         base_dir: &str,
         raw_path: &str,
         mode: u32,
+        umask: u32,
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<()> {
+    ) -> Result<(), FsOpError> {
         if matches!(last_raw_component(raw_path), None | Some(".") | Some("..")) {
-            return Err(FsError::Exists);
+            return Err(FsError::Exists.into());
         }
-        let (resolved, _) = self.walk_path(base_dir, raw_path, false).await?;
+        let (resolved, _) = self.walk_path_for(base_dir, raw_path, false, creds).await?;
         resolved.require_mutate_dir()?;
-        resolved
-            .fs()
-            .create_directory(resolved.fs_path(), now)
-            .await?;
-        resolved
-            .fs()
-            .apply_created_permissions(resolved.fs_path(), mode, now);
+        self.check_parent_permission(
+            resolved.container_path(),
+            creds,
+            permissions::MAY_WRITE | permissions::MAY_EXEC,
+        )
+        .await?;
+        if resolved.is_private() {
+            let attrs = BtrfsAttributes {
+                permissions: mode & 0o777,
+                uid: creds.user.effective,
+                gid: creds.group.effective,
+                umask,
+            };
+            resolved
+                .fs()
+                .create_directory_unix(resolved.fs_path(), attrs, now)
+                .await
+                .map_err(unix_to_op)?;
+        } else {
+            resolved
+                .fs()
+                .create_directory(resolved.fs_path(), now)
+                .await?;
+            resolved.fs().apply_created_permissions(
+                resolved.fs_path(),
+                (mode & 0o777) & !umask,
+                now,
+            );
+        }
+        Ok(())
+    }
+
+    /// Creates a regular file, FIFO, socket, or device node (`mknod`/`mknodat`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mknod_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        kind: NodeKind,
+        mode: u32,
+        umask: u32,
+        rdev: u64,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        if matches!(last_raw_component(raw_path), None | Some(".") | Some("..")) {
+            return Err(FsError::Exists.into());
+        }
+        let (resolved, trailing_slash) =
+            self.walk_path_for(base_dir, raw_path, false, creds).await?;
+        if trailing_slash {
+            return Err(FsError::IsDirectory.into());
+        }
+        resolved.require_mutate_dir()?;
+        if !resolved.is_private()
+            && matches!(kind, NodeKind::CharacterDevice | NodeKind::BlockDevice)
+        {
+            return Err(FsOpError::PermissionDenied);
+        }
+        self.check_parent_permission(
+            resolved.container_path(),
+            creds,
+            permissions::MAY_WRITE | permissions::MAY_EXEC,
+        )
+        .await?;
+        let attrs = BtrfsAttributes {
+            permissions: mode & 0o777,
+            uid: creds.user.effective,
+            gid: creds.group.effective,
+            umask,
+        };
+        match kind {
+            NodeKind::File => {
+                if resolved.is_private() {
+                    resolved
+                        .fs()
+                        .open_unix(
+                            resolved.fs_path(),
+                            OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                            attrs,
+                            now,
+                        )
+                        .await
+                        .map_err(unix_to_op)?;
+                } else {
+                    resolved
+                        .fs()
+                        .open(
+                            resolved.fs_path(),
+                            OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                            now,
+                        )
+                        .await?;
+                    resolved.fs().apply_created_permissions(
+                        resolved.fs_path(),
+                        (mode & 0o777) & !umask,
+                        now,
+                    );
+                }
+            }
+            NodeKind::Fifo => {
+                resolved
+                    .fs()
+                    .create_special(resolved.fs_path(), Special::Fifo, attrs, now)
+                    .await
+                    .map_err(unix_to_op)?;
+            }
+            NodeKind::Socket => {
+                resolved
+                    .fs()
+                    .create_special(resolved.fs_path(), Special::Socket, attrs, now)
+                    .await
+                    .map_err(unix_to_op)?;
+            }
+            NodeKind::CharacterDevice => {
+                let dev = DeviceNumber::decode(rdev as u32);
+                resolved
+                    .fs()
+                    .create_special(resolved.fs_path(), Special::CharDevice(dev), attrs, now)
+                    .await
+                    .map_err(unix_to_op)?;
+            }
+            NodeKind::BlockDevice => {
+                let dev = DeviceNumber::decode(rdev as u32);
+                resolved
+                    .fs()
+                    .create_special(resolved.fs_path(), Special::BlockDevice(dev), attrs, now)
+                    .await
+                    .map_err(unix_to_op)?;
+            }
+            _ => return Err(FsError::Invalid.into()),
+        }
         Ok(())
     }
 
@@ -868,58 +1318,82 @@ impl<S: Storage> ContainerFilesystem<S> {
         base_dir: &str,
         raw_path: &str,
         remove_dir: bool,
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<()> {
+    ) -> Result<(), FsOpError> {
         match last_raw_component(raw_path) {
             None => {
                 return Err(if remove_dir {
-                    FsError::Busy
+                    FsError::Busy.into()
                 } else {
-                    FsError::IsDirectory
+                    FsError::IsDirectory.into()
                 });
             }
             Some(".") => {
                 return Err(if remove_dir {
-                    FsError::Invalid
+                    FsError::Invalid.into()
                 } else {
-                    FsError::IsDirectory
+                    FsError::IsDirectory.into()
                 });
             }
             Some("..") => {
                 return Err(if remove_dir {
-                    FsError::NotEmpty
+                    FsError::NotEmpty.into()
                 } else {
-                    FsError::IsDirectory
+                    FsError::IsDirectory.into()
                 });
             }
             Some(_) => {}
         }
-        let (resolved, _) = self.walk_path(base_dir, raw_path, false).await?;
+        let (resolved, _) = self.walk_path_for(base_dir, raw_path, false, creds).await?;
         if remove_dir {
             if resolved.is_mount_root() {
-                return Err(FsError::Busy);
+                return Err(FsError::Busy.into());
             }
             resolved.require_mutate_dir()?;
+            let parent_meta = self
+                .check_parent_permission(
+                    resolved.container_path(),
+                    creds,
+                    permissions::MAY_WRITE | permissions::MAY_EXEC,
+                )
+                .await?;
             let meta = resolved.fs().stat(resolved.fs_path()).await?;
             if meta.kind != NodeKind::Directory {
-                return Err(FsError::NotDirectory);
+                return Err(FsError::NotDirectory.into());
             }
-            resolved
+            if let Some(parent_meta) = parent_meta {
+                let child_meta = resolved.inode_meta().await?;
+                permissions::check_sticky(creds, parent_meta, child_meta.uid)?;
+            }
+            Ok(resolved
                 .fs()
                 .remove_directory(resolved.fs_path(), now)
-                .await
+                .await?)
         } else {
             resolved.require_mutate_dir()?;
+            let parent_meta = self
+                .check_parent_permission(
+                    resolved.container_path(),
+                    creds,
+                    permissions::MAY_WRITE | permissions::MAY_EXEC,
+                )
+                .await?;
             let meta = resolved.fs().stat(resolved.fs_path()).await?;
             if meta.kind == NodeKind::Directory {
-                return Err(FsError::IsDirectory);
+                return Err(FsError::IsDirectory.into());
             }
-            resolved.fs().unlink(resolved.fs_path(), now).await
+            if let Some(parent_meta) = parent_meta {
+                let child_meta = resolved.inode_meta().await?;
+                permissions::check_sticky(creds, parent_meta, child_meta.uid)?;
+            }
+            Ok(resolved.fs().unlink(resolved.fs_path(), now).await?)
         }
     }
 
     /// Renames `old_raw` (relative to `old_base`) to `new_raw` (relative to
     /// `new_base`) within the same container mount.
+    #[allow(clippy::too_many_arguments)]
     pub async fn rename_at(
         &self,
         old_base: &str,
@@ -927,31 +1401,62 @@ impl<S: Storage> ContainerFilesystem<S> {
         new_base: &str,
         new_raw: &str,
         mode: RenameMode,
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<()> {
+    ) -> Result<(), FsOpError> {
         if matches!(last_raw_component(old_raw), None | Some(".") | Some(".."))
             || matches!(last_raw_component(new_raw), None | Some(".") | Some(".."))
         {
-            return Err(FsError::Busy);
+            return Err(FsError::Busy.into());
         }
-        let (old_resolved, old_slash) = self.walk_path(old_base, old_raw, false).await?;
-        let (new_resolved, new_slash) = self.walk_path(new_base, new_raw, false).await?;
+        let (old_resolved, old_slash) = self.walk_path_for(old_base, old_raw, false, creds).await?;
+        let (new_resolved, new_slash) = self.walk_path_for(new_base, new_raw, false, creds).await?;
         let old_meta = old_resolved.fs().stat(old_resolved.fs_path()).await?;
         if (old_slash || new_slash) && old_meta.kind != NodeKind::Directory {
-            return Err(FsError::NotDirectory);
+            return Err(FsError::NotDirectory.into());
         }
         if !old_resolved.same_mount(&new_resolved) {
-            return Err(FsError::CrossDevice);
+            return Err(FsError::CrossDevice.into());
         }
         if old_resolved.is_mount_root() || new_resolved.is_mount_root() {
-            return Err(FsError::Busy);
+            return Err(FsError::Busy.into());
         }
         old_resolved.require_mutate_dir()?;
         new_resolved.require_mutate_dir()?;
-        old_resolved
+        let old_parent_meta = self
+            .check_parent_permission(
+                old_resolved.container_path(),
+                creds,
+                permissions::MAY_WRITE | permissions::MAY_EXEC,
+            )
+            .await?;
+        let new_parent_meta = self
+            .check_parent_permission(
+                new_resolved.container_path(),
+                creds,
+                permissions::MAY_WRITE | permissions::MAY_EXEC,
+            )
+            .await?;
+        if let Some(old_parent_meta) = old_parent_meta {
+            let src_unix = old_resolved.inode_meta().await?;
+            permissions::check_sticky(creds, old_parent_meta, src_unix.uid)?;
+            let old_parent = crate::parent_path(old_resolved.container_path());
+            let new_parent = crate::parent_path(new_resolved.container_path());
+            if src_unix.kind == NodeKind::Directory && old_parent != new_parent {
+                old_resolved
+                    .check_permission(creds, permissions::MAY_WRITE)
+                    .await?;
+            }
+        }
+        if let Some(new_parent_meta) = new_parent_meta
+            && let Ok(dst_unix) = new_resolved.inode_meta().await
+        {
+            permissions::check_sticky(creds, new_parent_meta, dst_unix.uid)?;
+        }
+        Ok(old_resolved
             .fs()
             .rename(old_resolved.fs_path(), new_resolved.fs_path(), mode, now)
-            .await
+            .await?)
     }
 
     /// Creates a hard link from `old_raw` (or `old_base` when `empty_old`) to
@@ -965,32 +1470,47 @@ impl<S: Storage> ContainerFilesystem<S> {
         new_raw: &str,
         follow_old: bool,
         empty_old: bool,
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<()> {
+    ) -> Result<(), FsOpError> {
         if matches!(last_raw_component(new_raw), None | Some(".") | Some("..")) {
-            return Err(FsError::Exists);
+            return Err(FsError::Exists.into());
         }
         let old_resolved = if empty_old {
             self.resolve(old_base)?
         } else {
-            self.walk_path(old_base, old_raw, follow_old).await?.0
+            self.walk_path_for(old_base, old_raw, follow_old, creds)
+                .await?
+                .0
         };
-        let (new_resolved, new_slash) = self.walk_path(new_base, new_raw, false).await?;
+        let (new_resolved, new_slash) = self.walk_path_for(new_base, new_raw, false, creds).await?;
         if new_slash {
             return match new_resolved.fs().stat(new_resolved.fs_path()).await {
-                Ok(_) => Err(FsError::Exists),
-                Err(_) => Err(FsError::NoEntry),
+                Ok(_) => Err(FsError::Exists.into()),
+                Err(_) => Err(FsError::NoEntry.into()),
             };
         }
         if !old_resolved.same_mount(&new_resolved) {
-            return Err(FsError::CrossDevice);
+            return Err(FsError::CrossDevice.into());
         }
         old_resolved.require_read()?;
         new_resolved.require_mutate_dir()?;
-        old_resolved
+        self.check_parent_permission(
+            new_resolved.container_path(),
+            creds,
+            permissions::MAY_WRITE | permissions::MAY_EXEC,
+        )
+        .await?;
+        if old_resolved.is_private() {
+            let old_meta = old_resolved.inode_meta().await?;
+            if old_meta.kind == NodeKind::Directory {
+                return Err(FsOpError::PermissionDenied);
+            }
+        }
+        Ok(old_resolved
             .fs()
             .link(old_resolved.fs_path(), new_resolved.fs_path(), now)
-            .await
+            .await?)
     }
 
     /// Creates a symbolic link at `raw_path` (relative to `base_dir`) pointing
@@ -1000,33 +1520,454 @@ impl<S: Storage> ContainerFilesystem<S> {
         target: &str,
         base_dir: &str,
         raw_path: &str,
+        creds: &Credentials,
         now: u64,
-    ) -> FsResult<()> {
+    ) -> Result<(), FsOpError> {
         if target.is_empty() {
-            return Err(FsError::NoEntry);
+            return Err(FsError::NoEntry.into());
         }
         if matches!(last_raw_component(raw_path), None | Some(".") | Some("..")) {
-            return Err(FsError::Exists);
+            return Err(FsError::Exists.into());
         }
-        let (resolved, trailing_slash) = self.walk_path(base_dir, raw_path, false).await?;
+        let (resolved, trailing_slash) =
+            self.walk_path_for(base_dir, raw_path, false, creds).await?;
         if trailing_slash {
             return match resolved.fs().stat(resolved.fs_path()).await {
-                Ok(_) => Err(FsError::Exists),
-                Err(_) => Err(FsError::NoEntry),
+                Ok(_) => Err(FsError::Exists.into()),
+                Err(_) => Err(FsError::NoEntry.into()),
             };
         }
         resolved.require_mutate_dir()?;
-        resolved.fs().symlink(target, resolved.fs_path(), now).await
+        self.check_parent_permission(
+            resolved.container_path(),
+            creds,
+            permissions::MAY_WRITE | permissions::MAY_EXEC,
+        )
+        .await?;
+        if resolved.is_private() {
+            let attrs = BtrfsAttributes {
+                permissions: 0o777,
+                uid: creds.user.effective,
+                gid: creds.group.effective,
+                umask: 0,
+            };
+            resolved
+                .fs()
+                .symlink_unix(target, resolved.fs_path(), attrs, now)
+                .await
+                .map_err(unix_to_op)
+        } else {
+            Ok(resolved
+                .fs()
+                .symlink(target, resolved.fs_path(), now)
+                .await?)
+        }
+    }
+
+    /// Changes permission bits at `raw_path` (`chmod`/`fchmodat`/`fchmodat2`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chmod_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        mode: u32,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        let (resolved, _) = self
+            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .await?;
+        self.apply_chmod(&resolved, mode, creds, now).await
+    }
+
+    /// Changes permission bits on an already-resolved container path (`fchmod`).
+    pub async fn chmod_resolved(
+        &self,
+        container_path: &str,
+        mode: u32,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        let resolved = self.resolve(container_path)?;
+        self.apply_chmod(&resolved, mode, creds, now).await
+    }
+
+    async fn apply_chmod(
+        &self,
+        resolved: &ContainerResolved<'_, S>,
+        mode: u32,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        resolved.require_write()?;
+        if !resolved.is_private() {
+            let md = resolved.fs().stat(resolved.fs_path()).await?;
+            if md.kind == NodeKind::Symlink {
+                return Err(FsError::Unsupported.into());
+            }
+            if !permissions::inode_owner_or_capable(creds, self.shared_owner.uid) {
+                return Err(FsOpError::PermissionDenied);
+            }
+            return Ok(());
+        }
+        let meta = resolved.inode_meta().await?;
+        let effective = permissions::check_chmod(creds, meta, mode)?;
+        resolved
+            .fs()
+            .set_permissions(resolved.fs_path(), effective, now)
+            .await
+            .map_err(unix_to_op)
+    }
+
+    /// Changes owner/group at `raw_path` (`chown`/`lchown`/`fchownat`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chown_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        let (resolved, _) = self
+            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .await?;
+        self.apply_chown(&resolved, uid, gid, creds, now).await
+    }
+
+    /// Changes owner/group on an already-resolved container path (`fchown`).
+    pub async fn chown_resolved(
+        &self,
+        container_path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        let resolved = self.resolve(container_path)?;
+        self.apply_chown(&resolved, uid, gid, creds, now).await
+    }
+
+    async fn apply_chown(
+        &self,
+        resolved: &ContainerResolved<'_, S>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        resolved.require_write()?;
+        if !resolved.is_private() {
+            let md = resolved.fs().stat(resolved.fs_path()).await?;
+            let meta = permissions::InodeMeta {
+                kind: md.kind,
+                mode: 0o644,
+                uid: self.shared_owner.uid,
+                gid: self.shared_owner.gid,
+            };
+            let _ = permissions::check_chown(creds, meta, uid, gid)?;
+            return Ok(());
+        }
+        let meta = resolved.inode_meta().await?;
+        let plan = permissions::check_chown(creds, meta, uid, gid)?;
+        if plan.uid.is_some() || plan.gid.is_some() {
+            resolved
+                .fs()
+                .set_owner(resolved.fs_path(), plan.uid, plan.gid, now)
+                .await
+                .map_err(unix_to_op)?;
+        }
+        Ok(())
+    }
+
+    /// Reads extended attribute `name` at `raw_path`.
+    pub async fn get_xattr_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        name: &str,
+        creds: &Credentials,
+    ) -> Result<Vec<u8>, FsOpError> {
+        let (resolved, _) = self
+            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .await?;
+        self.get_xattr_inner(&resolved, name, creds).await
+    }
+
+    /// Reads extended attribute `name` on an already-resolved container path.
+    pub async fn get_xattr_resolved(
+        &self,
+        container_path: &str,
+        name: &str,
+        creds: &Credentials,
+    ) -> Result<Vec<u8>, FsOpError> {
+        let resolved = self.resolve(container_path)?;
+        self.get_xattr_inner(&resolved, name, creds).await
+    }
+
+    async fn get_xattr_inner(
+        &self,
+        resolved: &ContainerResolved<'_, S>,
+        name: &str,
+        creds: &Credentials,
+    ) -> Result<Vec<u8>, FsOpError> {
+        resolved.require_read()?;
+        if !resolved.is_private() {
+            let _ = resolved.fs().stat(resolved.fs_path()).await?;
+            return Err(FsError::Unsupported.into());
+        }
+        let meta = resolved.inode_meta().await?;
+        let acl = resolved.access_acl().await;
+        permissions::check_xattr_permission(creds, meta, acl.as_deref(), name, false)?;
+        let value = resolved
+            .fs()
+            .xattr(resolved.fs_path(), name)
+            .await
+            .map_err(unix_to_op)?
+            .ok_or(FsOpError::NoData)?;
+        Ok(value.to_vec())
+    }
+
+    /// Sets extended attribute `name` at `raw_path`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_xattr_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        name: &str,
+        value: &[u8],
+        mode: LinuxXattrSetMode,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        let (resolved, _) = self
+            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .await?;
+        self.set_xattr_inner(&resolved, name, value, mode, creds, now)
+            .await
+    }
+
+    /// Sets extended attribute `name` on an already-resolved container path.
+    pub async fn set_xattr_resolved(
+        &self,
+        container_path: &str,
+        name: &str,
+        value: &[u8],
+        mode: LinuxXattrSetMode,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        let resolved = self.resolve(container_path)?;
+        self.set_xattr_inner(&resolved, name, value, mode, creds, now)
+            .await
+    }
+
+    async fn set_xattr_inner(
+        &self,
+        resolved: &ContainerResolved<'_, S>,
+        name: &str,
+        value: &[u8],
+        mode: LinuxXattrSetMode,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        resolved.require_write()?;
+        if !resolved.is_private() {
+            let _ = resolved.fs().stat(resolved.fs_path()).await?;
+            return Err(FsError::Unsupported.into());
+        }
+        let meta = resolved.inode_meta().await?;
+        let acl = resolved.access_acl().await;
+        let ns = permissions::check_xattr_permission(creds, meta, acl.as_deref(), name, true)?;
+        if ns == permissions::XattrNamespace::SecurityCapability {
+            permissions::parse_vfs_cap_data(value)?;
+        }
+        resolved
+            .fs()
+            .set_xattr(
+                resolved.fs_path(),
+                name,
+                Bytes::copy_from_slice(value),
+                to_vfs_xattr_mode(mode),
+                now,
+            )
+            .await
+            .map_err(unix_to_op)?;
+        // `fs/posix_acl.c` `posix_acl_update_mode`: setting an access ACL
+        // clears `S_ISGID` when the caller is neither in the file's group nor
+        // holds `CAP_FSETID`.
+        if ns == permissions::XattrNamespace::PosixAclAccess
+            && !creds.in_group(meta.gid)
+            && !creds.capabilities.has_effective(CAP_FSETID)
+        {
+            let refreshed = resolved.inode_meta().await?;
+            if (refreshed.mode & permissions::S_ISGID) != 0 {
+                resolved
+                    .fs()
+                    .set_permissions(
+                        resolved.fs_path(),
+                        refreshed.mode & !permissions::S_ISGID,
+                        now,
+                    )
+                    .await
+                    .map_err(unix_to_op)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lists extended attribute names at `raw_path`, omitting `trusted.*`
+    /// unless `creds` holds `CAP_SYS_ADMIN`.
+    pub async fn list_xattrs_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        creds: &Credentials,
+    ) -> Result<Vec<String>, FsOpError> {
+        let (resolved, _) = self
+            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .await?;
+        self.list_xattrs_inner(&resolved, creds).await
+    }
+
+    /// Lists extended attribute names on an already-resolved container path.
+    pub async fn list_xattrs_resolved(
+        &self,
+        container_path: &str,
+        creds: &Credentials,
+    ) -> Result<Vec<String>, FsOpError> {
+        let resolved = self.resolve(container_path)?;
+        self.list_xattrs_inner(&resolved, creds).await
+    }
+
+    async fn list_xattrs_inner(
+        &self,
+        resolved: &ContainerResolved<'_, S>,
+        creds: &Credentials,
+    ) -> Result<Vec<String>, FsOpError> {
+        resolved.require_read()?;
+        if !resolved.is_private() {
+            let _ = resolved.fs().stat(resolved.fs_path()).await?;
+            return Ok(Vec::new());
+        }
+        let mut names = resolved
+            .fs()
+            .list_xattrs(resolved.fs_path())
+            .await
+            .map_err(unix_to_op)?;
+        names.retain(|name| permissions::xattr_visible_in_list(creds, name));
+        Ok(names)
+    }
+
+    /// Removes extended attribute `name` at `raw_path`.
+    pub async fn remove_xattr_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        follow_final: bool,
+        name: &str,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        let (resolved, _) = self
+            .walk_path_for(base_dir, raw_path, follow_final, creds)
+            .await?;
+        self.remove_xattr_inner(&resolved, name, creds, now).await
+    }
+
+    /// Removes extended attribute `name` on an already-resolved container path.
+    pub async fn remove_xattr_resolved(
+        &self,
+        container_path: &str,
+        name: &str,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        let resolved = self.resolve(container_path)?;
+        self.remove_xattr_inner(&resolved, name, creds, now).await
+    }
+
+    async fn remove_xattr_inner(
+        &self,
+        resolved: &ContainerResolved<'_, S>,
+        name: &str,
+        creds: &Credentials,
+        now: u64,
+    ) -> Result<(), FsOpError> {
+        resolved.require_write()?;
+        if !resolved.is_private() {
+            let _ = resolved.fs().stat(resolved.fs_path()).await?;
+            return Err(FsError::Unsupported.into());
+        }
+        let meta = resolved.inode_meta().await?;
+        let acl = resolved.access_acl().await;
+        permissions::check_xattr_permission(creds, meta, acl.as_deref(), name, true)?;
+        resolved
+            .fs()
+            .remove_xattr(resolved.fs_path(), name, now)
+            .await
+            .map_err(unix_to_op)
+    }
+
+    /// Resolves an executable at `raw_path`, checks execute permission (within
+    /// mount rights and private-mount DAC/ACL rules), and computes the
+    /// post-`execve` [`Credentials`] (`fs/exec.c` `bprm_fill_uid` +
+    /// `security/commoncap.c` `cap_bprm_creds_from_file`), bounded by
+    /// `authority_cap_ceiling` and the mount's `NO_SUID` flag.
+    pub async fn exec_credentials_at(
+        &self,
+        base_dir: &str,
+        raw_path: &str,
+        creds: &Credentials,
+        authority_cap_ceiling: u64,
+    ) -> Result<Credentials, FsOpError> {
+        let (resolved, _) = self.walk_path_for(base_dir, raw_path, true, creds).await?;
+        let required = DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE;
+        if !resolved.authority_rights().contains(required) {
+            return Err(FsError::NotPermitted.into());
+        }
+        let meta = resolved.inode_meta().await?;
+        if meta.kind != NodeKind::File {
+            return Err(FsError::NotPermitted.into());
+        }
+        resolved
+            .check_permission(creds, permissions::MAY_EXEC)
+            .await?;
+        let honours = resolved.flags().honours_exec_privileges();
+        let cap_bytes = if honours && resolved.is_private() {
+            resolved
+                .fs()
+                .xattr(resolved.fs_path(), permissions::XATTR_SECURITY_CAPABILITY)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let effective_cap = resolved.file_capability(cap_bytes.as_deref());
+        Ok(permissions::apply_exec_credentials(
+            creds,
+            meta,
+            effective_cap,
+            honours,
+            authority_cap_ceiling,
+        ))
     }
 
     /// Lists entries in `container_path` along with `(self_inode, parent_inode)`.
     pub async fn list_with_inodes(
         &self,
         container_path: &str,
-    ) -> FsResult<(u64, u64, Vec<DirEntry>)> {
+    ) -> Result<(u64, u64, Vec<DirEntry>), FsOpError> {
         let self_info = self.stat(container_path).await?;
         if self_info.metadata.kind != NodeKind::Directory {
-            return Err(FsError::NotDirectory);
+            return Err(FsError::NotDirectory.into());
         }
         let parent_path = crate::parent_path(container_path);
         let parent_ino = if parent_path == container_path {
@@ -1277,6 +2218,35 @@ impl<S: Storage> LinuxContainer<S> {
     /// The authority ceiling of every process running in this container.
     pub fn authority(&self) -> &ProcessAuthority {
         &self.authority
+    }
+
+    /// Linux capability mask bounded by this container's [`ProcessAuthority`].
+    /// `uid 0`, setuid binaries, and file capabilities inside this container
+    /// never exceed this ceiling.
+    pub fn authority_cap_ceiling(&self) -> u64 {
+        let mut mask = CAP_FULL_SET;
+        if !self
+            .authority
+            .clock_rights()
+            .contains(ClockAuthorityRights::SET_WALL_CLOCK)
+        {
+            mask &= !(1u64 << CAP_SYS_TIME);
+        }
+        if !self
+            .authority
+            .network_rights()
+            .contains(NetworkAuthorityRights::PRIVILEGED_BIND)
+        {
+            mask &= !(1u64 << CAP_NET_BIND_SERVICE);
+        }
+        if !self
+            .authority
+            .network_rights()
+            .contains(NetworkAuthorityRights::ADMIN)
+        {
+            mask &= !((1u64 << CAP_NET_ADMIN) | (1u64 << CAP_NET_RAW));
+        }
+        mask
     }
 
     /// This container's isolated filesystem (root and mounts).
@@ -2151,25 +3121,31 @@ mod tests {
         .expect("container creates");
         let fs = container.filesystem();
 
+        let root = Credentials::root();
         block_on(async {
             // Component walker catches missing and non-directory intermediate components.
             assert!(matches!(
-                fs.stat_at("/", "nonexistent/..", true).await,
-                Err(FsError::NoEntry)
+                fs.stat_at("/", "nonexistent/..", true, &root).await,
+                Err(FsOpError::Fs(FsError::NoEntry))
             ));
             assert!(matches!(
-                fs.stat_at("/", "alpha/..", true).await,
-                Err(FsError::NotDirectory)
+                fs.stat_at("/", "alpha/..", true, &root).await,
+                Err(FsOpError::Fs(FsError::NotDirectory))
             ));
             assert!(matches!(
-                fs.stat_at("/", "alpha/", true).await,
-                Err(FsError::NotDirectory)
+                fs.stat_at("/", "alpha/", true, &root).await,
+                Err(FsOpError::Fs(FsError::NotDirectory))
             ));
 
             // Intermediate symlink expands before `..`, and symlink loop returns `Loop`.
-            fs.mkdir_at("/", "sub", 0o755, 1).await.unwrap();
-            fs.symlink_at("sub", "/", "sym_sub", 1).await.unwrap();
-            let (_, resolved) = fs.stat_at("/", "sym_sub/../alpha", true).await.unwrap();
+            fs.mkdir_at("/", "sub", 0o755, 0, &root, 1).await.unwrap();
+            fs.symlink_at("sub", "/", "sym_sub", &root, 1)
+                .await
+                .unwrap();
+            let (_, resolved) = fs
+                .stat_at("/", "sym_sub/../alpha", true, &root)
+                .await
+                .unwrap();
             assert_eq!(resolved, "/alpha");
 
             // `O_PATH | O_NOFOLLOW` opens the symlink itself, and `read_link_resolved`
@@ -2187,20 +3163,28 @@ mod tests {
                 sync: false,
                 dsync: false,
                 mode: 0,
+                umask: 0,
             };
-            let (_, sym_path, _) = fs.open_at("/", "sym_sub", path_nofollow, 1).await.unwrap();
+            let (_, sym_path, _) = fs
+                .open_at("/", "sym_sub", path_nofollow, &root, 1)
+                .await
+                .unwrap();
             assert_eq!(sym_path, "/sym_sub");
             assert_eq!(fs.read_link_resolved(&sym_path).await.unwrap(), "sub");
 
-            fs.symlink_at("loop_b", "/", "loop_a", 1).await.unwrap();
-            fs.symlink_at("loop_a", "/", "loop_b", 1).await.unwrap();
+            fs.symlink_at("loop_b", "/", "loop_a", &root, 1)
+                .await
+                .unwrap();
+            fs.symlink_at("loop_a", "/", "loop_b", &root, 1)
+                .await
+                .unwrap();
             assert!(matches!(
-                fs.stat_at("/", "loop_a", true).await,
-                Err(FsError::Loop)
+                fs.stat_at("/", "loop_a", true, &root).await,
+                Err(FsOpError::Fs(FsError::Loop))
             ));
 
             // Dangling symlink with O_CREAT | O_EXCL fails with Exists.
-            fs.symlink_at("missing_target", "/", "dangling", 1)
+            fs.symlink_at("missing_target", "/", "dangling", &root, 1)
                 .await
                 .unwrap();
             let excl = OpenRequest {
@@ -2216,31 +3200,40 @@ mod tests {
                 sync: false,
                 dsync: false,
                 mode: 0o644,
+                umask: 0,
             };
             assert!(matches!(
-                fs.open_at("/", "dangling", excl, 1).await,
-                Err(FsError::Exists)
+                fs.open_at("/", "dangling", excl, &root, 1).await,
+                Err(FsOpError::Fs(FsError::Exists))
             ));
 
             // Cross-mount rename and link fail with CrossDevice, and read-only mount fails with ReadOnly.
             assert!(matches!(
-                fs.rename_at("/", "alpha", "/", "/ro/moved", RenameMode::Replace, 1)
-                    .await,
-                Err(FsError::CrossDevice)
+                fs.rename_at(
+                    "/",
+                    "alpha",
+                    "/",
+                    "/ro/moved",
+                    RenameMode::Replace,
+                    &root,
+                    1
+                )
+                .await,
+                Err(FsOpError::Fs(FsError::CrossDevice))
             ));
             assert!(matches!(
-                fs.link_at("/", "alpha", "/", "/ro/linked", false, false, 1)
+                fs.link_at("/", "alpha", "/", "/ro/linked", false, false, &root, 1)
                     .await,
-                Err(FsError::CrossDevice)
+                Err(FsOpError::Fs(FsError::CrossDevice))
             ));
             assert!(matches!(
-                fs.write_at("/ro/fixed", WritePosition::At(0), b"x", 1)
+                fs.write_at("/ro/fixed", WritePosition::At(0), b"x", &root, 1)
                     .await,
-                Err(FsError::ReadOnly)
+                Err(FsOpError::Fs(FsError::ReadOnly))
             ));
             assert!(matches!(
-                fs.unlink_at("/", "/ro/fixed", false, 1).await,
-                Err(FsError::ReadOnly)
+                fs.unlink_at("/", "/ro/fixed", false, &root, 1).await,
+                Err(FsOpError::Fs(FsError::ReadOnly))
             ));
         });
     }
@@ -2311,5 +3304,2295 @@ mod tests {
                 .synthetic_etc_file("/etc/passwd", &resolvers)
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod private_btrfs_tests {
+    extern crate std;
+
+    use super::*;
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use core::ops::ControlFlow;
+    use std::io::{Read, Seek, SeekFrom};
+
+    use ferrosys::btrfs::{FormatOptions, format_to};
+    use ferrosys::{Metadata as FerrosysMetadata, Timestamp as FerrosysTimestamp, TreeBuilder};
+    use futures_lite::future::block_on;
+    use helios_hal::fs::DeviceId;
+    use helios_hal::vmm::PageFlags;
+    use helios_linux::abi::{Abi, Operation};
+    use helios_linux::syscall::{
+        CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_MKNOD,
+        CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_SETFCAP, CAP_SYS_ADMIN, CAP_SYS_TIME, Call, Clock,
+        Denied, DirListEntry, FileAccess, FileStat, Filesystem, LinkOptions, MapError, MemoryFault,
+        MemoryTotals, Process, Region, Resources, SpawnError, SpawnedThread, Start, Stdio, Stream,
+        SyscallOutcome, System, Thread, Tty, UserMemory, VirtualMemory, WriteError,
+        XattrSetMode as LinuxXattrSetMode, dispatch,
+    };
+    use helios_unix::NoNetwork;
+
+    use crate::io::{MemoryDisk, cache_over};
+    use crate::test_support::{TestCpu, UnsupportedHostFileSystem, test_root_entropy, test_timer};
+    use crate::vfs::{
+        BOOT_DEVICE, BtrfsFs, BtrfsWriteOptions, CommitPolicy, MemoryFs, MountTable, MountedFs,
+    };
+    use crate::{BootFs, EmbeddedBootDirectory, EmbeddedBootFs};
+
+    const FORMATTED_BYTES: usize = 128 << 20;
+
+    #[derive(Clone, Copy)]
+    struct BtrfsTestStorage;
+    impl Storage for BtrfsTestStorage {
+        type HostShare = UnsupportedHostFileSystem;
+        type Disk = MemoryDisk;
+    }
+
+    const BTRFS_TEST_BOOT: EmbeddedBootFs = EmbeddedBootFs::new(
+        &[
+            EmbeddedBootDirectory::new("priv", 0),
+            EmbeddedBootDirectory::new("shared", 0),
+            EmbeddedBootDirectory::new("ro_priv", 0),
+        ],
+        &[],
+    );
+
+    const RWX: DirectoryAuthorityRights = DirectoryAuthorityRights::READ
+        .union(DirectoryAuthorityRights::WRITE)
+        .union(DirectoryAuthorityRights::MUTATE_DIRECTORY)
+        .union(DirectoryAuthorityRights::EXECUTE);
+    const RX: DirectoryAuthorityRights =
+        DirectoryAuthorityRights::READ.union(DirectoryAuthorityRights::EXECUTE);
+
+    fn format_btrfs_disk(seed: u8, read_only: bool) -> crate::BlockCache<MemoryDisk> {
+        let time = FerrosysTimestamp::from_secs(1_700_000_000);
+        let tree = TreeBuilder::new().root(FerrosysMetadata::new(0o755, time));
+        let mut image = tempfile::tempfile().expect("temp btrfs image");
+        image.set_len(FORMATTED_BYTES as u64).expect("set_len");
+        format_to(
+            &mut image,
+            tree,
+            FORMATTED_BYTES as u64,
+            FormatOptions::new([seed; 16], time),
+        )
+        .expect("format btrfs");
+        image.seek(SeekFrom::Start(0)).expect("rewind");
+        let mut bytes = Vec::new();
+        image.read_to_end(&mut bytes).expect("read image");
+        let disk = if read_only {
+            MemoryDisk::holding("btrfs-priv-ro", &bytes, false)
+        } else {
+            MemoryDisk::holding_writable("btrfs-priv-rw", &bytes)
+        };
+        cache_over(&disk, 256, 1)
+    }
+
+    fn write_options() -> BtrfsWriteOptions {
+        BtrfsWriteOptions {
+            entropy: test_root_entropy(),
+            concurrency: core::num::NonZeroUsize::new(2).unwrap(),
+            compress: None,
+            commit: Some(CommitPolicy::for_machine(1 << 30)),
+            max_inline: None,
+            now: 1_700_000_000_000_000_000,
+        }
+    }
+
+    fn encode_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + entries.len() * 8);
+        out.extend_from_slice(&2u32.to_le_bytes());
+        for &(tag, perm, id) in entries {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&perm.to_le_bytes());
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        out
+    }
+
+    fn encode_vfs_cap_v2(effective: bool, permitted: u64, inheritable: u64) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        let magic = 0x0200_0000u32 | if effective { 1 } else { 0 };
+        out[0..4].copy_from_slice(&magic.to_le_bytes());
+        out[4..8].copy_from_slice(&(permitted as u32).to_le_bytes());
+        out[8..12].copy_from_slice(&(inheritable as u32).to_le_bytes());
+        out[12..16].copy_from_slice(&((permitted >> 32) as u32).to_le_bytes());
+        out[16..20].copy_from_slice(&((inheritable >> 32) as u32).to_le_bytes());
+        out
+    }
+
+    // Minimal Linux syscall harness wired directly to a real LinuxContainer.
+    #[derive(Clone)]
+    struct TestFile {
+        path: String,
+        kind: NodeKind,
+        access: FileAccess,
+    }
+
+    struct TestRes;
+    impl Resources for TestRes {
+        type File = TestFile;
+        type Network = NoNetwork;
+        type Data = u64;
+    }
+
+    #[derive(Default)]
+    struct TestMem(BTreeMap<u64, u8>);
+    impl TestMem {
+        fn write_bytes(&mut self, addr: u64, bytes: &[u8]) {
+            for (i, &b) in bytes.iter().enumerate() {
+                self.0.insert(addr + i as u64, b);
+            }
+        }
+        fn write_cstr(&mut self, addr: u64, s: &str) {
+            self.write_bytes(addr, s.as_bytes());
+            self.0.insert(addr + s.len() as u64, 0);
+        }
+        fn read_bytes(&self, addr: u64, len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|i| *self.0.get(&(addr + i as u64)).unwrap_or(&0))
+                .collect()
+        }
+    }
+    impl UserMemory for TestMem {
+        fn read(&self, address: u64, output: &mut [u8]) -> Result<(), MemoryFault> {
+            for (i, slot) in output.iter_mut().enumerate() {
+                *slot = *self.0.get(&(address + i as u64)).ok_or(MemoryFault)?;
+            }
+            Ok(())
+        }
+        fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
+            if address == 0 && length > 0 {
+                return Err(MemoryFault);
+            }
+            Ok(())
+        }
+        fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
+            if address == 0 {
+                return Err(MemoryFault);
+            }
+            self.write_bytes(address, bytes);
+            Ok(())
+        }
+        fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+            let mut raw = [0u8; 4];
+            self.read(address, &mut raw)?;
+            Ok(u32::from_le_bytes(raw))
+        }
+        fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+            self.write(address, &value.to_le_bytes())
+        }
+        fn atomic_compare_exchange_u32(
+            &mut self,
+            address: u64,
+            expected: u32,
+            desired: u32,
+        ) -> Result<Result<u32, u32>, MemoryFault> {
+            let cur = self.atomic_load_u32(address)?;
+            if cur == expected {
+                self.atomic_store_u32(address, desired)?;
+                Ok(Ok(cur))
+            } else {
+                Ok(Err(cur))
+            }
+        }
+    }
+    impl VirtualMemory for TestMem {
+        fn lowest_address(&self) -> u64 {
+            0x1000
+        }
+        fn map_anywhere(&mut self, _: u64, _: u64, _: PageFlags) -> Result<u64, MapError> {
+            Err(MapError::OutOfMemory)
+        }
+        fn map_at(&mut self, _: u64, _: u64, _: PageFlags) -> Result<(), MapError> {
+            Err(MapError::OutOfMemory)
+        }
+        fn unmap(&mut self, _: u64, _: u64) {}
+        fn protect(&mut self, _: u64, _: u64, _: PageFlags) -> Result<(), MapError> {
+            Ok(())
+        }
+        fn discard(&mut self, _: u64, _: u64) {}
+        fn remap(&mut self, _: u64, _: u64, _: u64, _: u64) -> Result<(), MapError> {
+            Err(MapError::OutOfMemory)
+        }
+        fn region(&self, _: u64, _: u64) -> Option<Region> {
+            None
+        }
+        fn free_range(&self, _: u64, _: u64) -> Option<u64> {
+            None
+        }
+    }
+
+    struct TestThread;
+    impl Thread<TestRes> for TestThread {
+        fn thread_pointer(&self) -> u64 {
+            0
+        }
+        fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
+            Ok(())
+        }
+        fn spawn_thread(
+            &mut self,
+            _: Process<TestRes>,
+            _: SpawnedThread,
+        ) -> Result<(), SpawnError> {
+            Err(SpawnError::Busy)
+        }
+    }
+
+    struct ContainerHost<'a> {
+        container: &'a LinuxContainer<BtrfsTestStorage>,
+        now: u64,
+    }
+
+    fn info_to_stat(info: &ContainerNodeInfo) -> FileStat {
+        FileStat {
+            dev: info.metadata.id.device.raw(),
+            ino: info.metadata.id.inode,
+            kind: info.metadata.kind,
+            permissions: info.unix.permissions,
+            nlink: info.metadata.link_count,
+            uid: info.unix.uid,
+            gid: info.unix.gid,
+            rdev: info.rdev,
+            size: info.metadata.size,
+            access_nanos: info.metadata.access_nanos,
+            modified_nanos: info.metadata.modified_nanos,
+            status_nanos: info.metadata.status_nanos,
+        }
+    }
+
+    impl Stdio for ContainerHost<'_> {
+        async fn read_input(&mut self, _: usize) -> Result<Bytes, Denied> {
+            Ok(Bytes::new())
+        }
+        async fn write(&mut self, _: Stream, bytes: &[u8]) -> Result<usize, WriteError> {
+            Ok(bytes.len())
+        }
+    }
+    impl Clock for ContainerHost<'_> {
+        fn now_nanos(&self) -> u64 {
+            self.now
+        }
+        async fn sleep_until(&self, _: u64) {}
+    }
+    impl System for ContainerHost<'_> {
+        fn realtime_nanos(&self) -> u64 {
+            self.now
+        }
+        fn set_realtime_nanos(&mut self, _: u64) -> Result<(), Denied> {
+            Err(Denied)
+        }
+        fn cpu_nanos(&self) -> u64 {
+            0
+        }
+        fn fill_random(&mut self, out: &mut [u8]) {
+            out.fill(0);
+        }
+        fn memory(&self) -> MemoryTotals {
+            MemoryTotals {
+                total_bytes: 0,
+                free_bytes: 0,
+            }
+        }
+        fn process_count(&self) -> u32 {
+            1
+        }
+        fn kernel_version(&self) -> &str {
+            "test"
+        }
+    }
+    impl Tty for ContainerHost<'_> {}
+    impl helios_linux::syscall::Network<NoNetwork> for ContainerHost<'_> {
+        fn to_ip(&self, a: core::convert::Infallible) -> helios_linux::syscall::IpAddr {
+            match a {}
+        }
+        fn encode_ip(&self, _: helios_linux::syscall::IpAddr) -> core::convert::Infallible {
+            unreachable!()
+        }
+    }
+    impl Filesystem<TestRes> for ContainerHost<'_> {
+        fn file_access(&self, file: &TestFile) -> FileAccess {
+            file.access
+        }
+        fn file_is_directory(&self, file: &TestFile) -> bool {
+            file.kind == NodeKind::Directory
+        }
+        fn file_path<'b>(&self, file: &'b TestFile) -> Option<&'b str> {
+            Some(&file.path)
+        }
+        fn same_file(&self, a: &TestFile, b: &TestFile) -> bool {
+            a.path == b.path
+        }
+        async fn open(
+            &mut self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            request: OpenRequest,
+            creds: &Credentials,
+        ) -> Result<TestFile, FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            let (info, container_path, _) = self
+                .container
+                .filesystem()
+                .open_at(base_dir, path, request, creds, self.now)
+                .await?;
+            let access = match (request.read, request.write) {
+                (true, true) => FileAccess::ReadWrite,
+                (true, false) => FileAccess::ReadOnly,
+                (false, true) => FileAccess::WriteOnly,
+                (false, false) => FileAccess::PathOnly,
+            };
+            Ok(TestFile {
+                path: container_path,
+                kind: info.metadata.kind,
+                access,
+            })
+        }
+        async fn stat_path(
+            &self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            follow: bool,
+            creds: &Credentials,
+        ) -> Result<(FileStat, String), FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            let (info, resolved) = self
+                .container
+                .filesystem()
+                .stat_at(base_dir, path, follow, creds)
+                .await?;
+            Ok((info_to_stat(&info), resolved))
+        }
+        async fn stat_file(&self, file: &TestFile) -> Result<FileStat, FsOpError> {
+            let info = self
+                .container
+                .filesystem()
+                .stat_resolved(&file.path)
+                .await?;
+            Ok(info_to_stat(&info))
+        }
+        async fn access_path(
+            &self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            check: AccessCheck,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .access_at(base_dir, path, check, creds)
+                .await
+        }
+        async fn can_chdir_file(
+            &self,
+            file: &TestFile,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .can_chdir(&file.path, creds)
+                .await
+        }
+        async fn read_at(
+            &self,
+            file: &TestFile,
+            offset: u64,
+            max_bytes: usize,
+        ) -> Result<Bytes, FsOpError> {
+            self.container
+                .filesystem()
+                .read_at(&file.path, offset, max_bytes)
+                .await
+        }
+        async fn write_at(
+            &mut self,
+            file: &TestFile,
+            position: WritePosition,
+            bytes: &[u8],
+            creds: &Credentials,
+        ) -> Result<Landed, FsOpError> {
+            self.container
+                .filesystem()
+                .write_at(&file.path, position, bytes, creds, self.now)
+                .await
+        }
+        async fn list_dir(
+            &self,
+            file: &TestFile,
+        ) -> Result<(u64, u64, Vec<DirListEntry>), FsOpError> {
+            let (a, b, entries) = self
+                .container
+                .filesystem()
+                .list_with_inodes(&file.path)
+                .await?;
+            Ok((
+                a,
+                b,
+                entries
+                    .into_iter()
+                    .map(|e| DirListEntry {
+                        name: e.name,
+                        kind: e.kind,
+                        inode: e.inode,
+                    })
+                    .collect(),
+            ))
+        }
+        async fn set_size_file(
+            &mut self,
+            file: &TestFile,
+            size: u64,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .set_size(&file.path, size, creds, self.now)
+                .await
+        }
+        async fn set_size_path(
+            &mut self,
+            cwd: &str,
+            path: &str,
+            size: u64,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .set_size_at(cwd, path, size, creds, self.now)
+                .await
+        }
+        async fn sync(&self, file: &TestFile, data_only: bool) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .sync(&file.path, data_only)
+                .await
+        }
+        async fn read_link(
+            &self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            creds: &Credentials,
+        ) -> Result<String, FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .read_link_at(base_dir, path, creds)
+                .await
+        }
+        async fn mkdir(
+            &mut self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            mode: u32,
+            umask: u32,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .mkdir_at(base_dir, path, mode, umask, creds, self.now)
+                .await
+        }
+        async fn mknod(
+            &mut self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            kind: NodeKind,
+            mode: u32,
+            umask: u32,
+            rdev: u64,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .mknod_at(base_dir, path, kind, mode, umask, rdev, creds, self.now)
+                .await
+        }
+        async fn unlink(
+            &mut self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            remove_dir: bool,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .unlink_at(base_dir, path, remove_dir, creds, self.now)
+                .await
+        }
+        async fn rename(
+            &mut self,
+            old_base: Option<&TestFile>,
+            old_path: &str,
+            new_base: Option<&TestFile>,
+            new_path: &str,
+            cwd: &str,
+            mode: RenameMode,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
+            let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .rename_at(old_dir, old_path, new_dir, new_path, mode, creds, self.now)
+                .await
+        }
+        async fn link(
+            &mut self,
+            old_base: Option<&TestFile>,
+            old_path: &str,
+            new_base: Option<&TestFile>,
+            new_path: &str,
+            cwd: &str,
+            options: LinkOptions,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
+            let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .link_at(
+                    old_dir,
+                    old_path,
+                    new_dir,
+                    new_path,
+                    options.follow,
+                    options.empty_path,
+                    creds,
+                    self.now,
+                )
+                .await
+        }
+        async fn symlink(
+            &mut self,
+            target: &str,
+            base: Option<&TestFile>,
+            cwd: &str,
+            link_path: &str,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .symlink_at(target, base_dir, link_path, creds, self.now)
+                .await
+        }
+        async fn set_times_path(
+            &mut self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            follow: bool,
+            access: TimeUpdate,
+            modified: TimeUpdate,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .set_times_at(base_dir, path, follow, access, modified, creds, self.now)
+                .await
+        }
+        async fn set_times_file(
+            &mut self,
+            file: &TestFile,
+            access: TimeUpdate,
+            modified: TimeUpdate,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .set_times_resolved(&file.path, access, modified, creds, self.now)
+                .await
+        }
+        async fn chmod_path(
+            &mut self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            follow: bool,
+            mode: u32,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .chmod_at(base_dir, path, follow, mode, creds, self.now)
+                .await
+        }
+        async fn chmod_file(
+            &mut self,
+            file: &TestFile,
+            mode: u32,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .chmod_resolved(&file.path, mode, creds, self.now)
+                .await
+        }
+        async fn chown_path(
+            &mut self,
+            base: Option<&TestFile>,
+            cwd: &str,
+            path: &str,
+            follow: bool,
+            uid: Option<u32>,
+            gid: Option<u32>,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            let base_dir = base.map_or(cwd, |f| f.path.as_str());
+            self.container
+                .filesystem()
+                .chown_at(base_dir, path, follow, uid, gid, creds, self.now)
+                .await
+        }
+        async fn chown_file(
+            &mut self,
+            file: &TestFile,
+            uid: Option<u32>,
+            gid: Option<u32>,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .chown_resolved(&file.path, uid, gid, creds, self.now)
+                .await
+        }
+        async fn get_xattr_path(
+            &self,
+            cwd: &str,
+            path: &str,
+            follow: bool,
+            name: &str,
+            creds: &Credentials,
+        ) -> Result<Vec<u8>, FsOpError> {
+            self.container
+                .filesystem()
+                .get_xattr_at(cwd, path, follow, name, creds)
+                .await
+        }
+        async fn get_xattr_file(
+            &self,
+            file: &TestFile,
+            name: &str,
+            creds: &Credentials,
+        ) -> Result<Vec<u8>, FsOpError> {
+            self.container
+                .filesystem()
+                .get_xattr_resolved(&file.path, name, creds)
+                .await
+        }
+        async fn set_xattr_path(
+            &mut self,
+            cwd: &str,
+            path: &str,
+            follow: bool,
+            name: &str,
+            value: &[u8],
+            mode: LinuxXattrSetMode,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .set_xattr_at(cwd, path, follow, name, value, mode, creds, self.now)
+                .await
+        }
+        async fn set_xattr_file(
+            &mut self,
+            file: &TestFile,
+            name: &str,
+            value: &[u8],
+            mode: LinuxXattrSetMode,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .set_xattr_resolved(&file.path, name, value, mode, creds, self.now)
+                .await
+        }
+        async fn list_xattrs_path(
+            &self,
+            cwd: &str,
+            path: &str,
+            follow: bool,
+            creds: &Credentials,
+        ) -> Result<Vec<String>, FsOpError> {
+            self.container
+                .filesystem()
+                .list_xattrs_at(cwd, path, follow, creds)
+                .await
+        }
+        async fn list_xattrs_file(
+            &self,
+            file: &TestFile,
+            creds: &Credentials,
+        ) -> Result<Vec<String>, FsOpError> {
+            self.container
+                .filesystem()
+                .list_xattrs_resolved(&file.path, creds)
+                .await
+        }
+        async fn remove_xattr_path(
+            &mut self,
+            cwd: &str,
+            path: &str,
+            follow: bool,
+            name: &str,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .remove_xattr_at(cwd, path, follow, name, creds, self.now)
+                .await
+        }
+        async fn remove_xattr_file(
+            &mut self,
+            file: &TestFile,
+            name: &str,
+            creds: &Credentials,
+        ) -> Result<(), FsOpError> {
+            self.container
+                .filesystem()
+                .remove_xattr_resolved(&file.path, name, creds, self.now)
+                .await
+        }
+    }
+
+    fn syscall_num(abi: Abi, op: Operation) -> u64 {
+        (0..500)
+            .find(|&n| abi.operation(n) == op)
+            .unwrap_or_else(|| panic!("missing {op:?} on {abi:?}"))
+    }
+
+    async fn call(
+        proc: &mut Process<TestRes>,
+        op: Operation,
+        args: [u64; 6],
+        mem: &mut TestMem,
+        host: &mut ContainerHost<'_>,
+    ) -> u64 {
+        let mut thread = TestThread;
+        let call = Call {
+            number: syscall_num(Abi::X86_64, op),
+            arguments: args,
+        };
+        match Box::pin(dispatch(proc, call, mem, &mut thread, host)).await {
+            ControlFlow::Continue(SyscallOutcome::Return(v)) => v,
+            other => panic!("unexpected outcome for {op:?}: {other:?}"),
+        }
+    }
+
+    fn err(code: u64) -> u64 {
+        code.wrapping_neg()
+    }
+
+    const EPERM: u64 = 1;
+    const ENXIO: u64 = 6;
+    const EACCES: u64 = 13;
+    const EEXIST: u64 = 17;
+    const EINVAL: u64 = 22;
+    const EROFS: u64 = 30;
+    const ENODATA: u64 = 61;
+    const EOPNOTSUPP: u64 = 95;
+    const AT_FDCWD: u64 = (-100i32) as u32 as u64;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EACCESS: u64 = 0x200;
+
+    fn make_proc(id: u32, creds: Credentials) -> Process<TestRes> {
+        let start = Start {
+            credentials: creds,
+            ..Start::default()
+        };
+        Process::<TestRes>::with_descriptors(
+            Abi::X86_64,
+            NonZeroU32::new(id).unwrap(),
+            0x40_0000,
+            helios_linux::syscall::standard_streams::<TestRes>(),
+            start,
+        )
+    }
+
+    /// End-to-end integration test exercising every Unix permission, POSIX ACL,
+    /// sticky bit, S_ISGID inheritance, chmod/chown/write/truncate privilege
+    /// stripping, exec setuid/file-cap authority ceiling, privileged xattr
+    /// namespace, mknod/rdev/NO_DEV, and capget/capset rule on a REAL writable
+    /// Btrfs filesystem mounted as `MountSharing::Private` inside a container.
+    #[test]
+    fn private_btrfs_mount_enforces_full_linux_permission_model() {
+        let rw_cache = format_btrfs_disk(0x61, false);
+        let ro_cache = format_btrfs_disk(0x62, true);
+        let timer = test_timer(TestCpu::without_entropy());
+
+        block_on(async {
+            let (btrfs_rw, service) =
+                BtrfsFs::mount_writable(rw_cache.disk(0), || DeviceId::new(200), write_options())
+                    .await
+                    .expect("writable btrfs mount");
+            let btrfs_ro = BtrfsFs::mount(ro_cache.disk(0), || DeviceId::new(201))
+                .await
+                .expect("read-only btrfs mount");
+
+            let client = async move {
+                let host_ns = Namespace::<BtrfsTestStorage>::new(MountTable::new(
+                    BootFs::new(BTRFS_TEST_BOOT, BOOT_DEVICE),
+                    4,
+                ));
+                let root_auth = ProcessAuthority::root();
+                let rw = FileSystemRights::READ | FileSystemRights::WRITE;
+                let cap_priv = root_auth.derive_mount_cap("/priv").unwrap();
+                let cap_ro_priv = root_auth.derive_mount_cap("/ro_priv").unwrap();
+                let cap_shared = root_auth.derive_mount_cap("/shared").unwrap();
+                host_ns
+                    .mount(
+                        &cap_priv,
+                        MountedFs::Btrfs(btrfs_rw),
+                        MountGrant {
+                            rights: rw,
+                            sharing: MountSharing::Private,
+                        },
+                    )
+                    .await
+                    .expect("mount private btrfs");
+                host_ns
+                    .mount(
+                        &cap_ro_priv,
+                        MountedFs::Btrfs(btrfs_ro),
+                        MountGrant {
+                            rights: FileSystemRights::READ,
+                            sharing: MountSharing::Private,
+                        },
+                    )
+                    .await
+                    .expect("mount ro private btrfs");
+                let shared_mem = MemoryFs::new(DeviceId::new(202));
+                host_ns
+                    .mount(
+                        &cap_shared,
+                        MountedFs::Memory(shared_mem),
+                        MountGrant {
+                            rights: rw,
+                            sharing: MountSharing::Shared,
+                        },
+                    )
+                    .await
+                    .expect("mount shared memory");
+
+                // Container authority: grants PRIVILEGED_BIND, omits SET_WALL_CLOCK & ADMIN.
+                let mut container_auth = ProcessAuthority::empty();
+                container_auth.grant_network_rights(NetworkAuthorityRights::PRIVILEGED_BIND);
+                let container = LinuxContainer::create(
+                    ContainerId::new(NonZeroU64::new(42).unwrap()),
+                    &ProcessAuthority::root(),
+                    &host_ns,
+                    container_auth,
+                    ContainerConfig {
+                        root: ContainerMountSpec {
+                            source_path: String::from("/priv"),
+                            target_path: String::from("/"),
+                            rights: RWX,
+                            sharing: MountSharing::Private,
+                        },
+                        mounts: vec![
+                            ContainerMountSpec {
+                                source_path: String::from("/ro_priv"),
+                                target_path: String::from("/ro"),
+                                rights: RX,
+                                sharing: MountSharing::Private,
+                            },
+                            ContainerMountSpec {
+                                source_path: String::from("/shared"),
+                                target_path: String::from("/shared"),
+                                rights: RWX,
+                                sharing: MountSharing::Shared,
+                            },
+                        ],
+                        shared_owner: SharedOwner { uid: 0, gid: 0 },
+                        credentials: Credentials::root(),
+                        hostname: UtsField::UNSET,
+                        domainname: UtsField::UNSET,
+                    },
+                )
+                .await
+                .expect("create container");
+
+                let mut host = ContainerHost {
+                    container: &container,
+                    now: 1_700_000_000_000_000_000,
+                };
+                let mut mem = TestMem::default();
+                let mut root_p = make_proc(1, Credentials::root());
+                let mut u1000 = make_proc(2, Credentials::for_ids(1000, 100, vec![300]));
+                let mut u1001 = make_proc(3, Credentials::for_ids(1001, 200, vec![]));
+                let mut u2000 = make_proc(4, Credentials::for_ids(2000, 200, vec![300]));
+
+                // --- 1. DAC, owner non-fallthrough, dir search, CAP_DAC_OVERRIDE exec rule ---
+                mem.write_cstr(0x1000, "/secret_dir");
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Mkdirat,
+                        [AT_FDCWD, 0x1000, 0o700, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Fchownat,
+                        [AT_FDCWD, 0x1000, 1000, 100, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+
+                mem.write_cstr(0x1100, "/secret_dir/note");
+                let fd = call(
+                    &mut u1000,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1100, 0x42, 0o644, 0, 0], // O_CREAT | O_RDWR
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(fd < 1024);
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Close,
+                        [fd, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+
+                // u1001 cannot traverse /secret_dir (0o700 owned by 1000) for stat, open, or chdir.
+                assert_eq!(
+                    call(
+                        &mut u1001,
+                        Operation::Newfstatat,
+                        [AT_FDCWD, 0x1100, 0x5000, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+                assert_eq!(
+                    call(
+                        &mut u1001,
+                        Operation::Chdir,
+                        [0x1000, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+
+                // Owner mode 0o077 denies owner read (no fallthrough to group/other).
+                mem.write_cstr(0x1200, "/owner_locked");
+                let fd = call(
+                    &mut root_p,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1200, 0x42, 0o644, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(fd < 1024);
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Fchown,
+                        [fd, 1000, 300, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Fchmod,
+                        [fd, 0o077, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Close,
+                        [fd, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Openat,
+                        [AT_FDCWD, 0x1200, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+                // u2000 in supplementary group 300 CAN read/write /owner_locked.
+                let fd2 = call(
+                    &mut u2000,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1200, 2, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(fd2 < 1024);
+                assert_eq!(
+                    call(
+                        &mut u2000,
+                        Operation::Close,
+                        [fd2, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+
+                // Root with CAP_DAC_OVERRIDE cannot execute a 0o644 file (zero 0o111 bits),
+                // but CAN execute a 0o001 file.
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Faccessat2,
+                        [AT_FDCWD, 0x1100, 1, AT_EACCESS, 0, 0], // X_OK on 0o644
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Fchmodat2,
+                        [AT_FDCWD, 0x1100, 0o001, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Faccessat2,
+                        [AT_FDCWD, 0x1100, 1, AT_EACCESS, 0, 0], // X_OK on 0o001
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+
+                // faccessat (real UID 1001) vs faccessat2(AT_EACCESS) (effective UID 0).
+                let mut mixed_creds = Credentials::root();
+                mixed_creds.user.real = 1001;
+                mixed_creds.group.real = 200;
+                let mut mixed_p = make_proc(5, mixed_creds);
+                assert_eq!(
+                    call(
+                        &mut mixed_p,
+                        Operation::Faccessat,
+                        [AT_FDCWD, 0x1100, 4, 0, 0, 0], // R_OK as real uid 1001 -> denied
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+                assert_eq!(
+                    call(
+                        &mut mixed_p,
+                        Operation::Faccessat2,
+                        [AT_FDCWD, 0x1100, 4, AT_EACCESS, 0, 0], // R_OK as euid 0 -> allowed
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+
+                // --- 2. POSIX access & default ACLs on real Btrfs ---
+                mem.write_cstr(0x1300, "/acl_dir");
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Mkdirat,
+                        [AT_FDCWD, 0x1300, 0o755, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // Set default ACL granting named user 1001 rw- (masked by mask rwx).
+                let default_acl = encode_acl(&[
+                    (0x01, 7, u32::MAX), // USER_OBJ rwx
+                    (0x02, 6, 1001),     // USER 1001 rw-
+                    (0x04, 5, u32::MAX), // GROUP_OBJ r-x
+                    (0x10, 7, u32::MAX), // MASK rwx
+                    (0x20, 0, u32::MAX), // OTHER ---
+                ]);
+                mem.write_cstr(0x2000, "system.posix_acl_default");
+                mem.write_bytes(0x2100, &default_acl);
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Setxattr,
+                        [0x1300, 0x2000, 0x2100, default_acl.len() as u64, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // Create file inside /acl_dir with umask 0o077: default ACL bypasses umask!
+                call(
+                    &mut root_p,
+                    Operation::Umask,
+                    [0o077, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                mem.write_cstr(0x1320, "/acl_dir/inherited");
+                let fd = call(
+                    &mut root_p,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1320, 0x42, 0o660, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(fd < 1024);
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Close,
+                        [fd, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                call(
+                    &mut root_p,
+                    Operation::Umask,
+                    [0o022, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                // u1001 can read+write /acl_dir/inherited via inherited ACL_USER(1001)!
+                let fd_acl = call(
+                    &mut u1001,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1320, 2, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(fd_acl < 1024);
+                assert_eq!(
+                    call(
+                        &mut u1001,
+                        Operation::Close,
+                        [fd_acl, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // u2000 is denied by ACL_OTHER (0).
+                assert_eq!(
+                    call(
+                        &mut u2000,
+                        Operation::Openat,
+                        [AT_FDCWD, 0x1320, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+                // chmod(0o640) narrows ACL_MASK to r-- (`posix_acl_chmod`): u1001 can still read
+                // but can no longer write!
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Chmod,
+                        [0x1320, 0o640, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                let fd_ro = call(
+                    &mut u1001,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1320, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(fd_ro < 1024);
+                assert_eq!(
+                    call(
+                        &mut u1001,
+                        Operation::Close,
+                        [fd_ro, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1001,
+                        Operation::Openat,
+                        [AT_FDCWD, 0x1320, 1, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+
+                // --- 3. Sticky bit (S_ISVTX) & S_ISGID directory inheritance ---
+                mem.write_cstr(0x1400, "/sticky");
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Mkdirat,
+                        [AT_FDCWD, 0x1400, 0o777, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Chmod,
+                        [0x1400, 0o1777, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                mem.write_cstr(0x1420, "/sticky/a");
+                mem.write_cstr(0x1440, "/sticky/b");
+                let fd = call(
+                    &mut u1000,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1420, 0x42, 0o644, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(fd < 1024);
+                call(
+                    &mut u1000,
+                    Operation::Close,
+                    [fd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                // u2000 cannot unlink or rename u1000's file in sticky directory -> EPERM.
+                assert_eq!(
+                    call(
+                        &mut u2000,
+                        Operation::Unlinkat,
+                        [AT_FDCWD, 0x1420, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+                assert_eq!(
+                    call(
+                        &mut u2000,
+                        Operation::Renameat,
+                        [AT_FDCWD, 0x1420, AT_FDCWD, 0x1440, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+                // u1000 (file owner) CAN unlink it.
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Unlinkat,
+                        [AT_FDCWD, 0x1420, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+
+                // S_ISGID directory inheritance (group 500 + S_ISGID bit on subdir).
+                mem.write_cstr(0x1500, "/sgid_dir");
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Mkdirat,
+                        [AT_FDCWD, 0x1500, 0o777, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Chown,
+                        [0x1500, 0, 500, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Chmod,
+                        [0x1500, 0o2777, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                mem.write_cstr(0x1520, "/sgid_dir/child_file");
+                mem.write_cstr(0x1540, "/sgid_dir/child_sub");
+                let fd = call(
+                    &mut u1000,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1520, 0x42, 0o644, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(fd < 1024);
+                call(
+                    &mut u1000,
+                    Operation::Close,
+                    [fd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Mkdirat,
+                        [AT_FDCWD, 0x1540, 0o755, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                let (file_info, _) = container
+                    .filesystem()
+                    .stat_at("/", "/sgid_dir/child_file", true, &Credentials::root())
+                    .await
+                    .unwrap();
+                assert_eq!(file_info.unix.uid, 1000);
+                assert_eq!(file_info.unix.gid, 500);
+                assert_eq!(file_info.unix.permissions & 0o2000, 0);
+                let (sub_info, _) = container
+                    .filesystem()
+                    .stat_at("/", "/sgid_dir/child_sub", true, &Credentials::root())
+                    .await
+                    .unwrap();
+                assert_eq!(sub_info.unix.uid, 1000);
+                assert_eq!(sub_info.unix.gid, 500);
+                assert_ne!(sub_info.unix.permissions & 0o2000, 0);
+
+                // --- 4. chmod/chown/write/truncate privilege stripping + exec creds + authority ceiling ---
+                mem.write_cstr(0x1600, "/priv_bin");
+                let fd = call(
+                    &mut root_p,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1600, 0x42, 0o755, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(fd < 1024);
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Fchmod,
+                        [fd, 0o6777, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                let fcap = encode_vfs_cap_v2(
+                    true,
+                    (1u64 << CAP_NET_BIND_SERVICE)
+                        | (1u64 << CAP_SYS_ADMIN)
+                        | (1u64 << CAP_SYS_TIME),
+                    0,
+                );
+                mem.write_cstr(0x2200, "security.capability");
+                mem.write_bytes(0x2240, &fcap);
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Fsetxattr,
+                        [fd, 0x2200, 0x2240, fcap.len() as u64, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                call(
+                    &mut root_p,
+                    Operation::Close,
+                    [fd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+
+                // Exec calculation on private btrfs mount honours setuid + file caps, bounded by
+                // container.authority_cap_ceiling() (has PRIVILEGED_BIND, lacks SET_WALL_CLOCK & ADMIN).
+                let exec_creds = container
+                    .filesystem()
+                    .exec_credentials_at(
+                        "/",
+                        "/priv_bin",
+                        &Credentials::for_ids(1000, 100, vec![]),
+                        container.authority_cap_ceiling(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(exec_creds.user.effective, 0);
+                assert_eq!(exec_creds.group.effective, 0);
+                assert!(exec_creds.capabilities.has_effective(CAP_NET_BIND_SERVICE));
+                assert!(!exec_creds.capabilities.has_effective(CAP_SYS_TIME));
+                assert!(!exec_creds.capabilities.has_effective(CAP_NET_ADMIN));
+
+                // Same setuid binary on /shared (MountSharing::Shared -> NO_SUID) confers nothing!
+                mem.write_cstr(0x1680, "/shared/bin");
+                let sfd = call(
+                    &mut root_p,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1680, 0x42, 0o755, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                call(
+                    &mut root_p,
+                    Operation::Close,
+                    [sfd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                let shared_exec = container
+                    .filesystem()
+                    .exec_credentials_at(
+                        "/",
+                        "/shared/bin",
+                        &Credentials::for_ids(1000, 100, vec![]),
+                        container.authority_cap_ceiling(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(shared_exec.user.effective, 1000);
+                assert_eq!(shared_exec.capabilities.effective, 0);
+
+                // Non-CAP_FSETID write strips S_ISUID, S_ISGID (with S_IXGRP) AND security.capability.
+                let ufd = call(
+                    &mut u1000,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1600, 2, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(ufd < 1024);
+                mem.write_bytes(0x2300, b"data");
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Write,
+                        [ufd, 0x2300, 4, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    4
+                );
+                call(
+                    &mut u1000,
+                    Operation::Close,
+                    [ufd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                let after_write = container
+                    .filesystem()
+                    .stat_resolved("/priv_bin")
+                    .await
+                    .unwrap();
+                assert_eq!(after_write.unix.permissions & (0o4000 | 0o2000), 0);
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Getxattr,
+                        [0x1600, 0x2200, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(ENODATA)
+                );
+
+                // Re-arm S_ISUID + security.capability, then chown(-1, -1) preserves both,
+                // while chown(0, 0) clears both!
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Chmod,
+                        [0x1600, 0o4755, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Setxattr,
+                        [0x1600, 0x2200, 0x2240, fcap.len() as u64, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Chown,
+                        [0x1600, u32::MAX as u64, u32::MAX as u64, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_ne!(
+                    container
+                        .filesystem()
+                        .stat_resolved("/priv_bin")
+                        .await
+                        .unwrap()
+                        .unix
+                        .permissions
+                        & 0o4000,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Chown,
+                        [0x1600, 0, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    container
+                        .filesystem()
+                        .stat_resolved("/priv_bin")
+                        .await
+                        .unwrap()
+                        .unix
+                        .permissions
+                        & 0o4000,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Getxattr,
+                        [0x1600, 0x2200, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(ENODATA)
+                );
+
+                // --- 5. Privileged xattr namespaces (trusted.*, security.*, user.*) ---
+                mem.write_cstr(0x2400, "trusted.secret");
+                mem.write_cstr(0x2420, "user.cjk");
+                mem.write_cstr(0x2440, "security.selinux");
+                let cjk = "中文 日本語 한국어".as_bytes();
+                mem.write_bytes(0x2500, cjk);
+
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Setxattr,
+                        [0x1600, 0x2400, 0x2500, cjk.len() as u64, 1, 0], // XATTR_CREATE
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // Duplicate XATTR_CREATE -> EEXIST.
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Setxattr,
+                        [0x1600, 0x2400, 0x2500, cjk.len() as u64, 1, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EEXIST)
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Setxattr,
+                        [0x1600, 0x2420, 0x2500, cjk.len() as u64, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // Unprivileged user: trusted.* write -> EPERM, read -> ENODATA, omitted from listxattr!
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Setxattr,
+                        [0x1600, 0x2400, 0x2500, 3, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Getxattr,
+                        [0x1600, 0x2400, 0x3000, 64, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(ENODATA)
+                );
+                // Unprivileged user: security.capability & security.selinux write -> EPERM; malformed -> EINVAL for root.
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Setxattr,
+                        [0x1600, 0x2200, 0x2240, fcap.len() as u64, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Setxattr,
+                        [0x1600, 0x2440, 0x2500, 4, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Setxattr,
+                        [0x1600, 0x2200, 0x2500, 4, 0, 0], // malformed vfs_cap_data
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EINVAL)
+                );
+                // listxattr as u1000 omits trusted.secret, shows user.cjk.
+                let u_list_len = call(
+                    &mut u1000,
+                    Operation::Listxattr,
+                    [0x1600, 0x3100, 256, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await as usize;
+                let u_list = mem.read_bytes(0x3100, u_list_len);
+                let u_names: Vec<&str> = u_list
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| core::str::from_utf8(s).unwrap())
+                    .collect();
+                assert!(u_names.contains(&"user.cjk"));
+                assert!(!u_names.contains(&"trusted.secret"));
+                // listxattr as root includes trusted.secret.
+                let r_list_len = call(
+                    &mut root_p,
+                    Operation::Listxattr,
+                    [0x1600, 0x3200, 256, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await as usize;
+                let r_list = mem.read_bytes(0x3200, r_list_len);
+                let r_names: Vec<&str> = r_list
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| core::str::from_utf8(s).unwrap())
+                    .collect();
+                assert!(r_names.contains(&"trusted.secret"));
+                assert!(r_names.contains(&"user.cjk"));
+
+                // --- 6. Device nodes (mknodat, CAP_MKNOD, rdev in stat/statx, ENXIO vs EACCES) ---
+                mem.write_cstr(0x1700, "/dev_null_priv");
+                mem.write_cstr(0x1720, "/dev_blk_priv");
+                mem.write_cstr(0x1740, "/sticky/fifo_u1000");
+                // Unprivileged u1000 can create FIFO, refused char device -> EPERM.
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Mknodat,
+                        [AT_FDCWD, 0x1740, 0o010_644, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Mknodat,
+                        [AT_FDCWD, 0x1700, 0o020_666, 0x0103, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+                // Root with CAP_MKNOD creates char (1, 3) and block (8, 0) device nodes.
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Mknodat,
+                        [AT_FDCWD, 0x1700, 0o020_666, 0x0103, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Mknodat,
+                        [AT_FDCWD, 0x1720, 0o060_660, 0x0800, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // stat & statx report exact rdev (major=1, minor=3).
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Statx,
+                        [AT_FDCWD, 0x1700, 0, 0x7ff, 0x4000, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                let statx_raw = mem.read_bytes(0x4000, 256);
+                let rdev_major = u32::from_le_bytes(statx_raw[128..132].try_into().unwrap());
+                let rdev_minor = u32::from_le_bytes(statx_raw[132..136].try_into().unwrap());
+                assert_eq!((rdev_major, rdev_minor), (1, 3));
+                // Opening char device on private mount -> ENXIO; O_PATH succeeds.
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Openat,
+                        [AT_FDCWD, 0x1700, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(ENXIO)
+                );
+                let pfd = call(
+                    &mut root_p,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1700, 1 << 21, 0, 0, 0], // O_PATH
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(pfd < 1024);
+                call(
+                    &mut root_p,
+                    Operation::Close,
+                    [pfd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+
+                // Read-only private mount refuses chmod/mknod/setxattr even for uid 0 -> EROFS.
+                mem.write_cstr(0x1800, "/ro/new");
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Mknodat,
+                        [AT_FDCWD, 0x1800, 0o020_666, 0x0103, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EROFS)
+                );
+                mem.write_cstr(0x1820, "/ro");
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Chmod,
+                        [0x1820, 0o777, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EROFS)
+                );
+
+                // Symlink fchmodat2(AT_SYMLINK_NOFOLLOW) -> EOPNOTSUPP.
+                mem.write_cstr(0x1900, "/sym_chmod");
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Symlinkat,
+                        [0x1600, AT_FDCWD, 0x1900, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Fchmodat2,
+                        [AT_FDCWD, 0x1900, 0o644, AT_SYMLINK_NOFOLLOW, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EOPNOTSUPP)
+                );
+
+                // --- 7. capset live capability drop (CAP_MKNOD & CAP_SYS_ADMIN) ---
+                let hdr = 0x4500;
+                let cap_data = 0x4520;
+                mem.write_bytes(hdr, &0x2008_0522u32.to_le_bytes());
+                mem.write_bytes(hdr + 4, &0i32.to_le_bytes());
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Capget,
+                        [hdr, cap_data, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                let mut raw_caps = mem.read_bytes(cap_data, 24);
+                let lo_eff = u32::from_le_bytes(raw_caps[0..4].try_into().unwrap())
+                    & !((1u32 << CAP_MKNOD) | (1u32 << CAP_SYS_ADMIN) | (1u32 << CAP_SETFCAP));
+                raw_caps[0..4].copy_from_slice(&lo_eff.to_le_bytes());
+                raw_caps[4..8].copy_from_slice(&lo_eff.to_le_bytes());
+                mem.write_bytes(cap_data, &raw_caps);
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Capset,
+                        [hdr, cap_data, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // Dropping CAP_MKNOD, CAP_SYS_ADMIN, CAP_SETFCAP immediately takes effect on root_p!
+                mem.write_cstr(0x1920, "/dev_after_drop");
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Mknodat,
+                        [AT_FDCWD, 0x1920, 0o020_666, 0x0103, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Getxattr,
+                        [0x1600, 0x2400, 0x3300, 64, 0, 0], // trusted.secret -> ENODATA
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(ENODATA)
+                );
+                assert_eq!(
+                    call(
+                        &mut root_p,
+                        Operation::Setxattr,
+                        [0x1600, 0x2200, 0x2240, fcap.len() as u64, 0, 0], // security.capability -> EPERM
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+
+                // Unused cap imports check in case tests are pared down.
+                let _ = (
+                    CAP_CHOWN,
+                    CAP_DAC_OVERRIDE,
+                    CAP_DAC_READ_SEARCH,
+                    CAP_FOWNER,
+                    CAP_FSETID,
+                );
+
+                // --- 8. CAP_FSETID write/truncate, S_ISGID-without-S_IXGRP, utimensat, ACL S_ISGID strip ---
+                // Re-make a fresh root process (with CAP_FSETID) for privileged checks.
+                let mut root_full = make_proc(6, Credentials::root());
+                mem.write_cstr(0x1a00, "/fsetid_file");
+                let ffd = call(
+                    &mut root_full,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1a00, 0x42, 0o666, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(ffd < 1024);
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Fchmod,
+                        [ffd, 0o6755, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Fsetxattr,
+                        [ffd, 0x2200, 0x2240, fcap.len() as u64, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // CAP_FSETID write keeps S_ISUID|S_ISGID, but STILL removes security.capability!
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Write,
+                        [ffd, 0x2300, 4, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    4
+                );
+                let after_fsetid = container
+                    .filesystem()
+                    .stat_resolved("/fsetid_file")
+                    .await
+                    .unwrap();
+                assert_eq!(after_fsetid.unix.permissions & 0o6000, 0o6000);
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Fgetxattr,
+                        [ffd, 0x2200, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(ENODATA)
+                );
+                // Mandatory-locking mode 0o2666 (S_ISGID without S_IXGRP): unprivileged write keeps S_ISGID.
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Fchmod,
+                        [ffd, 0o2666, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                call(
+                    &mut root_full,
+                    Operation::Close,
+                    [ffd, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                let ufd2 = call(
+                    &mut u1000,
+                    Operation::Openat,
+                    [AT_FDCWD, 0x1a00, 2, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert!(ufd2 < 1024);
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Write,
+                        [ufd2, 0x2300, 4, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    4
+                );
+                call(
+                    &mut u1000,
+                    Operation::Close,
+                    [ufd2, 0, 0, 0, 0, 0],
+                    &mut mem,
+                    &mut host,
+                )
+                .await;
+                assert_eq!(
+                    container
+                        .filesystem()
+                        .stat_resolved("/fsetid_file")
+                        .await
+                        .unwrap()
+                        .unix
+                        .permissions
+                        & 0o2000,
+                    0o2000
+                );
+
+                // utimensat on 0o2666 file owned by uid 0:
+                // - u1000 with explicit timestamp -> EPERM
+                // - u1000 with times == NULL (UTIME_NOW) -> succeeds (file is writable!)
+                let mut explicit_ts = [0u8; 32];
+                explicit_ts[0..8].copy_from_slice(&1_700_000_010i64.to_le_bytes());
+                explicit_ts[16..24].copy_from_slice(&1_700_000_010i64.to_le_bytes());
+                mem.write_bytes(0x4600, &explicit_ts);
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Utimensat,
+                        [AT_FDCWD, 0x1a00, 0x4600, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EPERM)
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Utimensat,
+                        [AT_FDCWD, 0x1a00, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                // Make it 0o644 -> u1000 with times == NULL now fails with EACCES.
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Chmod,
+                        [0x1a00, 0o644, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Utimensat,
+                        [AT_FDCWD, 0x1a00, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    err(EACCES)
+                );
+
+                // Setting system.posix_acl_access by owner not in file's group and without CAP_FSETID
+                // strips S_ISGID (`fs/posix_acl.c` `posix_acl_update_mode`).
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Chown,
+                        [0x1a00, 1000, 999, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    call(
+                        &mut root_full,
+                        Operation::Chmod,
+                        [0x1a00, 0o2644, 0, 0, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                let access_acl = encode_acl(&[
+                    (0x01, 6, u32::MAX),
+                    (0x04, 4, u32::MAX),
+                    (0x20, 4, u32::MAX),
+                ]);
+                mem.write_cstr(0x2600, "system.posix_acl_access");
+                mem.write_bytes(0x2640, &access_acl);
+                assert_eq!(
+                    call(
+                        &mut u1000,
+                        Operation::Setxattr,
+                        [0x1a00, 0x2600, 0x2640, access_acl.len() as u64, 0, 0],
+                        &mut mem,
+                        &mut host
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    container
+                        .filesystem()
+                        .stat_resolved("/fsetid_file")
+                        .await
+                        .unwrap()
+                        .unix
+                        .permissions
+                        & 0o2000,
+                    0
+                );
+
+                drop(container);
+                host_ns
+                    .unmount(&root_auth.derive_unmount_cap("/priv").unwrap())
+                    .await
+                    .expect("unmount /priv");
+                host_ns
+                    .unmount(&root_auth.derive_unmount_cap("/ro_priv").unwrap())
+                    .await
+                    .expect("unmount /ro_priv");
+                host_ns
+                    .unmount(&root_auth.derive_unmount_cap("/shared").unwrap())
+                    .await
+                    .expect("unmount /shared");
+            };
+
+            futures::future::join(Box::pin(client), Box::pin(service.run(timer))).await;
+        });
     }
 }

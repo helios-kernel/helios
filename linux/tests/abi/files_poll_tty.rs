@@ -422,11 +422,12 @@ impl Filesystem<MemRes> for MockHost {
         _cwd: &str,
         path: &str,
         request: OpenRequest,
-    ) -> Result<MemFile, FsError> {
+        _creds: &helios_linux::syscall::Credentials,
+    ) -> Result<MemFile, helios_linux::syscall::FsOpError> {
         let id = match path {
             "/mapped" | "mapped" => 1,
             "/sym" | "sym" => 2,
-            _ => return Err(FsError::NoEntry),
+            _ => return Err(FsError::NoEntry.into()),
         };
         let access = match (request.read, request.write) {
             (true, true) => FileAccess::ReadWrite,
@@ -436,7 +437,10 @@ impl Filesystem<MemRes> for MockHost {
         };
         Ok(MemFile { id, access })
     }
-    async fn stat_file(&self, file: &MemFile) -> Result<FileStat, FsError> {
+    async fn stat_file(
+        &self,
+        file: &MemFile,
+    ) -> Result<FileStat, helios_linux::syscall::FsOpError> {
         let files = self.files.lock().unwrap();
         let data = files.get(&file.id).ok_or(FsError::NoEntry)?;
         Ok(FileStat {
@@ -459,7 +463,7 @@ impl Filesystem<MemRes> for MockHost {
         file: &MemFile,
         offset: u64,
         max_bytes: usize,
-    ) -> Result<Bytes, FsError> {
+    ) -> Result<Bytes, helios_linux::syscall::FsOpError> {
         let files = self.files.lock().unwrap();
         let data = files.get(&file.id).ok_or(FsError::NoEntry)?;
         let off = offset as usize;
@@ -474,7 +478,8 @@ impl Filesystem<MemRes> for MockHost {
         file: &MemFile,
         position: WritePosition,
         bytes: &[u8],
-    ) -> Result<Landed, FsError> {
+        _creds: &helios_linux::syscall::Credentials,
+    ) -> Result<Landed, helios_linux::syscall::FsOpError> {
         let mut files = self.files.lock().unwrap();
         let data = files.get_mut(&file.id).ok_or(FsError::NoEntry)?;
         let off = match position {
@@ -491,7 +496,11 @@ impl Filesystem<MemRes> for MockHost {
             len: bytes.len(),
         })
     }
-    async fn sync(&self, _file: &MemFile, _data_only: bool) -> Result<(), FsError> {
+    async fn sync(
+        &self,
+        _file: &MemFile,
+        _data_only: bool,
+    ) -> Result<(), helios_linux::syscall::FsOpError> {
         Ok(())
     }
     async fn read_link(
@@ -499,16 +508,17 @@ impl Filesystem<MemRes> for MockHost {
         base: Option<&MemFile>,
         _cwd: &str,
         path: &str,
-    ) -> Result<String, FsError> {
+        _creds: &helios_linux::syscall::Credentials,
+    ) -> Result<String, helios_linux::syscall::FsOpError> {
         if path.is_empty() {
             return match base {
                 Some(file) if file.id == 2 => Ok(String::from("target-from-fd")),
-                _ => Err(FsError::Invalid),
+                _ => Err(FsError::Invalid.into()),
             };
         }
         match path {
             "/sym" | "sym" => Ok(String::from("target-from-path")),
-            _ => Err(FsError::NoEntry),
+            _ => Err(FsError::NoEntry.into()),
         }
     }
 }
