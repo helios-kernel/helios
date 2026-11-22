@@ -612,10 +612,20 @@ fn blocking_any_child_join_waits_on_all_children_and_wakes_when_second_exits_fir
     assert_eq!(status[0], WASIX_JOIN_STATUS_EXIT_NORMAL);
     assert_eq!(u16::from_le_bytes([status[2], status[3]]), 9);
     assert!(
-        harness.store.data().children.signal_target(20).is_some(),
+        harness
+            .store
+            .data_mut()
+            .live_child_signal_target(20)
+            .is_some(),
         "the first child remains running in the table"
     );
-    assert!(harness.store.data().children.signal_target(21).is_none());
+    assert!(
+        harness
+            .store
+            .data_mut()
+            .live_child_signal_target(21)
+            .is_none()
+    );
 
     WasixJoinHarness::finish_child(first, 20, ChildTermination::Exited(4));
     let (errno, joined_pid, status) = harness.call_join(None, 0);
@@ -872,7 +882,7 @@ fn runtime_end_classification_distinguishes_exits_signals_traps_owner_kills_and_
     let waker = futures::task::noop_waker_ref();
     let mut cx = Context::from_waker(waker);
     assert!(driven.as_mut().poll(&mut cx).is_pending());
-    signals.raise(15);
+    signals.raise(helios_unix::Signal::SIGTERM);
     let Poll::Ready(Err(stop)) = driven.as_mut().poll(&mut cx) else {
         panic!("signal stops the suspended component turn");
     };
@@ -936,6 +946,20 @@ mod linux_tests {
         }
         fn write(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
             Ok(())
+        }
+        fn atomic_load_u32(&self, _: VirtAddr) -> Result<u32, NativeError> {
+            Ok(0)
+        }
+        fn atomic_store_u32(&self, _: VirtAddr, _: u32) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn atomic_compare_exchange_u32(
+            &self,
+            _: VirtAddr,
+            expected: u32,
+            _: u32,
+        ) -> Result<Result<u32, u32>, NativeError> {
+            Ok(Ok(expected))
         }
         fn unmap(&self, _: VirtRange) -> Result<(), NativeError> {
             Ok(())
@@ -1001,6 +1025,15 @@ mod linux_tests {
         fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError> {
             self.tp = address;
             Ok(())
+        }
+
+        fn try_clone(&self) -> Result<Self, NativeError> {
+            Ok(Self {
+                behavior: self.behavior,
+                step: AtomicUsize::new(self.step.load(AtomicOrdering::Relaxed)),
+                result: self.result,
+                tp: self.tp,
+            })
         }
 
         fn resume(&mut self, _: &MockSpace) -> Stop {
@@ -1193,6 +1226,9 @@ mod linux_tests {
         let timeline = phases::Timeline::begin(&cpu, "spawn", "/linux/mock");
         let argv = ProgramArgv::launched("mock", Vec::new());
 
+        let instance_spawner = executor
+            .spawner(cpu.clone())
+            .instance_spawner(crate::TaskFunding::Instance, &instance);
         let mut fut = core::pin::pin!(run_linux_process(
             exec_context,
             argv,
@@ -1200,6 +1236,7 @@ mod linux_tests {
             ProcessAuthority::root(),
             None,
             signal_state.clone(),
+            instance_spawner,
             instance,
             output_mode,
             executable,
@@ -1232,7 +1269,7 @@ mod linux_tests {
         );
 
         let signaled = run_mock_linux(LinuxBehavior::SuspendInRead, |_, _, signals| {
-            signals.raise(15);
+            signals.raise(helios_unix::Signal::SIGTERM);
         });
         assert_eq!(
             signaled.termination,

@@ -2,6 +2,7 @@ use crate::{InterruptTarget, SignalState};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use hashbrown::{HashMap, HashSet};
 use helios_sync::Notify;
 use spin::Mutex;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -11,15 +12,32 @@ pub enum ThreadAdmissionError {
     #[error("thread id exceeds the ABI range")]
     IdOverflow,
 }
+
+/// What a caller joining `tid` finds in the process's thread table.
+pub enum ThreadJoinTarget {
+    /// The thread is still in the live table; wait on its [`ThreadExit`].
+    Running(Arc<ThreadExit>),
+    /// The process admitted `tid` and its entry already left the table once
+    /// its exit was published: `thread_join` succeeds immediately.
+    AlreadyEnded,
+    /// `tid` was never admitted by this process (or its admission was
+    /// cancelled before the thread ever started): `thread_join` reports
+    /// `ESRCH`.
+    Unknown,
+}
+
 /// The threads of one WASIX process: its main thread's mailbox, every
-/// thread any store of the process spawned and nobody has joined, the
-/// next thread id, and the end a spawned thread chose for the whole
-/// process.
+/// currently running thread keyed by tid, the next thread id, and the end
+/// a spawned thread chose for the whole process.
 ///
 /// The process owns its threads, not the store that spawned each one,
 /// so any thread joins or signals any other and the process's end
 /// ([`Self::end`]) reaches all of them, those whose spawner has itself
-/// returned included. A spawned thread that exits, execs, takes a
+/// returned included. A thread's entry leaves the table as soon as its
+/// exit is published ([`Self::finish`]), so detached threads do not hold
+/// kernel heap entries until process exit, while [`Self::join_target`]
+/// still answers [`ThreadJoinTarget::AlreadyEnded`] for any admitted tid
+/// that has already finished. A spawned thread that exits, execs, takes a
 /// fatal signal or fails (a trap, an out-of-memory kill) ends the
 /// process the same way main does ([`Self::end_from_thread`]): `Image`
 /// is what an exec hands the process's main thread to run next.
@@ -27,12 +45,15 @@ pub enum ThreadAdmissionError {
 /// # Concurrency
 ///
 /// Every store of the process, each driven on whichever processor runs
-/// it, admits, joins, signals and ends the process through one table.
-/// Each of those takes the spin lock for one lookup, push, removal or
-/// record and releases it before anything is awaited or raised; no
-/// interrupt handler touches the table. A thread's end is published
-/// lock-free through its own [`ThreadExit`], which the joiner and
-/// the process's end wait on outside the lock.
+/// it, admits, finishes, joins, signals and ends the process through one
+/// table keyed by `tid`. Each operation takes the spin lock only for an
+/// O(1) map lookup, insert, remove or record and releases it before
+/// anything is awaited or raised; no interrupt handler touches the table.
+/// A thread's end is published lock-free through its own [`ThreadExit`]
+/// before its table entry is removed, so a joiner that looked up the
+/// entry before removal wakes on the publish, a joiner after removal sees
+/// [`ThreadJoinTarget::AlreadyEnded`], and [`Self::end`] never waits on a
+/// thread whose store has already dropped.
 pub struct ProcessThreads<T: InterruptTarget, Image, Failure> {
     table: Arc<Mutex<ThreadGroupTable<T, Image, Failure>>>,
     /// The main thread's own mailbox, through which a spawned thread
@@ -52,8 +73,13 @@ impl<T: InterruptTarget, Image, Failure> Clone for ProcessThreads<T, Image, Fail
 }
 
 struct ThreadGroupTable<T: InterruptTarget, Image, Failure> {
+    first_tid: u32,
     next_tid: u32,
-    threads: Vec<GroupThread<T>>,
+    threads: HashMap<u32, GroupThread<T>>,
+    /// Tids whose admission was cancelled before the thread ever started when
+    /// a later tid had already been handed out so `next_tid` could not roll
+    /// back immediately.
+    cancelled: HashSet<u32>,
     /// Set by [`ProcessThreads::end`] and by
     /// [`ProcessThreads::end_from_thread`]; no thread is admitted
     /// after, and no second end is recorded.
@@ -80,7 +106,6 @@ pub enum ProcessEnd<Image, Failure> {
 }
 
 struct GroupThread<T: InterruptTarget> {
-    tid: u32,
     /// The thread's own mailbox: `thread_signal` raises on it and the
     /// process's end ends the thread through it.
     mailbox: SignalState<T>,
@@ -99,8 +124,10 @@ impl<T: InterruptTarget, Image, Failure> ProcessThreads<T, Image, Failure> {
     pub fn starting_at(first: core::num::NonZeroU32) -> Self {
         Self {
             table: Arc::new(Mutex::new(ThreadGroupTable {
+                first_tid: first.get(),
                 next_tid: first.get(),
-                threads: Vec::new(),
+                threads: HashMap::new(),
+                cancelled: HashSet::new(),
                 ended: false,
                 process_end: None,
             })),
@@ -142,8 +169,8 @@ impl<T: InterruptTarget, Image, Failure> ProcessThreads<T, Image, Failure> {
             table
                 .threads
                 .iter()
-                .filter(|thread| thread.tid != tid)
-                .map(|thread| thread.mailbox.clone())
+                .filter(|&(&other_tid, _)| other_tid != tid)
+                .map(|(_, thread)| thread.mailbox.clone())
                 .collect()
         };
         // Recorded under the lock before main is stopped, so main finds
@@ -178,25 +205,60 @@ impl<T: InterruptTarget, Image, Failure> ProcessThreads<T, Image, Failure> {
         let tid = table.next_tid;
         i32::try_from(tid).map_err(|_| ThreadAdmissionError::IdOverflow)?;
         table.next_tid = tid + 1;
-        table.threads.push(GroupThread { tid, mailbox, exit });
+        table.threads.insert(tid, GroupThread { mailbox, exit });
         Ok(tid)
     }
 
-    /// Removes thread `tid` from the table, if it is still there.
-    pub fn withdraw(&self, tid: u32) {
+    /// Publishes thread `tid`'s exit status and removes its entry from the
+    /// live table so detached threads do not remain on the kernel heap until
+    /// process exit.
+    pub fn finish(&self, tid: u32, exit: &ThreadExit, code: u32) {
+        exit.publish(code);
         let mut table = self.table.lock();
-        if let Some(index) = table.threads.iter().position(|thread| thread.tid == tid) {
-            table.threads.swap_remove(index);
+        table.threads.remove(&tid);
+    }
+
+    /// Cancels an admission whose task never started (e.g. executor task
+    /// capacity exhaustion): removes `tid` from the live table and excludes
+    /// it from the admitted range so `thread_join` reports `ESRCH`.
+    pub fn cancel_admission(&self, tid: u32) {
+        let mut table = self.table.lock();
+        table.threads.remove(&tid);
+        if tid.checked_add(1) == Some(table.next_tid) {
+            table.next_tid = tid;
+            while table.next_tid > table.first_tid {
+                let prev = table.next_tid - 1;
+                if !table.cancelled.remove(&prev) {
+                    break;
+                }
+                table.next_tid = prev;
+            }
+        } else if tid >= table.first_tid && tid < table.next_tid {
+            table.cancelled.insert(tid);
         }
     }
 
-    /// The end of thread `tid`, for a join to wait on.
+    /// Resolves `tid` for `thread_join`: returns its [`ThreadExit`] if still
+    /// live, [`ThreadJoinTarget::AlreadyEnded`] if the process admitted `tid`
+    /// and its entry already left the table, or [`ThreadJoinTarget::Unknown`].
+    pub fn join_target(&self, tid: u32) -> ThreadJoinTarget {
+        let table = self.table.lock();
+        if let Some(thread) = table.threads.get(&tid) {
+            return ThreadJoinTarget::Running(thread.exit.clone());
+        }
+        if tid >= table.first_tid && tid < table.next_tid && !table.cancelled.contains(&tid) {
+            ThreadJoinTarget::AlreadyEnded
+        } else {
+            ThreadJoinTarget::Unknown
+        }
+    }
+
+    /// The end of thread `tid` while its entry is still in the live table.
     pub fn exit_of(&self, tid: u32) -> Option<Arc<ThreadExit>> {
         self.table
             .lock()
             .threads
-            .iter()
-            .find(|thread| thread.tid == tid)
+            .get(&tid)
             .map(|thread| thread.exit.clone())
     }
 
@@ -205,9 +267,14 @@ impl<T: InterruptTarget, Image, Failure> ProcessThreads<T, Image, Failure> {
         self.table
             .lock()
             .threads
-            .iter()
-            .find(|thread| thread.tid == tid && thread.exit.code().is_none())
+            .get(&tid)
+            .filter(|thread| thread.exit.code().is_none())
             .map(|thread| thread.mailbox.clone())
+    }
+
+    /// Number of threads currently held in the live table.
+    pub fn live_count(&self) -> usize {
+        self.table.lock().threads.len()
     }
 
     /// Ends every thread the process still has and returns once each one
@@ -231,10 +298,10 @@ impl<T: InterruptTarget, Image, Failure> ProcessThreads<T, Image, Failure> {
             table.ended = true;
             core::mem::take(&mut table.threads)
         };
-        for thread in &threads {
+        for thread in threads.values() {
             thread.mailbox.end_thread();
         }
-        futures::future::join_all(threads.iter().map(|thread| thread.exit.wait())).await;
+        futures::future::join_all(threads.values().map(|thread| thread.exit.wait())).await;
     }
 }
 
@@ -298,5 +365,128 @@ impl Default for ThreadExit {
 impl<T: InterruptTarget, Image, Failure> Default for ProcessThreads<T, Image, Failure> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_lite::future::block_on;
+
+    #[derive(Clone)]
+    struct NoopTarget;
+
+    impl InterruptTarget for NoopTarget {
+        fn interrupt(&self) {}
+    }
+
+    #[test]
+    fn finished_detached_threads_leave_table_and_join_succeeds() {
+        let threads = ProcessThreads::<NoopTarget, (), ()>::new();
+        assert_eq!(threads.live_count(), 0);
+        assert!(matches!(threads.join_target(0), ThreadJoinTarget::Unknown));
+        assert!(matches!(threads.join_target(1), ThreadJoinTarget::Unknown));
+
+        for expected_tid in 1..=64_u32 {
+            let exit = Arc::new(ThreadExit::new());
+            let tid = threads
+                .admit(SignalState::new(), exit.clone())
+                .expect("admits detached thread");
+            assert_eq!(tid, expected_tid);
+            assert_eq!(threads.live_count(), 1);
+            assert!(matches!(
+                threads.join_target(tid),
+                ThreadJoinTarget::Running(_)
+            ));
+            assert!(threads.live_mailbox(tid).is_some());
+
+            threads.finish(tid, &exit, 0);
+            assert_eq!(
+                threads.live_count(),
+                0,
+                "finished thread leaves the live table immediately"
+            );
+            assert!(threads.exit_of(tid).is_none());
+            assert!(threads.live_mailbox(tid).is_none());
+            assert!(
+                matches!(threads.join_target(tid), ThreadJoinTarget::AlreadyEnded),
+                "join on already-ended admitted thread returns AlreadyEnded"
+            );
+        }
+
+        // Unadmitted tid past the highest admitted tid stays Unknown.
+        assert!(matches!(threads.join_target(65), ThreadJoinTarget::Unknown));
+        // Process end has nothing left to wait on.
+        block_on(threads.end());
+    }
+
+    #[test]
+    fn cancelled_admissions_roll_back_and_report_unknown_to_join() {
+        let threads = ProcessThreads::<NoopTarget, (), ()>::new();
+        let exit1 = Arc::new(ThreadExit::new());
+        let tid1 = threads
+            .admit(SignalState::new(), exit1.clone())
+            .expect("admits tid1");
+        let exit2 = Arc::new(ThreadExit::new());
+        let tid2 = threads
+            .admit(SignalState::new(), exit2.clone())
+            .expect("admits tid2");
+
+        // Cancel tid1 out of order (cannot roll back next_tid yet).
+        threads.cancel_admission(tid1);
+        assert!(matches!(
+            threads.join_target(tid1),
+            ThreadJoinTarget::Unknown
+        ));
+        assert!(threads.live_mailbox(tid1).is_none());
+        assert_eq!(threads.live_count(), 1);
+
+        // Finish tid2 normally; tid1 remains Unknown while tid2 is AlreadyEnded.
+        threads.finish(tid2, &exit2, 7);
+        assert!(matches!(
+            threads.join_target(tid1),
+            ThreadJoinTarget::Unknown
+        ));
+        assert!(matches!(
+            threads.join_target(tid2),
+            ThreadJoinTarget::AlreadyEnded
+        ));
+        assert_eq!(threads.live_count(), 0);
+
+        // Admit and immediately cancel tail tid3; next_tid rolls back so tid3 is reused.
+        let exit3 = Arc::new(ThreadExit::new());
+        let tid3 = threads
+            .admit(SignalState::new(), exit3)
+            .expect("admits tid3");
+        threads.cancel_admission(tid3);
+        assert!(matches!(
+            threads.join_target(tid3),
+            ThreadJoinTarget::Unknown
+        ));
+        let exit_reused = Arc::new(ThreadExit::new());
+        let reused = threads
+            .admit(SignalState::new(), exit_reused.clone())
+            .expect("reuses rolled-back tid");
+        assert_eq!(reused, tid3);
+        threads.finish(reused, &exit_reused, 0);
+    }
+
+    #[test]
+    fn join_lookup_before_finish_wakes_when_exit_publishes() {
+        let threads = ProcessThreads::<NoopTarget, (), ()>::new();
+        let exit = Arc::new(ThreadExit::new());
+        let tid = threads
+            .admit(SignalState::new(), exit.clone())
+            .expect("admits thread");
+        let ThreadJoinTarget::Running(joined) = threads.join_target(tid) else {
+            panic!("live thread returns Running");
+        };
+        threads.finish(tid, &exit, 42);
+        assert_eq!(block_on(joined.wait()), 42);
+        assert_eq!(threads.live_count(), 0);
+        assert!(matches!(
+            threads.join_target(tid),
+            ThreadJoinTarget::AlreadyEnded
+        ));
     }
 }

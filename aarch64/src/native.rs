@@ -308,6 +308,7 @@ impl Drop for Aarch64Tables {
 /// A slice's register record, shared with `native.S`.
 #[derive(Default)]
 #[repr(C)]
+#[derive(Clone)]
 struct Switch {
     x: [u64; 31],
     sp: u64,
@@ -425,6 +426,12 @@ unsafe impl UserContext for Aarch64Context {
         }
         self.switch.tpidr = address.raw() as u64;
         Ok(())
+    }
+
+    fn try_clone(&self) -> Result<Self, NativeError> {
+        Ok(Self {
+            switch: self.switch.clone(),
+        })
     }
 
     fn resume(&mut self, space: &NativeSpace<Aarch64Tables>) -> Stop {
@@ -593,7 +600,9 @@ pub(crate) fn verify_user_isolation(isolation: UserIsolation) {
     });
     for (page, contents, flags) in [
         (code, &RET[..], PageFlags::READ | PageFlags::EXECUTE),
-        (data, &[][..], PageFlags::READ | PageFlags::WRITE),
+        // Non-empty contents commit the data page's PTE up front so the EL1
+        // probe tests a PSTATE.PAN permission fault on a present translation.
+        (data, &[0][..], PageFlags::READ | PageFlags::WRITE),
     ] {
         space
             .map(VirtRange::new(page, PAGE as usize), contents, flags)

@@ -1948,11 +1948,19 @@ impl ComponentStoreEpilogue {
 }
 
 fn take_component_signal_stop(signal_state: &WasixSignalState) -> Option<wasmtime::Error> {
-    signal_state.take_pending().map(|signal| {
-        wasmtime::Error::new(Preview1SignalExit {
-            signal: u8::try_from(signal).unwrap_or(u8::MAX),
+    signal_state
+        .sweep_pending(|signal| match signal.default_action() {
+            helios_unix::DefaultSignalAction::Ignore
+            | helios_unix::DefaultSignalAction::Continue => helios_unix::SignalSweep::Drop,
+            helios_unix::DefaultSignalAction::Terminate
+            | helios_unix::DefaultSignalAction::CoreDump
+            | helios_unix::DefaultSignalAction::Stop => helios_unix::SignalSweep::Take,
         })
-    })
+        .map(|signal| {
+            wasmtime::Error::new(Preview1SignalExit {
+                signal: signal.raw(),
+            })
+        })
 }
 
 impl crate::component::StopWake for ComponentStoreEpilogue {

@@ -563,7 +563,7 @@ red lane names the surface that broke:
 | Lane | Runner | What it proves |
 | --- | --- | --- |
 | `check-host` | `ubuntu-24.04` | The host surfaces compile. |
-| `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
+| `lint-fmt`, `lint-host`, `lint-programs`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
 | `test-kernel`, `test-libraries`, `test-host-tools`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests, the btrfs reader against `mkfs.btrfs` images, and the embedded debugger. |
 | `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot on one node and on two NUMA nodes, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures; under `swtpm`, the kernel's signing key kept across two boots, resealed after a changed payload, and a tampered payload refused; static Linux programs through dash, checked against the same programs run natively on the runner. |
 | `smoke-x86-64-venus` | `ubuntu-24.04`, `--accel kvm` | `gpu-test` on a Venus `virtio-gpu-gl` device rendered through lavapipe: a virgl context's fence, host and guest blobs, two instances at once. It runs only on changes to the 3D path, against a pinned QEMU and virglrenderer it builds and caches. |
