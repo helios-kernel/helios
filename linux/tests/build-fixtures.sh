@@ -66,5 +66,5 @@ if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     "$out/linux/readiness" hold-open | "$out/linux/readiness" stdin-quiet
     "$out/linux/tty"
     "$out/linux/process"
-    sh "$out/linux/check-dash.sh" "$out/linux/dash" "$out/linux/hello" "$out/linux/args" "$(command -v cat)"
+    HELIOS_PROCESS_ID=1 sh "$out/linux/check-dash.sh" "$out/linux/dash" "$out/linux/hello" "$out/linux/args" "$(command -v cat)"
 fi
