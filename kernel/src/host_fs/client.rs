@@ -4648,7 +4648,7 @@ mod tests {
             let opened = block_on(share.open(path, OpenFlags::empty(), 0));
             match kind.open_refusal() {
                 Some(refusal) => assert_eq!(opened.map(|_| ()), Err(refusal), "mode {mode:o}"),
-                None => assert_eq!(opened.expect("opens").kind, kind),
+                None => assert_eq!(opened.expect("opens").metadata.kind, kind),
             }
 
             let Some(refusal) = refusal else {

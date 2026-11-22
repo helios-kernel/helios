@@ -151,7 +151,7 @@ fn dispatch(request: ControlRequest, device: &str, shared: &SharedState) -> Cont
                 .lock()
                 .expect("an earlier request panicked while holding the filesystem");
             let deadline = Instant::now() + RELEASE_DRAIN_TIMEOUT;
-            while !state.is_destroyed() && state.has_open_writable() {
+            while !state.is_destroyed() && state.blocks_read_only_remount() {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     break;
                 };
@@ -295,7 +295,7 @@ mod tests {
             seconds: 1_700_000_001,
             nanoseconds: 0,
         };
-        let fh = {
+        let (file_ino, fh) = {
             let mut state = shared.state.lock().unwrap();
             let (attr, _) = block_on(state.create(
                 INodeNo::ROOT,
@@ -310,13 +310,13 @@ mod tests {
                 now,
             ))
             .unwrap();
-            let fh = state.open_file(OpenFlags(libc::O_WRONLY)).unwrap();
+            let fh = block_on(state.open_file(attr.ino, OpenFlags(libc::O_WRONLY))).unwrap();
             assert_ne!(fh, FileHandle(0));
             let written = block_on(state.write(attr.ino, 0, b"durable", now)).unwrap();
             assert_eq!(written, 7);
             // Direct remount_read_only rejects open writable handles with EBUSY.
             assert_eq!(block_on(state.remount_read_only()), Err(Errno::EBUSY));
-            fh
+            (attr.ino, fh)
         };
 
         // Release the writable handle from another thread while `RemountReadOnly`
@@ -325,7 +325,7 @@ mod tests {
         let releaser = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
             let mut state = releaser_shared.state.lock().unwrap();
-            assert!(state.release_file(fh));
+            assert!(block_on(state.release_file(fh)));
             releaser_shared.writable_released.notify_all();
         });
 
@@ -361,13 +361,12 @@ mod tests {
         {
             let mut state = shared.state.lock().unwrap();
             assert_eq!(
-                state.open_file(OpenFlags(libc::O_WRONLY)),
+                block_on(state.open_file(file_ino, OpenFlags(libc::O_WRONLY))),
                 Err(Errno::EROFS)
             );
-            assert_eq!(
-                state.open_file(OpenFlags(libc::O_RDONLY)),
-                Ok(FileHandle(0))
-            );
+            let ro_fh = block_on(state.open_file(file_ino, OpenFlags(libc::O_RDONLY))).unwrap();
+            assert_ne!(ro_fh, FileHandle(0));
+            assert!(!block_on(state.release_file(ro_fh)));
         }
 
         // Transition back to rw, then test rollback_ro.

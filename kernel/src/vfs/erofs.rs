@@ -346,13 +346,19 @@ impl<Device> FileSystem for ErofsFs<Device>
 where
     Device: BlockDevice<Buffer = BlockPages> + 'static,
 {
+    super::delegate_path_handles!();
     type Dir = ErofsDir<Device>;
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         let inode = self.inode(path).await?;
         self.metadata(&inode)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        _now: u64,
+    ) -> FsResult<helios_hal::fs::Opened<helios_hal::fs::OwnedFsPath>> {
         let metadata = match self.stat(path).await {
             Ok(metadata) => metadata,
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
@@ -372,7 +378,10 @@ where
         if flags.contains(OpenFlags::TRUNCATE) {
             return Err(FsError::ReadOnly);
         }
-        Ok(metadata)
+        Ok(helios_hal::fs::Opened {
+            metadata,
+            handle: helios_hal::fs::OwnedFsPath::from(path),
+        })
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {

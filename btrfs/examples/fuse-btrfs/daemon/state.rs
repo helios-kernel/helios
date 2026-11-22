@@ -6,7 +6,7 @@
 //! transaction commits on `fsync`, `fsyncdir`, `remount,ro` and unmount, and
 //! when its dirty metadata reaches Linux's bound.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
@@ -123,9 +123,12 @@ pub struct DeviceBacking {
 /// State of an open directory stream (`FUSE_OPENDIR` .. `FUSE_RELEASEDIR`),
 /// following Linux's `btrfs_opendir` and `btrfs_real_readdir`
 /// (`fs/btrfs/inode.c`, commit `9b378f6ad48c`, refreshed on rewind as
-/// commit `fd968e683bd9`).
-#[derive(Clone, Copy)]
+/// commit `fd968e683bd9`). Also retains the directory inode in the writer so
+/// an open unlinked/overwritten directory survives until `releasedir`.
 struct OpenDir {
+    ino: INodeNo,
+    identity: Identity,
+    handle: Option<InodeHandle>,
     bound: DirBound,
     /// Whether this stream has already served a `readdir`. Linux FUSE handles
     /// `lseek(dirfd, 0, SEEK_SET)` (`rewinddir(3)`) in the VFS without sending
@@ -133,6 +136,15 @@ struct OpenDir {
     /// a rewind and refreshes `bound`, while the initial `readdir(0)` keeps
     /// the bound captured at `opendir`.
     started: bool,
+}
+
+/// One open file handle (`FUSE_OPEN` / `FUSE_CREATE` / `FUSE_TMPFILE` ..
+/// `FUSE_RELEASE`), holding the writer's inode handle until release.
+struct OpenFileEntry {
+    ino: INodeNo,
+    identity: Identity,
+    handle: Option<InodeHandle>,
+    writable: bool,
 }
 
 pub struct State<S = Device, B = DeviceBacking> {
@@ -146,7 +158,9 @@ pub struct State<S = Device, B = DeviceBacking> {
     read_only: bool,
     destroyed: bool,
     next_fh: u64,
-    writable_handles: HashSet<u64>,
+    open_files: HashMap<u64, OpenFileEntry>,
+    /// Total open file and directory handles per FUSE inode number.
+    open_counts: HashMap<INodeNo, usize>,
 }
 
 /// The host's memory, which holds the writer's dirty data.
@@ -272,7 +286,8 @@ impl State<Device, DeviceBacking> {
             read_only: true,
             destroyed: false,
             next_fh: 1,
-            writable_handles: HashSet::new(),
+            open_files: HashMap::new(),
+            open_counts: HashMap::new(),
         })
     }
 
@@ -316,8 +331,21 @@ impl State<Device, DeviceBacking> {
                 .await
                 .map_err(|error| write_errno(&error))?;
                 let pending = self.inodes.pending_handles();
-                let resolved = {
-                    let transaction = writer.join().await.map_err(|error| write_errno(&error))?;
+                let open_file_ids: Vec<(u64, Identity)> = self
+                    .open_files
+                    .iter()
+                    .filter(|(_, entry)| entry.handle.is_none())
+                    .map(|(&fh, entry)| (fh, entry.identity))
+                    .collect();
+                let open_dir_ids: Vec<(u64, Identity)> = self
+                    .open_dirs
+                    .iter()
+                    .filter(|(_, entry)| entry.handle.is_none())
+                    .map(|(&fh, entry)| (fh, entry.identity))
+                    .collect();
+                let (resolved, attached_files, attached_dirs) = {
+                    let mut transaction =
+                        writer.join().await.map_err(|error| write_errno(&error))?;
                     let mut resolved = Vec::with_capacity(pending.len());
                     for entry in pending {
                         let Some(handle) = transaction
@@ -336,10 +364,48 @@ impl State<Device, DeviceBacking> {
                         }
                         resolved.push((entry.ino, handle));
                     }
-                    resolved
+                    let mut attached_files = Vec::with_capacity(open_file_ids.len());
+                    for (fh, identity) in open_file_ids {
+                        if let Some(handle) = transaction
+                            .inode(identity.tree, identity.number)
+                            .await
+                            .map_err(|error| write_errno(&error))?
+                        {
+                            transaction
+                                .open_inode(&handle)
+                                .await
+                                .map_err(|error| write_errno(&error))?;
+                            attached_files.push((fh, handle));
+                        }
+                    }
+                    let mut attached_dirs = Vec::with_capacity(open_dir_ids.len());
+                    for (fh, identity) in open_dir_ids {
+                        if let Some(handle) = transaction
+                            .inode(identity.tree, identity.number)
+                            .await
+                            .map_err(|error| write_errno(&error))?
+                        {
+                            transaction
+                                .open_inode(&handle)
+                                .await
+                                .map_err(|error| write_errno(&error))?;
+                            attached_dirs.push((fh, handle));
+                        }
+                    }
+                    (resolved, attached_files, attached_dirs)
                 };
                 for (ino, handle) in resolved {
                     self.inodes.attach_handle(ino, handle);
+                }
+                for (fh, handle) in attached_files {
+                    if let Some(entry) = self.open_files.get_mut(&fh) {
+                        entry.handle = Some(handle);
+                    }
+                }
+                for (fh, handle) in attached_dirs {
+                    if let Some(entry) = self.open_dirs.get_mut(&fh) {
+                        entry.handle = Some(handle);
+                    }
                 }
                 self.storage = Storage::Writable(Box::new(writer));
             }
@@ -383,7 +449,8 @@ impl<S: BlockSink, B> State<S, B> {
             read_only,
             destroyed: false,
             next_fh: 1,
-            writable_handles: HashSet::new(),
+            open_files: HashMap::new(),
+            open_counts: HashMap::new(),
         })
     }
 
@@ -396,40 +463,122 @@ impl<S: BlockSink, B> State<S, B> {
     }
 
     pub fn has_open_writable(&self) -> bool {
-        !self.writable_handles.is_empty()
+        self.open_files.values().any(|entry| entry.writable)
     }
 
-    /// Records a file open. Writable opens (`O_WRONLY` or `O_RDWR`) fail with
-    /// `EROFS` on a read-only mount and receive a tracked handle so
-    /// `remount,ro` can reject active writers with `EBUSY`.
-    pub fn open_file(&mut self, flags: OpenFlags) -> Result<FileHandle, Errno> {
-        if matches!(
-            flags.acc_mode(),
-            OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
-        ) {
-            self.writable()?;
-            let id = self.next_fh;
-            self.next_fh += 1;
-            self.writable_handles.insert(id);
-            Ok(FileHandle(id))
-        } else {
-            Ok(FileHandle(0))
+    pub fn has_open_orphans(&self) -> bool {
+        matches!(&self.storage, Storage::Writable(writer) if writer.has_open_orphans())
+    }
+
+    /// Whether active handles prevent transitioning the mount to read-only:
+    /// open writable handles or open unlinked/tmpfile orphans whose release
+    /// must mutate the filesystem.
+    pub fn blocks_read_only_remount(&self) -> bool {
+        self.has_open_writable() || self.has_open_orphans()
+    }
+
+    fn is_open(&self, ino: INodeNo) -> bool {
+        self.open_counts.get(&ino).copied().unwrap_or(0) > 0
+    }
+
+    fn increment_open_count(&mut self, ino: INodeNo) {
+        *self.open_counts.entry(ino).or_insert(0) += 1;
+    }
+
+    fn decrement_open_count(&mut self, ino: INodeNo) {
+        if let Some(count) = self.open_counts.get_mut(&ino) {
+            if *count <= 1 {
+                self.open_counts.remove(&ino);
+            } else {
+                *count -= 1;
+            }
         }
     }
 
-    /// Releases a file handle. Returns `true` if this released the last open
-    /// writable handle.
-    pub fn release_file(&mut self, fh: FileHandle) -> bool {
-        fh.0 != 0 && self.writable_handles.remove(&fh.0) && self.writable_handles.is_empty()
+    /// Records a file open and retains the inode on the writer so unlinking
+    /// its last directory entry keeps an orphan alive until [`Self::release_file`].
+    /// Writable opens (`O_WRONLY` or `O_RDWR`) fail with `EROFS` on a read-only
+    /// mount.
+    pub async fn open_file(&mut self, ino: INodeNo, flags: OpenFlags) -> Result<FileHandle, Errno> {
+        let writable = matches!(
+            flags.acc_mode(),
+            OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
+        );
+        if writable {
+            self.writable()?;
+        }
+        let (identity, _) = self.inodes.identity(ino)?;
+        let handle = match &mut self.storage {
+            Storage::ReadOnly(_) => None,
+            Storage::Writable(writer) => {
+                let handle = self.inodes.handle(ino)?;
+                let mut transaction = writer.join().await.map_err(|error| write_errno(&error))?;
+                transaction
+                    .open_inode(&handle)
+                    .await
+                    .map_err(|error| write_errno(&error))?;
+                Some(handle)
+            }
+        };
+        let id = self.next_fh;
+        self.next_fh += 1;
+        self.open_files.insert(
+            id,
+            OpenFileEntry {
+                ino,
+                identity,
+                handle,
+                writable,
+            },
+        );
+        self.increment_open_count(ino);
+        Ok(FileHandle(id))
+    }
+
+    /// Releases a file handle, deleting any orphaned inode if this was its
+    /// final open handle. Returns `true` if releasing this handle cleared the
+    /// last blocker for a waiting `remount,ro`.
+    pub async fn release_file(&mut self, fh: FileHandle) -> bool {
+        let was_blocking = self.blocks_read_only_remount();
+        let Some(entry) = self.open_files.remove(&fh.0) else {
+            return false;
+        };
+        self.decrement_open_count(entry.ino);
+        if let Some(handle) = entry.handle {
+            self.release_writer_handle(&handle).await;
+        }
+        was_blocking && !self.blocks_read_only_remount()
+    }
+
+    async fn release_writer_handle(&mut self, handle: &InodeHandle) {
+        let deleted = match &mut self.storage {
+            Storage::Writable(writer) => match writer.join().await {
+                Ok(mut transaction) => match transaction.release_inode(handle).await {
+                    Ok(deleted) => deleted,
+                    Err(error) => {
+                        tracing::warn!(%error, "releasing open btrfs inode failed");
+                        false
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "joining transaction for inode release failed");
+                    false
+                }
+            },
+            Storage::ReadOnly(_) => false,
+        };
+        if deleted && let Err(errno) = self.settle().await {
+            tracing::warn!(?errno, "settling transaction after orphan deletion failed");
+        }
     }
 
     /// Transitions the daemon to read-only after verifying no writable file
-    /// handles remain open and committing any running transaction.
+    /// handles or open orphans remain and committing any running transaction.
     pub async fn remount_read_only(&mut self) -> Result<(), Errno> {
         if self.destroyed {
             return Err(Errno::ENODEV);
         }
-        if !self.writable_handles.is_empty() {
+        if self.blocks_read_only_remount() {
             return Err(Errno::EBUSY);
         }
         self.sync().await?;
@@ -493,7 +642,9 @@ impl<S: BlockSink, B> State<S, B> {
             }
             Err(error) => return Err(read_errno(&error)),
         };
-        if inode.metadata().generation != generation || inode.metadata().nlink == 0 {
+        if inode.metadata().generation != generation
+            || (inode.metadata().nlink == 0 && !self.is_open(ino))
+        {
             return Err(Errno::ESTALE);
         }
         Ok(inode)
@@ -609,7 +760,7 @@ impl<S: BlockSink, B> State<S, B> {
             }
             Err(error) => return Err(read_errno(&error)),
         };
-        if inode.metadata().nlink == 0 {
+        if inode.metadata().nlink == 0 && !self.is_open(ino) {
             return Err(Errno::ESTALE);
         }
         if let Some(known) = self.inodes.generation(ino)
@@ -769,31 +920,59 @@ impl<S: BlockSink, B> State<S, B> {
         Ok(data)
     }
 
-    /// Opens a directory stream and records its upper `DIR_INDEX` bound as of
-    /// open time (`btrfs_opendir` in Linux `fs/btrfs/inode.c`, commit
-    /// `9b378f6ad48c`).
+    /// Opens a directory stream, retains the directory inode so unlinking or
+    /// overwriting it while open keeps it alive until [`Self::releasedir`],
+    /// and records its upper `DIR_INDEX` bound as of open time
+    /// (`btrfs_opendir` in Linux `fs/btrfs/inode.c`, commit `9b378f6ad48c`).
     pub async fn opendir(&mut self, ino: INodeNo) -> Result<FileHandle, Errno> {
+        let (identity, _) = self.inodes.identity(ino)?;
         let snapshot = self.snapshot()?;
         let directory = self.open_inode(&snapshot, ino).await?;
         let bound = snapshot
             .dir_bound(&directory)
             .await
             .map_err(|error| read_errno(&error))?;
+        let dir_handle = match &mut self.storage {
+            Storage::ReadOnly(_) => None,
+            Storage::Writable(writer) => {
+                let handle = self.inodes.handle(ino)?;
+                let mut transaction = writer.join().await.map_err(|error| write_errno(&error))?;
+                transaction
+                    .open_inode(&handle)
+                    .await
+                    .map_err(|error| write_errno(&error))?;
+                Some(handle)
+            }
+        };
         let handle = self.next_dir_handle;
         self.next_dir_handle += 1;
         self.open_dirs.insert(
             handle,
             OpenDir {
+                ino,
+                identity,
+                handle: dir_handle,
                 bound,
                 started: false,
             },
         );
+        self.increment_open_count(ino);
         Ok(FileHandle(handle))
     }
 
-    /// Releases a directory stream opened by [`Self::opendir`].
-    pub fn releasedir(&mut self, fh: FileHandle) {
-        self.open_dirs.remove(&fh.0);
+    /// Releases a directory stream opened by [`Self::opendir`], deleting the
+    /// directory if it was unlinked while open and this was its last handle.
+    /// Returns `true` if releasing it cleared the last `remount,ro` blocker.
+    pub async fn releasedir(&mut self, fh: FileHandle) -> bool {
+        let was_blocking = self.blocks_read_only_remount();
+        let Some(entry) = self.open_dirs.remove(&fh.0) else {
+            return false;
+        };
+        self.decrement_open_count(entry.ino);
+        if let Some(handle) = entry.handle {
+            self.release_writer_handle(&handle).await;
+        }
+        was_blocking && !self.blocks_read_only_remount()
     }
 
     /// Hands the entries of directory `ino` after cookie `offset` up to the
@@ -820,8 +999,11 @@ impl<S: BlockSink, B> State<S, B> {
                 Err(error) => return Err(read_errno(&error)),
             }
         };
-        let open = *self.open_dirs.get(&fh.0).ok_or(Errno::EBADF)?;
-        let bound = if offset == 0 && open.started {
+        let (open_started, open_bound) = {
+            let open = self.open_dirs.get(&fh.0).ok_or(Errno::EBADF)?;
+            (open.started, open.bound)
+        };
+        let bound = if offset == 0 && open_started {
             // Refresh the upper `DIR_INDEX` bound on rewind (`rewinddir(3)` ->
             // `lseek(dirfd, 0, SEEK_SET)` in the Linux VFS, which FUSE does not
             // forward to the daemon), matching Linux `fs/btrfs/inode.c`, commit
@@ -836,13 +1018,13 @@ impl<S: BlockSink, B> State<S, B> {
                 .bound = refreshed;
             refreshed
         } else {
-            if !open.started {
+            if !open_started {
                 self.open_dirs
                     .get_mut(&fh.0)
                     .expect("open directory handle checked above")
                     .started = true;
             }
-            open.bound
+            open_bound
         };
         // The format stores neither `.` nor `..`; the kernel reports both.
         for (cookie, entry_ino, name) in [(1, ino, "."), (2, parent_ino, "..")] {
@@ -961,6 +1143,64 @@ impl<S: BlockSink, B> State<S, B> {
             number: created.number(),
         };
         self.entry_of(identity, Some(created)).await
+    }
+
+    /// Creates and opens an unnamed regular file (`O_TMPFILE`) in `parent`'s
+    /// subvolume with an on-disk orphan item and `nlink == 0`.
+    pub async fn tmpfile(
+        &mut self,
+        parent: INodeNo,
+        permissions: u32,
+        owner: Owner,
+        flags: OpenFlags,
+        now: Timestamp,
+    ) -> Result<(FileAttr, Generation, FileHandle), Errno> {
+        let writable = matches!(
+            flags.acc_mode(),
+            OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
+        );
+        if !writable {
+            return Err(Errno::EINVAL);
+        }
+        self.writable()?;
+        let parent = self.inodes.handle(parent)?;
+        let linkable = (flags.0 & libc::O_EXCL) == 0;
+        let attributes = Attributes {
+            permissions,
+            uid: owner.uid,
+            gid: owner.gid,
+            umask: owner.umask,
+        };
+        let created = {
+            let mut transaction = self
+                .writable_writer()?
+                .join()
+                .await
+                .map_err(|error| write_errno(&error))?;
+            transaction
+                .create_tmpfile(&parent, attributes, linkable, now)
+                .await
+                .map_err(|error| write_errno(&error))?
+        };
+        self.settle().await?;
+        let identity = Identity {
+            tree: created.tree(),
+            number: created.number(),
+        };
+        let (attr, generation) = self.entry_of(identity, Some(created.clone())).await?;
+        let id = self.next_fh;
+        self.next_fh += 1;
+        self.open_files.insert(
+            id,
+            OpenFileEntry {
+                ino: attr.ino,
+                identity,
+                handle: Some(created),
+                writable: true,
+            },
+        );
+        self.increment_open_count(attr.ino);
+        Ok((attr, generation, FileHandle(id)))
     }
 
     pub async fn link(
@@ -1609,7 +1849,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            remounted.releasedir(top_fh);
+            remounted.releasedir(top_fh).await;
             assert!(entries.contains(&(OsStr::new("..").to_os_string(), INodeNo::ROOT)));
             assert!(entries.contains(&(OsStr::new("nested-renamed").to_os_string(), nested.ino)));
 
@@ -1892,10 +2132,228 @@ mod tests {
         }
         assert_eq!(seen.len(), 4, "expected 4 entries, got {seen:?}");
 
-        state.releasedir(fh);
+        block_on(state.releasedir(fh));
         assert_eq!(
             block_on(state.readdir(dir, fh, 0, |_, _, _, _| false)),
             Err(Errno::EBADF)
         );
+    }
+
+    #[test]
+    fn unlinked_open_file_and_dir_stay_accessible_until_final_release() {
+        block_on(async {
+            let (disk, backing) = empty_image();
+            let mut state = open_state(disk);
+
+            let (file, file_gen) = state
+                .create(
+                    INodeNo::ROOT,
+                    OsStr::new("open.txt"),
+                    Node::File,
+                    0o644,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            let fh1 = state
+                .open_file(file.ino, OpenFlags(libc::O_RDWR))
+                .await
+                .unwrap();
+            let fh2 = state
+                .open_file(file.ino, OpenFlags(libc::O_RDONLY))
+                .await
+                .unwrap();
+            state
+                .write(file.ino, 0, b"before-unlink", test_time())
+                .await
+                .unwrap();
+
+            // Unlink while two handles are open.
+            state
+                .remove(INodeNo::ROOT, OsStr::new("open.txt"), false, test_time())
+                .await
+                .unwrap();
+            assert_eq!(
+                state.lookup(INodeNo::ROOT, OsStr::new("open.txt")).await,
+                Err(Errno::ENOENT)
+            );
+            assert!(state.has_open_orphans());
+
+            // Attributes report nlink == 0, export `.` lookup succeeds, I/O works.
+            let attr = state.getattr(file.ino).await.unwrap();
+            assert_eq!(attr.nlink, 0);
+            let (dot_attr, dot_gen) = state.lookup(file.ino, OsStr::new(".")).await.unwrap();
+            assert_eq!(dot_attr.nlink, 0);
+            assert_eq!(dot_gen, file_gen);
+            assert_eq!(state.read(file.ino, 0, 32).await.unwrap(), b"before-unlink");
+            state
+                .write(file.ino, 13, b"-after", test_time())
+                .await
+                .unwrap();
+            assert_eq!(
+                state.read(file.ino, 0, 32).await.unwrap(),
+                b"before-unlink-after"
+            );
+
+            // Re-linking a previously named file whose nlink dropped to 0 fails with ENOENT.
+            assert_eq!(
+                state
+                    .link(file.ino, INodeNo::ROOT, OsStr::new("revived"), test_time())
+                    .await,
+                Err(Errno::ENOENT)
+            );
+
+            // Releasing the first handle keeps the orphan alive.
+            state.release_file(fh1).await;
+            assert!(state.has_open_orphans());
+            assert_eq!(
+                state.read(file.ino, 0, 32).await.unwrap(),
+                b"before-unlink-after"
+            );
+
+            // Releasing the last handle deletes the inode and orphan item.
+            state.release_file(fh2).await;
+            assert!(!state.has_open_orphans());
+            assert_eq!(state.getattr(file.ino).await, Err(Errno::ESTALE));
+            assert_eq!(
+                state.lookup(file.ino, OsStr::new(".")).await,
+                Err(Errno::ESTALE)
+            );
+
+            // Open directory overwritten by rename keeps nlink == 0 until releasedir.
+            let (dir1, _) = state
+                .create(
+                    INodeNo::ROOT,
+                    OsStr::new("dir1"),
+                    Node::Directory,
+                    0o755,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            let (dir2, _) = state
+                .create(
+                    INodeNo::ROOT,
+                    OsStr::new("dir2"),
+                    Node::Directory,
+                    0o755,
+                    test_owner(),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            let dir_fh = state.opendir(dir2.ino).await.unwrap();
+            state
+                .rename(
+                    INodeNo::ROOT,
+                    OsStr::new("dir1"),
+                    INodeNo::ROOT,
+                    OsStr::new("dir2"),
+                    RenameMode::Replace,
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(state.getattr(dir2.ino).await.unwrap().nlink, 0);
+            assert_eq!(state.getattr(dir1.ino).await.unwrap().nlink, 1);
+            assert!(state.has_open_orphans());
+            state.releasedir(dir_fh).await;
+            assert!(!state.has_open_orphans());
+            assert_eq!(state.getattr(dir2.ino).await, Err(Errno::ESTALE));
+
+            state.sync().await.unwrap();
+            drop(state);
+            // Remount succeeds cleanly after orphan deletion.
+            let remounted = open_state(TempDisk::from_file(backing));
+            assert!(!remounted.has_open_orphans());
+        });
+    }
+
+    #[test]
+    fn tmpfile_supports_linking_and_respects_o_excl() {
+        block_on(async {
+            let (disk, backing) = empty_image();
+            let mut state = open_state(disk);
+
+            // O_TMPFILE without O_EXCL can be written and later linked into a directory.
+            let (tmp, _, fh) = state
+                .tmpfile(
+                    INodeNo::ROOT,
+                    0o640,
+                    test_owner(),
+                    OpenFlags(libc::O_RDWR),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(tmp.nlink, 0);
+            assert!(state.has_open_orphans());
+            state
+                .write(tmp.ino, 0, b"staged", test_time())
+                .await
+                .unwrap();
+
+            let (linked, _) = state
+                .link(tmp.ino, INodeNo::ROOT, OsStr::new("final.txt"), test_time())
+                .await
+                .unwrap();
+            assert_eq!(linked.ino, tmp.ino);
+            assert_eq!(linked.nlink, 1);
+            assert!(!state.has_open_orphans());
+            state.release_file(fh).await;
+
+            // O_TMPFILE | O_EXCL refuses link with ENOENT and deletes on release.
+            let (excl, _, excl_fh) = state
+                .tmpfile(
+                    INodeNo::ROOT,
+                    0o600,
+                    test_owner(),
+                    OpenFlags(libc::O_RDWR | libc::O_EXCL),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(excl.nlink, 0);
+            assert_eq!(
+                state
+                    .link(excl.ino, INodeNo::ROOT, OsStr::new("nope"), test_time())
+                    .await,
+                Err(Errno::ENOENT)
+            );
+            state.release_file(excl_fh).await;
+            assert_eq!(state.getattr(excl.ino).await, Err(Errno::ESTALE));
+
+            // Commit a live tmpfile and drop without release to test mount-time cleanup.
+            let (crashed, _, _leaked_fh) = state
+                .tmpfile(
+                    INodeNo::ROOT,
+                    0o600,
+                    test_owner(),
+                    OpenFlags(libc::O_RDWR),
+                    test_time(),
+                )
+                .await
+                .unwrap();
+            state
+                .write(crashed.ino, 0, b"lost-on-crash", test_time())
+                .await
+                .unwrap();
+            state.sync().await.unwrap();
+            drop(state);
+
+            let mut recovered = open_state(TempDisk::from_file(backing));
+            assert!(!recovered.has_open_orphans());
+            assert_eq!(
+                recovered.lookup(crashed.ino, OsStr::new(".")).await,
+                Err(Errno::ESTALE)
+            );
+            let (kept, _) = recovered
+                .lookup(INodeNo::ROOT, OsStr::new("final.txt"))
+                .await
+                .unwrap();
+            assert_eq!(recovered.read(kept.ino, 0, 16).await.unwrap(), b"staged");
+        });
     }
 }

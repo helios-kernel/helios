@@ -1358,6 +1358,7 @@ pub(super) fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Optio
             flags: directory_authority_to_descriptor_flags(preopen.rights()),
             identity: None,
             mount: None,
+            open: None,
         },
     })
 }
@@ -1406,6 +1407,7 @@ impl<Net: ComponentHostNetwork> Preview1DescriptorTable<Net> {
                 flags: directory_authority_to_descriptor_flags(preopen.rights()),
                 identity: None,
                 mount: None,
+                open: None,
             };
             table.entries.push(Some(Preview1DescriptorEntry::new(
                 Preview1Descriptor::Preopen {
@@ -1856,12 +1858,6 @@ pub(super) fn p1_filetype_from_descriptor_type(type_: fs_types::DescriptorType) 
         fs_types::DescriptorType::BlockDevice => 1,
         _ => 0,
     }
-}
-
-pub(super) fn p1_descriptor_path<Net: ComponentHostNetwork>(
-    descriptor: Option<&Preview1Descriptor<Net>>,
-) -> Option<&str> {
-    p1_fs_descriptor(descriptor).map(|descriptor| descriptor.path.as_str())
 }
 
 pub(super) fn p1_null_device_stat() -> fs_types::DescriptorStat {

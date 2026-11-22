@@ -11,7 +11,7 @@ use alloc::string::String;
 
 use bitflags::bitflags;
 
-use crate::{ComponentFsNodeKind, MountHold, ObjectIdentity};
+use crate::{ComponentFsNodeKind, MountHold, MountedOpenHandle, ObjectIdentity};
 
 bitflags! {
     /// The rights a node handle was opened with, and the synchronisation it
@@ -44,4 +44,7 @@ pub struct FsDescriptor {
         reason = "held for its effect: a live share is what makes unmount busy"
     )]
     pub(crate) mount: Option<MountHold>,
+    /// The underlying filesystem's open handle, retaining unlinked or unnamed
+    /// inodes until the last descriptor and stream referencing them drop.
+    pub(crate) open: Option<MountedOpenHandle>,
 }

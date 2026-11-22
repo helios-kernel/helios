@@ -2415,6 +2415,7 @@ pub(super) fn wasix_proc_spawn_resolve_child_cwd(
             flags,
             identity: None,
             mount: None,
+            open: None,
         },
     })
 }
@@ -3323,6 +3324,7 @@ pub(super) fn wasix_spawn_resolve_cwd_target<Net: ComponentHostNetwork>(
             flags,
             identity: None,
             mount: None,
+            open: None,
         },
     })
 }
@@ -4500,6 +4502,7 @@ mod spawn_descriptor_tests {
             flags: FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             identity: None,
             mount: None,
+            open: None,
         }))
     }
 

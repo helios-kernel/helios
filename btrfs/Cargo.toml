@@ -45,7 +45,7 @@ helios-btrfs = { version = "0.1.0", path = ".", features = ["test-support"] }
 # Only the FUSE adapter example needs these, and only on Linux: fuser mounts
 # through `fusermount3` with no libfuse.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-fuser = { version = "0.18.0", default-features = false }
+fuser = { version = "0.19.0", default-features = false }
 getrandom = { version = "0.4.3", default-features = false }
 libc = { version = "0.2.191", default-features = false }
 tracing-log = { version = "0.2.0", default-features = false, features = ["log-tracer", "std"] }

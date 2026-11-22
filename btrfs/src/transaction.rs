@@ -10,6 +10,7 @@ pub(crate) mod chunks;
 mod extents;
 pub(crate) mod file;
 pub(crate) mod namespace;
+pub(crate) mod orphan;
 pub(crate) mod ownership;
 pub(crate) mod reflink;
 pub(crate) mod replay;
@@ -21,6 +22,7 @@ use core::num::NonZeroUsize;
 use futures::future;
 
 use self::namespace::Name;
+use self::orphan::OpenInodes;
 use self::reflink::FileId;
 use crate::accounting::{Accounting, Allocation};
 use crate::commit::CommitImage;
@@ -69,6 +71,9 @@ pub(crate) struct Transaction<S> {
     pub(crate) accounting: Accounting,
     /// File data written but not yet given extents.
     pub(crate) delalloc: Delalloc,
+    /// Open-handle accounting mirrored from the owning [`crate::write::Writer`],
+    /// checkpointed and rolled back alongside tree edits.
+    pub(crate) open: OpenInodes,
 }
 
 /// Private operation state. Inode allocation high-water marks deliberately
@@ -83,6 +88,7 @@ pub(crate) struct Checkpoint {
     space: Space,
     accounting: Accounting,
     delalloc: Delalloc,
+    open: OpenInodes,
 }
 
 impl<S: BlockSink> Transaction<S> {
@@ -128,6 +134,7 @@ impl<S: BlockSink> Transaction<S> {
             space: self.space.clone(),
             accounting: self.accounting.clone(),
             delalloc: self.delalloc.clone(),
+            open: self.open.clone(),
         };
         self.space.begin_operation();
         saved
@@ -142,6 +149,7 @@ impl<S: BlockSink> Transaction<S> {
         self.space = saved.space;
         self.accounting = saved.accounting;
         self.delalloc = saved.delalloc;
+        self.open = saved.open;
     }
 
     pub(crate) async fn inode_metadata(&self, file: FileId) -> Result<Metadata, WriteError> {
@@ -252,6 +260,7 @@ impl<S: BlockSink> Transaction<S> {
             accounting,
             trees,
             delalloc,
+            open: OpenInodes::new(),
         })
     }
 

@@ -211,6 +211,7 @@ impl<H: HostFileSystem> DirStream for HostDir<H> {
 }
 
 impl<H: HostFileSystem> FileSystem for HostShare<H> {
+    super::delegate_path_handles!();
     type Write = HostShareWrite<H::Write>;
     type Dir = HostDir<H>;
 
@@ -223,9 +224,14 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
         metadata_from_host(&metadata)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        _now: u64,
+    ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
         let host = host_path(path);
-        match self
+        let metadata = match self
             .client
             .stat_path(host)
             .await
@@ -251,7 +257,7 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
                         .await
                         .map_err(fs_error_from_host)?;
                 }
-                Ok(metadata)
+                metadata
             }
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
                 if flags.contains(OpenFlags::DIRECTORY) {
@@ -262,10 +268,14 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
                     .create_file(host, creation)
                     .await
                     .map_err(fs_error_from_host)?;
-                self.stat(path).await
+                self.stat(path).await?
             }
-            Err(error) => Err(error),
-        }
+            Err(error) => return Err(error),
+        };
+        Ok(helios_hal::fs::Opened {
+            metadata,
+            handle: OwnedFsPath::from(path),
+        })
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {

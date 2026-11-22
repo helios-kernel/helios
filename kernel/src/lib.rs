@@ -256,12 +256,12 @@ pub use surface::{
     SurfaceServiceError, SurfaceShared,
 };
 pub use vfs::{
-    AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow,
-    FsDescriptor, FsDescriptorFlags, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
+    AttachedStorage, BOOT_DEVICE, BtrfsOpenHandle, DiskImage, ErofsError, ErofsFs, FileContents,
+    Follow, FsDescriptor, FsDescriptorFlags, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
     MAX_SYMLINK_DEPTH, MemoryFs, MemoryUnixMetadata, MemoryWrite, MountError, MountFlags,
     MountGrant, MountHold, MountRequest, MountRequestError, MountSharing, MountSource, MountTable,
-    MountedFs, MountedWrite, Namespace, NoDisks, ROOT_GRANT, ROOT_LAYER_DEVICE, ReaderError,
-    Resolved, RootFs, RootWrite, SharedOwner, Storage, UnixAttributes, XattrSetMode,
+    MountedFs, MountedOpenHandle, MountedWrite, Namespace, NoDisks, ROOT_GRANT, ROOT_LAYER_DEVICE,
+    ReaderError, Resolved, RootFs, RootWrite, SharedOwner, Storage, UnixAttributes, XattrSetMode,
     object_identity, request_mount, request_unmount, symlink_target, within_directory,
 };
 pub use vsock::{
