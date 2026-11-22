@@ -4,11 +4,12 @@
 
 use std::borrow::Borrow;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::future::{Future, poll_fn};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU16;
 use std::path::Path;
 use std::pin::pin;
 use std::process::Command;
@@ -30,15 +31,17 @@ use http_kit_io::DialUnix;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use http_kit_io::splice::{FilledPipe, Pipe, Spliced};
 use http_kit_io::{
-    Answer, BufResult, Dial, IoBuf, IoBufMut, IoVectoredBuf, NoBuf, Read, ReadAhead, ReadOwned,
-    Received, Resolve, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions, Timer, Write,
+    Answer, BufResult, Datagram, DatagramSocket, Dial, IoBuf, IoBufMut, IoVectoredBuf, NoBuf, Read,
+    ReadAhead, ReadOwned, Received, RecvMeta, Resolve, SendFile, SpliceRead, SpliceWrite, Split,
+    TcpOptions, Timer, Write,
 };
 use http_kit_tls::TlsAcceptor;
 use http_kit_tls::rustls::pki_types::pem::PemObject;
 use http_kit_tls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use zenwave::backend::NativeBackend;
+use zenwave::dns::{HttpsRecord, ResolveHttps};
 use zenwave::transport::Proxy;
-use zenwave::{Body, Endpoint, Transport};
+use zenwave::{Body, Endpoint, ResolveError, Transport};
 
 use crate::error::{body_code, code};
 use crate::request::BodyOutcome;
@@ -47,7 +50,7 @@ const OPENSSL_CA_CNF: &str = include_str!("../testdata/ca.cnf");
 const OPENSSL_LEAF_CNF: &str = include_str!("../testdata/leaf.cnf");
 
 /// CJK payload covering Chinese, Japanese, and Korean.
-const CJK_GREETING: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
+pub(crate) const CJK_GREETING: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
 
 struct TimerEntry {
     deadline: Instant,
@@ -72,7 +75,7 @@ impl Default for Scheduler {
 }
 
 #[derive(Clone, Default)]
-struct TestExecutor {
+pub(crate) struct TestExecutor {
     scheduler: Rc<Scheduler>,
 }
 
@@ -86,7 +89,7 @@ impl TestExecutor {
         ran
     }
 
-    fn run_until<F: Future>(&self, future: F) -> F::Output {
+    pub(crate) fn run_until<F: Future>(&self, future: F) -> F::Output {
         let mut future = pin!(future);
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
@@ -157,11 +160,11 @@ struct PipeBuffer {
     read_waker: Option<Waker>,
 }
 
-struct DuplexRead {
+pub(crate) struct DuplexRead {
     inbound: Rc<RefCell<PipeBuffer>>,
 }
 
-struct DuplexWrite {
+pub(crate) struct DuplexWrite {
     outbound: Rc<RefCell<PipeBuffer>>,
 }
 
@@ -175,7 +178,7 @@ impl Drop for DuplexWrite {
     }
 }
 
-struct DuplexStream {
+pub(crate) struct DuplexStream {
     read: DuplexRead,
     write: DuplexWrite,
 }
@@ -462,24 +465,210 @@ impl TcpOptions for DuplexStream {
 }
 
 type ServerHandler = Rc<dyn Fn(DuplexStream)>;
+type HttpsLookupHandler = Rc<dyn Fn(&str, u16) -> Result<Option<HttpsRecord>, ResolveError>>;
+
+#[derive(Default)]
+struct UdpInbox {
+    queue: VecDeque<(SocketAddr, Vec<u8>)>,
+    waker: Option<Waker>,
+}
+
+struct UdpHubState {
+    sockets: HashMap<SocketAddr, Rc<RefCell<UdpInbox>>>,
+    next_port: u16,
+    udp_binds: usize,
+}
+
+impl Default for UdpHubState {
+    fn default() -> Self {
+        Self {
+            sockets: HashMap::new(),
+            next_port: 40_000,
+            udp_binds: 0,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct InMemoryUdpHub {
+    state: Rc<RefCell<UdpHubState>>,
+}
+
+fn normalize_udp_addr(addr: SocketAddr) -> SocketAddr {
+    let ip = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, addr.port())
+}
+
+impl InMemoryUdpHub {
+    pub(crate) fn bind(&self, addr: SocketAddr) -> io::Result<InMemoryUdpSocket> {
+        let mut state = self.state.borrow_mut();
+        let mut local = normalize_udp_addr(addr);
+        if local.port() == 0 {
+            let start = state.next_port;
+            loop {
+                let candidate = SocketAddr::new(local.ip(), state.next_port);
+                state.next_port = state.next_port.wrapping_add(1).max(40_000);
+                if !state.sockets.contains_key(&candidate) {
+                    local = candidate;
+                    break;
+                }
+                if state.next_port == start {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "exhausted in-memory UDP ephemeral ports",
+                    ));
+                }
+            }
+        } else if state.sockets.contains_key(&local) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("in-memory UDP address {local} is already bound"),
+            ));
+        }
+        let inbox = Rc::new(RefCell::new(UdpInbox::default()));
+        state.sockets.insert(local, Rc::clone(&inbox));
+        state.udp_binds += 1;
+        Ok(InMemoryUdpSocket {
+            local,
+            inbox,
+            hub: self.clone(),
+        })
+    }
+
+    pub(crate) fn bind_count(&self) -> usize {
+        RefCell::borrow(&self.state).udp_binds
+    }
+
+    fn deliver(&self, from: SocketAddr, target: SocketAddr, bytes: Vec<u8>) {
+        let target = normalize_udp_addr(target);
+        let inbox = RefCell::borrow(&self.state).sockets.get(&target).cloned();
+        if let Some(inbox) = inbox {
+            let mut inbox = inbox.borrow_mut();
+            inbox.queue.push_back((from, bytes));
+            if let Some(waker) = inbox.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+}
+
+pub(crate) struct InMemoryUdpSocket {
+    local: SocketAddr,
+    inbox: Rc<RefCell<UdpInbox>>,
+    hub: InMemoryUdpHub,
+}
+
+impl Drop for InMemoryUdpSocket {
+    fn drop(&mut self) {
+        self.hub.state.borrow_mut().sockets.remove(&self.local);
+    }
+}
+
+impl DatagramSocket for InMemoryUdpSocket {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
+
+    fn max_send_segments(&self) -> usize {
+        1
+    }
+
+    async fn send_from<B: IoBuf>(
+        &self,
+        buf: B,
+        target: SocketAddr,
+        _source: Option<IpAddr>,
+    ) -> BufResult<usize, B> {
+        let bytes = buf.as_init();
+        let len = bytes.len();
+        self.hub.deliver(self.local, target, bytes.to_vec());
+        BufResult(Ok(len), buf)
+    }
+
+    async fn send_segments_from<B: IoBuf>(
+        &self,
+        buf: B,
+        segment_size: NonZeroU16,
+        target: SocketAddr,
+        _source: Option<IpAddr>,
+    ) -> BufResult<usize, B> {
+        let bytes = buf.as_init();
+        let len = bytes.len();
+        for chunk in bytes.chunks(usize::from(segment_size.get())) {
+            self.hub.deliver(self.local, target, chunk.to_vec());
+        }
+        BufResult(Ok(len), buf)
+    }
+
+    async fn recv_from<B: IoBufMut>(&self, mut buf: B) -> BufResult<RecvMeta, B> {
+        let (from, datagram) = poll_fn(|cx| {
+            let mut inbox = self.inbox.borrow_mut();
+            if let Some(item) = inbox.queue.pop_front() {
+                Poll::Ready(item)
+            } else {
+                inbox.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await;
+        let dst = buf.as_uninit();
+        let copied = datagram.len().min(dst.len());
+        for (slot, byte) in dst[..copied].iter_mut().zip(&datagram[..copied]) {
+            slot.write(*byte);
+        }
+        // SAFETY: the first `copied` bytes of `buf` were initialized above.
+        unsafe { buf.set_len(copied) };
+        BufResult(Ok(RecvMeta::single(copied, from)), buf)
+    }
+}
 
 #[derive(Clone)]
-struct InMemoryNet {
+pub(crate) struct InMemoryNet {
     scheduler: Rc<Scheduler>,
     dials: Rc<Cell<usize>>,
+    refuse_tcp: Rc<Cell<bool>>,
     on_accept: ServerHandler,
+    udp_hub: InMemoryUdpHub,
+    https_lookup: HttpsLookupHandler,
 }
 
 impl InMemoryNet {
-    fn new(executor: &TestExecutor, on_accept: impl Fn(DuplexStream) + 'static) -> Self {
+    pub(crate) fn new(executor: &TestExecutor, on_accept: impl Fn(DuplexStream) + 'static) -> Self {
         Self {
             scheduler: Rc::clone(&executor.scheduler),
             dials: Rc::new(Cell::new(0)),
+            refuse_tcp: Rc::new(Cell::new(false)),
             on_accept: Rc::new(on_accept),
+            udp_hub: InMemoryUdpHub::default(),
+            https_lookup: Rc::new(|_, _| Ok(None)),
         }
     }
 
-    fn dial_count(&self) -> usize {
+    pub(crate) fn timer_only(executor: &TestExecutor) -> Self {
+        Self::new(executor, |_| {})
+    }
+
+    pub(crate) fn with_https_lookup(
+        mut self,
+        lookup: impl Fn(&str, u16) -> Result<Option<HttpsRecord>, ResolveError> + 'static,
+    ) -> Self {
+        self.https_lookup = Rc::new(lookup);
+        self
+    }
+
+    pub(crate) fn set_refuse_tcp(&self, refuse: bool) {
+        self.refuse_tcp.set(refuse);
+    }
+
+    pub(crate) fn udp_hub(&self) -> &InMemoryUdpHub {
+        &self.udp_hub
+    }
+
+    pub(crate) fn dial_count(&self) -> usize {
         self.dials.get()
     }
 }
@@ -489,9 +678,23 @@ impl Dial for InMemoryNet {
 
     async fn connect(&self, _addr: SocketAddr) -> io::Result<DuplexStream> {
         self.dials.set(self.dials.get() + 1);
+        if self.refuse_tcp.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "TCP refused by test fixture",
+            ));
+        }
         let (client, server) = duplex_pair();
         (self.on_accept)(server);
         Ok(client)
+    }
+}
+
+impl Datagram for InMemoryNet {
+    type UdpSocket = InMemoryUdpSocket;
+
+    async fn bind_udp(&self, addr: SocketAddr) -> io::Result<InMemoryUdpSocket> {
+        self.udp_hub.bind(addr)
     }
 }
 
@@ -513,6 +716,16 @@ impl Resolve for InMemoryNet {
     }
 }
 
+impl ResolveHttps for InMemoryNet {
+    async fn https_record(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Option<HttpsRecord>, ResolveError> {
+        (self.https_lookup)(host, port)
+    }
+}
+
 impl Timer for InMemoryNet {
     async fn sleep_until(&self, deadline: Instant) {
         poll_fn(|cx| {
@@ -530,12 +743,18 @@ impl Timer for InMemoryNet {
     }
 }
 
-struct TestPki {
-    ca_pem: Vec<u8>,
-    server_config: Arc<rustls::ServerConfig>,
+pub(crate) struct TestPki {
+    pub(crate) ca_pem: Vec<u8>,
+    pub(crate) leaf_pem: Vec<u8>,
+    pub(crate) key_pem: Vec<u8>,
+    pub(crate) server_config: Arc<rustls::ServerConfig>,
 }
 
-fn generate_test_pki() -> TestPki {
+pub(crate) fn generate_test_pki() -> TestPki {
+    generate_test_pki_named("helios-test-ca")
+}
+
+pub(crate) fn generate_test_pki_named(ca_common_name: &str) -> TestPki {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls_pure::provider().install_default();
     }
@@ -559,6 +778,7 @@ fn generate_test_pki() -> TestPki {
         );
     };
 
+    let ca_subject = format!("/CN={ca_common_name}");
     run_openssl(&[
         "req",
         "-x509",
@@ -574,7 +794,7 @@ fn generate_test_pki() -> TestPki {
         "-days",
         "2",
         "-subj",
-        "/CN=helios-test-ca",
+        &ca_subject,
         "-extensions",
         "v3_ca",
         "-config",
@@ -635,6 +855,8 @@ fn generate_test_pki() -> TestPki {
 
     TestPki {
         ca_pem,
+        leaf_pem,
+        key_pem,
         server_config: Arc::new(server_config),
     }
 }
@@ -650,11 +872,7 @@ fn alpn_negotiates_http2_and_multiplexes_concurrent_requests() {
 
     let net = InMemoryNet::new(&executor, move |stream| {
         let acceptor = acceptor.clone();
-        let timer = InMemoryNet {
-            scheduler: Rc::clone(&server_exec.scheduler),
-            dials: Rc::new(Cell::new(0)),
-            on_accept: Rc::new(|_| {}),
-        };
+        let timer = InMemoryNet::timer_only(&server_exec);
         let alpn = Rc::clone(&server_alpn);
         server_exec
             .spawn_local(async move {
@@ -750,11 +968,7 @@ fn h2_oversized_response_headers_map_to_header_section_size() {
 
     let net = InMemoryNet::new(&executor, move |stream| {
         let acceptor = acceptor.clone();
-        let timer = InMemoryNet {
-            scheduler: Rc::clone(&server_exec.scheduler),
-            dials: Rc::new(Cell::new(0)),
-            on_accept: Rc::new(|_| {}),
-        };
+        let timer = InMemoryNet::timer_only(&server_exec);
         server_exec
             .spawn_local(async move {
                 let tls = acceptor.accept(stream, &timer).await.expect("TLS accept");
@@ -814,11 +1028,7 @@ fn h2_abrupt_connection_drop_maps_head_and_body_errors() {
     // Case 1: server drops connection before sending response headers.
     let net_head_drop = InMemoryNet::new(&executor, move |stream| {
         let acceptor = acceptor.clone();
-        let timer = InMemoryNet {
-            scheduler: Rc::clone(&server_exec.scheduler),
-            dials: Rc::new(Cell::new(0)),
-            on_accept: Rc::new(|_| {}),
-        };
+        let timer = InMemoryNet::timer_only(&server_exec);
         server_exec
             .spawn_local(async move {
                 let tls = acceptor.accept(stream, &timer).await.expect("TLS accept");
@@ -868,11 +1078,7 @@ fn h2_abrupt_connection_drop_maps_head_and_body_errors() {
 
     let net_body_drop = InMemoryNet::new(&executor, move |stream| {
         let acceptor = acceptor.clone();
-        let timer = InMemoryNet {
-            scheduler: Rc::clone(&server_exec.scheduler),
-            dials: Rc::new(Cell::new(0)),
-            on_accept: Rc::new(|_| {}),
-        };
+        let timer = InMemoryNet::timer_only(&server_exec);
         let drop_rx = Rc::clone(&drop_rx);
         server_exec
             .spawn_local(async move {

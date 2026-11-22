@@ -191,10 +191,11 @@ maintainer's decision and the fork's revision moves once, per §1.
 - The HTTP client is a kernel plugin (`programs/http-client`): the kernel
   implements `wasi:http/types` only and forwards `wasi:http/client.send`
   through a cache-padded, NUMA-local `PerProcessorProvider` shard to that
-  core's lazy plugin `wasi:http/handler`; HTTP/1.1 framing, DNS and TLS run in
-  user memory, synchronized with `ProcessorStep` CPU hotplug so departing cores
-  drain/redirect work to their successor. `ProviderSlot` remains the route for
-  singleton plugins with exclusive hardware ownership (such as `compositor`).
+  core's lazy plugin `wasi:http/handler`; HTTP/1.1, HTTP/2, HTTP/3 (QUIC), DNS
+  and TLS run in user memory, synchronized with `ProcessorStep` CPU hotplug so
+  departing cores drain/redirect work to their successor. `ProviderSlot` remains
+  the route for singleton plugins with exclusive hardware ownership (such as
+  `compositor`).
 - Plugins share the user-memory and allocation contract of every program.
   There is no plugin-private allocator policy, memory floor, or oversized
   linker memory. A plugin may fail with a typed OOM result and be discarded
