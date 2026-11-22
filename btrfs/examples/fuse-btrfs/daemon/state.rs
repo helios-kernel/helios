@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, TimeOrNow};
 use futures_lite::future::block_on;
 use helios_btrfs::write::{
-    Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, WriteOptions, Writer,
-    XattrMode,
+    Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, Special, WriteOptions,
+    Writer, XattrMode,
 };
 use helios_btrfs::{
     BlockSink, BlockSource, DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata,
@@ -63,6 +63,7 @@ pub enum Node<'a> {
     File,
     Directory,
     Symlink(&'a [u8]),
+    Special(Special),
 }
 
 /// The caller a creation is made for.
@@ -529,6 +530,11 @@ impl<S: BlockSink> State<S> {
             Node::File => transaction.create_file(at, attributes, now).await,
             Node::Directory => transaction.create_directory(at, attributes, now).await,
             Node::Symlink(target) => transaction.symlink(at, target, attributes, now).await,
+            Node::Special(special) => {
+                transaction
+                    .create_special(at, special, attributes, now)
+                    .await
+            }
         }
         .map_err(|error| write_errno(&error))?;
         self.settle().await?;
@@ -856,7 +862,9 @@ fn attr<S: BlockSource>(ino: INodeNo, metadata: &Metadata, snapshot: &Snapshot<S
         nlink: metadata.nlink,
         uid: metadata.uid,
         gid: metadata.gid,
-        rdev: metadata.rdev as u32,
+        // FUSE carries `stat`'s encoding, which the kernel decodes with
+        // `new_decode_dev` (`fuse_fillattr` in `fs/fuse/inode.c`).
+        rdev: metadata.rdev.encode(),
         blksize: snapshot.superblock().sectorsize(),
         flags: 0,
     }

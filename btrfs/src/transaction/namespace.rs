@@ -7,7 +7,7 @@ use helios_hal::fs::RenameMode;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::Transaction;
-use super::ownership::{S_IFDIR, S_IFMT, S_ISGID, refuse_set_id};
+use super::ownership::{S_IFDIR, S_IFMT, S_ISGID};
 use crate::csum::{inode_ref_hash, name_hash};
 use crate::items::{INODE_APPEND, INODE_IMMUTABLE, RecordKind, dir_index_record, dir_records};
 use crate::ondisk::{
@@ -29,6 +29,8 @@ pub(crate) struct Attributes {
     pub(crate) mode: u32,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+    /// The inode item's `rdev`: a device node's number, zero otherwise.
+    pub(crate) rdev: u64,
     /// The creating process's umask, which `posix_acl_create` applies when
     /// the parent directory has no default ACL.
     pub(crate) umask: u32,
@@ -281,7 +283,6 @@ impl<S: BlockSink> Transaction<S> {
         } else {
             attributes.gid
         };
-        refuse_set_id(mode)?;
         let tree = name.tree;
         let next = if let Some(last) = self.inode_high_water.get(&tree) {
             last.checked_add(1)
@@ -310,6 +311,7 @@ impl<S: BlockSink> Transaction<S> {
         raw.mode.set(mode);
         raw.uid.set(attributes.uid);
         raw.gid.set(gid);
+        raw.rdev.set(attributes.rdev);
         raw.atime = timestamp;
         raw.ctime = timestamp;
         raw.mtime = timestamp;

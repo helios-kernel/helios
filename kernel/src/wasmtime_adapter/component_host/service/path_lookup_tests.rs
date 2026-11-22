@@ -217,7 +217,10 @@ fn wasix_and_preview1_lookup_operations_honor_dirfd_and_symlink_follow() {
         ns.mount(
             &cap,
             mem_fs,
-            FileSystemRights::READ | FileSystemRights::WRITE,
+            crate::MountGrant {
+                rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                sharing: crate::MountSharing::Shared,
+            },
         )
         .await
         .expect("mount");
