@@ -312,11 +312,13 @@ pub(super) fn ioctl<R: Resources, M: UserMemory, T: Tty>(
                 TCSETSF => TermiosAction::Flush,
                 _ => unreachable!(),
             };
-            if action == TermiosAction::Flush {
-                process.shared.stdin_carry.lock().clear();
-            }
             match tty.set_termios(stream, Termios::from_bytes(&raw), action) {
-                Ok(()) => 0,
+                Ok(()) => {
+                    if action == TermiosAction::Flush {
+                        process.shared.stdin_carry.lock().clear();
+                    }
+                    0
+                }
                 Err(error) => tty_errno(error),
             }
         }

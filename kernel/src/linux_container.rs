@@ -830,6 +830,14 @@ impl<S: Storage> ContainerFilesystem<S> {
         resolved.fs().read_link(resolved.fs_path()).await
     }
 
+    /// Reads the symbolic link target for an already-resolved container path
+    /// (used by `readlinkat(fd, "", ...)` on an `O_PATH | O_NOFOLLOW` symlink).
+    pub async fn read_link_resolved(&self, container_path: &str) -> FsResult<String> {
+        let resolved = self.resolve(container_path)?;
+        resolved.require_read()?;
+        resolved.fs().read_link(resolved.fs_path()).await
+    }
+
     /// Creates a directory at `raw_path` relative to `base_dir`.
     pub async fn mkdir_at(
         &self,
@@ -2093,6 +2101,26 @@ mod tests {
             fs.symlink_at("sub", "/", "sym_sub", 1).await.unwrap();
             let (_, resolved) = fs.stat_at("/", "sym_sub/../alpha", true).await.unwrap();
             assert_eq!(resolved, "/alpha");
+
+            // `O_PATH | O_NOFOLLOW` opens the symlink itself, and `read_link_resolved`
+            // reads its target without re-walking.
+            let path_nofollow = OpenRequest {
+                read: false,
+                write: false,
+                create: false,
+                exclusive: false,
+                truncate: false,
+                directory: false,
+                nofollow: true,
+                path_only: true,
+                append: false,
+                sync: false,
+                dsync: false,
+                mode: 0,
+            };
+            let (_, sym_path, _) = fs.open_at("/", "sym_sub", path_nofollow, 1).await.unwrap();
+            assert_eq!(sym_path, "/sym_sub");
+            assert_eq!(fs.read_link_resolved(&sym_path).await.unwrap(), "sub");
 
             fs.symlink_at("loop_b", "/", "loop_a", 1).await.unwrap();
             fs.symlink_at("loop_a", "/", "loop_b", 1).await.unwrap();

@@ -25,8 +25,10 @@ use std::task::Wake;
 
 const PAGE: u64 = 4096;
 const EPERM: u64 = 1;
+const ENOENT: u64 = 2;
 const EBADF: u64 = 9;
 const EAGAIN: u64 = 11;
+const ENOMEM: u64 = 12;
 const EACCES: u64 = 13;
 const EFAULT: u64 = 14;
 const EINVAL: u64 = 22;
@@ -249,6 +251,7 @@ struct MockHost {
     stdin: Arc<Mutex<Vec<u8>>>,
     stdin_notify: Arc<Notify>,
     stdin_eof: bool,
+    stdin_return_whole_chunk: bool,
     tty_attached: bool,
     tty_control: bool,
     termios: Termios,
@@ -263,6 +266,7 @@ impl Default for MockHost {
             stdin: Arc::new(Mutex::new(Vec::new())),
             stdin_notify: Arc::new(Notify::new()),
             stdin_eof: false,
+            stdin_return_whole_chunk: false,
             tty_attached: true,
             tty_control: true,
             termios: Termios::from_flags(true, true, true),
@@ -279,7 +283,11 @@ impl Stdio for MockHost {
     }
     async fn read_input(&mut self, limit: usize) -> Result<Bytes, Denied> {
         let mut guard = self.stdin.lock().unwrap();
-        let take = guard.len().min(limit);
+        let take = if self.stdin_return_whole_chunk {
+            guard.len()
+        } else {
+            guard.len().min(limit)
+        };
         let out = Bytes::copy_from_slice(&guard[..take]);
         guard.drain(..take);
         Ok(out)
@@ -408,6 +416,7 @@ impl Filesystem<MemRes> for MockHost {
     ) -> Result<MemFile, FsError> {
         let id = match path {
             "/mapped" | "mapped" => 1,
+            "/sym" | "sym" => 2,
             _ => return Err(FsError::NoEntry),
         };
         let access = match (request.read, request.write) {
@@ -475,6 +484,23 @@ impl Filesystem<MemRes> for MockHost {
     }
     async fn sync(&self, _file: &MemFile, _data_only: bool) -> Result<(), FsError> {
         Ok(())
+    }
+    async fn read_link(
+        &self,
+        base: Option<&MemFile>,
+        _cwd: &str,
+        path: &str,
+    ) -> Result<String, FsError> {
+        if path.is_empty() {
+            return match base {
+                Some(file) if file.id == 2 => Ok(String::from("target-from-fd")),
+                _ => Err(FsError::Invalid),
+            };
+        }
+        match path {
+            "/sym" | "sym" => Ok(String::from("target-from-path")),
+            _ => Err(FsError::NoEntry),
+        }
     }
 }
 
@@ -1026,4 +1052,373 @@ fn fcntl_dupfd_and_status_flags_match_both_abis() {
             0x400 | 0x800
         );
     }
+}
+
+#[test]
+fn mremap_growth_populates_shared_tail_and_preserves_backing_file() {
+    let abi = Abi::X86_64;
+    let mut process = Process::<MemRes>::new(abi, NonZeroU32::new(1).unwrap(), 0x40_0000);
+    let mut mem = PageMem::default();
+    let mut host = MockHost::default();
+    let mut data = vec![b'A'; PAGE as usize];
+    data.extend(core::iter::repeat_n(b'B', PAGE as usize));
+    host.files.lock().unwrap().insert(1, data);
+
+    let buf = 0x10_0000;
+    mem.write(buf, b"/mapped\0").unwrap();
+    let fd = run_call(
+        &mut process,
+        abi,
+        Operation::Openat,
+        [(-100i32) as u32 as u64, buf, 2 /* O_RDWR */, 0, 0, 0],
+        &mut mem,
+        &mut host,
+    );
+    assert!(fd >= 3);
+
+    // 1. In-place growth of writable MAP_SHARED populates page 2 from file and
+    // preserves page 2 across msync + munmap.
+    let m1 = run_call(
+        &mut process,
+        abi,
+        Operation::Mmap,
+        [
+            0, PAGE, 3,    /* PROT_READ|PROT_WRITE */
+            0x01, /* MAP_SHARED */
+            fd, 0,
+        ],
+        &mut mem,
+        &mut host,
+    );
+    assert!(m1 >= PAGE);
+    let grown = run_call(
+        &mut process,
+        abi,
+        Operation::Mremap,
+        [m1, PAGE, 2 * PAGE, 0, 0, 0],
+        &mut mem,
+        &mut host,
+    );
+    assert_eq!(grown, m1);
+    let mut page1 = [0u8; 4];
+    let mut page2 = [0u8; 4];
+    mem.read(grown, &mut page1).unwrap();
+    mem.read(grown + PAGE, &mut page2).unwrap();
+    assert_eq!(&page1, b"AAAA");
+    assert_eq!(&page2, b"BBBB");
+
+    mem.write(grown, b"CCCC").unwrap();
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Msync,
+            [grown, 2 * PAGE, 4 /* MS_SYNC */, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        0
+    );
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Munmap,
+            [grown, 2 * PAGE, 0, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        0
+    );
+    {
+        let files = host.files.lock().unwrap();
+        let file_bytes = &files[&1];
+        assert_eq!(&file_bytes[..4], b"CCCC");
+        assert_eq!(&file_bytes[PAGE as usize..PAGE as usize + 4], b"BBBB");
+    }
+
+    // 2. Relocated growth (MREMAP_MAYMOVE) of PROT_READ MAP_SHARED populates
+    // page 2 from file and keeps page 2 read-only.
+    let m2 = run_call(
+        &mut process,
+        abi,
+        Operation::Mmap,
+        [
+            0, PAGE, 1,    /* PROT_READ */
+            0x01, /* MAP_SHARED */
+            fd, 0,
+        ],
+        &mut mem,
+        &mut host,
+    );
+    assert!(m2 >= PAGE);
+    // Occupy m2 + PAGE so mremap must relocate.
+    mem.map_at(m2 + PAGE, PAGE, PageFlags::READ).unwrap();
+    let moved = run_call(
+        &mut process,
+        abi,
+        Operation::Mremap,
+        [m2, PAGE, 2 * PAGE, 1 /* MREMAP_MAYMOVE */, 0, 0],
+        &mut mem,
+        &mut host,
+    );
+    assert_ne!(moved, m2);
+    assert!(moved >= PAGE);
+    mem.read(moved, &mut page1).unwrap();
+    mem.read(moved + PAGE, &mut page2).unwrap();
+    assert_eq!(&page1, b"CCCC");
+    assert_eq!(&page2, b"BBBB");
+    assert!(mem.check_writable(moved + PAGE, 1).is_err());
+}
+
+#[test]
+fn shared_mapping_syncs_write_into_readonly_pages_and_partial_mprotect_flushes() {
+    let abi = Abi::X86_64;
+    let mut process = Process::<MemRes>::new(abi, NonZeroU32::new(1).unwrap(), 0x40_0000);
+    let mut mem = PageMem::default();
+    let mut host = MockHost::default();
+    host.files
+        .lock()
+        .unwrap()
+        .insert(1, b"initial-data".to_vec());
+
+    let buf = 0x10_0000;
+    mem.write(buf, b"/mapped\0").unwrap();
+    let fd = run_call(
+        &mut process,
+        abi,
+        Operation::Openat,
+        [(-100i32) as u32 as u64, buf, 2 /* O_RDWR */, 0, 0, 0],
+        &mut mem,
+        &mut host,
+    );
+    assert!(fd >= 3);
+
+    // Map PROT_READ | MAP_SHARED from an O_RDWR fd.
+    let addr = run_call(
+        &mut process,
+        abi,
+        Operation::Mmap,
+        [
+            0, PAGE, 1,    /* PROT_READ */
+            0x01, /* MAP_SHARED */
+            fd, 0,
+        ],
+        &mut mem,
+        &mut host,
+    );
+    assert!(addr >= PAGE);
+    assert!(mem.check_writable(addr, 1).is_err());
+
+    // pwrite64 into the file updates the read-only MAP_SHARED page while keeping
+    // the page read-only.
+    mem.write(buf + 64, b"UPDATED").unwrap();
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Pwrite64,
+            [fd, buf + 64, 7, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        7
+    );
+    let mut seen = [0u8; 12];
+    mem.read(addr, &mut seen).unwrap();
+    assert_eq!(&seen, b"UPDATED-data");
+    assert!(mem.check_writable(addr, 1).is_err());
+
+    // Partial mprotect across [addr, addr + 2*PAGE) (second page is a hole)
+    // returns ENOMEM, leaves page 0 writable, and marks the mapping writable so
+    // msync / munmap flush mutations back to the file.
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Mprotect,
+            [addr, 2 * PAGE, 3 /* PROT_READ|PROT_WRITE */, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        err(ENOMEM)
+    );
+    mem.write(addr, b"PARTIAL").unwrap();
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Msync,
+            [addr, PAGE, 4 /* MS_SYNC */, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        0
+    );
+    assert_eq!(&host.files.lock().unwrap()[&1], b"PARTIAL-data");
+}
+
+#[test]
+fn readlinkat_empty_path_rejects_at_fdcwd_and_resolves_open_fd() {
+    let abi = Abi::X86_64;
+    let mut process = Process::<MemRes>::new(abi, NonZeroU32::new(1).unwrap(), 0x40_0000);
+    let mut mem = PageMem::default();
+    let mut host = MockHost::default();
+    let buf = 0x10_0000;
+
+    // Empty path relative to AT_FDCWD must fail with ENOENT.
+    mem.write(buf, b"\0").unwrap();
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Readlinkat,
+            [(-100i32) as u32 as u64, buf, buf + 64, 64, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        err(ENOENT)
+    );
+
+    // Open /sym with O_PATH | O_NOFOLLOW and readlinkat(sym_fd, "", ...).
+    mem.write(buf + 16, b"/sym\0").unwrap();
+    let sym_fd = run_call(
+        &mut process,
+        abi,
+        Operation::Openat,
+        [
+            (-100i32) as u32 as u64,
+            buf + 16,
+            0x20_0000 | 0x2_0000, /* O_PATH | O_NOFOLLOW (x86_64) */
+            0,
+            0,
+            0,
+        ],
+        &mut mem,
+        &mut host,
+    );
+    assert!(sym_fd >= 3);
+    let n = run_call(
+        &mut process,
+        abi,
+        Operation::Readlinkat,
+        [sym_fd, buf, buf + 64, 64, 0, 0],
+        &mut mem,
+        &mut host,
+    );
+    assert_eq!(n, b"target-from-fd".len() as u64);
+    let mut out = [0u8; 14];
+    mem.read(buf + 64, &mut out).unwrap();
+    assert_eq!(&out, b"target-from-fd");
+}
+
+#[test]
+fn tcsetsf_does_not_flush_stdin_when_denied_and_flushes_when_allowed() {
+    let abi = Abi::X86_64;
+    let mut process = Process::<MemRes>::new(abi, NonZeroU32::new(1).unwrap(), 0x40_0000);
+    let mut mem = PageMem::default();
+    let mut host = MockHost {
+        stdin_return_whole_chunk: true,
+        ..Default::default()
+    };
+    host.stdin.lock().unwrap().extend_from_slice(b"abcdef");
+    let buf = 0x10_0000;
+
+    // Seed stdin_carry with "cdef" by reading 2 bytes from a 6-byte chunk.
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Read,
+            [0, buf, 2, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        2
+    );
+    let mut got = [0u8; 2];
+    mem.read(buf, &mut got).unwrap();
+    assert_eq!(&got, b"ab");
+
+    // Fetch current termios into buf + 64.
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Ioctl,
+            [0, 0x5401 /* TCGETS */, buf + 64, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        0
+    );
+
+    // Without TTY control authority, TCSETSF fails with EPERM and must NOT
+    // discard unread stdin_carry bytes.
+    host.tty_control = false;
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Ioctl,
+            [0, 0x5404 /* TCSETSF */, buf + 64, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        err(EPERM)
+    );
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Read,
+            [0, buf, 2, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        2
+    );
+    mem.read(buf, &mut got).unwrap();
+    assert_eq!(&got, b"cd");
+
+    // With TTY control authority, TCSETSF succeeds and flushes the remaining
+    // "ef" in stdin_carry so a nonblocking read returns EAGAIN.
+    host.tty_control = true;
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Ioctl,
+            [0, 0x5404 /* TCSETSF */, buf + 64, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        0
+    );
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Fcntl,
+            [
+                0, 4,     /* F_SETFL */
+                0x800, /* O_NONBLOCK */
+                0, 0, 0
+            ],
+            &mut mem,
+            &mut host
+        ),
+        0
+    );
+    assert_eq!(
+        run_call(
+            &mut process,
+            abi,
+            Operation::Read,
+            [0, buf, 4, 0, 0, 0],
+            &mut mem,
+            &mut host
+        ),
+        err(EAGAIN)
+    );
 }

@@ -960,7 +960,7 @@ async fn read<R: Resources, M: UserMemory, O: Stdio + Filesystem<R>>(
     io::read_resource::<R, M>(&entry, args, memory).await
 }
 
-async fn write<R: Resources, M: UserMemory, O: Stdio + Filesystem<R>>(
+async fn write<R: Resources, M: VirtualMemory, O: Stdio + Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,

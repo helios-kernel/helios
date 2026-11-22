@@ -1058,6 +1058,9 @@ pub(super) async fn readlinkat<R: Resources, M: UserMemory, F: Filesystem<R>>(
         Ok(path) => path,
         Err(err) => return err,
     };
+    if path.is_empty() && dirfd == AT_FDCWD {
+        return errno(ENOENT);
+    }
     let base = match dirfd_file(process, dirfd, &path, true, fs) {
         Ok(base) => base,
         Err(err) => return err,
@@ -1647,7 +1650,7 @@ pub(super) async fn read_file<R: Resources, M: UserMemory, F: Filesystem<R>>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn write_file<R: Resources, M: UserMemory, F: Filesystem<R>>(
+pub(super) async fn write_file<R: Resources, M: VirtualMemory, F: Filesystem<R>>(
     process: &Process<R>,
     entry: &Entry<R>,
     buf: u64,
@@ -1809,7 +1812,7 @@ pub(super) async fn pread64<R: Resources, M: UserMemory, F: Filesystem<R>>(
     .await
 }
 
-pub(super) async fn pwrite64<R: Resources, M: UserMemory, F: Filesystem<R>>(
+pub(super) async fn pwrite64<R: Resources, M: VirtualMemory, F: Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     memory: &mut M,
@@ -1947,7 +1950,7 @@ pub(super) async fn readv_common<R: Resources, M: UserMemory, O: Stdio + Filesys
     done
 }
 
-pub(super) async fn writev_common<R: Resources, M: UserMemory, O: Stdio + Filesystem<R>>(
+pub(super) async fn writev_common<R: Resources, M: VirtualMemory, O: Stdio + Filesystem<R>>(
     process: &Process<R>,
     args: [u64; 6],
     explicit_offset: Option<i64>,

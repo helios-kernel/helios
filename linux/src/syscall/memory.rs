@@ -277,8 +277,13 @@ pub(super) async fn flush_all_shared_mappings<R: Resources, M: UserMemory, F: fs
 }
 
 /// Propagates bytes written to `file` at `offset` into any active `MAP_SHARED`
-/// mappings of the same file in `process`.
-pub(super) fn sync_write_to_shared_mappings<R: Resources, M: UserMemory, F: fs::Filesystem<R>>(
+/// mappings of the same file in `process`, temporarily granting write access
+/// to read-only `MAP_SHARED` pages while copying.
+pub(super) fn sync_write_to_shared_mappings<
+    R: Resources,
+    M: VirtualMemory,
+    F: fs::Filesystem<R>,
+>(
     process: &Process<R>,
     file: &R::File,
     offset: u64,
@@ -307,10 +312,49 @@ pub(super) fn sync_write_to_shared_mappings<R: Resources, M: UserMemory, F: fs::
             })
             .collect()
     };
+    if targets.is_empty() {
+        return;
+    }
+    let _mm = process.shared.program_break.lock();
     for (addr, src_off, len) in targets {
-        let src_start = src_off as usize;
-        let src_end = src_start + len as usize;
-        let _ = memory.write(addr, &bytes[src_start..src_end]);
+        let end = addr.saturating_add(len);
+        let query_end = page_align(end);
+        let mut pos = addr;
+        while pos < end {
+            let query_start = pos & !(PAGE - 1);
+            let Some(region) = memory.region(query_start, query_end) else {
+                break;
+            };
+            if region.start >= end {
+                break;
+            }
+            let copy_start = region.start.max(pos);
+            let copy_end = region.end.min(end);
+            if copy_start < copy_end {
+                let slice_start = (src_off + (copy_start - addr)) as usize;
+                let slice_end = slice_start + (copy_end - copy_start) as usize;
+                if region.access.contains(PageFlags::WRITE) {
+                    let _ = memory.write(copy_start, &bytes[slice_start..slice_end]);
+                } else {
+                    let p_start = copy_start & !(PAGE - 1);
+                    let p_end = page_align(copy_end);
+                    let p_len = p_end - p_start;
+                    if p_len > 0
+                        && memory
+                            .protect(
+                                p_start,
+                                p_len,
+                                region.access | PageFlags::READ | PageFlags::WRITE,
+                            )
+                            .is_ok()
+                    {
+                        let _ = memory.write(copy_start, &bytes[slice_start..slice_end]);
+                        let _ = memory.protect(p_start, p_len, region.access);
+                    }
+                }
+            }
+            pos = copy_end.max(region.end);
+        }
     }
 }
 
@@ -580,6 +624,18 @@ pub(super) async fn msync<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
     if hole { errno(ENOMEM) } else { 0 }
 }
 
+fn mark_shared_writable<R: Resources>(process: &Process<R>, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let mut shared = process.shared.shared_mappings.lock();
+    for m in shared.iter_mut() {
+        if m.start < end && m.end() > start {
+            m.writable = true;
+        }
+    }
+}
+
 /// `mprotect(addr, length, prot)` (mm/mprotect.c `do_mprotect_pkey`).
 /// Regions are changed in address order; a hole after the first ends the
 /// walk with `ENOMEM` and leaves the regions before it changed.
@@ -627,33 +683,31 @@ pub(super) fn mprotect<R: Resources, M: VirtualMemory>(
     let access = access(prot);
     let mut position = start;
     let mut region = Some(first);
-    while let Some(Region {
-        start: r_start,
-        end: run,
-        ..
-    }) = region
-    {
+    let result = loop {
+        let Some(Region {
+            start: r_start,
+            end: run,
+            ..
+        }) = region
+        else {
+            break errno(ENOMEM);
+        };
         if r_start != position {
-            return errno(ENOMEM);
+            break errno(ENOMEM);
         }
         if let Err(error) = memory.protect(r_start, run - r_start, access) {
-            return map_errno(error);
+            break map_errno(error);
         }
         position = run;
         if position == end {
-            if prot & PROT_WRITE != 0 {
-                let mut shared = process.shared.shared_mappings.lock();
-                for m in shared.iter_mut() {
-                    if m.start < end && m.end() > start {
-                        m.writable = true;
-                    }
-                }
-            }
-            return 0;
+            break 0;
         }
         region = memory.region(position, end);
+    };
+    if prot & PROT_WRITE != 0 {
+        mark_shared_writable(process, start, position);
     }
-    errno(ENOMEM)
+    result
 }
 
 /// `madvise(addr, length, advice)` for the advice that frees memory
@@ -684,24 +738,115 @@ pub(super) fn madvise<M: VirtualMemory>(args: [u64; 6], memory: &mut M) -> u64 {
     if hole { errno(ENOMEM) } else { 0 }
 }
 
+struct GrownSharedTail<F> {
+    mapping_start: u64,
+    old_len: u64,
+    new_len: u64,
+    tail_addr: u64,
+    tail_len: u64,
+    file: F,
+    tail_file_offset: u64,
+}
+
 /// Relocates any `SharedFileMapping` contained in `[from, from + old_len)` to
-/// `[to, to + new_len)`.
+/// `to`. When a full mapping grew (`new_len > old_len`), keeps `m.len == old_len`
+/// and returns a `GrownSharedTail` so the caller populates the newly exposed
+/// file pages before expanding `m.len`.
 fn move_shared_range<R: Resources>(
     process: &Process<R>,
     from: u64,
     old_len: u64,
     to: u64,
     new_len: u64,
-) {
+) -> Option<GrownSharedTail<R::File>> {
     let from_end = from.saturating_add(old_len);
     let mut guard = process.shared.shared_mappings.lock();
+    let mut grown_tail = None;
     for m in guard.iter_mut() {
         if m.start >= from && m.end() <= from_end {
             let offset_in_old = m.start - from;
             m.start = to + offset_in_old;
-            if offset_in_old == 0 && m.len == old_len {
-                m.len = new_len;
+            if offset_in_old == 0 && m.len == old_len && new_len > old_len {
+                grown_tail = Some(GrownSharedTail {
+                    mapping_start: to,
+                    old_len,
+                    new_len,
+                    tail_addr: to + old_len,
+                    tail_len: new_len - old_len,
+                    file: m.file.clone(),
+                    tail_file_offset: m.file_offset.saturating_add(old_len),
+                });
             }
+        }
+    }
+    grown_tail
+}
+
+/// Populates the newly grown tail of a `MAP_SHARED` file mapping from its
+/// backing file and then expands the tracked mapping length to `new_len`.
+async fn populate_grown_shared_tail<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
+    process: &Process<R>,
+    tail: GrownSharedTail<R::File>,
+    region_access: PageFlags,
+    memory: &mut M,
+    fs: &mut F,
+) {
+    let Ok(stat) = fs.stat_file(&tail.file).await else {
+        return;
+    };
+    if tail.tail_file_offset < stat.size {
+        let to_load = tail.tail_len.min(stat.size - tail.tail_file_offset);
+        let need_temp_write = !region_access.contains(PageFlags::WRITE);
+        if need_temp_write {
+            let _mm = process.shared.program_break.lock();
+            if memory
+                .protect(
+                    tail.tail_addr,
+                    tail.tail_len,
+                    PageFlags::READ | PageFlags::WRITE,
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+        const CHUNK: usize = 64 * 1024;
+        let mut filled = 0u64;
+        let mut ok = true;
+        while filled < to_load {
+            let want = (to_load - filled).min(CHUNK as u64) as usize;
+            let Ok(bytes) = fs
+                .read_at(&tail.file, tail.tail_file_offset + filled, want)
+                .await
+            else {
+                ok = false;
+                break;
+            };
+            if bytes.is_empty() {
+                break;
+            }
+            if memory.write(tail.tail_addr + filled, &bytes).is_err() {
+                ok = false;
+                break;
+            }
+            filled += bytes.len() as u64;
+            if bytes.len() < want {
+                break;
+            }
+        }
+        if need_temp_write {
+            let _mm = process.shared.program_break.lock();
+            let _ = memory.protect(tail.tail_addr, tail.tail_len, region_access);
+        }
+        if !ok {
+            return;
+        }
+    }
+    let mut guard = process.shared.shared_mappings.lock();
+    for m in guard.iter_mut() {
+        if m.start == tail.mapping_start && m.len == tail.old_len {
+            m.len = tail.new_len;
+            break;
         }
     }
 }
@@ -763,39 +908,65 @@ pub(super) async fn mremap<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>
     if let Err(result) = resizable(address, old_length, region) {
         return result;
     }
-    let _mm = process.shared.program_break.lock();
-    if old_length == region.end - address {
-        let delta = new_length - old_length;
-        if region
-            .end
-            .checked_add(delta)
-            .is_some_and(|end| end <= task && memory.region(region.end, end).is_none())
-        {
-            return match memory.map_at(region.end, delta, region.access) {
-                Ok(()) => {
-                    move_shared_range(process, address, old_length, address, new_length);
-                    address
+    let (result_addr, grown_tail) = {
+        let _mm = process.shared.program_break.lock();
+        if old_length == region.end - address {
+            let delta = new_length - old_length;
+            if region
+                .end
+                .checked_add(delta)
+                .is_some_and(|end| end <= task && memory.region(region.end, end).is_none())
+            {
+                match memory.map_at(region.end, delta, region.access) {
+                    Ok(()) => {
+                        let tail =
+                            move_shared_range(process, address, old_length, address, new_length);
+                        (Ok(address), tail)
+                    }
+                    Err(error) => (Err(map_errno(error)), None),
                 }
-                Err(error) => map_errno(error),
-            };
+            } else if flags & MREMAP_MAYMOVE == 0 {
+                (Err(errno(ENOMEM)), None)
+            } else if let Some(target) = (new_length <= task)
+                .then(|| memory.free_range(0, new_length))
+                .flatten()
+            {
+                match memory.remap(address, old_length, target, new_length) {
+                    Ok(()) => {
+                        let tail =
+                            move_shared_range(process, address, old_length, target, new_length);
+                        (Ok(target), tail)
+                    }
+                    Err(error) => (Err(map_errno(error)), None),
+                }
+            } else {
+                (Err(errno(ENOMEM)), None)
+            }
+        } else if flags & MREMAP_MAYMOVE == 0 {
+            (Err(errno(ENOMEM)), None)
+        } else if let Some(target) = (new_length <= task)
+            .then(|| memory.free_range(0, new_length))
+            .flatten()
+        {
+            match memory.remap(address, old_length, target, new_length) {
+                Ok(()) => {
+                    let tail = move_shared_range(process, address, old_length, target, new_length);
+                    (Ok(target), tail)
+                }
+                Err(error) => (Err(map_errno(error)), None),
+            }
+        } else {
+            (Err(errno(ENOMEM)), None)
         }
-    }
-    if flags & MREMAP_MAYMOVE == 0 {
-        return errno(ENOMEM);
-    }
-    let Some(target) = (new_length <= task)
-        .then(|| memory.free_range(0, new_length))
-        .flatten()
-    else {
-        return errno(ENOMEM);
     };
-    match memory.remap(address, old_length, target, new_length) {
-        Ok(()) => {
-            move_shared_range(process, address, old_length, target, new_length);
-            target
-        }
-        Err(error) => map_errno(error),
+    let target = match result_addr {
+        Ok(addr) => addr,
+        Err(err) => return err,
+    };
+    if let Some(tail) = grown_tail {
+        populate_grown_shared_tail(process, tail, region.access, memory, fs).await;
     }
+    target
 }
 
 /// `vma_to_resize`'s checks on a region, `Err` holding the result.
@@ -843,34 +1014,40 @@ async fn mremap_to<R: Resources, M: VirtualMemory, F: fs::Filesystem<R>>(
         }
         old_length = new_length;
     }
-    let _mm = process.shared.program_break.lock();
-    let region = match memory.region(address, task) {
-        Some(region) if region.start == address => region,
-        _ => return errno(EFAULT),
-    };
-    if let Err(result) = resizable(address, old_length, region) {
-        return result;
-    }
-    let target = if flags & MREMAP_FIXED != 0 {
-        if new_address < memory.lowest_address() {
-            return map_errno(MapError::Address);
+    let (target, region_access, grown_tail) = {
+        let _mm = process.shared.program_break.lock();
+        let region = match memory.region(address, task) {
+            Some(region) if region.start == address => region,
+            _ => return errno(EFAULT),
+        };
+        if let Err(result) = resizable(address, old_length, region) {
+            return result;
         }
-        new_address
-    } else {
-        match memory.free_range(new_address, new_length) {
-            Some(target) => target,
-            None => return errno(ENOMEM),
-        }
-    };
-    if let Err(error) = memory.remap(address, old_length, target, new_length) {
-        return map_errno(error);
-    }
-    move_shared_range(process, address, old_length, target, new_length);
-    if flags & MREMAP_DONTUNMAP != 0 {
-        if let Err(error) = memory.map_at(address, old_length, region.access) {
+        let target = if flags & MREMAP_FIXED != 0 {
+            if new_address < memory.lowest_address() {
+                return map_errno(MapError::Address);
+            }
+            new_address
+        } else {
+            match memory.free_range(new_address, new_length) {
+                Some(target) => target,
+                None => return errno(ENOMEM),
+            }
+        };
+        if let Err(error) = memory.remap(address, old_length, target, new_length) {
             return map_errno(error);
         }
-        memory.discard(address, old_length);
+        let tail = move_shared_range(process, address, old_length, target, new_length);
+        if flags & MREMAP_DONTUNMAP != 0 {
+            if let Err(error) = memory.map_at(address, old_length, region.access) {
+                return map_errno(error);
+            }
+            memory.discard(address, old_length);
+        }
+        (target, region.access, tail)
+    };
+    if let Some(tail) = grown_tail {
+        populate_grown_shared_tail(process, tail, region_access, memory, fs).await;
     }
     target
 }

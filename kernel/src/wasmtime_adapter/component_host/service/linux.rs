@@ -793,7 +793,7 @@ where
         &mut self,
         stream: TtyStream,
         termios: Termios,
-        _action: TermiosAction,
+        action: TermiosAction,
     ) -> Result<(), TtyError> {
         let mut state = self.shared.tty.lock();
         if !state.is_tty(stream) {
@@ -803,6 +803,10 @@ where
             return Err(TtyError::Denied);
         }
         state.termios = termios;
+        drop(state);
+        if action == TermiosAction::Flush {
+            self.shared.serial_peek.lock().clear();
+        }
         Ok(())
     }
 
@@ -1028,6 +1032,17 @@ where
     ) -> Result<String, FsError> {
         if self.shared.grants.symlink_read.is_none() {
             return Err(FsError::NotPermitted);
+        }
+        if path.is_empty() {
+            let Some(file) = base else {
+                return Err(FsError::NoEntry);
+            };
+            return self
+                .shared
+                .container
+                .filesystem()
+                .read_link_resolved(&file.path)
+                .await;
         }
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         self.shared
