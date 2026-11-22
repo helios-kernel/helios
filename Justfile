@@ -102,6 +102,10 @@ clippy-host:
 clippy-programs:
     #!/usr/bin/env bash
     set -euo pipefail
+    # `helios-venus` generates its protocol module from the pinned
+    # venus-protocol inputs when `helios-gpu-test` or `helios-webgpu-provider`
+    # builds.
+    {{ cli }} venus-protocol-fetch
     # One program per invocation: they select mutually exclusive
     # `helios-api` worlds, and a single invocation covering several of
     # them would unify those features and fail to build.

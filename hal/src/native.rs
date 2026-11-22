@@ -273,17 +273,20 @@ pub trait NativeExecution: Send + Sync + 'static {
 /// with. Dropping a space releases its frames; the caller's borrow during
 /// [`UserContext::resume`] guarantees no slice of it is running then.
 pub unsafe trait UserSpace: Send + Sync + 'static {
-    /// Installs zero-filled private pages covering `range` with `flags`,
-    /// then copies `contents` to `range.start`. `range` need not be page
-    /// aligned; every page it touches is installed. Fails, mapping nothing,
-    /// when `contents` is longer than the range or any covered page is
-    /// already mapped. Any combination of read, write and execute is a
-    /// valid `flags`, write and execute together included.
+    /// Reserves private zero-fill-on-demand pages covering `range` with `flags`
+    /// and copies `contents` to `range.start`, committing frames for the
+    /// pages `contents` touches and leaving any remaining pages uncommitted
+    /// until their first touch. `range` need not be page aligned; every page
+    /// it touches is mapped. Fails, mapping nothing, when `contents` is
+    /// longer than the range or any covered page is already mapped. Any
+    /// combination of read, write and execute is a valid `flags`, write and
+    /// execute together included.
     fn map(&self, range: VirtRange, contents: &[u8], flags: PageFlags) -> Result<(), NativeError>;
 
-    /// Installs `byte_len` bytes (a page multiple) of zero-filled private
-    /// pages at the first free range at or above `hint`, else at the first
-    /// free range of the user range, and returns where.
+    /// Reserves `byte_len` bytes (a page multiple) of private
+    /// zero-fill-on-demand pages at the first free range at or above `hint`,
+    /// else at the first free range of the user range, and returns where.
+    /// Pages take no backing frame until first touched.
     fn map_anywhere(
         &self,
         hint: VirtAddr,
@@ -300,6 +303,29 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     /// Copies `bytes` to `address`, which must be mapped writable over the
     /// whole length; nothing is written otherwise.
     fn write(&self, address: VirtAddr, bytes: &[u8]) -> Result<(), NativeError>;
+
+    /// Atomically loads the 32-bit little-endian word at the 4-byte-aligned
+    /// `address`, coherent with user-mode atomic operations on every
+    /// processor. Fails with [`NativeError::Address`] when `address` is
+    /// misaligned or outside the user range, and [`NativeError::NotMapped`]
+    /// when the page is not mapped readable.
+    fn atomic_load_u32(&self, address: VirtAddr) -> Result<u32, NativeError>;
+
+    /// Atomically stores `value` at the 4-byte-aligned `address`, committing a
+    /// discarded writable page first and coherent with user-mode atomic
+    /// operations on every processor.
+    fn atomic_store_u32(&self, address: VirtAddr, value: u32) -> Result<(), NativeError>;
+
+    /// Atomically compares the 32-bit word at the 4-byte-aligned `address`
+    /// with `expected` and, if equal, replaces it with `desired`, coherent
+    /// with user-mode atomic operations on every processor. Requires both
+    /// read and write access on the page.
+    fn atomic_compare_exchange_u32(
+        &self,
+        address: VirtAddr,
+        expected: u32,
+        desired: u32,
+    ) -> Result<Result<u32, u32>, NativeError>;
 
     /// Removes every mapped page of `range`, a page-aligned range inside
     /// the user range, and frees its frame once the shootdown completes.
@@ -320,22 +346,23 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     fn discard(&self, range: VirtRange) -> Result<(), NativeError>;
 
     /// Moves the pages of `from` to the start of `to`, each keeping its
-    /// frame (or its discarded state) and its access, and installs
-    /// zero-filled pages with the same access over the rest of `to`. Both
-    /// ranges are page aligned and disjoint, `to` is at least as long as
-    /// `from` and has no mapping, and every page of `from` is mapped with
-    /// one access; anything else fails with nothing changed. When it
-    /// returns, `from` has no mapping and no processor holds a translation
-    /// of it.
+    /// frame (or its uncommitted state) and its access, and reserves
+    /// zero-fill-on-demand pages with the same access over the rest of
+    /// `to` without committing frames until touched. Both ranges are page
+    /// aligned and disjoint, `to` is at least as long as `from` and has no
+    /// mapping, and every page of `from` is mapped with one access; anything
+    /// else fails with nothing changed. When it returns, `from` has no
+    /// mapping and no processor holds a translation of it.
     fn remap(&self, from: VirtRange, to: VirtRange) -> Result<(), NativeError>;
 
     /// Answers a page fault a slice reported at `address` for `access`
     /// (one of read, write or execute). Succeeds, and the context may
-    /// resume, when the page is mapped with that access: a discarded page
-    /// gets its zero-filled frame here, and a page that already has one
-    /// faulted on a translation an earlier, narrower state left on that
-    /// processor. Fails with [`NativeError::NotMapped`] when the page is
-    /// not mapped with `access`, so the fault is the program's.
+    /// resume, when the page is mapped with that access: an uncommitted
+    /// page (newly reserved or discarded) gets its zero-filled frame here,
+    /// and a page that already has one faulted on a translation an earlier,
+    /// narrower state left on that processor. Fails with
+    /// [`NativeError::NotMapped`] when the page is not mapped with
+    /// `access`, so the fault is the program's.
     fn resolve_fault(&self, address: VirtAddr, access: PageFlags) -> Result<(), NativeError>;
 
     /// The first run of the page-aligned `range` mapped contiguously with
@@ -384,6 +411,13 @@ pub unsafe trait UserContext: Send + 'static {
     /// Replaces the thread pointer; refused outside the user range.
     fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError>;
 
+    /// Duplicates the detached architectural snapshot (general, flags, thread
+    /// pointer, vector and extended state) into an independent context for a
+    /// new thread or child process.
+    fn try_clone(&self) -> Result<Self, NativeError>
+    where
+        Self: Sized;
+
     /// Runs one slice against `space`.
     fn resume(&mut self, space: &Self::Space) -> Stop;
 }
@@ -422,6 +456,20 @@ unsafe impl UserSpace for Infallible {
     fn write(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
         match *self {}
     }
+    fn atomic_load_u32(&self, _: VirtAddr) -> Result<u32, NativeError> {
+        match *self {}
+    }
+    fn atomic_store_u32(&self, _: VirtAddr, _: u32) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn atomic_compare_exchange_u32(
+        &self,
+        _: VirtAddr,
+        _: u32,
+        _: u32,
+    ) -> Result<Result<u32, u32>, NativeError> {
+        match *self {}
+    }
     fn unmap(&self, _: VirtRange) -> Result<(), NativeError> {
         match *self {}
     }
@@ -434,7 +482,8 @@ unsafe impl UserSpace for Infallible {
     fn remap(&self, _: VirtRange, _: VirtRange) -> Result<(), NativeError> {
         match *self {}
     }
-    fn resolve_fault(&self, _: VirtAddr, _: PageFlags) -> Result<(), NativeError> {
+    fn resolve_fault(&self, _: VirtAddr, access: PageFlags) -> Result<(), NativeError> {
+        let _ = access;
         match *self {}
     }
     fn mapping(&self, _: VirtRange) -> Option<Mapping> {
@@ -458,6 +507,9 @@ unsafe impl UserContext for Infallible {
         match *self {}
     }
     fn set_thread_pointer(&mut self, _: VirtAddr) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn try_clone(&self) -> Result<Self, NativeError> {
         match *self {}
     }
     fn resume(&mut self, _: &Self) -> Stop {

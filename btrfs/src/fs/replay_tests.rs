@@ -122,6 +122,7 @@ async fn create<S: BlockSink>(
             },
             Attributes {
                 mode,
+                umask: 0,
                 uid: 1000,
                 gid: 1000,
             },
