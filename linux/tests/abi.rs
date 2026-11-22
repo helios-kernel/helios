@@ -16,6 +16,8 @@ use helios_linux::syscall::{
 // The crate root is not `mod.rs`, so the submodule names its directory.
 #[path = "abi/files_poll_tty.rs"]
 mod files_poll_tty;
+#[path = "abi/permissions.rs"]
+mod permissions;
 #[path = "abi/system.rs"]
 mod system;
 
@@ -519,9 +521,9 @@ fn aarch64_numbers_reach_the_same_operations_and_legacy_numbers_do_not() {
         unix_call(&mut process, 172, [0; 6], &mut memory, &mut sink),
         5
     );
-    // x86-64's write (1), dup2 (33) and epoll_create (213) are no aarch64
-    // calls this decoder serves (213 is readahead there).
-    for number in [1, 33, 213] {
+    // x86-64's write (1), epoll_create (213) and eventfd (284) are no aarch64
+    // calls this decoder serves (1 is io_destroy, 213 readahead, 284 seccomp).
+    for number in [1, 213, 284] {
         assert_eq!(
             unix_call(&mut process, number, [0; 6], &mut memory, &mut sink),
             38u64.wrapping_neg()

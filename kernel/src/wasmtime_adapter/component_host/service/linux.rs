@@ -1037,19 +1037,11 @@ fn container_info_to_stat(info: &crate::ContainerNodeInfo) -> FileStat {
         nlink: info.metadata.link_count,
         uid: info.unix.uid,
         gid: info.unix.gid,
-        rdev: 0,
+        rdev: info.rdev,
         size: info.metadata.size,
         access_nanos: info.metadata.access_nanos,
         modified_nanos: info.metadata.modified_nanos,
         status_nanos: info.metadata.status_nanos,
-    }
-}
-
-fn resolve_time_update(update: TimeUpdate, now: u64) -> Option<u64> {
-    match update {
-        TimeUpdate::Omit => None,
-        TimeUpdate::Now => Some(now),
-        TimeUpdate::Set(nanos) => Some(nanos),
     }
 }
 
@@ -1157,18 +1149,19 @@ where
         cwd: &str,
         path: &str,
         request: OpenRequest,
-    ) -> Result<FsDescriptor, FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<FsDescriptor, syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
         let opened = self
             .shared
             .container
             .filesystem()
-            .open_at(base_dir, path, request, now)
+            .open_at(base_dir, path, request, creds, now)
             .await;
         let (info, container_path, mount_hold) = match opened {
             Ok(ok) => ok,
-            Err(FsError::NoEntry) => {
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
                 let servers = self
                     .shared
                     .runtime_state
@@ -1181,7 +1174,8 @@ where
                     path,
                     &servers,
                     request,
-                );
+                )
+                .map_err(Into::into);
             }
             Err(error) => return Err(error),
         };
@@ -1217,17 +1211,18 @@ where
         cwd: &str,
         path: &str,
         follow: bool,
-    ) -> Result<(FileStat, String), FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<(FileStat, String), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         match self
             .shared
             .container
             .filesystem()
-            .stat_at(base_dir, path, follow)
+            .stat_at(base_dir, path, follow, creds)
             .await
         {
             Ok((info, resolved_path)) => Ok((container_info_to_stat(&info), resolved_path)),
-            Err(FsError::NoEntry) => {
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
                 let servers = self
                     .shared
                     .runtime_state
@@ -1235,12 +1230,13 @@ where
                     .map(|service| service.dns_servers())
                     .unwrap_or_default();
                 synthetic_etc_stat_lookup(&self.shared.container, base_dir, path, &servers)
+                    .map_err(Into::into)
             }
             Err(error) => Err(error),
         }
     }
 
-    async fn stat_file(&self, file: &FsDescriptor) -> Result<FileStat, FsError> {
+    async fn stat_file(&self, file: &FsDescriptor) -> Result<FileStat, syscall::FsOpError> {
         match self
             .shared
             .container
@@ -1249,7 +1245,7 @@ where
             .await
         {
             Ok(info) => Ok(container_info_to_stat(&info)),
-            Err(FsError::NoEntry) => {
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
                 let servers = self
                     .shared
                     .runtime_state
@@ -1263,7 +1259,7 @@ where
                 {
                     return Ok(synthetic_etc_stat(&file.path, bytes.len() as u64));
                 }
-                Err(FsError::NoEntry)
+                Err(FsError::NoEntry.into())
             }
             Err(error) => Err(error),
         }
@@ -1275,17 +1271,18 @@ where
         cwd: &str,
         path: &str,
         check: AccessCheck,
-    ) -> Result<(), FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         match self
             .shared
             .container
             .filesystem()
-            .access_at(base_dir, path, check)
+            .access_at(base_dir, path, check, creds)
             .await
         {
             Ok(()) => Ok(()),
-            Err(FsError::NoEntry) => {
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
                 let servers = self
                     .shared
                     .runtime_state
@@ -1293,9 +1290,22 @@ where
                     .map(|service| service.dns_servers())
                     .unwrap_or_default();
                 synthetic_etc_access_lookup(&self.shared.container, base_dir, path, &servers, check)
+                    .map_err(Into::into)
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn can_chdir_file(
+        &self,
+        file: &FsDescriptor,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .can_chdir(&file.path, creds)
+            .await
     }
 
     async fn read_at(
@@ -1303,7 +1313,7 @@ where
         file: &FsDescriptor,
         offset: u64,
         max_bytes: usize,
-    ) -> Result<Bytes, FsError> {
+    ) -> Result<Bytes, syscall::FsOpError> {
         match self
             .shared
             .container
@@ -1312,7 +1322,7 @@ where
             .await
         {
             Ok(bytes) => Ok(bytes),
-            Err(FsError::NoEntry) => {
+            Err(syscall::FsOpError::Fs(FsError::NoEntry)) => {
                 let servers = self
                     .shared
                     .runtime_state
@@ -1330,7 +1340,7 @@ where
                     let end = start.saturating_add(max_bytes).min(bytes.len());
                     return Ok(Bytes::copy_from_slice(&bytes[start..end]));
                 }
-                Err(FsError::NoEntry)
+                Err(FsError::NoEntry.into())
             }
             Err(error) => Err(error),
         }
@@ -1341,19 +1351,20 @@ where
         file: &FsDescriptor,
         position: WritePosition,
         bytes: &[u8],
-    ) -> Result<Landed, FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<Landed, syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
         self.shared
             .container
             .filesystem()
-            .write_at(&file.path, position, bytes, now)
+            .write_at(&file.path, position, bytes, creds, now)
             .await
     }
 
     async fn list_dir(
         &self,
         file: &FsDescriptor,
-    ) -> Result<(u64, u64, Vec<DirListEntry>), FsError> {
+    ) -> Result<(u64, u64, Vec<DirListEntry>), syscall::FsOpError> {
         let (self_ino, parent_ino, entries) = self
             .shared
             .container
@@ -1371,25 +1382,36 @@ where
         Ok((self_ino, parent_ino, out))
     }
 
-    async fn set_size_file(&mut self, file: &FsDescriptor, size: u64) -> Result<(), FsError> {
+    async fn set_size_file(
+        &mut self,
+        file: &FsDescriptor,
+        size: u64,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
         self.shared
             .container
             .filesystem()
-            .set_size(&file.path, size, now)
+            .set_size(&file.path, size, creds, now)
             .await
     }
 
-    async fn set_size_path(&mut self, cwd: &str, path: &str, size: u64) -> Result<(), FsError> {
+    async fn set_size_path(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        size: u64,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
         self.shared
             .container
             .filesystem()
-            .set_size_at(cwd, path, size, now)
+            .set_size_at(cwd, path, size, creds, now)
             .await
     }
 
-    async fn sync(&self, file: &FsDescriptor, data_only: bool) -> Result<(), FsError> {
+    async fn sync(&self, file: &FsDescriptor, data_only: bool) -> Result<(), syscall::FsOpError> {
         self.shared
             .container
             .filesystem()
@@ -1402,13 +1424,14 @@ where
         base: Option<&FsDescriptor>,
         cwd: &str,
         path: &str,
-    ) -> Result<String, FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<String, syscall::FsOpError> {
         if self.shared.grants.symlink_read.is_none() {
-            return Err(FsError::NotPermitted);
+            return Err(FsError::NotPermitted.into());
         }
         if path.is_empty() {
             let Some(file) = base else {
-                return Err(FsError::NoEntry);
+                return Err(FsError::NoEntry.into());
             };
             return self
                 .shared
@@ -1421,7 +1444,7 @@ where
         self.shared
             .container
             .filesystem()
-            .read_link_at(base_dir, path)
+            .read_link_at(base_dir, path, creds)
             .await
     }
 
@@ -1431,13 +1454,35 @@ where
         cwd: &str,
         path: &str,
         mode: u32,
-    ) -> Result<(), FsError> {
+        umask: u32,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
         self.shared
             .container
             .filesystem()
-            .mkdir_at(base_dir, path, mode, now)
+            .mkdir_at(base_dir, path, mode, umask, creds, now)
+            .await
+    }
+
+    async fn mknod(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        kind: NodeKind,
+        mode: u32,
+        umask: u32,
+        rdev: u64,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .mknod_at(base_dir, path, kind, mode, umask, rdev, creds, now)
             .await
     }
 
@@ -1447,13 +1492,14 @@ where
         cwd: &str,
         path: &str,
         remove_dir: bool,
-    ) -> Result<(), FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
         self.shared
             .container
             .filesystem()
-            .unlink_at(base_dir, path, remove_dir, now)
+            .unlink_at(base_dir, path, remove_dir, creds, now)
             .await
     }
 
@@ -1465,14 +1511,15 @@ where
         new_path: &str,
         cwd: &str,
         mode: RenameMode,
-    ) -> Result<(), FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
         let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
         self.shared
             .container
             .filesystem()
-            .rename_at(old_dir, old_path, new_dir, new_path, mode, now)
+            .rename_at(old_dir, old_path, new_dir, new_path, mode, creds, now)
             .await
     }
 
@@ -1484,9 +1531,10 @@ where
         new_path: &str,
         cwd: &str,
         options: LinkOptions,
-    ) -> Result<(), FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         if self.shared.grants.link_source.is_none() {
-            return Err(FsError::NotPermitted);
+            return Err(FsError::NotPermitted.into());
         }
         let old_dir = old_base.map_or(cwd, |f| f.path.as_str());
         let new_dir = new_base.map_or(cwd, |f| f.path.as_str());
@@ -1501,6 +1549,7 @@ where
                 new_path,
                 options.follow,
                 options.empty_path,
+                creds,
                 now,
             )
             .await
@@ -1512,16 +1561,17 @@ where
         base: Option<&FsDescriptor>,
         cwd: &str,
         link_path: &str,
-    ) -> Result<(), FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         if self.shared.grants.symlink_create.is_none() {
-            return Err(FsError::NotPermitted);
+            return Err(FsError::NotPermitted.into());
         }
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
         self.shared
             .container
             .filesystem()
-            .symlink_at(target, base_dir, link_path, now)
+            .symlink_at(target, base_dir, link_path, creds, now)
             .await
     }
 
@@ -1533,20 +1583,14 @@ where
         follow: bool,
         access: TimeUpdate,
         modified: TimeUpdate,
-    ) -> Result<(), FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
         self.shared
             .container
             .filesystem()
-            .set_times_at(
-                base_dir,
-                path,
-                follow,
-                resolve_time_update(access, now),
-                resolve_time_update(modified, now),
-                now,
-            )
+            .set_times_at(base_dir, path, follow, access, modified, creds, now)
             .await
     }
 
@@ -1555,17 +1599,197 @@ where
         file: &FsDescriptor,
         access: TimeUpdate,
         modified: TimeUpdate,
-    ) -> Result<(), FsError> {
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
         let now = self.shared.clock.lock().system_time_nanos();
         self.shared
             .container
             .filesystem()
-            .set_times_resolved(
-                &file.path,
-                resolve_time_update(access, now),
-                resolve_time_update(modified, now),
-                now,
-            )
+            .set_times_resolved(&file.path, access, modified, creds, now)
+            .await
+    }
+
+    async fn chmod_path(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        mode: u32,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .chmod_at(base_dir, path, follow, mode, creds, now)
+            .await
+    }
+
+    async fn chmod_file(
+        &mut self,
+        file: &FsDescriptor,
+        mode: u32,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .chmod_resolved(&file.path, mode, creds, now)
+            .await
+    }
+
+    async fn chown_path(
+        &mut self,
+        base: Option<&FsDescriptor>,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let base_dir = base.map_or(cwd, |f| f.path.as_str());
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .chown_at(base_dir, path, follow, uid, gid, creds, now)
+            .await
+    }
+
+    async fn chown_file(
+        &mut self,
+        file: &FsDescriptor,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .chown_resolved(&file.path, uid, gid, creds, now)
+            .await
+    }
+
+    async fn get_xattr_path(
+        &self,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        name: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<Vec<u8>, syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .get_xattr_at(cwd, path, follow, name, creds)
+            .await
+    }
+
+    async fn get_xattr_file(
+        &self,
+        file: &FsDescriptor,
+        name: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<Vec<u8>, syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .get_xattr_resolved(&file.path, name, creds)
+            .await
+    }
+
+    async fn set_xattr_path(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        name: &str,
+        value: &[u8],
+        mode: syscall::XattrSetMode,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_xattr_at(cwd, path, follow, name, value, mode, creds, now)
+            .await
+    }
+
+    async fn set_xattr_file(
+        &mut self,
+        file: &FsDescriptor,
+        name: &str,
+        value: &[u8],
+        mode: syscall::XattrSetMode,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .set_xattr_resolved(&file.path, name, value, mode, creds, now)
+            .await
+    }
+
+    async fn list_xattrs_path(
+        &self,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        creds: &syscall::Credentials,
+    ) -> Result<Vec<String>, syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .list_xattrs_at(cwd, path, follow, creds)
+            .await
+    }
+
+    async fn list_xattrs_file(
+        &self,
+        file: &FsDescriptor,
+        creds: &syscall::Credentials,
+    ) -> Result<Vec<String>, syscall::FsOpError> {
+        self.shared
+            .container
+            .filesystem()
+            .list_xattrs_resolved(&file.path, creds)
+            .await
+    }
+
+    async fn remove_xattr_path(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        follow: bool,
+        name: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .remove_xattr_at(cwd, path, follow, name, creds, now)
+            .await
+    }
+
+    async fn remove_xattr_file(
+        &mut self,
+        file: &FsDescriptor,
+        name: &str,
+        creds: &syscall::Credentials,
+    ) -> Result<(), syscall::FsOpError> {
+        let now = self.shared.clock.lock().system_time_nanos();
+        self.shared
+            .container
+            .filesystem()
+            .remove_xattr_resolved(&file.path, name, creds, now)
             .await
     }
 }
@@ -3985,7 +4209,8 @@ where
         Some(table) => table.into_slots(),
         None => syscall::standard_streams::<LinuxResources<Net>>(),
     };
-    let credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
+    let mut credentials = credentials.unwrap_or_else(|| container.default_credentials().clone());
+    container.clamp_credentials(&mut credentials);
     let initial_cwd = container
         .authority()
         .cwd()
@@ -4498,6 +4723,7 @@ mod tests {
             sync: false,
             dsync: false,
             mode: 0o644,
+            umask: 0,
         };
 
         // Trailing slash on a synthetic regular file must fail with NotDirectory.
@@ -4524,6 +4750,7 @@ mod tests {
                     write: false,
                     exec: false,
                     follow: true,
+                    use_effective: false,
                 },
             )
             .err(),

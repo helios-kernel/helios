@@ -1060,7 +1060,8 @@ fn sigchld_auto_reap_and_orphan_reparenting_to_pid_1() {
 fn fork_cow_map_shared_untouched_child_does_not_clobber_post_fork_writes() {
     use helios_hal::fs::{FsError, Landed, NodeKind, WritePosition};
     use helios_linux::syscall::{
-        FileAccess, FileStat, Filesystem, OpenRequest, Resources, Tty, VirtualMemory,
+        Credentials, FileAccess, FileStat, Filesystem, FsOpError, OpenRequest, Resources, Tty,
+        VirtualMemory,
     };
 
     struct FileBacking;
@@ -1269,14 +1270,15 @@ fn fork_cow_map_shared_untouched_child_does_not_clobber_post_fork_writes() {
             _: &str,
             path: &str,
             _: OpenRequest,
-        ) -> Result<u32, FsError> {
+            _: &Credentials,
+        ) -> Result<u32, FsOpError> {
             if path == "/shared.bin" {
                 Ok(1)
             } else {
-                Err(FsError::NoEntry)
+                Err(FsOpError::Fs(FsError::NoEntry))
             }
         }
-        async fn stat_file(&self, _: &u32) -> Result<FileStat, FsError> {
+        async fn stat_file(&self, _: &u32) -> Result<FileStat, FsOpError> {
             let size = self.data.lock().unwrap().len() as u64;
             Ok(FileStat {
                 dev: 1,
@@ -1298,7 +1300,7 @@ fn fork_cow_map_shared_untouched_child_does_not_clobber_post_fork_writes() {
             _: &u32,
             offset: u64,
             max_bytes: usize,
-        ) -> Result<bytes::Bytes, FsError> {
+        ) -> Result<bytes::Bytes, FsOpError> {
             let data = self.data.lock().unwrap();
             let off = (offset as usize).min(data.len());
             let n = max_bytes.min(data.len() - off);
@@ -1309,7 +1311,8 @@ fn fork_cow_map_shared_untouched_child_does_not_clobber_post_fork_writes() {
             _: &u32,
             pos: WritePosition,
             bytes: &[u8],
-        ) -> Result<Landed, FsError> {
+            _: &Credentials,
+        ) -> Result<Landed, FsOpError> {
             let mut data = self.data.lock().unwrap();
             let off = match pos {
                 WritePosition::At(o) => o as usize,
@@ -1674,7 +1677,7 @@ fn clone_sighand_without_clone_thread_keeps_distinct_tgid_and_unshares_on_exec()
 #[test]
 fn dev_null_fallback_rejects_dotdot_traversal() {
     use helios_hal::fs::FsError;
-    use helios_linux::syscall::{Filesystem, OpenRequest, Tty};
+    use helios_linux::syscall::{Credentials, Filesystem, FsOpError, OpenRequest, Tty};
 
     struct EmptyFsPlatform;
     impl Stdio for EmptyFsPlatform {
@@ -1731,8 +1734,9 @@ fn dev_null_fallback_rejects_dotdot_traversal() {
             _: &str,
             _: &str,
             _: OpenRequest,
-        ) -> Result<core::convert::Infallible, FsError> {
-            Err(FsError::NoEntry)
+            _: &Credentials,
+        ) -> Result<core::convert::Infallible, FsOpError> {
+            Err(FsOpError::Fs(FsError::NoEntry))
         }
     }
 

@@ -23,6 +23,7 @@ mod io;
 mod memory;
 mod netlink;
 mod packet;
+pub mod permissions;
 mod poll;
 mod process;
 mod signal;
@@ -34,8 +35,8 @@ mod tty;
 pub use crate::abi::{Abi, Operation};
 pub use crate::signal_frame::SignalFrameError;
 pub use fs::{
-    AccessCheck, DirListEntry, FileAccess, FileStat, Filesystem, LinkOptions, OpenRequest,
-    TimeUpdate,
+    AccessCheck, DirListEntry, FileAccess, FileStat, Filesystem, FsOpError, LinkOptions,
+    OpenRequest, TimeUpdate, XattrSetMode,
 };
 pub use io::Clock;
 pub use netlink::{AF_NETLINK, NETLINK_ROUTE};
@@ -52,11 +53,12 @@ pub use socket::{
     SocketReady,
 };
 pub use system::{
-    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_KILL,
-    CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_BROADCAST, CAP_NET_RAW, CAP_SETGID, CAP_SETUID,
-    CAP_SYS_ADMIN, CAP_SYS_CHROOT, CAP_SYS_NICE, CAP_SYS_RESOURCE, CAP_SYS_TIME, Credentials,
-    CredentialsError, Ids, LinuxCapabilities, MemoryTotals, NGROUPS_MAX, NR_OPEN_DEFAULT, RELEASE,
-    RLIM_INFINITY, Resource, Rlimit, Start, System, UTS_FIELD_MAX, UtsField, UtsNameError,
+    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_FULL_SET,
+    CAP_KILL, CAP_LAST_CAP, CAP_MKNOD, CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_BROADCAST,
+    CAP_NET_RAW, CAP_SETFCAP, CAP_SETGID, CAP_SETPCAP, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_CHROOT,
+    CAP_SYS_NICE, CAP_SYS_RESOURCE, CAP_SYS_TIME, Credentials, CredentialsError, Ids,
+    LinuxCapabilities, MemoryTotals, NGROUPS_MAX, NR_OPEN_DEFAULT, RELEASE, RLIM_INFINITY,
+    Resource, Rlimit, Start, System, UTS_FIELD_MAX, UtsField, UtsNameError,
 };
 pub use thread::PidNamespace;
 pub use tty::{Termios, TermiosAction, Tty, TtyError, TtyStream, Winsize};
@@ -1151,6 +1153,72 @@ pub async fn dispatch<
         Operation::Mkdir => {
             SyscallOutcome::Return(fs::mkdir::<R, _, _>(process, arguments, memory, output).await)
         }
+        Operation::Mknodat => {
+            SyscallOutcome::Return(fs::mknodat::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Mknod => {
+            SyscallOutcome::Return(fs::mknod::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Chmod => {
+            SyscallOutcome::Return(fs::chmod::<R, _, _>(process, arguments, memory, output).await)
+        }
+        Operation::Fchmod => {
+            SyscallOutcome::Return(fs::fchmod::<R, _>(process, arguments, output).await)
+        }
+        Operation::Fchmodat => SyscallOutcome::Return(
+            fs::fchmodat2::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Fchmodat2 => SyscallOutcome::Return(
+            fs::fchmodat2::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        Operation::Chown => SyscallOutcome::Return(
+            fs::chown::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        Operation::Lchown => SyscallOutcome::Return(
+            fs::chown::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Fchown => {
+            SyscallOutcome::Return(fs::fchown::<R, _>(process, arguments, output).await)
+        }
+        Operation::Fchownat => SyscallOutcome::Return(
+            fs::fchownat::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Setxattr => SyscallOutcome::Return(
+            fs::setxattr_path::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        Operation::Lsetxattr => SyscallOutcome::Return(
+            fs::setxattr_path::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Fsetxattr => SyscallOutcome::Return(
+            fs::fsetxattr::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Getxattr => SyscallOutcome::Return(
+            fs::getxattr_path::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        Operation::Lgetxattr => SyscallOutcome::Return(
+            fs::getxattr_path::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Fgetxattr => SyscallOutcome::Return(
+            fs::fgetxattr::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Listxattr => SyscallOutcome::Return(
+            fs::listxattr_path::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        Operation::Llistxattr => SyscallOutcome::Return(
+            fs::listxattr_path::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Flistxattr => SyscallOutcome::Return(
+            fs::flistxattr::<R, _, _>(process, arguments, memory, output).await,
+        ),
+        Operation::Removexattr => SyscallOutcome::Return(
+            fs::removexattr_path::<R, _, _>(process, arguments, true, memory, output).await,
+        ),
+        Operation::Lremovexattr => SyscallOutcome::Return(
+            fs::removexattr_path::<R, _, _>(process, arguments, false, memory, output).await,
+        ),
+        Operation::Fremovexattr => SyscallOutcome::Return(
+            fs::fremovexattr::<R, _, _>(process, arguments, memory, output).await,
+        ),
         Operation::Unlinkat => SyscallOutcome::Return(
             fs::unlinkat::<R, _, _>(process, arguments, memory, output).await,
         ),
@@ -1433,6 +1501,8 @@ pub async fn dispatch<
                 .lock()
                 .setgroups(arguments, memory),
         ),
+        Operation::Capget => SyscallOutcome::Return(process.capget(arguments, memory)),
+        Operation::Capset => SyscallOutcome::Return(process.capset(arguments, memory)),
         operation @ (Operation::Prlimit64 | Operation::Getrlimit | Operation::Setrlimit) => {
             SyscallOutcome::Return(process.rlimit(operation, arguments, memory))
         }

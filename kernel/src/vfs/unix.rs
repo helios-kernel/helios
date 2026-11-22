@@ -29,7 +29,45 @@
 //! caller's processor; nothing is shared or locked.
 
 use bitflags::bitflags;
-use helios_hal::fs::{FileSystemRights, NodeKind};
+use helios_hal::fs::{FileSystemRights, FsError, NodeKind};
+
+/// Errors returned by Unix metadata and extended-attribute VFS operations,
+/// preserving Linux's distinctions (`EPERM`, `ENODATA`, `ERANGE`, `E2BIG`)
+/// beyond `hal`'s [`FsError`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum UnixFsError {
+    #[error(transparent)]
+    Fs(#[from] FsError),
+    #[error("operation not permitted")]
+    PermissionDenied,
+    #[error("extended attribute not found")]
+    NoData,
+    #[error("extended attribute name or buffer out of range")]
+    Range,
+    #[error("extended attribute value too large")]
+    ArgTooBig,
+}
+
+impl UnixFsError {
+    /// Lossy projection onto `hal`'s [`FsError`] for non-Linux callers.
+    pub const fn into_fs_error(self) -> FsError {
+        match self {
+            Self::Fs(error) => error,
+            Self::PermissionDenied => FsError::NotPermitted,
+            Self::NoData => FsError::NoEntry,
+            Self::Range | Self::ArgTooBig => FsError::Overflow,
+        }
+    }
+}
+
+/// Stored Unix metadata of a node, independent of the backing filesystem kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnixNodeMetadata {
+    pub kind: NodeKind,
+    pub attributes: UnixAttributes,
+    /// Encoded device number (`new_encode_dev`), zero for non-device nodes.
+    pub rdev: u32,
+}
 
 /// The set-group-id bit, from `include/uapi/linux/stat.h`.
 const S_ISGID: u32 = 0o2000;

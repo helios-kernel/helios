@@ -48,13 +48,14 @@ use helios_hal::fs_management::{
 use helios_hal::io::{IoError, IoResult};
 use triomphe::Arc;
 
-use super::DeviceIdAllocator;
+use super::{DeviceIdAllocator, UnixAttributes, UnixFsError, UnixNodeMetadata, XattrSetMode};
 use crate::{
     BlockCacheError, BlockPages, CACHE_BLOCK_BYTES, CachedDisk, ProgressSignal, RootEntropyHandle,
 };
 use helios_btrfs::write::{
-    CompressionPolicy, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, DEFAULT_MAX_INLINE, EncodeError,
-    WriteError, Writer, default_dirty_data_limit, stream_referenced_sources,
+    Attributes, CompressionPolicy, Compressor, DEFAULT_DIRTY_METADATA_LIMIT, DEFAULT_MAX_INLINE,
+    EncodeError, Special, WriteError, Writer, XattrMode, default_dirty_data_limit,
+    stream_referenced_sources,
 };
 
 mod prepared;
@@ -842,7 +843,14 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
     ) -> FsResult<Opened<Self::OpenHandle>> {
         if let Some(writer) = &self.inner.writer {
             return match writer
-                .execute(path.as_str(), now, Operation::Open { flags })
+                .execute(
+                    path.as_str(),
+                    now,
+                    Operation::Open {
+                        flags,
+                        attributes: None,
+                    },
+                )
                 .await?
             {
                 Response::Opened { handle, metadata } => {
@@ -1018,7 +1026,8 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
             .await
     }
     async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
-        self.mutate(path, now, Operation::CreateDirectory).await
+        self.mutate(path, now, Operation::CreateDirectory { attributes: None })
+            .await
     }
     async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
         self.mutate(path, now, Operation::Remove { directory: true })
@@ -1076,6 +1085,7 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
             now,
             Operation::Symlink {
                 target: String::from(target),
+                attributes: None,
             },
         )
         .await
@@ -1105,6 +1115,350 @@ impl<Device: BlockDevice<Buffer = BlockPages> + 'static> FileSystem for BtrfsFs<
 }
 
 impl<Device: BlockDevice<Buffer = BlockPages> + 'static> BtrfsFs<Device> {
+    fn unix_node_metadata(inode: &Inode) -> Result<UnixNodeMetadata, UnixFsError> {
+        let md = inode.metadata();
+        let kind = node_kind(md.kind)?;
+        Ok(UnixNodeMetadata {
+            kind,
+            attributes: UnixAttributes {
+                permissions: md.permissions,
+                uid: md.uid,
+                gid: md.gid,
+            },
+            rdev: md.rdev.encode(),
+        })
+    }
+
+    async fn read_xattr_inode(
+        &self,
+        reader: &Snapshot<Device>,
+        inode: &Inode,
+        name: &str,
+    ) -> Result<Option<Bytes>, UnixFsError> {
+        let mut buf = alloc::vec![0u8; 256];
+        match reader
+            .xattr(inode, name.as_bytes(), &mut buf)
+            .await
+            .map_err(|e| self.fs_error(e))?
+        {
+            None => Ok(None),
+            Some(len) if len <= buf.len() => {
+                buf.truncate(len);
+                Ok(Some(Bytes::from(buf)))
+            }
+            Some(len) => {
+                buf.resize(len, 0);
+                let actual = reader
+                    .xattr(inode, name.as_bytes(), &mut buf)
+                    .await
+                    .map_err(|e| self.fs_error(e))?
+                    .ok_or(UnixFsError::NoData)?;
+                buf.truncate(actual.min(buf.len()));
+                Ok(Some(Bytes::from(buf)))
+            }
+        }
+    }
+
+    async fn list_xattrs_inode(
+        &self,
+        reader: &Snapshot<Device>,
+        inode: &Inode,
+    ) -> Result<Vec<String>, UnixFsError> {
+        let mut names = Vec::new();
+        reader
+            .list_xattrs(inode, |raw| {
+                if let Ok(name) = core::str::from_utf8(raw) {
+                    names.push(String::from(name));
+                }
+                ControlFlow::Continue(())
+            })
+            .await
+            .map_err(|e| self.fs_error(e))?;
+        Ok(names)
+    }
+
+    pub async fn unix_metadata(&self, path: FsPath<'_>) -> Result<UnixNodeMetadata, UnixFsError> {
+        let reader = self.snapshot();
+        let inode = self.inode(&reader, path).await?;
+        Self::unix_node_metadata(&inode)
+    }
+
+    pub async fn unix_metadata_handle(
+        &self,
+        handle: &BtrfsOpenHandle,
+    ) -> Result<UnixNodeMetadata, UnixFsError> {
+        let reader = self.snapshot();
+        let inode = self
+            .inode_by_id(&reader, handle.tree(), handle.number())
+            .await?;
+        Self::unix_node_metadata(&inode)
+    }
+
+    pub async fn xattr(&self, path: FsPath<'_>, name: &str) -> Result<Option<Bytes>, UnixFsError> {
+        let reader = self.snapshot();
+        let inode = self.inode(&reader, path).await?;
+        self.read_xattr_inode(&reader, &inode, name).await
+    }
+
+    pub async fn xattr_handle(
+        &self,
+        handle: &BtrfsOpenHandle,
+        name: &str,
+    ) -> Result<Option<Bytes>, UnixFsError> {
+        let reader = self.snapshot();
+        let inode = self
+            .inode_by_id(&reader, handle.tree(), handle.number())
+            .await?;
+        self.read_xattr_inode(&reader, &inode, name).await
+    }
+
+    pub async fn list_xattrs(&self, path: FsPath<'_>) -> Result<Vec<String>, UnixFsError> {
+        let reader = self.snapshot();
+        let inode = self.inode(&reader, path).await?;
+        self.list_xattrs_inode(&reader, &inode).await
+    }
+
+    pub async fn list_xattrs_handle(
+        &self,
+        handle: &BtrfsOpenHandle,
+    ) -> Result<Vec<String>, UnixFsError> {
+        let reader = self.snapshot();
+        let inode = self
+            .inode_by_id(&reader, handle.tree(), handle.number())
+            .await?;
+        self.list_xattrs_inode(&reader, &inode).await
+    }
+
+    async fn mutate_unix(
+        &self,
+        path: FsPath<'_>,
+        now: u64,
+        operation: Operation,
+    ) -> Result<(), UnixFsError> {
+        let writer = self.inner.writer.as_ref().ok_or(FsError::ReadOnly)?;
+        writer.execute_unix(path.as_str(), now, operation).await?;
+        Ok(())
+    }
+
+    async fn mutate_handle_unix(
+        &self,
+        handle: &BtrfsOpenHandle,
+        now: u64,
+        operation: Operation,
+    ) -> Result<(), UnixFsError> {
+        let writer = self.inner.writer.as_ref().ok_or(FsError::ReadOnly)?;
+        let inode = handle.inode_handle().ok_or(FsError::ReadOnly)?.clone();
+        writer.execute_inode_unix(inode, now, operation).await?;
+        Ok(())
+    }
+
+    pub async fn open_unix(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<Opened<BtrfsOpenHandle>, UnixFsError> {
+        if let Some(writer) = &self.inner.writer {
+            return match writer
+                .execute_unix(
+                    path.as_str(),
+                    now,
+                    Operation::Open {
+                        flags,
+                        attributes: Some(attributes),
+                    },
+                )
+                .await?
+            {
+                Response::Opened { handle, metadata } => {
+                    let metadata = self.inode_metadata(handle.tree(), handle.number(), metadata)?;
+                    Ok(Opened { metadata, handle })
+                }
+                Response::Done | Response::Written(_) => {
+                    unreachable!("open request returns inode metadata")
+                }
+            };
+        }
+        self.open(path, flags, now).await.map_err(UnixFsError::Fs)
+    }
+
+    pub async fn create_directory_unix(
+        &self,
+        path: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.mutate_unix(
+            path,
+            now,
+            Operation::CreateDirectory {
+                attributes: Some(attributes),
+            },
+        )
+        .await
+    }
+
+    pub async fn symlink_unix(
+        &self,
+        target: &str,
+        path: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.mutate_unix(
+            path,
+            now,
+            Operation::Symlink {
+                target: String::from(target),
+                attributes: Some(attributes),
+            },
+        )
+        .await
+    }
+
+    pub async fn create_special(
+        &self,
+        path: FsPath<'_>,
+        special: Special,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.mutate_unix(
+            path,
+            now,
+            Operation::CreateSpecial {
+                special,
+                attributes,
+            },
+        )
+        .await
+    }
+
+    pub async fn set_permissions(
+        &self,
+        path: FsPath<'_>,
+        permissions: u32,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.mutate_unix(path, now, Operation::SetPermissions { permissions })
+            .await
+    }
+
+    pub async fn set_permissions_handle(
+        &self,
+        handle: &BtrfsOpenHandle,
+        permissions: u32,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.mutate_handle_unix(handle, now, Operation::SetPermissions { permissions })
+            .await
+    }
+
+    pub async fn set_owner(
+        &self,
+        path: FsPath<'_>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.mutate_unix(path, now, Operation::SetOwner { uid, gid })
+            .await
+    }
+
+    pub async fn set_owner_handle(
+        &self,
+        handle: &BtrfsOpenHandle,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.mutate_handle_unix(handle, now, Operation::SetOwner { uid, gid })
+            .await
+    }
+
+    pub async fn set_xattr(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mode = match mode {
+            XattrSetMode::Any => XattrMode::Set,
+            XattrSetMode::Create => XattrMode::Create,
+            XattrSetMode::Replace => XattrMode::Replace,
+        };
+        self.mutate_unix(
+            path,
+            now,
+            Operation::SetXattr {
+                name: String::from(name),
+                value,
+                mode,
+            },
+        )
+        .await
+    }
+
+    pub async fn set_xattr_handle(
+        &self,
+        handle: &BtrfsOpenHandle,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        let mode = match mode {
+            XattrSetMode::Any => XattrMode::Set,
+            XattrSetMode::Create => XattrMode::Create,
+            XattrSetMode::Replace => XattrMode::Replace,
+        };
+        self.mutate_handle_unix(
+            handle,
+            now,
+            Operation::SetXattr {
+                name: String::from(name),
+                value,
+                mode,
+            },
+        )
+        .await
+    }
+
+    pub async fn remove_xattr(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.mutate_unix(
+            path,
+            now,
+            Operation::RemoveXattr {
+                name: String::from(name),
+            },
+        )
+        .await
+    }
+
+    pub async fn remove_xattr_handle(
+        &self,
+        handle: &BtrfsOpenHandle,
+        name: &str,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.mutate_handle_unix(
+            handle,
+            now,
+            Operation::RemoveXattr {
+                name: String::from(name),
+            },
+        )
+        .await
+    }
+
     async fn manage(
         &self,
         operation: ManageOperation<Device>,

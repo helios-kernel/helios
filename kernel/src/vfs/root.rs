@@ -35,13 +35,17 @@ use alloc::vec::Vec;
 use core::future::Future;
 
 use bytes::Bytes;
+use helios_btrfs::write::{Attributes, Special};
 use helios_hal::fs::{
     DirCookie, DirEntry, DirStream, FileSystem, FsError, FsPath, FsResult, Landed, Metadata,
-    NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition, WriteProgress,
+    NodeKind, OpenFlags, Opened, OwnedFsPath, PreparedWrite, RenameMode, WritePosition,
+    WriteProgress,
 };
 
 use super::memory::UpperView;
-use super::{FileContents, MemoryFs, UnixAttributes, read_all};
+use super::{
+    FileContents, MemoryFs, UnixAttributes, UnixFsError, UnixNodeMetadata, XattrSetMode, read_all,
+};
 use crate::BootFs;
 
 /// The Unix attributes the boot image's directories hold; its files and
@@ -96,6 +100,144 @@ impl RootFs {
         match found.layer {
             Layer::Upper => Ok(self.upper.unix_metadata(path)?.attributes),
             Layer::Lower => Ok(BOOT_UNIX.inherited(found.metadata.kind)),
+        }
+    }
+
+    pub fn unix_node_metadata(&self, path: FsPath<'_>) -> Result<UnixNodeMetadata, UnixFsError> {
+        let found = self.find(path)?;
+        match found.layer {
+            Layer::Upper => self.upper.unix_node_metadata(path),
+            Layer::Lower => Ok(UnixNodeMetadata {
+                kind: found.metadata.kind,
+                attributes: BOOT_UNIX.inherited(found.metadata.kind),
+                rdev: 0,
+            }),
+        }
+    }
+
+    pub fn open_unix(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<Opened<OwnedFsPath>, UnixFsError> {
+        match self.find(path) {
+            Ok(found) => {
+                if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
+                    return Err(FsError::Exists.into());
+                }
+                if flags.contains(OpenFlags::DIRECTORY)
+                    && found.metadata.kind != NodeKind::Directory
+                {
+                    return Err(FsError::NotDirectory.into());
+                }
+                if flags.contains(OpenFlags::TRUNCATE) {
+                    self.copy_up(path)?;
+                    return self.upper.open_unix(path, flags, attributes, now);
+                }
+                Ok(Opened {
+                    metadata: found.metadata,
+                    handle: path.into(),
+                })
+            }
+            Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
+                self.creatable(path)?;
+                self.upper.open_unix(path, flags, attributes, now)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn create_directory_unix(
+        &self,
+        path: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.creatable(path)?;
+        self.upper.create_directory_unix(path, attributes, now)
+    }
+
+    pub fn symlink_unix(
+        &self,
+        target: &str,
+        path: FsPath<'_>,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.creatable(path)?;
+        self.upper.symlink_unix(target, path, attributes, now)
+    }
+
+    pub fn create_special_unix(
+        &self,
+        path: FsPath<'_>,
+        special: Special,
+        attributes: Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.creatable(path)?;
+        self.upper
+            .create_special_unix(path, special, attributes, now)
+    }
+
+    pub fn set_permissions(
+        &self,
+        path: FsPath<'_>,
+        permissions: u32,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.copy_up(path)?;
+        self.upper.set_permissions(path, permissions, now)?;
+        Ok(())
+    }
+
+    pub fn set_owner(
+        &self,
+        path: FsPath<'_>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.copy_up(path)?;
+        self.upper.set_owner(path, uid, gid, now)?;
+        Ok(())
+    }
+
+    pub fn xattr(&self, path: FsPath<'_>, name: &str) -> Result<Option<Bytes>, UnixFsError> {
+        let found = self.find(path)?;
+        match found.layer {
+            Layer::Upper => Ok(self.upper.xattr(path, name)?),
+            Layer::Lower => Ok(None),
+        }
+    }
+
+    pub fn list_xattrs(&self, path: FsPath<'_>) -> Result<Vec<String>, UnixFsError> {
+        let found = self.find(path)?;
+        match found.layer {
+            Layer::Upper => Ok(self.upper.list_xattrs(path)?),
+            Layer::Lower => Ok(Vec::new()),
+        }
+    }
+
+    pub fn set_xattr(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        self.copy_up(path)?;
+        self.upper.set_xattr_unix(path, name, value, mode, now)
+    }
+
+    pub fn remove_xattr(&self, path: FsPath<'_>, name: &str, now: u64) -> Result<(), UnixFsError> {
+        let found = self.find(path)?;
+        match found.layer {
+            Layer::Upper => self.upper.remove_xattr_unix(path, name, now),
+            Layer::Lower => Err(UnixFsError::NoData),
         }
     }
 
