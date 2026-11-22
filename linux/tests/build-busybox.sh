@@ -60,8 +60,11 @@ mkdir -p "$work_dir/src"
 tar -xjf "$tarball" -C "$work_dir/src" --strip-components=1
 
 jobs="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+host_cc="${HOSTCC:-cc}"
 (
     cd "$work_dir/src"
+    export ZIG_LOCAL_CACHE_DIR="$work_dir/zig-local-cache"
+    mkdir -p "$ZIG_LOCAL_CACHE_DIR"
     # Strip GNU-ld-only flags that zig/lld rejects.
     python3 - <<'PY'
 from pathlib import Path
@@ -71,7 +74,7 @@ for flag in ("-Wl,--warn-common", "-Wl,--verbose", "-Wl,-Map,$EXE.map"):
     text = text.replace(flag, "")
 p.write_text(text)
 PY
-    make allnoconfig HOSTCC="zig cc" >/dev/null
+    make allnoconfig HOSTCC="$host_cc" >/dev/null
     python3 - <<'PY'
 from pathlib import Path
 p = Path(".config")
@@ -91,9 +94,9 @@ text = text.replace("CONFIG_FEATURE_UDHCPC_ARPING=y", "# CONFIG_FEATURE_UDHCPC_A
 p.write_text(text)
 PY
     # `yes` exits with SIGPIPE once `make oldconfig` closes stdin.
-    (set +o pipefail; yes "" | make oldconfig HOSTCC="zig cc" >/dev/null)
+    (set +o pipefail; yes "" | make oldconfig HOSTCC="$host_cc" >/dev/null)
     make -j"$jobs" \
-        HOSTCC="zig cc" \
+        HOSTCC="$host_cc" \
         CC="zig cc -target ${arch}-linux-musl" \
         AR="zig ar" \
         LD="zig cc -target ${arch}-linux-musl" \
