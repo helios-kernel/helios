@@ -60,4 +60,13 @@ if [ "$bg_out" != "bg:5:0:11" ]; then
     exit 1
 fi
 
+# 4. Shebang (#!) script execution when running inside Helios bootfs.
+if [ "$dash_bin" = "/linux/dash" ] && [ -f /linux/shebang-hello.sh ]; then
+    sb_out="$("$dash_bin" -c "/linux/shebang-hello.sh | $cat_prog")"
+    if [ "$sb_out" != "native Linux syscall: ok" ]; then
+        echo "dash shebang failed: got '$sb_out'" >&2
+        exit 1
+    fi
+fi
+
 echo "dash: ok"

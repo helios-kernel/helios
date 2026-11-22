@@ -31,6 +31,11 @@ cp linux/tests/check-memory.sh "$out/linux/check-memory.sh"
 cp linux/tests/check-pthreads.sh "$out/linux/check-pthreads.sh"
 cp linux/tests/check-signals.sh "$out/linux/check-signals.sh"
 cp linux/tests/check-dash.sh "$out/linux/check-dash.sh"
+cat > "$out/linux/shebang-hello.sh" <<'EOF'
+#!/linux/dash
+exec /linux/hello
+EOF
+chmod +x "$out/linux/shebang-hello.sh"
 # The same executables first run under Linux, establishing their ABI assertions.
 if [[ "$(uname -s)" == Linux && "$(uname -m)" == "$arch" ]]; then
     "$out/linux/hello"

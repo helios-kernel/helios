@@ -105,6 +105,20 @@ static void test_fork_cow_isolation(void) {
         memset(mmap_buf, 0xbb, page_size * 2);
         stack_word = 0xccccccccccccccccULL;
 
+        /* Multi-generation CoW: grandchild forks from child and writes its own
+         * distinct pattern to mmap_buf without disturbing child or grandparent. */
+        pid_t grand = fork();
+        CHECK(grand >= 0);
+        if (grand == 0) {
+            CHECK(mmap_buf[0] == 0xbb && mmap_buf[page_size] == 0xbb);
+            memset(mmap_buf, 0xdd, page_size * 2);
+            CHECK(mmap_buf[0] == 0xdd && mmap_buf[page_size] == 0xdd);
+            _exit(5);
+        }
+        int gstatus = 0;
+        CHECK(wait4(grand, &gstatus, 0, NULL) == grand);
+        CHECK(WIFEXITED(gstatus) && WEXITSTATUS(gstatus) == 5);
+
         CHECK(heap_buf[0] == 0xaa && heap_buf[page_size - 1] == 0xaa);
         CHECK(mmap_buf[0] == 0xbb && mmap_buf[page_size] == 0xbb);
         CHECK(stack_word == 0xccccccccccccccccULL);
@@ -141,6 +155,42 @@ static void test_fork_cow_isolation(void) {
 
     free(heap_buf);
     CHECK(munmap(mmap_buf, page_size * 2) == 0);
+
+    /* Signal-state inheritance across fork: blocked mask is inherited, while
+     * pending signals are cleared in the child and retained in the parent. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigusr1_handler;
+    CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
+    g_sigusr1_count = 0;
+
+    sigset_t block, oldmask;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    CHECK(sigprocmask(SIG_BLOCK, &block, &oldmask) == 0);
+    CHECK(raise(SIGUSR1) == 0);
+
+    pid_t sig_child = fork();
+    CHECK(sig_child >= 0);
+    if (sig_child == 0) {
+        sigset_t cur, pend;
+        CHECK(sigprocmask(SIG_SETMASK, NULL, &cur) == 0);
+        CHECK(sigismember(&cur, SIGUSR1) == 1);
+        CHECK(sigpending(&pend) == 0);
+        CHECK(sigismember(&pend, SIGUSR1) == 0);
+        _exit(0);
+    }
+    int sig_status = 0;
+    CHECK(wait4(sig_child, &sig_status, 0, NULL) == sig_child);
+    CHECK(WIFEXITED(sig_status) && WEXITSTATUS(sig_status) == 0);
+
+    sigset_t parent_pend;
+    CHECK(sigpending(&parent_pend) == 0);
+    CHECK(sigismember(&parent_pend, SIGUSR1) == 1);
+    CHECK(sigprocmask(SIG_SETMASK, &oldmask, NULL) == 0);
+    CHECK(g_sigusr1_count == 1);
+    sa.sa_handler = SIG_DFL;
+    CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
 }
 
 static __attribute__((noinline)) void test_vfork_exit_and_exec(const char *self) {
@@ -561,6 +611,39 @@ static int run_mixed_linux_wasix(const char *wasix_cat) {
     CHECK(WIFEXITED(st1) && WEXITSTATUS(st1) == 0);
     CHECK(wait4(reader, &st2, 0, NULL) == reader);
     CHECK(WIFEXITED(st2) && WEXITSTATUS(st2) == 0);
+
+    /* Also verify vfork() + execve() into a WASIX binary unblocks parent
+     * immediately so parent can write to the child's stdin pipe without deadlock. */
+    CHECK(pipe(p_in) == 0);
+    CHECK(pipe(p_out) == 0);
+    pid_t vreader = vfork();
+    CHECK(vreader >= 0);
+    if (vreader == 0) {
+        close(p_in[1]);
+        close(p_out[0]);
+        if (dup2(p_in[0], 0) != 0 || dup2(p_out[1], 1) != 1) {
+            _exit(125);
+        }
+        close(p_in[0]);
+        close(p_out[1]);
+        char *argv[] = {(char *)wasix_cat, NULL};
+        char *envp[] = {NULL};
+        execve(wasix_cat, argv, envp);
+        _exit(126);
+    }
+    close(p_in[0]);
+    close(p_out[1]);
+    write_all(p_in[1], payload, strlen(payload));
+    close(p_in[1]);
+    memset(out, 0, sizeof(out));
+    n = read_all(p_out[0], out, sizeof(out) - 1);
+    close(p_out[0]);
+    CHECK(n == strlen(payload));
+    CHECK(strcmp(out, payload) == 0);
+    int st3 = 0;
+    CHECK(wait4(vreader, &st3, 0, NULL) == vreader);
+    CHECK(WIFEXITED(st3) && WEXITSTATUS(st3) == 0);
+
     puts("process mixed: ok");
     return 0;
 }
