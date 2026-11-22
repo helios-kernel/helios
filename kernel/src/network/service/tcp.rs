@@ -45,23 +45,23 @@ impl Iterator for ReceivePairOrder {
 ///
 /// Owned by the polling task alone: the sink runs synchronously on the
 /// processor that called the drain, so nothing here is shared.
-struct RxBatchDelivery {
+pub(super) struct RxBatchDelivery {
     /// Shards that took a frame, signalled once the batch is done.
-    arrivals: ShardArrivals,
+    pub(super) arrivals: ShardArrivals,
     /// Frames a shard consumed — delivered or unparseable — which is
     /// what the poll's receive budget counts.
-    delivered: usize,
-    delivered_bytes: usize,
+    pub(super) delivered: usize,
+    pub(super) delivered_bytes: usize,
     /// Bytes of every frame the device lent, refused ones included:
     /// the ring phase's byte count.
-    lent_bytes: usize,
+    pub(super) lent_bytes: usize,
     /// Time spent demuxing inside the device's hold, summed over the
     /// batch's frames, which the ring phase is reported without.
-    dispatch: NetworkPerfSpan,
+    pub(super) dispatch: NetworkPerfSpan,
 }
 
 impl RxBatchDelivery {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             arrivals: ShardArrivals::new(),
             delivered: 0,
@@ -571,7 +571,7 @@ where
         hop_limit: u8,
         deadline_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
-        if matches!(destination, IpAddress::Ipv4(_)) {
+        if matches!(destination, IpAddress::Ipv4(ip) if !ip.is_loopback()) {
             self.wait_for_ipv4_tcp(deadline_nanos).await?;
         }
         // The source address is the same on every shard — the control
@@ -1366,7 +1366,7 @@ where
     /// for different flows are processed in parallel by other
     /// processors and each shard's stack only sees the connections it
     /// owns.
-    fn deliver_rx_frame(
+    pub(super) fn deliver_rx_frame(
         &self,
         frame: &RxFrame,
         received_at: StackInstant,

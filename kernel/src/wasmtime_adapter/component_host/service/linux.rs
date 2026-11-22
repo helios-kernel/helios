@@ -815,6 +815,120 @@ fn node_kind_to_component(kind: NodeKind) -> ComponentFsNodeKind {
     }
 }
 
+fn join_synthetic_etc_path(base_dir: &str, path: &str) -> Option<(String, bool)> {
+    // Reject `..` components so `/nonexistent/../etc/hosts` cannot lexically
+    // collapse onto a synthetic `/etc` entry.
+    if path.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    let trailing_slash = path.ends_with('/');
+    let combined = if path.starts_with('/') {
+        String::from(path)
+    } else if base_dir.ends_with('/') {
+        alloc::format!("{base_dir}{path}")
+    } else {
+        alloc::format!("{base_dir}/{path}")
+    };
+    Some((combined, trailing_slash))
+}
+
+fn synthetic_etc_open<StorageImpl: crate::Storage>(
+    container: &crate::LinuxContainer<StorageImpl>,
+    base_dir: &str,
+    path: &str,
+    servers: &[crate::NetworkIpAddress],
+    request: OpenRequest,
+) -> Result<FsDescriptor, FsError> {
+    let Some((combined, trailing_slash)) = join_synthetic_etc_path(base_dir, path) else {
+        return Err(FsError::NoEntry);
+    };
+    if container.synthetic_etc_file(&combined, servers).is_none() {
+        return Err(FsError::NoEntry);
+    }
+    if trailing_slash || request.directory {
+        return Err(FsError::NotDirectory);
+    }
+    if request.create && request.exclusive {
+        return Err(FsError::Exists);
+    }
+    if request.write || request.truncate {
+        return Err(FsError::ReadOnly);
+    }
+    let mut flags = FsDescriptorFlags::empty();
+    if request.read {
+        flags |= FsDescriptorFlags::READ;
+    }
+    Ok(FsDescriptor {
+        path: combined,
+        kind: ComponentFsNodeKind::File,
+        flags,
+        identity: None,
+        mount: None,
+        open: None,
+    })
+}
+
+fn synthetic_etc_stat_lookup<StorageImpl: crate::Storage>(
+    container: &crate::LinuxContainer<StorageImpl>,
+    base_dir: &str,
+    path: &str,
+    servers: &[crate::NetworkIpAddress],
+) -> Result<(FileStat, String), FsError> {
+    let Some((combined, trailing_slash)) = join_synthetic_etc_path(base_dir, path) else {
+        return Err(FsError::NoEntry);
+    };
+    let Some(bytes) = container.synthetic_etc_file(&combined, servers) else {
+        return Err(FsError::NoEntry);
+    };
+    if trailing_slash {
+        return Err(FsError::NotDirectory);
+    }
+    Ok((synthetic_etc_stat(&combined, bytes.len() as u64), combined))
+}
+
+fn synthetic_etc_access_lookup<StorageImpl: crate::Storage>(
+    container: &crate::LinuxContainer<StorageImpl>,
+    base_dir: &str,
+    path: &str,
+    servers: &[crate::NetworkIpAddress],
+    check: AccessCheck,
+) -> Result<(), FsError> {
+    let Some((combined, trailing_slash)) = join_synthetic_etc_path(base_dir, path) else {
+        return Err(FsError::NoEntry);
+    };
+    if container.synthetic_etc_file(&combined, servers).is_none() {
+        return Err(FsError::NoEntry);
+    }
+    if trailing_slash {
+        return Err(FsError::NotDirectory);
+    }
+    if check.write {
+        return Err(FsError::ReadOnly);
+    }
+    if check.exec {
+        return Err(FsError::NotPermitted);
+    }
+    Ok(())
+}
+
+fn synthetic_etc_stat(path: &str, size: u64) -> FileStat {
+    let ino = if path.ends_with("/resolv.conf") { 1 } else { 2 };
+    FileStat {
+        dev: u64::MAX,
+        ino,
+        kind: NodeKind::File,
+        permissions: 0o444,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        size,
+        access_nanos: 0,
+        modified_nanos: 0,
+        status_nanos: 0,
+    }
+}
+
 fn container_info_to_stat(info: &crate::ContainerNodeInfo) -> FileStat {
     FileStat {
         dev: info.metadata.id.device.raw(),
@@ -947,12 +1061,31 @@ where
     ) -> Result<FsDescriptor, FsError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
         let now = self.shared.clock.lock().system_time_nanos();
-        let (info, container_path, mount_hold) = self
+        let opened = self
             .shared
             .container
             .filesystem()
             .open_at(base_dir, path, request, now)
-            .await?;
+            .await;
+        let (info, container_path, mount_hold) = match opened {
+            Ok(ok) => ok,
+            Err(FsError::NoEntry) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                return synthetic_etc_open(
+                    &self.shared.container,
+                    base_dir,
+                    path,
+                    &servers,
+                    request,
+                );
+            }
+            Err(error) => return Err(error),
+        };
         let mut flags = FsDescriptorFlags::empty();
         if request.read {
             flags |= FsDescriptorFlags::READ;
@@ -987,23 +1120,54 @@ where
         follow: bool,
     ) -> Result<(FileStat, String), FsError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
-        let (info, resolved_path) = self
+        match self
             .shared
             .container
             .filesystem()
             .stat_at(base_dir, path, follow)
-            .await?;
-        Ok((container_info_to_stat(&info), resolved_path))
+            .await
+        {
+            Ok((info, resolved_path)) => Ok((container_info_to_stat(&info), resolved_path)),
+            Err(FsError::NoEntry) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                synthetic_etc_stat_lookup(&self.shared.container, base_dir, path, &servers)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn stat_file(&self, file: &FsDescriptor) -> Result<FileStat, FsError> {
-        let info = self
+        match self
             .shared
             .container
             .filesystem()
             .stat_resolved(&file.path)
-            .await?;
-        Ok(container_info_to_stat(&info))
+            .await
+        {
+            Ok(info) => Ok(container_info_to_stat(&info)),
+            Err(FsError::NoEntry) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if let Some(bytes) = self
+                    .shared
+                    .container
+                    .synthetic_etc_file(&file.path, &servers)
+                {
+                    return Ok(synthetic_etc_stat(&file.path, bytes.len() as u64));
+                }
+                Err(FsError::NoEntry)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn access_path(
@@ -1014,11 +1178,25 @@ where
         check: AccessCheck,
     ) -> Result<(), FsError> {
         let base_dir = base.map_or(cwd, |f| f.path.as_str());
-        self.shared
+        match self
+            .shared
             .container
             .filesystem()
             .access_at(base_dir, path, check)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(FsError::NoEntry) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                synthetic_etc_access_lookup(&self.shared.container, base_dir, path, &servers, check)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn read_at(
@@ -1027,11 +1205,36 @@ where
         offset: u64,
         max_bytes: usize,
     ) -> Result<Bytes, FsError> {
-        self.shared
+        match self
+            .shared
             .container
             .filesystem()
             .read_at(&file.path, offset, max_bytes)
             .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(FsError::NoEntry) => {
+                let servers = self
+                    .shared
+                    .runtime_state
+                    .network_service()
+                    .map(|service| service.dns_servers())
+                    .unwrap_or_default();
+                if let Some(bytes) = self
+                    .shared
+                    .container
+                    .synthetic_etc_file(&file.path, &servers)
+                {
+                    let start = usize::try_from(offset)
+                        .unwrap_or(bytes.len())
+                        .min(bytes.len());
+                    let end = start.saturating_add(max_bytes).min(bytes.len());
+                    return Ok(Bytes::copy_from_slice(&bytes[start..end]));
+                }
+                Err(FsError::NoEntry)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn write_at(
@@ -3459,5 +3662,161 @@ mod tests {
             }
             other => panic!("unexpected aarch64 brk outcome: {other:?}"),
         }
+    }
+
+    #[test]
+    fn synthetic_etc_lookup_enforces_trailing_slash_and_open_flags() {
+        use crate::test_support::UnsupportedStorage;
+        use crate::vfs::BOOT_DEVICE;
+        use crate::{
+            BootFs, ContainerConfig, ContainerId, ContainerMountSpec, DirectoryAuthorityRights,
+            EmbeddedBootDirectory, EmbeddedBootFs, LinuxContainer, MountSharing, ProcessAuthority,
+            SharedOwner,
+        };
+        use core::task::{Context, Poll, Waker};
+        use helios_linux::syscall::{Credentials, UtsField};
+
+        const BOOT_IMAGE: EmbeddedBootFs =
+            EmbeddedBootFs::new(&[EmbeddedBootDirectory::new("root", 0)], &[]);
+        let host_ns = crate::Namespace::<UnsupportedStorage>::new(crate::MountTable::new(
+            BootFs::new(BOOT_IMAGE, BOOT_DEVICE),
+            4,
+        ));
+        let root_auth = ProcessAuthority::root();
+        let container = {
+            let mut fut = core::pin::pin!(LinuxContainer::create(
+                ContainerId::new(core::num::NonZeroU64::new(1).unwrap()),
+                &root_auth,
+                &host_ns,
+                ProcessAuthority::root(),
+                ContainerConfig {
+                    root: ContainerMountSpec {
+                        source_path: String::from("/root"),
+                        target_path: String::from("/"),
+                        rights: DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE,
+                        sharing: MountSharing::Shared,
+                    },
+                    mounts: Vec::new(),
+                    shared_owner: SharedOwner { uid: 0, gid: 0 },
+                    credentials: Credentials::root(),
+                    hostname: UtsField::from_bytes(b"helios-test").unwrap(),
+                    domainname: UtsField::from_bytes(b"").unwrap(),
+                },
+            ));
+            match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(container)) => container,
+                Poll::Ready(Err(err)) => panic!("container create failed: {err:?}"),
+                Poll::Pending => panic!("container create unexpectedly pending"),
+            }
+        };
+
+        let servers = [crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+            10, 0, 2, 3,
+        ]))];
+        let base_req = OpenRequest {
+            read: true,
+            write: false,
+            create: false,
+            exclusive: false,
+            truncate: false,
+            directory: false,
+            nofollow: false,
+            path_only: false,
+            append: false,
+            sync: false,
+            dsync: false,
+            mode: 0o644,
+        };
+
+        // Trailing slash on a synthetic regular file must fail with NotDirectory.
+        assert_eq!(
+            synthetic_etc_open(&container, "/", "/etc/hosts/", &servers, base_req).err(),
+            Some(FsError::NotDirectory)
+        );
+        assert_eq!(
+            synthetic_etc_stat_lookup(&container, "/", "/etc/hosts/", &servers).err(),
+            Some(FsError::NotDirectory)
+        );
+        assert_eq!(
+            synthetic_etc_stat_lookup(&container, "/", "/etc/resolv.conf/", &servers).err(),
+            Some(FsError::NotDirectory)
+        );
+        assert_eq!(
+            synthetic_etc_access_lookup(
+                &container,
+                "/",
+                "/etc/hosts/",
+                &servers,
+                AccessCheck {
+                    read: false,
+                    write: false,
+                    exec: false,
+                    follow: true,
+                },
+            )
+            .err(),
+            Some(FsError::NotDirectory)
+        );
+
+        // O_CREAT | O_EXCL on an existing synthetic file must return Exists (EEXIST).
+        assert_eq!(
+            synthetic_etc_open(
+                &container,
+                "/",
+                "/etc/hosts",
+                &servers,
+                OpenRequest {
+                    create: true,
+                    exclusive: true,
+                    ..base_req
+                },
+            )
+            .err(),
+            Some(FsError::Exists)
+        );
+
+        // O_CREAT | O_RDONLY (without exclusive/write/truncate) opens the existing file read-only.
+        let desc = synthetic_etc_open(
+            &container,
+            "/",
+            "/etc/hosts",
+            &servers,
+            OpenRequest {
+                create: true,
+                ..base_req
+            },
+        )
+        .expect("O_CREAT | O_RDONLY on existing synthetic /etc/hosts must succeed");
+        assert_eq!(desc.path, "/etc/hosts");
+        assert!(desc.flags.contains(FsDescriptorFlags::READ));
+
+        // O_WRONLY / O_TRUNC still return ReadOnly (EROFS).
+        assert_eq!(
+            synthetic_etc_open(
+                &container,
+                "/",
+                "/etc/hosts",
+                &servers,
+                OpenRequest {
+                    write: true,
+                    ..base_req
+                },
+            )
+            .err(),
+            Some(FsError::ReadOnly)
+        );
+
+        // `..` path traversal must not resolve to synthetic /etc files.
+        assert_eq!(
+            synthetic_etc_open(
+                &container,
+                "/",
+                "/nonexistent/../etc/hosts",
+                &servers,
+                base_req,
+            )
+            .err(),
+            Some(FsError::NoEntry)
+        );
     }
 }

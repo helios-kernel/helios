@@ -27,6 +27,7 @@ const EPOLLERR: u32 = poll::POLLERR;
 const EPOLLHUP: u32 = poll::POLLHUP;
 const EPOLLRDNORM: u32 = poll::POLLRDNORM;
 const EPOLLWRNORM: u32 = poll::POLLWRNORM;
+const EPOLLRDHUP: u32 = 0x2000;
 const EPOLLONESHOT: u32 = 1 << 30; // Linux eventpoll.h
 
 pub(super) fn descriptor_errno(error: DescriptorTableError) -> u64 {
@@ -415,7 +416,14 @@ pub(super) fn epoll_ctl<R: Resources, M: UserMemory>(
         }
         let events = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         if events
-            & !(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDNORM | EPOLLWRNORM | EPOLLONESHOT)
+            & !(EPOLLIN
+                | EPOLLOUT
+                | EPOLLERR
+                | EPOLLHUP
+                | EPOLLRDNORM
+                | EPOLLWRNORM
+                | EPOLLRDHUP
+                | EPOLLONESHOT)
             != 0
         {
             return errno(EINVAL);
