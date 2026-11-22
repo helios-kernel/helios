@@ -12,6 +12,7 @@ pub(crate) mod file;
 pub(crate) mod namespace;
 pub(crate) mod ownership;
 pub(crate) mod reflink;
+pub(crate) mod replay;
 pub(crate) mod reserve;
 pub(crate) mod xattr;
 

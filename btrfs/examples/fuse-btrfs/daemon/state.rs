@@ -149,7 +149,12 @@ impl State {
         read_only: bool,
     ) -> Result<Self, OpenError> {
         let device = Device::open_read_write(&device_path, claim.clone())?;
-        let mut writer = block_on(Writer::mount(device, RandomUuids, concurrency))?;
+        let mut writer = block_on(Writer::mount(
+            device,
+            RandomUuids,
+            concurrency,
+            timestamp(SystemTime::now()),
+        ))?;
         let snapshot = writer.snapshot()?;
         let root = block_on(snapshot.root())?;
         let handle = {
@@ -273,9 +278,14 @@ impl State {
                             Errno::from(error)
                         }
                     })?;
-                let mut writer = Writer::mount(device, RandomUuids, self.concurrency)
-                    .await
-                    .map_err(|error| write_errno(&error))?;
+                let mut writer = Writer::mount(
+                    device,
+                    RandomUuids,
+                    self.concurrency,
+                    timestamp(SystemTime::now()),
+                )
+                .await
+                .map_err(|error| write_errno(&error))?;
                 let root_handle = {
                     let transaction = writer.join().await.map_err(|error| write_errno(&error))?;
                     transaction
