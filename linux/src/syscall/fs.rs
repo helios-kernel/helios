@@ -1997,6 +1997,44 @@ pub(super) async fn readv_common<
         }
         return SyscallOutcome::Return(0);
     }
+    if let FileDescriptor::Socket(sock) = &entry.descriptor {
+        let mut total = 0usize;
+        for &(base, len) in &iovs {
+            let take = len.min(MAX_RW_COUNT - total as u64) as usize;
+            if take > 0 && memory.check_writable(base, take).is_err() {
+                return SyscallOutcome::Return(errno(EFAULT));
+            }
+            total = total.saturating_add(take);
+            if total as u64 >= MAX_RW_COUNT {
+                break;
+            }
+        }
+        let recv = match super::socket::socket_recv(sock, total, 0, output).await {
+            Ok(recv) => recv,
+            Err(err) => return SyscallOutcome::Return(errno(err)),
+        };
+        let mut offset = 0usize;
+        for (base, len) in iovs {
+            if offset >= recv.data.len() {
+                break;
+            }
+            let take = (len as usize).min(recv.data.len() - offset);
+            if take > 0 {
+                if memory
+                    .write(base, &recv.data[offset..offset + take])
+                    .is_err()
+                {
+                    return SyscallOutcome::Return(if offset == 0 {
+                        errno(EFAULT)
+                    } else {
+                        offset as u64
+                    });
+                }
+                offset += take;
+            }
+        }
+        return SyscallOutcome::Return(offset as u64);
+    }
     let mut done = 0u64;
     let mut cur_off = explicit_offset;
     for (base, len) in iovs {
@@ -2084,6 +2122,36 @@ pub(super) async fn writev_common<
             }
         }
         return SyscallOutcome::Return(0);
+    }
+    if let FileDescriptor::Socket(sock) = &entry.descriptor {
+        let mut data = Vec::new();
+        let mut chunk = [0u8; 4096];
+        for (base, len) in iovs {
+            let remaining = MAX_RW_COUNT.saturating_sub(data.len() as u64);
+            if remaining == 0 {
+                break;
+            }
+            let take = len.min(remaining) as usize;
+            let mut copied = 0usize;
+            while copied < take {
+                let step = (take - copied).min(chunk.len());
+                let Some(addr) = base.checked_add(copied as u64) else {
+                    return SyscallOutcome::Return(errno(EFAULT));
+                };
+                if memory.read(addr, &mut chunk[..step]).is_err() {
+                    return SyscallOutcome::Return(errno(EFAULT));
+                }
+                data.extend_from_slice(&chunk[..step]);
+                copied += step;
+            }
+        }
+        let ctx = super::socket_context(process);
+        return SyscallOutcome::Return(
+            match super::socket::socket_send(sock, data, 0, None, ctx, output).await {
+                Ok(written) => written as u64,
+                Err(err) => errno(err),
+            },
+        );
     }
     let mut done = 0u64;
     let mut cur_off = explicit_offset;

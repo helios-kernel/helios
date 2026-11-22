@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -18,6 +19,7 @@
 #include <sys/ioctl.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -106,7 +108,8 @@ static void test_socketpair_and_io(void) {
           "epoll_wait sees EPOLLIN on socketpair");
     CHECK(recv(sv[1], buf, 4, 0) == 4 && memcmp(buf, "ping", 4) == 0, "recv ping");
 
-    /* sendfile from pipe into socketpair. */
+    /* sendfile: pipe in_fd fails with ESPIPE (with offset) / EINVAL (NULL offset);
+     * regular-file in_fd transfers into socketpair with both NULL and explicit offset. */
     int pfd[2];
     CHECK(pipe(pfd) == 0, "pipe for sendfile");
     CHECK(write(pfd[1], "sendfile-ok", 11) == 11, "write pipe for sendfile");
@@ -114,12 +117,31 @@ static void test_socketpair_and_io(void) {
     errno = 0;
     CHECK(sendfile(sv[0], pfd[0], &off, 11) == -1 && errno == ESPIPE,
           "sendfile with offset on pipe -> ESPIPE");
-    CHECK(sendfile(sv[0], pfd[0], NULL, 11) == 11, "sendfile pipe -> socketpair");
-    memset(buf, 0, sizeof(buf));
-    CHECK(recv(sv[1], buf, 11, 0) == 11 && memcmp(buf, "sendfile-ok", 11) == 0,
-          "recv after sendfile");
+    errno = 0;
+    CHECK(sendfile(sv[0], pfd[0], NULL, 11) == -1 && errno == EINVAL,
+          "sendfile with NULL offset on pipe -> EINVAL");
     close(pfd[0]);
     close(pfd[1]);
+
+    (void)mkdir("/tmp", 0755);
+    const char *sf_path = "/tmp/sockets-sendfile.txt";
+    int sf_fd = open(sf_path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    CHECK(sf_fd >= 0, "open regular file for sendfile");
+    CHECK(write(sf_fd, "0123sendfile-ok", 15) == 15, "write regular file for sendfile");
+    off = 4;
+    CHECK(sendfile(sv[0], sf_fd, &off, 11) == 11 && off == 15,
+          "sendfile file -> socketpair with explicit offset");
+    memset(buf, 0, sizeof(buf));
+    CHECK(recv(sv[1], buf, 11, 0) == 11 && memcmp(buf, "sendfile-ok", 11) == 0,
+          "recv after sendfile with offset");
+    CHECK(lseek(sf_fd, 0, SEEK_SET) == 0, "lseek regular file for sendfile");
+    CHECK(sendfile(sv[0], sf_fd, NULL, 4) == 4, "sendfile file -> socketpair with NULL offset");
+    memset(buf, 0, sizeof(buf));
+    CHECK(recv(sv[1], buf, 4, 0) == 4 && memcmp(buf, "0123", 4) == 0,
+          "recv after sendfile with NULL offset");
+    CHECK(lseek(sf_fd, 0, SEEK_CUR) == 4, "sendfile NULL offset advances file position");
+    close(sf_fd);
+    unlink(sf_path);
 
     /* getsockopt metadata on socketpair. */
     int opt = 0;
@@ -390,11 +412,46 @@ static void test_error_cases(void) {
     close(pfd[1]);
 }
 
+static void test_etc_and_localhost_resolution(void) {
+    /* /etc/hosts must be readable and contain localhost -> 127.0.0.1. */
+    int fd = open("/etc/hosts", O_RDONLY);
+    CHECK(fd >= 0, "open /etc/hosts");
+    struct stat st;
+    CHECK(fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0,
+          "fstat /etc/hosts");
+    char buf[512];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    CHECK(n > 0, "read /etc/hosts");
+    buf[n] = '\0';
+    CHECK(strstr(buf, "127.0.0.1") != NULL && strstr(buf, "localhost") != NULL,
+          "/etc/hosts contains 127.0.0.1 localhost");
+    close(fd);
+
+    /* /etc/resolv.conf must be readable as a regular file. */
+    fd = open("/etc/resolv.conf", O_RDONLY);
+    CHECK(fd >= 0, "open /etc/resolv.conf");
+    CHECK(fstat(fd, &st) == 0 && S_ISREG(st.st_mode), "fstat /etc/resolv.conf");
+    close(fd);
+
+    /* musl getaddrinfo("localhost", "80") resolves via /etc/hosts. */
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    CHECK(getaddrinfo("localhost", "80", &hints, &res) == 0 && res != NULL,
+          "getaddrinfo(localhost)");
+    struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+    CHECK(sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK) && sin->sin_port == htons(80),
+          "getaddrinfo(localhost) -> 127.0.0.1:80");
+    freeaddrinfo(res);
+}
+
 int main(void) {
     test_error_cases();
     test_socketpair_and_io();
     test_tcp_loopback();
     test_udp_loopback_and_mmsg();
+    test_etc_and_localhost_resolution();
     puts("sockets: ok");
     return 0;
 }

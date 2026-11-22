@@ -544,18 +544,23 @@ impl NetworkControlPlane {
         match address {
             NetworkIpAddress::Ipv4(address) => {
                 let target = map_kernel_ipv4_address(address);
-                self.ipv4_addresses
-                    .load_full()
-                    .entries
-                    .iter()
-                    .any(|cidr| cidr.address() == target)
+                target.is_loopback()
+                    || self
+                        .ipv4_addresses
+                        .load_full()
+                        .entries
+                        .iter()
+                        .any(|cidr| cidr.address() == target)
             }
-            NetworkIpAddress::Ipv6(address) => self
-                .ipv6_addresses
-                .load_full()
-                .entries
-                .iter()
-                .any(|entry| entry.cidr().address() == address),
+            NetworkIpAddress::Ipv6(address) => {
+                address.is_loopback()
+                    || self
+                        .ipv6_addresses
+                        .load_full()
+                        .entries
+                        .iter()
+                        .any(|entry| entry.cidr().address() == address)
+            }
         }
     }
 }
@@ -968,6 +973,13 @@ where
     /// answers the same — and it has to be answerable before a shard is
     /// chosen, since the answer is half of the flow the choice hashes.
     fn local_address_for(&self, destination: IpAddress) -> Option<IpAddress> {
+        match destination {
+            IpAddress::Ipv4(ipv4) if ipv4.is_loopback() => return Some(IpAddress::Ipv4(ipv4)),
+            IpAddress::Ipv6(ipv6) if ipv6.is_loopback() => {
+                return Some(IpAddress::Ipv6(Ipv6Address::LOOPBACK));
+            }
+            _ => {}
+        }
         self.inner.state.with(|state| match destination {
             IpAddress::Ipv4(_) => state
                 .stack
@@ -7478,5 +7490,105 @@ mod tests {
             let record = outcome.expect("chain budget check must not fail with DnsError");
             assert_eq!(record.is_some(), expect_some);
         }
+    }
+
+    #[test]
+    fn loopback_ipv4_and_ipv6_tcp_and_udp_work_without_dhcp_or_nic_tx() {
+        fn poll_ready<F: core::future::Future>(
+            mut fut: core::pin::Pin<&mut F>,
+            cx: &mut core::task::Context<'_>,
+        ) -> F::Output {
+            for _ in 0..16 {
+                if let core::task::Poll::Ready(out) = fut.as_mut().poll(cx) {
+                    return out;
+                }
+            }
+            panic!("loopback future did not complete within 16 polls");
+        }
+
+        let device = RecordingNetworkInterface::accepting_transmissions(1);
+        let service = test_network_service_on(device.clone());
+        let waker = core::task::Waker::noop();
+        let mut cx = core::task::Context::from_waker(waker);
+
+        for loopback in [
+            NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+            NetworkIpAddress::Ipv6(Ipv6Address::LOOPBACK),
+        ] {
+            let listener = {
+                let fut = core::pin::pin!(service.tcp_listen(loopback, 0, 4, 64));
+                poll_ready(fut, &mut cx).expect("loopback tcp listen must succeed without DHCP")
+            };
+            assert_ne!(listener.local_port, 0);
+
+            let client = {
+                let fut = core::pin::pin!(service.tcp_connect_address(
+                    loopback,
+                    listener.local_port,
+                    0,
+                    64,
+                    SECOND,
+                ));
+                poll_ready(fut, &mut cx).expect("loopback tcp connect must succeed without DHCP")
+            };
+            let accepted = {
+                let fut = core::pin::pin!(service.tcp_accept(listener.listener, SECOND));
+                poll_ready(fut, &mut cx).expect("loopback tcp accept must succeed")
+            };
+
+            {
+                let fut = core::pin::pin!(service.tcp_write_all(client, b"hello", SECOND));
+                poll_ready(fut, &mut cx).expect("loopback tcp write");
+            }
+            let received = {
+                let fut = core::pin::pin!(service.tcp_read(accepted.stream, 32, SECOND));
+                poll_ready(fut, &mut cx).expect("loopback tcp read")
+            };
+            let received: alloc::vec::Vec<u8> = received
+                .into_iter()
+                .flat_map(|chunk| chunk.to_vec())
+                .collect();
+            assert_eq!(received.as_slice(), b"hello");
+
+            service.tcp_close(client);
+            service.tcp_close(accepted.stream);
+            service.tcp_listener_close(listener.listener);
+
+            let udp_server = {
+                let fut = core::pin::pin!(service.udp_bind(loopback, 0));
+                poll_ready(fut, &mut cx).expect("loopback udp bind must succeed")
+            };
+            let udp_client = {
+                let fut = core::pin::pin!(service.udp_bind(loopback, 0));
+                poll_ready(fut, &mut cx).expect("loopback udp client bind must succeed")
+            };
+            let sent = {
+                let fut = core::pin::pin!(service.udp_send_address(
+                    udp_client.socket,
+                    loopback,
+                    udp_server.local_port,
+                    b"dgram",
+                    SECOND,
+                ));
+                poll_ready(fut, &mut cx).expect("loopback udp send_address")
+            };
+            assert_eq!(sent, 5);
+            let dgram = {
+                let fut = core::pin::pin!(service.udp_receive(udp_server.socket, 64, SECOND));
+                poll_ready(fut, &mut cx)
+                    .expect("loopback udp receive")
+                    .expect("loopback udp datagram must arrive")
+            };
+            assert_eq!(dgram.bytes.as_ref(), b"dgram");
+            assert_eq!(dgram.address, loopback);
+
+            service.udp_close(udp_client.socket);
+            service.udp_close(udp_server.socket);
+        }
+
+        assert!(
+            device.transmitted_frames().is_empty(),
+            "loopback traffic must never be transmitted onto the NIC"
+        );
     }
 }

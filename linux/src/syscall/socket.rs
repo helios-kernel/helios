@@ -10,6 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bytes::Bytes;
 use core::future::Future;
+use helios_hal::fs::WritePosition;
 use helios_unix::{
     OwnedPacketSocket, OwnedTcpListener, OwnedTcpStream, OwnedUdpSocket, PairRecvError, Socket,
     SocketFamily, SocketFlag, SocketKind, SocketNetwork, SocketOptionError, SocketSize, SocketTime,
@@ -2326,9 +2327,14 @@ pub(crate) async fn shutdown<R: Resources, Net: Network<R::Network>>(
     errno(ENOTSOCK)
 }
 
-pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio>(
+pub(crate) async fn sendfile<
+    R: Resources,
+    M: super::VirtualMemory,
+    O: Network<R::Network> + super::Stdio + super::Filesystem<R>,
+>(
     process: &Process<R>,
     args: [u64; 6],
+    memory: &mut M,
     output: &mut O,
 ) -> u64 {
     let out_fd = args[0] as u32 as i32;
@@ -2346,73 +2352,98 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
         };
         (out_entry, in_entry)
     };
-    if offset_ptr != 0 {
-        // Pipes and sockets are not seekable; Linux reports `ESPIPE`.
-        return errno(ESPIPE);
-    }
-    // Validate both descriptor kinds before consuming any bytes from `in_fd`.
-    if !matches!(
-        in_entry.descriptor,
-        Descriptor::<R>::PipeRead { .. }
-            | Descriptor::<R>::Socket(_)
-            | Descriptor::<R>::Stdin { .. }
-    ) || !matches!(
-        out_entry.descriptor,
+
+    // Linux `fs/read_write.c:do_sendfile`: `in_fd` must be a readable regular
+    // file (mmap-capable). Non-seekable inputs (pipes, sockets, stdin) fail
+    // with `ESPIPE` when `offset != NULL` and `EINVAL` when `offset == NULL`.
+    let in_open = match &in_entry.descriptor {
+        Descriptor::<R>::File(open) => {
+            if !matches!(
+                output.file_access(open.node()),
+                super::FileAccess::ReadOnly | super::FileAccess::ReadWrite
+            ) {
+                return errno(EBADF);
+            }
+            if output.file_is_directory(open.node()) {
+                return errno(EINVAL);
+            }
+            open.clone()
+        }
+        _ => {
+            return if offset_ptr != 0 {
+                errno(ESPIPE)
+            } else {
+                errno(EINVAL)
+            };
+        }
+    };
+
+    let explicit_offset = if offset_ptr != 0 {
+        if memory.check_writable(offset_ptr, 8).is_err() {
+            return errno(EFAULT);
+        }
+        let mut raw = [0u8; 8];
+        if memory.read(offset_ptr, &mut raw).is_err() {
+            return errno(EFAULT);
+        }
+        let off = i64::from_le_bytes(raw);
+        if off < 0 {
+            return errno(EINVAL);
+        }
+        Some(off as u64)
+    } else {
+        None
+    };
+
+    match &out_entry.descriptor {
         Descriptor::<R>::Socket(_)
-            | Descriptor::<R>::PipeWrite { .. }
-            | Descriptor::<R>::Stdout
-            | Descriptor::<R>::Stderr
-    ) {
-        return errno(EINVAL);
+        | Descriptor::<R>::PipeWrite { .. }
+        | Descriptor::<R>::Stdout
+        | Descriptor::<R>::Stderr => {}
+        Descriptor::<R>::File(out_open) => {
+            if !matches!(
+                output.file_access(out_open.node()),
+                super::FileAccess::WriteOnly | super::FileAccess::ReadWrite
+            ) {
+                return errno(EBADF);
+            }
+            if output.file_is_directory(out_open.node()) {
+                return errno(EINVAL);
+            }
+            // Linux `fs/read_write.c:do_sendfile` rejects `O_APPEND` on `out_fd`.
+            if out_entry.fdflags() & helios_unix::FDFLAG_APPEND != 0 {
+                return errno(EINVAL);
+            }
+        }
+        _ => return errno(EINVAL),
     }
+
     if count == 0 {
         return 0;
     }
 
-    let in_nonblocking = in_entry.fdflags() & helios_unix::FDFLAG_NONBLOCK != 0;
+    super::memory::flush_file_shared_mappings(process, in_open.node(), memory, output).await;
+
     let out_nonblocking = out_entry.fdflags() & helios_unix::FDFLAG_NONBLOCK != 0;
     let mut total_sent = 0usize;
+
     while total_sent < count {
         let chunk_len = (count - total_sent).min(SENDFILE_CHUNK);
-        let chunk = match &in_entry.descriptor {
-            Descriptor::<R>::PipeRead { reader } => {
-                if in_nonblocking {
-                    match reader.try_read_limit(chunk_len) {
-                        helios_sync::TryRead::Ready(bytes) => bytes,
-                        helios_sync::TryRead::Pending => {
-                            return if total_sent > 0 {
-                                total_sent as u64
-                            } else {
-                                errno(EAGAIN)
-                            };
-                        }
-                        helios_sync::TryRead::Eof => Bytes::new(),
-                    }
-                } else {
-                    reader.read_limit(chunk_len).await.unwrap_or_default()
+        // Never hold `in_open`'s position lock across `out_fd` I/O or
+        // `out_open.lock_position()` — holding both deadlocks `sendfile(fd, fd, NULL, n)`
+        // and concurrent opposite-direction transfers.
+        let read_pos = match explicit_offset {
+            Some(base) => base.saturating_add(total_sent as u64),
+            None => in_open.lock_position().await.get(),
+        };
+        let chunk = match output.read_at(in_open.node(), read_pos, chunk_len).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                if total_sent > 0 {
+                    break;
                 }
+                return errno(super::EIO);
             }
-            Descriptor::<R>::Socket(sock) => match socket_recv(sock, chunk_len, 0, output).await {
-                Ok(recv) => recv.data,
-                Err(err) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(err)
-                    };
-                }
-            },
-            Descriptor::<R>::Stdin { .. } => match output.read_input(chunk_len).await {
-                Ok(bytes) => bytes,
-                Err(super::Denied) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(EACCES)
-                    };
-                }
-            },
-            _ => unreachable!(),
         };
         if chunk.is_empty() {
             break;
@@ -2431,11 +2462,10 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
                 {
                     Ok(n) => n,
                     Err(err) => {
-                        return if total_sent > 0 {
-                            total_sent as u64
-                        } else {
-                            errno(err)
-                        };
+                        if total_sent > 0 {
+                            break;
+                        }
+                        return errno(err);
                     }
                 }
             }
@@ -2445,100 +2475,103 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
                     match writer.try_write(chunk) {
                         helios_sync::TryWrite::Written => len,
                         helios_sync::TryWrite::Full(_) => {
-                            return if total_sent > 0 {
-                                total_sent as u64
-                            } else {
-                                errno(EAGAIN)
-                            };
+                            if total_sent > 0 {
+                                break;
+                            }
+                            return errno(EAGAIN);
                         }
                         helios_sync::TryWrite::Closed => {
-                            return if total_sent > 0 {
-                                total_sent as u64
-                            } else {
-                                errno(EPIPE)
-                            };
+                            if total_sent > 0 {
+                                break;
+                            }
+                            return errno(EPIPE);
                         }
                     }
                 } else {
                     match writer.write(chunk).await {
                         Ok(()) => len,
                         Err(helios_sync::ClosedPeer) => {
-                            return if total_sent > 0 {
-                                total_sent as u64
-                            } else {
-                                errno(EPIPE)
-                            };
+                            if total_sent > 0 {
+                                break;
+                            }
+                            return errno(EPIPE);
                         }
                     }
                 }
             }
             Descriptor::<R>::Stdout => match output.write(super::Stream::Stdout, &chunk).await {
                 Ok(n) => n,
-                Err(super::WriteError::Denied) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(EACCES)
-                    };
-                }
-                Err(super::WriteError::Io) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(EPIPE)
-                    };
-                }
-                Err(super::WriteError::Interrupted) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(super::EINTR)
-                    };
-                }
-                Err(super::WriteError::WouldBlock) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(EAGAIN)
-                    };
+                Err(err) => {
+                    if total_sent > 0 {
+                        break;
+                    }
+                    return errno(match err {
+                        super::WriteError::Denied => EACCES,
+                        super::WriteError::Io => EPIPE,
+                        super::WriteError::Interrupted => super::EINTR,
+                        super::WriteError::WouldBlock => EAGAIN,
+                    });
                 }
             },
             Descriptor::<R>::Stderr => match output.write(super::Stream::Stderr, &chunk).await {
                 Ok(n) => n,
-                Err(super::WriteError::Denied) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(EACCES)
-                    };
-                }
-                Err(super::WriteError::Io) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(EPIPE)
-                    };
-                }
-                Err(super::WriteError::Interrupted) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(super::EINTR)
-                    };
-                }
-                Err(super::WriteError::WouldBlock) => {
-                    return if total_sent > 0 {
-                        total_sent as u64
-                    } else {
-                        errno(EAGAIN)
-                    };
+                Err(err) => {
+                    if total_sent > 0 {
+                        break;
+                    }
+                    return errno(match err {
+                        super::WriteError::Denied => EACCES,
+                        super::WriteError::Io => EPIPE,
+                        super::WriteError::Interrupted => super::EINTR,
+                        super::WriteError::WouldBlock => EAGAIN,
+                    });
                 }
             },
-            _ => return errno(EINVAL),
+            Descriptor::<R>::File(out_open) => {
+                let landed = {
+                    let mut out_pos = out_open.lock_position().await;
+                    let pos = WritePosition::At(out_pos.get());
+                    match output.write_at(out_open.node(), pos, &chunk).await {
+                        Ok(landed) => {
+                            out_pos.set(landed.offset.saturating_add(landed.len as u64));
+                            landed
+                        }
+                        Err(_) => {
+                            if total_sent > 0 {
+                                break;
+                            }
+                            return errno(super::EIO);
+                        }
+                    }
+                };
+                if landed.len > 0 {
+                    super::memory::sync_write_to_shared_mappings(
+                        process,
+                        out_open.node(),
+                        landed.offset,
+                        &chunk[..landed.len],
+                        memory,
+                        output,
+                    );
+                }
+                landed.len
+            }
+            _ => unreachable!(),
         };
+        if explicit_offset.is_none() && sent > 0 {
+            let mut pos = in_open.lock_position().await;
+            pos.set(read_pos.saturating_add(sent as u64));
+        }
         total_sent += sent;
         if sent < chunk_len {
             break;
+        }
+    }
+
+    if let Some(base) = explicit_offset {
+        let updated = base.saturating_add(total_sent as u64) as i64;
+        if memory.write(offset_ptr, &updated.to_le_bytes()).is_err() {
+            return errno(EFAULT);
         }
     }
     total_sent as u64

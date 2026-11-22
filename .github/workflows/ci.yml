@@ -291,8 +291,8 @@ jobs:
             (if ($lanes | index("linux-syscalls-full")) then "full"
              elif ($lanes | index("linux-syscalls")) then "listed"
              else "none" end) as $mode
-            | [{arch: "x86_64", runner: "ubuntu-24.04", vm_arch: "x86-64", accel: "kvm", shards: 8},
-               {arch: "aarch64", runner: "ubuntu-24.04-arm", vm_arch: "aarch64", accel: "tcg", shards: 16}] as $arches
+            | [{arch: "x86_64", runner: "ubuntu-24.04", vm_arch: "x86-64", accel: "kvm", shards: 16},
+               {arch: "aarch64", runner: "ubuntu-24.04-arm", vm_arch: "aarch64", accel: "tcg", shards: 32}] as $arches
             | {mode: $mode,
                build: (if $mode == "none" then [] else $arches | map(del(.shards)) end),
                shards: (if $mode == "none" then []
@@ -1197,6 +1197,27 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/linux"
           mkdir -p "$runtime"
           bash linux/tests/build-fixtures.sh "$runtime/bootfs" aarch64
+          bash linux/tests/fetch-curl.sh "$runtime/bootfs/linux/curl" aarch64 "$GITHUB_WORKSPACE/linux-curl-cache"
+          python3 - "$runtime/curl-port" <<'PY' &
+          import http.server, sys
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = b"curl-smoke: ok\n"
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+          with open(sys.argv[1], "w") as f:
+              f.write(str(srv.server_address[1]))
+          srv.serve_forever()
+          PY
+          curl_srv_pid=$!
+          trap 'kill "$curl_srv_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do [[ -s "$runtime/curl-port" ]] && break; sleep 0.1; done
+          curl_port="$(cat "$runtime/curl-port")"
           # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
           # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
@@ -1205,7 +1226,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1228,7 +1249,7 @@ jobs:
           # The system-information suite (#1035), sockets (#1030), netconfig
           # (#1031), file/readiness/tty suites (#1028), and process/dash suites
           # (#1034) run in the same modes build-fixtures.sh asserts on Linux.
-          for suite in clock random identity limits machine priority container sockets netconfig files files-cross readiness stdin-epoll tty process; do
+          for suite in clock random identity limits machine priority container sockets netconfig files files-cross readiness stdin-epoll tty process curl-smoke; do
             grep -Fqx "$suite: ok" linux-smoke.out
           done
           grep -Fqx 'from-wasix: 中文 日本語 한국어' linux-smoke.out
@@ -1892,6 +1913,27 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/linux"
           mkdir -p "$runtime"
           bash linux/tests/build-fixtures.sh "$runtime/bootfs" x86_64
+          bash linux/tests/fetch-curl.sh "$runtime/bootfs/linux/curl" x86_64 "$GITHUB_WORKSPACE/linux-curl-cache"
+          python3 - "$runtime/curl-port" <<'PY' &
+          import http.server, sys
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = b"curl-smoke: ok\n"
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+          with open(sys.argv[1], "w") as f:
+              f.write(str(srv.server_address[1]))
+          srv.serve_forever()
+          PY
+          curl_srv_pid=$!
+          trap 'kill "$curl_srv_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do [[ -s "$runtime/curl-port" ]] && break; sleep 0.1; done
+          curl_port="$(cat "$runtime/curl-port")"
           # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
           # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
@@ -1900,7 +1942,7 @@ jobs:
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1923,7 +1965,7 @@ jobs:
           # The system-information suite (#1035), sockets (#1030), netconfig
           # (#1031), file/readiness/tty suites (#1028), and process/dash suites
           # (#1034) run in the same modes build-fixtures.sh asserts on Linux.
-          for suite in clock random identity limits machine priority container sockets netconfig files files-cross readiness stdin-epoll tty process; do
+          for suite in clock random identity limits machine priority container sockets netconfig files files-cross readiness stdin-epoll tty process curl-smoke; do
             grep -Fqx "$suite: ok" linux-smoke.out
           done
           grep -Fqx 'from-wasix: 中文 日本語 한국어' linux-smoke.out
@@ -3412,7 +3454,7 @@ jobs:
     needs: [changes, kernel-profile, wasm-release, linux-syscalls-build]
     if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.linux-syscalls-build.result == 'success' && needs.wasm-release.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 40 || 15 }}
+    timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 60 || 15 }}
     permissions:
       contents: read
       actions: read
