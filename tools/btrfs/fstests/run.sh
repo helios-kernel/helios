@@ -43,10 +43,14 @@ export HELIOS_FSTESTS_SCRATCH_MNT=$mounts/scratch
 export HELIOS_CRASH_MNT=$mounts/crash
 
 loops=()
+orig_core_pattern=
 
 cleanup() {
     # Best-effort teardown: the verdict is already decided.
     set +e
+    if [[ -n "$orig_core_pattern" ]]; then
+        sysctl -w "kernel.core_pattern=$orig_core_pattern" >/dev/null
+    fi
     local mountpoint
     for mountpoint in "$HELIOS_FSTESTS_TEST_DIR" "$HELIOS_FSTESTS_SCRATCH_MNT" "$HELIOS_CRASH_MNT"; do
         while findmnt --mountpoint "$mountpoint" >/dev/null; do
@@ -123,6 +127,19 @@ make_loop() {
 mkdir -p "$results" "$HELIOS_FSTESTS_RESULTS" \
     "$HELIOS_FSTESTS_TEST_DIR" "$HELIOS_FSTESTS_SCRATCH_MNT" "$HELIOS_CRASH_MNT"
 trap cleanup EXIT
+
+# Ubuntu/Debian patches systemd's 50-coredump.conf to hardcode 2^63 in place
+# of %c and leaves default soft RLIMIT_CORE at 0, so systemd-coredump ignores
+# ulimit -c 0 (generic/394's expected SIGXFSZ). Raise RLIMIT_CORE for fuse-btrfs
+# and test helpers, and pass %c so processes with RLIMIT_CORE=0 are skipped.
+ulimit -c unlimited
+current_core_pattern=$(sysctl -n kernel.core_pattern 2>/dev/null || true)
+read -ra core_fields <<< "$current_core_pattern"
+if ((${#core_fields[@]} >= 7)) && [[ "${core_fields[0]}" == \|*systemd-coredump && "${core_fields[6]}" != "%c" ]]; then
+    orig_core_pattern=$current_core_pattern
+    core_fields[6]=%c
+    sysctl -w "kernel.core_pattern=${core_fields[*]}" >/dev/null
+fi
 
 make_loop "$work/test.img" "$device_size"
 HELIOS_FSTESTS_TEST_DEV=$loop

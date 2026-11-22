@@ -64,6 +64,19 @@ impl Device {
         })
     }
 
+    #[cfg(test)]
+    pub fn open_for_test(path: &Path) -> io::Result<Self> {
+        let buffered = OpenOptions::new().read(true).write(true).open(path)?;
+        let durable = buffered.try_clone()?;
+        let len = (&buffered).seek(SeekFrom::End(0))?;
+        Ok(Self {
+            buffered,
+            durable,
+            len,
+            poisoned: AtomicBool::new(false),
+        })
+    }
+
     fn check_alive(&self) -> IoResult<()> {
         if self.poisoned.load(Ordering::Acquire) {
             error!("the device is poisoned by an earlier failed commit");

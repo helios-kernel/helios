@@ -8,8 +8,8 @@ use ferrosys::btrfs::{FormatOptions, SubvolumeRequest, format_to};
 use ferrosys::{Metadata, Timestamp, TreeBuilder};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
-    BlockSerial, DeviceId, DirCookie, FileSystem, FilledWrite, FsError, FsPath, Landed, NodeKind,
-    OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress, write_with,
+    BlockSerial, DeviceId, DirCookie, DirStream, FileSystem, FilledWrite, FsError, FsPath, Landed,
+    NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress, write_with,
 };
 
 use super::BtrfsFs;
@@ -499,9 +499,10 @@ fn special_nodes_are_listed_and_statted_and_never_opened() {
     ];
 
     let mut listed = Vec::new();
+    let dir = block_on(fs.open_dir(path(""))).expect("opens root");
     let mut cookie = DirCookie::new(0);
     loop {
-        let entries = block_on(fs.read_dir(path(""), cookie, 2)).expect("directory page");
+        let entries = block_on(dir.read(cookie, 2)).expect("directory page");
         let Some(last) = entries.last() else {
             break;
         };
@@ -603,9 +604,10 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
     );
 
     let mut names = BTreeSet::new();
+    let dir = block_on(fs.open_dir(path(""))).expect("opens root");
     let mut cookie = DirCookie::new(0);
     loop {
-        let entries = block_on(fs.read_dir(path(""), cookie, 1)).expect("directory page");
+        let entries = block_on(dir.read(cookie, 1)).expect("directory page");
         let Some(entry) = entries.first() else {
             break;
         };
@@ -1864,4 +1866,135 @@ fn the_max_inline_option_bounds_inline_files_and_follows_its_operator() {
         )),
         Err(crate::MountRequestError::MaxInlineUnsupported)
     ));
+}
+
+/// Opening a btrfs directory stream records the upper `DIR_INDEX` bound so
+/// renaming entries (`entry -> TEMPFILE -> entry`) while iterating finishes
+/// in bounded entries, and `rewind` refreshes the bound for newly created
+/// entries.
+#[test]
+fn open_dir_bounds_iteration_during_renames_and_refreshes_on_rewind() {
+    let disk = MemoryDisk::holding_writable("btrfs-test", &empty_image());
+    block_on(async {
+        let (fs, service) = BtrfsFs::mount_writable(
+            cache_over(&disk, 256, 1).disk(0),
+            || DeviceId::new(100),
+            write_options(1, None),
+        )
+        .await
+        .expect("writable mount");
+        let client = async move {
+            fs.create_directory(path("work"), 1_000_000_000)
+                .await
+                .expect("mkdir work");
+            fs.create_directory(path("empty"), 1_000_000_000)
+                .await
+                .expect("mkdir empty");
+            let mut expected = Vec::new();
+            for name in ["中文", "日本語", "한국어"] {
+                let full = alloc::format!("work/{name}");
+                fs.open(path(&full), OpenFlags::CREATE, 1_000_000_001)
+                    .await
+                    .expect("create cjk file");
+                expected.push(alloc::string::String::from(name));
+            }
+            for i in 0..32 {
+                let name = alloc::format!("entry-{i:02}");
+                let full = alloc::format!("work/{name}");
+                fs.open(path(&full), OpenFlags::CREATE, 1_000_000_001)
+                    .await
+                    .expect("create file");
+                expected.push(name);
+            }
+
+            // Opening a non-directory fails with `NotDirectory`.
+            assert_eq!(
+                fs.open_dir(path("work/entry-00")).await.map(drop),
+                Err(FsError::NotDirectory)
+            );
+
+            // An open stream on an empty directory sees nothing added after
+            // open until `rewind` refreshes its bound.
+            let mut empty_stream = fs.open_dir(path("empty")).await.expect("open empty");
+            fs.open(path("empty/added"), OpenFlags::CREATE, 1_000_000_002)
+                .await
+                .expect("create after open");
+            assert!(
+                empty_stream
+                    .read(DirCookie::START, 8)
+                    .await
+                    .expect("read empty")
+                    .is_empty()
+            );
+            empty_stream.rewind().await.expect("rewind empty");
+            let after_rewind = empty_stream
+                .read(DirCookie::START, 8)
+                .await
+                .expect("read after rewind");
+            assert_eq!(after_rewind.len(), 1);
+            assert_eq!(after_rewind[0].name, "added");
+
+            // Rename every yielded entry (`entry -> TEMPFILE -> entry`) while
+            // paging through `work`; iteration terminates with the initial set.
+            let mut stream = fs.open_dir(path("work")).await.expect("open work");
+            let mut cookie = DirCookie::START;
+            let mut seen = Vec::new();
+            let safety_cap = expected.len() * 3;
+            loop {
+                let batch = stream.read(cookie, 2).await.expect("read page");
+                let Some(last) = batch.last() else {
+                    break;
+                };
+                cookie = last.next;
+                for entry in batch {
+                    let from = alloc::format!("work/{}", entry.name);
+                    fs.rename(
+                        path(&from),
+                        path("work/TEMPFILE"),
+                        RenameMode::Replace,
+                        1_000_000_003,
+                    )
+                    .await
+                    .expect("rename to TEMPFILE");
+                    fs.rename(
+                        path("work/TEMPFILE"),
+                        path(&from),
+                        RenameMode::Replace,
+                        1_000_000_004,
+                    )
+                    .await
+                    .expect("rename back");
+                    seen.push(entry.name);
+                    assert!(
+                        seen.len() <= safety_cap,
+                        "directory stream looped past safety cap ({safety_cap})"
+                    );
+                }
+            }
+            seen.sort();
+            expected.sort();
+            assert_eq!(seen, expected);
+
+            // After adding a new entry and calling `rewind`, the new entry appears.
+            fs.open(path("work/after"), OpenFlags::CREATE, 1_000_000_005)
+                .await
+                .expect("create after");
+            stream.rewind().await.expect("rewind work");
+            let mut refreshed = Vec::new();
+            let mut cookie = DirCookie::START;
+            loop {
+                let batch = stream.read(cookie, 16).await.expect("read refreshed");
+                let Some(last) = batch.last() else {
+                    break;
+                };
+                cookie = last.next;
+                refreshed.extend(batch.into_iter().map(|entry| entry.name));
+            }
+            assert!(refreshed.iter().any(|name| name == "after"));
+            drop(stream);
+            drop(empty_stream);
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+    });
 }
