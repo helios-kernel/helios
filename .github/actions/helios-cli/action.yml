@@ -59,15 +59,17 @@ runs:
         fi
         mkdir -p "${DIR}"
         cp "target/${PROFILE}/helios-cli" "${DIR}/helios-cli"
-    # Jobs that started before this upload built their own; the binaries
-    # are the same commit's, so whichever lands last is the one kept.
+    # Jobs that started before the first upload built their own identical
+    # commit binary; keep the first upload live instead of deleting and
+    # re-uploading it (`overwrite: true` deletes before uploading and races
+    # concurrent readers).
     - if: steps.download.outcome != 'success'
+      continue-on-error: true
       uses: actions/upload-artifact@v4
       with:
         name: ${{ steps.name.outputs.artifact }}
         path: ${{ steps.name.outputs.dir }}/helios-cli
         if-no-files-found: error
-        overwrite: true
         retention-days: 1
     - shell: bash
       env:

@@ -340,7 +340,7 @@ jobs:
     needs: changes
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'debug')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 15
     strategy:
       matrix:
         profile: [debug]
@@ -384,7 +384,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: helios
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          shared-key: check-host-checks
+          save-if: "false"
       # Pinned `wasi-sdk-34` used by `helios-cli wasm-build` to cross-compile
       # BoringSSL for `programs/http-client`; restored read-only on PRs and
       # populated on `dev` pushes.
@@ -425,7 +426,7 @@ jobs:
     needs: changes
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'release')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 15
     strategy:
       matrix:
         profile: [release]
@@ -553,7 +554,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.tests != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
