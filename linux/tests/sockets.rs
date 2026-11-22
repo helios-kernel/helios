@@ -146,6 +146,8 @@ struct MockNet {
     allow_multicast: bool,
     connect_state: Arc<Mutex<ConnectProgress>>,
     multicast_joins: Arc<Mutex<Vec<MulticastJoin>>>,
+    udp_queue: Arc<Mutex<Vec<(Bytes, SocketAddr, usize)>>>,
+    last_udp_timeout: Arc<Mutex<Option<u64>>>,
 }
 
 impl Default for MockNet {
@@ -157,6 +159,8 @@ impl Default for MockNet {
             allow_multicast: false,
             connect_state: Arc::new(Mutex::new(ConnectProgress::Pending)),
             multicast_joins: Arc::new(Mutex::new(Vec::new())),
+            udp_queue: Arc::new(Mutex::new(Vec::new())),
+            last_udp_timeout: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -326,6 +330,23 @@ impl Network<MockNet> for Platform {
     }
     fn udp_disconnect(&self, _: u64) -> Result<(), u64> {
         self.check_udp_open()
+    }
+    async fn udp_receive(
+        &self,
+        _: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+        _: bool,
+    ) -> Result<Option<(Bytes, SocketAddr, usize)>, u64> {
+        self.check_udp_open()?;
+        *self.net.last_udp_timeout.lock() = Some(timeout_nanos);
+        let mut queue = self.net.udp_queue.lock();
+        if queue.is_empty() {
+            return Err(110); // ETIMEDOUT -> mapped to EAGAIN
+        }
+        let (bytes, peer, original_len) = queue.remove(0);
+        let take = (max_bytes as usize).min(bytes.len());
+        Ok(Some((bytes.slice(..take), peer, original_len)))
     }
     async fn udp_join_multicast_v4(&self, group: [u8; 4], interface: [u8; 4]) -> Result<(), u64> {
         if !self.net.allow_multicast {
@@ -514,6 +535,7 @@ fn nonblocking_connect_transitions_through_einprogress_epoll_and_so_error() {
                 allow_multicast: true,
                 connect_state: Arc::new(Mutex::new(ConnectProgress::Pending)),
                 multicast_joins: Arc::new(Mutex::new(Vec::new())),
+                ..Default::default()
             },
             now: 0,
         };
@@ -794,4 +816,216 @@ fn socketpair_supports_nonblocking_peek_shutdown_and_pipe_sendfile() {
         ),
         ENOTCONN.wrapping_neg()
     );
+}
+
+#[test]
+fn udp_recvmsg_sets_msg_trunc_and_recvmmsg_enforces_timeout_and_multicast_u8_options() {
+    let mut proc = new_process(Abi::X86_64);
+    let mut mem = Memory::new(4096);
+    let mut plat = Platform {
+        net: MockNet {
+            allow_udp: true,
+            allow_multicast: true,
+            ..Default::default()
+        },
+        now: 1_000_000,
+    };
+    let udp = call_op(
+        &mut proc,
+        Abi::X86_64,
+        Operation::Socket,
+        [2, 2, 0, 0, 0, 0],
+        &mut mem,
+        &mut plat,
+    );
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&2u16.to_le_bytes());
+    sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    mem.write(64, &sa).unwrap();
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Bind,
+            [udp, 64, 16, 0, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        0
+    );
+
+    // 1-byte u8 options for IP_MULTICAST_TTL (33) and IP_MULTICAST_LOOP (34).
+    mem.write(96, &[7u8]).unwrap();
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Setsockopt,
+            [udp, 0, 33, 96, 1, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        0
+    );
+    mem.write(97, &[0u8]).unwrap();
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Setsockopt,
+            [udp, 0, 34, 97, 1, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        0
+    );
+    mem.write(104, &4u32.to_le_bytes()).unwrap();
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Getsockopt,
+            [udp, 0, 33, 100, 104, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        0
+    );
+    let mut ttl_out = [0u8; 4];
+    mem.read(100, &mut ttl_out).unwrap();
+    assert_eq!(i32::from_le_bytes(ttl_out), 7);
+
+    // Queue a 10-byte datagram and receive into a 4-byte iovec without MSG_TRUNC in input flags:
+    // recvmsg must return 4 and set MSG_TRUNC (0x20) in msghdr.msg_flags.
+    plat.net.udp_queue.lock().push((
+        Bytes::from_static(b"0123456789"),
+        SocketAddr {
+            ip: IpAddr::V4([127, 0, 0, 1]),
+            port: 5555,
+        },
+        10,
+    ));
+    let mut iov = [0u8; 16];
+    iov[0..8].copy_from_slice(&300u64.to_le_bytes());
+    iov[8..16].copy_from_slice(&4u64.to_le_bytes());
+    mem.write(200, &iov).unwrap();
+    let mut hdr = [0u8; 56];
+    hdr[16..24].copy_from_slice(&200u64.to_le_bytes());
+    hdr[24..32].copy_from_slice(&1u64.to_le_bytes());
+    mem.write(400, &hdr).unwrap();
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Recvmsg,
+            [udp, 400, 0, 0, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        4
+    );
+    let mut flags_out = [0u8; 4];
+    mem.read(448, &mut flags_out).unwrap();
+    assert_eq!(u32::from_le_bytes(flags_out) & 0x20, 0x20);
+    // Blocking socket with no SO_RCVTIMEO passes u64::MAX (indefinite).
+    assert_eq!(*plat.net.last_udp_timeout.lock(), Some(u64::MAX));
+
+    // recvmmsg with a 500ms timespec passes 500_000_000ns and maps ETIMEDOUT -> EAGAIN.
+    let mut ts = [0u8; 16];
+    ts[0..8].copy_from_slice(&0i64.to_le_bytes());
+    ts[8..16].copy_from_slice(&500_000_000i64.to_le_bytes());
+    mem.write(600, &ts).unwrap();
+    mem.write(700, &hdr).unwrap();
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Recvmmsg,
+            [udp, 700, 1, 0, 600, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        EAGAIN.wrapping_neg()
+    );
+    assert_eq!(*plat.net.last_udp_timeout.lock(), Some(500_000_000));
+}
+
+#[test]
+fn sendfile_validates_fds_before_reading_and_honours_nonblocking_pipes() {
+    let mut proc = new_process(Abi::X86_64);
+    let mut mem = Memory::new(4096);
+    let mut plat = Platform {
+        net: MockNet::default(),
+        now: 0,
+    };
+    // pipe2(fds, O_NONBLOCK)
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Pipe2,
+            [64, 0x0800, 0, 0, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        0
+    );
+    let mut pfds = [0u8; 8];
+    mem.read(64, &mut pfds).unwrap();
+    let pr = i32::from_le_bytes(pfds[0..4].try_into().unwrap()) as u64;
+    let pw = i32::from_le_bytes(pfds[4..8].try_into().unwrap()) as u64;
+
+    // Non-blocking empty pipe -> sendfile returns EAGAIN instead of blocking.
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Sendfile,
+            [1, pr, 0, 8, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        EAGAIN.wrapping_neg()
+    );
+
+    // Write bytes to pipe, then call sendfile with an invalid out_fd (pr is read-only):
+    // must return EINVAL (22) without consuming bytes from the pipe.
+    mem.write(128, b"keep").unwrap();
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Write,
+            [pw, 128, 4, 0, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        4
+    );
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Sendfile,
+            [pr, pr, 0, 4, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        22u64.wrapping_neg()
+    );
+    // Bytes are still intact in the pipe.
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Read,
+            [pr, 200, 4, 0, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        4
+    );
+    let mut kept = [0u8; 4];
+    mem.read(200, &mut kept).unwrap();
+    assert_eq!(&kept, b"keep");
 }

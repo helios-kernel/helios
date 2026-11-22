@@ -319,6 +319,16 @@ where
             .await
     }
 
+    pub async fn tcp_write_some_bytes(
+        &self,
+        stream: TcpStreamId,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, TcpError> {
+        self.execute_tcp_write_some_bytes(stream, bytes, timeout_nanos)
+            .await
+    }
+
     pub async fn tcp_read(
         &self,
         stream: TcpStreamId,
@@ -786,6 +796,51 @@ where
             self.wait_for_tcp_progress(wait, deadline_nanos).await;
         }
         Ok(())
+    }
+
+    pub(super) async fn execute_tcp_write_some_bytes(
+        &self,
+        stream: TcpStreamId,
+        mut bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, TcpError> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        let mut written = 0usize;
+        while !bytes.is_empty() {
+            let wait = self.shard_wait_for_handle(stream);
+            let progress = self.inner.state.with_handle(stream, |state| {
+                state.try_write_tcp_bytes(stream, &mut bytes)
+            })?;
+            self.drive_tcp().await?;
+            match progress {
+                TcpWriteProgress::Room(queued) => {
+                    written += queued;
+                    if bytes.is_empty() || timeout_nanos == 0 {
+                        return Ok(written);
+                    }
+                    continue;
+                }
+                TcpWriteProgress::Pending => {
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                }
+                TcpWriteProgress::Closed(error) => {
+                    return if written > 0 { Ok(written) } else { Err(error) };
+                }
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(TcpError {
+                    kind: TcpErrorKind::Timeout,
+                    detail: NetworkErrorDetail::TcpWriteTimeout,
+                });
+            }
+            self.wait_for_tcp_progress(wait, deadline_nanos).await;
+        }
+        Ok(written)
     }
 
     pub(super) async fn execute_tcp_read(

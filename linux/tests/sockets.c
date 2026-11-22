@@ -344,13 +344,25 @@ static void test_udp_loopback_and_mmsg(void) {
     CHECK(getpeername(cli, (struct sockaddr *)&peer, &peerlen) == -1 && errno == ENOTCONN,
           "udp getpeername after disconnect -> ENOTCONN");
 
-    /* IPv4 multicast options. */
-    int mttl = 2;
-    CHECK(setsockopt(srv, IPPROTO_IP, IP_MULTICAST_TTL, &mttl, sizeof(mttl)) == 0,
-          "IP_MULTICAST_TTL");
-    int mloop = 1;
-    CHECK(setsockopt(srv, IPPROTO_IP, IP_MULTICAST_LOOP, &mloop, sizeof(mloop)) == 0,
-          "IP_MULTICAST_LOOP");
+    /* recvmsg on a truncated datagram sets MSG_TRUNC in msg_flags. */
+    CHECK(sendto(cli, "truncated!", 10, 0, (struct sockaddr *)&addr, sizeof(addr)) == 10,
+          "udp sendto for recvmsg MSG_TRUNC");
+    char small[4] = {0};
+    struct iovec tiov = { .iov_base = small, .iov_len = sizeof(small) };
+    struct msghdr tmsg = {0};
+    tmsg.msg_iov = &tiov;
+    tmsg.msg_iovlen = 1;
+    CHECK(recvmsg(srv, &tmsg, 0) == 4 && memcmp(small, "trun", 4) == 0 &&
+          (tmsg.msg_flags & MSG_TRUNC) != 0,
+          "udp recvmsg sets MSG_TRUNC in msg_flags");
+
+    /* IPv4 multicast options (both 1-byte u8 and 4-byte int). */
+    unsigned char mttl_u8 = 2;
+    CHECK(setsockopt(srv, IPPROTO_IP, IP_MULTICAST_TTL, &mttl_u8, sizeof(mttl_u8)) == 0,
+          "IP_MULTICAST_TTL u8");
+    unsigned char mloop_u8 = 1;
+    CHECK(setsockopt(srv, IPPROTO_IP, IP_MULTICAST_LOOP, &mloop_u8, sizeof(mloop_u8)) == 0,
+          "IP_MULTICAST_LOOP u8");
     struct ip_mreq mreq = {0};
     mreq.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
     mreq.imr_interface.s_addr = htonl(INADDR_ANY);

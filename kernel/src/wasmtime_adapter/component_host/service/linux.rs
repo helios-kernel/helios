@@ -983,12 +983,10 @@ where
             .runtime_state
             .network_service()
             .ok_or(syscall::ENETDOWN)?;
-        let len = bytes.len();
         service
-            .tcp_write_all_bytes(stream, bytes, timeout_nanos)
+            .tcp_write_some_bytes(stream, bytes, timeout_nanos)
             .await
-            .map_err(linux_errno_from_tcp_error)?;
-        Ok(len)
+            .map_err(linux_errno_from_tcp_error)
     }
 
     async fn tcp_shutdown_send(&self, stream: Net::TcpStream) -> Result<(), u64> {
@@ -1130,7 +1128,7 @@ where
         max_bytes: u32,
         timeout_nanos: u64,
         peek: bool,
-    ) -> Result<Option<(Bytes, syscall::SocketAddr)>, u64> {
+    ) -> Result<Option<(Bytes, syscall::SocketAddr, usize)>, u64> {
         self.check_udp_open()?;
         let service = self
             .shared
@@ -1155,6 +1153,7 @@ where
                     ip: network_to_linux_ip(d.address),
                     port: d.port,
                 },
+                d.original_len,
             )
         }))
     }

@@ -649,6 +649,15 @@ where
         NetworkService::tcp_write_all_bytes(self, stream, bytes, timeout_nanos).await
     }
 
+    async fn tcp_write_some_bytes(
+        &self,
+        stream: Self::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<usize, TcpError> {
+        NetworkService::tcp_write_some_bytes(self, stream, bytes, timeout_nanos).await
+    }
+
     async fn tcp_read(
         &self,
         stream: Self::TcpStream,

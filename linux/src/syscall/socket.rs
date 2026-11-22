@@ -120,10 +120,6 @@ pub const EINPROGRESS: u64 = 115;
 // Linux `ioctl` request for toggling `O_NONBLOCK` (`include/uapi/asm-generic/ioctls.h`).
 pub(crate) const FIONBIO: u32 = 0x5421;
 
-/// Default timeout for blocking socket operations when neither `SO_RCVTIMEO`
-/// nor `SO_SNDTIMEO` is set: 30 seconds, matching the network service default.
-const DEFAULT_SOCKET_TIMEOUT_NANOS: u64 = 30_000_000_000;
-
 /// Maximum `iovec` entries accepted in one `sendmsg` / `recvmsg` (`UIO_MAXIOV`).
 const UIO_MAXIOV: usize = 1024;
 /// Maximum `mmsghdr` entries accepted in one `sendmmsg` / `recvmmsg` (`UIO_MAXIOV`).
@@ -367,7 +363,7 @@ pub trait Network<N: SocketNetwork> {
         max_bytes: u32,
         timeout_nanos: u64,
         peek: bool,
-    ) -> impl Future<Output = Result<Option<(Bytes, SocketAddr)>, u64>> + Send + '_ {
+    ) -> impl Future<Output = Result<Option<(Bytes, SocketAddr, usize)>, u64>> + Send + '_ {
         let _ = (socket, max_bytes, timeout_nanos, peek);
         core::future::ready(Err(ENETDOWN))
     }
@@ -519,10 +515,22 @@ fn write_sockaddr<M: UserMemory>(
 }
 
 fn effective_timeout(configured: Option<u64>, nonblocking: bool) -> u64 {
+    effective_timeout_bounded(configured, nonblocking, None)
+}
+
+fn effective_timeout_bounded(
+    configured: Option<u64>,
+    nonblocking: bool,
+    bound: Option<u64>,
+) -> u64 {
     if nonblocking {
         0
     } else {
-        configured.unwrap_or(DEFAULT_SOCKET_TIMEOUT_NANOS)
+        let base = configured.unwrap_or(u64::MAX);
+        match bound {
+            Some(limit) => base.min(limit),
+            None => base,
+        }
     }
 }
 
@@ -878,7 +886,7 @@ pub(crate) async fn accept<R: Resources, M: UserMemory, Net: Network<R::Network>
     let timeout = effective_timeout(options.time(SocketTime::AcceptTimeout), nonblocking);
     let (stream, peer) = match net.tcp_accept(listener.id(), timeout).await {
         Ok(accepted) => accepted,
-        Err(ETIMEDOUT) if nonblocking => return errno(EAGAIN),
+        Err(ETIMEDOUT) => return errno(EAGAIN),
         Err(err) => return errno(err),
     };
     if let Err(err) = write_sockaddr(memory, addr_ptr, addrlen_ptr, peer) {
@@ -1280,7 +1288,7 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
         let timeout = effective_timeout(options.time(SocketTime::SendTimeout), nonblocking);
         return match net.tcp_write(stream.id(), Bytes::from(data), timeout).await {
             Ok(written) => Ok(written),
-            Err(ETIMEDOUT) if nonblocking => Err(EAGAIN),
+            Err(ETIMEDOUT) => Err(EAGAIN),
             Err(err) => Err(err),
         };
     }
@@ -1344,7 +1352,7 @@ pub(crate) async fn socket_send<N: SocketNetwork, Net: Network<N>>(
         let timeout = effective_timeout(send_timeout, nonblocking);
         return match net.udp_send(udp_id, remote, &data, timeout).await {
             Ok(sent) => Ok(sent),
-            Err(ETIMEDOUT) if nonblocking => Err(EAGAIN),
+            Err(ETIMEDOUT) => Err(EAGAIN),
             Err(err) => Err(err),
         };
     }
@@ -1367,6 +1375,16 @@ pub(crate) async fn socket_recv<N: SocketNetwork, Net: Network<N>>(
     sock: &Socket<N>,
     max_len: usize,
     flags: u32,
+    net: &Net,
+) -> Result<RecvResult, u64> {
+    socket_recv_bounded(sock, max_len, flags, None, net).await
+}
+
+async fn socket_recv_bounded<N: SocketNetwork, Net: Network<N>>(
+    sock: &Socket<N>,
+    max_len: usize,
+    flags: u32,
+    timeout_bound: Option<u64>,
     net: &Net,
 ) -> Result<RecvResult, u64> {
     if flags & MSG_OOB != 0 {
@@ -1451,7 +1469,11 @@ pub(crate) async fn socket_recv<N: SocketNetwork, Net: Network<N>>(
                 truncated: false,
             });
         }
-        let timeout = effective_timeout(options.time(SocketTime::ReceiveTimeout), nonblocking);
+        let timeout = effective_timeout_bounded(
+            options.time(SocketTime::ReceiveTimeout),
+            nonblocking,
+            timeout_bound,
+        );
         let mut received = Vec::new();
         loop {
             let need = max_len.saturating_sub(received.len());
@@ -1467,7 +1489,7 @@ pub(crate) async fn socket_recv<N: SocketNetwork, Net: Network<N>>(
                     }
                 }
                 Ok(_) => break,
-                Err(ETIMEDOUT) if nonblocking => {
+                Err(ETIMEDOUT) => {
                     if received.is_empty() {
                         return Err(EAGAIN);
                     }
@@ -1497,19 +1519,16 @@ pub(crate) async fn socket_recv<N: SocketNetwork, Net: Network<N>>(
         else {
             return Err(EAGAIN);
         };
-        let timeout = effective_timeout(options.time(SocketTime::ReceiveTimeout), nonblocking);
-        // Read up to the maximum UDP datagram payload when `MSG_TRUNC` is
-        // requested so we can report the true untruncated datagram length.
-        let req = if flags & MSG_TRUNC != 0 {
-            65_535
-        } else {
-            u32::try_from(max_len.max(1)).unwrap_or(u32::MAX)
-        };
+        let timeout = effective_timeout_bounded(
+            options.time(SocketTime::ReceiveTimeout),
+            nonblocking,
+            timeout_bound,
+        );
+        let req = u32::try_from(max_len).unwrap_or(u32::MAX);
         match net.udp_receive(socket.id(), req, timeout, peek).await {
-            Ok(Some((payload, peer))) => {
-                let full_len = payload.len();
-                let truncated = full_len > max_len;
-                let data = if truncated {
+            Ok(Some((payload, peer, original_len))) => {
+                let truncated = original_len > max_len;
+                let data = if payload.len() > max_len {
                     payload.slice(..max_len)
                 } else {
                     payload
@@ -1517,12 +1536,12 @@ pub(crate) async fn socket_recv<N: SocketNetwork, Net: Network<N>>(
                 return Ok(RecvResult {
                     data,
                     peer: Some(peer),
-                    full_len,
+                    full_len: original_len,
                     truncated,
                 });
             }
             Ok(None) => return Err(EAGAIN),
-            Err(ETIMEDOUT) if nonblocking => return Err(EAGAIN),
+            Err(ETIMEDOUT) => return Err(EAGAIN),
             Err(err) => return Err(err),
         }
     }
@@ -1694,6 +1713,7 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
     sock: &Socket<N>,
     msg_ptr: u64,
     flags: u32,
+    timeout_bound: Option<u64>,
     memory: &mut M,
     net: &Net,
 ) -> Result<usize, u64> {
@@ -1705,7 +1725,8 @@ async fn recvmsg_one<N: SocketNetwork, M: UserMemory, Net: Network<N>>(
             return Err(EFAULT);
         }
     }
-    let result = socket_recv(sock, total, flags & !MSG_CMSG_CLOEXEC, net).await?;
+    let result =
+        socket_recv_bounded(sock, total, flags & !MSG_CMSG_CLOEXEC, timeout_bound, net).await?;
     let mut offset = 0usize;
     for (base, len) in iovecs {
         if offset >= result.data.len() {
@@ -1787,7 +1808,7 @@ pub(crate) async fn recvmsg<R: Resources, M: UserMemory, Net: Network<R::Network
         Ok(sock) => sock,
         Err(err) => return errno(err),
     };
-    match recvmsg_one(&sock, msg_ptr, flags, memory, net).await {
+    match recvmsg_one(&sock, msg_ptr, flags, None, memory, net).await {
         Ok(read) => read as u64,
         Err(err) => errno(err),
     }
@@ -1845,7 +1866,11 @@ pub(crate) async fn sendmmsg<R: Resources, M: UserMemory, Net: Network<R::Networ
     sent_count as u64
 }
 
-pub(crate) async fn recvmmsg<R: Resources, M: UserMemory, Net: Network<R::Network>>(
+pub(crate) async fn recvmmsg<
+    R: Resources,
+    M: UserMemory,
+    Net: Network<R::Network> + super::Clock,
+>(
     descriptors: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
     memory: &mut M,
@@ -1856,7 +1881,7 @@ pub(crate) async fn recvmmsg<R: Resources, M: UserMemory, Net: Network<R::Networ
     let vlen = (args[2] as u32 as usize).min(MAX_MMSG);
     let mut flags = args[3] as u32;
     let timeout_ptr = args[4];
-    if timeout_ptr != 0 {
+    let deadline = if timeout_ptr != 0 {
         let mut raw = [0u8; 16];
         if memory.read(timeout_ptr, &mut raw).is_err() {
             return errno(EFAULT);
@@ -1866,7 +1891,13 @@ pub(crate) async fn recvmmsg<R: Resources, M: UserMemory, Net: Network<R::Networ
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
             return errno(EINVAL);
         }
-    }
+        let timeout_nanos = (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec as u64);
+        Some(net.now_nanos().saturating_add(timeout_nanos))
+    } else {
+        None
+    };
     let sock = match get_socket::<R>(descriptors, fd) {
         Ok(sock) => sock,
         Err(err) => return errno(err),
@@ -1875,6 +1906,15 @@ pub(crate) async fn recvmmsg<R: Resources, M: UserMemory, Net: Network<R::Networ
     flags &= !MSG_WAITFORONE;
     let mut recv_count = 0usize;
     for index in 0..vlen {
+        let timeout_bound = if let Some(end) = deadline {
+            let rem = end.saturating_sub(net.now_nanos());
+            if rem == 0 && recv_count > 0 {
+                break;
+            }
+            Some(rem)
+        } else {
+            None
+        };
         let Some(entry_ptr) = (index as u64)
             .checked_mul(MMSGHDR_LEN as u64)
             .and_then(|o| vec_ptr.checked_add(o))
@@ -1885,12 +1925,12 @@ pub(crate) async fn recvmmsg<R: Resources, M: UserMemory, Net: Network<R::Networ
                 errno(EFAULT)
             };
         };
-        let iter_flags = if wait_for_one && recv_count > 0 {
+        let iter_flags = if (wait_for_one && recv_count > 0) || timeout_bound == Some(0) {
             flags | MSG_DONTWAIT
         } else {
             flags
         };
-        match recvmsg_one(&sock, entry_ptr, iter_flags, memory, net).await {
+        match recvmsg_one(&sock, entry_ptr, iter_flags, timeout_bound, memory, net).await {
             Ok(bytes) => {
                 if memory
                     .write(entry_ptr + 56, &(bytes as u32).to_le_bytes())
@@ -2001,16 +2041,47 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
         // Pipes and sockets are not seekable; Linux reports `ESPIPE`.
         return errno(ESPIPE);
     }
+    // Validate both descriptor kinds before consuming any bytes from `in_fd`.
+    if !matches!(
+        in_entry.descriptor,
+        Descriptor::<R>::PipeRead { .. }
+            | Descriptor::<R>::Socket(_)
+            | Descriptor::<R>::Stdin { .. }
+    ) || !matches!(
+        out_entry.descriptor,
+        Descriptor::<R>::Socket(_)
+            | Descriptor::<R>::PipeWrite { .. }
+            | Descriptor::<R>::Stdout
+            | Descriptor::<R>::Stderr
+    ) {
+        return errno(EINVAL);
+    }
     if count == 0 {
         return 0;
     }
 
+    let in_nonblocking = in_entry.fdflags() & (SOCK_NONBLOCK as u16) != 0;
+    let out_nonblocking = out_entry.fdflags() & (SOCK_NONBLOCK as u16) != 0;
     let mut total_sent = 0usize;
     while total_sent < count {
         let chunk_len = (count - total_sent).min(SENDFILE_CHUNK);
         let chunk = match &in_entry.descriptor {
             Descriptor::<R>::PipeRead { reader } => {
-                reader.read_limit(chunk_len).await.unwrap_or_default()
+                if in_nonblocking {
+                    match reader.try_read_limit(chunk_len) {
+                        helios_sync::TryRead::Ready(bytes) => bytes,
+                        helios_sync::TryRead::Pending => {
+                            return if total_sent > 0 {
+                                total_sent as u64
+                            } else {
+                                errno(EAGAIN)
+                            };
+                        }
+                        helios_sync::TryRead::Eof => Bytes::new(),
+                    }
+                } else {
+                    reader.read_limit(chunk_len).await.unwrap_or_default()
+                }
             }
             Descriptor::<R>::Socket(sock) => match socket_recv(sock, chunk_len, 0, output).await {
                 Ok(recv) => recv.data,
@@ -2032,7 +2103,7 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
                     };
                 }
             },
-            _ => return errno(EINVAL),
+            _ => unreachable!(),
         };
         if chunk.is_empty() {
             break;
@@ -2052,14 +2123,34 @@ pub(crate) async fn sendfile<R: Resources, O: Network<R::Network> + super::Stdio
             }
             Descriptor::<R>::PipeWrite { writer } => {
                 let len = chunk.len();
-                match writer.write(chunk).await {
-                    Ok(()) => len,
-                    Err(helios_sync::ClosedPeer) => {
-                        return if total_sent > 0 {
-                            total_sent as u64
-                        } else {
-                            errno(EPIPE)
-                        };
+                if out_nonblocking {
+                    match writer.try_write(chunk) {
+                        helios_sync::TryWrite::Written => len,
+                        helios_sync::TryWrite::Full(_) => {
+                            return if total_sent > 0 {
+                                total_sent as u64
+                            } else {
+                                errno(EAGAIN)
+                            };
+                        }
+                        helios_sync::TryWrite::Closed => {
+                            return if total_sent > 0 {
+                                total_sent as u64
+                            } else {
+                                errno(EPIPE)
+                            };
+                        }
+                    }
+                } else {
+                    match writer.write(chunk).await {
+                        Ok(()) => len,
+                        Err(helios_sync::ClosedPeer) => {
+                            return if total_sent > 0 {
+                                total_sent as u64
+                            } else {
+                                errno(EPIPE)
+                            };
+                        }
                     }
                 }
             }
@@ -2128,6 +2219,18 @@ fn read_opt_i32<M: UserMemory>(memory: &M, ptr: u64, len: u32) -> Result<i32, u6
     let mut raw = [0u8; 4];
     memory.read(ptr, &mut raw).map_err(|_| EFAULT)?;
     Ok(i32::from_le_bytes(raw))
+}
+
+/// Reads an option value that Linux (`ip(7)`) accepts as either a 1-byte
+/// `unsigned char` (`optlen == 1`) or a 4-byte `int` (`optlen >= 4`).
+fn read_opt_i32_or_u8<M: UserMemory>(memory: &M, ptr: u64, len: u32) -> Result<i32, u64> {
+    if len == 1 {
+        let mut raw = [0u8; 1];
+        memory.read(ptr, &mut raw).map_err(|_| EFAULT)?;
+        Ok(i32::from(raw[0]))
+    } else {
+        read_opt_i32(memory, ptr, len)
+    }
 }
 
 fn write_opt_bytes<M: UserMemory>(
@@ -2211,7 +2314,12 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             if level == IPPROTO_TCP && !sock.is_tcp() {
                 return errno(EOPNOTSUPP);
             }
-            let val = match read_opt_i32(memory, optval, optlen) {
+            let raw_val = if (level, optname) == (IPPROTO_IP, IP_MULTICAST_LOOP) {
+                read_opt_i32_or_u8(memory, optval, optlen)
+            } else {
+                read_opt_i32(memory, optval, optlen)
+            };
+            let val = match raw_val {
                 Ok(v) => v != 0,
                 Err(err) => return errno(err),
             };
@@ -2270,7 +2378,7 @@ pub(crate) async fn setsockopt<R: Resources, M: UserMemory, Net: Network<R::Netw
             }
         }
         (IPPROTO_IP, IP_MULTICAST_TTL) => {
-            let val = match read_opt_i32(memory, optval, optlen) {
+            let val = match read_opt_i32_or_u8(memory, optval, optlen) {
                 Ok(-1) => 1u64,
                 Ok(v) if (0..=255).contains(&v) => v as u64,
                 Ok(_) => return errno(EINVAL),

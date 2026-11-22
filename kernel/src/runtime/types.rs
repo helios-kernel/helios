@@ -1004,6 +1004,24 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         async move { self.tcp_write_all(stream, &bytes, timeout_nanos).await }
     }
 
+    /// Writes up to `bytes.len()` bytes to `stream`, returning a partial count
+    /// if some bytes were queued before the send window filled or `timeout_nanos`
+    /// expired. Fails with `TcpErrorKind::Timeout` only when zero bytes could be
+    /// queued before the deadline.
+    fn tcp_write_some_bytes<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<usize, TcpError>> + Send + 'a {
+        async move {
+            let len = bytes.len();
+            self.tcp_write_all_bytes(stream, bytes, timeout_nanos)
+                .await?;
+            Ok(len)
+        }
+    }
+
     fn tcp_read<'a>(
         &'a self,
         stream: Self::TcpStream,

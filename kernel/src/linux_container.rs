@@ -734,7 +734,7 @@ pub fn format_hosts(hostname: &str) -> String {
     use core::fmt::Write;
     let mut out = String::new();
     let trimmed = hostname.trim();
-    if trimmed.is_empty() || trimmed == "localhost" {
+    if trimmed.is_empty() || trimmed == "localhost" || trimmed == "(none)" {
         let _ = writeln!(out, "127.0.0.1 localhost");
         let _ = writeln!(out, "::1 localhost");
     } else {
@@ -1467,6 +1467,15 @@ mod tests {
             resolv,
             "nameserver 10.0.2.3\nnameserver 2001:4860:4860::8888\n"
         );
+
+        // Default unset UTS hostname ("(none)") is omitted from /etc/hosts.
+        let default_hosts = String::from_utf8(
+            with_dns
+                .synthetic_etc_file("/etc/hosts", &resolvers)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(default_hosts, "127.0.0.1 localhost\n::1 localhost\n");
 
         // /etc/hosts reflects the container's current UTS hostname.
         with_dns.set_hostname(UtsField::from_bytes(b"app-box").unwrap());
