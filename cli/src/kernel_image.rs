@@ -68,7 +68,12 @@ pub enum KernelImageError {
 pub struct KernelImageKey {
     /// One field of the build's description, in order. The inspector
     /// names the cargo command line and the environment that reaches it.
-    #[arg(long = "field", value_name = "TEXT", required = true)]
+    #[arg(
+        long = "field",
+        value_name = "TEXT",
+        required = true,
+        allow_hyphen_values = true
+    )]
     fields: Vec<String>,
     /// The trusted root public key file the kernel build embeds.
     #[arg(long, value_name = "FILE")]
@@ -239,5 +244,56 @@ mod tests {
         );
         write_image(&path, b"other").expect("another image replaces it");
         assert_eq!(fs::read(&path).expect("the image"), b"other");
+    }
+
+    #[test]
+    fn kernel_image_fields_accept_cargo_flags_with_leading_hyphens() {
+        let restore = KernelImageRestore::try_parse_from([
+            "kernel-image-restore",
+            "--public-key",
+            "root.pub",
+            "--image",
+            "helios",
+            "--field",
+            "cargo",
+            "--field",
+            "--profile",
+            "--field",
+            "release",
+            "--field",
+            "-Zbuild-std=core,alloc",
+            "--field",
+            "--no-default-features",
+        ])
+        .expect("restore parses hyphenated --field arguments");
+        assert_eq!(
+            restore.key.fields,
+            [
+                "cargo",
+                "--profile",
+                "release",
+                "-Zbuild-std=core,alloc",
+                "--no-default-features",
+            ]
+        );
+
+        let store = KernelImageStore::try_parse_from([
+            "kernel-image-store",
+            "--field",
+            "--profile",
+            "--field",
+            "release",
+            "--public-key",
+            "root.pub",
+            "--image",
+            "helios",
+            "--target",
+            "x86_64-unknown-none",
+            "--target-dir",
+            "target",
+        ])
+        .expect("store parses hyphenated --field arguments");
+        assert_eq!(store.key.fields, ["--profile", "release"]);
+        assert_eq!(store.target, "x86_64-unknown-none");
     }
 }
