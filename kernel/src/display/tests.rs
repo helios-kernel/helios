@@ -459,7 +459,7 @@ fn a_retained_framebuffer_can_replace_an_image_without_reallocation() {
             offset: 0,
             stride: SMALL.width * 4,
         };
-        let held_blob = Arc::new(crate::gpu::BlobShared::new(
+        let held_blob = Arc::new(crate::gpu::BlobShared::for_test(
             blob,
             u64::from(layout.stride) * u64::from(SMALL.height),
             Arc::new(crate::exec::Notify::new()),
@@ -578,7 +578,7 @@ fn repeated_blob_surfaces_have_distinct_identities_and_release_in_either_order()
             offset: 0,
             stride: SMALL.width * 4,
         };
-        let held_blob = Arc::new(crate::gpu::BlobShared::new(
+        let held_blob = Arc::new(crate::gpu::BlobShared::for_test(
             blob,
             u64::from(layout.stride) * u64::from(SMALL.height),
             Arc::new(crate::exec::Notify::new()),
@@ -697,7 +697,7 @@ fn a_blob_remains_retained_when_surface_or_claim_detachment_is_unconfirmed() {
             offset: 0,
             stride: SMALL.width * 4,
         };
-        let held_blob = Arc::new(crate::gpu::BlobShared::new(
+        let held_blob = Arc::new(crate::gpu::BlobShared::for_test(
             blob,
             u64::from(layout.stride) * u64::from(SMALL.height),
             Arc::new(crate::exec::Notify::new()),
@@ -766,7 +766,7 @@ fn an_unanswered_blob_attachment_retains_storage_but_a_refusal_does_not() {
             offset: 0,
             stride: SMALL.width * 4,
         };
-        let held_blob = Arc::new(crate::gpu::BlobShared::new(
+        let held_blob = Arc::new(crate::gpu::BlobShared::for_test(
             blob,
             u64::from(layout.stride) * u64::from(SMALL.height),
             Arc::new(crate::exec::Notify::new()),
@@ -820,7 +820,7 @@ fn a_blob_surface_is_retained_once_and_each_present_flushes_the_blob() {
     };
     let scanout = ScanoutId::new(0);
     // The gpu path's record of the blob, which the surface holds.
-    let held_blob = Arc::new(crate::gpu::BlobShared::new(
+    let held_blob = Arc::new(crate::gpu::BlobShared::for_test(
         blob,
         u64::from(layout.stride) * u64::from(SMALL.height),
         Arc::new(crate::exec::Notify::new()),
