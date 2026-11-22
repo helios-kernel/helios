@@ -1375,6 +1375,13 @@ where
         let dispatch_started = self.profile_start();
         let frame_len = frame.len();
         batch.lent_bytes = batch.lent_bytes.saturating_add(frame_len);
+        if self
+            .inner
+            .packet_taps
+            .tap_rx_frame(IFINDEX_ETH0, frame.bytes.as_ref())
+        {
+            self.inner.state.any_arrival.signal();
+        }
         match self
             .inner
             .state
