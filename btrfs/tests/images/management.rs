@@ -594,6 +594,213 @@ fn send_and_receive_full_and_incremental_with_unix_metadata() {
 }
 
 #[test]
+fn send_receive_cross_depth_hardlinks_truncated_clone_and_error_cleanup() {
+    block_on(async {
+        let disk = SharedDisk::new(base_image());
+        let mut writer = mount_writer(disk.clone()).await;
+
+        let src = writer
+            .create_subvolume("", b"src", attrs(0o755, 0, 0), WHEN)
+            .await
+            .unwrap();
+        let recv_dir = "recv";
+        {
+            let mut tx = writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            tx.create_directory(
+                Name {
+                    parent: &root,
+                    bytes: recv_dir.as_bytes(),
+                },
+                attrs(0o755, 0, 0),
+                WHEN,
+            )
+            .await
+            .unwrap();
+            let src_dir = tx.lookup(&root, b"src").await.unwrap().unwrap();
+            let dir_a = tx
+                .create_directory(
+                    Name {
+                        parent: &src_dir,
+                        bytes: b"a",
+                    },
+                    attrs(0o755, 0, 0),
+                    WHEN,
+                )
+                .await
+                .unwrap();
+
+            // Regression #1: cross-depth hardlinks `"z"` (depth 1) and `"a/b"`
+            // (depth 2, lexicographically smaller than `"z"`).
+            let file_z = tx
+                .create_file(
+                    Name {
+                        parent: &src_dir,
+                        bytes: b"z",
+                    },
+                    attrs(0o644, 0, 0),
+                    WHEN,
+                )
+                .await
+                .unwrap();
+            tx.write_file(&file_z, 0, b"cross-depth-hardlink", WHEN)
+                .await
+                .unwrap();
+            tx.hard_link(
+                Name {
+                    parent: &dir_a,
+                    bytes: b"b",
+                },
+                &file_z,
+                WHEN,
+            )
+            .await
+            .unwrap();
+
+            // Regression #2: 8 KiB file later truncated to 5000 B in a snapshot.
+            let big = tx
+                .create_file(
+                    Name {
+                        parent: &src_dir,
+                        bytes: b"trunc.bin",
+                    },
+                    attrs(0o644, 0, 0),
+                    WHEN,
+                )
+                .await
+                .unwrap();
+            let mut body = vec![0x33_u8; 4096];
+            body.extend_from_slice(&vec![0x44_u8; 4096]);
+            tx.write_file(&big, 0, &body, WHEN).await.unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        let snap1 = writer
+            .snapshot_subvolume(src.id, "", b"snap1", true, WHEN)
+            .await
+            .unwrap();
+
+        // Full send/receive exercises cross-depth hardlinks `"z"` + `"a/b"`.
+        let full_stream = writer.send_subvolume(snap1.id, None, &[]).await.unwrap();
+        let recv1 = writer
+            .receive_subvolume(recv_dir, &full_stream, WHEN, |_| Ok(()))
+            .await
+            .unwrap();
+        assert!(recv1.read_only);
+
+        // Truncate `trunc.bin` from 8192 B to 5000 B and snapshot for incremental send.
+        {
+            let mut tx = writer.join().await.unwrap();
+            let root = tx.root().await.unwrap();
+            let src_dir = tx.lookup(&root, b"src").await.unwrap().unwrap();
+            let big = tx.lookup(&src_dir, b"trunc.bin").await.unwrap().unwrap();
+            tx.truncate_file(&big, 5000, WHEN).await.unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        let snap2 = writer
+            .snapshot_subvolume(src.id, "", b"snap2", true, WHEN)
+            .await
+            .unwrap();
+        let inc_stream = writer
+            .send_subvolume(snap2.id, Some(snap1.id), &[])
+            .await
+            .unwrap();
+        let recv2 = writer
+            .receive_subvolume(recv_dir, &inc_stream, WHEN, |_| Ok(()))
+            .await
+            .unwrap();
+        assert!(recv2.read_only);
+
+        // Regression #4a: unauthorized external CLONE source must fail before
+        // creating any target subvolume on disk.
+        let clone_stream = writer
+            .send_subvolume(snap2.id, None, &[snap1.id])
+            .await
+            .unwrap();
+        let before_count = writer.list_subvolumes().await.unwrap().len();
+        let denied = writer
+            .receive_subvolume(recv_dir, &clone_stream, WHEN, |_| {
+                Err(WriteError::PermissionDenied)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, WriteError::PermissionDenied));
+        assert_eq!(writer.list_subvolumes().await.unwrap().len(), before_count);
+
+        // Regression #4b: mid-stream failure after SUBVOL creation must clean up
+        // the half-received writable subvolume so nothing stray remains.
+        let mut failing_stream = Vec::new();
+        failing_stream.extend_from_slice(b"btrfs-stream\0");
+        failing_stream.extend_from_slice(&1_u32.to_le_bytes());
+        let push_cmd = |out: &mut Vec<u8>, code: u16, tlvs: &[(u16, &[u8])]| {
+            let mut body = Vec::new();
+            for &(kind, data) in tlvs {
+                body.extend_from_slice(&kind.to_le_bytes());
+                body.extend_from_slice(&(data.len() as u16).to_le_bytes());
+                body.extend_from_slice(data);
+            }
+            let start = out.len();
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&code.to_le_bytes());
+            out.extend_from_slice(&0_u32.to_le_bytes());
+            out.extend_from_slice(&body);
+            // CRC32C (Castagnoli) over the command with zeroed CRC field.
+            let mut crc = 0_u32;
+            for &byte in &out[start..] {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
+                }
+            }
+            out[start + 6..start + 10].copy_from_slice(&crc.to_le_bytes());
+        };
+        let bad_uuid = [0x99_u8; 16];
+        push_cmd(
+            &mut failing_stream,
+            1, // BTRFS_SEND_C_SUBVOL
+            &[
+                (15, b"leaked-subvol"),
+                (1, &bad_uuid),
+                (2, &42_u64.to_le_bytes()),
+            ],
+        );
+        push_cmd(
+            &mut failing_stream,
+            11, // BTRFS_SEND_C_UNLINK of nonexistent file triggers NoEntry
+            &[(15, b"does-not-exist")],
+        );
+        push_cmd(&mut failing_stream, 21, &[]); // BTRFS_SEND_C_END
+
+        let err = writer
+            .receive_subvolume(recv_dir, &failing_stream, WHEN, |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WriteError::NoEntry { .. }));
+        let subvols = writer.list_subvolumes().await.unwrap();
+        assert_eq!(subvols.len(), before_count);
+        assert!(!subvols.iter().any(|s| s.path.ends_with("leaked-subvol")));
+
+        drop(writer);
+        let fs = Filesystem::mount(disk).await.unwrap();
+        let rz = fs.resolve(b"/recv/snap1/z").await.unwrap();
+        let rab = fs.resolve(b"/recv/snap1/a/b").await.unwrap();
+        assert_eq!(rz.number(), rab.number());
+        assert_eq!(rz.metadata().nlink, 2);
+        assert_eq!(
+            read_all(&fs, "/recv/snap1/z").await,
+            b"cross-depth-hardlink"
+        );
+
+        let trunc_data = read_all(&fs, "/recv/snap2/trunc.bin").await;
+        assert_eq!(trunc_data.len(), 5000);
+        assert!(trunc_data[..4096].iter().all(|&b| b == 0x33));
+        assert!(trunc_data[4096..].iter().all(|&b| b == 0x44));
+    });
+}
+
+#[test]
 fn reflink_and_dedupe_verify_equality_and_share_extents() {
     block_on(async {
         let disk = SharedDisk::new(base_image());

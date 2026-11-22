@@ -806,10 +806,37 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     {
         let commands = crate::receive::parse_stream(stream)?;
         let init = crate::receive::decode_receive_init(&commands)?;
+        let referenced_sources = crate::receive::referenced_sources_in_commands(&commands)?;
+        let (target_name, stream_uuid) = match &init {
+            crate::receive::ReceiveInit::Subvol { name, uuid, .. }
+            | crate::receive::ReceiveInit::Snapshot { name, uuid, .. } => (name.to_vec(), *uuid),
+        };
 
-        // Commit any prior pending work so parent snapshot lookup sees committed roots.
+        // Commit any prior pending work so parent and clone source lookups see committed roots.
         self.commit().await?;
         self.start().await?;
+
+        // Pre-authorize every external source subvolume referenced by `SNAPSHOT`
+        // or `CLONE` commands before creating any target subvolume on disk.
+        {
+            let inner = &self.running.as_ref().expect("transaction started").inner;
+            for &(clone_uuid, clone_ctransid) in &referenced_sources {
+                if clone_uuid == stream_uuid {
+                    continue;
+                }
+                let found = inner
+                    .roots
+                    .find_subvolume_by_uuid(clone_uuid, Some(clone_ctransid))
+                    .ok_or_else(|| {
+                        WriteError::InvalidStream(alloc::string::String::from(
+                            "stream references unknown source subvolume UUID",
+                        ))
+                    })?;
+                let (_, source_root_path) = inner.subvolume_path(found).await?;
+                authorize_source(&source_root_path)?;
+            }
+        }
+
         let dest_parent = self.resolve_tx_path(dest_dir_path).await?;
         let new_uuid = self.uuids.next_uuid();
 
@@ -853,17 +880,14 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             } => {
                 let parent_tree = {
                     let inner = &self.running.as_ref().expect("transaction started").inner;
-                    let found = inner
+                    inner
                         .roots
                         .find_subvolume_by_uuid(clone_uuid, Some(clone_ctransid))
                         .ok_or_else(|| {
                             WriteError::InvalidStream(alloc::string::String::from(
                                 "SNAPSHOT references unknown parent subvolume UUID",
                             ))
-                        })?;
-                    let (_, parent_root_path) = inner.subvolume_path(found).await?;
-                    authorize_source(&parent_root_path)?;
-                    found
+                        })?
                 };
                 let mut tx = self.join().await?;
                 let mut op = Mutation::new(&mut tx, Units::CREATE).await?;
@@ -888,31 +912,43 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
 
         // Commit the created subvolume/snapshot first so any in-stream CLONE
         // or rollback operates cleanly, then apply all stream commands in a
-        // transaction and commit.
+        // transaction and commit. If applying the stream fails, remove the
+        // half-received writable subvolume so nothing stray remains on disk.
         self.commit().await?;
-        self.start().await?;
-        {
-            let mut tx = self.join().await?;
-            let mut op = Mutation::checkpointed(&mut tx, Units::default());
-            let (inner, compressor, concurrency, max_inline) = op.split();
-            crate::receive::apply_receive_commands(
-                inner,
-                crate::receive::ReceiveApplyContext {
-                    target_tree,
-                    received_uuid,
-                    stransid,
-                    when,
-                    compressor,
-                    concurrency,
-                    max_inline,
-                },
-                &commands,
-                authorize_source,
-            )
-            .await?;
-            op.publish()?;
+        let apply_result: Result<(), WriteError> = async {
+            self.start().await?;
+            {
+                let mut tx = self.join().await?;
+                let mut op = Mutation::checkpointed(&mut tx, Units::default());
+                let (inner, compressor, concurrency, max_inline) = op.split();
+                crate::receive::apply_receive_commands(
+                    inner,
+                    crate::receive::ReceiveApplyContext {
+                        target_tree,
+                        received_uuid,
+                        stransid,
+                        when,
+                        compressor,
+                        concurrency,
+                        max_inline,
+                    },
+                    &commands,
+                    authorize_source,
+                )
+                .await?;
+                op.publish()?;
+            }
+            self.commit().await
         }
-        self.commit().await?;
+        .await;
+        if let Err(err) = apply_result {
+            if self.committed.is_some() {
+                let _ = self
+                    .delete_subvolume(dest_dir_path, &target_name, when)
+                    .await;
+            }
+            return Err(err);
+        }
         self.subvolume_info(target_tree).await
     }
 
@@ -1159,21 +1195,32 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
 
     /// Verifies checksums across all allocated metadata blocks, data extents,
     /// and superblocks (optionally restricted to `devid`), repairing corrupt
-    /// mirror copies when `!read_only`.
+    /// mirror copies when `!read_only`. Forces a commit whenever repairs were
+    /// staged so they become durable on write-caching `BlockSink`s.
     pub async fn scrub(
         &mut self,
         devid: Option<u64>,
         read_only: bool,
     ) -> Result<ScrubReport, WriteError> {
         self.commit().await?;
-        let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
-        crate::scrub::scrub_volume(
-            &committed.volume,
-            committed.snapshot.root_tree,
-            devid,
-            read_only,
-        )
-        .await
+        let report = {
+            let committed = self.committed.as_ref().ok_or(WriteError::WriterPoisoned)?;
+            crate::scrub::scrub_volume(
+                &committed.volume,
+                committed.snapshot.root_tree,
+                devid,
+                read_only,
+            )
+            .await?
+        };
+        if !read_only && report.corrected_errors > 0 {
+            self.start().await?;
+            if let Some(running) = &mut self.running {
+                running.inner.force_commit = true;
+            }
+            self.commit().await?;
+        }
+        Ok(report)
     }
 
     /// Enables quota groups and scans existing extents into `QUOTA_TREE`.

@@ -267,13 +267,13 @@ async fn resolve_parent_in_subvol<'a, S: BlockSink>(
     Ok((current, last))
 }
 
-/// Parses `stream` (verifying header and per-command CRC32C) and returns every
-/// `(uuid, ctransid)` source subvolume referenced by `SNAPSHOT` or `CLONE`
-/// commands, deduplicated in order of first appearance.
-pub fn stream_referenced_sources(stream: &[u8]) -> Result<Vec<([u8; 16], u64)>, WriteError> {
-    let commands = parse_stream(stream)?;
+/// Returns every `(uuid, ctransid)` source subvolume referenced by `SNAPSHOT`
+/// or `CLONE` commands in `commands`, deduplicated in order of first appearance.
+pub(crate) fn referenced_sources_in_commands(
+    commands: &[ParsedCommand<'_>],
+) -> Result<Vec<([u8; 16], u64)>, WriteError> {
     let mut sources: Vec<([u8; 16], u64)> = Vec::new();
-    for command in &commands {
+    for command in commands {
         if matches!(command.code, cmd::SNAPSHOT | cmd::CLONE) {
             let uuid = command.uuid(attr::CLONE_UUID)?;
             let ctransid = command.u64(attr::CLONE_CTRANSID)?;
@@ -283,6 +283,14 @@ pub fn stream_referenced_sources(stream: &[u8]) -> Result<Vec<([u8; 16], u64)>, 
         }
     }
     Ok(sources)
+}
+
+/// Parses `stream` (verifying header and per-command CRC32C) and returns every
+/// `(uuid, ctransid)` source subvolume referenced by `SNAPSHOT` or `CLONE`
+/// commands, deduplicated in order of first appearance.
+pub fn stream_referenced_sources(stream: &[u8]) -> Result<Vec<([u8; 16], u64)>, WriteError> {
+    let commands = parse_stream(stream)?;
+    referenced_sources_in_commands(&commands)
 }
 
 /// First command header extracted from a send stream so the caller can set up

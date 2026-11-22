@@ -167,8 +167,18 @@ struct FileExtentSpan {
     disk: Option<(u64, u64)>,
 }
 
-/// Index mapping `(disk_bytenr, disk_offset, length)` -> `(clone_uuid, clone_ctransid, path, file_offset)`.
-type CloneIndex = BTreeMap<(u64, u64), Vec<([u8; 16], u64, Vec<u8>, u64, u64)>>;
+/// Candidate extent in a parent or clone-source subvolume eligible for `CLONE`.
+struct CloneEntry {
+    uuid: [u8; 16],
+    ctransid: u64,
+    path: Vec<u8>,
+    offset: u64,
+    length: u64,
+    source_size: u64,
+}
+
+/// Index mapping `(disk_bytenr, disk_offset)` -> matching extents in clone sources.
+type CloneIndex = BTreeMap<(u64, u64), Vec<CloneEntry>>;
 
 /// Collects a full snapshot of `tree` from `fs` (an immutable view).
 async fn collect_subvolume<S: BlockSource>(
@@ -340,13 +350,17 @@ fn index_clone_sources(
         };
         for span in &info.extents {
             if let Some((disk_bytenr, disk_offset)) = span.disk {
-                index.entry((disk_bytenr, disk_offset)).or_default().push((
-                    uuid,
-                    ctransid,
-                    first_path.clone(),
-                    span.file_offset,
-                    span.length,
-                ));
+                index
+                    .entry((disk_bytenr, disk_offset))
+                    .or_default()
+                    .push(CloneEntry {
+                        uuid,
+                        ctransid,
+                        path: first_path.clone(),
+                        offset: span.file_offset,
+                        length: span.length,
+                        source_size: info.metadata.size,
+                    });
             }
         }
     }
@@ -418,29 +432,52 @@ async fn emit_file_data<S: BlockSource>(
             continue;
         }
         // Emit `CLONE` if an aligned identical extent exists in a clone source
-        // (matching sector alignment rules of Linux `btrfs receive`).
+        // (matching sector alignment rules of Linux `btrfs receive` and
+        // `btrfs_remap_file_range_prep`: an unaligned tail length is only valid
+        // when it reaches EOF in BOTH source and destination).
+        let mut write_start = start;
         if let Some((disk_bytenr, disk_offset)) = span.disk
             && start.is_multiple_of(sector)
-            && (len.is_multiple_of(sector) || end == size)
             && let Some(candidates) = clone_index.get(&(disk_bytenr, disk_offset))
-            && let Some((clone_uuid, clone_ctransid, clone_path, clone_offset, _clone_avail)) =
-                candidates
-                    .iter()
-                    .find(|(_, _, _, co, ca)| co.is_multiple_of(sector) && *ca >= len)
         {
-            enc.push_cmd(cmd::CLONE, |c| {
-                c.u64(attr::FILE_OFFSET, start);
-                c.u64(attr::CLONE_LEN, len);
-                c.bytes(attr::PATH, path);
-                c.bytes(attr::CLONE_UUID, clone_uuid);
-                c.u64(attr::CLONE_CTRANSID, *clone_ctransid);
-                c.bytes(attr::CLONE_PATH, clone_path);
-                c.u64(attr::CLONE_OFFSET, *clone_offset);
-            });
-            continue;
+            if (len.is_multiple_of(sector) || end == size)
+                && let Some(cand) = candidates.iter().find(|c| {
+                    c.offset.is_multiple_of(sector)
+                        && c.length >= len
+                        && (len.is_multiple_of(sector) || c.offset + len == c.source_size)
+                })
+            {
+                enc.push_cmd(cmd::CLONE, |c| {
+                    c.u64(attr::FILE_OFFSET, start);
+                    c.u64(attr::CLONE_LEN, len);
+                    c.bytes(attr::PATH, path);
+                    c.bytes(attr::CLONE_UUID, &cand.uuid);
+                    c.u64(attr::CLONE_CTRANSID, cand.ctransid);
+                    c.bytes(attr::CLONE_PATH, &cand.path);
+                    c.u64(attr::CLONE_OFFSET, cand.offset);
+                });
+                continue;
+            }
+            let aligned_len = (len / sector) * sector;
+            if aligned_len > 0
+                && let Some(cand) = candidates
+                    .iter()
+                    .find(|c| c.offset.is_multiple_of(sector) && c.length >= aligned_len)
+            {
+                enc.push_cmd(cmd::CLONE, |c| {
+                    c.u64(attr::FILE_OFFSET, start);
+                    c.u64(attr::CLONE_LEN, aligned_len);
+                    c.bytes(attr::PATH, path);
+                    c.bytes(attr::CLONE_UUID, &cand.uuid);
+                    c.u64(attr::CLONE_CTRANSID, cand.ctransid);
+                    c.bytes(attr::CLONE_PATH, &cand.path);
+                    c.u64(attr::CLONE_OFFSET, cand.offset);
+                });
+                write_start = start + aligned_len;
+            }
         }
 
-        let mut at = start;
+        let mut at = write_start;
         while at < end {
             let chunk = ((end - at) as usize).min(buf.len());
             let n = fs.read(&file, at, &mut buf[..chunk]).await?;
@@ -616,7 +653,7 @@ async fn emit_full<S: BlockSource>(
     }
 
     // 2. Create all non-directory inodes and their hardlinks, data, and metadata.
-    let mut created = BTreeSet::new();
+    let mut created: BTreeMap<u64, &[u8]> = BTreeMap::new();
     let mut non_dirs: Vec<(&[u8], u64)> = snap
         .paths
         .iter()
@@ -627,19 +664,19 @@ async fn emit_full<S: BlockSource>(
 
     for (path, ino) in non_dirs {
         let info = &snap.inodes[&ino];
-        if created.insert(ino) {
+        if let Some(&primary) = created.get(&ino) {
+            // Additional hardlink to the path that created this inode first.
+            enc.push_cmd(cmd::LINK, |c| {
+                c.bytes(attr::PATH, path);
+                c.bytes(attr::PATH_LINK, primary);
+            });
+        } else {
             emit_create_inode(enc, path, ino, info);
             if info.metadata.kind == FileKind::Regular {
                 emit_file_data(enc, fs, tree, ino, path, info, clone_index).await?;
             }
             emit_metadata(enc, path, info, None);
-        } else {
-            // Additional hardlink to an already-created inode.
-            let primary = &snap.inode_paths[&ino][0];
-            enc.push_cmd(cmd::LINK, |c| {
-                c.bytes(attr::PATH, path);
-                c.bytes(attr::PATH_LINK, primary);
-            });
+            created.insert(ino, path);
         }
     }
 
@@ -761,7 +798,8 @@ async fn emit_incremental<S: BlockSource>(
                 if info.metadata.kind == FileKind::Regular
                     && (info.metadata.size != prev.metadata.size
                         || info.extents != prev.extents
-                        || info.metadata.mtime != prev.metadata.mtime)
+                        || info.metadata.mtime != prev.metadata.mtime
+                        || info.metadata.ctime != prev.metadata.ctime)
                 {
                     // Truncate to 0 and rewrite / clone extents cleanly so
                     // holes and shrunk ranges match identically.
