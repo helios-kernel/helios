@@ -42,7 +42,7 @@ use crate::transaction::replay::{LogReplayError, PendingLog};
 use crate::tree::edit::{Header, Leaf};
 use crate::tree::write::{MetadataAllocator, WriteError};
 use crate::tree::{Cursor, Expected, Node};
-use crate::{DirPosition, Error, FileKind, Key, Timestamp};
+use crate::{DirBound, DirPosition, Error, FileKind, Key, Timestamp};
 
 /// When the baselines' files were made.
 const WHEN: Timestamp = Timestamp {
@@ -807,7 +807,7 @@ async fn directories(check: bool) {
     let emptied = fs.resolve("/父".as_bytes()).await.unwrap();
     assert_eq!(emptied.metadata().size, 0);
     let mut entries = 0;
-    fs.read_dir(&emptied, DirPosition::START, |_| {
+    fs.read_dir(&emptied, DirPosition::START, DirBound::UNBOUNDED, |_| {
         entries += 1;
         ControlFlow::Continue(())
     })

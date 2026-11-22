@@ -21,8 +21,8 @@ use std::path::Path;
 use erofs_rs::build::{Builder, Compression, Metadata, Options, SpecialFile};
 use futures_lite::future::block_on;
 use helios_hal::fs::{
-    BlockSerial, DeviceId, DirCookie, FileSystem, FsError, FsPath, IoError, NodeKind, OpenFlags,
-    WritePosition,
+    BlockSerial, DeviceId, DirCookie, DirStream, FileSystem, FsError, FsPath, IoError, NodeKind,
+    OpenFlags, WritePosition,
 };
 
 use super::{ErofsError, ErofsFs};
@@ -137,10 +137,11 @@ type FsResultBytes = Result<Vec<u8>, FsError>;
 /// each page resuming at the cookie the last entry of the one before it
 /// returned.
 fn list(fs: &ErofsFs<MemoryDisk>, dir: &str) -> Result<Vec<(String, NodeKind)>, FsError> {
+    let stream = block_on(fs.open_dir(path(dir)))?;
     let mut entries = Vec::new();
     let mut cookie = DirCookie::START;
     loop {
-        let page = block_on(fs.read_dir(path(dir), cookie, PAGE))?;
+        let page = block_on(stream.read(cookie, PAGE))?;
         let complete = page.len() < PAGE;
         for entry in &page {
             assert_ne!(entry.inode, 0, "{} carries its inode", entry.name);
@@ -234,7 +235,7 @@ fn assert_refusals(fs: &ErofsFs<MemoryDisk>) {
         Err(FsError::IsDirectory)
     );
     assert_eq!(
-        block_on(fs.read_dir(path("hello.txt"), DirCookie::START, 8)),
+        block_on(fs.open_dir(path("hello.txt"))).map(drop),
         Err(FsError::NotDirectory)
     );
     assert_eq!(
@@ -266,8 +267,9 @@ fn assert_refusals(fs: &ErofsFs<MemoryDisk>) {
     // `docs/` holds six entries, `.` and `..` among them, in one block:
     // index 7 of that block is past its last entry, so no listing of the
     // directory handed that cookie out.
+    let docs = block_on(fs.open_dir(path("docs"))).expect("opens docs");
     assert_eq!(
-        block_on(fs.read_dir(path("docs"), DirCookie::new(7), 8)),
+        block_on(docs.read(DirCookie::new(7), 8)),
         Err(FsError::Invalid)
     );
 }

@@ -9,7 +9,7 @@ use std::ops::ControlFlow;
 
 use chrono::DateTime;
 use futures_lite::future::block_on;
-use helios_btrfs::{DirPosition, FileKind, Filesystem};
+use helios_btrfs::{DirBound, DirPosition, FileKind, Filesystem};
 use thiserror::Error;
 
 use support::Image;
@@ -88,7 +88,7 @@ async fn run(args: &[String]) -> Result<(), Error> {
             } else {
                 let inode = fs.resolve(image_path(&paths[0])?.as_bytes()).await?;
                 let mut entries = Vec::new();
-                fs.read_dir(&inode, DirPosition::START, |entry| {
+                fs.read_dir(&inode, DirPosition::START, DirBound::UNBOUNDED, |entry| {
                     entries.push((entry.name.to_vec(), entry.target));
                     ControlFlow::Continue(())
                 })
