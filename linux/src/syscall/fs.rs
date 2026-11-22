@@ -2053,19 +2053,24 @@ pub(super) async fn writev_common<
     }
     if let FileDescriptor::Socket(sock) = &entry.descriptor {
         let mut data = Vec::new();
+        let mut chunk = [0u8; 4096];
         for (base, len) in iovs {
             let remaining = MAX_RW_COUNT.saturating_sub(data.len() as u64);
             if remaining == 0 {
                 break;
             }
             let take = len.min(remaining) as usize;
-            if take == 0 {
-                continue;
-            }
-            let start = data.len();
-            data.resize(start + take, 0);
-            if memory.read(base, &mut data[start..]).is_err() {
-                return SyscallOutcome::Return(errno(EFAULT));
+            let mut copied = 0usize;
+            while copied < take {
+                let step = (take - copied).min(chunk.len());
+                let Some(addr) = base.checked_add(copied as u64) else {
+                    return SyscallOutcome::Return(errno(EFAULT));
+                };
+                if memory.read(addr, &mut chunk[..step]).is_err() {
+                    return SyscallOutcome::Return(errno(EFAULT));
+                }
+                data.extend_from_slice(&chunk[..step]);
+                copied += step;
             }
         }
         let ctx = super::socket_context(process);

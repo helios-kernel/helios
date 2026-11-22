@@ -2329,7 +2329,7 @@ pub(crate) async fn shutdown<R: Resources, Net: Network<R::Network>>(
 
 pub(crate) async fn sendfile<
     R: Resources,
-    M: UserMemory,
+    M: super::VirtualMemory,
     O: Network<R::Network> + super::Stdio + super::Filesystem<R>,
 >(
     process: &Process<R>,
@@ -2379,6 +2379,9 @@ pub(crate) async fn sendfile<
     };
 
     let explicit_offset = if offset_ptr != 0 {
+        if memory.check_writable(offset_ptr, 8).is_err() {
+            return errno(EFAULT);
+        }
         let mut raw = [0u8; 8];
         if memory.read(offset_ptr, &mut raw).is_err() {
             return errno(EFAULT);
@@ -2407,6 +2410,10 @@ pub(crate) async fn sendfile<
             if output.file_is_directory(out_open.node()) {
                 return errno(EINVAL);
             }
+            // Linux `fs/read_write.c:do_sendfile` rejects `O_APPEND` on `out_fd`.
+            if out_entry.fdflags() & helios_unix::FDFLAG_APPEND != 0 {
+                return errno(EINVAL);
+            }
         }
         _ => return errno(EINVAL),
     }
@@ -2419,18 +2426,15 @@ pub(crate) async fn sendfile<
 
     let out_nonblocking = out_entry.fdflags() & helios_unix::FDFLAG_NONBLOCK != 0;
     let mut total_sent = 0usize;
-    let mut pos_guard = if explicit_offset.is_none() {
-        Some(in_open.lock_position().await)
-    } else {
-        None
-    };
 
     while total_sent < count {
         let chunk_len = (count - total_sent).min(SENDFILE_CHUNK);
-        let read_pos = match (explicit_offset, pos_guard.as_ref()) {
-            (Some(base), _) => base.saturating_add(total_sent as u64),
-            (None, Some(pos)) => pos.get(),
-            (None, None) => unreachable!(),
+        // Never hold `in_open`'s position lock across `out_fd` I/O or
+        // `out_open.lock_position()` — holding both deadlocks `sendfile(fd, fd, NULL, n)`
+        // and concurrent opposite-direction transfers.
+        let read_pos = match explicit_offset {
+            Some(base) => base.saturating_add(total_sent as u64),
+            None => in_open.lock_position().await.get(),
         };
         let chunk = match output.read_at(in_open.node(), read_pos, chunk_len).await {
             Ok(bytes) => bytes,
@@ -2524,29 +2528,38 @@ pub(crate) async fn sendfile<
                 }
             },
             Descriptor::<R>::File(out_open) => {
-                let mut out_pos = out_open.lock_position().await;
-                let append = out_entry.fdflags() & helios_unix::FDFLAG_APPEND != 0;
-                let pos = if append {
-                    WritePosition::End
-                } else {
-                    WritePosition::At(out_pos.get())
-                };
-                match output.write_at(out_open.node(), pos, &chunk).await {
-                    Ok(landed) => {
-                        out_pos.set(landed.offset.saturating_add(landed.len as u64));
-                        landed.len
-                    }
-                    Err(_) => {
-                        if total_sent > 0 {
-                            break;
+                let landed = {
+                    let mut out_pos = out_open.lock_position().await;
+                    let pos = WritePosition::At(out_pos.get());
+                    match output.write_at(out_open.node(), pos, &chunk).await {
+                        Ok(landed) => {
+                            out_pos.set(landed.offset.saturating_add(landed.len as u64));
+                            landed
                         }
-                        return errno(super::EIO);
+                        Err(_) => {
+                            if total_sent > 0 {
+                                break;
+                            }
+                            return errno(super::EIO);
+                        }
                     }
+                };
+                if landed.len > 0 {
+                    super::memory::sync_write_to_shared_mappings(
+                        process,
+                        out_open.node(),
+                        landed.offset,
+                        &chunk[..landed.len],
+                        memory,
+                        output,
+                    );
                 }
+                landed.len
             }
             _ => unreachable!(),
         };
-        if let Some(pos) = pos_guard.as_mut() {
+        if explicit_offset.is_none() && sent > 0 {
+            let mut pos = in_open.lock_position().await;
             pos.set(read_pos.saturating_add(sent as u64));
         }
         total_sent += sent;

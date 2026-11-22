@@ -1037,3 +1037,45 @@ fn sendfile_rejects_pipe_inputs_with_espipe_or_einval_without_consuming() {
     mem.read(200, &mut kept).unwrap();
     assert_eq!(&kept, b"keep");
 }
+
+#[test]
+fn writev_socket_large_unmapped_iovec_returns_efault_without_allocating() {
+    let mut proc = new_process(Abi::X86_64);
+    let mut mem = Memory::new(4096);
+    let mut plat = Platform {
+        net: MockNet::default(),
+        now: 0,
+    };
+
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Socketpair,
+            [1, 1, 0, 64, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        0
+    );
+    let mut sv = [0u8; 8];
+    mem.read(64, &mut sv).unwrap();
+    let fd0 = i32::from_le_bytes(sv[0..4].try_into().unwrap()) as u64;
+
+    // One iovec pointing at unmapped memory with a 1 GiB length must fault
+    // immediately with EFAULT (14) instead of trying to allocate 1 GiB first.
+    let iov_ptr = 128u64;
+    mem.write(iov_ptr, &0x1000_0000u64.to_le_bytes()).unwrap();
+    mem.write(iov_ptr + 8, &(1u64 << 30).to_le_bytes()).unwrap();
+    assert_eq!(
+        call_op(
+            &mut proc,
+            Abi::X86_64,
+            Operation::Writev,
+            [fd0, iov_ptr, 1, 0, 0, 0],
+            &mut mem,
+            &mut plat,
+        ),
+        14u64.wrapping_neg()
+    );
+}
