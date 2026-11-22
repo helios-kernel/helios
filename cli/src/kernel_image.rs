@@ -15,6 +15,7 @@
 //! The secret half of the root key is never an input and never stored: an
 //! image carries the public key alone.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ use std::process::{Command, ExitStatus};
 
 use clap::Parser;
 use tempfile::NamedTempFile;
+use walkdir::WalkDir;
 
 use crate::CacheArgs;
 use crate::artifact_cache::{
@@ -65,8 +67,10 @@ pub enum KernelImageError {
     ListDepInfo {
         path: String,
         #[source]
-        source: io::Error,
+        source: walkdir::Error,
     },
+    #[error("{path} holds no dep-info file: the build did not run there")]
+    NoDepInfo { path: String },
 }
 
 /// What addresses a kernel image in the cache.
@@ -106,7 +110,7 @@ pub struct KernelImageStore {
     #[arg(long)]
     target: String,
     /// The directory cargo wrote the build into, `<target dir>/<triple>/
-    /// <profile>`: its `deps/` holds the dep-info file of every unit.
+    /// <profile>`: it holds the dep-info file of every unit.
     #[arg(long, value_name = "DIR")]
     artifact_dir: PathBuf,
     /// The cargo target directory, whose files are outputs and never inputs.
@@ -138,25 +142,52 @@ pub fn store(command: &KernelImageStore, workspace_root: &Path) -> Result<(), Ke
     };
     let key = key(&command.key, workspace_root)?;
     let image = read(&command.key.image)?;
-    let deps = command.artifact_dir.join("deps");
-    let list_error = |source| KernelImageError::ListDepInfo {
-        path: deps.display().to_string(),
-        source,
-    };
+    // Where cargo keeps a unit's dep-info depends on its build-directory
+    // layout (`deps/` or `build/<package>/<hash>/out/`), so every one the
+    // build wrote is found by its extension.
     let mut dep_infos = Vec::new();
-    for entry in fs::read_dir(&deps).map_err(list_error)? {
-        let path = entry.map_err(list_error)?.path();
-        if path.extension().is_some_and(|extension| extension == "d") {
-            dep_infos.push(path);
+    for entry in WalkDir::new(&command.artifact_dir) {
+        let entry = entry.map_err(|source| KernelImageError::ListDepInfo {
+            path: command.artifact_dir.display().to_string(),
+            source,
+        })?;
+        if entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "d")
+        {
+            dep_infos.push(entry.into_path());
         }
+    }
+    if dep_infos.is_empty() {
+        return Err(KernelImageError::NoDepInfo {
+            path: command.artifact_dir.display().to_string(),
+        });
     }
     let excluded =
         fs::canonicalize(&command.target_dir).map_err(|source| KernelImageError::Read {
             path: command.target_dir.display().to_string(),
             source,
         })?;
-    let inputs = workspace_inputs(
-        &dep_infos,
+    // A target directory that outlives a checkout or a toolchain holds the
+    // dep-info of units this build did not run, and those name files that
+    // are gone; such a unit is no input of the image.
+    let mut inputs = BTreeSet::new();
+    for dep_info in &dep_infos {
+        match workspace_inputs(
+            std::slice::from_ref(dep_info),
+            workspace_root,
+            &excluded,
+            &[],
+        ) {
+            Ok(files) => inputs.extend(files),
+            Err(CacheError::Resolve { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    inputs.extend(workspace_inputs(
+        &[],
         workspace_root,
         &excluded,
         &package_directories(
@@ -165,7 +196,8 @@ pub fn store(command: &KernelImageStore, workspace_root: &Path) -> Result<(), Ke
             &command.target,
             FeatureSet::All,
         )?,
-    )?;
+    )?);
+    let inputs = inputs.into_iter().collect::<Vec<_>>();
     cache.store_inputs(&key, workspace_root, &inputs, &image)?;
     Ok(())
 }
