@@ -392,6 +392,10 @@ pub struct Credentials {
     pub group: Ids,
     pub supplementary_groups: Vec<u32>,
     pub capabilities: LinuxCapabilities,
+    /// `PR_SET_NO_NEW_PRIVS` one-way latch (`include/linux/sched.h`
+    /// `PF_NO_NEW_PRIVS`): once set, inherited across `fork`/`clone`/`execve`
+    /// and suppresses set-id and file-capability elevation on `execve`.
+    pub no_new_privs: bool,
 }
 
 impl Default for Credentials {
@@ -461,6 +465,7 @@ impl Credentials {
             },
             supplementary_groups,
             capabilities: LinuxCapabilities::for_uid(uid),
+            no_new_privs: false,
         })
     }
 
@@ -1414,5 +1419,30 @@ impl<R: Resources> Process<R> {
         }
         attributes.nice = nice;
         0
+    }
+
+    /// `prctl(option, arg2, arg3, arg4, arg5)` (`kernel/sys.c` `sys_prctl`,
+    /// Linux v6.12). Supports `PR_SET_NO_NEW_PRIVS` (38) and
+    /// `PR_GET_NO_NEW_PRIVS` (39); other options return `EINVAL`.
+    pub(super) fn prctl(&mut self, args: [u64; 6]) -> u64 {
+        // `include/uapi/linux/prctl.h`, Linux v6.12.
+        const PR_SET_NO_NEW_PRIVS: i32 = 38;
+        const PR_GET_NO_NEW_PRIVS: i32 = 39;
+        match args[0] as u32 as i32 {
+            PR_SET_NO_NEW_PRIVS => {
+                if args[1] != 1 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
+                    return errno(EINVAL);
+                }
+                self.shared.credentials.lock().no_new_privs = true;
+                0
+            }
+            PR_GET_NO_NEW_PRIVS => {
+                if args[1] != 0 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
+                    return errno(EINVAL);
+                }
+                u64::from(self.shared.credentials.lock().no_new_privs)
+            }
+            _ => errno(EINVAL),
+        }
     }
 }

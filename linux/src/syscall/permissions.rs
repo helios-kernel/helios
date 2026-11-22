@@ -551,7 +551,9 @@ pub fn parse_vfs_cap_data(bytes: &[u8]) -> Result<VfsCapData, FsOpError> {
 /// Linux v6.12).
 ///
 /// - When `honours_exec_privileges` is `false` (a shared or `NO_SUID` mount),
-///   set-id bits and file capabilities are ignored.
+///   or when `current.no_new_privs` (`PR_SET_NO_NEW_PRIVS`) is set, set-id
+///   bits and file capabilities are ignored and no capability outside
+///   `current.capabilities.permitted` can be gained.
 /// - `authority_cap_ceiling` caps every resulting capability set so a
 ///   container's processes never exceed the container's granted authority, even
 ///   as `uid 0` or via setuid/file capabilities.
@@ -564,8 +566,9 @@ pub fn apply_exec_credentials(
 ) -> Credentials {
     let mut new = current.clone();
     let ceiling = authority_cap_ceiling & CAP_FULL_SET;
+    let grant_privs = honours_exec_privileges && !current.no_new_privs;
 
-    if honours_exec_privileges {
+    if grant_privs {
         if (inode.mode & S_ISUID) != 0 {
             new.user.effective = inode.uid;
         }
@@ -576,7 +579,7 @@ pub fn apply_exec_credentials(
     new.user.saved = new.user.effective;
     new.group.saved = new.group.effective;
 
-    let file_caps = if honours_exec_privileges {
+    let file_caps = if grant_privs {
         file_cap_bytes
             .and_then(|raw| parse_vfs_cap_data(raw).ok())
             .filter(|caps| caps.rootid == 0)
@@ -590,7 +593,7 @@ pub fn apply_exec_credentials(
         new.capabilities.ambient = 0;
     }
 
-    let (permitted, effective) = if let Some(fcaps) = file_caps {
+    let (mut permitted, mut effective) = if let Some(fcaps) = file_caps {
         let p = ((current.capabilities.inheritable & fcaps.inheritable)
             | (fcaps.permitted & current.capabilities.bounding)
             | new.capabilities.ambient)
@@ -611,12 +614,28 @@ pub fn apply_exec_credentials(
         (a, a)
     };
 
+    if current.no_new_privs {
+        // `security/commoncap.c` `cap_bprm_creds_from_file`: `PR_SET_NO_NEW_PRIVS`
+        // prevents gaining any capability outside the caller's permitted set.
+        permitted &= current.capabilities.permitted;
+        effective &= permitted;
+    }
+
     new.capabilities.bounding &= ceiling;
     new.capabilities.permitted = permitted & ceiling;
     new.capabilities.effective = effective & ceiling;
     new.capabilities.inheritable &= ceiling;
     new.capabilities.ambient &= ceiling;
     new
+}
+
+/// Whether an `execve` credential transition from `old` to `new` sets
+/// `AT_SECURE = 1` (`security/commoncap.c` `cap_bprm_creds_from_file`,
+/// Linux v6.12).
+pub fn exec_is_secure(old: &Credentials, new: &Credentials) -> bool {
+    new.user.effective != old.user.real
+        || new.group.effective != old.group.real
+        || (new.capabilities.permitted & !old.capabilities.permitted) != 0
 }
 
 #[cfg(test)]
@@ -874,11 +893,24 @@ mod tests {
         assert_eq!(priv_creds.user.effective, 0);
         assert!(priv_creds.capabilities.has_effective(CAP_NET_BIND_SERVICE));
         assert!(!priv_creds.capabilities.has_effective(CAP_SYS_ADMIN));
+        assert!(exec_is_secure(&user, &priv_creds));
 
         let shared_creds =
             apply_exec_credentials(&user, exec_file, Some(&raw_cap), false, CAP_FULL_SET);
         assert_eq!(shared_creds.user.effective, 1000);
         assert_eq!(shared_creds.capabilities.effective, 0);
+        assert!(!exec_is_secure(&user, &shared_creds));
+
+        // PR_SET_NO_NEW_PRIVS suppresses both set-id and file capabilities.
+        let mut nnp_user = user.clone();
+        nnp_user.no_new_privs = true;
+        let nnp_creds = apply_exec_credentials(&nnp_user, exec_file, Some(&raw_cap), true, ceiling);
+        assert_eq!(nnp_creds.user.effective, 1000);
+        assert_eq!(nnp_creds.group.effective, 1000);
+        assert_eq!(nnp_creds.capabilities.permitted, 0);
+        assert_eq!(nnp_creds.capabilities.effective, 0);
+        assert!(nnp_creds.no_new_privs);
+        assert!(!exec_is_secure(&nnp_user, &nnp_creds));
     }
 
     use super::super::system::CAP_NET_BIND_SERVICE;

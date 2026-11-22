@@ -2663,4 +2663,968 @@ mod linux_tests {
         .expect("host call");
         assert!(reclaimed.is_ok());
     }
+
+    #[test]
+    fn execve_on_private_btrfs_enforces_may_exec_setid_file_caps_nosuid_nnp_and_authority_ceiling()
+    {
+        use alloc::collections::{BTreeMap, VecDeque};
+        use core::sync::atomic::AtomicUsize;
+        use ferrosys::btrfs::{FormatOptions, format_to};
+        use ferrosys::{Metadata as BtrfsMeta, Timestamp as BtrfsTimestamp, TreeBuilder};
+        use helios_btrfs::write::Attributes as BtrfsAttributes;
+        use helios_hal::fs::{
+            DeviceId, FileSystemRights, FsPath, OpenFlags, WritePosition, write_with,
+        };
+        use helios_linux::syscall::{
+            CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_RAW, CAP_SYS_TIME, Credentials, UtsField,
+        };
+        use std::io::{Read, Seek, SeekFrom};
+
+        use crate::io::{MemoryDisk, cache_over};
+        use crate::test_support::{UnsupportedHostFileSystem, test_timer};
+        use crate::vfs::{
+            BOOT_DEVICE, BtrfsFs, BtrfsWriteOptions, CommitPolicy, MemoryFs, MountGrant,
+            MountSharing, MountTable, MountedFs, Namespace, SharedOwner, Storage, XattrSetMode,
+        };
+        use crate::{
+            BootFs, ContainerConfig, ContainerId, ContainerMountSpec, DirectoryAuthorityRights,
+            EmbeddedBootDirectory, EmbeddedBootFs, LinuxContainer, NetworkAuthorityRights,
+            ProcessAuthority,
+        };
+
+        const FORMATTED_BYTES: usize = 128 << 20;
+        const BTRFS_EXEC_BOOT: EmbeddedBootFs = EmbeddedBootFs::new(
+            &[
+                EmbeddedBootDirectory::new("priv", 0),
+                EmbeddedBootDirectory::new("shared", 0),
+            ],
+            &[],
+        );
+        const RWX: DirectoryAuthorityRights = DirectoryAuthorityRights::READ
+            .union(DirectoryAuthorityRights::WRITE)
+            .union(DirectoryAuthorityRights::MUTATE_DIRECTORY)
+            .union(DirectoryAuthorityRights::EXECUTE);
+
+        #[derive(Clone, Copy)]
+        struct BtrfsExecStorage;
+        impl Storage for BtrfsExecStorage {
+            type HostShare = UnsupportedHostFileSystem;
+            type Disk = MemoryDisk;
+        }
+
+        // Real mapped-byte user address space for scripted `run_linux_process` execution.
+        #[derive(Default)]
+        struct MapSpace {
+            bytes: spin::Mutex<BTreeMap<usize, u8>>,
+        }
+
+        impl MapSpace {
+            fn write_bytes(&self, addr: usize, data: &[u8]) {
+                let mut map = self.bytes.lock();
+                for (i, &b) in data.iter().enumerate() {
+                    map.insert(addr + i, b);
+                }
+            }
+            fn read_u64(&self, addr: usize) -> u64 {
+                let map = self.bytes.lock();
+                let mut buf = [0u8; 8];
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    *slot = map.get(&(addr + i)).copied().unwrap_or(0);
+                }
+                u64::from_le_bytes(buf)
+            }
+            fn read_u32(&self, addr: usize) -> u32 {
+                let map = self.bytes.lock();
+                let mut buf = [0u8; 4];
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    *slot = map.get(&(addr + i)).copied().unwrap_or(0);
+                }
+                u32::from_le_bytes(buf)
+            }
+        }
+
+        // SAFETY: MapSpace is an in-memory test double that never maps hardware page tables.
+        unsafe impl UserSpace for MapSpace {
+            fn map(
+                &self,
+                range: VirtRange,
+                initial: &[u8],
+                _: PageFlags,
+            ) -> Result<(), NativeError> {
+                let start = range.start.raw();
+                let mut map = self.bytes.lock();
+                for i in 0..range.byte_len {
+                    map.insert(start + i, initial.get(i).copied().unwrap_or(0));
+                }
+                Ok(())
+            }
+            fn map_anywhere(
+                &self,
+                hint: VirtAddr,
+                byte_len: usize,
+                _: PageFlags,
+            ) -> Result<VirtRange, NativeError> {
+                Ok(VirtRange::new(hint, byte_len))
+            }
+            fn check_writable(&self, _: VirtAddr, _: usize) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn remap(&self, _: VirtRange, _: VirtRange) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn unmap(&self, _: VirtRange) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn protect(&self, _: VirtRange, _: PageFlags) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn read(&self, address: VirtAddr, out: &mut [u8]) -> Result<(), NativeError> {
+                let map = self.bytes.lock();
+                let base = address.raw();
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = map.get(&(base + i)).copied().unwrap_or(0);
+                }
+                Ok(())
+            }
+            fn write(&self, address: VirtAddr, bytes: &[u8]) -> Result<(), NativeError> {
+                self.write_bytes(address.raw(), bytes);
+                Ok(())
+            }
+            fn resolve_fault(&self, _: VirtAddr, _: PageFlags) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn discard(&self, _: VirtRange) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn atomic_load_u32(&self, address: VirtAddr) -> Result<u32, NativeError> {
+                Ok(self.read_u32(address.raw()))
+            }
+            fn atomic_store_u32(&self, address: VirtAddr, value: u32) -> Result<(), NativeError> {
+                self.write_bytes(address.raw(), &value.to_le_bytes());
+                Ok(())
+            }
+            fn atomic_compare_exchange_u32(
+                &self,
+                address: VirtAddr,
+                expected: u32,
+                new: u32,
+            ) -> Result<Result<u32, u32>, NativeError> {
+                let cur = self.read_u32(address.raw());
+                if cur == expected {
+                    self.write_bytes(address.raw(), &new.to_le_bytes());
+                    Ok(Ok(cur))
+                } else {
+                    Ok(Err(cur))
+                }
+            }
+            fn mapping(&self, _: VirtRange) -> Option<Mapping> {
+                None
+            }
+            fn free_range(&self, hint: VirtAddr, _: usize) -> Option<VirtAddr> {
+                Some(hint)
+            }
+            fn clone_cow(&self) -> Result<Self, NativeError> {
+                Ok(Self {
+                    bytes: spin::Mutex::new(self.bytes.lock().clone()),
+                })
+            }
+        }
+
+        struct ScriptStep {
+            writes: Vec<(usize, Vec<u8>)>,
+            regs: [u64; 7], // [rax, rdi, rsi, rdx, r10, r8, r9]
+            capture_cap_buf: Option<usize>,
+        }
+
+        #[derive(Default)]
+        struct ScriptState {
+            steps: VecDeque<ScriptStep>,
+            results: Vec<u64>,
+            captured_caps: Vec<(u64, u64)>, // (effective, permitted)
+            auxv: Vec<BTreeMap<u64, u64>>,
+            pending_cap_buf: Option<usize>,
+        }
+
+        #[derive(Clone)]
+        struct ScriptCpu {
+            base: TestCpu,
+            state: Arc<spin::Mutex<ScriptState>>,
+        }
+
+        struct ScriptContext {
+            state: Arc<spin::Mutex<ScriptState>>,
+            regs: [u64; 7],
+            sp: u64,
+            tp: VirtAddr,
+            started: AtomicUsize,
+        }
+
+        // SAFETY: ScriptContext never enters hardware user mode.
+        unsafe impl UserContext for ScriptContext {
+            type Space = MapSpace;
+
+            fn register(&self, register: RegisterId) -> Result<u64, NativeError> {
+                match register {
+                    RegisterId::X86Gpr(0) => Ok(self.regs[0]),
+                    RegisterId::X86Gpr(7) => Ok(self.regs[1]),
+                    RegisterId::X86Gpr(6) => Ok(self.regs[2]),
+                    RegisterId::X86Gpr(2) => Ok(self.regs[3]),
+                    RegisterId::X86Gpr(10) => Ok(self.regs[4]),
+                    RegisterId::X86Gpr(8) => Ok(self.regs[5]),
+                    RegisterId::X86Gpr(9) => Ok(self.regs[6]),
+                    RegisterId::X86Gpr(4) => Ok(self.sp),
+                    RegisterId::X86Gpr(_) => Ok(0),
+                    _ => Err(NativeError::Register),
+                }
+            }
+            fn set_register(
+                &mut self,
+                register: RegisterId,
+                value: u64,
+            ) -> Result<(), NativeError> {
+                if matches!(register, RegisterId::X86Gpr(0)) {
+                    self.regs[0] = value;
+                    self.state.lock().results.push(value);
+                    Ok(())
+                } else {
+                    Err(NativeError::Register)
+                }
+            }
+            fn thread_pointer(&self) -> VirtAddr {
+                self.tp
+            }
+            fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError> {
+                self.tp = address;
+                Ok(())
+            }
+            fn extended_state(&self) -> ExtendedState {
+                ExtendedState::X86Xsave(alloc::vec![0; 576])
+            }
+            fn set_extended_state(&mut self, _: &ExtendedState) -> Result<(), NativeError> {
+                Ok(())
+            }
+            fn try_clone(&self) -> Result<Self, NativeError> {
+                Ok(Self {
+                    state: self.state.clone(),
+                    regs: self.regs,
+                    sp: self.sp,
+                    tp: self.tp,
+                    started: AtomicUsize::new(0),
+                })
+            }
+            fn resume(&mut self, space: &MapSpace) -> Stop {
+                let pending_cap_buf = self.state.lock().pending_cap_buf.take();
+                if let Some(addr) = pending_cap_buf {
+                    let eff_lo = space.read_u32(addr) as u64;
+                    let perm_lo = space.read_u32(addr + 4) as u64;
+                    let eff_hi = space.read_u32(addr + 12) as u64;
+                    let perm_hi = space.read_u32(addr + 16) as u64;
+                    self.state
+                        .lock()
+                        .captured_caps
+                        .push((eff_lo | (eff_hi << 32), perm_lo | (perm_hi << 32)));
+                }
+                if self.started.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                    // Parse the initial ELF stack's auxiliary vector on entry.
+                    let mut cursor = self.sp as usize;
+                    let argc = space.read_u64(cursor) as usize;
+                    cursor += 8 + (argc + 1) * 8;
+                    while space.read_u64(cursor) != 0 {
+                        cursor += 8;
+                    }
+                    cursor += 8; // skip NULL after envp
+                    let mut auxv = BTreeMap::new();
+                    loop {
+                        let tag = space.read_u64(cursor);
+                        let val = space.read_u64(cursor + 8);
+                        cursor += 16;
+                        if tag == 0 {
+                            break;
+                        }
+                        auxv.insert(tag, val);
+                    }
+                    self.state.lock().auxv.push(auxv);
+                }
+                let next = self.state.lock().steps.pop_front();
+                match next {
+                    Some(step) => {
+                        for (addr, data) in &step.writes {
+                            space.write_bytes(*addr, data);
+                        }
+                        self.state.lock().pending_cap_buf = step.capture_cap_buf;
+                        self.regs = step.regs;
+                        Stop::SystemCall
+                    }
+                    None => {
+                        self.regs = [231, 0, 0, 0, 0, 0, 0]; // exit_group(0)
+                        Stop::SystemCall
+                    }
+                }
+            }
+        }
+
+        impl NativeExecution for ScriptCpu {
+            type Space = MapSpace;
+            type Context = ScriptContext;
+            fn instruction_set(&self) -> InstructionSet {
+                InstructionSet::X86_64
+            }
+            fn user_range(&self) -> VirtRange {
+                VirtRange::new(
+                    VirtAddr::new(PhysFrame::SIZE),
+                    (1usize << 47) - 2 * PhysFrame::SIZE,
+                )
+            }
+            fn create_space(&self) -> Result<Self::Space, NativeError> {
+                Ok(MapSpace::default())
+            }
+            fn create_context(
+                &self,
+                _: VirtAddr,
+                sp: VirtAddr,
+            ) -> Result<Self::Context, NativeError> {
+                Ok(ScriptContext {
+                    state: self.state.clone(),
+                    regs: [0; 7],
+                    sp: sp.raw() as u64,
+                    tp: VirtAddr::new(PhysFrame::SIZE),
+                    started: AtomicUsize::new(0),
+                })
+            }
+        }
+
+        impl Cpu for ScriptCpu {
+            type Hypervisor = core::convert::Infallible;
+            type Native = Self;
+            const TIMER_INTERRUPT: TimerInterrupt = TimerInterrupt::Deadline;
+            fn native(&self) -> Result<&Self::Native, NativeUnavailable> {
+                Ok(self)
+            }
+            fn has_lazy_commit_virtual_memory(&self) -> bool {
+                true
+            }
+            fn processor_count(&self) -> usize {
+                1
+            }
+            fn bootstrap_processor(&self) -> ProcessorId {
+                ProcessorId::new(0)
+            }
+            fn park_current(&self) {}
+            type WakeOnlyMask = ();
+            fn mask_to_wake_only(&self) {
+                unreachable!()
+            }
+            fn park_wake_only(&self, _: &core::sync::atomic::AtomicU8, _: u8) {
+                unreachable!()
+            }
+            fn start_processor(&self, _: ProcessorId) {}
+            fn wake_processor(&self, _: ProcessorId) {}
+            fn stop_current(&self) {
+                unreachable!()
+            }
+            fn restart_processor(&self, _: ProcessorId) {
+                unreachable!()
+            }
+            fn now(&self) -> Instant {
+                self.base.now()
+            }
+            fn timebase(&self) -> Timebase {
+                self.base.timebase()
+            }
+            fn set_deadline(&self, _: Instant) {}
+            fn publish_executable(&self, _: *const u8, _: usize) {}
+            fn unpublish_executable(&self, _: *const u8, _: usize) {}
+            fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+                self.base.native_feature_probe()
+            }
+            fn fill_entropy(
+                &self,
+                buffer: &mut [u8],
+            ) -> Result<EntropyQuality, EntropyUnavailable> {
+                self.base.fill_entropy(buffer)
+            }
+            fn shutdown(&self) -> ! {
+                unreachable!()
+            }
+            fn reboot(&self) -> ! {
+                unreachable!()
+            }
+        }
+
+        // Format a real writable Btrfs disk image.
+        let time = BtrfsTimestamp::from_secs(1_700_000_000);
+        let tree = TreeBuilder::new().root(BtrfsMeta::new(0o755, time));
+        let mut img = tempfile::tempfile().expect("temp btrfs image");
+        img.set_len(FORMATTED_BYTES as u64).expect("set_len");
+        format_to(
+            &mut img,
+            tree,
+            FORMATTED_BYTES as u64,
+            FormatOptions::new([0x77; 16], time),
+        )
+        .expect("format btrfs");
+        img.seek(SeekFrom::Start(0)).expect("rewind");
+        let mut raw_img = Vec::new();
+        img.read_to_end(&mut raw_img).expect("read btrfs image");
+        let disk = MemoryDisk::holding_writable("btrfs-exec-rw", &raw_img);
+        let cache = cache_over(&disk, 256, 1);
+
+        let elf_bytes = minimal_x86_64_elf();
+        let now = 1_700_000_000_000_000_000_u64;
+
+        let make_cap_v2 = |effective: bool, permitted: u64| -> Vec<u8> {
+            let mut out = vec![0u8; 20];
+            let magic = 0x0200_0000_u32 | if effective { 1 } else { 0 };
+            out[0..4].copy_from_slice(&magic.to_le_bytes());
+            out[4..8].copy_from_slice(&(permitted as u32).to_le_bytes());
+            out[12..16].copy_from_slice(&((permitted >> 32) as u32).to_le_bytes());
+            out
+        };
+
+        let cstr = |s: &str| -> Vec<u8> {
+            let mut b = s.as_bytes().to_vec();
+            b.push(0);
+            b
+        };
+
+        // Helper builders for scripted x86-64 syscalls.
+        const SYS_EXECVE: u64 = 59;
+        const SYS_GETUID: u64 = 102;
+        const SYS_GETGID: u64 = 104;
+        const SYS_GETEUID: u64 = 107;
+        const SYS_GETEGID: u64 = 108;
+        const SYS_CAPGET: u64 = 125;
+        const SYS_PRCTL: u64 = 157;
+        const SYS_EXIT_GROUP: u64 = 231;
+        const EACCES_NEG: u64 = 13u64.wrapping_neg();
+
+        let step_execve = |path: &str| -> ScriptStep {
+            let path_addr = 0x20_0000_usize;
+            let argv_addr = 0x20_0100_usize;
+            let envp_addr = 0x20_0200_usize;
+            let mut argv_bytes = Vec::with_capacity(16);
+            argv_bytes.extend_from_slice(&(path_addr as u64).to_le_bytes());
+            argv_bytes.extend_from_slice(&0u64.to_le_bytes());
+            ScriptStep {
+                writes: vec![
+                    (path_addr, cstr(path)),
+                    (argv_addr, argv_bytes),
+                    (envp_addr, 0u64.to_le_bytes().to_vec()),
+                ],
+                regs: [
+                    SYS_EXECVE,
+                    path_addr as u64,
+                    argv_addr as u64,
+                    envp_addr as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                capture_cap_buf: None,
+            }
+        };
+        let step_simple = |nr: u64, a0: u64, a1: u64| -> ScriptStep {
+            ScriptStep {
+                writes: Vec::new(),
+                regs: [nr, a0, a1, 0, 0, 0, 0],
+                capture_cap_buf: None,
+            }
+        };
+        let step_capget = || -> ScriptStep {
+            let hdr_addr = 0x20_0300_usize;
+            let data_addr = 0x20_0320_usize;
+            let mut hdr = [0u8; 8];
+            hdr[0..4].copy_from_slice(&0x2008_0522_u32.to_le_bytes()); // _LINUX_CAPABILITY_VERSION_3
+            ScriptStep {
+                writes: vec![(hdr_addr, hdr.to_vec()), (data_addr, vec![0u8; 24])],
+                regs: [SYS_CAPGET, hdr_addr as u64, data_addr as u64, 0, 0, 0, 0],
+                capture_cap_buf: Some(data_addr),
+            }
+        };
+
+        let timer = test_timer(TestCpu::without_entropy());
+        block_on(async {
+            let entropy = triomphe::Arc::new(
+                crate::RootEntropy::from_platform(
+                    &TestCpu::with_entropy(0x42),
+                    None,
+                    None,
+                    crate::MachineGeneration::new(None),
+                )
+                .expect("entropy"),
+            );
+            let (btrfs, btrfs_service) = BtrfsFs::mount_writable(
+                cache.disk(0),
+                || DeviceId::new(220),
+                BtrfsWriteOptions {
+                    entropy: entropy.clone(),
+                    concurrency: core::num::NonZeroUsize::new(2).unwrap(),
+                    compress: None,
+                    commit: Some(CommitPolicy::for_machine(1 << 30)),
+                    max_inline: None,
+                    now,
+                },
+            )
+            .await
+            .expect("mount writable btrfs");
+
+            let client = async {
+                // Populate real binaries & scripts on the private Btrfs mount.
+                let write_btrfs_file = |p: &str, mode: u32, uid: u32, gid: u32, data: &[u8]| {
+                    let btrfs = &btrfs;
+                    let p = String::from(p);
+                    let data = data.to_vec();
+                    async move {
+                        let attrs = BtrfsAttributes {
+                            permissions: mode,
+                            uid,
+                            gid,
+                            umask: 0,
+                        };
+                        btrfs
+                            .open_unix(
+                                FsPath::new(&p).unwrap(),
+                                OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                                attrs,
+                                now,
+                            )
+                            .await
+                            .expect("create btrfs file");
+                        write_with(
+                            btrfs,
+                            FsPath::new(&p).unwrap(),
+                            WritePosition::At(0),
+                            data.len(),
+                            now,
+                            |offset, dst| dst.copy_from_slice(&data[offset..offset + dst.len()]),
+                        )
+                        .await
+                        .expect("write btrfs file");
+                    }
+                };
+
+                write_btrfs_file("noexec_bin", 0o644, 0, 0, &elf_bytes).await;
+                write_btrfs_file("plain_bin", 0o755, 0, 0, &elf_bytes).await;
+                write_btrfs_file("suid_bin", 0o4755, 0, 0, &elf_bytes).await;
+                write_btrfs_file("exec_only_suid", 0o4111, 0, 0, &elf_bytes).await;
+                write_btrfs_file("sgid_bin", 0o2755, 1000, 500, &elf_bytes).await;
+                write_btrfs_file("fcap_bin", 0o755, 0, 0, &elf_bytes).await;
+                let raw_cap = make_cap_v2(
+                    true,
+                    (1u64 << CAP_NET_BIND_SERVICE)
+                        | (1u64 << CAP_SYS_TIME)
+                        | (1u64 << CAP_NET_ADMIN),
+                );
+                btrfs
+                    .set_xattr(
+                        FsPath::new("fcap_bin").unwrap(),
+                        "security.capability",
+                        Bytes::from(raw_cap),
+                        XattrSetMode::Any,
+                        now,
+                    )
+                    .await
+                    .expect("set security.capability");
+                write_btrfs_file("suid_script", 0o4755, 0, 0, b"#!/plain_bin\n").await;
+                btrfs
+                    .create_directory_unix(
+                        FsPath::new("dir_noexec").unwrap(),
+                        BtrfsAttributes {
+                            permissions: 0o700,
+                            uid: 0,
+                            gid: 0,
+                            umask: 0,
+                        },
+                        now,
+                    )
+                    .await
+                    .expect("mkdir dir_noexec");
+                write_btrfs_file("dir_noexec/hidden_bin", 0o755, 0, 0, &elf_bytes).await;
+
+                // Populate a setuid binary on a shared (NO_SUID) MemoryFs mount.
+                let shared_mem = MemoryFs::new(DeviceId::new(221));
+                shared_mem
+                    .open_unix(
+                        FsPath::new("suid_bin").unwrap(),
+                        OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                        BtrfsAttributes {
+                            permissions: 0o4755,
+                            uid: 0,
+                            gid: 0,
+                            umask: 0,
+                        },
+                        now,
+                    )
+                    .expect("create shared suid_bin");
+                write_with(
+                    &shared_mem,
+                    FsPath::new("suid_bin").unwrap(),
+                    WritePosition::At(0),
+                    elf_bytes.len(),
+                    now,
+                    |offset, dst| dst.copy_from_slice(&elf_bytes[offset..offset + dst.len()]),
+                )
+                .await
+                .expect("write shared suid_bin");
+
+                let host_ns = Namespace::<BtrfsExecStorage>::new(MountTable::new(
+                    BootFs::new(BTRFS_EXEC_BOOT, BOOT_DEVICE),
+                    8,
+                ));
+                let root_auth = ProcessAuthority::root();
+                let rw = FileSystemRights::READ | FileSystemRights::WRITE;
+                host_ns
+                    .mount(
+                        &root_auth.derive_mount_cap("/priv").unwrap(),
+                        MountedFs::Btrfs(btrfs),
+                        MountGrant {
+                            rights: rw,
+                            sharing: MountSharing::Private,
+                        },
+                    )
+                    .await
+                    .expect("mount /priv");
+                host_ns
+                    .mount(
+                        &root_auth.derive_mount_cap("/shared").unwrap(),
+                        MountedFs::Memory(shared_mem),
+                        MountGrant {
+                            rights: rw,
+                            sharing: MountSharing::Shared,
+                        },
+                    )
+                    .await
+                    .expect("mount /shared");
+
+                // Container authority grants PRIVILEGED_BIND (CAP_NET_BIND_SERVICE) and
+                // omits SET_WALL_CLOCK (CAP_SYS_TIME) & ADMIN (CAP_NET_ADMIN / CAP_NET_RAW).
+                let mut container_auth = ProcessAuthority::empty();
+                container_auth.grant_network_rights(NetworkAuthorityRights::PRIVILEGED_BIND);
+                let container = Arc::new(
+                    LinuxContainer::create(
+                        ContainerId::new(NonZeroU64::new(84).unwrap()),
+                        &root_auth,
+                        &host_ns,
+                        container_auth,
+                        ContainerConfig {
+                            root: ContainerMountSpec {
+                                source_path: String::from("/priv"),
+                                target_path: String::from("/"),
+                                rights: RWX,
+                                sharing: MountSharing::Private,
+                            },
+                            mounts: vec![ContainerMountSpec {
+                                source_path: String::from("/shared"),
+                                target_path: String::from("/shared"),
+                                rights: RWX,
+                                sharing: MountSharing::Shared,
+                            }],
+                            shared_owner: SharedOwner { uid: 0, gid: 0 },
+                            credentials: Credentials::root(),
+                            hostname: UtsField::UNSET,
+                            domainname: UtsField::UNSET,
+                        },
+                    )
+                    .await
+                    .expect("create container"),
+                );
+
+                let run_scenario = |initial_creds: Credentials, steps: Vec<ScriptStep>| {
+                    let container = container.clone();
+                    let elf_bytes = elf_bytes.clone();
+                    let entropy = entropy.clone();
+                    Box::pin(async move {
+                        let state = Arc::new(spin::Mutex::new(ScriptState {
+                            steps: VecDeque::from(steps),
+                            ..ScriptState::default()
+                        }));
+                        let cpu = ScriptCpu {
+                            base: TestCpu::with_entropy(0x55),
+                            state: state.clone(),
+                        };
+                        let runtime_state: HostRuntimeState<
+                            ScriptCpu,
+                            TestNetworkService,
+                            BtrfsExecStorage,
+                        > = crate::RuntimeState::new(
+                            cpu.timebase(),
+                            1,
+                            0,
+                            crate::BootPayload::for_tests(),
+                            GuestIsa::for_build_target(cpu.native_feature_probe()),
+                        );
+                        runtime_state.install_root_entropy(entropy);
+                        let executor = crate::Executor::isolated(
+                            ProgressCounter::new(),
+                            crate::test_support::single_node_pool(1),
+                            ProcessorId::new(0),
+                        );
+                        let registry = crate::InstanceRegistry::new();
+                        let instance = registry.register("linux-exec-btrfs", 0);
+                        let exec_context = ProgramExecContext {
+                            cpu: cpu.clone(),
+                            timer: executor.timer(cpu.clone()),
+                            spawner: executor.spawner(cpu.clone()),
+                            runtime_state,
+                            instance_registry: registry,
+                            parent_instance_id: None,
+                            read_serial: |_, _| {},
+                            write_serial: crate::DebugSerialWriter::of::<test_store::DiscardPort>(),
+                        };
+                        let executable =
+                            LinuxExecutable::load(&cpu, elf_bytes).expect("load minimal ELF");
+                        let (_stdin_tx, stdin_rx) = crate::byte_channel();
+                        let (stdout_tx, _stdout_rx) = crate::byte_channel();
+                        let (stderr_tx, _stderr_rx) = crate::byte_channel();
+                        let instance_spawner = executor
+                            .spawner(cpu.clone())
+                            .instance_spawner(crate::TaskFunding::Instance, &instance);
+                        let timeline = phases::Timeline::begin(&cpu, "spawn", "/linux/exec-test");
+                        let exit = Box::pin(run_linux_process(
+                            LinuxExecRuntime {
+                                exec_context,
+                                wasm: None,
+                            },
+                            ProgramArgv::launched("exec-test", Vec::new()),
+                            Vec::new(),
+                            container,
+                            Some(initial_creds),
+                            None,
+                            WasixSignalState::new(),
+                            instance_spawner,
+                            instance,
+                            OutputMode::Child {
+                                stdin_rx,
+                                stdout_tx,
+                                stderr_tx,
+                            },
+                            executable,
+                            &timeline,
+                        ))
+                        .await
+                        .expect("run_linux_process");
+                        assert_eq!(exit.termination, ChildTermination::Exited(0));
+                        let st = state.lock();
+                        (
+                            st.results.clone(),
+                            st.captured_caps.clone(),
+                            st.auxv.clone(),
+                        )
+                    })
+                };
+
+                // 1. Missing MAY_EXEC (0o644) -> EACCES for both u1000 and uid 0 (CAP_DAC_OVERRIDE),
+                //    and missing dir search MAY_EXEC (/dir_noexec/hidden_bin) -> EACCES for u1000.
+                let (res_noexec_user, _, _) = run_scenario(
+                    Credentials::for_ids(1000, 100, vec![]),
+                    vec![
+                        step_execve("/noexec_bin"),
+                        step_execve("/dir_noexec/hidden_bin"),
+                        step_simple(SYS_EXIT_GROUP, 0, 0),
+                    ],
+                )
+                .await;
+                assert_eq!(res_noexec_user, vec![EACCES_NEG, EACCES_NEG]);
+
+                let (res_noexec_root, _, _) = run_scenario(
+                    Credentials::root(),
+                    vec![
+                        step_execve("/noexec_bin"),
+                        step_simple(SYS_EXIT_GROUP, 0, 0),
+                    ],
+                )
+                .await;
+                assert_eq!(res_noexec_root, vec![EACCES_NEG]);
+
+                // 2. S_ISUID root (0o4755) on private Btrfs: u1000 -> euid 0, ruid 1000,
+                //    AT_SECURE = 1, and live capget() clamped to container ProcessAuthority
+                //    (CAP_NET_BIND_SERVICE allowed, CAP_SYS_TIME / CAP_NET_ADMIN / CAP_NET_RAW absent).
+                let (res_suid, caps_suid, auxv_suid) = run_scenario(
+                    Credentials::for_ids(1000, 100, vec![]),
+                    vec![
+                        step_execve("/suid_bin"),
+                        step_simple(SYS_GETUID, 0, 0),
+                        step_simple(SYS_GETEUID, 0, 0),
+                        step_simple(SYS_GETGID, 0, 0),
+                        step_simple(SYS_GETEGID, 0, 0),
+                        step_capget(),
+                        step_simple(SYS_EXIT_GROUP, 0, 0),
+                    ],
+                )
+                .await;
+                assert_eq!(res_suid, vec![1000, 0, 100, 100, 0]);
+                assert_eq!(caps_suid.len(), 1);
+                let (suid_eff, suid_perm) = caps_suid[0];
+                assert_ne!(suid_eff & (1u64 << CAP_NET_BIND_SERVICE), 0);
+                assert_eq!(suid_eff & (1u64 << CAP_SYS_TIME), 0);
+                assert_eq!(suid_eff & (1u64 << CAP_NET_ADMIN), 0);
+                assert_eq!(suid_eff & (1u64 << CAP_NET_RAW), 0);
+                assert_eq!(suid_eff, suid_perm);
+                assert_eq!(auxv_suid.len(), 2);
+                assert_eq!(auxv_suid[0].get(&23), Some(&0)); // initial AT_SECURE = 0
+                assert_eq!(auxv_suid[1].get(&11), Some(&1000)); // AT_UID
+                assert_eq!(auxv_suid[1].get(&12), Some(&0)); // AT_EUID
+                assert_eq!(auxv_suid[1].get(&13), Some(&100)); // AT_GID
+                assert_eq!(auxv_suid[1].get(&14), Some(&100)); // AT_EGID
+                assert_eq!(auxv_suid[1].get(&23), Some(&1)); // AT_SECURE = 1
+
+                // 3. Execute-only S_ISUID (0o4111): u1000 can execve even without MAY_READ.
+                let (res_exec_only, _, auxv_exec_only) = run_scenario(
+                    Credentials::for_ids(1000, 100, vec![]),
+                    vec![
+                        step_execve("/exec_only_suid"),
+                        step_simple(SYS_GETEUID, 0, 0),
+                        step_simple(SYS_EXIT_GROUP, 0, 0),
+                    ],
+                )
+                .await;
+                assert_eq!(res_exec_only, vec![0]);
+                assert_eq!(auxv_exec_only[1].get(&12), Some(&0));
+                assert_eq!(auxv_exec_only[1].get(&23), Some(&1));
+
+                // 4. S_ISGID (0o2755, gid 500) on private Btrfs: u1000 -> egid 500, AT_SECURE = 1.
+                let (res_sgid, _, auxv_sgid) = run_scenario(
+                    Credentials::for_ids(1000, 100, vec![]),
+                    vec![
+                        step_execve("/sgid_bin"),
+                        step_simple(SYS_GETGID, 0, 0),
+                        step_simple(SYS_GETEGID, 0, 0),
+                        step_simple(SYS_EXIT_GROUP, 0, 0),
+                    ],
+                )
+                .await;
+                assert_eq!(res_sgid, vec![100, 500]);
+                assert_eq!(auxv_sgid[1].get(&14), Some(&500));
+                assert_eq!(auxv_sgid[1].get(&23), Some(&1));
+
+                // 5. File capabilities (`security.capability`) on private Btrfs:
+                //    u1000 keeps euid 1000, gets AT_SECURE = 1, and live capget() reports
+                //    only CAP_NET_BIND_SERVICE (CAP_SYS_TIME / CAP_NET_ADMIN clamped out).
+                let (res_fcap, caps_fcap, auxv_fcap) = run_scenario(
+                    Credentials::for_ids(1000, 100, vec![]),
+                    vec![
+                        step_execve("/fcap_bin"),
+                        step_simple(SYS_GETEUID, 0, 0),
+                        step_capget(),
+                        step_simple(SYS_EXIT_GROUP, 0, 0),
+                    ],
+                )
+                .await;
+                assert_eq!(res_fcap, vec![1000, 0]);
+                assert_eq!(
+                    caps_fcap,
+                    vec![(1u64 << CAP_NET_BIND_SERVICE, 1u64 << CAP_NET_BIND_SERVICE)]
+                );
+                assert_eq!(auxv_fcap[1].get(&12), Some(&1000));
+                assert_eq!(auxv_fcap[1].get(&23), Some(&1)); // AT_SECURE = 1 from file caps
+
+                // 6. Setuid `#!` script (/suid_script 0o4755 -> /plain_bin 0o755):
+                //    ignores script S_ISUID (fs/binfmt_script.c).
+                let (res_script, caps_script, auxv_script) = run_scenario(
+                    Credentials::for_ids(1000, 100, vec![]),
+                    vec![
+                        step_execve("/suid_script"),
+                        step_simple(SYS_GETEUID, 0, 0),
+                        step_capget(),
+                        step_simple(SYS_EXIT_GROUP, 0, 0),
+                    ],
+                )
+                .await;
+                assert_eq!(res_script, vec![1000, 0]);
+                assert_eq!(caps_script, vec![(0, 0)]);
+                assert_eq!(auxv_script[1].get(&12), Some(&1000));
+                assert_eq!(auxv_script[1].get(&23), Some(&0));
+
+                // 7. Shared mount (`NO_SUID`) blocks S_ISUID on /shared/suid_bin.
+                let (res_nosuid, caps_nosuid, auxv_nosuid) = run_scenario(
+                    Credentials::for_ids(1000, 100, vec![]),
+                    vec![
+                        step_execve("/shared/suid_bin"),
+                        step_simple(SYS_GETEUID, 0, 0),
+                        step_capget(),
+                        step_simple(SYS_EXIT_GROUP, 0, 0),
+                    ],
+                )
+                .await;
+                assert_eq!(res_nosuid, vec![1000, 0]);
+                assert_eq!(caps_nosuid, vec![(0, 0)]);
+                assert_eq!(auxv_nosuid[1].get(&12), Some(&1000));
+                assert_eq!(auxv_nosuid[1].get(&23), Some(&0));
+
+                // 8. PR_SET_NO_NEW_PRIVS suppresses both S_ISUID and file capabilities,
+                //    and persists across execve (`PR_GET_NO_NEW_PRIVS == 1`).
+                let (res_nnp, caps_nnp, auxv_nnp) = run_scenario(
+                    Credentials::for_ids(1000, 100, vec![]),
+                    vec![
+                        step_simple(SYS_PRCTL, 38, 1), // PR_SET_NO_NEW_PRIVS
+                        step_execve("/suid_bin"),
+                        step_simple(SYS_GETEUID, 0, 0),
+                        step_capget(),
+                        step_simple(SYS_PRCTL, 39, 0), // PR_GET_NO_NEW_PRIVS
+                        step_execve("/fcap_bin"),
+                        step_simple(SYS_GETEUID, 0, 0),
+                        step_capget(),
+                        step_simple(SYS_PRCTL, 39, 0),
+                        step_simple(SYS_EXIT_GROUP, 0, 0),
+                    ],
+                )
+                .await;
+                assert_eq!(res_nnp, vec![0, 1000, 0, 1, 1000, 0, 1]);
+                assert_eq!(caps_nnp, vec![(0, 0), (0, 0)]);
+                assert_eq!(auxv_nnp[1].get(&12), Some(&1000));
+                assert_eq!(auxv_nnp[1].get(&23), Some(&0));
+                assert_eq!(auxv_nnp[2].get(&12), Some(&1000));
+                assert_eq!(auxv_nnp[2].get(&23), Some(&0));
+
+                // Verify the exact capability bitmasks computed for /suid_bin and /fcap_bin
+                // against the container's ProcessAuthority ceiling (CAP_NET_BIND_SERVICE
+                // granted; CAP_SYS_TIME / CAP_NET_ADMIN / CAP_NET_RAW clamped out).
+                let suid_creds = container
+                    .filesystem()
+                    .exec_credentials_at(
+                        "/",
+                        "/suid_bin",
+                        &Credentials::for_ids(1000, 100, vec![]),
+                        container.authority_cap_ceiling(),
+                    )
+                    .await
+                    .expect("exec_credentials_at /suid_bin");
+                assert!(suid_creds.capabilities.has_effective(CAP_NET_BIND_SERVICE));
+                assert!(!suid_creds.capabilities.has_effective(CAP_SYS_TIME));
+                assert!(!suid_creds.capabilities.has_effective(CAP_NET_ADMIN));
+                assert!(!suid_creds.capabilities.has_effective(CAP_NET_RAW));
+
+                let fcap_creds = container
+                    .filesystem()
+                    .exec_credentials_at(
+                        "/",
+                        "/fcap_bin",
+                        &Credentials::for_ids(1000, 100, vec![]),
+                        container.authority_cap_ceiling(),
+                    )
+                    .await
+                    .expect("exec_credentials_at /fcap_bin");
+                assert_eq!(
+                    fcap_creds.capabilities.effective,
+                    1u64 << CAP_NET_BIND_SERVICE
+                );
+                assert_eq!(
+                    fcap_creds.capabilities.permitted,
+                    1u64 << CAP_NET_BIND_SERVICE
+                );
+
+                drop(container);
+                host_ns
+                    .unmount(&root_auth.derive_unmount_cap("/priv").unwrap())
+                    .await
+                    .expect("unmount /priv");
+                host_ns
+                    .unmount(&root_auth.derive_unmount_cap("/shared").unwrap())
+                    .await
+                    .expect("unmount /shared");
+            };
+
+            futures::future::join(Box::pin(client), Box::pin(btrfs_service.run(timer))).await;
+        });
+    }
 }

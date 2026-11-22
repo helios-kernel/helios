@@ -21,6 +21,13 @@ pub struct Startup<'a> {
     pub environment: &'a [&'a [u8]],
     /// The path the program was executed by, for `AT_EXECFN`.
     pub executable: &'a [u8],
+    /// Process credentials and secure-execution flag (`AT_UID`, `AT_EUID`,
+    /// `AT_GID`, `AT_EGID`, `AT_SECURE`, `fs/binfmt_elf.c` `create_elf_tables`).
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub secure: bool,
 }
 
 /// The bytes of a process's initial stack and where they go.
@@ -39,6 +46,11 @@ const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
 const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
 // ELF64 program-header entries are 56 bytes (System V gABI).
@@ -58,7 +70,7 @@ pub fn build(startup: &Startup<'_>, top: u64) -> Result<InitialStack, Error> {
         }
         string_bytes += string.len() + 1;
     }
-    let auxiliary = 8;
+    let auxiliary = 13;
     let words = 1 + startup.arguments.len() + 1 + startup.environment.len() + 1 + auxiliary * 2;
     let random_offset_from_top = string_bytes + 16;
     // The vector sits below the random bytes, aligned so `argc` is at a
@@ -106,6 +118,16 @@ pub fn build(startup: &Startup<'_>, top: u64) -> Result<InitialStack, Error> {
         startup.page_size,
         AT_ENTRY,
         startup.entry,
+        AT_UID,
+        u64::from(startup.uid),
+        AT_EUID,
+        u64::from(startup.euid),
+        AT_GID,
+        u64::from(startup.gid),
+        AT_EGID,
+        u64::from(startup.egid),
+        AT_SECURE,
+        u64::from(startup.secure),
         AT_RANDOM,
         random,
         AT_EXECFN,

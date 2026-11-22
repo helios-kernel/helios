@@ -761,6 +761,13 @@ impl<R: Resources> Process<R> {
         self.shared.cwd.clone()
     }
 
+    /// Shared handle to this process's credentials (for host `execve`/`execveat`
+    /// permission checks and set-id / file-capability transitions without
+    /// holding a borrow on `Process`).
+    pub fn credentials_handle(&self) -> Arc<spin::Mutex<system::Credentials>> {
+        self.shared.credentials.clone()
+    }
+
     /// If a non-leader thread called `execve`, transitions its thread ID to
     /// the thread-group leader (`tid == pid`), matching Linux `de_thread`.
     fn normalize_exec_leader(&mut self) {
@@ -782,13 +789,20 @@ impl<R: Resources> Process<R> {
     /// Commits an in-place Linux-to-Linux `execve`/`execveat`:
     /// - detaches from any `vfork`/`CLONE_VM`/`CLONE_FILES` parent state,
     /// - closes `FD_CLOEXEC` descriptors,
+    /// - applies the post-`execve` `new_credentials` (visible to both the new
+    ///   image and `PidNamespace` signal checks),
     /// - resets caught signal handlers to `SIG_DFL` while preserving `SIG_IGN`
     ///   and the calling thread's signal mask,
     /// - marks `has_execed` in [`PidNamespace`] and wakes any `vfork` parent,
     /// - resets the thread group to a single thread (`tid == pid`) with
     ///   `new_program_break`.
-    pub fn commit_linux_exec(&mut self, new_program_break: u64) {
+    pub fn commit_linux_exec(
+        &mut self,
+        new_program_break: u64,
+        new_credentials: system::Credentials,
+    ) {
         let pid = self.pid();
+        *self.shared.credentials.lock() = new_credentials;
         let mut surviving = self.shared.descriptors.lock().clone();
         let len = surviving.entries.len();
         for index in 0..len {
@@ -1395,6 +1409,7 @@ pub async fn dispatch<
             process.clear_child_tid = arguments[0];
             SyscallOutcome::Return(u64::from(process.tid.get()))
         }
+        Operation::Prctl => SyscallOutcome::Return(process.prctl(arguments)),
         Operation::ArchPrctl => SyscallOutcome::Return(arch_prctl(abi, arguments, memory, thread)),
         Operation::Ioctl => SyscallOutcome::Return({
             let is_socket = process

@@ -628,3 +628,97 @@ fn chmod_chown_mknod_and_xattr_syscalls_decode_on_both_abis() {
         );
     }
 }
+
+#[test]
+fn prctl_no_new_privs_works_across_both_abis() {
+    const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    const PR_GET_NO_NEW_PRIVS: u64 = 39;
+
+    for abi in [Abi::X86_64, Abi::Aarch64] {
+        let mut proc = Process::<DummyRes>::new(abi, NonZeroU32::new(1).unwrap(), 0x40_0000);
+        let mut mem = FlatMem::default();
+        let mut host = RecordingHost::default();
+
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+        // Invalid arg2 != 1 or non-zero trailing args -> EINVAL.
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_SET_NO_NEW_PRIVS, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EINVAL)
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_SET_NO_NEW_PRIVS, 1, 1, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EINVAL)
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_GET_NO_NEW_PRIVS, 1, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EINVAL)
+        );
+        // Unsupported option -> EINVAL.
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [999, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            err(EINVAL)
+        );
+        // Setting PR_SET_NO_NEW_PRIVS latches permanently.
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            0
+        );
+        assert_eq!(
+            run_call(
+                &mut proc,
+                abi,
+                Operation::Prctl,
+                [PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0],
+                &mut mem,
+                &mut host
+            ),
+            1
+        );
+        assert!(proc.credentials_handle().lock().no_new_privs);
+    }
+}

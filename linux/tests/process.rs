@@ -598,7 +598,8 @@ fn vfork_suspends_parent_until_child_execs_or_exits() {
     let child_pid = child.pid().get();
 
     // Child calls commit_linux_exec -> immediately unblocks parent!
-    child.commit_linux_exec(0x50_0000);
+    let creds = child.credentials_handle().lock().clone();
+    child.commit_linux_exec(0x50_0000, creds);
     match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(ControlFlow::Continue(SyscallOutcome::Return(ret))) => {
             assert_eq!(ret, u64::from(child_pid));
@@ -806,7 +807,8 @@ fn pgid_sid_setsid_and_exec_resets_cloexec_and_handlers() {
 
         // Commit exec on child: CLOEXEC fd closed, kept fd open, SIGUSR1 reset
         // to SIG_DFL, SIGUSR2 still SIG_IGN, and parent setpgid now returns EACCES.
-        child.commit_linux_exec(0x60_0000);
+        let creds = child.credentials_handle().lock().clone();
+        child.commit_linux_exec(0x60_0000, creds);
         assert!(child.descriptor_entry(cloexec_fd).is_none());
         assert!(child.descriptor_entry(kept_fd).is_some());
         assert_eq!(
@@ -1465,7 +1467,8 @@ fn fork_cow_map_shared_untouched_child_does_not_clobber_post_fork_writes() {
                 .is_ready()
         );
     }
-    child2.commit_linux_exec(PROGRAM_BREAK);
+    let creds = child2.credentials_handle().lock().clone();
+    child2.commit_linux_exec(PROGRAM_BREAK, creds);
     assert_eq!(&*backing.lock().unwrap(), b"POSTFORK");
 
     // Child 3 forks and DOES dirty `mapped` (breaking CoW) -> flushes "CHILDWRT".
@@ -1593,7 +1596,8 @@ fn clone_sighand_without_clone_thread_keeps_distinct_tgid_and_unshares_on_exec()
 
     // Child calling `commit_linux_exec` unshares sighand and resets child's
     // SIGUSR1 to SIG_DFL while preserving parent's SIGUSR1 handler (0x40_1000).
-    child.commit_linux_exec(PROGRAM_BREAK);
+    let creds = child.credentials_handle().lock().clone();
+    child.commit_linux_exec(PROGRAM_BREAK, creds);
     assert_eq!(
         call_ret(
             &mut child,
