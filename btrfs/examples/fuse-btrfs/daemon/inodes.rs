@@ -18,6 +18,15 @@ pub struct Identity {
     pub number: u64,
 }
 
+/// A cached non-root inode that needs a live writer [`InodeHandle`] attached
+/// after upgrading a read-only mount to writable.
+pub struct PendingHandle {
+    pub ino: INodeNo,
+    pub identity: Identity,
+    pub generation: Option<u64>,
+    pub path: Vec<Vec<u8>>,
+}
+
 struct Entry {
     identity: Identity,
     /// The generation the inode was created in, once a lookup or creation
@@ -76,7 +85,7 @@ impl Inodes {
 
     /// Cached non-root entries that still need a writer [`InodeHandle`] after
     /// upgrading a read-only mount to writable.
-    pub fn pending_handle_paths(&self) -> Vec<(INodeNo, Identity, Option<u64>, Vec<Vec<u8>>)> {
+    pub fn pending_handle_paths(&self) -> Vec<PendingHandle> {
         let mut pending: Vec<_> = self
             .entries
             .iter()
@@ -85,10 +94,15 @@ impl Inodes {
                     return None;
                 }
                 let path = entry.origin_path.clone()?;
-                Some((INodeNo(ino), entry.identity, entry.generation, path))
+                Some(PendingHandle {
+                    ino: INodeNo(ino),
+                    identity: entry.identity,
+                    generation: entry.generation,
+                    path,
+                })
             })
             .collect();
-        pending.sort_by_key(|(_, _, _, path)| path.len());
+        pending.sort_by_key(|entry| entry.path.len());
         pending
     }
 

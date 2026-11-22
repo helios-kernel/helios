@@ -296,11 +296,11 @@ impl State {
                     let mut by_path: HashMap<Vec<Vec<u8>>, InodeHandle> = HashMap::new();
                     by_path.insert(Vec::new(), root_handle.clone());
                     let mut resolved = Vec::with_capacity(pending.len());
-                    for (ino, identity, expected_gen, path) in pending {
+                    for entry in pending {
                         let mut current = root_handle.clone();
-                        let mut prefix = Vec::with_capacity(path.len());
+                        let mut prefix = Vec::with_capacity(entry.path.len());
                         let mut found = true;
-                        for component in path {
+                        for component in entry.path {
                             prefix.push(component);
                             if let Some(cached) = by_path.get(&prefix) {
                                 current = cached.clone();
@@ -318,12 +318,12 @@ impl State {
                             current = next;
                         }
                         if !found
-                            || current.tree() != identity.tree
-                            || current.number() != identity.number
+                            || current.tree() != entry.identity.tree
+                            || current.number() != entry.identity.number
                         {
                             continue;
                         }
-                        if let Some(generation) = expected_gen {
+                        if let Some(generation) = entry.generation {
                             let meta = transaction
                                 .metadata(&current)
                                 .await
@@ -332,7 +332,7 @@ impl State {
                                 continue;
                             }
                         }
-                        resolved.push((ino, current));
+                        resolved.push((entry.ino, current));
                     }
                     (root_handle, resolved)
                 };
