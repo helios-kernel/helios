@@ -78,6 +78,9 @@ pub struct BtrfsWriteOptions {
     /// a source other than btrfs is refused. [`BtrfsFs::set_max_inline`]
     /// changes it later.
     pub max_inline: Option<u64>,
+    /// Wall-clock nanoseconds since the Unix epoch at the mount request:
+    /// what the replay of a log tree a crash left stamps on what it unlinks.
+    pub now: u64,
 }
 
 /// What the machine keeps of a writable btrfs mount, whatever its device
@@ -371,6 +374,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             compress,
             commit,
             max_inline,
+            now,
         } = options;
         let compressor = Compressor::new(compress)?;
         let serial = disk.serial();
@@ -384,6 +388,7 @@ impl<Device: BlockDevice<Buffer = BlockPages>> BtrfsFs<Device> {
             writer::EntropyUuids(entropy),
             concurrency,
             compressor,
+            writer::timestamp(now),
         )
         .await?;
         writer.set_max_inline(max_inline);

@@ -47,11 +47,12 @@ use crate::source::BlockSink;
 use crate::transaction::file::DEFAULT_MAX_INLINE;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
+use crate::transaction::replay::PendingLog;
 use crate::transaction::reserve::Units;
 use crate::transaction::xattr::XattrMode;
 use crate::transaction::{Checkpoint, Transaction};
 use crate::tree::write::WriteError;
-use crate::{Error, FileKind, Metadata, Timestamp};
+use crate::{DeviceNumber, Error, FileKind, Metadata, Timestamp};
 
 /// The dirty metadata a running transaction holds before it is committed,
 /// unless the mount's operator chose another bound: Linux's
@@ -113,7 +114,9 @@ impl InodeHandle {
 }
 
 /// Permissions and ownership for a newly created entry. File type is selected
-/// by create_file, create_directory or symlink, never by permission bits.
+/// by create_file, create_directory, symlink or create_special, never by
+/// permission bits. Every bit of `07777` is stored as given, the set-id and
+/// sticky bits included, on every kind of inode.
 #[derive(Clone, Copy, Debug)]
 pub struct Attributes {
     /// The mode bits asked for, before the umask.
@@ -131,6 +134,10 @@ pub struct Attributes {
 
 impl Attributes {
     fn raw(self, kind: u32) -> Result<RawAttributes, WriteError> {
+        self.raw_with_device(kind, 0)
+    }
+
+    fn raw_with_device(self, kind: u32, rdev: u64) -> Result<RawAttributes, WriteError> {
         if self.permissions & !0o7777 != 0 {
             return Err(WriteError::InvalidPermissions {
                 permissions: self.permissions,
@@ -140,8 +147,31 @@ impl Attributes {
             mode: kind | self.permissions,
             uid: self.uid,
             gid: self.gid,
+            rdev,
             umask: self.umask,
         })
+    }
+}
+
+/// A node `mknod` makes that holds no data: a device node, a FIFO or a
+/// socket, as `btrfs_mknod` in `fs/btrfs/inode.c` creates them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Special {
+    CharDevice(DeviceNumber),
+    BlockDevice(DeviceNumber),
+    Fifo,
+    Socket,
+}
+
+impl Special {
+    /// The file type bits of the mode, and the inode item's `rdev`.
+    fn mode_and_rdev(self) -> (u32, u64) {
+        match self {
+            Self::CharDevice(device) => (0o020_000, device.inode_item()),
+            Self::BlockDevice(device) => (0o060_000, device.inode_item()),
+            Self::Fifo => (0o010_000, 0),
+            Self::Socket => (0o140_000, 0),
+        }
     }
 }
 
@@ -215,14 +245,26 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// `uuids`, writeback encodes the data of every inode Linux would
     /// compress with `compressor` (the `compress=` mount option), and both
     /// keep at most `concurrency` block writes in flight.
+    ///
+    /// A log tree a crash left behind an fsync is replayed first, in one
+    /// transaction that this call commits before it returns, as Linux's
+    /// `btrfs_recover_log_trees` does at mount; `now` is the time that
+    /// replay stamps on what its unlinks change. A log that cannot be
+    /// replayed refuses the mount, and the device keeps its last committed
+    /// generation.
     pub async fn mount(
         source: S,
         uuids: U,
         concurrency: NonZeroUsize,
         compressor: Compressor,
+        now: Timestamp,
     ) -> Result<Self, WriteError> {
-        let current = Filesystem::mount(Arc::new(source)).await?;
+        let current = Filesystem::mount_committed(Arc::new(source)).await?;
         current.superblock().check_writable()?;
+        let log = current
+            .superblock()
+            .log_tree()
+            .map(|(bytenr, level)| PendingLog { bytenr, level });
         // Linux enables quotas by creating the quota tree. Its qgroup counts
         // go stale under any write this writer makes, so refuse until the
         // writer maintains them (lexoliu/helios#1043).
@@ -238,7 +280,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             Err(error) => return Err(error.into()),
         }
         let allocation = Allocation::load(&current.volume, current.snapshot.root_tree).await?;
-        Ok(Self {
+        let mut writer = Self {
             committed: Some(current),
             allocation,
             retirements: Retirements::default(),
@@ -248,7 +290,27 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             compressor,
             max_inline: DEFAULT_MAX_INLINE,
             concurrency,
-        })
+        };
+        if let Some(log) = log {
+            writer.replay(log, now).await?;
+        }
+        Ok(writer)
+    }
+
+    /// Replays `log` in a transaction of its own and commits it, which
+    /// clears the superblock's log root even when the replay changed
+    /// nothing else. Linux reserves nothing up front for it
+    /// (`btrfs_start_transaction(tree_root, 0)`), so only the commit's own
+    /// hold is checked.
+    async fn replay(&mut self, log: PendingLog, now: Timestamp) -> Result<(), WriteError> {
+        self.start().await?;
+        let running = self
+            .running
+            .as_mut()
+            .expect("a transaction runs once started");
+        running.inner.replay_log(log, now).await?;
+        running.inner.check_commit_hold(Units::default())?;
+        self.commit_running().await
     }
 
     /// The mount's `max_inline` limit, in bytes.
@@ -384,14 +446,26 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// the future before it finishes, poisons the writer instead of
     /// discarding them; the device keeps the previous generation.
     pub async fn commit(&mut self) -> Result<(), WriteError> {
-        let mut current = self.committed.take().ok_or(WriteError::WriterPoisoned)?;
-        let Some(running) = self.running.take().filter(|running| {
-            running.inner.dirty_metadata_bytes() != 0 || running.inner.dirty_data_bytes() != 0
-        }) else {
+        if self.committed.is_none() {
+            return Err(WriteError::WriterPoisoned);
+        }
+        if self.running.as_ref().is_none_or(|running| {
+            running.inner.dirty_metadata_bytes() == 0 && running.inner.dirty_data_bytes() == 0
+        }) {
             // A clean transaction holds nothing the last commit did not.
-            self.committed = Some(current);
+            self.running = None;
             return Ok(());
-        };
+        }
+        self.commit_running().await
+    }
+
+    /// Commits the running transaction, whatever it holds.
+    async fn commit_running(&mut self) -> Result<(), WriteError> {
+        let mut current = self.committed.take().ok_or(WriteError::WriterPoisoned)?;
+        let running = self
+            .running
+            .take()
+            .expect("the caller commits a running transaction");
         let uuids = &mut self.uuids;
         let mut committed = running
             .inner
@@ -704,9 +778,9 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         operation.accept()
     }
 
-    /// Replaces the permission bits (`07777`, with the set-id bits refused on
-    /// a non-directory with [`WriteError::SetId`]) and stamps `changed`. An
-    /// access ACL's base entries follow the new bits.
+    /// Replaces the permission bits (`07777`, the set-id and sticky bits
+    /// included on every kind of inode) and stamps `changed`. An access ACL's
+    /// base entries follow the new bits.
     pub async fn set_permissions(
         &mut self,
         file: &InodeHandle,
@@ -838,6 +912,20 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         when: Timestamp,
     ) -> Result<InodeHandle, WriteError> {
         self.create(name, attributes.raw(0o040000)?, when).await
+    }
+
+    /// Creates a device node, a FIFO or a socket, as `mknod`. The node holds
+    /// no data; a device node keeps the number it names.
+    pub async fn create_special(
+        &mut self,
+        name: Name<'_>,
+        special: Special,
+        attributes: Attributes,
+        when: Timestamp,
+    ) -> Result<InodeHandle, WriteError> {
+        let (kind, rdev) = special.mode_and_rdev();
+        self.create(name, attributes.raw_with_device(kind, rdev)?, when)
+            .await
     }
 
     async fn create(

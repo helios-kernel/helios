@@ -41,23 +41,42 @@ impl Checksums {
         let sector = volume.superblock().sectorsize() as usize;
         let algorithm = volume.superblock().csum_type();
         let length: usize = pieces.iter().map(|piece| piece.len()).sum();
-        let end = logical
-            .checked_add(length as u64)
-            .ok_or(WriteError::Checksum { key: key(logical) })?;
-        self.remove(volume, trees, space, logical..end).await?;
-        let per_item = max_csum_items(volume.superblock());
         let mut digests = Vec::with_capacity(length / sector * algorithm.size());
         for piece in pieces {
             for sector in piece.chunks_exact(sector) {
                 digests.extend_from_slice(algorithm.digest(sector).as_bytes());
             }
         }
-        let mut start = logical;
-        for bytes in digests.chunks(per_item * algorithm.size()) {
+        self.store(volume, trees, space, logical, &digests).await
+    }
+
+    /// Replaces the checksums of the sectors from `logical` with `digests`,
+    /// one digest per sector, splitting them into items that fit a leaf.
+    pub(crate) async fn store<S: BlockSource>(
+        &mut self,
+        volume: &Volume<S>,
+        trees: &mut Trees,
+        space: &mut Space,
+        logical: u64,
+        digests: &[u8],
+    ) -> Result<(), WriteError> {
+        let sector = u64::from(volume.superblock().sectorsize());
+        let digest = volume.superblock().csum_type().size();
+        let invalid = || WriteError::Checksum { key: key(logical) };
+        if digests.is_empty() || !digests.len().is_multiple_of(digest) {
+            return Err(invalid());
+        }
+        let end = ((digests.len() / digest) as u64)
+            .checked_mul(sector)
+            .and_then(|length| logical.checked_add(length))
+            .ok_or_else(invalid)?;
+        self.remove(volume, trees, space, logical..end).await?;
+        let per_item = max_csum_items(volume.superblock());
+        for (index, chunk) in digests.chunks(per_item * digest).enumerate() {
+            let start = logical + (index * per_item) as u64 * sector;
             self.root = trees
-                .apply(volume, self.root, key(start), Some(bytes), space)
+                .apply(volume, self.root, key(start), Some(chunk), space)
                 .await?;
-            start += (per_item * sector) as u64;
         }
         Ok(())
     }

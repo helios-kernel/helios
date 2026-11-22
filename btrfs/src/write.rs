@@ -23,7 +23,10 @@
 //! to its mount and generation. Directory lookup sees staged namespace
 //! changes, including subvolume entries.
 //!
-//! Writable support is single-device and excludes pending log replay, verity,
+//! A log tree a crash left behind an fsync is replayed when the writer mounts,
+//! in one transaction committed before [`Writer::mount`] returns; a log item
+//! the replay does not implement refuses the mount ([`LogReplayError`]).
+//! Writable support is single-device and excludes verity,
 //! unknown compat-ro features and filesystems with quotas enabled (the writer
 //! maintains no quota-group accounting). Space comes from the block groups, and the
 //! writer allocates a chunk on the device when a type runs short, following
@@ -44,11 +47,13 @@ pub use crate::compress::write::{EncodeError, Encoded, Encoder, Lzo, Zlib, Zstd}
 pub use crate::free_space::FreeSpaceDefect;
 pub use crate::fs::writer::{
     Attributes, CloneRange, DEFAULT_DIRTY_METADATA_LIMIT, DIRTY_BACKGROUND_RATIO, Dirty,
-    InodeHandle, Name, RootUuids, Usage, WriteTransaction, Writer, default_dirty_data_limit,
+    InodeHandle, Name, RootUuids, Special, Usage, WriteTransaction, Writer,
+    default_dirty_data_limit,
 };
 pub use crate::space::{SpaceDefect, SpaceError};
 pub use crate::transaction::chunks::ChunkError;
 pub use crate::transaction::file::DEFAULT_MAX_INLINE;
+pub use crate::transaction::replay::LogReplayError;
 pub use crate::transaction::xattr::XattrMode;
 pub use crate::tree::edit::EditError;
 pub use crate::tree::write::WriteError;
