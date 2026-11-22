@@ -8,8 +8,8 @@
 //! lives out here, and none of it lives in the kernel.
 //!
 //! The plugin carries no protocol code of its own. It hosts zenwave's native
-//! backend (HTTP/1.1 framing, TLS through rustls with the Mozilla roots
-//! compiled in) over `helios_api::http_kit::HeliosNet`, which is
+//! backend (HTTP/1.1 and HTTP/2 over ALPN, TLS through rustls with the Mozilla
+//! roots compiled in) over `helios_api::http_kit::HeliosNet`, which is
 //! `http-kit-io` on `wasi:sockets` and the monotonic clock. What is left
 //! here is the translation between `wasi:http` and `http` messages, the
 //! `request-options` timeouts, and the choice of `wasi:http` error code for
@@ -18,10 +18,13 @@
 //! One persistent connection pool (`NativeBackend`) is lazily built per shard
 //! on the first exchange (loading the Mozilla roots plus optional
 //! `/etc/ssl/certs/ca-certificates.crt` once) and retained across requests on
-//! that processor core so HTTP keep-alive sockets and TLS sessions are reused.
+//! that processor core so HTTP/1.1 keep-alive sockets, multiplexed HTTP/2
+//! connections, and TLS sessions are reused.
 
 mod error;
 mod fields;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod h2_tests;
 mod request;
 mod response;
 
