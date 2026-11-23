@@ -190,9 +190,9 @@ pub use machine::{
     spawn_generation_probe,
 };
 pub use memory::{
-    AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
-    BootRegionSplitter, COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval, CompressRefusal,
-    CompressedPage, CompressedPool, CompressedPoolError, CompressedPoolStats,
+    AGE_BATCH_PAGES, AccessibilityPlan, AllocationTagHooks, BalloonHandle, BalloonStats,
+    BootMemoryPlan, BootRegionSplitter, COMPRESSED_PAGE_BYTES, CommittedRegion, CommittedRemoval,
+    CompressRefusal, CompressedPage, CompressedPool, CompressedPoolError, CompressedPoolStats,
     DEFAULT_COMPRESSION_LEVEL, DEFAULT_POOL_PERCENT, Decommitted, ENTROPY_RESEED_INTERVAL,
     EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES, FREE_PAGE_REPORT_INTERVAL, FiberStack,
     FiberStackArenaStats, FiberStackError, FiberStackVmHooks, HardwareEntropySource,

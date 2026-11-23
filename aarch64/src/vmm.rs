@@ -54,8 +54,8 @@ use helios_kernel::runtime_memory::{
     default_memory_image_map_at, default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup, ReservationTracker,
-    ResidencyVmHooks, SwapLeafFormat, SwapSpace, SwapVmHooks, VaCursor,
+    AllocationTagHooks, FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup,
+    ReservationTracker, ResidencyVmHooks, SwapLeafFormat, SwapSpace, SwapVmHooks, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_uninit_on_node, allocate_user_run_zeroed_on,
     current_user_memory_owner, deallocate_user_frame_on, deallocate_user_run_on,
     install_fiber_stack_hooks, install_residency_hooks, ranges_outside, residency_vm_hooks,
@@ -1743,6 +1743,7 @@ static AARCH64_FIBER_STACK_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
     prepare_demand_commit: |virt, flags| user_as().prepare_demand_commit(virt, flags),
     commit_demand_page: |addr, frame, flags| user_as().commit_demand_page(addr, frame, flags),
     end_demand_commit: |virt, mapped| user_as().end_demand_commit(virt, mapped),
+    tags: AllocationTagHooks::NONE,
 };
 
 /// Resolves an access-flag fault raised by the swap policy's aging pass.

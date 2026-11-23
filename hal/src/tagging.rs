@@ -64,6 +64,11 @@ impl TagSet {
     pub const fn contains(self, tag: Tag) -> bool {
         self.0 >> tag.raw() & 1 != 0
     }
+
+    /// The set's bitmask, one bit per tag.
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
 }
 
 /// The allocation-tag operations of the executing processor.
@@ -251,6 +256,8 @@ mod tests {
         assert!(set.contains(Tag::UNCHECKED));
         assert!(!set.contains(Tag::FREE));
         assert!(!set.contains(Tag::new(0x4)));
+        assert_eq!(set.raw(), (1 << 0x3) | (1 << 0xf));
+        assert_eq!(TagSet::EMPTY.raw(), 0);
         assert!((0..=0xf).all(|raw| !TagSet::EMPTY.contains(Tag::new(raw))));
     }
 

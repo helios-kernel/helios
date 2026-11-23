@@ -94,6 +94,7 @@ use crossbeam_utils::CachePadded;
 use helios_hal::cpu::{ProcessorId, current_processor};
 use helios_hal::numa::NodeId;
 use helios_hal::pmm::PhysFrame;
+use helios_hal::tagging::{AllocationTags, NoAllocationTags, Tag, TagSet};
 use helios_hal::vmm::{AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use spin::Once;
 use thiserror::Error;
@@ -113,6 +114,45 @@ use crate::wasmtime_adapter::parking::ParkedFibers;
 /// frame either Cranelift or the kernel's own Rust code builds, so an
 /// overflow always lands inside it.
 pub const FIBER_STACK_GUARD_BYTES: usize = 64 * 1024;
+
+/// Allocation-tag operations the arena needs, as plain function pointers.
+///
+/// Mirrors [`AllocationTags`] without `dyn`: a backend fills this with
+/// [`AllocationTagHooks::of`] when it tags fiber stacks, or uses
+/// [`AllocationTagHooks::NONE`] when it does not.
+#[derive(Clone, Copy)]
+pub struct AllocationTagHooks {
+    /// Bytes one allocation tag covers.
+    pub granule_bytes: usize,
+    /// Whether the executing processor checks tags.
+    pub checking: fn() -> bool,
+    /// Chooses a tag outside `Tag::UNCHECKED`, `Tag::FREE` and `avoid` and
+    /// stores it across `range`.
+    pub assign: unsafe fn(NonNull<[u8]>, TagSet) -> Tag,
+    /// Stores `tag` across `range`.
+    pub store: unsafe fn(NonNull<[u8]>, Tag),
+    /// Returns `addr` carrying `tag`.
+    pub apply: fn(usize, Tag) -> usize,
+    /// Returns `addr` with any logical tag removed.
+    pub strip: fn(usize) -> usize,
+}
+
+impl AllocationTagHooks {
+    /// Hook table for a concrete [`AllocationTags`] implementation.
+    pub const fn of<A: AllocationTags>() -> Self {
+        Self {
+            granule_bytes: A::GRANULE_BYTES,
+            checking: A::checking,
+            assign: A::assign,
+            store: A::store,
+            apply: A::apply,
+            strip: A::strip,
+        }
+    }
+
+    /// Identity hooks for hardware that stores no allocation tags.
+    pub const NONE: Self = Self::of::<NoAllocationTags>();
+}
 
 /// The address-space operations the arena needs, as plain function
 /// pointers.
@@ -134,6 +174,8 @@ pub struct FiberStackVmHooks {
     /// second range is the part of the body a commit may have mapped:
     /// from the slot's watermark to its top.
     pub end_demand_commit: fn(VirtRange, VirtRange) -> Result<(), AddressSpaceError>,
+    /// Allocation-tag operations for stack bodies.
+    pub tags: AllocationTagHooks,
 }
 
 /// What a backend's fault entry does with a faulting address.
@@ -217,7 +259,16 @@ struct FiberStackSlot {
     /// is what lets the next claimant prefer pages on its own node.
     /// Meaningless while the slot is cold.
     node: AtomicU8,
+    /// The logical tag of the live stack owning this slot, or the tag its
+    /// previous owner held while the slot is warm or cold so the next claim
+    /// avoids repeating it. Stored as [`Tag::raw`].
+    tag: AtomicU8,
     watermark: AtomicUsize,
+    /// One bit per page in the slot's body, set when that page is mapped.
+    /// A large stack frame can skip a page and leave a hole between
+    /// `watermark` and `body_top`; tagging loops walk only the set bits so
+    /// they never issue a tag store against an unmapped hole.
+    committed_pages: Box<[AtomicU64]>,
     /// The Wasmtime unpark generation the fiber on this stack last
     /// returned from a parking wait at; see
     /// `wasmtime_adapter::parking`. A value left by an earlier fiber is
@@ -227,9 +278,36 @@ struct FiberStackSlot {
     parked_generation: AtomicU64,
 }
 
+impl FiberStackSlot {
+    fn mark_page_committed(&self, page_index: usize) {
+        let word = page_index / 64;
+        let bit = page_index % 64;
+        self.committed_pages[word].fetch_or(1u64 << bit, Ordering::Release);
+    }
+
+    fn clear_committed_pages(&self) {
+        for word in &self.committed_pages {
+            word.store(0, Ordering::Release);
+        }
+    }
+
+    fn for_each_committed_page(&self, body_start: usize, mut visit: impl FnMut(usize)) {
+        for (word_index, word) in self.committed_pages.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let page_index = word_index * 64 + bit;
+                visit(body_start + page_index * PhysFrame::SIZE);
+                bits &= bits - 1;
+            }
+        }
+    }
+}
+
 /// The machine's fiber stacks.
 pub struct FiberStackArena {
     hooks: &'static FiberStackVmHooks,
+    checking: bool,
     base: usize,
     slot_bytes: usize,
     stack_bytes: usize,
@@ -341,6 +419,15 @@ pub fn install_fiber_stack_arena(slots: usize, stack_bytes: usize, retain_bytes:
             stack_bytes != 0 && stack_bytes.is_multiple_of(PhysFrame::SIZE),
             "a fiber stack of {stack_bytes} bytes is not a whole number of pages"
         );
+        let checking = (hooks.tags.checking)();
+        if checking {
+            assert!(
+                hooks.tags.granule_bytes.is_power_of_two()
+                    && PhysFrame::SIZE.is_multiple_of(hooks.tags.granule_bytes),
+                "allocation tag granule {} must be a power of two dividing a page",
+                hooks.tags.granule_bytes,
+            );
+        }
         let pool = super::user_memory_pool();
         let slot_bytes = FIBER_STACK_GUARD_BYTES
             .checked_add(stack_bytes)
@@ -351,12 +438,17 @@ pub fn install_fiber_stack_arena(slots: usize, stack_bytes: usize, retain_bytes:
         let range = (hooks.reserve)(bytes).unwrap_or_else(|error| {
             panic!("the address space refused the {bytes}-byte fiber stack arena: {error}")
         });
+        let bitmap_words = (stack_bytes / PhysFrame::SIZE).div_ceil(64);
         let mut slot_states = Vec::with_capacity(slots);
         slot_states.resize_with(slots, || {
+            let mut committed_pages = Vec::with_capacity(bitmap_words);
+            committed_pages.resize_with(bitmap_words, || AtomicU64::new(0));
             CachePadded::new(FiberStackSlot {
                 state: AtomicU8::new(SLOT_COLD),
                 node: AtomicU8::new(0),
+                tag: AtomicU8::new(Tag::FREE.raw()),
                 watermark: AtomicUsize::new(0),
+                committed_pages: committed_pages.into_boxed_slice(),
                 #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
                 parked_generation: AtomicU64::new(0),
             })
@@ -369,10 +461,12 @@ pub fn install_fiber_stack_arena(slots: usize, stack_bytes: usize, retain_bytes:
             guard_bytes = FIBER_STACK_GUARD_BYTES,
             reserved_bytes = bytes,
             retain_bytes,
+            tagged = checking,
             "fiber stack arena reserved; stacks commit on demand"
         );
         FiberStackArena {
             hooks,
+            checking,
             base: range.start.raw(),
             slot_bytes,
             stack_bytes,
@@ -442,8 +536,69 @@ impl FiberStackArena {
         (start as *mut u8)..((start + FIBER_STACK_GUARD_BYTES) as *mut u8)
     }
 
+    fn page_flags(&self) -> PageFlags {
+        let mut flags = PageFlags::READ | PageFlags::WRITE;
+        if self.checking {
+            flags |= PageFlags::TAGGED;
+        }
+        flags
+    }
+
+    fn page_range(page: usize) -> NonNull<[u8]> {
+        let ptr = NonNull::new(page as *mut u8).expect("a mapped fiber-stack page is not null");
+        NonNull::slice_from_raw_parts(ptr, PhysFrame::SIZE)
+    }
+
+    /// Assigns one fresh tag avoiding `slot`'s previous tag across every
+    /// committed page of `index`, and publishes that tag on `slot`.
+    fn tag_committed_pages(&self, index: usize) -> Tag {
+        if !self.checking {
+            return Tag::UNCHECKED;
+        }
+        let slot = &self.slots[index];
+        let body = self.body(index);
+        let previous = Tag::new(slot.tag.load(Ordering::Relaxed));
+        let avoid = TagSet::EMPTY.with(previous);
+        let mut assigned: Option<Tag> = None;
+        slot.for_each_committed_page(body.start.raw(), |page| {
+            let range = Self::page_range(page);
+            match assigned {
+                None => {
+                    // SAFETY: `page` is a committed `PageFlags::TAGGED` page
+                    // of a slot exclusively owned by this live claim, and
+                    // `PhysFrame::SIZE` is a multiple of the tag granule.
+                    let tag = unsafe { (self.hooks.tags.assign)(range, avoid) };
+                    assigned = Some(tag);
+                }
+                Some(tag) => {
+                    // SAFETY: as above.
+                    unsafe { (self.hooks.tags.store)(range, tag) };
+                }
+            }
+        });
+        let tag = assigned.expect("a claimed fiber stack has at least its top page committed");
+        slot.tag.store(tag.raw(), Ordering::Release);
+        tag
+    }
+
+    /// Returns every committed page of slot `index` to [`Tag::FREE`] so any
+    /// stale pointer left behind by the released stack faults on access.
+    fn clear_slot_tags(&self, index: usize) {
+        if !self.checking {
+            return;
+        }
+        let slot = &self.slots[index];
+        let body = self.body(index);
+        slot.for_each_committed_page(body.start.raw(), |page| {
+            // SAFETY: `page` is still mapped `PageFlags::TAGGED` in this slot,
+            // which is being released exclusively by its owner.
+            unsafe { (self.hooks.tags.store)(Self::page_range(page), Tag::FREE) };
+        });
+    }
+
     #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
     fn parked_generation(&self, addr: usize) -> &AtomicU64 {
+        let addr = (self.hooks.tags.strip)(addr);
         let index = addr
             .checked_sub(self.base)
             .filter(|offset| *offset < self.reserved_bytes())
@@ -464,7 +619,7 @@ impl FiberStackArena {
     }
 
     fn resolve(&self, addr: VirtAddr) -> StackFault {
-        let raw = addr.raw();
+        let raw = (self.hooks.tags.strip)(addr.raw());
         let Some(offset) = raw.checked_sub(self.base) else {
             return StackFault::Elsewhere;
         };
@@ -489,7 +644,7 @@ impl FiberStackArena {
         let page = VirtAddr::new(raw & !(PhysFrame::SIZE - 1));
         let processor = current_processor();
         let frame = frame_reserve::take_frame(processor);
-        match (self.hooks.commit_demand_page)(page, frame, PageFlags::READ | PageFlags::WRITE) {
+        match (self.hooks.commit_demand_page)(page, frame, self.page_flags()) {
             Ok(()) => {}
             Err(error) => {
                 panic!(
@@ -498,6 +653,16 @@ impl FiberStackArena {
                 );
             }
         }
+        let body_start = self.body(index).start.raw();
+        let page_index = (page.raw() - body_start) / PhysFrame::SIZE;
+        if self.checking {
+            let tag = Tag::new(slot.tag.load(Ordering::Acquire));
+            // SAFETY: `page` was just committed with `PageFlags::TAGGED` in
+            // this live slot, and `PhysFrame::SIZE` is a multiple of the
+            // granule.
+            unsafe { (self.hooks.tags.store)(Self::page_range(page.raw()), tag) };
+        }
+        slot.mark_page_committed(page_index);
         slot.watermark.fetch_min(page.raw(), Ordering::AcqRel);
         self.processors
             .get(processor)
@@ -524,11 +689,17 @@ impl FiberStackArena {
         if let Some(index) = self.take_warm_slot(node) {
             // The pages its last stack touched are still mapped, so the
             // runtime's first frame lands on a committed page and nothing
-            // here touches the address space.
+            // here touches the address space. Retagging gives the reused
+            // pages a fresh tag distinct from the previous stack's.
             self.retained_bytes
                 .fetch_sub(self.committed_bytes(index), Ordering::AcqRel);
+            let tag = self.tag_committed_pages(index);
             frame_reserve::top_up(processor);
-            return Ok(FiberStack { arena: self, index });
+            return Ok(FiberStack {
+                arena: self,
+                index,
+                tag,
+            });
         }
         let index = self
             .take_slot(SLOT_COLD, None)
@@ -536,7 +707,7 @@ impl FiberStackArena {
                 slots: self.slots.len(),
             })?;
         let body = self.body(index);
-        let flags = PageFlags::READ | PageFlags::WRITE;
+        let flags = self.page_flags();
         if let Err(error) = (self.hooks.prepare_demand_commit)(body, flags) {
             self.slots[index].state.store(SLOT_COLD, Ordering::Release);
             return Err(FiberStackError::Prepare(error));
@@ -548,6 +719,7 @@ impl FiberStackArena {
         self.slots[index]
             .node
             .store(node.index() as u8, Ordering::Relaxed);
+        self.slots[index].clear_committed_pages();
         self.slots[index]
             .watermark
             .store(body_top, Ordering::Release);
@@ -568,13 +740,20 @@ impl FiberStackArena {
             self.slots[index].state.store(SLOT_COLD, Ordering::Release);
             return Err(FiberStackError::Prepare(error));
         }
+        let top_page_index = self.stack_bytes / PhysFrame::SIZE - 1;
+        self.slots[index].mark_page_committed(top_page_index);
         self.slots[index]
             .watermark
             .store(top_page.raw(), Ordering::Release);
+        let tag = self.tag_committed_pages(index);
         // Creating a stack is outside fault context, so it is one of the
         // two places that may refill the reserve the ordinary way.
         frame_reserve::top_up(processor);
-        Ok(FiberStack { arena: self, index })
+        Ok(FiberStack {
+            arena: self,
+            index,
+            tag,
+        })
     }
 
     /// Moves the lowest slot in state `from` to live and returns it.
@@ -626,6 +805,10 @@ impl FiberStackArena {
     /// does.
     fn release(&self, index: usize) {
         let committed_bytes = self.committed_bytes(index);
+        // Return every committed granule to `Tag::FREE` before the slot is
+        // parked warm or unmapped, so stale pointers to this stack fault and
+        // recycled frames never carry a live tag.
+        self.clear_slot_tags(index);
         // What this stack actually cost, against what it would have cost
         // committed up front, summed for the boot-end report. Nothing is
         // logged per release: a store teardown is on the spawn path, and
@@ -655,6 +838,7 @@ impl FiberStackArena {
                 body.start.raw()
             )
         });
+        self.slots[index].clear_committed_pages();
         self.slots[index]
             .watermark
             .store(body.end().raw(), Ordering::Release);
@@ -733,24 +917,31 @@ impl FiberStackArena {
 pub struct FiberStack {
     arena: &'static FiberStackArena,
     index: usize,
+    tag: Tag,
 }
 
 impl FiberStack {
-    /// The stack's usable range, guard excluded.
+    /// The stack's usable range, guard excluded, carrying the slot's
+    /// logical tag so stack-limit comparisons against `SP` share its top byte.
     pub fn range(&self) -> Range<usize> {
         let body = self.arena.body(self.index);
-        body.start.raw()..body.end().raw()
+        let apply = self.arena.hooks.tags.apply;
+        apply(body.start.raw(), self.tag)..apply(body.end().raw(), self.tag)
     }
 
     /// The highest address of the stack; the fiber's initial stack
-    /// pointer.
+    /// pointer, carrying the slot's logical tag.
     pub fn top(&self) -> *mut u8 {
-        self.arena.body(self.index).end().raw() as *mut u8
+        let end = self.arena.body(self.index).end().raw();
+        (self.arena.hooks.tags.apply)(end, self.tag) as *mut u8
     }
 
     /// The unmapped range below the stack.
     pub fn guard_range(&self) -> Range<*mut u8> {
-        self.arena.guard(self.index)
+        let guard = self.arena.guard(self.index);
+        let apply = self.arena.hooks.tags.apply;
+        (apply(guard.start as usize, self.tag) as *mut u8)
+            ..(apply(guard.end as usize, self.tag) as *mut u8)
     }
 }
 
@@ -860,6 +1051,7 @@ mod tests {
             ENDED.fetch_add(1, Ordering::Relaxed);
             Ok(())
         },
+        tags: AllocationTagHooks::NONE,
     };
 
     /// Brings up the one-processor user pool the frame reserve draws on
@@ -1076,5 +1268,221 @@ mod tests {
         assert_eq!(fiber_stack_demand_commits_on(here), 1);
         assert_eq!(fiber_stack_demand_commits_on(other), 0);
         assert_eq!(fiber_stack_arena_stats().expect("stats").demand_commits, 1);
+    }
+
+    mod tagged {
+        use super::*;
+        use alloc::vec::Vec;
+        use spin::Mutex;
+
+        const TAG_SHIFT: usize = 56;
+        const TAG_MASK: usize = 0xf;
+        const TEST_TAGGED_BASE: usize = 0xffff_c000_0000_0000;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum TagOp {
+            Assign { start: usize, len: usize, tag: Tag },
+            Store { start: usize, len: usize, tag: Tag },
+        }
+
+        static NEXT_TAG: AtomicU8 = AtomicU8::new(1);
+        static OPS: Mutex<Vec<TagOp>> = Mutex::new(Vec::new());
+
+        struct RecordingTags;
+
+        impl AllocationTags for RecordingTags {
+            const GRANULE_BYTES: usize = 16;
+
+            fn checking() -> bool {
+                true
+            }
+
+            unsafe fn assign(range: NonNull<[u8]>, avoid: TagSet) -> Tag {
+                let mut candidate = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
+                let tag = loop {
+                    let raw = candidate & 0xf;
+                    candidate = candidate.wrapping_add(1);
+                    let tag = Tag::new(raw);
+                    if tag != Tag::FREE && tag != Tag::UNCHECKED && !avoid.contains(tag) {
+                        break tag;
+                    }
+                };
+                NEXT_TAG.store(candidate, Ordering::Relaxed);
+                OPS.lock().push(TagOp::Assign {
+                    start: range.as_ptr() as *mut u8 as usize,
+                    len: range.len(),
+                    tag,
+                });
+                tag
+            }
+
+            unsafe fn store(range: NonNull<[u8]>, tag: Tag) {
+                OPS.lock().push(TagOp::Store {
+                    start: range.as_ptr() as *mut u8 as usize,
+                    len: range.len(),
+                    tag,
+                });
+            }
+
+            fn apply(addr: usize, tag: Tag) -> usize {
+                (addr & !(TAG_MASK << TAG_SHIFT)) | (usize::from(tag.raw()) << TAG_SHIFT)
+            }
+
+            fn strip(addr: usize) -> usize {
+                (((addr << 8) as isize) >> 8) as usize
+            }
+        }
+
+        static TAGGED_HOOKS: FiberStackVmHooks = FiberStackVmHooks {
+            reserve: |bytes| Ok(VirtRange::new(VirtAddr::new(TEST_TAGGED_BASE), bytes)),
+            prepare_demand_commit: |_virt, flags| {
+                assert_eq!(
+                    flags,
+                    PageFlags::READ | PageFlags::WRITE | PageFlags::TAGGED
+                );
+                Ok(())
+            },
+            commit_demand_page: |addr, _frame, flags| {
+                assert!(addr.is_page_aligned());
+                assert_eq!(
+                    flags,
+                    PageFlags::READ | PageFlags::WRITE | PageFlags::TAGGED
+                );
+                Ok(())
+            },
+            end_demand_commit: |_virt, _mapped| Ok(()),
+            tags: AllocationTagHooks::of::<RecordingTags>(),
+        };
+
+        fn tagged_arena() {
+            let layout = Layout::from_size_align(POOL_BYTES, PhysFrame::SIZE).expect("pool layout");
+            // SAFETY: non-zero size, intentionally leaked for the test process.
+            let base = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
+            let pool = super::super::super::install_user_memory_pool(
+                super::super::super::UserMemoryPool::single_node(
+                    TEST_PROCESSORS,
+                    &[(base, base + POOL_BYTES)],
+                ),
+            );
+            frame_reserve::configure(pool);
+            install_fiber_stack_hooks(&TAGGED_HOOKS);
+            install_fiber_stack_arena(TEST_SLOTS, TEST_STACK_BYTES, TEST_RETAIN_BYTES);
+        }
+
+        fn tag_of(addr: usize) -> Tag {
+            Tag::new(((addr >> TAG_SHIFT) & TAG_MASK) as u8)
+        }
+
+        #[test]
+        fn tagged_stacks_tag_committed_pages_only_and_rotate_across_warm_reuse() {
+            tagged_arena();
+            let first = claim_fiber_stack(TEST_STACK_BYTES).expect("first stack");
+            let first_range = first.range();
+            let first_tag = tag_of(first_range.start);
+            assert_ne!(first_tag, Tag::FREE);
+            assert_ne!(first_tag, Tag::UNCHECKED);
+            assert_eq!(tag_of(first_range.end), first_tag);
+            assert_eq!(first_range.end - first_range.start, TEST_STACK_BYTES);
+            assert_eq!(first.top() as usize, first_range.end);
+            assert_eq!(first.guard_range().end as usize, first_range.start);
+
+            let top_page = RecordingTags::strip(first_range.end) - PhysFrame::SIZE;
+            {
+                let ops = OPS.lock();
+                assert_eq!(
+                    ops.as_slice(),
+                    &[TagOp::Assign {
+                        start: top_page,
+                        len: PhysFrame::SIZE,
+                        tag: first_tag,
+                    }]
+                );
+            }
+            OPS.lock().clear();
+
+            // Fault three pages below the top, leaving the middle page unmapped
+            // as a hole; only the faulted page is tagged and resolving accepts
+            // a tagged address.
+            let deep_tagged = first_range.end - 3 * PhysFrame::SIZE + 16;
+            let deep_page = RecordingTags::strip(first_range.end) - 3 * PhysFrame::SIZE;
+            assert_eq!(
+                resolve_stack_fault(VirtAddr::new(deep_tagged)),
+                StackFault::Committed
+            );
+            {
+                let ops = OPS.lock();
+                assert_eq!(
+                    ops.as_slice(),
+                    &[TagOp::Store {
+                        start: deep_page,
+                        len: PhysFrame::SIZE,
+                        tag: first_tag,
+                    }]
+                );
+            }
+            OPS.lock().clear();
+
+            // Releasing returns only the two committed pages to Tag::FREE,
+            // never touching the unmapped hole between them.
+            drop(first);
+            {
+                let ops = OPS.lock();
+                assert_eq!(
+                    ops.as_slice(),
+                    &[
+                        TagOp::Store {
+                            start: deep_page,
+                            len: PhysFrame::SIZE,
+                            tag: Tag::FREE,
+                        },
+                        TagOp::Store {
+                            start: top_page,
+                            len: PhysFrame::SIZE,
+                            tag: Tag::FREE,
+                        },
+                    ]
+                );
+            }
+            OPS.lock().clear();
+
+            // The slot exceeded the two-page retain budget (watermark span is
+            // 3 pages), so it went cold; claim again and confirm a fresh stack
+            // avoids the slot's previous tag.
+            let second = claim_fiber_stack(TEST_STACK_BYTES).expect("second stack");
+            let second_tag = tag_of(second.range().start);
+            assert_ne!(second_tag, first_tag);
+            assert_ne!(second_tag, Tag::FREE);
+            assert_ne!(second_tag, Tag::UNCHECKED);
+            OPS.lock().clear();
+
+            // Drop untouched (1 page <= retain budget) so it stays warm, then
+            // re-claim warm and verify it rotates to a third distinct tag.
+            drop(second);
+            assert_eq!(
+                OPS.lock().as_slice(),
+                &[TagOp::Store {
+                    start: top_page,
+                    len: PhysFrame::SIZE,
+                    tag: Tag::FREE,
+                }]
+            );
+            OPS.lock().clear();
+
+            let third = claim_fiber_stack(TEST_STACK_BYTES).expect("warm stack");
+            let third_tag = tag_of(third.range().start);
+            assert_ne!(third_tag, second_tag);
+            assert_eq!(
+                RecordingTags::strip(third.range().start),
+                RecordingTags::strip(first_range.start)
+            );
+            assert_eq!(
+                OPS.lock().as_slice(),
+                &[TagOp::Assign {
+                    start: top_page,
+                    len: PhysFrame::SIZE,
+                    tag: third_tag,
+                }]
+            );
+        }
     }
 }
