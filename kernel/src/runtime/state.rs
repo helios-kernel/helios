@@ -7,11 +7,11 @@ use triomphe::Arc;
 
 use crate::{
     BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
-    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, HEAP_SIZE_CLASS_COUNT,
-    HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId, InstanceRegistry,
-    InstructionSampler, MountTable, MountedFs, Namespace, Notify, PerfMetricFilter,
-    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink,
-    StatsSample, TraceEvent, TraceFilter, TraceLog,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, EmbeddedInit, FoldedProfileSample,
+    HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId,
+    InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace, Notify,
+    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope,
+    ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
 use crate::{MountGrant, MountSharing};
@@ -128,6 +128,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
     payload: BootPayload,
+    boot_init_launched: AtomicBool,
+    boot_init_completed: AtomicBool,
+    boot_init_ready: Notify,
     /// The root namespace: the kernel's own process tree, which every
     /// program's tree descends from. Its root is the payload's boot
     /// filesystem; the host share joins its table once a backend installs
@@ -373,6 +376,9 @@ where
                 audio_service: Once::new(),
                 vsock_service: Once::new(),
                 payload,
+                boot_init_launched: AtomicBool::new(false),
+                boot_init_completed: AtomicBool::new(false),
+                boot_init_ready: Notify::new(),
                 namespace: Namespace::new(MountTable::new(
                     BootFs::new(payload.bootfs(), BOOT_DEVICE),
                     processor_count,
@@ -1197,6 +1203,50 @@ where
 
     pub fn vsock_service(&self) -> Option<ComponentHostVsockService> {
         self.inner.vsock_service.get().cloned()
+    }
+
+    /// The boot-time init component and `argv0` this payload carries.
+    pub fn embedded_init(&self) -> EmbeddedInit {
+        self.inner.payload.embedded_init()
+    }
+
+    /// Marks that the bootstrap processor has scheduled the payload's
+    /// boot `init` component to run.
+    pub(crate) fn mark_boot_init_launched(&self) {
+        assert!(
+            !self.inner.boot_init_launched.swap(true, Ordering::AcqRel),
+            "boot init was launched more than once"
+        );
+    }
+
+    /// Marks that the payload's boot `init` component has finished its
+    /// bring-up run and wakes any system component waiting for it.
+    pub(crate) fn mark_boot_init_completed(&self) {
+        self.inner
+            .boot_init_completed
+            .store(true, Ordering::Release);
+        self.inner.boot_init_ready.notify_all();
+    }
+
+    /// Whether the payload's boot `init` component has finished running.
+    pub fn boot_init_completed(&self) -> bool {
+        self.inner.boot_init_completed.load(Ordering::Acquire)
+    }
+
+    /// Waits until the payload's boot `init` component has finished.
+    ///
+    /// Waits unconditionally rather than checking `boot_init_launched`: on
+    /// SMP boots a secondary processor can reach the system component entry
+    /// before the bootstrap processor schedules `init`, so checking
+    /// `boot_init_launched` here would let it bypass the barrier.
+    pub async fn wait_for_boot_init(&self) {
+        loop {
+            let ready = self.inner.boot_init_ready.notified();
+            if self.inner.boot_init_completed.load(Ordering::Acquire) {
+                return;
+            }
+            ready.await;
+        }
     }
 
     /// The system component this payload carries, when this build would
