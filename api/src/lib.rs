@@ -30,7 +30,7 @@ pub mod image;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;
-#[cfg(feature = "http")]
+#[cfg(any(feature = "http", feature = "http-handler"))]
 pub mod http;
 #[cfg(feature = "http-kit-io")]
 pub mod http_kit;
@@ -83,6 +83,8 @@ pub use io::{ReadExt, WriteExt};
 pub use std::io::Error;
 use std::io::Write as _;
 pub use wit_bindgen;
+#[cfg(all(feature = "http", not(feature = "http-handler")))]
+pub use zenwave;
 
 /// Whether a component-model stream read result means the stream is closed.
 ///

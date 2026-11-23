@@ -18,7 +18,7 @@ http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", def
 rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 rustls-pure = { version = "0.15.4", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
-zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["native-backend", "native-http2", "native-http3"] }
+zenwave = { workspace = true, features = ["native-backend", "native-http2", "native-http3"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "main", default-features = false }

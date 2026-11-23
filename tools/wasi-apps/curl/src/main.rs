@@ -1,17 +1,14 @@
 use std::fs::File;
 use std::io::{self, Write};
 
-use helios_api::ReadExt;
-use helios_api::http::{ErrorCode, Request, UrlError};
+use futures_lite::StreamExt as _;
+use helios_api::http::{BodyError, Client as _, DefaultClient, Error as HttpError, Transport};
 use helios_curl_write_out::expand_write_out;
 use thiserror::Error;
 
 type Result<T> = core::result::Result<T, CurlError>;
 
 const NULL_DEVICE_PATH: &str = "/dev/null";
-
-/// Bytes taken from the response body per write.
-const BODY_CHUNK_BYTES: usize = 64 * 1024;
 
 const USER_AGENT: &str = "helios-curl/0.1";
 
@@ -25,24 +22,14 @@ enum CurlError {
     UnsupportedOption(String),
     #[error("multiple URLs were provided")]
     MultipleUrls,
-    #[error("invalid URL `{raw}`: {source}")]
-    InvalidUrl {
-        raw: String,
-        #[source]
-        source: UrlError,
-    },
-    #[error("failed to set the user agent header: {0}")]
-    UserAgent(helios_api::http::HeaderError),
     #[error("http request failed: {0}")]
-    Request(ErrorCode),
+    Request(#[from] HttpError),
     #[error("failed to read response after {bytes_read} bytes: {source}")]
     ReadResponse {
         bytes_read: usize,
         #[source]
-        source: io::Error,
+        source: BodyError,
     },
-    #[error("response body did not complete: {0}")]
-    IncompleteResponse(ErrorCode),
     #[error("failed to write response body")]
     WriteResponseBody(#[source] io::Error),
     #[error("failed to create output file `{path}`")]
@@ -139,39 +126,22 @@ fn write_out(template: &str, size_download: usize) -> Result<()> {
 
 async fn run() -> Result<()> {
     let mut options = parse_options()?;
-    let request = Request::get(&options.url).map_err(|source| CurlError::InvalidUrl {
-        raw: options.url.clone(),
-        source,
-    })?;
-    let response = request
-        .header("user-agent", USER_AGENT)
-        .map_err(CurlError::UserAgent)?
-        .send()
-        .await
-        .map_err(CurlError::Request)?;
+    let mut client = DefaultClient::raw(Transport::system());
+    let response = client
+        .get(options.url.as_str())?
+        .header("user-agent", USER_AGENT)?
+        .await?;
 
-    let mut body = response.into_body();
-    let mut buffer = vec![0_u8; BODY_CHUNK_BYTES];
+    let mut body = response.into_body().into_data_stream();
     let mut size_download = 0_usize;
-    loop {
-        let read = body
-            .read(&mut buffer)
-            .await
-            .map_err(|source| CurlError::ReadResponse {
-                bytes_read: size_download,
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-        size_download += read;
-        options.output.write_body(&buffer[..read])?;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|source| CurlError::ReadResponse {
+            bytes_read: size_download,
+            source,
+        })?;
+        size_download += chunk.len();
+        options.output.write_body(&chunk)?;
     }
-    // The stream closing means the transfer stopped, not that it succeeded;
-    // the trailers future carries the verdict.
-    body.trailers()
-        .await
-        .map_err(CurlError::IncompleteResponse)?;
 
     if let Some(template) = options.write_out.as_deref() {
         write_out(template, size_download)?;

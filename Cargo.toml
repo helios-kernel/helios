@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "linux", "unix", "sync",
-    "aarch64", "acpi", "api", "api-macro", "artifact", "btrfs", "cli", "compiler-abi", "compiler-host", "compiler-plugin", "compiler-support", "firmware", "hal", "i6300esb", "hosted", "kernel", "netstack", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/cpu", "programs/date", "programs/debugger", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/oob-load", "programs/perf", "programs/ping", "programs/pride-flag", "programs/procbench", "programs/sched-tasks", "programs/surface-test", "programs/vmm", "programs/webgpu", "riscv", "tools/branch-hints", "tools/desktop/check-text", "tpm", "venus", "venus-gen", "webgpu", "x86", "x86-vmm", "inspector", "inspector-protocol", "virtio", "workspace-root",
+    "aarch64", "acpi", "api", "api-macro", "artifact", "btrfs", "cli", "compiler-abi", "compiler-host", "compiler-plugin", "compiler-support", "firmware", "hal", "i6300esb", "hosted", "kernel", "netstack", "nu-shell", "profdata", "programs/audio-test", "programs/compositor", "programs/compositor/render", "programs/cpu", "programs/date", "programs/debugger", "programs/display-test", "programs/gpu-test", "programs/http-client", "programs/init", "programs/input-test", "programs/oob-load", "programs/perf", "programs/ping", "programs/pride-flag", "programs/procbench", "programs/sched-tasks", "programs/surface-test", "programs/vmm", "programs/webgpu", "riscv", "tools/branch-hints", "tools/desktop/check-text", "tpm", "venus", "venus-gen", "webgpu", "x86", "x86-vmm", "inspector", "inspector-protocol", "virtio", "workspace-root",
 ]
 resolver = "2"
 
@@ -65,6 +65,7 @@ i6300esb = { path = "i6300esb" }
 crossbeam-utils = { version = "0.8.23", default-features = false }
 tracing = { version = "0.1.44",  default-features = false }
 wit-bindgen = { version = "0.63.0", default-features = false }
+zenwave = { git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false }
 tempfile = "3.27.0"
 
 
