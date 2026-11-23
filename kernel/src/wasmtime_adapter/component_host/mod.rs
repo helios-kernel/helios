@@ -99,7 +99,7 @@ pub use service::{
     BlobHandle, ChildExit, ChildHandle, ClientImageSurfaceHandle, ClientSurfaceHandle,
     CommandBufferHandle, ContainerHandle, ContextHandle, DisplayHandle, GpuHandle,
     InputDeviceHandle, PlaybackHandle, SurfaceHandle, UserProgramService,
-    install_component_host_program_service, install_program_service,
+    install_component_host_program_service, install_program_service, launch_boot_init,
     run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
@@ -2417,6 +2417,11 @@ where
     drop(instantiate_heartbeat);
     let executor = executor.map_err(DebuggerError::InstantiateComponent)?;
     write_serial.emit_stage_marker("instantiate:ok");
+
+    // Let the payload's boot `init` finish its mounts, console banner,
+    // and `/etc/rc` before the system component claims the serial line
+    // for RPC framing or opens inspector sessions.
+    debug_state.wait_for_boot_init().await;
 
     tracing::info!(component = component_name, "entering wasi:cli/run");
     write_serial.emit_stage_marker("run:begin");
