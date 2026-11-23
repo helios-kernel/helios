@@ -117,6 +117,7 @@ def fake_driver(options: RunOptions, passes: dict[str, dict]):
         helios_out = Path(args.out_dir)
         root = helios_out.parent
         key = "" if root == options.out_dir else root.relative_to(options.out_dir).as_posix()
+        assert args.helios_skip_build == bool(key), "only the initial measurement pass builds images"
         spec = passes.get(key)
         if spec is None:
             pytest.fail(f"the driver was invoked under {root}, which no pass of this test provides")
@@ -168,7 +169,7 @@ def suite(options: RunOptions, manifest, monkeypatch, report: Report) -> Report:
     monkeypatch.setattr(runner, "kernel_pgo_uncovered", lambda *args: None)
     monkeypatch.setattr(runner, "collect_hardware", lambda lane: report.hardware)
     monkeypatch.setattr(
-        runner, "collect_pins", lambda lane, workloads, kernel_build, baseline, helios_run: report.pins
+        runner, "collect_pins", lambda lane, workloads, kernel_build, baseline, sides: report.pins
     )
     return run_suite(options, manifest)
 

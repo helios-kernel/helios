@@ -26,9 +26,16 @@ deny = [
         "wit-bindgen-core",
         "wit-bindgen-rust",
         "wit-bindgen-rust-macro",
+        # The component composition `helios-cli` plugs libraries with.
+        "wac-graph",
+        "wac-types",
         # The Wasmtime fork's build-time and macro crates.
         "wasmtime-environ",
         "wasmtime-internal-component-macro",
         "wasmtime-internal-wit-bindgen",
+        # The fork's CLIF parser, and Cranelift's disassembly support
+        # (`disas`), both used only by `compiler-support`'s lowering tests.
+        "cranelift-reader",
+        "cranelift-codegen",
     ] },
 ]

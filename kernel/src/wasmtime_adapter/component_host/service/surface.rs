@@ -42,16 +42,17 @@ use wasmtime::component::{
     StreamResult, VecBuffer,
 };
 
-use crate::ComponentHostNetwork;
 use crate::buffer::{Span, ViewId};
 use crate::component::ProviderError;
+use crate::gpu::GpuImage;
 use crate::surface::{
     SurfaceCreate, SurfaceEvents, SurfaceGeometry, SurfaceId, SurfaceRect, SurfaceRequest,
     SurfaceServiceError, SurfaceShared,
 };
 use crate::wasmtime_adapter::bindings::surface::bindings::helios::system::surface as surface_wit;
+use crate::{ComponentHostNetwork, SharedTimeline, SignalTimeline, Timeline, TimelineSource};
 
-use super::super::{StoreData, guest_memory, view_trap};
+use super::super::{StoreData, caller_memory, view_trap};
 
 /// Register `helios:system/surface` in a linker.
 ///
@@ -59,27 +60,37 @@ use super::super::{StoreData, guest_memory, view_trap};
 /// does: the window is the capability, not the import. A program that
 /// never asks for one learns nothing from having it, and one that asks
 /// on a machine with no compositor is told `unavailable`.
-pub(in crate::wasmtime_adapter::component_host) fn add_surface_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(in crate::wasmtime_adapter::component_host) fn add_surface_to_linker<
+    CpuImpl,
+    Net,
+    StorageImpl,
+>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    surface_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
+    surface_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(
+        linker,
+        |state| state,
+    )
 }
 
 /// One client window, as its store records it.
-pub struct ClientSurfaceHandle {
+pub struct ClientSurfaceHandle<Backing = ViewId> {
     shared: Arc<SurfaceShared>,
     /// The frame buffer's view at the client's span, ended when the
     /// handle is dropped.
-    view: ViewId,
+    view: Backing,
 }
+
+pub type ClientImageSurfaceHandle = ClientSurfaceHandle<()>;
 
 const fn to_wit_error(error: SurfaceServiceError) -> surface_wit::Error {
     match error {
+        SurfaceServiceError::RenderFailed => surface_wit::Error::RenderFailed,
         SurfaceServiceError::Unavailable => surface_wit::Error::Unavailable,
         SurfaceServiceError::NoCompositor => surface_wit::Error::NoCompositor,
         SurfaceServiceError::UnsupportedSize => surface_wit::Error::UnsupportedSize,
@@ -116,19 +127,124 @@ const fn provider_error(error: ProviderError) -> SurfaceServiceError {
     }
 }
 
-impl<CpuImpl, Net, HostFs> surface_wit::Host for StoreData<CpuImpl, Net, HostFs>
+async fn dispatch(
+    provider: &crate::ProviderSlot<SurfaceRequest>,
+    request: SurfaceRequest,
+    answer: oneshot::Receiver<Result<(), SurfaceServiceError>>,
+) -> Result<(), SurfaceServiceError> {
+    provider.send(request).await.map_err(provider_error)?;
+    answer
+        .await
+        .map_err(|_| SurfaceServiceError::NoCompositor)?
+}
+
+impl<CpuImpl, Net, StorageImpl> surface_wit::HostImageSurface
+    for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
+{
+    fn size(
+        &mut self,
+        handle: Resource<ClientImageSurfaceHandle>,
+    ) -> wasmtime::Result<surface_wit::Size> {
+        let geometry = self.table.get(&handle)?.shared.geometry();
+        Ok(surface_wit::Size {
+            width: geometry.width,
+            height: geometry.height,
+        })
+    }
+
+    fn drop(&mut self, handle: Resource<ClientImageSurfaceHandle>) -> wasmtime::Result<()> {
+        let handle = self.table.delete(handle)?;
+        let registry = self.runtime_state.surface_service();
+        self.device
+            .surfaces_mut()
+            .release(&registry, handle.shared.id());
+        Ok(())
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl, U> surface_wit::HostImageSurfaceWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
+where
+    U: 'static,
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn events(
+        mut accessor: Access<'_, U, Self>,
+        handle: Resource<ClientImageSurfaceHandle>,
+    ) -> wasmtime::Result<StreamReader<surface_wit::InputEvent>> {
+        let events = SurfaceShared::events(&accessor.get().table.get(&handle)?.shared);
+        StreamReader::new(&mut accessor, SurfaceEventStreamProducer { events })
+    }
+
+    async fn present(
+        accessor: &Accessor<U, Self>,
+        handle: Resource<ClientImageSurfaceHandle>,
+        image: Resource<GpuImage>,
+        ready: surface_wit::TimelinePoint,
+    ) -> wasmtime::Result<Result<Resource<SharedTimeline>, surface_wit::Error>> {
+        let (shared, image, timeline, runtime) = accessor.with(|mut access| {
+            let data = access.get();
+            Ok::<_, wasmtime::Error>((
+                data.table.get(&handle)?.shared.clone(),
+                data.table.get(&image)?.clone(),
+                data.table.get(&ready.timeline)?.clone(),
+                data.runtime_state.clone(),
+            ))
+        })?;
+        if !shared.is_alive() {
+            return Ok(Err(surface_wit::Error::Gone));
+        }
+        let geometry = shared.geometry();
+        let layout = image.layout();
+        if layout.mode.width != geometry.width || layout.mode.height != geometry.height {
+            return Ok(Err(surface_wit::Error::UnsupportedSize));
+        }
+        if timeline.wait(ready.value).await.is_err() {
+            return Ok(Err(surface_wit::Error::RenderFailed));
+        }
+        if !shared.is_alive() {
+            return Ok(Err(surface_wit::Error::Gone));
+        }
+        let retired = TimelineSource::new(0);
+        let reader = retired.reader();
+        let (reply, answer) = oneshot::channel();
+        if let Err(error) = dispatch(
+            runtime.compositor(),
+            SurfaceRequest::PresentImage {
+                id: shared.id(),
+                image,
+                retired,
+                reply,
+            },
+            answer,
+        )
+        .await
+        {
+            return Ok(Err(to_wit_error(error)));
+        }
+        accessor.with(|mut access| Ok(Ok(access.get().table.push(reader)?)))
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl> surface_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
+where
+    CpuImpl: helios_hal::cpu::Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
 {
 }
 
-impl<CpuImpl, Net, HostFs> surface_wit::HostSurface for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> surface_wit::HostSurface for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn size(
         &mut self,
@@ -203,14 +319,60 @@ impl<T: 'static> StreamProducer<T> for SurfaceEventStreamProducer {
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> surface_wit::HostWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> surface_wit::HostWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
+    async fn create_image(
+        accessor: &Accessor<U, Self>,
+        width: u32,
+        height: u32,
+    ) -> wasmtime::Result<Result<Resource<ClientImageSurfaceHandle>, surface_wit::Error>> {
+        let geometry = SurfaceGeometry { width, height };
+        let (pending, runtime) = accessor.with(|mut access| {
+            let data = access.get();
+            let registry = data.runtime_state.surface_service();
+            (
+                data.device
+                    .surfaces_mut()
+                    .prepare_image(&registry, geometry),
+                data.runtime_state.clone(),
+            )
+        });
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(error) => return Ok(Err(to_wit_error(error))),
+        };
+        let (reply, answer) = oneshot::channel();
+        let accepted = dispatch(
+            runtime.compositor(),
+            SurfaceRequest::CreateImage(SurfaceCreate {
+                id: pending.id(),
+                geometry,
+                buffer: (),
+                reply,
+            }),
+            answer,
+        )
+        .await;
+        accessor.with(|mut access| {
+            let data = access.get();
+            if let Err(error) = accepted {
+                let registry = data.runtime_state.surface_service();
+                data.device.surfaces_mut().refused(&registry, pending);
+                return Ok(Err(to_wit_error(error)));
+            }
+            Ok(Ok(data.table.push(ClientImageSurfaceHandle {
+                shared: pending.settle(),
+                view: (),
+            })?))
+        })
+    }
+
     async fn create(
         accessor: &Accessor<U, Self>,
         width: u32,
@@ -227,8 +389,7 @@ where
         // that drops this call's future hands back to the compositor's
         // supervisor as it goes.
         let prepared = accessor.with(|mut access| {
-            let linear_memory = access.get().linear_memory;
-            let memory = guest_memory(linear_memory, &access);
+            let memory = caller_memory(&access);
             let data = access.get();
             let registry = data.runtime_state.surface_service();
             let runtime_state = data.runtime_state.clone();
@@ -276,11 +437,10 @@ where
         // together, with no wait in between that a cancellation could
         // land in.
         accessor.with(|mut access| {
-            let linear_memory = access.get().linear_memory;
-            // The store's memory handle is recorded once, when the
-            // instance is built, and `prepare` already read it.
-            let memory = guest_memory(linear_memory, &access)
-                .expect("a store whose memory took the span when the window was prepared has one");
+            // The memory belongs to the call, so every step of it
+            // answers the same, and `prepare` already read it.
+            let memory = caller_memory(&access)
+                .expect("a call whose memory took the span when the window was prepared has one");
             let data = access.get();
             let registry = data.runtime_state.surface_service();
             let surfaces = data.device.surfaces_mut();
@@ -343,13 +503,13 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> surface_wit::HostSurfaceWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> surface_wit::HostSurfaceWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn events(
         mut accessor: Access<'_, U, Self>,

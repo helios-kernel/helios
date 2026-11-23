@@ -7,13 +7,14 @@ use triomphe::Arc;
 
 use crate::{
     BOOT_DEVICE, BootFs, BootPayload, DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY,
-    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, FutexKey, FutexTable,
-    FutexWaitRegistration, HEAP_SIZE_CLASS_COUNT, HOST_SHARE_GUEST_MOUNT_PATH, HeapStats,
-    HostShare, InstanceRegistry, InstructionSampler, MountTable, MountedFs, Namespace, Notify,
-    PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope,
-    ProfileSink, StatsSample, TraceEvent, TraceFilter, TraceHistory,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedComponent, FoldedProfileSample, HEAP_SIZE_CLASS_COUNT,
+    HOST_SHARE_GUEST_MOUNT_PATH, HeapStats, HostShare, InstanceId, InstanceRegistry,
+    InstructionSampler, MountTable, MountedFs, Namespace, Notify, PerfMetricFilter,
+    PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileScope, ProfileSink,
+    StatsSample, TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
+use crate::{MountGrant, MountSharing};
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
 use helios_hal::fs::FileSystemRights;
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
@@ -21,18 +22,18 @@ use spin::{Mutex, Once};
 
 use crate::memory::BalloonHandle;
 
-use crate::BlockService;
 use crate::ComponentHostVsockService;
-use crate::component::{ComponentRuntimeState, ProviderSlot};
+use crate::component::{ComponentRuntimeState, PerProcessorProvider, ProviderSlot};
 use crate::device::DeviceGrantRegistry;
 use crate::network::HttpExchange;
+use crate::{AttachedStorage, BlockCache, BlockService, HostFileSystem, Storage};
 
 #[derive(Clone)]
-pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {
-    inner: Arc<RuntimeStateInner<ProgramService, NetworkService, HostFsService>>,
+pub struct RuntimeState<ProgramService, NetworkService, StorageImpl: Storage> {
+    inner: Arc<RuntimeStateInner<ProgramService, NetworkService, StorageImpl>>,
 }
 
-struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
+struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     boot_ticks: u64,
     timebase: Timebase,
     processor_count: u32,
@@ -56,11 +57,21 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// after each machine restore. Unseeded on a machine that carries no
     /// such clock, where wall time is uptime.
     wall_clock: crate::exec::WallClock,
-    /// Queue into the `http-client` kernel plugin. Empty on a kernel image
-    /// that does not provision the plugin, in which case the runtime adapter
-    /// answers a configuration error rather than trapping.
-    http_client: ProviderSlot<HttpExchange>,
-    host_fs_service: Mutex<Option<HostFsService>>,
+    /// Per-processor sharded queues into the `http-client` kernel plugin.
+    /// Empty on a kernel image that does not provision the plugin, in which
+    /// case the runtime adapter answers a configuration error rather than
+    /// trapping.
+    http_client: PerProcessorProvider<HttpExchange>,
+    host_fs_service: Mutex<Option<StorageImpl::HostShare>>,
+    /// The block cache over the machine's mount-source disks, once the
+    /// kernel identified them. Empty on a machine with none, where a
+    /// disk mount is refused as unavailable.
+    mount_sources: Once<BlockCache<StorageImpl::Disk>>,
+    /// True while the asynchronous block-discovery task is identifying disks
+    /// and opening mount sources; cleared once `install_mount_sources` has
+    /// published them so early mount requests wait instead of racing boot.
+    block_discovery_pending: AtomicBool,
+    block_discovery_ready: Notify,
     /// What the kernel publishes about its disks once it identified them
     /// and proved the scratch disk: the scratch disk's counters and the
     /// compressed pool's settings. Empty on a machine with no block
@@ -100,6 +111,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
     iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
+    /// The ISA level the program service compiles guest code for, chosen
+    /// when the state is built and reported through the statistics.
+    guest_isa: crate::isa::GuestIsa,
     /// The memory balloon the host resizes this guest through. Empty on
     /// a machine that gave the kernel none.
     balloon: Once<BalloonHandle>,
@@ -110,7 +124,6 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// device up. Empty on a machine with no vsock device, where the
     /// runtime adapter answers `unavailable` rather than trapping.
     vsock_service: Once<ComponentHostVsockService>,
-    futex_table: Mutex<FutexTable>,
     /// The user payload the backend handed the kernel — init component,
     /// `argv0`, and the boot filesystem it carries — parsed from the
     /// boot module at bring-up.
@@ -119,8 +132,8 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// program's tree descends from. Its root is the payload's boot
     /// filesystem; the host share joins its table once a backend installs
     /// the 9p client.
-    namespace: Namespace<HostFsService>,
-    tracing: Mutex<TraceHistory>,
+    namespace: Namespace<StorageImpl>,
+    tracing: TraceLog,
     /// The profile and perf histories, held as a handle rather than as
     /// fields so a subsystem this state owns can record into them
     /// without naming the state's own type (see [`ProfileSink`]).
@@ -313,18 +326,19 @@ fn heap_size_class_metric_name(kind: HeapMetricKind, index: usize) -> &'static s
     }
 }
 
-impl<ProgramService, NetworkService, HostFsService>
-    RuntimeState<ProgramService, NetworkService, HostFsService>
+impl<ProgramService, NetworkService, StorageImpl>
+    RuntimeState<ProgramService, NetworkService, StorageImpl>
 where
     ProgramService: Clone,
     NetworkService: Clone,
-    HostFsService: Clone,
+    StorageImpl: Storage,
 {
     pub fn new(
         timebase: Timebase,
         processor_count: usize,
         boot_ticks: u64,
         payload: BootPayload,
+        guest_isa: crate::isa::GuestIsa,
     ) -> Self {
         Self {
             inner: Arc::new(RuntimeStateInner {
@@ -340,11 +354,15 @@ where
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
                 wall_clock: crate::exec::WallClock::new(),
-                http_client: ProviderSlot::new(),
+                http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
+                mount_sources: Once::new(),
+                block_discovery_pending: AtomicBool::new(false),
+                block_discovery_ready: Notify::new(),
                 block_service: Once::new(),
                 device_grants: DeviceGrantRegistry::new(),
                 iommu_report: Once::new(),
+                guest_isa,
                 balloon: Once::new(),
                 swap: Once::new(),
                 display_service: Once::new(),
@@ -354,13 +372,12 @@ where
                 compositor: ProviderSlot::new(),
                 audio_service: Once::new(),
                 vsock_service: Once::new(),
-                futex_table: Mutex::new(FutexTable::new()),
                 payload,
                 namespace: Namespace::new(MountTable::new(
                     BootFs::new(payload.bootfs(), BOOT_DEVICE),
                     processor_count,
                 )),
-                tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
+                tracing: TraceLog::new(DEFAULT_TRACE_HISTORY_CAPACITY),
                 profiles: ProfileSink::new(
                     DEFAULT_PROFILE_STACK_CAPACITY,
                     DEFAULT_PERF_METRIC_CAPACITY,
@@ -371,20 +388,35 @@ where
         }
     }
 
-    pub fn record_console_text(&self, current_ticks: u64, text: &str) {
+    /// Records `text` as console events attributed to `origin`: the
+    /// instance that wrote it, or `None` for the kernel's own console.
+    pub fn record_console_text(&self, current_ticks: u64, origin: Option<InstanceId>, text: &str) {
         let timestamp = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
         self.inner
             .tracing
-            .lock()
-            .record_console_text(timestamp, text);
+            .record_console_text(timestamp, origin, text);
     }
 
-    pub fn recent(&self, filter: &TraceFilter, limit: u32) -> alloc::vec::Vec<TraceEvent> {
-        self.inner.tracing.lock().recent(filter, limit)
+    /// The newest `limit` events `scope` admits and `filter` matches; see
+    /// [`TraceLog::recent`].
+    pub fn recent(
+        &self,
+        scope: &impl crate::ObservationScope,
+        filter: &TraceFilter,
+        limit: u32,
+    ) -> alloc::vec::Vec<Arc<TraceEvent>> {
+        self.inner.tracing.recent(scope, filter, limit)
     }
 
-    pub fn next_after(&self, cursor: u64, filter: &TraceFilter) -> Option<(u64, TraceEvent)> {
-        self.inner.tracing.lock().next_after(cursor, filter)
+    /// The next event after `*cursor` that `scope` admits and `filter`
+    /// matches; see [`TraceLog::next_after`].
+    pub fn next_after(
+        &self,
+        scope: &impl crate::ObservationScope,
+        cursor: &mut u64,
+        filter: &TraceFilter,
+    ) -> Option<Arc<TraceEvent>> {
+        self.inner.tracing.next_after(scope, cursor, filter)
     }
 
     pub fn set_profiling_enabled(&self, enabled: bool) {
@@ -501,35 +533,33 @@ where
             .record_str(scope, stack, weight_nanos);
     }
 
-    pub fn record_profile_stack_parts_nanos(
-        &self,
-        scope: ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        weight_nanos: u64,
-    ) {
+    /// Records `weight_nanos` of time `instance`, running the program
+    /// named `program`, spent in user code, as the user-scope stack
+    /// `user;<program>` attributed to that instance.
+    ///
+    /// Concurrency: callable from any processor; it takes the profile
+    /// history's lock for one record.
+    pub fn record_user_profile(&self, instance: InstanceId, program: &str, weight_nanos: u64) {
         if !self.inner.profiles.enabled() {
             return;
         }
-        self.inner
-            .profiles
-            .profiling()
-            .lock()
-            .record_parts(scope, prefix, suffix, weight_nanos);
+        self.inner.profiles.profiling().lock().record_user_parts(
+            instance,
+            "user;",
+            program,
+            weight_nanos,
+        );
     }
 
     pub fn folded_profile(
         &self,
         current_ticks: u64,
+        scope: &impl crate::ObservationScope,
         filter: &ProfileFilter,
         limit: u32,
     ) -> alloc::vec::Vec<FoldedProfileSample> {
         let _ = current_ticks;
-        self.inner
-            .profiles
-            .profiling()
-            .lock()
-            .folded(filter, core::iter::empty(), limit)
+        self.inner.profiles.folded(scope, filter, limit)
     }
 
     pub fn record_perf_metric_parts(
@@ -651,14 +681,11 @@ where
 
     pub fn perf_metrics(
         &self,
+        scope: &impl crate::ObservationScope,
         filter: &PerfMetricFilter,
         limit: u32,
     ) -> alloc::vec::Vec<PerfMetricSample> {
-        self.inner
-            .profiles
-            .perf_metrics()
-            .lock()
-            .recent(filter, limit)
+        self.inner.profiles.metrics(scope, filter, limit)
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
@@ -830,13 +857,14 @@ where
         }
     }
 
-    /// The hand-off slot for the `http-client` kernel plugin.
+    /// The per-processor sharded hand-off slot for the `http-client` kernel
+    /// plugin.
     ///
-    /// The plugin supervisor installs the queue during startup; the runtime
-    /// adapter's HTTP client binding sends every exchange through it. The slot
-    /// stays empty when the plugin is not provisioned, which that binding
-    /// reports to the guest as a configuration error.
-    pub fn http_client(&self) -> &ProviderSlot<HttpExchange> {
+    /// Each online processor sends into its own cache-padded NUMA-local shard;
+    /// processor hot-unplug atomically redirects queued and future work to its
+    /// successor. The slot stays empty when the plugin is not provisioned,
+    /// which the adapter reports to the guest as a configuration error.
+    pub fn http_client(&self) -> &PerProcessorProvider<HttpExchange> {
         &self.inner.http_client
     }
 
@@ -1003,7 +1031,7 @@ where
 
     /// Installs the host share's 9p client and mounts the share at
     /// [`HOST_SHARE_GUEST_MOUNT_PATH`].
-    pub fn install_host_fs_service(&self, service: HostFsService) {
+    pub fn install_host_fs_service(&self, service: StorageImpl::HostShare) {
         let mut slot = self.inner.host_fs_service.lock();
         assert!(
             slot.is_none(),
@@ -1016,19 +1044,79 @@ where
             .mount(
                 HOST_SHARE_GUEST_MOUNT_PATH,
                 MountedFs::Host(HostShare::new(service)),
-                FileSystemRights::READ | FileSystemRights::WRITE,
+                // The host's files, seen by every program the kernel runs.
+                MountGrant {
+                    rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                    sharing: MountSharing::Shared,
+                },
             )
             .unwrap_or_else(|error| panic!("host share mount failed at bring-up: {error}"));
     }
 
     /// The root namespace. A program the kernel launches runs in a tree
     /// that descends from it ([`Namespace::descend`]).
-    pub fn root_namespace(&self) -> &Namespace<HostFsService> {
+    pub fn root_namespace(&self) -> &Namespace<StorageImpl> {
         &self.inner.namespace
     }
 
-    pub fn host_fs_service(&self) -> Option<HostFsService> {
+    pub fn host_fs_service(&self) -> Option<StorageImpl::HostShare> {
         self.inner.host_fs_service.lock().clone()
+    }
+
+    /// Publishes the block cache over the machine's mount-source disks,
+    /// which a disk mount names by serial.
+    ///
+    /// Called from the task that identified every disk, once.
+    pub fn install_mount_sources(&self, cache: BlockCache<StorageImpl::Disk>) {
+        let mut installed = false;
+        self.inner.mount_sources.call_once(|| {
+            installed = true;
+            cache
+        });
+        assert!(installed, "mount sources were installed more than once");
+    }
+
+    /// The block cache over the mount-source disks, or `None` on a
+    /// machine with none.
+    pub fn mount_sources(&self) -> Option<BlockCache<StorageImpl::Disk>> {
+        self.inner.mount_sources.get().cloned()
+    }
+
+    /// Marks asynchronous block-device discovery as in flight so disk mounts
+    /// wait until [`Self::finish_block_discovery`] publishes any mount sources.
+    pub fn begin_block_discovery(&self) {
+        self.inner
+            .block_discovery_pending
+            .store(true, Ordering::Release);
+    }
+
+    /// Marks asynchronous block-device discovery complete and wakes any
+    /// mount request waiting for mount-source disks.
+    pub fn finish_block_discovery(&self) {
+        self.inner
+            .block_discovery_pending
+            .store(false, Ordering::Release);
+        self.inner.block_discovery_ready.notify_all();
+    }
+
+    /// Waits until in-flight block-device discovery completes. Returns
+    /// immediately on machines with no pending block discovery.
+    pub async fn wait_for_block_discovery(&self) {
+        while self.inner.block_discovery_pending.load(Ordering::Acquire) {
+            let ready = self.inner.block_discovery_ready.notified();
+            if !self.inner.block_discovery_pending.load(Ordering::Acquire) {
+                return;
+            }
+            ready.await;
+        }
+    }
+
+    /// The storage a mount request builds its source from.
+    pub fn attached_storage(&self) -> AttachedStorage<StorageImpl> {
+        AttachedStorage {
+            host_share: self.host_fs_service(),
+            disks: self.mount_sources(),
+        }
     }
 
     /// Publishes what the kernel knows about the machine's disks.
@@ -1047,6 +1135,11 @@ where
 
     pub fn block_service(&self) -> Option<BlockService> {
         self.inner.block_service.get().cloned()
+    }
+
+    /// The ISA level the program service compiles guest code for.
+    pub(crate) fn guest_isa(&self) -> crate::isa::GuestIsa {
+        self.inner.guest_isa
     }
 
     /// Publishes what the platform's IOMMU confines.
@@ -1106,22 +1199,6 @@ where
         self.inner.vsock_service.get().cloned()
     }
 
-    pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {
-        self.inner.futex_table.lock().prepare_wait(key)
-    }
-
-    pub fn complete_futex_wait(&self, registration: FutexWaitRegistration) {
-        self.inner.futex_table.lock().complete_wait(registration);
-    }
-
-    pub fn wake_futex(&self, key: FutexKey, count: usize) -> usize {
-        self.inner.futex_table.lock().wake(key, count)
-    }
-
-    pub fn wake_all_futex(&self, key: FutexKey) -> usize {
-        self.inner.futex_table.lock().wake_all(key)
-    }
-
     /// The system component this payload carries, when this build would
     /// autostart one.
     pub fn system_component(&self) -> Option<EmbeddedComponent> {
@@ -1133,6 +1210,12 @@ where
     pub fn has_system_component(&self) -> bool {
         self.inner.payload.has_system_component()
     }
+
+    /// SHA-256 of the payload body whose signature the kernel verified,
+    /// the value bring-up measures before it reads the sealed seed.
+    pub fn payload_digest(&self) -> helios_artifact::bootfs::Digest256 {
+        self.inner.payload.digest()
+    }
 }
 
 /// The system-wide observation snapshot.
@@ -1140,21 +1223,25 @@ where
 /// This sits in its own block because reporting the host share's cache
 /// counters needs the filesystem service to actually be a filesystem,
 /// which the rest of `RuntimeState` does not care about.
-impl<ProgramService, NetworkService, HostFsService>
-    RuntimeState<ProgramService, NetworkService, HostFsService>
+impl<ProgramService, NetworkService, StorageImpl>
+    RuntimeState<ProgramService, NetworkService, StorageImpl>
 where
     ProgramService: Clone,
     NetworkService: crate::NetworkAdminBackend,
-    HostFsService: crate::HostFileSystem,
+    StorageImpl: Storage,
 {
     pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
         let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
+        let guest_isa = self.inner.guest_isa;
         StatsSample {
             timestamp: uptime,
             uptime,
             wall_clock: self.wall_clock_nanos(current_ticks),
             configured_processors: self.inner.processor_count,
-            online_processors: self.inner.processor_count,
+            online_processors: u32::try_from(crate::online_processor_count())
+                .unwrap_or_else(|_| panic!("the online processor count does not fit a u32")),
+            guest_isa_level: guest_isa.processor().base_name(),
+            guest_isa_extras: guest_isa.processor().extras().collect(),
             block: self.inner.block_service.get().map(BlockService::stats),
             iommu: self
                 .inner
@@ -1186,12 +1273,12 @@ where
     }
 }
 
-impl<ProgramService, NetworkService, HostFsService> ComponentRuntimeState
-    for RuntimeState<ProgramService, NetworkService, HostFsService>
+impl<ProgramService, NetworkService, StorageImpl> ComponentRuntimeState
+    for RuntimeState<ProgramService, NetworkService, StorageImpl>
 where
     ProgramService: Clone + Send + 'static,
     NetworkService: crate::ComponentNetworkService,
-    HostFsService: Clone + Send + Sync + 'static,
+    StorageImpl: Storage,
 {
     fn retire_network_handles(&self, retired: &crate::SocketRetirementQueue) {
         if retired.is_empty() {
@@ -1211,8 +1298,8 @@ where
         RuntimeState::wall_clock_offset_nanos(self)
     }
 
-    fn record_console_text(&self, current_ticks: u64, text: &str) {
-        RuntimeState::record_console_text(self, current_ticks, text);
+    fn record_console_text(&self, current_ticks: u64, origin: Option<InstanceId>, text: &str) {
+        RuntimeState::record_console_text(self, current_ticks, origin, text);
     }
 
     fn root_entropy(&self) -> &RootEntropy {
@@ -1260,14 +1347,8 @@ where
         RuntimeState::record_profile_stack_nanos(self, scope, stack, weight_nanos);
     }
 
-    fn record_profile_stack_parts_nanos(
-        &self,
-        scope: ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        weight_nanos: u64,
-    ) {
-        RuntimeState::record_profile_stack_parts_nanos(self, scope, prefix, suffix, weight_nanos);
+    fn record_user_profile(&self, instance: InstanceId, program: &str, weight_nanos: u64) {
+        RuntimeState::record_user_profile(self, instance, program, weight_nanos);
     }
 
     fn record_perf_metric_parts(
@@ -1283,8 +1364,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-
     use super::*;
 
     /// A real-time clock whose reading the test moves, as a restore
@@ -1301,11 +1380,12 @@ mod tests {
 
     #[test]
     fn a_reseed_moves_the_wall_clock_to_the_new_reading() {
-        let state = RuntimeState::<(), (), ()>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
             BootPayload::for_tests(),
+            crate::isa::GuestIsa::for_build_target(Some(crate::test_support::floor_only_probe)),
         );
         let rtc = SettableRtc(core::cell::Cell::new(1_000));
         state.seed_wall_clock(2_000_000_000, &rtc);
@@ -1314,7 +1394,7 @@ mod tests {
 
         // The machine was stopped and the calendar moved a day.
         rtc.0.set(1_000 + 86_400);
-        let wall = RuntimeState::<(), (), ()>::read_rtc(&rtc);
+        let wall = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::read_rtc(&rtc);
         state.reseed_wall_clock(6_000_000_000, wall);
         assert_eq!(state.wall_clock_nanos(6_000_000_000), 87_400_000_000_000);
     }
@@ -1322,11 +1402,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "seeded more than once")]
     fn seeding_the_wall_clock_twice_is_a_bring_up_fault() {
-        let state = RuntimeState::<(), (), ()>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
             BootPayload::for_tests(),
+            crate::isa::GuestIsa::for_build_target(Some(crate::test_support::floor_only_probe)),
         );
         let rtc = SettableRtc(core::cell::Cell::new(1_000));
         state.seed_wall_clock(0, &rtc);
@@ -1335,11 +1416,12 @@ mod tests {
 
     #[test]
     fn runtime_state_records_kernel_heap_delta_metrics() {
-        let state = RuntimeState::<(), (), ()>::new(
+        let state = RuntimeState::<(), (), crate::test_support::UnsupportedStorage>::new(
             Timebase::new(1_000_000_000),
             1,
             0,
             BootPayload::for_tests(),
+            crate::isa::GuestIsa::for_build_target(Some(crate::test_support::floor_only_probe)),
         );
         let baseline = crate::heap_stats();
         state.inner.heap_perf_snapshot.reset(baseline);
@@ -1362,50 +1444,52 @@ mod tests {
         state.record_kernel_heap_metrics(current);
 
         let samples = state.perf_metrics(
+            &crate::test_support::test_observe_machine_cap(),
             &PerfMetricFilter {
-                name_prefixes: vec!["kernel;heap;".into()],
+                name_prefixes: crate::PrefixSet::from_prefixes(["kernel;heap;"])
+                    .expect("one short prefix fits the filter bounds"),
             },
             8,
         );
 
         let alloc = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;alloc")
+            .find(|sample| &*sample.name == "kernel;heap;alloc")
             .expect("alloc metric should be recorded");
         assert_eq!(alloc.total_events, 3);
         assert_eq!(alloc.total_bytes, 96);
 
         let dealloc = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;dealloc")
+            .find(|sample| &*sample.name == "kernel;heap;dealloc")
             .expect("dealloc metric should be recorded");
         assert_eq!(dealloc.total_events, 2);
         assert_eq!(dealloc.total_bytes, 64);
 
         let realloc = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;realloc")
+            .find(|sample| &*sample.name == "kernel;heap;realloc")
             .expect("realloc metric should be recorded");
         assert_eq!(realloc.total_events, 1);
         assert_eq!(realloc.total_bytes, 128);
 
         let alloc_size = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;alloc-size-0064")
+            .find(|sample| &*sample.name == "kernel;heap;alloc-size-0064")
             .expect("alloc size class metric should be recorded");
         assert_eq!(alloc_size.total_events, 2);
         assert_eq!(alloc_size.total_bytes, 96);
 
         let dealloc_size = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;dealloc-size-0032")
+            .find(|sample| &*sample.name == "kernel;heap;dealloc-size-0032")
             .expect("dealloc size class metric should be recorded");
         assert_eq!(dealloc_size.total_events, 1);
         assert_eq!(dealloc_size.total_bytes, 32);
 
         let realloc_size = samples
             .iter()
-            .find(|sample| sample.name == "kernel;heap;realloc-size-0128")
+            .find(|sample| &*sample.name == "kernel;heap;realloc-size-0128")
             .expect("realloc size class metric should be recorded");
         assert_eq!(realloc_size.total_events, 1);
         assert_eq!(realloc_size.total_bytes, 128);

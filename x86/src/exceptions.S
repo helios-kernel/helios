@@ -15,6 +15,18 @@
     jmp helios_x86_exception_common
 .endm
 
+.if {native_users}
+HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_debug, 1
+HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_overflow, 4
+HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_bound, 5
+HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_device_unavailable, 7
+HELIOS_X86_EXCEPTION_WITH_ERROR helios_x86_exception_invalid_tss, 10
+HELIOS_X86_EXCEPTION_WITH_ERROR helios_x86_exception_segment_missing, 11
+HELIOS_X86_EXCEPTION_WITH_ERROR helios_x86_exception_stack_segment, 12
+HELIOS_X86_EXCEPTION_WITH_ERROR helios_x86_exception_alignment, 17
+HELIOS_X86_EXCEPTION_WITH_ERROR helios_x86_exception_control_protection, 21
+.endif
+
 HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_divide_error, 0
 HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_breakpoint, 3
 HELIOS_X86_EXCEPTION_NO_ERROR helios_x86_exception_invalid_opcode, 6
@@ -186,6 +198,12 @@ helios_x86_interrupt_debug_serial:
     push 0x3e
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_sci
+helios_x86_interrupt_sci:
+    push 0
+    push 0x3f
+    jmp helios_x86_interrupt_common
+
 helios_x86_exception_common:
     push rax
     push rcx
@@ -203,6 +221,11 @@ helios_x86_exception_common:
     push r14
     push r15
 
+    .if {native_users}
+    // CS is after the 15 saved registers, vector, error and RIP.
+    test byte ptr [rsp + 144], 3
+    jnz helios_x86_native_trap_exit
+    .endif
     mov rdi, rsp
     mov r12, rsp
     // The dispatcher returns when the kernel resolved the fault in
@@ -258,6 +281,11 @@ helios_x86_interrupt_common:
     push r14
     push r15
 
+    .if {native_users}
+    // CS is after the 15 saved registers, vector, error and RIP.
+    test byte ptr [rsp + 144], 3
+    jnz helios_x86_native_trap_exit
+    .endif
     mov rdi, rsp
     mov r12, rsp
     sub rsp, 512

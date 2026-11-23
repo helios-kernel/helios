@@ -56,7 +56,7 @@
 //! hart sets up the root table, secondary harts share it via `satp`.
 //! Every address-space mutation invalidates this hart's TLB entries
 //! and dispatches one `sbi_rt::remote_sfence_vma` range fence to every
-//! other hart, after the last page-table write and before any frame
+//! other running hart (a stopped hart flushes on restart), after the last page-table write and before any frame
 //! goes back to the user-memory pool.
 
 extern crate alloc;
@@ -80,9 +80,11 @@ use helios_kernel::runtime_memory::{
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, VaCursor,
-    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame_on,
-    deallocate_user_run_on, install_fiber_stack_hooks, ranges_outside, validate_range,
+    FiberStackVmHooks, InstalledAddressSpace, MemoryOwner, ReservationLookup, ReservationTracker,
+    ResidencyVmHooks, VaCursor, allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed_on,
+    allocate_user_run_zeroed_on, current_user_memory_owner, deallocate_user_frame_on,
+    deallocate_user_run_on, install_fiber_stack_hooks, install_residency_hooks, ranges_outside,
+    residency_vm_hooks, user_frame_node, validate_range,
 };
 use spin::{Mutex, Once};
 
@@ -505,6 +507,18 @@ impl RiscvUserAddressSpace {
         Ok(raw.as_ptr() as usize)
     }
 
+    /// A replacement for the frame at `old_phys`, from the node that
+    /// frame is on: a relocation that moved the page to another node
+    /// would undo its placement. Not zeroed, because the caller copies
+    /// the whole page over it.
+    fn alloc_relocation_frame(&self, old_phys: usize) -> Result<usize, AddressSpaceError> {
+        let old = NonNull::new(old_phys as *mut u8)
+            .unwrap_or_else(|| panic!("RISC-V relocation source is a null frame"));
+        let raw = allocate_user_frame_uninit_on_node(user_frame_node(old))
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        Ok(raw.as_ptr() as usize)
+    }
+
     fn dealloc_user_phys(&self, phys: usize) {
         let ptr = NonNull::new(phys as *mut u8)
             .unwrap_or_else(|| panic!("RISC-V user-frame dealloc received null pointer"));
@@ -527,7 +541,7 @@ impl RiscvUserAddressSpace {
                     return Err(AddressSpaceError::NotCommitted);
                 }
             };
-            let new_phys = match self.alloc_user_frame() {
+            let new_phys = match self.alloc_relocation_frame(old_phys) {
                 Ok(phys) => phys,
                 Err(error) => {
                     for page in pages {
@@ -804,8 +818,11 @@ impl RiscvUserAddressSpace {
 
         // This backend has no swap, so committing over the range can
         // never orphan a swap extent; the assertion keeps that true if
-        // swap reaches this architecture (#25).
-        let orphaned = state.record_commit(virt, flags, MemoryOwner::NONE)?;
+        // swap reaches this architecture (#25). The region is the
+        // instance's whose turn this hart is in: the OOM killer ranks an
+        // instance by what it holds of the pool.
+        let owner = current_user_memory_owner(crate::current_hart_id());
+        let orphaned = state.record_commit(virt, flags, owner)?;
         debug_assert!(orphaned.is_empty());
         Ok(())
     }
@@ -1163,7 +1180,32 @@ impl AddressSpace for RiscvUserAddressSpace {
         }
         Ok(())
     }
+
+    /// Every committed page is resident: this backend has no swap.
+    fn owned_resident_bytes(&self, owner: u64) -> u64 {
+        self.state
+            .lock()
+            .owned_resident_bytes(MemoryOwner::new(owner))
+    }
+
+    fn visit_owned_resident_bytes<Visit>(&self, mut visit: Visit)
+    where
+        Visit: FnMut(u64, u64),
+    {
+        self.state
+            .lock()
+            .visit_owned_resident_bytes(|owner, bytes| visit(owner.raw(), bytes));
+    }
 }
+
+impl InstalledAddressSpace for RiscvUserAddressSpace {
+    fn installed() -> &'static Self {
+        user_as()
+    }
+}
+
+/// The kernel's view of how much of the user pool each instance holds.
+static RISCV_RESIDENCY_HOOKS: ResidencyVmHooks = residency_vm_hooks::<RiscvUserAddressSpace>();
 
 /// Invalidate `pages` translations starting at `start` on this hart and
 /// on every other hart in the system.
@@ -1187,17 +1229,7 @@ fn flush_tlb_pages(start: usize, pages: usize) {
         }
     }
     let byte_len = pages * PAGE_SIZE;
-    let ret = sbi_rt::remote_sfence_vma(
-        sbi_rt::HartMask::from_mask_base(0, usize::MAX),
-        start,
-        byte_len,
-    );
-    assert!(
-        ret.is_ok(),
-        "SBI remote_sfence_vma failed for user VA {start:#x}+{byte_len:#x}: error={} value={}",
-        ret.error,
-        ret.value
-    );
+    crate::lifecycle::remote_sfence_vma(start, byte_len);
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
@@ -1245,6 +1277,7 @@ const _: () = {
 /// runtime engine is constructed.
 pub fn install_runtime_memory_hooks() {
     runtime_memory::install_hooks(&RISCV_VMM_HOOKS);
+    install_residency_hooks(&RISCV_RESIDENCY_HOOKS);
     install_fiber_stack_hooks(&RISCV_FIBER_STACK_HOOKS);
 }
 

@@ -1,0 +1,27 @@
+[package]
+name = "helios-unix"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[features]
+default = []
+runtime = ["dep:bytes", "dep:helios-sync", "helios-sync/runtime", "dep:helios-hal", "dep:hashbrown", "dep:heapless", "dep:spin", "dep:triomphe", "dep:thiserror", "dep:futures"]
+
+[dependencies]
+bytes = { version = "1.12.1", default-features = false, optional = true }
+helios-sync = { workspace = true, optional = true }
+helios-hal = { workspace = true, optional = true }
+hashbrown = { version = "0.16.1", default-features = false, features = ["allocator-api2", "default-hasher", "equivalent", "inline-more"], optional = true }
+heapless = { version = "0.7.17", default-features = false, optional = true }
+spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"], optional = true }
+triomphe = { version = "0.1.15", default-features = false, optional = true }
+thiserror = { version = "2.0.21", default-features = false, optional = true }
+futures = { version = "0.3.31", default-features = false, features = ["alloc"], optional = true }
+
+[dev-dependencies]
+critical-section = { version = "1.2.0", features = ["std"] }
+futures-lite = "2.6.1"
+
+[lints]
+workspace = true

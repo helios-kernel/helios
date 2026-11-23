@@ -36,15 +36,35 @@
 
 extern crate alloc;
 
+mod btrfs;
+mod btrfs_management;
+mod erofs;
 mod host;
 mod memory;
+mod node;
 mod request;
 mod root;
+mod storage;
+mod unix;
 
-pub use host::HostShare;
-pub use memory::MemoryFs;
-pub use request::{MountRequestError, MountSource, request_mount, request_unmount};
-pub use root::RootFs;
+use btrfs::WritableMount;
+pub use btrfs::{
+    BtrfsFs, BtrfsMountError, BtrfsOpenHandle, BtrfsService, BtrfsWriteOptions, CommitPolicy,
+};
+pub use btrfs_management::{BtrfsManagementError, BtrfsVolumeRequest};
+pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
+pub use host::{HostShare, HostShareWrite};
+pub use memory::{MemoryFs, MemoryUnixMetadata, MemoryWrite, XattrSetMode};
+pub use node::{FsDescriptor, FsDescriptorFlags};
+pub use request::{
+    AttachedStorage, MountRequest, MountRequestError, MountSource, request_mount, request_unmount,
+};
+pub use root::{RootFs, RootWrite};
+pub use storage::{NoDisks, Storage};
+pub use unix::{
+    MountFlags, MountGrant, MountSharing, SharedOwner, UnixAttributes, UnixFsError,
+    UnixNodeMetadata,
+};
 
 use alloc::borrow::{Cow, ToOwned};
 use alloc::boxed::Box;
@@ -53,6 +73,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::cmp::Ordering;
 use core::future::Future;
+use core::marker::PhantomData;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use core::task::{Context, Poll};
@@ -61,15 +82,14 @@ use bytes::{Bytes, BytesMut};
 use crossbeam_utils::CachePadded;
 use helios_hal::cpu::current_processor;
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FileSystemRights, FsError, FsPath, FsResult,
-    Metadata, NodeKind, OpenFlags, WritePosition,
+    DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FileSystemRights, FilledWrite, FsError,
+    FsPath, FsResult, Metadata, NodeKind, OpenFlags, Opened, OwnedFsPath, PreparedWrite,
+    RenameMode, WritePosition, WriteProgress,
 };
 use thiserror::Error;
 use triomphe::Arc;
 
-use crate::{
-    AuthorityDomain, BootFs, BootfsBytes, HostFileSystem, MountCap, ObjectIdentity, UnmountCap,
-};
+use crate::{AuthorityDomain, BootFs, BootfsBytes, MountCap, ObjectIdentity, UnmountCap};
 
 /// Mounts one table holds besides its root.
 ///
@@ -87,27 +107,169 @@ pub const BOOT_DEVICE: DeviceId = DeviceId::new(AuthorityDomain::GUEST_BOOTFS.ra
 /// root filesystems may.
 pub const ROOT_LAYER_DEVICE: DeviceId = DeviceId::new(AuthorityDomain::GUEST_ROOT_LAYER.raw());
 
+/// What a namespace's root grants: the boot image under the tree's own
+/// writable layer, seen by every program of the tree, so shared.
+pub const ROOT_GRANT: MountGrant = MountGrant {
+    rights: FileSystemRights::READ.union(FileSystemRights::WRITE),
+    sharing: MountSharing::Shared,
+};
+
 /// The deepest chain of symbolic links one resolution follows.
 pub const MAX_SYMLINK_DEPTH: usize = 16;
+
+/// Delegates the handle-addressed [`FileSystem`] methods to the path-addressed
+/// methods for filesystems whose [`FileSystem::OpenHandle`] is [`OwnedFsPath`].
+macro_rules! delegate_path_handles {
+    () => {
+        type OpenHandle = helios_hal::fs::OwnedFsPath;
+
+        async fn stat_handle(
+            &self,
+            handle: &Self::OpenHandle,
+        ) -> helios_hal::fs::FsResult<helios_hal::fs::Metadata> {
+            self.stat(handle.as_path()).await
+        }
+
+        async fn read_handle_at(
+            &self,
+            handle: &Self::OpenHandle,
+            offset: u64,
+            max_bytes: usize,
+        ) -> helios_hal::fs::FsResult<bytes::Bytes> {
+            self.read_at(handle.as_path(), offset, max_bytes).await
+        }
+
+        async fn prepare_write_handle(
+            &self,
+            handle: &Self::OpenHandle,
+            position: helios_hal::fs::WritePosition,
+            len: usize,
+            now: u64,
+        ) -> helios_hal::fs::FsResult<Self::Write> {
+            self.prepare_write(handle.as_path(), position, len, now)
+                .await
+        }
+
+        async fn set_size_handle(
+            &self,
+            handle: &Self::OpenHandle,
+            size: u64,
+            now: u64,
+        ) -> helios_hal::fs::FsResult<()> {
+            self.set_size(handle.as_path(), size, now).await
+        }
+
+        async fn set_times_handle(
+            &self,
+            handle: &Self::OpenHandle,
+            access_nanos: Option<u64>,
+            modified_nanos: Option<u64>,
+            now: u64,
+        ) -> helios_hal::fs::FsResult<()> {
+            self.set_times(handle.as_path(), access_nanos, modified_nanos, now)
+                .await
+        }
+
+        async fn open_dir_handle(
+            &self,
+            handle: &Self::OpenHandle,
+        ) -> helios_hal::fs::FsResult<Self::Dir> {
+            self.open_dir(handle.as_path()).await
+        }
+
+        async fn link_handle(
+            &self,
+            handle: &Self::OpenHandle,
+            link: helios_hal::fs::FsPath<'_>,
+            now: u64,
+        ) -> helios_hal::fs::FsResult<()> {
+            self.link(handle.as_path(), link, now).await
+        }
+
+        async fn sync_handle(&self, handle: &Self::OpenHandle) -> helios_hal::fs::FsResult<()> {
+            self.sync(handle.as_path()).await
+        }
+
+        async fn sync_data_handle(
+            &self,
+            handle: &Self::OpenHandle,
+        ) -> helios_hal::fs::FsResult<()> {
+            self.sync_data(handle.as_path()).await
+        }
+    };
+}
+pub(crate) use delegate_path_handles;
 
 /// Defines [`MountedFs`] over the closed set of filesystem kinds, with a
 /// [`FileSystem`] implementation that forwards each operation to the kind
 /// it holds. Adding a kind is one line here.
 macro_rules! mount_kinds {
-    ($($(#[$doc:meta])* $kind:ident($fs:ty)),+ $(,)?) => {
+    ($($(#[$doc:meta])* $kind:ident($fs:ty => $open:ty)),+ $(,)?) => {
         /// A mounted filesystem of one of the kinds the kernel builds.
-        #[derive(Clone)]
-        pub enum MountedFs<H> {
+        pub enum MountedFs<S: Storage> {
             $($(#[$doc])* $kind($fs),)+
         }
 
-        impl<H: HostFileSystem> FileSystem for MountedFs<H> {
+        /// An open handle returned by whichever kind a [`MountedFs`] holds.
+        #[derive(Clone)]
+        pub enum MountedOpenHandle {
+            $($kind($open),)+
+        }
+
+        // Written out rather than derived: a derive would also demand
+        // `Clone` of the storage's device types, which every kind holds
+        // behind a shared handle.
+        impl<S: Storage> Clone for MountedFs<S> {
+            fn clone(&self) -> Self {
+                match self { $(Self::$kind(fs) => Self::$kind(fs.clone()),)+ }
+            }
+        }
+
+        impl<S: Storage> FileSystem for MountedFs<S> {
+            type OpenHandle = MountedOpenHandle;
+            type Write = MountedWrite<S>;
+            type Dir = MountedDir<S>;
+
             async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
                 match self { $(Self::$kind(fs) => fs.stat(path).await,)+ }
             }
 
-            async fn open(&self, path: FsPath<'_>, flags: OpenFlags, now: u64) -> FsResult<Metadata> {
-                match self { $(Self::$kind(fs) => fs.open(path, flags, now).await,)+ }
+            async fn stat_handle(&self, handle: &MountedOpenHandle) -> FsResult<Metadata> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => fs.stat_handle(handle).await,)+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+
+            async fn open(
+                &self,
+                path: FsPath<'_>,
+                flags: OpenFlags,
+                now: u64,
+            ) -> FsResult<Opened<MountedOpenHandle>> {
+                match self {
+                    $(Self::$kind(fs) => fs.open(path, flags, now).await.map(|opened| Opened {
+                        metadata: opened.metadata,
+                        handle: MountedOpenHandle::$kind(opened.handle),
+                    }),)+
+                }
+            }
+
+            async fn open_tmpfile(
+                &self,
+                directory: FsPath<'_>,
+                exclusive: bool,
+                now: u64,
+            ) -> FsResult<Opened<MountedOpenHandle>> {
+                match self {
+                    $(Self::$kind(fs) => fs
+                        .open_tmpfile(directory, exclusive, now)
+                        .await
+                        .map(|opened| Opened {
+                            metadata: opened.metadata,
+                            handle: MountedOpenHandle::$kind(opened.handle),
+                        }),)+
+                }
             }
 
             async fn read_at(
@@ -119,29 +281,67 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.read_at(path, offset, max_bytes).await,)+ }
             }
 
-            fn write_with<'a, F>(
+            async fn read_handle_at(
+                &self,
+                handle: &MountedOpenHandle,
+                offset: u64,
+                max_bytes: usize,
+            ) -> FsResult<Bytes> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.read_handle_at(handle, offset, max_bytes).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+
+            async fn prepare_write<'a>(
                 &'a self,
                 path: FsPath<'a>,
                 position: WritePosition,
                 len: usize,
                 now: u64,
-                fill: F,
-            ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-            where
-                F: FnOnce(&mut [u8]),
-            {
-                // Each kind runs `fill` in this call, so the dispatch must
-                // too: the arms' futures are carried in one enum rather
-                // than awaited in an async body that would hold `fill`.
+            ) -> FsResult<MountedWrite<S>> {
                 match self {
-                    $(Self::$kind(fs) => MountedWrite::$kind {
-                        future: fs.write_with(path, position, len, now, fill),
-                    },)+
+                    $(Self::$kind(fs) => {
+                        fs.prepare_write(path, position, len, now).await.map(MountedWrite::$kind)
+                    })+
+                }
+            }
+
+            async fn prepare_write_handle<'a>(
+                &'a self,
+                handle: &'a MountedOpenHandle,
+                position: WritePosition,
+                len: usize,
+                now: u64,
+            ) -> FsResult<MountedWrite<S>> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.prepare_write_handle(handle, position, len, now)
+                            .await
+                            .map(MountedWrite::$kind)
+                    })+
+                    _ => Err(FsError::CrossDevice),
                 }
             }
 
             async fn set_size(&self, path: FsPath<'_>, size: u64, now: u64) -> FsResult<()> {
                 match self { $(Self::$kind(fs) => fs.set_size(path, size, now).await,)+ }
+            }
+
+            async fn set_size_handle(
+                &self,
+                handle: &MountedOpenHandle,
+                size: u64,
+                now: u64,
+            ) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.set_size_handle(handle, size, now).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
             }
 
             async fn set_times(
@@ -158,38 +358,74 @@ macro_rules! mount_kinds {
                 }
             }
 
-            async fn read_dir(
+            async fn set_times_handle(
                 &self,
-                path: FsPath<'_>,
-                cookie: DirCookie,
-                max_entries: usize,
-            ) -> FsResult<Vec<DirEntry>> {
-                match self { $(Self::$kind(fs) => fs.read_dir(path, cookie, max_entries).await,)+ }
+                handle: &MountedOpenHandle,
+                access_nanos: Option<u64>,
+                modified_nanos: Option<u64>,
+                now: u64,
+            ) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.set_times_handle(handle, access_nanos, modified_nanos, now).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+
+            async fn open_dir(&self, path: FsPath<'_>) -> FsResult<MountedDir<S>> {
+                match self {
+                    $(Self::$kind(fs) => fs.open_dir(path).await.map(MountedDir::$kind),)+
+                }
+            }
+
+            async fn open_dir_handle(&self, handle: &MountedOpenHandle) -> FsResult<MountedDir<S>> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.open_dir_handle(handle).await.map(MountedDir::$kind)
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
             }
 
             async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
                 match self { $(Self::$kind(fs) => fs.create_directory(path, now).await,)+ }
             }
 
-            async fn remove_directory(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.remove_directory(path).await,)+ }
+            async fn remove_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.remove_directory(path, now).await,)+ }
             }
 
-            async fn unlink(&self, path: FsPath<'_>) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.unlink(path).await,)+ }
+            async fn unlink(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
+                match self { $(Self::$kind(fs) => fs.unlink(path, now).await,)+ }
             }
 
             async fn rename(
                 &self,
                 source: FsPath<'_>,
                 destination: FsPath<'_>,
+                mode: RenameMode,
                 now: u64,
             ) -> FsResult<()> {
-                match self { $(Self::$kind(fs) => fs.rename(source, destination, now).await,)+ }
+                match self { $(Self::$kind(fs) => fs.rename(source, destination, mode, now).await,)+ }
             }
 
             async fn link(&self, existing: FsPath<'_>, link: FsPath<'_>, now: u64) -> FsResult<()> {
                 match self { $(Self::$kind(fs) => fs.link(existing, link, now).await,)+ }
+            }
+
+            async fn link_handle(
+                &self,
+                handle: &MountedOpenHandle,
+                link: FsPath<'_>,
+                now: u64,
+            ) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.link_handle(handle, link, now).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
             }
 
             async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
@@ -204,33 +440,128 @@ macro_rules! mount_kinds {
                 match self { $(Self::$kind(fs) => fs.sync(path).await,)+ }
             }
 
+            async fn sync_handle(&self, handle: &MountedOpenHandle) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.sync_handle(handle).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+
             async fn sync_data(&self, path: FsPath<'_>) -> FsResult<()> {
                 match self { $(Self::$kind(fs) => fs.sync_data(path).await,)+ }
+            }
+
+            async fn sync_data_handle(&self, handle: &MountedOpenHandle) -> FsResult<()> {
+                match (self, handle) {
+                    $((Self::$kind(fs), MountedOpenHandle::$kind(handle)) => {
+                        fs.sync_data_handle(handle).await
+                    })+
+                    _ => Err(FsError::CrossDevice),
+                }
+            }
+        }
+
+        /// A write staged by whichever kind a [`MountedFs`] holds.
+        pub enum MountedWrite<S: Storage> {
+            $($kind(<$fs as FileSystem>::Write),)+
+        }
+
+        /// A directory stream opened by whichever kind a [`MountedFs`] holds.
+        pub enum MountedDir<S: Storage> {
+            $($kind(<$fs as FileSystem>::Dir),)+
+        }
+
+        impl<S: Storage> DirStream for MountedDir<S> {
+            async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+                match self { $(Self::$kind(dir) => dir.read(cookie, max_entries).await,)+ }
+            }
+
+            async fn rewind(&mut self) -> FsResult<()> {
+                match self { $(Self::$kind(dir) => dir.rewind().await,)+ }
+            }
+        }
+
+        impl<S: Storage> PreparedWrite for MountedWrite<S> {
+            type Filled = MountedFilledWrite<S>;
+
+            fn staged_len(&self) -> usize {
+                match self { $(Self::$kind(write) => write.staged_len(),)+ }
+            }
+
+            #[expect(unreachable_code, reason = "read-only filesystems cannot stage writes")]
+            fn fill<F>(self, fill: F) -> Self::Filled
+            where
+                F: FnMut(usize, &mut [u8]),
+            {
+                match self {
+                    $(Self::$kind(write) => MountedFilledWrite::$kind(write.fill(fill)),)+
+                }
+            }
+        }
+
+        /// A filled round of the mounted filesystem, with no source borrow.
+        pub enum MountedFilledWrite<S: Storage> {
+            $($kind(<<$fs as FileSystem>::Write as PreparedWrite>::Filled),)+
+        }
+
+        impl<S: Storage> FilledWrite for MountedFilledWrite<S> {
+            type Next = MountedWrite<S>;
+
+            #[expect(unreachable_code, reason = "read-only filesystems cannot stage writes")]
+            fn submit(self) -> impl Future<Output = FsResult<WriteProgress<Self::Next>>> + Send {
+                match self {
+                    $(Self::$kind(write) => MountedSubmit::$kind {
+                        future: write.submit(),
+                        marker: PhantomData,
+                    },)+
+                }
             }
         }
 
         pin_project_lite::pin_project! {
-            /// The write future of whichever kind a [`MountedFs`] holds.
-            #[project = MountedWriteProjection]
-            enum MountedWrite<$($kind),+> {
-                $($kind { #[pin] future: $kind },)+
+            /// The submit future of whichever kind a [`MountedWrite`]
+            /// holds, resolving with the next round as a `W`. The marker
+            /// is pinned only so the projection moves no field by value.
+            #[project = MountedSubmitProjection]
+            enum MountedSubmit<W, $($kind),+> {
+                $($kind { #[pin] future: $kind, #[pin] marker: PhantomData<fn() -> W> },)+
             }
         }
 
-        impl<$($kind: Future<Output = FsResult<u64>>),+> Future for MountedWrite<$($kind),+> {
-            type Output = FsResult<u64>;
+        impl<S: Storage, $($kind),+> Future
+            for MountedSubmit<MountedWrite<S>, $($kind),+>
+        where
+            $($kind: Future<Output = FsResult<WriteProgress<<$fs as FileSystem>::Write>>>,)+
+        {
+            type Output = FsResult<WriteProgress<MountedWrite<S>>>;
 
+            #[expect(
+                unreachable_code,
+                reason = "the boot image refuses every write, so its staged write is `Infallible` and its arm is never reached"
+            )]
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 match self.project() {
-                    $(MountedWriteProjection::$kind { future } => future.poll(cx),)+
+                    $(MountedSubmitProjection::$kind { future, .. } => {
+                        future.poll(cx).map(|progress| {
+                            progress.map(|progress| match progress {
+                                WriteProgress::More(write) => {
+                                    WriteProgress::More(MountedWrite::$kind(write))
+                                }
+                                WriteProgress::Done(landed) => WriteProgress::Done(landed),
+                            })
+                        })
+                    })+
                 }
             }
         }
     };
 }
 
-/// Writes `data` at `position` through [`FileSystem::write_with`], and
-/// resolves with the offset it landed at: the filesystem tests' write.
+/// Writes `data` at `position` through [`helios_hal::fs::write_with`],
+/// and resolves with the offset it landed at: the filesystem tests'
+/// write. It asserts that every byte landed.
 #[cfg(test)]
 pub(crate) async fn write_bytes<F: FileSystem>(
     fs: &F,
@@ -239,22 +570,400 @@ pub(crate) async fn write_bytes<F: FileSystem>(
     data: &[u8],
     now: u64,
 ) -> FsResult<u64> {
-    fs.write_with(path, position, data.len(), now, |destination| {
-        destination.copy_from_slice(data)
-    })
-    .await
+    let landed =
+        helios_hal::fs::write_with(fs, path, position, data.len(), now, |at, destination| {
+            destination.copy_from_slice(&data[at..at + destination.len()]);
+        })
+        .await?;
+    assert_eq!(landed.len, data.len(), "the write landed in full");
+    Ok(landed.offset)
 }
 
 mount_kinds! {
     /// A namespace's root: its own tree over the boot image. Only the
     /// table's root is of this kind; [`MountTable::mount`] refuses it.
-    Root(RootFs),
+    Root(RootFs => OwnedFsPath),
     /// The boot image on its own, read-only.
-    Boot(BootFs),
+    Boot(BootFs => OwnedFsPath),
     /// A tree in kernel memory, shared by every namespace that sees it.
-    Memory(MemoryFs),
+    Memory(MemoryFs => OwnedFsPath),
     /// The host share over 9p.
-    Host(HostShare<H>),
+    Host(HostShare<S::HostShare> => OwnedFsPath),
+    /// An EROFS image on a mount-source disk, read-only.
+    Erofs(ErofsFs<S::Disk> => OwnedFsPath),
+    /// A btrfs image on a mount-source disk.
+    Btrfs(BtrfsFs<S::Disk> => BtrfsOpenHandle),
+}
+
+impl<S: Storage> MountedFs<S> {
+    pub async fn unix_metadata(&self, path: FsPath<'_>) -> Result<UnixNodeMetadata, UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.unix_metadata(path).await,
+            Self::Memory(fs) => fs.unix_node_metadata(path),
+            Self::Root(fs) => fs.unix_node_metadata(path),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => {
+                let md = self.stat(path).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes: UnixAttributes {
+                        permissions: if md.kind == NodeKind::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        },
+                        uid: 0,
+                        gid: 0,
+                    },
+                    rdev: 0,
+                })
+            }
+        }
+    }
+
+    pub async fn unix_metadata_handle(
+        &self,
+        handle: &MountedOpenHandle,
+    ) -> Result<UnixNodeMetadata, UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => fs.unix_metadata_handle(h).await,
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => fs.unix_node_metadata(p.as_path()),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.unix_node_metadata(p.as_path()),
+            (Self::Boot(fs), MountedOpenHandle::Boot(p)) => {
+                let md = fs.stat(p.as_path()).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes: UnixAttributes {
+                        permissions: if md.kind == NodeKind::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        },
+                        uid: 0,
+                        gid: 0,
+                    },
+                    rdev: 0,
+                })
+            }
+            (Self::Host(fs), MountedOpenHandle::Host(p)) => {
+                let md = fs.stat(p.as_path()).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes: UnixAttributes {
+                        permissions: if md.kind == NodeKind::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        },
+                        uid: 0,
+                        gid: 0,
+                    },
+                    rdev: 0,
+                })
+            }
+            (Self::Erofs(fs), MountedOpenHandle::Erofs(p)) => {
+                let md = fs.stat(p.as_path()).await?;
+                Ok(UnixNodeMetadata {
+                    kind: md.kind,
+                    attributes: UnixAttributes {
+                        permissions: if md.kind == NodeKind::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        },
+                        uid: 0,
+                        gid: 0,
+                    },
+                    rdev: 0,
+                })
+            }
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn open_unix(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        attributes: helios_btrfs::write::Attributes,
+        now: u64,
+    ) -> Result<Opened<MountedOpenHandle>, UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs
+                .open_unix(path, flags, attributes, now)
+                .await
+                .map(|o| Opened {
+                    metadata: o.metadata,
+                    handle: MountedOpenHandle::Btrfs(o.handle),
+                }),
+            Self::Memory(fs) => fs.open_unix(path, flags, attributes, now).map(|o| Opened {
+                metadata: o.metadata,
+                handle: MountedOpenHandle::Memory(o.handle),
+            }),
+            Self::Root(fs) => fs.open_unix(path, flags, attributes, now).map(|o| Opened {
+                metadata: o.metadata,
+                handle: MountedOpenHandle::Root(o.handle),
+            }),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => {
+                self.open(path, flags, now).await.map_err(UnixFsError::Fs)
+            }
+        }
+    }
+
+    pub async fn create_directory_unix(
+        &self,
+        path: FsPath<'_>,
+        attributes: helios_btrfs::write::Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.create_directory_unix(path, attributes, now).await,
+            Self::Memory(fs) => fs.create_directory_unix(path, attributes, now),
+            Self::Root(fs) => fs.create_directory_unix(path, attributes, now),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
+                .create_directory(path, now)
+                .await
+                .map_err(UnixFsError::Fs),
+        }
+    }
+
+    pub async fn symlink_unix(
+        &self,
+        target: &str,
+        path: FsPath<'_>,
+        attributes: helios_btrfs::write::Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.symlink_unix(target, path, attributes, now).await,
+            Self::Memory(fs) => fs.symlink_unix(target, path, attributes, now),
+            Self::Root(fs) => fs.symlink_unix(target, path, attributes, now),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => self
+                .symlink(target, path, now)
+                .await
+                .map_err(UnixFsError::Fs),
+        }
+    }
+
+    pub async fn create_special(
+        &self,
+        path: FsPath<'_>,
+        special: helios_btrfs::write::Special,
+        attributes: helios_btrfs::write::Attributes,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.create_special(path, special, attributes, now).await,
+            Self::Memory(fs) => fs.create_special_unix(path, special, attributes, now),
+            Self::Root(fs) => fs.create_special_unix(path, special, attributes, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn set_permissions(
+        &self,
+        path: FsPath<'_>,
+        permissions: u32,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.set_permissions(path, permissions, now).await,
+            Self::Memory(fs) => Ok(fs.set_permissions(path, permissions, now)?),
+            Self::Root(fs) => fs.set_permissions(path, permissions, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn set_permissions_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        permissions: u32,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
+                fs.set_permissions_handle(h, permissions, now).await
+            }
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => {
+                Ok(fs.set_permissions(p.as_path(), permissions, now)?)
+            }
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => {
+                fs.set_permissions(p.as_path(), permissions, now)
+            }
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn set_owner(
+        &self,
+        path: FsPath<'_>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.set_owner(path, uid, gid, now).await,
+            Self::Memory(fs) => Ok(fs.set_owner(path, uid, gid, now)?),
+            Self::Root(fs) => fs.set_owner(path, uid, gid, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn set_owner_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
+                fs.set_owner_handle(h, uid, gid, now).await
+            }
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => {
+                Ok(fs.set_owner(p.as_path(), uid, gid, now)?)
+            }
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => {
+                fs.set_owner(p.as_path(), uid, gid, now)
+            }
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn xattr(&self, path: FsPath<'_>, name: &str) -> Result<Option<Bytes>, UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.xattr(path, name).await,
+            Self::Memory(fs) => Ok(fs.xattr(path, name)?),
+            Self::Root(fs) => fs.xattr(path, name),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn xattr_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        name: &str,
+    ) -> Result<Option<Bytes>, UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => fs.xattr_handle(h, name).await,
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => Ok(fs.xattr(p.as_path(), name)?),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.xattr(p.as_path(), name),
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Host(_), MountedOpenHandle::Host(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn list_xattrs(&self, path: FsPath<'_>) -> Result<Vec<String>, UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.list_xattrs(path).await,
+            Self::Memory(fs) => Ok(fs.list_xattrs(path)?),
+            Self::Root(fs) => fs.list_xattrs(path),
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn list_xattrs_handle(
+        &self,
+        handle: &MountedOpenHandle,
+    ) -> Result<Vec<String>, UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => fs.list_xattrs_handle(h).await,
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => Ok(fs.list_xattrs(p.as_path())?),
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.list_xattrs(p.as_path()),
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Host(_), MountedOpenHandle::Host(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn set_xattr(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.set_xattr(path, name, value, mode, now).await,
+            Self::Memory(fs) => fs.set_xattr_unix(path, name, value, mode, now),
+            Self::Root(fs) => fs.set_xattr(path, name, value, mode, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn set_xattr_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
+                fs.set_xattr_handle(h, name, value, mode, now).await
+            }
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => {
+                fs.set_xattr_unix(p.as_path(), name, value, mode, now)
+            }
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => {
+                fs.set_xattr(p.as_path(), name, value, mode, now)
+            }
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
+
+    pub async fn remove_xattr(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match self {
+            Self::Btrfs(fs) => fs.remove_xattr(path, name, now).await,
+            Self::Memory(fs) => fs.remove_xattr_unix(path, name, now),
+            Self::Root(fs) => fs.remove_xattr(path, name, now),
+            Self::Boot(_) | Self::Erofs(_) => Err(FsError::ReadOnly.into()),
+            Self::Host(_) => Err(FsError::Unsupported.into()),
+        }
+    }
+
+    pub async fn remove_xattr_handle(
+        &self,
+        handle: &MountedOpenHandle,
+        name: &str,
+        now: u64,
+    ) -> Result<(), UnixFsError> {
+        match (self, handle) {
+            (Self::Btrfs(fs), MountedOpenHandle::Btrfs(h)) => {
+                fs.remove_xattr_handle(h, name, now).await
+            }
+            (Self::Memory(fs), MountedOpenHandle::Memory(p)) => {
+                fs.remove_xattr_unix(p.as_path(), name, now)
+            }
+            (Self::Root(fs), MountedOpenHandle::Root(p)) => fs.remove_xattr(p.as_path(), name, now),
+            (Self::Boot(_), MountedOpenHandle::Boot(_))
+            | (Self::Erofs(_), MountedOpenHandle::Erofs(_)) => Err(FsError::ReadOnly.into()),
+            (Self::Host(_), MountedOpenHandle::Host(_)) => Err(FsError::Unsupported.into()),
+            _ => Err(FsError::CrossDevice.into()),
+        }
+    }
 }
 
 /// Why a mount or unmount was refused.
@@ -280,13 +989,60 @@ const SLOT_EMPTY: u8 = 0;
 const SLOT_LIVE: u8 = 1;
 const SLOT_RETIRING: u8 = 2;
 
-struct Mount<H> {
+/// Shared lock slot tracking the single container holding a
+/// [`MountSharing::Private`] mount: `Some((container_id, claim_count))`.
+type PrivateMountOwner = Arc<spin::Mutex<Option<(u64, usize)>>>;
+
+struct Mount<S: Storage> {
     point: String,
-    rights: FileSystemRights,
-    fs: MountedFs<H>,
+    grant: MountGrant,
+    fs: MountedFs<S>,
     /// The table's own share of the mount's hold; any other share is a
     /// descriptor or stream that keeps the mount from being unmounted.
     hold: MountHold,
+    /// Exclusive container owner for [`MountSharing::Private`] mounts:
+    /// `Some((container_id, claim_count))` while claimed by one container.
+    /// `None` for [`MountSharing::Shared`] mounts.
+    private_owner: Option<PrivateMountOwner>,
+}
+
+/// Why claiming a [`MountSharing::Private`] mount for a container failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum PrivateMountClaimError {
+    #[error("mount is shared and cannot be claimed exclusively as private")]
+    NotPrivate,
+    #[error("private mount is already claimed by another container")]
+    AlreadyClaimed,
+}
+
+/// Exclusive ownership claim a container holds on a [`MountSharing::Private`]
+/// mount. Released automatically when the container drops.
+pub struct PrivateMountClaim {
+    owner_slot: PrivateMountOwner,
+    owner: u64,
+}
+
+impl core::fmt::Debug for PrivateMountClaim {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PrivateMountClaim")
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
+impl Drop for PrivateMountClaim {
+    fn drop(&mut self) {
+        let mut slot = self.owner_slot.lock();
+        if let Some((owner, count)) = slot.as_mut()
+            && *owner == self.owner
+        {
+            *count -= 1;
+            if *count == 0 {
+                *slot = None;
+            }
+        }
+    }
 }
 
 /// What an open descriptor or file stream keeps of the mount it resolved
@@ -318,9 +1074,9 @@ impl core::fmt::Debug for MountHold {
 
 /// What a resolution found in one table: the mount that owns a path,
 /// pinned for as long as the resolution looks at it.
-struct Located<'a, H> {
+struct Located<'a, S: Storage> {
     point_len: usize,
-    mount: &'a Mount<H>,
+    mount: &'a Mount<S>,
     pin: SlotPin<'a>,
 }
 
@@ -333,11 +1089,11 @@ struct Located<'a, H> {
 /// pinned the slot. `mount` is written only by the writer, only while
 /// `state` is [`SLOT_EMPTY`] or [`SLOT_RETIRING`] with no pins, and read
 /// only by a resolution that pinned the slot and then saw [`SLOT_LIVE`].
-struct Slot<H> {
+struct Slot<S: Storage> {
     state: AtomicU8,
     point_len: AtomicUsize,
     point_hash: AtomicU64,
-    mount: UnsafeCell<Option<Mount<H>>>,
+    mount: UnsafeCell<Option<Mount<S>>>,
 }
 
 // SAFETY: `mount` is shared across processors under the protocol on
@@ -345,9 +1101,9 @@ struct Slot<H> {
 // (empty, or retiring with no pins), and a resolution reads it only after
 // pinning the slot and observing it live, which the writer's sequentially
 // consistent publication orders after the write.
-unsafe impl<H: Send + Sync> Sync for Slot<H> {}
+unsafe impl<S: Storage> Sync for Slot<S> where Mount<S>: Send + Sync {}
 
-impl<H> Slot<H> {
+impl<S: Storage> Slot<S> {
     fn new() -> Self {
         Self {
             state: AtomicU8::new(SLOT_EMPTY),
@@ -445,13 +1201,13 @@ impl Drop for SlotPin<'_> {
 /// resolutions to let go, the guard puts the slot back to live: the mount
 /// is still in place, and a retiring slot that nothing will ever empty
 /// would hide it from every resolution and refuse every later unmount.
-struct Retiring<'a, H> {
-    table: &'a TableInner<H>,
+struct Retiring<'a, S: Storage> {
+    table: &'a TableInner<S>,
     index: usize,
 }
 
-impl<H> Retiring<'_, H> {
-    fn slot(&self) -> &Slot<H> {
+impl<S: Storage> Retiring<'_, S> {
+    fn slot(&self) -> &Slot<S> {
         &self.table.slots[self.index]
     }
 
@@ -467,7 +1223,7 @@ impl<H> Retiring<'_, H> {
     }
 
     /// Takes the mount out of the slot and leaves the slot empty.
-    fn retire(self) -> Option<Mount<H>> {
+    fn retire(self) -> Option<Mount<S>> {
         let this = core::mem::ManuallyDrop::new(self);
         let _writer = this.table.writer.lock();
         // SAFETY: the slot is retiring with no pins and the writer lock is
@@ -479,10 +1235,27 @@ impl<H> Retiring<'_, H> {
     }
 }
 
-impl<H> Drop for Retiring<'_, H> {
+impl<S: Storage> Drop for Retiring<'_, S> {
     fn drop(&mut self) {
         let _writer = self.table.writer.lock();
         self.slot().state.store(SLOT_LIVE, AtomicOrdering::SeqCst);
+    }
+}
+
+/// Cloneable allocator of kernel-unique [`DeviceId`] values, shared by the
+/// mount table and any mounted volume that creates subvolumes at runtime.
+#[derive(Clone)]
+pub struct DeviceIdAllocator(Arc<AtomicU64>);
+
+impl DeviceIdAllocator {
+    /// Creates an allocator starting at `first`.
+    pub fn starting_at(first: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(first)))
+    }
+
+    /// Allocates the next distinct [`DeviceId`].
+    pub fn allocate(&self) -> DeviceId {
+        DeviceId::new(self.0.fetch_add(1, AtomicOrdering::Relaxed))
     }
 }
 
@@ -491,15 +1264,19 @@ impl<H> Drop for Retiring<'_, H> {
 /// must stay distinct however many tables there are.
 struct Machine {
     boot: BootFs,
-    next_device: AtomicU64,
+    next_device: DeviceIdAllocator,
     /// Processors that may resolve a path: one pin block each, in every
     /// table.
     processors: usize,
+    /// Every writable btrfs mount whose service has not ended, in whichever
+    /// tree it was made: what the machine commits before it powers off.
+    /// Held only to add, prune and copy the list, never across an await.
+    writable: spin::Mutex<Vec<WritableMount>>,
 }
 
-struct TableInner<H> {
+struct TableInner<S: Storage> {
     machine: Arc<Machine>,
-    slots: [Slot<H>; MAX_MOUNTS],
+    slots: [Slot<S>; MAX_MOUNTS],
     pins: Pins,
     writer: spin::Mutex<()>,
 }
@@ -507,13 +1284,13 @@ struct TableInner<H> {
 // A resolution remembers the slots it has ruled out in one `u32`.
 const _: () = assert!(MAX_MOUNTS <= u32::BITS as usize);
 
-impl<H> TableInner<H> {
+impl<S: Storage> TableInner<S> {
     /// Pins slot `index` and answers its mount while the slot is live.
     ///
     /// The pin is taken and, when the slot turns out not to be live,
     /// released in this one synchronous call, so a pin that backs off
     /// never moves to another processor: [`Pins`] relies on it.
-    fn pin_live(&self, index: usize) -> Option<(&Mount<H>, SlotPin<'_>)> {
+    fn pin_live(&self, index: usize) -> Option<(&Mount<S>, SlotPin<'_>)> {
         let slot = &self.slots[index];
         if slot.state.load(AtomicOrdering::Acquire) != SLOT_LIVE {
             return None;
@@ -533,7 +1310,7 @@ impl<H> TableInner<H> {
 
     /// Runs `read` on the mount in slot `index` when it is live, with the
     /// slot pinned for the duration.
-    fn read<R>(&self, index: usize, read: impl FnOnce(&Mount<H>) -> R) -> Option<R> {
+    fn read<R>(&self, index: usize, read: impl FnOnce(&Mount<S>) -> R) -> Option<R> {
         self.pin_live(index).map(|(mount, _pin)| read(mount))
     }
 
@@ -546,7 +1323,7 @@ impl<H> TableInner<H> {
     /// collided, or a slot unmounted and filled again since the scan) is
     /// ruled out and the scan runs again, so each mount is seen whole,
     /// before or after a concurrent change to it.
-    fn longest_match(&self, absolute: &str, longer_than: usize) -> Option<Located<'_, H>> {
+    fn longest_match(&self, absolute: &str, longer_than: usize) -> Option<Located<'_, S>> {
         let mut ruled_out = 0u32;
         loop {
             let mut best: Option<(usize, usize)> = None;
@@ -594,11 +1371,11 @@ fn prefix_is_point(absolute: &str, len: usize, hash: u64) -> bool {
 }
 
 /// One namespace's own mounts. Clones share it.
-pub struct MountTable<H> {
-    inner: Arc<TableInner<H>>,
+pub struct MountTable<S: Storage> {
+    inner: Arc<TableInner<S>>,
 }
 
-impl<H> Clone for MountTable<H> {
+impl<S: Storage> Clone for MountTable<S> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -618,14 +1395,15 @@ fn valid_point(point: &str) -> bool {
     point.len() > 1 && point.strip_prefix('/').and_then(FsPath::new).is_some()
 }
 
-impl<H: Clone> MountTable<H> {
+impl<S: Storage> MountTable<S> {
     /// A kernel's first table: `boot` under each namespace's own layer,
     /// with nothing mounted, for a machine of `processors` processors.
     pub fn new(boot: BootFs, processors: usize) -> Self {
         Self::on(Arc::new(Machine {
             boot,
-            next_device: AtomicU64::new(AuthorityDomain::FIRST_MOUNTED.raw()),
+            next_device: DeviceIdAllocator::starting_at(AuthorityDomain::FIRST_MOUNTED.raw()),
             processors,
+            writable: spin::Mutex::new(Vec::new()),
         }))
     }
 
@@ -655,23 +1433,25 @@ impl<H: Clone> MountTable<H> {
     /// A device id no other filesystem on this kernel has, for a tree the
     /// table is about to mount.
     pub fn allocate_device(&self) -> DeviceId {
-        DeviceId::new(
-            self.inner
-                .machine
-                .next_device
-                .fetch_add(1, AtomicOrdering::Relaxed),
-        )
+        self.inner.machine.next_device.allocate()
     }
 
-    /// Mounts `fs` at `point`.
+    /// A cloneable handle to this machine's device id allocator, for
+    /// filesystems that create new subvolumes after mount.
+    pub fn device_allocator(&self) -> DeviceIdAllocator {
+        self.inner.machine.next_device.clone()
+    }
+
+    /// Mounts `fs` at `point`, granting what `grant` says for as long as
+    /// the mount exists.
     ///
     /// Checks only the table: the namespace that asks checks the point
     /// against the filesystem beneath it first (see [`Namespace::mount`]).
     pub fn mount(
         &self,
         point: &str,
-        fs: MountedFs<H>,
-        rights: FileSystemRights,
+        fs: MountedFs<S>,
+        grant: MountGrant,
     ) -> Result<(), MountError> {
         if !valid_point(point) {
             return Err(MountError::InvalidPoint(point.to_owned()));
@@ -698,14 +1478,23 @@ impl<H: Clone> MountTable<H> {
             }
         }
         let slot = empty.ok_or(MountError::TableFull)?;
+        if let MountedFs::Btrfs(btrfs) = &fs
+            && let Some(writable) = btrfs.writable()
+        {
+            let mut mounts = self.inner.machine.writable.lock();
+            mounts.retain(|mount| !mount.has_ended());
+            mounts.push(writable);
+        }
         // SAFETY: the slot is empty and the writer lock is held: no
         // resolution reads an empty slot's mount and no writer races.
         unsafe {
             *slot.mount.get() = Some(Mount {
                 point: point.to_owned(),
-                rights,
+                grant,
                 fs,
                 hold: MountHold::new(),
+                private_owner: (grant.sharing == MountSharing::Private)
+                    .then(|| Arc::new(spin::Mutex::new(None))),
             });
         }
         slot.point_len.store(point.len(), AtomicOrdering::Relaxed);
@@ -763,7 +1552,11 @@ impl<H: Clone> MountTable<H> {
         if retiring.held() {
             return Err(busy());
         }
-        drop(retiring.retire());
+        // As Linux's unmount, the call returns once what the filesystem
+        // held is on its device.
+        if let Some(mount) = retiring.retire() {
+            mount.fs.unmount().await;
+        }
         Ok(())
     }
 
@@ -801,29 +1594,52 @@ impl<H: Clone> MountTable<H> {
 /// resolved through stays pinned, so an unmount of that mount waits for
 /// it. An operation that outlives its caller's borrow (a stream across
 /// polls) keeps a [`HeldPath`] instead.
-pub struct Resolved<'a, H> {
-    fs: &'a MountedFs<H>,
-    rights: FileSystemRights,
+pub struct Resolved<'a, S: Storage> {
+    fs: &'a MountedFs<S>,
+    grant: MountGrant,
     absolute: Cow<'a, str>,
     /// Length of the mount point in `absolute`; `0` for the root mount.
     point_len: usize,
     /// The mount's hold; `None` for the namespace's root, which is never
     /// unmounted.
     hold: Option<&'a MountHold>,
+    /// Open filesystem handle when this resolution came from an open descriptor
+    /// or stream, allowing I/O on unlinked or unnamed files.
+    open: Option<&'a MountedOpenHandle>,
+    /// Exclusive container owner slot for [`MountSharing::Private`] mounts.
+    private_owner: Option<&'a PrivateMountOwner>,
     /// The pin on the mount's slot; `None` for the root, and for a view
     /// of a [`HeldPath`], which owns what it uses.
     _pin: Option<SlotPin<'a>>,
 }
 
-impl<'a, H: HostFileSystem> Resolved<'a, H> {
+impl<'a, S: Storage> Resolved<'a, S> {
+    /// Attaches an open handle to this resolution so operations dispatch
+    /// through the handle rather than re-resolving the path.
+    pub fn with_open(mut self, open: Option<&'a MountedOpenHandle>) -> Self {
+        self.open = open;
+        self
+    }
+
+    /// The attached open handle, when this resolution serves an open
+    /// descriptor or stream.
+    pub fn open(&self) -> Option<&'a MountedOpenHandle> {
+        self.open
+    }
     /// The filesystem, for reading.
-    pub fn fs(&self) -> &'a MountedFs<H> {
+    pub fn fs(&self) -> &'a MountedFs<S> {
         self.fs
     }
 
+    /// What the mount this resolved through grants: its rights, and
+    /// whether it is private or shared.
+    pub fn grant(&self) -> MountGrant {
+        self.grant
+    }
+
     /// The filesystem, for changing: refused when the mount is read-only.
-    pub fn writable(&self) -> FsResult<&'a MountedFs<H>> {
-        if self.rights.contains(FileSystemRights::WRITE) {
+    pub fn writable(&self) -> FsResult<&'a MountedFs<S>> {
+        if self.grant.rights.contains(FileSystemRights::WRITE) {
             Ok(self.fs)
         } else {
             Err(FsError::ReadOnly)
@@ -853,7 +1669,7 @@ impl<'a, H: HostFileSystem> Resolved<'a, H> {
 
     /// Whether `other` lies on the same mount, so a rename or link between
     /// the two can stay within one filesystem.
-    pub fn same_mount(&self, other: &Resolved<'_, H>) -> bool {
+    pub fn same_mount(&self, other: &Resolved<'_, S>) -> bool {
         self.mount_point() == other.mount_point()
     }
 
@@ -864,6 +1680,33 @@ impl<'a, H: HostFileSystem> Resolved<'a, H> {
         self.hold.cloned()
     }
 
+    /// Claims exclusive ownership of a [`MountSharing::Private`] mount for the
+    /// container identified by `owner`.
+    pub fn claim_private(&self, owner: u64) -> Result<PrivateMountClaim, PrivateMountClaimError> {
+        if self.grant.sharing != MountSharing::Private {
+            return Err(PrivateMountClaimError::NotPrivate);
+        }
+        let Some(owner_slot) = self.private_owner else {
+            return Err(PrivateMountClaimError::NotPrivate);
+        };
+        let mut slot = owner_slot.lock();
+        match slot.as_mut() {
+            None => {
+                *slot = Some((owner, 1));
+            }
+            Some((existing, count)) if *existing == owner => {
+                *count += 1;
+            }
+            Some(_) => {
+                return Err(PrivateMountClaimError::AlreadyClaimed);
+            }
+        }
+        Ok(PrivateMountClaim {
+            owner_slot: owner_slot.clone(),
+            owner,
+        })
+    }
+
     /// Whether the path names the root of its mount.
     pub fn is_mount_root(&self) -> bool {
         self.path().is_root()
@@ -872,58 +1715,64 @@ impl<'a, H: HostFileSystem> Resolved<'a, H> {
     /// An owned copy of this resolution, for an operation that keeps
     /// using the file after the caller's borrow ends. It holds the mount
     /// ([`MountHold`]) rather than pinning its slot.
-    pub fn held(&self) -> HeldPath<H> {
+    pub fn held(&self) -> HeldPath<S> {
+        self.held_open(self.open.cloned())
+    }
+
+    /// An owned copy of this resolution retaining `open` across polls so a
+    /// stream keeps an unlinked or unnamed file alive until it finishes.
+    pub fn held_open(&self, open: Option<MountedOpenHandle>) -> HeldPath<S> {
         HeldPath(Arc::new(HeldInner {
             fs: self.fs.clone(),
-            rights: self.rights,
+            grant: self.grant,
             absolute: String::from(&*self.absolute),
             point_len: self.point_len,
             hold: self.hold(),
+            open,
+            private_owner: self.private_owner.cloned(),
         }))
     }
 
     /// The whole of the regular file at this path, with the provenance of
     /// the layer that produced the bytes.
     pub async fn read_whole(&self) -> FsResult<FileContents> {
-        let path = self.path();
-        match self.fs {
-            MountedFs::Root(root) => root.read_whole(path).await,
-            MountedFs::Boot(boot) => boot.file_contents(path).map(FileContents::Boot),
-            MountedFs::Memory(fs) => read_all(fs, path).await.map(FileContents::Written),
-            MountedFs::Host(fs) => read_all(fs, path).await.map(FileContents::Written),
-        }
+        self.fs.read_whole(self.path()).await
     }
 }
 
 /// A resolution a stream keeps across polls: it owns the filesystem
 /// handle and the path, and holds the mount, so an unmount refuses with
 /// [`MountError::Busy`] until it is dropped. Clones share one copy.
-pub struct HeldPath<H>(Arc<HeldInner<H>>);
+pub struct HeldPath<S: Storage>(Arc<HeldInner<S>>);
 
-struct HeldInner<H> {
-    fs: MountedFs<H>,
-    rights: FileSystemRights,
+struct HeldInner<S: Storage> {
+    fs: MountedFs<S>,
+    grant: MountGrant,
     absolute: String,
     point_len: usize,
     hold: Option<MountHold>,
+    open: Option<MountedOpenHandle>,
+    private_owner: Option<PrivateMountOwner>,
 }
 
-impl<H> Clone for HeldPath<H> {
+impl<S: Storage> Clone for HeldPath<S> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<H: HostFileSystem> HeldPath<H> {
+impl<S: Storage> HeldPath<S> {
     /// The resolution this keeps, to operate through.
-    pub fn resolved(&self) -> Resolved<'_, H> {
+    pub fn resolved(&self) -> Resolved<'_, S> {
         let held = &*self.0;
         Resolved {
             fs: &held.fs,
-            rights: held.rights,
+            grant: held.grant,
             absolute: Cow::Borrowed(&held.absolute),
             point_len: held.point_len,
             hold: held.hold.as_ref(),
+            open: held.open.as_ref(),
+            private_owner: held.private_owner.as_ref(),
             _pin: None,
         }
     }
@@ -948,21 +1797,20 @@ pub enum FileContents {
 /// The whole of the regular file at `path` on `fs`.
 pub(crate) async fn read_all<F: FileSystem>(fs: &F, path: FsPath<'_>) -> FsResult<Bytes> {
     let metadata = fs.stat(path).await?;
-    match metadata.kind {
-        NodeKind::File => {}
-        NodeKind::Directory => return Err(FsError::IsDirectory),
-        NodeKind::Symlink => return Err(FsError::Invalid),
-    }
+    metadata.kind.require_regular()?;
     let size = usize::try_from(metadata.size).map_err(|_| FsError::Overflow)?;
+    if size == 0 {
+        return Ok(Bytes::new());
+    }
     let first = fs.read_at(path, 0, size).await?;
-    if first.len() == size {
+    if first.len() >= size {
         return Ok(first);
     }
     // A filesystem may answer in pieces (9p bounds one read by its
     // message size): gather the rest.
     let mut gathered = BytesMut::with_capacity(size);
     gathered.extend_from_slice(&first);
-    loop {
+    while gathered.len() < size {
         let chunk = fs
             .read_at(path, gathered.len() as u64, size - gathered.len())
             .await?;
@@ -996,19 +1844,19 @@ pub fn object_identity(metadata: &Metadata) -> ObjectIdentity {
 /// Resolution reads this tree's table and then each ancestor's, nearest
 /// first, with no lock: the chain of ancestors is fixed when the tree
 /// starts, and each table resolves lock-free.
-pub struct Namespace<H> {
+pub struct Namespace<S: Storage> {
     /// This tree's own mounts.
-    own: MountTable<H>,
+    own: MountTable<S>,
     /// The tables of the trees this one descends from, nearest first.
-    inherited: Arc<Vec<MountTable<H>>>,
+    inherited: Arc<Vec<MountTable<S>>>,
     /// The writable layer of the root.
     layer: MemoryFs,
     /// The root: `layer` over the boot image, as the filesystem a
     /// resolution that no mount claims borrows.
-    root: MountedFs<H>,
+    root: MountedFs<S>,
 }
 
-impl<H: Clone> Clone for Namespace<H> {
+impl<S: Storage> Clone for Namespace<S> {
     fn clone(&self) -> Self {
         Self {
             own: self.own.clone(),
@@ -1019,10 +1867,86 @@ impl<H: Clone> Clone for Namespace<H> {
     }
 }
 
-impl<H: Clone> Namespace<H> {
+impl<S: Storage> MountedFs<S> {
+    /// The whole of the regular file at `path`, with the provenance of the
+    /// layer that produced the bytes.
+    pub async fn read_whole(&self, path: FsPath<'_>) -> FsResult<FileContents> {
+        match self {
+            Self::Root(root) => root.read_whole(path).await,
+            Self::Boot(boot) => boot.file_contents(path).map(FileContents::Boot),
+            Self::Memory(fs) => read_all(fs, path).await.map(FileContents::Written),
+            Self::Host(fs) => read_all(fs, path).await.map(FileContents::Written),
+            Self::Erofs(fs) => read_all(fs, path).await.map(FileContents::Written),
+            Self::Btrfs(fs) => read_all(fs, path).await.map(FileContents::Written),
+        }
+    }
+
+    /// The stored Unix attributes for `path` on every filesystem that records
+    /// them (`MemoryFs`, `RootFs`, `HostShare`, `ErofsFs`, `BtrfsFs`), or
+    /// default boot-image attributes for `BootFs` which stores no Unix
+    /// ownership or mode bits.
+    pub async fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<UnixAttributes> {
+        match self {
+            Self::Memory(fs) => Ok(fs.unix_metadata(path)?.attributes),
+            Self::Root(root) => root.unix_attributes(path),
+            Self::Host(share) => share.unix_attributes(path).await,
+            Self::Erofs(fs) => fs.unix_attributes(path).await,
+            Self::Btrfs(fs) => fs.unix_attributes(path).await,
+            Self::Boot(_) => {
+                let meta = self.stat(path).await?;
+                Ok(root::BOOT_UNIX.inherited(meta.kind))
+            }
+        }
+    }
+
+    /// Updates Unix permission bits on filesystems that store them in memory
+    /// (`MemoryFs` and `RootFs`'s writable upper layer). No-op on backends
+    /// whose host or on-disk metadata sets creation permissions itself.
+    pub fn apply_created_permissions(&self, path: FsPath<'_>, permissions: u32, now: u64) {
+        let mode = permissions & 0o7777;
+        match self {
+            Self::Memory(fs) => {
+                let _ = fs.set_permissions(path, mode, now);
+            }
+            Self::Root(root) => {
+                let _ = root.upper().set_permissions(path, mode, now);
+            }
+            Self::Boot(_) | Self::Host(_) | Self::Erofs(_) | Self::Btrfs(_) => {}
+        }
+    }
+
+    /// Ends the filesystem as it leaves the mount table: a writable btrfs
+    /// mount commits and lets its device go first.
+    async fn unmount(&self) {
+        if let Self::Btrfs(btrfs) = self {
+            btrfs.unmount().await;
+        }
+    }
+}
+
+impl<S: Storage> Namespace<S> {
+    /// Makes every writable btrfs mount on the machine durable, in every
+    /// tree and including those still ending after an unmount: what the
+    /// kernel does before it powers off, as Linux syncs and unmounts.
+    pub async fn sync_writable_mounts(&self) {
+        let mounts: Vec<WritableMount> = {
+            let mut mounts = self.own.inner.machine.writable.lock();
+            mounts.retain(|mount| !mount.has_ended());
+            mounts.clone()
+        };
+        // Each mount commits through its own service and device; at most a
+        // table's worth of them wait at once.
+        futures::StreamExt::for_each_concurrent(
+            futures::stream::iter(&mounts),
+            MAX_MOUNTS,
+            WritableMount::settle,
+        )
+        .await;
+    }
+
     /// The root namespace, over `table`: the kernel's own tree, with a
     /// fresh root layer and no ancestors.
-    pub fn new(table: MountTable<H>) -> Self {
+    pub fn new(table: MountTable<S>) -> Self {
         Self::over(
             table,
             Arc::new(Vec::new()),
@@ -1030,7 +1954,7 @@ impl<H: Clone> Namespace<H> {
         )
     }
 
-    fn over(own: MountTable<H>, inherited: Arc<Vec<MountTable<H>>>, layer: MemoryFs) -> Self {
+    fn over(own: MountTable<S>, inherited: Arc<Vec<MountTable<S>>>, layer: MemoryFs) -> Self {
         let root = MountedFs::Root(RootFs::new(layer.clone(), own.boot().clone()));
         Self {
             own,
@@ -1072,33 +1996,33 @@ impl<H: Clone> Namespace<H> {
     }
 
     /// This tree's own mounts.
-    pub fn table(&self) -> &MountTable<H> {
+    pub fn table(&self) -> &MountTable<S> {
         &self.own
     }
 
     /// Every table this tree sees, its own first.
-    fn tables(&self) -> impl Iterator<Item = &MountTable<H>> {
+    fn tables(&self) -> impl Iterator<Item = &MountTable<S>> {
         core::iter::once(&self.own).chain(self.inherited.iter())
     }
 }
 
-impl<H: HostFileSystem> Namespace<H> {
+impl<S: Storage> Namespace<S> {
     /// Resolves a normalized absolute guest path (as
     /// [`crate::resolve_child_path`] produces) to the mount that owns it.
     ///
     /// The longest mount point wins; between two at the same point, the
     /// nearer tree's, so a tree may mount over what it inherited.
-    pub fn resolve<'a>(&'a self, absolute: &'a str) -> FsResult<Resolved<'a, H>> {
+    pub fn resolve<'a>(&'a self, absolute: &'a str) -> FsResult<Resolved<'a, S>> {
         self.resolve_path(Cow::Borrowed(absolute))
     }
 
-    fn resolve_path<'a>(&'a self, absolute: Cow<'a, str>) -> FsResult<Resolved<'a, H>> {
+    fn resolve_path<'a>(&'a self, absolute: Cow<'a, str>) -> FsResult<Resolved<'a, S>> {
         if !absolute.starts_with('/') {
             return Err(FsError::Invalid);
         }
         // Nearest table first, and a farther one only for a strictly
         // longer point: the nearer tree wins a tie.
-        let mut found: Option<Located<'a, H>> = None;
+        let mut found: Option<Located<'a, S>> = None;
         for table in self.tables() {
             let longer_than = found.as_ref().map_or(0, |best| best.point_len);
             if let Some(located) = table.inner.longest_match(&absolute, longer_than) {
@@ -1112,18 +2036,22 @@ impl<H: HostFileSystem> Namespace<H> {
                 pin,
             }) => Resolved {
                 fs: &mount.fs,
-                rights: mount.rights,
+                grant: mount.grant,
                 absolute,
                 point_len,
                 hold: Some(&mount.hold),
+                open: None,
+                private_owner: mount.private_owner.as_ref(),
                 _pin: Some(pin),
             },
             None => Resolved {
                 fs: &self.root,
-                rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                grant: ROOT_GRANT,
                 absolute,
                 point_len: 0,
                 hold: None,
+                open: None,
+                private_owner: None,
                 _pin: None,
             },
         };
@@ -1142,7 +2070,7 @@ impl<H: HostFileSystem> Namespace<H> {
         &'a self,
         absolute: &'a str,
         follow: Follow<'_>,
-    ) -> FsResult<Resolved<'a, H>> {
+    ) -> FsResult<Resolved<'a, S>> {
         let mut resolved = self.resolve(absolute)?;
         let Follow::Within(floor) = follow else {
             return Ok(resolved);
@@ -1177,16 +2105,34 @@ impl<H: HostFileSystem> Namespace<H> {
     /// Every entry of the directory at `absolute`, with the mount points
     /// directly inside it, which the filesystem beneath may not have.
     pub async fn list(&self, absolute: &str) -> FsResult<Vec<DirEntry>> {
+        self.list_dir(absolute, None).await
+    }
+
+    /// Every entry of an open directory handle resolved at `absolute`.
+    pub async fn list_open(
+        &self,
+        absolute: &str,
+        open: &MountedOpenHandle,
+    ) -> FsResult<Vec<DirEntry>> {
+        self.list_dir(absolute, Some(open)).await
+    }
+
+    async fn list_dir(
+        &self,
+        absolute: &str,
+        open: Option<&MountedOpenHandle>,
+    ) -> FsResult<Vec<DirEntry>> {
         /// Entries one listing request asks for.
         const BATCH: usize = 256;
         let resolved = self.resolve(absolute)?;
+        let dir = match open {
+            Some(handle) => resolved.fs().open_dir_handle(handle).await?,
+            None => resolved.fs().open_dir(resolved.path()).await?,
+        };
         let mut entries: Vec<DirEntry> = Vec::new();
         let mut cookie = DirCookie::START;
         loop {
-            let batch = resolved
-                .fs()
-                .read_dir(resolved.path(), cookie, BATCH)
-                .await?;
+            let batch = dir.read(cookie, BATCH).await?;
             let complete = batch.len() < BATCH;
             if let Some(last) = batch.last() {
                 cookie = last.next;
@@ -1220,18 +2166,27 @@ impl<H: HostFileSystem> Namespace<H> {
     /// Removes the empty directory `absolute`. A mount point, or a
     /// directory with a mount point below it, is in use:
     /// [`FsError::Busy`].
-    pub async fn remove_directory(&self, absolute: &str) -> FsResult<()> {
+    pub async fn remove_directory(&self, absolute: &str, now: u64) -> FsResult<()> {
         let resolved = self.resolve(absolute)?;
         if resolved.is_mount_root() || self.holds_mounts(absolute) {
             return Err(FsError::Busy);
         }
-        resolved.writable()?.remove_directory(resolved.path()).await
+        resolved
+            .writable()?
+            .remove_directory(resolved.path(), now)
+            .await
     }
 
     /// Renames within one mount; across two, [`FsError::CrossDevice`]. A
     /// directory with a mount point below it stays where it is:
-    /// [`FsError::Busy`].
-    pub async fn rename(&self, source: &str, destination: &str, now: u64) -> FsResult<()> {
+    /// [`FsError::Busy`]. `mode` is as [`FileSystem::rename`] takes it.
+    pub async fn rename(
+        &self,
+        source: &str,
+        destination: &str,
+        mode: RenameMode,
+        now: u64,
+    ) -> FsResult<()> {
         if self.holds_mounts(source) {
             return Err(FsError::Busy);
         }
@@ -1245,7 +2200,7 @@ impl<H: HostFileSystem> Namespace<H> {
         }
         source
             .writable()?
-            .rename(source.path(), destination.path(), now)
+            .rename(source.path(), destination.path(), mode, now)
             .await
     }
 
@@ -1265,14 +2220,54 @@ impl<H: HostFileSystem> Namespace<H> {
             .await
     }
 
+    /// Creates and opens an unnamed temporary file (`O_TMPFILE`) in the mount
+    /// containing `directory`.
+    pub async fn open_tmpfile(
+        &self,
+        directory: &str,
+        exclusive: bool,
+        now: u64,
+    ) -> FsResult<(Opened<MountedOpenHandle>, Option<MountHold>)> {
+        let resolved = self.resolve(directory)?;
+        let opened = resolved
+            .writable()?
+            .open_tmpfile(resolved.path(), exclusive, now)
+            .await?;
+        Ok((opened, resolved.hold()))
+    }
+
+    /// Gives an open handle (`O_TMPFILE` or open file) the name `link` on the
+    /// same mount as `source_mount_path`; across two mounts,
+    /// [`FsError::CrossDevice`].
+    pub async fn link_open(
+        &self,
+        source_mount_path: &str,
+        handle: &MountedOpenHandle,
+        link: &str,
+        now: u64,
+    ) -> FsResult<()> {
+        let source = self.resolve(source_mount_path)?;
+        let link = self.resolve(link)?;
+        if !source.same_mount(&link) {
+            return Err(FsError::CrossDevice);
+        }
+        if link.is_mount_root() {
+            return Err(FsError::NotPermitted);
+        }
+        source
+            .writable()?
+            .link_handle(handle, link.path(), now)
+            .await
+    }
+
     /// Mounts `fs` at the point `cap` names, after checking the point
     /// against what lies beneath it: its parent must be a directory, and
     /// the point itself a directory or nothing.
     pub async fn mount(
         &self,
         cap: &MountCap,
-        fs: MountedFs<H>,
-        rights: FileSystemRights,
+        fs: MountedFs<S>,
+        grant: MountGrant,
     ) -> Result<(), MountError> {
         let point = cap.point();
         if !valid_point(point) {
@@ -1285,14 +2280,13 @@ impl<H: HostFileSystem> Namespace<H> {
         let parent = crate::parent_path(point);
         // The cap is the authority over where a mount goes, so the parent's
         // links are followed anywhere in the namespace.
-        match self
+        let parent_kind = self
             .stat(parent, Follow::Within("/"))
             .await
             .map_err(refuse)?
-            .kind
-        {
-            NodeKind::Directory => {}
-            NodeKind::File | NodeKind::Symlink => return Err(refuse(FsError::NotDirectory)),
+            .kind;
+        if parent_kind != NodeKind::Directory {
+            return Err(refuse(FsError::NotDirectory));
         }
         match self.stat(point, Follow::No).await {
             Ok(metadata) if metadata.kind != NodeKind::Directory => {
@@ -1301,7 +2295,7 @@ impl<H: HostFileSystem> Namespace<H> {
             Ok(_) | Err(FsError::NoEntry) => {}
             Err(error) => return Err(refuse(error)),
         }
-        self.own.mount(point, fs, rights)
+        self.own.mount(point, fs, grant)
     }
 
     /// Unmounts the filesystem this tree mounted at the point `cap` names,

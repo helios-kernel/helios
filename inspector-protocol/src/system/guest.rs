@@ -1,16 +1,19 @@
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::{
-    instances as host_instances, profiling as host_profiling, programs as host_programs,
-    stats as host_stats, tracing as host_tracing,
+    instances as host_instances, processors as host_processors, profiling as host_profiling,
+    programs as host_programs, stats as host_stats, tracing as host_tracing,
 };
 
 use crate::error::DispatchError;
 use crate::system::accept;
 use crate::system::server::{self, Dispatcher, Invocations};
 
-use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
+use super::bindings::helios::system::{
+    filters, instances, processors, profiling, programs, stats, tracing,
+};
 use super::methods::{
-    INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED,
+    INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROCESSORS_INSTANCE,
+    PROCESSORS_OFFLINE, PROCESSORS_ONLINE, PROCESSORS_SETS, PROFILING_CLEAR, PROFILING_FOLDED,
     PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES, PROFILING_METRICS,
     PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE, PROFILING_SET_ENABLED,
     PROFILING_SET_INSTRUCTION_SAMPLING, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
@@ -70,6 +73,9 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (STATS_INSTANCE, STATS_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_KILL)
+            | (PROCESSORS_INSTANCE, PROCESSORS_SETS)
+            | (PROCESSORS_INSTANCE, PROCESSORS_OFFLINE)
+            | (PROCESSORS_INSTANCE, PROCESSORS_ONLINE)
             | (TRACING_INSTANCE, TRACING_RECENT)
             | (TRACING_INSTANCE, TRACING_SET_TARGET_ENABLED)
             | (PROFILING_INSTANCE, PROFILING_SET_ENABLED)
@@ -198,6 +204,50 @@ async fn dispatch(
                 source,
             })
         }
+        (PROCESSORS_INSTANCE, PROCESSORS_SETS) => {
+            if !payload.is_empty() {
+                return Err(DispatchError::UnexpectedPayload {
+                    operation: "processors.sets",
+                });
+            }
+            let sets = convert_processor_sets(host_processors::sets());
+            postcard::to_allocvec(&sets).map_err(|source| DispatchError::Encode {
+                operation: "processors.sets",
+                source,
+            })
+        }
+        (PROCESSORS_INSTANCE, PROCESSORS_OFFLINE) => {
+            let processor =
+                postcard::from_bytes::<processors::ProcessorId>(payload).map_err(|source| {
+                    DispatchError::Decode {
+                        operation: "processors.offline",
+                        source,
+                    }
+                })?;
+            let answer = host_processors::offline(processor)
+                .await
+                .map_err(convert_offline_error);
+            postcard::to_allocvec(&answer).map_err(|source| DispatchError::Encode {
+                operation: "processors.offline",
+                source,
+            })
+        }
+        (PROCESSORS_INSTANCE, PROCESSORS_ONLINE) => {
+            let processor =
+                postcard::from_bytes::<processors::ProcessorId>(payload).map_err(|source| {
+                    DispatchError::Decode {
+                        operation: "processors.online",
+                        source,
+                    }
+                })?;
+            let answer = host_processors::online(processor)
+                .await
+                .map_err(convert_online_error);
+            postcard::to_allocvec(&answer).map_err(|source| DispatchError::Encode {
+                operation: "processors.online",
+                source,
+            })
+        }
         (TRACING_INSTANCE, TRACING_SET_TARGET_ENABLED) => {
             let (target, enabled): (String, bool) =
                 postcard::from_bytes(payload).map_err(|source| DispatchError::Decode {
@@ -209,6 +259,7 @@ async fn dispatch(
                     host_tracing::TargetError::UnknownTarget(name) => {
                         tracing::TargetError::UnknownTarget(name)
                     }
+                    host_tracing::TargetError::Denied => tracing::TargetError::Denied,
                 });
             postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "tracing.set-target-enabled",
@@ -222,9 +273,8 @@ async fn dispatch(
                     source,
                 })?;
             let events = host_tracing::recent(&convert_filter(filter), limit)
-                .into_iter()
-                .map(convert_event)
-                .collect::<Vec<_>>();
+                .map(|events| events.into_iter().map(convert_event).collect::<Vec<_>>())
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&events).map_err(|source| DispatchError::Encode {
                 operation: "tracing.recent",
                 source,
@@ -236,8 +286,8 @@ async fn dispatch(
                     operation: "profiling.set-enabled",
                     source,
                 })?;
-            host_profiling::set_enabled(enabled);
-            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+            let result = host_profiling::set_enabled(enabled).map_err(convert_control_error);
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "profiling.set-enabled",
                 source,
             })
@@ -248,8 +298,8 @@ async fn dispatch(
                     operation: "profiling.clear",
                 });
             }
-            host_profiling::clear();
-            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+            let result = host_profiling::clear().map_err(convert_control_error);
+            postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "profiling.clear",
                 source,
             })
@@ -261,9 +311,13 @@ async fn dispatch(
                     source,
                 })?;
             let samples = host_profiling::folded(&convert_profile_filter(filter), limit)
-                .into_iter()
-                .map(convert_profile_sample)
-                .collect::<Vec<_>>();
+                .map(|samples| {
+                    samples
+                        .into_iter()
+                        .map(convert_profile_sample)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.folded",
                 source,
@@ -276,9 +330,13 @@ async fn dispatch(
                     source,
                 })?;
             let samples = host_profiling::metrics(&convert_metric_filter(filter), limit)
-                .into_iter()
-                .map(convert_metric_sample)
-                .collect::<Vec<_>>();
+                .map(|samples| {
+                    samples
+                        .into_iter()
+                        .map(convert_metric_sample)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(convert_filter_error);
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.metrics",
                 source,
@@ -435,8 +493,32 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Diagnostics(grant) => {
+                host_programs::CapabilityGrant::Diagnostics(host_programs::DiagnosticsGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_diagnostics_right_to_host)
+                        .collect(),
+                })
+            }
+            programs::CapabilityGrant::Machine(grant) => {
+                host_programs::CapabilityGrant::Machine(host_programs::MachineGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_machine_right_to_host)
+                        .collect(),
+                })
+            }
         })
         .collect()
+}
+
+fn map_machine_right_to_host(right: programs::MachineRight) -> host_programs::MachineRight {
+    match right {
+        programs::MachineRight::ControlProcessors => host_programs::MachineRight::ControlProcessors,
+    }
 }
 
 fn map_filesystem_right_to_host(
@@ -512,6 +594,16 @@ fn map_device_class_to_host(class: programs::DeviceClass) -> host_programs::Devi
     }
 }
 
+fn map_diagnostics_right_to_host(
+    right: programs::DiagnosticsRight,
+) -> host_programs::DiagnosticsRight {
+    match right {
+        programs::DiagnosticsRight::ObserveMachine => {
+            host_programs::DiagnosticsRight::ObserveMachine
+        }
+    }
+}
+
 fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::ExecErrorKind {
     match kind {
         host_programs::ExecErrorKind::InvalidBinary => programs::ExecErrorKind::InvalidBinary,
@@ -526,6 +618,8 @@ fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::Ex
         host_programs::ExecErrorKind::OutOfMemory => programs::ExecErrorKind::OutOfMemory,
         host_programs::ExecErrorKind::Unavailable => programs::ExecErrorKind::Unavailable,
         host_programs::ExecErrorKind::Internal => programs::ExecErrorKind::Internal,
+        host_programs::ExecErrorKind::NotFound => programs::ExecErrorKind::NotFound,
+        host_programs::ExecErrorKind::Io => programs::ExecErrorKind::Io,
     }
 }
 
@@ -543,11 +637,19 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
                 .into_iter()
                 .map(convert_processor)
                 .collect(),
+            guest_isa_level: sample.processors.guest_isa_level,
+            guest_isa_extras: sample.processors.guest_isa_extras,
         },
         memory: stats::Memory {
             total_bytes: sample.memory.total_bytes,
             available_bytes: sample.memory.available_bytes,
             pressure: convert_memory_pressure(sample.memory.pressure),
+            nodes: sample
+                .memory
+                .nodes
+                .into_iter()
+                .map(convert_memory_node)
+                .collect(),
         },
         block: sample.block.map(convert_block_device),
         iommu: sample.iommu.map(convert_iommu),
@@ -558,6 +660,15 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         devices: sample.devices.into_iter().map(convert_device).collect(),
         inputs: sample.inputs.into_iter().map(convert_input).collect(),
         audio: sample.audio.into_iter().map(convert_audio_stream).collect(),
+    }
+}
+
+fn convert_memory_node(node: host_stats::MemoryNode) -> stats::MemoryNode {
+    stats::MemoryNode {
+        id: node.id,
+        total_bytes: node.total_bytes,
+        available_bytes: node.available_bytes,
+        off_node_allocations: node.off_node_allocations,
     }
 }
 
@@ -736,10 +847,64 @@ fn convert_kill_error(error: host_instances::KillError) -> instances::KillError 
     }
 }
 
+fn convert_processor_sets(sets: host_processors::ProcessorSets) -> processors::ProcessorSets {
+    processors::ProcessorSets {
+        possible: sets.possible,
+        bootstrap: sets.bootstrap,
+        online: sets.online,
+    }
+}
+
+fn convert_offline_error(error: host_processors::OfflineError) -> processors::OfflineError {
+    use host_processors::OfflineError as Host;
+    use processors::OfflineError as Wire;
+
+    match error {
+        Host::NotPossible(possible) => Wire::NotPossible(possible),
+        Host::Bootstrap => Wire::Bootstrap,
+        Host::CurrentProcessor => Wire::CurrentProcessor,
+        Host::NotOnline => Wire::NotOnline,
+        Host::Refused(refusal) => Wire::Refused(convert_offline_refusal(refusal)),
+        Host::Denied => Wire::Denied,
+    }
+}
+
+fn convert_offline_refusal(refusal: host_processors::OfflineRefusal) -> processors::OfflineRefusal {
+    match refusal {
+        host_processors::OfflineRefusal::PinnedTasks(live) => {
+            processors::OfflineRefusal::PinnedTasks(live)
+        }
+        host_processors::OfflineRefusal::NetworkStarting => {
+            processors::OfflineRefusal::NetworkStarting
+        }
+    }
+}
+
+fn convert_online_error(error: host_processors::OnlineError) -> processors::OnlineError {
+    use host_processors::OnlineError as Host;
+    use processors::OnlineError as Wire;
+
+    match error {
+        Host::NotPossible(possible) => Wire::NotPossible(possible),
+        Host::NotOffline => Wire::NotOffline,
+        Host::Denied => Wire::Denied,
+    }
+}
+
 fn convert_filter(filter: tracing::Filter) -> host_tracing::Filter {
     host_tracing::Filter {
         min_level: filter.min_level.map(convert_level_to_local),
         target_prefixes: filter.target_prefixes,
+    }
+}
+
+fn convert_filter_error(error: host_tracing::FilterError) -> filters::FilterError {
+    use filters::FilterError as Wire;
+    use host_tracing::FilterError as Host;
+
+    match error {
+        Host::TooManyPrefixes(limit) => Wire::TooManyPrefixes(limit),
+        Host::PrefixTooLong(limit) => Wire::PrefixTooLong(limit),
     }
 }
 
@@ -753,6 +918,13 @@ fn convert_raw_profile_error(error: host_profiling::RawProfileError) -> profilin
         Host::MalformedSection(section) => Wire::MalformedSection(convert_profile_section(section)),
         Host::OutOfRange(len) => Wire::OutOfRange(len),
         Host::ReadTooLarge(limit) => Wire::ReadTooLarge(limit),
+        Host::Denied => Wire::Denied,
+    }
+}
+
+fn convert_control_error(error: host_profiling::ControlError) -> profiling::ControlError {
+    match error {
+        host_profiling::ControlError::Denied => profiling::ControlError::Denied,
     }
 }
 
@@ -796,6 +968,9 @@ fn convert_instruction_profile_error(
     match error {
         host_profiling::InstructionProfileError::NotCaptured => {
             profiling::InstructionProfileError::NotCaptured
+        }
+        host_profiling::InstructionProfileError::Denied => {
+            profiling::InstructionProfileError::Denied
         }
     }
 }

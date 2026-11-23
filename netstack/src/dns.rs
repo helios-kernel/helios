@@ -4,18 +4,24 @@ use crate::{IpAddress, Ipv4Address, Ipv6Address};
 use arrayvec::ArrayVec;
 
 pub const DNS_PORT: u16 = 53;
+/// Default TCP/UDP port for `https` origins, which queries `host` directly
+/// rather than `_<port>._https.<host>` (RFC 9460 section 9.1).
+pub const HTTPS_DEFAULT_PORT: u16 = 443;
 /// Maximum address records collected from one response, across both
 /// address families.
 pub const DNS_MAX_ADDRESS_RECORDS: usize = 32;
+/// Maximum ALPN protocol identifiers collected from one `HTTPS` record.
+pub const DNS_MAX_ALPN_IDS: usize = 16;
 
-/// `CNAME` links one response may chain from the queried name: Unbound's
-/// default `max-query-restarts`, the limit it puts on the chain it will
-/// follow. A longer chain is not followed and its far end is not trusted.
+/// `CNAME` and `AliasMode` links one lookup may chain from the queried name:
+/// Unbound's default `max-query-restarts`, the limit it puts on the chain it
+/// will follow. A longer chain is not followed and its far end is not trusted.
 pub const DNS_MAX_CNAME_CHAIN: usize = 11;
 
 const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
 const TYPE_AAAA: u16 = 28;
+const TYPE_HTTPS: u16 = 65;
 const CLASS_IN: u16 = 1;
 /// The first question starts right after the 12-byte header (RFC 1035
 /// section 4.1.1).
@@ -24,13 +30,22 @@ const QUESTION_OFFSET: usize = 12;
 /// 255 octets (RFC 1035 section 2.3.4).
 const MAX_NAME_OCTETS: usize = 255;
 
-/// Which address family a question asks for.
+const SVC_PARAM_MANDATORY: u16 = 0;
+const SVC_PARAM_ALPN: u16 = 1;
+const SVC_PARAM_NO_DEFAULT_ALPN: u16 = 2;
+const SVC_PARAM_PORT: u16 = 3;
+const SVC_PARAM_IPV4HINT: u16 = 4;
+const SVC_PARAM_IPV6HINT: u16 = 6;
+
+/// Which resource record type a question asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DnsRecordType {
     /// `A`: IPv4 host address.
     A,
     /// `AAAA`: IPv6 host address.
     Aaaa,
+    /// `HTTPS` (RFC 9460 Type 65): service binding for an `https` origin.
+    Https,
 }
 
 impl DnsRecordType {
@@ -38,8 +53,213 @@ impl DnsRecordType {
         match self {
             Self::A => TYPE_A,
             Self::Aaaa => TYPE_AAAA,
+            Self::Https => TYPE_HTTPS,
         }
     }
+}
+
+/// DNS header `RCODE` (RFC 1035 section 4.1.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnsRcode {
+    /// `0`: no error condition (`NOERROR`).
+    NoError,
+    /// `3`: queried domain name does not exist (`NXDOMAIN`).
+    NxDomain,
+    /// Any other response code (`FORMERR`, `SERVFAIL`, `NOTIMP`, `REFUSED`, ...).
+    Other(u8),
+}
+
+/// Canonical uncompressed DNS domain name in wire format (`<= 255` octets,
+/// terminating root `0` octet included).
+///
+/// Equality and hashing ignore ASCII case per RFC 1035 section 2.3.3.
+#[derive(Clone, Copy)]
+pub struct DnsWireName {
+    octets: [u8; MAX_NAME_OCTETS],
+    len: u8,
+}
+
+impl DnsWireName {
+    /// Encodes `host` (dotted labels, with an optional single trailing dot)
+    /// into uncompressed wire format.
+    pub fn from_host(host: &str) -> Option<Self> {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        let mut octets = [0u8; MAX_NAME_OCTETS];
+        let mut offset = 0usize;
+        for label in host.split('.') {
+            if label.is_empty() || label.len() > 63 {
+                return None;
+            }
+            let end = offset + 1 + label.len();
+            if end >= MAX_NAME_OCTETS {
+                return None;
+            }
+            octets[offset] = label.len() as u8;
+            octets[offset + 1..end].copy_from_slice(label.as_bytes());
+            offset = end;
+        }
+        octets[offset] = 0;
+        Some(Self {
+            octets,
+            len: (offset + 1) as u8,
+        })
+    }
+
+    /// Encodes the RFC 9460 section 9.1 `QNAME` for an `https` origin:
+    /// `host` when `port == 443`, and `_<port>._https.<host>` otherwise.
+    pub fn https_qname(host: &str, port: u16) -> Option<Self> {
+        let host_wire = Self::from_host(host)?;
+        if port == HTTPS_DEFAULT_PORT {
+            return Some(host_wire);
+        }
+        let mut port_digits = [0u8; 5];
+        let digit_len = encode_u16_decimal(port, &mut port_digits);
+        let port_label_len = 1 + digit_len;
+        let https_label = b"_https";
+        let prefix_len = (1 + port_label_len) + (1 + https_label.len());
+        let host_slice = host_wire.as_wire();
+        let total = prefix_len + host_slice.len();
+        if total > MAX_NAME_OCTETS {
+            return None;
+        }
+        let mut octets = [0u8; MAX_NAME_OCTETS];
+        octets[0] = port_label_len as u8;
+        octets[1] = b'_';
+        octets[2..2 + digit_len].copy_from_slice(&port_digits[..digit_len]);
+        let https_offset = 1 + port_label_len;
+        octets[https_offset] = https_label.len() as u8;
+        octets[https_offset + 1..prefix_len].copy_from_slice(https_label);
+        octets[prefix_len..total].copy_from_slice(host_slice);
+        Some(Self {
+            octets,
+            len: total as u8,
+        })
+    }
+
+    /// Uncompressed wire octets including the terminating root `0` octet.
+    pub fn as_wire(&self) -> &[u8] {
+        &self.octets[..usize::from(self.len)]
+    }
+
+    /// Whether this name is the DNS root (`.`).
+    pub const fn is_root(&self) -> bool {
+        self.len == 1 && self.octets[0] == 0
+    }
+
+    /// Case-insensitive wire-name equality (RFC 1035 section 2.3.3).
+    pub fn eq_ignore_ascii_case(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        let left = self.as_wire();
+        let right = other.as_wire();
+        let mut offset = 0usize;
+        while offset < left.len() {
+            let len = usize::from(left[offset]);
+            if usize::from(right[offset]) != len {
+                return false;
+            }
+            if len == 0 {
+                return true;
+            }
+            let start = offset + 1;
+            let end = start + len;
+            if !left[start..end].eq_ignore_ascii_case(&right[start..end]) {
+                return false;
+            }
+            offset = end;
+        }
+        false
+    }
+
+    fn from_wire(bytes: &[u8], offset: usize) -> Option<Self> {
+        let mut octets = [0u8; MAX_NAME_OCTETS];
+        let mut out = 0usize;
+        for label in Labels::new(bytes, offset) {
+            let label = label.ok()?;
+            let end = out + 1 + label.len();
+            if end >= MAX_NAME_OCTETS {
+                return None;
+            }
+            octets[out] = label.len() as u8;
+            octets[out + 1..end].copy_from_slice(label);
+            out = end;
+        }
+        octets[out] = 0;
+        Some(Self {
+            octets,
+            len: (out + 1) as u8,
+        })
+    }
+}
+
+impl PartialEq for DnsWireName {
+    fn eq(&self, other: &Self) -> bool {
+        self.eq_ignore_ascii_case(other)
+    }
+}
+
+impl Eq for DnsWireName {}
+
+impl core::fmt::Debug for DnsWireName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "\"")?;
+        if self.is_root() {
+            return write!(f, ".\"");
+        }
+        let wire = self.as_wire();
+        let mut offset = 0usize;
+        let mut first = true;
+        while offset < wire.len() {
+            let len = usize::from(wire[offset]);
+            if len == 0 {
+                break;
+            }
+            if !first {
+                write!(f, ".")?;
+            }
+            first = false;
+            let label = &wire[offset + 1..offset + 1 + len];
+            match core::str::from_utf8(label) {
+                Ok(text) => write!(f, "{text}")?,
+                Err(_) => write!(f, "{label:?}")?,
+            }
+            offset += 1 + len;
+        }
+        write!(f, "\"")
+    }
+}
+
+/// Service parameters decoded from a usable `ServiceMode` `HTTPS` record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsHttpsRecord<'a> {
+    /// ALPN protocol identifiers from `SvcParamKey` 1, in wire order.
+    pub alpn: ArrayVec<&'a str, DNS_MAX_ALPN_IDS>,
+    /// Alternative port from `SvcParamKey` 3, when overridden.
+    pub port: Option<u16>,
+    /// Minimum TTL across the answer chain and matching `HTTPS` RRSet, in seconds.
+    pub ttl_seconds: u32,
+}
+
+/// What a validated Type 65 (`HTTPS`) DNS response means for its question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DnsHttpsOutcome<'a> {
+    /// A usable `ServiceMode` (`SvcPriority > 0`) record won.
+    Service(DnsHttpsRecord<'a>),
+    /// An `AliasMode` (`SvcPriority == 0`) record pointed at `target`, whose
+    /// target records were not included in this packet and must be queried.
+    Alias {
+        target: DnsWireName,
+        ttl_seconds: u32,
+        /// Number of `CNAME` + `AliasMode` hops consumed inside this packet.
+        hops: usize,
+    },
+    /// Definitive absence: `NXDOMAIN`, `NODATA`, `AliasMode` `.`, an
+    /// incompatible/malformed RRSet, or an alias chain exceeding the bound.
+    NoRecord,
+    /// The server answered our question with a failure `RCODE` (such as
+    /// `SERVFAIL` or `REFUSED`).
+    ServerFailure(u8),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +312,7 @@ impl<'a> DnsResponse<'a> {
             return None;
         }
         let flags = read_u16(bytes, 2)?;
-        if flags & 0x8000 == 0 || flags & 0x000f != 0 {
+        if flags & 0x8000 == 0 || flags & 0x7800 != 0 {
             return None;
         }
         Some(Self { bytes })
@@ -105,6 +325,15 @@ impl<'a> DnsResponse<'a> {
         u16::from_be_bytes([self.bytes[0], self.bytes[1]])
     }
 
+    /// The response code carried in the DNS header.
+    pub fn rcode(self) -> DnsRcode {
+        match self.bytes[3] & 0x0f {
+            0 => DnsRcode::NoError,
+            3 => DnsRcode::NxDomain,
+            other => DnsRcode::Other(other),
+        }
+    }
+
     /// The addresses this response gives for `query`, or `None` when it
     /// is not an answer to it.
     ///
@@ -115,6 +344,9 @@ impl<'a> DnsResponse<'a> {
     /// collected; records the forger had no reason to know the query for
     /// are not.
     pub fn message(self, query: DnsQuery<'_>) -> Option<DnsMessage> {
+        if self.rcode() != DnsRcode::NoError {
+            return None;
+        }
         let bytes = self.bytes;
         let id = self.id();
         let question_count = read_u16(bytes, 4)?;
@@ -192,6 +424,180 @@ impl<'a> DnsResponse<'a> {
 
         Some(DnsMessage { id, addresses })
     }
+
+    /// Evaluates this response against a Type 65 (`HTTPS`) question for
+    /// `qname` (RFC 9460), following at most `max_hops` `CNAME`/`AliasMode`
+    /// transitions (capped at [`DNS_MAX_CNAME_CHAIN`]).
+    ///
+    /// Returns `None` when the packet does not echo `(qname, HTTPS, IN)` as
+    /// its sole question or when any answer record header runs past the end
+    /// of the datagram, so off-path or truncated packets are ignored rather
+    /// than accepted.
+    pub fn https_outcome(
+        self,
+        qname: &DnsWireName,
+        max_hops: usize,
+    ) -> Option<DnsHttpsOutcome<'a>> {
+        let bytes = self.bytes;
+        let question_count = read_u16(bytes, 4)?;
+        let answer_count = read_u16(bytes, 6)?;
+        if question_count != 1 {
+            return None;
+        }
+        let question_name = QUESTION_OFFSET;
+        let mut offset = skip_name(bytes, question_name)?;
+        let question_type = read_u16(bytes, offset)?;
+        let question_class = read_u16(bytes, offset.checked_add(2)?)?;
+        offset = offset.checked_add(4)?;
+        if question_type != TYPE_HTTPS
+            || question_class != CLASS_IN
+            || !name_equals_wire(bytes, question_name, qname)?
+        {
+            return None;
+        }
+        let answers_start = offset;
+
+        // Validate answer-section framing up front so a truncated packet
+        // never masquerades as NODATA or NXDOMAIN.
+        let mut framing_cursor = answers_start;
+        for _ in 0..answer_count {
+            read_record(bytes, &mut framing_cursor)?;
+        }
+
+        match self.rcode() {
+            DnsRcode::NxDomain => return Some(DnsHttpsOutcome::NoRecord),
+            DnsRcode::Other(code) => return Some(DnsHttpsOutcome::ServerFailure(code)),
+            DnsRcode::NoError => {}
+        }
+
+        let max_hops = max_hops.min(DNS_MAX_CNAME_CHAIN);
+        let mut owners: ArrayVec<usize, { DNS_MAX_CNAME_CHAIN + 1 }> = ArrayVec::new();
+        owners.push(question_name);
+        let mut chain_min_ttl: Option<u32> = None;
+
+        loop {
+            let end = owners[owners.len() - 1];
+
+            let mut cname_step = None;
+            let mut cursor = answers_start;
+            for _ in 0..answer_count {
+                let record = read_record(bytes, &mut cursor)?;
+                if record.class == CLASS_IN
+                    && record.record_type == TYPE_CNAME
+                    && names_equal(bytes, end, record.name)?
+                    && skip_name(bytes, record.data_offset)
+                        == Some(record.data_offset + record.data.len())
+                {
+                    cname_step = Some((record.data_offset, record.ttl));
+                    break;
+                }
+            }
+            if let Some((target, ttl)) = cname_step {
+                if owners.len() > max_hops || is_owner(bytes, &owners, target)? {
+                    return Some(DnsHttpsOutcome::NoRecord);
+                }
+                chain_min_ttl = Some(chain_min_ttl.map_or(ttl, |min| min.min(ttl)));
+                owners.push(target);
+                continue;
+            }
+
+            // RFC 9460 §2.4.1: an AliasMode (`SvcPriority == 0`) record in an
+            // RRSet voids any ServiceMode records beside it.
+            let mut alias_step = None;
+            let mut cursor = answers_start;
+            for _ in 0..answer_count {
+                let record = read_record(bytes, &mut cursor)?;
+                if record.class != CLASS_IN
+                    || record.record_type != TYPE_HTTPS
+                    || !names_equal(bytes, end, record.name)?
+                {
+                    continue;
+                }
+                if let Some(ParsedHttpsRdata::Alias { is_root }) = parse_https_rdata(record.data) {
+                    alias_step = Some((is_root, record.data_offset + 2, record.ttl));
+                    break;
+                }
+            }
+            if let Some((is_root, target_offset, ttl)) = alias_step {
+                // RFC 9460 §2.5.1: `.` in AliasMode declares the service unavailable.
+                if is_root {
+                    return Some(DnsHttpsOutcome::NoRecord);
+                }
+                if owners.len() > max_hops || is_owner(bytes, &owners, target_offset)? {
+                    return Some(DnsHttpsOutcome::NoRecord);
+                }
+                let next_ttl = chain_min_ttl.map_or(ttl, |min| min.min(ttl));
+                if has_cname_or_https_for(bytes, answers_start, answer_count, target_offset)? {
+                    chain_min_ttl = Some(next_ttl);
+                    owners.push(target_offset);
+                    continue;
+                }
+                let target = DnsWireName::from_wire(bytes, target_offset)?;
+                return Some(DnsHttpsOutcome::Alias {
+                    target,
+                    ttl_seconds: next_ttl,
+                    hops: owners.len(),
+                });
+            }
+
+            break;
+        }
+
+        let end = owners[owners.len() - 1];
+        let mut best: Option<SelectedHttpsService<'a>> = None;
+        let mut rrset_min_ttl: Option<u32> = None;
+        let mut cursor = answers_start;
+        for _ in 0..answer_count {
+            let record = read_record(bytes, &mut cursor)?;
+            if record.class != CLASS_IN
+                || record.record_type != TYPE_HTTPS
+                || !names_equal(bytes, end, record.name)?
+            {
+                continue;
+            }
+            let Some(ParsedHttpsRdata::Service {
+                priority,
+                compatible,
+                alpn_wire,
+                port,
+            }) = parse_https_rdata(record.data)
+            else {
+                continue;
+            };
+            rrset_min_ttl = Some(rrset_min_ttl.map_or(record.ttl, |min| min.min(record.ttl)));
+            if !compatible {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|current| priority < current.priority)
+            {
+                best = Some(SelectedHttpsService {
+                    priority,
+                    alpn_wire,
+                    port,
+                });
+            }
+        }
+
+        let Some(best) = best else {
+            return Some(DnsHttpsOutcome::NoRecord);
+        };
+        let alpn = match best.alpn_wire {
+            Some(wire) => collect_alpn_ids(wire)?,
+            None => ArrayVec::new(),
+        };
+        let ttl_seconds = match (chain_min_ttl, rrset_min_ttl) {
+            (Some(chain_ttl), Some(rr_ttl)) => chain_ttl.min(rr_ttl),
+            (_, Some(rr_ttl)) => rr_ttl,
+            _ => 0,
+        };
+        Some(DnsHttpsOutcome::Service(DnsHttpsRecord {
+            alpn,
+            port: best.port,
+            ttl_seconds,
+        }))
+    }
 }
 
 pub struct DnsQuestionWriter<'a> {
@@ -213,6 +619,36 @@ impl<'a> DnsQuestionWriter<'a> {
     /// Writes an `AAAA` question.
     pub fn write_aaaa_query(&mut self, id: u16, name: &str) -> Option<usize> {
         self.write_query(id, name, DnsRecordType::Aaaa)
+    }
+
+    /// Writes an RFC 9460 Type 65 (`HTTPS`) question for `host:port`.
+    pub fn write_https_query(&mut self, id: u16, host: &str, port: u16) -> Option<usize> {
+        let qname = DnsWireName::https_qname(host, port)?;
+        self.write_wire_query(id, &qname, DnsRecordType::Https)
+    }
+
+    /// Writes a question whose `QNAME` is already in canonical uncompressed
+    /// wire format.
+    pub fn write_wire_query(
+        &mut self,
+        id: u16,
+        qname: &DnsWireName,
+        record: DnsRecordType,
+    ) -> Option<usize> {
+        let wire = qname.as_wire();
+        let total = QUESTION_OFFSET.checked_add(wire.len())?.checked_add(4)?;
+        if self.output.len() < total {
+            return None;
+        }
+        self.output[..QUESTION_OFFSET].fill(0);
+        write_u16(self.output, 0, id)?;
+        write_u16(self.output, 2, 0x0100)?;
+        write_u16(self.output, 4, 1)?;
+        let qtype_offset = QUESTION_OFFSET + wire.len();
+        self.output[QUESTION_OFFSET..qtype_offset].copy_from_slice(wire);
+        write_u16(self.output, qtype_offset, record.code())?;
+        write_u16(self.output, qtype_offset + 2, CLASS_IN)?;
+        Some(total)
     }
 
     pub fn write_query(&mut self, id: u16, name: &str, record: DnsRecordType) -> Option<usize> {
@@ -253,6 +689,279 @@ impl<'a> DnsQuestionWriter<'a> {
     }
 }
 
+struct SelectedHttpsService<'a> {
+    priority: u16,
+    alpn_wire: Option<&'a [u8]>,
+    port: Option<u16>,
+}
+
+enum ParsedHttpsRdata<'a> {
+    Alias {
+        is_root: bool,
+    },
+    Service {
+        priority: u16,
+        compatible: bool,
+        alpn_wire: Option<&'a [u8]>,
+        port: Option<u16>,
+    },
+}
+
+/// Decodes one RFC 9460 Type 65 `RDATA` payload.
+///
+/// Returns `None` when the record violates RFC 9460 wire syntax: truncated
+/// fields, compressed or invalid `TargetName`, non-increasing or duplicate
+/// `SvcParamKey`s, malformed `mandatory` / `alpn` / `no-default-alpn` / `port`
+/// / address-hint values, or a `mandatory` key absent from `SvcParams`.
+fn parse_https_rdata<'a>(data: &'a [u8]) -> Option<ParsedHttpsRdata<'a>> {
+    let priority = read_u16(data, 0)?;
+    let target_wire = data.get(2..)?;
+    let target_len = skip_uncompressed_name(target_wire)?;
+    let is_root = target_len == 1;
+
+    if priority == 0 {
+        // RFC 9460 §2.4.2: recipients MUST ignore any SvcParams present in an
+        // AliasMode record, and §2.4.1 voids sibling ServiceMode records
+        // regardless of trailing SvcParams bytes.
+        return Some(ParsedHttpsRdata::Alias { is_root });
+    }
+
+    let mut params = data.get(2 + target_len..)?;
+
+    let mut prev_key: Option<u16> = None;
+    let mut mandatory_supported_mask: u8 = 0;
+    let mut seen_supported_mask: u8 = 0;
+    let mut unsupported_mandatory_key: Option<u16> = None;
+    let mut unsupported_mandatory_present = true;
+    let mut alpn_wire: Option<&'a [u8]> = None;
+    let mut port: Option<u16> = None;
+
+    // If `mandatory` lists keys outside `{1, 2, 3}`, we also verify every such
+    // key actually appears in `SvcParams` (RFC 9460 §7 syntax) while marking
+    // the RR incompatible (RFC 9460 §8).
+    let mut mandatory_list: &[u8] = &[];
+
+    while !params.is_empty() {
+        let key = read_u16(params, 0)?;
+        let value_len = usize::from(read_u16(params, 2)?);
+        let value_end = 4usize.checked_add(value_len)?;
+        let value = params.get(4..value_end)?;
+        params = &params[value_end..];
+
+        if let Some(prev) = prev_key
+            && key <= prev
+        {
+            return None;
+        }
+        prev_key = Some(key);
+
+        match key {
+            SVC_PARAM_MANDATORY => {
+                if value.is_empty() || !value.len().is_multiple_of(2) {
+                    return None;
+                }
+                let mut prev_req: Option<u16> = None;
+                let mut offset = 0usize;
+                while offset < value.len() {
+                    let req = u16::from_be_bytes([value[offset], value[offset + 1]]);
+                    if req == SVC_PARAM_MANDATORY {
+                        return None;
+                    }
+                    if let Some(prev) = prev_req
+                        && req <= prev
+                    {
+                        return None;
+                    }
+                    prev_req = Some(req);
+                    match req {
+                        SVC_PARAM_ALPN => mandatory_supported_mask |= 1 << 1,
+                        SVC_PARAM_NO_DEFAULT_ALPN => mandatory_supported_mask |= 1 << 2,
+                        SVC_PARAM_PORT => mandatory_supported_mask |= 1 << 3,
+                        other => {
+                            unsupported_mandatory_key.get_or_insert(other);
+                        }
+                    }
+                    offset += 2;
+                }
+                mandatory_list = value;
+            }
+            SVC_PARAM_ALPN => {
+                seen_supported_mask |= 1 << 1;
+                if !validate_alpn_wire(value) {
+                    return None;
+                }
+                alpn_wire = Some(value);
+            }
+            SVC_PARAM_NO_DEFAULT_ALPN => {
+                seen_supported_mask |= 1 << 2;
+                if !value.is_empty() {
+                    return None;
+                }
+            }
+            SVC_PARAM_PORT => {
+                seen_supported_mask |= 1 << 3;
+                if value.len() != 2 {
+                    return None;
+                }
+                port = Some(u16::from_be_bytes([value[0], value[1]]));
+            }
+            SVC_PARAM_IPV4HINT if value.is_empty() || !value.len().is_multiple_of(4) => {
+                return None;
+            }
+            SVC_PARAM_IPV6HINT if value.is_empty() || !value.len().is_multiple_of(16) => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+
+    if (mandatory_supported_mask & seen_supported_mask) != mandatory_supported_mask {
+        return None;
+    }
+
+    // Verify any unsupported mandatory keys were at least present in SvcParams
+    // so a missing mandatory key is classified as malformed (`None`) per §7.
+    if unsupported_mandatory_key.is_some() {
+        let after_mandatory = data.get(2 + target_len + 4 + mandatory_list.len()..)?;
+        let mut req_offset = 0usize;
+        while req_offset < mandatory_list.len() {
+            let req =
+                u16::from_be_bytes([mandatory_list[req_offset], mandatory_list[req_offset + 1]]);
+            if !svc_params_contain_key(after_mandatory, req) {
+                return None;
+            }
+            req_offset += 2;
+        }
+        unsupported_mandatory_present = false;
+    }
+
+    let no_default_without_alpn =
+        (seen_supported_mask & (1 << 2)) != 0 && (seen_supported_mask & (1 << 1)) == 0;
+    let compatible = unsupported_mandatory_present && !no_default_without_alpn;
+
+    Some(ParsedHttpsRdata::Service {
+        priority,
+        compatible,
+        alpn_wire,
+        port,
+    })
+}
+
+fn validate_alpn_wire(value: &[u8]) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let mut cursor = 0usize;
+    while cursor < value.len() {
+        let id_len = usize::from(value[cursor]);
+        if id_len == 0 {
+            return false;
+        }
+        let id_end = cursor + 1 + id_len;
+        let Some(id_bytes) = value.get(cursor + 1..id_end) else {
+            return false;
+        };
+        if core::str::from_utf8(id_bytes).is_err() {
+            return false;
+        }
+        cursor = id_end;
+    }
+    true
+}
+
+fn collect_alpn_ids(value: &[u8]) -> Option<ArrayVec<&str, DNS_MAX_ALPN_IDS>> {
+    let mut alpn = ArrayVec::new();
+    let mut cursor = 0usize;
+    while cursor < value.len() {
+        let id_len = usize::from(*value.get(cursor)?);
+        if id_len == 0 {
+            return None;
+        }
+        let id_end = cursor + 1 + id_len;
+        let id_str = core::str::from_utf8(value.get(cursor + 1..id_end)?).ok()?;
+        let _ = alpn.try_push(id_str);
+        cursor = id_end;
+    }
+    Some(alpn)
+}
+
+fn svc_params_contain_key(mut params: &[u8], wanted: u16) -> bool {
+    while let Some(key) = read_u16(params, 0) {
+        let Some(len) = read_u16(params, 2) else {
+            return false;
+        };
+        if key == wanted {
+            return true;
+        }
+        if key > wanted {
+            return false;
+        }
+        let Some(rest) = params.get(4 + usize::from(len)..) else {
+            return false;
+        };
+        params = rest;
+    }
+    false
+}
+
+/// Validates an uncompressed wire name at the start of `data` (RFC 9460 §2.2,
+/// RFC 3597 §4) and returns its wire length, root octet included.
+fn skip_uncompressed_name(data: &[u8]) -> Option<usize> {
+    let mut offset = 0usize;
+    loop {
+        let &len = data.get(offset)?;
+        if len == 0 {
+            let total = offset + 1;
+            return (total <= MAX_NAME_OCTETS).then_some(total);
+        }
+        if len > 63 {
+            return None;
+        }
+        let next = offset + 1 + usize::from(len);
+        if next > data.len() || next >= MAX_NAME_OCTETS {
+            return None;
+        }
+        offset = next;
+    }
+}
+
+fn has_cname_or_https_for(
+    bytes: &[u8],
+    answers_start: usize,
+    answer_count: u16,
+    owner: usize,
+) -> Option<bool> {
+    let mut cursor = answers_start;
+    for _ in 0..answer_count {
+        let record = read_record(bytes, &mut cursor)?;
+        if record.class == CLASS_IN
+            && (record.record_type == TYPE_CNAME || record.record_type == TYPE_HTTPS)
+            && names_equal(bytes, owner, record.name)?
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn encode_u16_decimal(mut value: u16, out: &mut [u8; 5]) -> usize {
+    if value == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+    let mut scratch = [0u8; 5];
+    let mut count = 0usize;
+    while value > 0 {
+        scratch[count] = b'0' + (value % 10) as u8;
+        value /= 10;
+        count += 1;
+    }
+    for idx in 0..count {
+        out[idx] = scratch[count - 1 - idx];
+    }
+    count
+}
+
 /// Where the name at `offset` ends in the message: past its root label or
 /// its first compression pointer. `None` when the name does not decode.
 fn skip_name(bytes: &[u8], offset: usize) -> Option<usize> {
@@ -271,6 +980,7 @@ struct Record<'a> {
     name: usize,
     record_type: u16,
     class: u16,
+    ttl: u32,
     /// Offset of the `RDATA`, which for a `CNAME` is the target name.
     data_offset: usize,
     data: &'a [u8],
@@ -282,6 +992,7 @@ fn read_record<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<Record<'a>> {
     let mut offset = skip_name(bytes, name)?;
     let record_type = read_u16(bytes, offset)?;
     let class = read_u16(bytes, offset.checked_add(2)?)?;
+    let ttl = read_u32(bytes, offset.checked_add(4)?)?;
     let data_len = usize::from(read_u16(bytes, offset.checked_add(8)?)?);
     offset = offset.checked_add(10)?;
     let data_end = offset.checked_add(data_len)?;
@@ -291,6 +1002,7 @@ fn read_record<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<Record<'a>> {
         name,
         record_type,
         class,
+        ttl,
         data_offset: offset,
         data,
     })
@@ -429,6 +1141,34 @@ fn name_equals_text(bytes: &[u8], offset: usize, text: &str) -> Option<bool> {
     }
 }
 
+/// Whether the name at `offset` equals `expected`, ignoring ASCII case.
+/// `None` when the packet's name does not decode.
+fn name_equals_wire(bytes: &[u8], offset: usize, expected: &DnsWireName) -> Option<bool> {
+    let mut wire = Labels::new(bytes, offset);
+    let expected = expected.as_wire();
+    let mut exp_offset = 0usize;
+    loop {
+        let exp_len = usize::from(*expected.get(exp_offset)?);
+        let next_exp = if exp_len == 0 {
+            None
+        } else {
+            let label = expected.get(exp_offset + 1..exp_offset + 1 + exp_len)?;
+            exp_offset += 1 + exp_len;
+            Some(label)
+        };
+        match (wire.next(), next_exp) {
+            (None, None) => return Some(true),
+            (Some(Ok(wire_label)), Some(exp_label)) => {
+                if !wire_label.eq_ignore_ascii_case(exp_label) {
+                    return Some(false);
+                }
+            }
+            (Some(Err(MalformedName)), _) => return None,
+            (Some(Ok(_)), None) | (None, Some(_)) => return Some(false),
+        }
+    }
+}
+
 /// Whether the name at `name` is one of the `owners`. `None` when a name
 /// does not decode.
 fn is_owner(bytes: &[u8], owners: &[usize], name: usize) -> Option<bool> {
@@ -443,6 +1183,11 @@ fn is_owner(bytes: &[u8], owners: &[usize], name: usize) -> Option<bool> {
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let end = offset.checked_add(2)?;
     Some(u16::from_be_bytes(bytes.get(offset..end)?.try_into().ok()?))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    Some(u32::from_be_bytes(bytes.get(offset..end)?.try_into().ok()?))
 }
 
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> Option<()> {
@@ -879,5 +1624,590 @@ mod tests {
         let message = parse(&bytes, EXAMPLE_A).expect("oversized response should still parse");
 
         assert_eq!(message.addresses.len(), DNS_MAX_ADDRESS_RECORDS);
+    }
+
+    fn https_rdata(priority: u16, target: &str, params: &[(u16, &[u8])]) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::new();
+        out.extend_from_slice(&priority.to_be_bytes());
+        if target == "." {
+            out.push(0);
+        } else {
+            push_name(&mut out, target);
+        }
+        for (key, value) in params {
+            out.extend_from_slice(&key.to_be_bytes());
+            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
+    fn alpn_param(ids: &[&str]) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::new();
+        for id in ids {
+            out.push(id.len() as u8);
+            out.extend_from_slice(id.as_bytes());
+        }
+        out
+    }
+
+    fn https_response_for(
+        qname: &str,
+        flags: u16,
+        answers: &[(Owner<'_>, u16, u32, alloc::vec::Vec<u8>)],
+    ) -> alloc::vec::Vec<u8> {
+        let mut bytes = alloc::vec::Vec::new();
+        bytes.extend_from_slice(&0x4242u16.to_be_bytes());
+        bytes.extend_from_slice(&flags.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        push_name(&mut bytes, qname);
+        bytes.extend_from_slice(&TYPE_HTTPS.to_be_bytes());
+        bytes.extend_from_slice(&CLASS_IN.to_be_bytes());
+        for (owner, record_type, ttl, data) in answers {
+            match owner {
+                Owner::Question => bytes.extend_from_slice(&[0xc0, 0x0c]),
+                Owner::Name(name) => push_name(&mut bytes, name),
+            }
+            bytes.extend_from_slice(&record_type.to_be_bytes());
+            bytes.extend_from_slice(&CLASS_IN.to_be_bytes());
+            bytes.extend_from_slice(&ttl.to_be_bytes());
+            bytes.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(data);
+        }
+        bytes
+    }
+
+    fn parse_https_with_budget<'a>(
+        bytes: &'a [u8],
+        host: &str,
+        port: u16,
+        max_hops: usize,
+    ) -> Option<DnsHttpsOutcome<'a>> {
+        let qname = DnsWireName::https_qname(host, port)?;
+        DnsResponse::parse(bytes).and_then(|response| response.https_outcome(&qname, max_hops))
+    }
+
+    fn parse_https<'a>(bytes: &'a [u8], host: &str, port: u16) -> Option<DnsHttpsOutcome<'a>> {
+        parse_https_with_budget(bytes, host, port, DNS_MAX_CNAME_CHAIN)
+    }
+
+    #[test]
+    fn https_query_encodes_bare_host_on_443_and_service_prefix_on_non_default_ports() {
+        let mut default_buf = [0u8; 128];
+        let default_len = DnsQuestionWriter::new(&mut default_buf)
+            .write_https_query(9, "example.com", 443)
+            .expect("443 HTTPS query should encode");
+        assert_eq!(
+            u16::from_be_bytes([default_buf[default_len - 4], default_buf[default_len - 3]]),
+            TYPE_HTTPS
+        );
+        assert_eq!(
+            &default_buf[QUESTION_OFFSET..default_len - 4],
+            wire_name("example.com").as_slice()
+        );
+
+        let mut alt_buf = [0u8; 128];
+        let alt_len = DnsQuestionWriter::new(&mut alt_buf)
+            .write_https_query(9, "example.com", 8443)
+            .expect("non-default HTTPS query should encode");
+        assert_eq!(
+            &alt_buf[QUESTION_OFFSET..alt_len - 4],
+            wire_name("_8443._https.example.com").as_slice()
+        );
+    }
+
+    #[test]
+    fn https_service_mode_decodes_alpn_port_and_minimum_ttl() {
+        let alpn = alpn_param(&["h2", "h3"]);
+        let port = 8443u16.to_be_bytes();
+        let bytes = https_response_for(
+            "_8443._https.example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                300,
+                https_rdata(1, ".", &[(1, &alpn), (3, &port)]),
+            )],
+        );
+
+        let Some(DnsHttpsOutcome::Service(record)) = parse_https(&bytes, "example.com", 8443)
+        else {
+            panic!("expected ServiceMode HTTPS record");
+        };
+        assert_eq!(record.alpn.as_slice(), &["h2", "h3"]);
+        assert_eq!(record.port, Some(8443));
+        assert_eq!(record.ttl_seconds, 300);
+    }
+
+    #[test]
+    fn https_multiple_priorities_pick_lowest_nonzero_priority_and_shortest_ttl() {
+        let h2_only = alpn_param(&["h2"]);
+        let h3_alpn = alpn_param(&["h3", "h2"]);
+        let port_9443 = 9443u16.to_be_bytes();
+        let bytes = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    400,
+                    https_rdata(10, ".", &[(1, &h2_only)]),
+                ),
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    120,
+                    https_rdata(2, "example.com", &[(1, &h3_alpn), (3, &port_9443)]),
+                ),
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    90,
+                    https_rdata(5, ".", &[(1, &h2_only)]),
+                ),
+            ],
+        );
+
+        let Some(DnsHttpsOutcome::Service(record)) = parse_https(&bytes, "example.com", 443) else {
+            panic!("expected priority 2 ServiceMode record");
+        };
+        assert_eq!(record.alpn.as_slice(), &["h3", "h2"]);
+        assert_eq!(record.port, Some(9443));
+        assert_eq!(record.ttl_seconds, 90);
+    }
+
+    #[test]
+    fn https_follows_cname_and_alias_mode_chains_within_limit() {
+        let h3 = alpn_param(&["h3"]);
+        let bytes = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Name("svc.edge.example"),
+                    TYPE_HTTPS,
+                    300,
+                    https_rdata(1, ".", &[(1, &h3)]),
+                ),
+                (
+                    Owner::Name("alias.edge.example"),
+                    TYPE_HTTPS,
+                    45,
+                    https_rdata(0, "svc.edge.example", &[]),
+                ),
+                (
+                    Owner::Question,
+                    TYPE_CNAME,
+                    180,
+                    wire_name("alias.edge.example"),
+                ),
+            ],
+        );
+
+        let Some(DnsHttpsOutcome::Service(record)) = parse_https(&bytes, "example.com", 443) else {
+            panic!("expected CNAME + AliasMode chain to resolve");
+        };
+        assert_eq!(record.alpn.as_slice(), &["h3"]);
+        assert_eq!(record.ttl_seconds, 45);
+    }
+
+    #[test]
+    fn https_external_alias_mode_reports_target_for_follow_up_query() {
+        let bytes = https_response_for(
+            "alias.test",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                150,
+                https_rdata(0, "real.test", &[]),
+            )],
+        );
+
+        let Some(DnsHttpsOutcome::Alias {
+            target,
+            ttl_seconds,
+            hops,
+        }) = parse_https(&bytes, "alias.test", 443)
+        else {
+            panic!("expected Alias outcome when target is not in packet");
+        };
+        assert_eq!(target, DnsWireName::from_host("real.test").unwrap());
+        assert_eq!(ttl_seconds, 150);
+        assert_eq!(hops, 1);
+    }
+
+    #[test]
+    fn https_root_alias_mode_voids_service_records_and_returns_no_record() {
+        let h3 = alpn_param(&["h3"]);
+        let bytes = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    300,
+                    https_rdata(1, ".", &[(1, &h3)]),
+                ),
+                (Owner::Question, TYPE_HTTPS, 300, https_rdata(0, ".", &[])),
+            ],
+        );
+
+        assert_eq!(
+            parse_https(&bytes, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+    }
+
+    #[test]
+    fn https_chain_past_limit_or_looping_resolves_to_no_record() {
+        let h3 = alpn_param(&["h3"]);
+        let links: alloc::vec::Vec<alloc::string::String> = (1..=DNS_MAX_CNAME_CHAIN + 1)
+            .map(|step| alloc::format!("hop{step}.example"))
+            .collect();
+        let mut answers = alloc::vec![(Owner::Question, TYPE_CNAME, 60, wire_name(&links[0]),)];
+        for pair in links.windows(2) {
+            answers.push((
+                Owner::Name(&pair[0]),
+                TYPE_HTTPS,
+                60,
+                https_rdata(0, &pair[1], &[]),
+            ));
+        }
+        answers.push((
+            Owner::Name(&links[DNS_MAX_CNAME_CHAIN]),
+            TYPE_HTTPS,
+            60,
+            https_rdata(1, ".", &[(1, &h3)]),
+        ));
+        let too_deep = https_response_for("example.com", 0x8180, &answers);
+        assert_eq!(
+            parse_https(&too_deep, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        let cycle = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    60,
+                    https_rdata(0, "loop.example", &[]),
+                ),
+                (
+                    Owner::Name("loop.example"),
+                    TYPE_HTTPS,
+                    60,
+                    https_rdata(0, "example.com", &[]),
+                ),
+            ],
+        );
+        assert_eq!(
+            parse_https(&cycle, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+    }
+
+    #[test]
+    fn https_nxdomain_and_nodata_return_no_record_while_servfail_is_server_failure() {
+        let nodata = https_response_for("example.com", 0x8180, &[]);
+        assert_eq!(
+            parse_https(&nodata, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        let nxdomain = https_response_for("example.com", 0x8183, &[]);
+        assert_eq!(
+            parse_https(&nxdomain, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        let servfail = https_response_for("example.com", 0x8182, &[]);
+        assert_eq!(
+            parse_https(&servfail, "example.com", 443),
+            Some(DnsHttpsOutcome::ServerFailure(2))
+        );
+
+        // Wrong question echo on NXDOMAIN/SERVFAIL is ignored (`None`), never
+        // accepted as an answer for `example.com`.
+        let forged_nxdomain = https_response_for("other.example", 0x8183, &[]);
+        assert_eq!(parse_https(&forged_nxdomain, "example.com", 443), None);
+    }
+
+    #[test]
+    fn https_rejects_duplicate_out_of_order_truncated_and_incompatible_svc_params() {
+        let h3 = alpn_param(&["h3"]);
+        let port = 8443u16.to_be_bytes();
+
+        // Out-of-order keys (3 before 1).
+        let out_of_order = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                60,
+                https_rdata(1, ".", &[(3, &port), (1, &h3)]),
+            )],
+        );
+        assert_eq!(
+            parse_https(&out_of_order, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        // Duplicate keys (1 twice).
+        let duplicate = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                60,
+                https_rdata(1, ".", &[(1, &h3), (1, &h3)]),
+            )],
+        );
+        assert_eq!(
+            parse_https(&duplicate, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        // Truncated RDATA (claims 10-byte SvcParamValue with only 2 bytes left).
+        let truncated_rdata = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                60,
+                alloc::vec![0, 1, 0, 0, 1, 0, 10, 2, b'h'],
+            )],
+        );
+        assert_eq!(
+            parse_https(&truncated_rdata, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        // Compression pointer in TargetName (forbidden by RFC 9460 §2.2 / RFC 3597).
+        let compressed_target = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                60,
+                alloc::vec![0, 1, 0xc0, 0x0c, 0, 1, 0, 3, 2, b'h', b'3'],
+            )],
+        );
+        assert_eq!(
+            parse_https(&compressed_target, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        // Mandatory unknown key (key 5 = ech) on priority 1 is skipped so
+        // compatible priority 2 wins; mandatory key 1 + 3 present succeeds.
+        let mandatory_ech = 5u16.to_be_bytes();
+        let mandatory_alpn_port = [0u8, 1, 0, 3];
+        let fallback_ok = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    60,
+                    https_rdata(1, ".", &[(0, &mandatory_ech), (1, &h3), (5, &[1, 2, 3, 4])]),
+                ),
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    60,
+                    https_rdata(2, ".", &[(0, &mandatory_alpn_port), (1, &h3), (3, &port)]),
+                ),
+            ],
+        );
+        let Some(DnsHttpsOutcome::Service(record)) = parse_https(&fallback_ok, "example.com", 443)
+        else {
+            panic!("compatible priority 2 record should win when priority 1 has mandatory ech");
+        };
+        assert_eq!(record.alpn.as_slice(), &["h3"]);
+        assert_eq!(record.port, Some(8443));
+
+        // Missing mandatory key (mandatory lists port=3, RR omits key 3).
+        let missing_mandatory = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                60,
+                https_rdata(1, ".", &[(0, &3u16.to_be_bytes()), (1, &h3)]),
+            )],
+        );
+        assert_eq!(
+            parse_https(&missing_mandatory, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+    }
+
+    #[test]
+    fn https_max_hops_caps_in_packet_cname_and_alias_chains() {
+        let h3 = alpn_param(&["h3"]);
+        let two_hop_chain = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_CNAME,
+                    120,
+                    wire_name("alias.edge.example"),
+                ),
+                (
+                    Owner::Name("alias.edge.example"),
+                    TYPE_HTTPS,
+                    90,
+                    https_rdata(0, "svc.edge.example", &[]),
+                ),
+                (
+                    Owner::Name("svc.edge.example"),
+                    TYPE_HTTPS,
+                    300,
+                    https_rdata(1, ".", &[(1, &h3)]),
+                ),
+            ],
+        );
+
+        let Some(DnsHttpsOutcome::Service(record)) =
+            parse_https_with_budget(&two_hop_chain, "example.com", 443, 2)
+        else {
+            panic!("2-hop chain must succeed with max_hops = 2");
+        };
+        assert_eq!(record.alpn.as_slice(), &["h3"]);
+        assert_eq!(record.ttl_seconds, 90);
+        assert_eq!(
+            parse_https_with_budget(&two_hop_chain, "example.com", 443, 1),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+        assert_eq!(
+            parse_https_with_budget(&two_hop_chain, "example.com", 443, 0),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        // Zero remaining hops still permits a direct ServiceMode answer on the
+        // queried name, while rejecting a 1-hop external AliasMode transition.
+        let direct = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                120,
+                https_rdata(1, ".", &[(1, &h3)]),
+            )],
+        );
+        assert!(matches!(
+            parse_https_with_budget(&direct, "example.com", 443, 0),
+            Some(DnsHttpsOutcome::Service(_))
+        ));
+        let external_alias = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                120,
+                https_rdata(0, "next.example", &[]),
+            )],
+        );
+        assert_eq!(
+            parse_https_with_budget(&external_alias, "example.com", 443, 0),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+    }
+
+    #[test]
+    fn https_alias_mode_ignores_trailing_svc_params_and_voids_service_records() {
+        let h3 = alpn_param(&["h3"]);
+        let port = 8443u16.to_be_bytes();
+
+        // RFC 9460 §2.4.1 / §2.4.2: AliasMode with non-empty or malformed
+        // trailing SvcParams must still be treated as AliasMode and void
+        // sibling ServiceMode records rather than falling through to them.
+        let mut malformed_root_alias = alloc::vec![0, 0, 0]; // priority=0, target="."
+        malformed_root_alias.extend_from_slice(&[0, 3, 0, 10, 0xff]); // truncated SvcParam
+        let root_void = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    300,
+                    https_rdata(1, ".", &[(1, &h3)]),
+                ),
+                (Owner::Question, TYPE_HTTPS, 300, malformed_root_alias),
+            ],
+        );
+        assert_eq!(
+            parse_https(&root_void, "example.com", 443),
+            Some(DnsHttpsOutcome::NoRecord)
+        );
+
+        let non_empty_alias = https_rdata(0, "real.example", &[(3, &port), (1, &h3)]);
+        let follow_alias = https_response_for(
+            "example.com",
+            0x8180,
+            &[
+                (
+                    Owner::Question,
+                    TYPE_HTTPS,
+                    300,
+                    https_rdata(1, ".", &[(1, &h3)]),
+                ),
+                (Owner::Question, TYPE_HTTPS, 180, non_empty_alias),
+            ],
+        );
+        let Some(DnsHttpsOutcome::Alias {
+            target,
+            ttl_seconds,
+            hops,
+        }) = parse_https(&follow_alias, "example.com", 443)
+        else {
+            panic!("AliasMode with trailing SvcParams must take precedence over ServiceMode");
+        };
+        assert_eq!(target, DnsWireName::from_host("real.example").unwrap());
+        assert_eq!(ttl_seconds, 180);
+        assert_eq!(hops, 1);
+    }
+
+    #[test]
+    fn https_service_mode_accepts_explicit_cross_host_target_name() {
+        let h3 = alpn_param(&["h3", "h2"]);
+        let port = 8443u16.to_be_bytes();
+        let bytes = https_response_for(
+            "example.com",
+            0x8180,
+            &[(
+                Owner::Question,
+                TYPE_HTTPS,
+                240,
+                https_rdata(1, "edge.cdn.example", &[(1, &h3), (3, &port)]),
+            )],
+        );
+
+        let Some(DnsHttpsOutcome::Service(record)) = parse_https(&bytes, "example.com", 443) else {
+            panic!("ServiceMode with explicit cross-host TargetName must resolve cleanly");
+        };
+        assert_eq!(record.alpn.as_slice(), &["h3", "h2"]);
+        assert_eq!(record.port, Some(8443));
+        assert_eq!(record.ttl_seconds, 240);
     }
 }

@@ -1,302 +1,49 @@
 use super::*;
 
-/// The threads of one WASIX process: its main thread's mailbox, every
-/// thread any store of the process spawned and nobody has joined, the
-/// next thread id, and the end a spawned thread chose for the whole
-/// process.
-///
-/// The process owns its threads, not the store that spawned each one,
-/// so any thread joins or signals any other and the process's end
-/// ([`Self::end`]) reaches all of them, those whose spawner has itself
-/// returned included. A spawned thread that exits, execs, takes a
-/// fatal signal or fails (a trap, an out-of-memory kill) ends the
-/// process the same way main does ([`Self::end_from_thread`]): `Image`
-/// is what an exec hands the process's main thread to run next.
-///
-/// # Concurrency
-///
-/// Every store of the process, each driven on whichever processor runs
-/// it, admits, joins, signals and ends the process through one table.
-/// Each of those takes the spin lock for one lookup, push, removal or
-/// record and releases it before anything is awaited or raised; no
-/// interrupt handler touches the table. A thread's end is published
-/// lock-free through its own [`WasixThreadExit`], which the joiner and
-/// the process's end wait on outside the lock.
-pub(super) struct WasixProcessThreads<Image> {
-    table: Arc<Mutex<WasixThreadTable<Image>>>,
-    /// The main thread's own mailbox, through which a spawned thread
-    /// that ends the process ends main's image.
-    main: WasixSignalState,
-}
-
-impl<Image> Clone for WasixProcessThreads<Image> {
-    fn clone(&self) -> Self {
-        Self {
-            table: self.table.clone(),
-            main: self.main.clone(),
-        }
-    }
-}
-
-struct WasixThreadTable<Image> {
-    next_tid: u32,
-    threads: Vec<WasixThread>,
-    /// Set by [`WasixProcessThreads::end`] and by
-    /// [`WasixProcessThreads::end_from_thread`]; no thread is admitted
-    /// after, and no second end is recorded.
-    ended: bool,
-    /// The end a spawned thread chose for the process, recorded before
-    /// main's image is ended and taken by main once its call has
-    /// stopped.
-    process_end: Option<WasixProcessEnd<Image>>,
-}
-
-/// How a spawned thread ended its whole process: each is the end the
-/// same call would have given main's image (`run_core_module_image`).
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum WasixProcessEnd<Image> {
-    /// `proc_exit` or a fatal signal's default action, with the
-    /// process's exit status.
-    Exit(u32),
-    /// `proc_exec*`: the image the process runs next, in place of the
-    /// one every thread of it was running.
-    Exec(Image),
-    /// A trap or any other failure, with the failure main reports for
-    /// it, as the default action of `SIGSEGV` and `SIGILL` ends the
-    /// process.
-    Fail(ProgramExecError),
-}
-
-struct WasixThread {
-    tid: u32,
-    /// The thread's own mailbox: `thread_signal` raises on it and the
-    /// process's end ends the thread through it.
-    mailbox: WasixSignalState,
-    exit: Arc<WasixThreadExit>,
-}
-
-impl<Image> WasixProcessThreads<Image> {
-    /// The table of a new process, whose main thread is thread 0.
-    pub(super) fn new() -> Self {
-        Self {
-            table: Arc::new(Mutex::new(WasixThreadTable {
-                next_tid: 1,
-                threads: Vec::new(),
-                ended: false,
-                process_end: None,
-            })),
-            main: WasixSignalState::new(),
-        }
-    }
-
-    /// The main thread's own mailbox, for its store to read.
-    pub(super) fn main_mailbox(&self) -> WasixSignalState {
-        self.main.clone()
-    }
-
-    /// Ends the whole process from spawned thread `tid`, whose own call
-    /// has ended with `end`, as POSIX `exit`, `execve`, a fatal signal
-    /// and a fault's default action do from any thread.
-    ///
-    /// The end is recorded first, then main's image is ended through
-    /// its mailbox, which stops main's call and makes main's completion
-    /// take the end ([`Self::take_process_end`]): the exit status or the
-    /// failure it reports, or the image it runs next once every thread
-    /// has ended; every other thread is
-    /// ended in the same pass, so none runs on after the process's end
-    /// and they stop concurrently. Main's completion path then waits for
-    /// all of them through [`Self::end`], as for any other end of the
-    /// image.
-    ///
-    /// The first end wins. One that comes after the process has already
-    /// ended, by main's own end or another thread's, is dropped: the
-    /// thread raising it is being ended with the rest.
-    pub(super) fn end_from_thread(&self, tid: u32, end: WasixProcessEnd<Image>) {
-        let others: Vec<WasixSignalState> = {
-            let mut table = self.table.lock();
-            if table.ended {
-                return;
-            }
-            table.ended = true;
-            table.process_end = Some(end);
-            table
-                .threads
-                .iter()
-                .filter(|thread| thread.tid != tid)
-                .map(|thread| thread.mailbox.clone())
-                .collect()
-        };
-        // Recorded under the lock before main is stopped, so main finds
-        // the end once its call meets the stop.
-        self.main.end_thread();
-        for mailbox in &others {
-            mailbox.end_thread();
-        }
-    }
-
-    /// The end a spawned thread recorded for the process, taken by main
-    /// once its call has stopped on its mailbox's end.
-    pub(super) fn take_process_end(&self) -> Option<WasixProcessEnd<Image>> {
-        self.table.lock().process_end.take()
-    }
-
-    /// Admits a thread whose mailbox is `mailbox` and whose end `exit`
-    /// will publish, and returns its id, which fits the `i32` that
-    /// `wasi_thread_start` takes. A process that has ended admits
-    /// nothing: the caller is one of its threads, ended already, and it
-    /// gets `AGAIN`, `pthread_create`'s answer for a thread it cannot
-    /// have.
-    pub(super) fn admit(
-        &self,
-        mailbox: WasixSignalState,
-        exit: Arc<WasixThreadExit>,
-    ) -> Result<u32, i32> {
-        let mut table = self.table.lock();
-        if table.ended {
-            return Err(p1::errno::AGAIN);
-        }
-        let tid = table.next_tid;
-        i32::try_from(tid).map_err(|_| p1::errno::OVERFLOW)?;
-        table.next_tid = tid + 1;
-        table.threads.push(WasixThread { tid, mailbox, exit });
-        Ok(tid)
-    }
-
-    /// Removes thread `tid` from the table, if it is still there.
-    pub(super) fn withdraw(&self, tid: u32) {
-        let mut table = self.table.lock();
-        if let Some(index) = table.threads.iter().position(|thread| thread.tid == tid) {
-            table.threads.swap_remove(index);
-        }
-    }
-
-    /// The end of thread `tid`, for a join to wait on.
-    pub(super) fn exit_of(&self, tid: u32) -> Option<Arc<WasixThreadExit>> {
-        self.table
-            .lock()
-            .threads
-            .iter()
-            .find(|thread| thread.tid == tid)
-            .map(|thread| thread.exit.clone())
-    }
-
-    /// The mailbox of thread `tid`, while it is still running.
-    pub(super) fn live_mailbox(&self, tid: u32) -> Option<WasixSignalState> {
-        self.table
-            .lock()
-            .threads
-            .iter()
-            .find(|thread| thread.tid == tid && thread.exit.code().is_none())
-            .map(|thread| thread.mailbox.clone())
-    }
-
-    /// Ends every thread the process still has and returns once each one
-    /// has ended, its store, fiber stack and registry handle dropped.
-    ///
-    /// Called once, by the process's main thread after its own call has
-    /// ended and before the process's completion is reported, whether
-    /// main ended on its own or a spawned thread ended it
-    /// ([`Self::end_from_thread`]). The table is closed and emptied
-    /// under the lock, so a thread admitted later cannot exist; then
-    /// every thread is ended (again, harmlessly, for those a spawned
-    /// thread's end already reached), and only then is any
-    /// awaited, so the threads stop concurrently and the wait is the
-    /// slowest one's. A parked thread is reached through the wake its
-    /// turn is armed on, which drops the call it is parked in, and a
-    /// running one through its interrupt check (see
-    /// [`WasixSignalState::end_thread`]).
-    pub(super) async fn end(&self) {
-        let threads = {
-            let mut table = self.table.lock();
-            table.ended = true;
-            core::mem::take(&mut table.threads)
-        };
-        for thread in &threads {
-            thread.mailbox.end_thread();
-        }
-        futures::future::join_all(threads.iter().map(|thread| thread.exit.wait())).await;
-    }
-}
-
-/// The end of one WASIX thread: its exit status, published once, after
-/// the thread's store is gone.
-///
-/// # Concurrency
-///
-/// The thread's task publishes from whichever processor ran it; any
-/// number of waiters (a joiner, the process's end) wait on any other.
-/// The status is one atomic and the broadcast stores nothing, so a
-/// waiter arms its wait before it reads the status.
-pub(super) struct WasixThreadExit {
-    status: AtomicU64,
-    ended: crate::Notify,
-}
-
-impl WasixThreadExit {
-    const RUNNING: u64 = u64::MAX;
-
-    pub(super) fn new() -> Self {
-        Self {
-            status: AtomicU64::new(Self::RUNNING),
-            ended: crate::Notify::new(),
-        }
-    }
-
-    /// Publishes the thread's exit status and wakes every waiter.
-    pub(super) fn publish(&self, code: u32) {
-        self.status.store(u64::from(code), AtomicOrdering::Release);
-        self.ended.notify_all();
-    }
-
-    /// The thread's exit status, once it has ended.
-    pub(super) fn code(&self) -> Option<u32> {
-        match self.status.load(AtomicOrdering::Acquire) {
-            Self::RUNNING => None,
-            code => Some(code as u32),
-        }
-    }
-
-    /// Waits for the thread's end and returns its exit status.
-    pub(super) async fn wait(&self) -> u32 {
-        loop {
-            // Armed before the status is read, so a publish between the
-            // read and the park still completes the wait.
-            let ended = self.ended.notified();
-            if let Some(code) = self.code() {
-                return code;
-            }
-            ended.await;
-        }
-    }
-}
-
-pub(super) async fn wasix_thread_sleep<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_thread_sleep<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     duration: i64,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Ok(duration) = u64::try_from(duration) else {
         return p1::errno::INVAL;
     };
-    caller
-        .data()
-        .sleep_for(Duration::from_nanos(duration))
-        .await;
-    p1::errno::SUCCESS
+    if caller.data().has_deliverable_catch() {
+        return p1::errno::INTR;
+    }
+    if duration == 0 {
+        return p1::errno::SUCCESS;
+    }
+    let sleep = caller.data().sleep_for(Duration::from_nanos(duration));
+    let signals = caller.data().signals();
+    let active_handlers = caller.data().active_signal_handlers;
+    let catch_signal = signals.wait_for_catch_signal(active_handlers);
+    futures::pin_mut!(sleep);
+    futures::pin_mut!(catch_signal);
+    core::future::poll_fn(|cx| {
+        if catch_signal.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(p1::errno::INTR);
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(p1::errno::SUCCESS);
+        }
+        Poll::Pending
+    })
+    .await
 }
 
-pub(super) fn wasix_thread_id<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_thread_id<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     ret_tid: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -305,157 +52,112 @@ where
     p1_write_u32(caller, memory, GuestAddress::wasm32(ret_tid), thread_id)
 }
 
-pub(super) async fn wasix_thread_spawn_v2<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_thread_spawn_v2<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     args: u32,
     ret_tid: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let mut thread_start = [0_u8; WASIX_THREAD_START_SIZE];
-    if p1_read_memory_into(
-        caller,
-        memory,
-        GuestAddress::wasm32(args),
-        &mut thread_start,
-    )
-    .is_err()
-    {
-        return p1::errno::FAULT;
+    // The new thread reads its start record itself; here it only has to
+    // lie inside linear memory.
+    memory.check_bounds(GuestAddress::wasm32(args), WASIX_THREAD_START_SIZE)?;
+    if caller.data().imported_memory.is_none() {
+        return Ok(p1::errno::NOTSUP);
     }
-    let Some(imported_memory) = caller.data().imported_memory.clone() else {
-        return p1::errno::NOTSUP;
+    let Some(instance_pre) = caller.data().thread_instance_pre.clone() else {
+        return Ok(p1::errno::NOTSUP);
     };
-    let Some(compiled) = caller.data().current_core_module.clone() else {
-        return p1::errno::NOTSUP;
-    };
-    if !compiled
-        .module
+    if !instance_pre
+        .module()
         .exports()
         .any(|export| export.name() == "wasi_thread_start")
     {
-        return p1::errno::NOTCAPABLE;
+        return Ok(p1::errno::NOTCAPABLE);
     }
 
-    let cpu = caller.data().cpu.clone();
-    let timer = caller.data().timer();
     let spawner = caller.data().spawner.clone();
-    let runtime_state = caller.data().runtime_state.clone();
-    let interrupts = caller.data().interrupts.clone();
-    let instance = caller.data().instance().clone();
-    let parent_instance_id = caller.data().parent_instance_id;
-    let arguments = caller.data().arguments.clone();
-    let environment = caller.data().environment.clone();
-    let authority = caller.data().authority.clone();
-    let output_mode = caller.data().output_mode.clone();
-    let read_serial = caller.data().read_serial;
-    let write_serial = caller.data().write_serial;
-    let filesystem = caller.data().filesystem.clone();
-    let descriptors = caller.data().descriptors.clone();
-    let signal_state = caller.data().signal_state.clone();
-    let wasix_abi = caller.data().wasix_abi;
     let threads = caller.data().threads.clone();
-    let engine = compiled.module.engine().clone();
+    let engine = instance_pre.module().engine().clone();
+    // The thread's own mailbox, which the table below holds; every process-wide
+    // table (descriptors, cwd, children, signals, threads, InstancePre) is
+    // shared with the spawning store.
+    let mut store_data = caller.data().spawn_thread_store(WasixSignalState::new());
+    // Admitting the thread, telling the guest its id and spawning its
+    // task happen in one synchronous step, in the poll that found the
+    // `ret_tid` slot present: an admitted thread whose task never started
+    // would leave the process's end waiting for an exit nobody publishes,
+    // so nothing may await between the admission and the spawn.
+    Ok(memory
+        .write(GuestAddress::wasm32(ret_tid), 4, move |slot| {
+            // The thread joins its process's table before its task exists,
+            // so the process's end cannot miss it: an end that came first
+            // refuses it here, and one that comes later finds it in the
+            // table and ends it, whether or not its task has started.
+            let exit = Arc::new(WasixThreadExit::new());
+            let tid = match threads
+                .admit(store_data.thread_signals.clone(), exit.clone())
+                .map_err(thread_admission_errno)
+            {
+                Ok(tid) => tid,
+                Err(errno) => return errno,
+            };
+            store_data.set_thread_id(tid);
+            slot.copy_from_slice(&tid.to_le_bytes());
 
-    let mut store_data = Preview1ProgramStore::new(
-        cpu,
-        timer,
-        spawner.clone(),
-        runtime_state,
-        interrupts,
-        instance,
-        parent_instance_id,
-        arguments,
-        environment,
-        authority,
-        output_mode,
-        read_serial,
-        write_serial,
-        Some(imported_memory.clone()),
-        Some(filesystem),
-        Some(descriptors),
-        signal_state,
-        // The thread's own mailbox, which the table below holds.
-        WasixSignalState::new(),
-        caller.data().signal_dispositions.clone(),
-        Some(compiled.clone()),
-        wasix_abi,
-        threads.clone(),
-    );
-    // The thread joins its process's table before its task exists, so
-    // the process's end cannot miss it: an end that came first refuses
-    // it here, and one that comes later finds it in the table and ends
-    // it, whether or not its task has started.
-    let exit = Arc::new(WasixThreadExit::new());
-    let tid = match threads.admit(store_data.thread_signals.clone(), exit.clone()) {
-        Ok(tid) => tid,
-        Err(errno) => return errno,
-    };
-    store_data.set_thread_id(tid);
-    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(ret_tid), tid);
-    if status != p1::errno::SUCCESS {
-        threads.withdraw(tid);
-        exit.publish(u32::from(status as u16));
-        return status;
-    }
-
-    let thread_exit = exit.clone();
-    if let Err(error) = spawner.try_spawn_detached(async move {
-        let code = run_wasix_thread(engine, compiled, imported_memory, store_data, tid, args).await;
-        // Published only now, with the thread's store, fiber stack and
-        // registry handle already dropped inside `run_wasix_thread`.
-        thread_exit.publish(code);
-    }) {
-        tracing::warn!(
-            target: "helios_kernel::program",
-            %error,
-            "refused a wasix thread: the executor's instance share is full"
-        );
-        // The thread never ran. Leave no entry for `thread_join` to wait
-        // on, and publish its end for a process end that already took
-        // the entry out of the table.
-        threads.withdraw(tid);
-        exit.publish(u32::from(p1::errno::NOMEM as u16));
-        return p1::errno::NOMEM;
-    }
-    p1::errno::SUCCESS
+            let thread_threads = threads.clone();
+            let thread_exit = exit.clone();
+            if let Err(error) = spawner.try_spawn_detached(async move {
+                let code = run_wasix_thread(engine, instance_pre, store_data, tid, args).await;
+                // Published only now, with the thread's store, InstancePre,
+                // fiber stack and registry handle already dropped inside
+                // `run_wasix_thread`; `finish` also removes `tid` from the
+                // live table so finished detached threads never accumulate.
+                thread_threads.finish(tid, &thread_exit, code);
+            }) {
+                tracing::warn!(
+                    target: "helios_kernel::program",
+                    %error,
+                    "refused a wasix thread: the executor's instance share is full"
+                );
+                // The thread never ran. Cancel its admission so `thread_join`
+                // sees `ESRCH` rather than an already-ended thread, and
+                // publish its end for a process end that already drained the
+                // table.
+                threads.cancel_admission(tid);
+                exit.publish(u32::from(p1::errno::NOMEM as u16));
+                return p1::errno::NOMEM;
+            }
+            p1::errno::SUCCESS
+        })
+        .await?)
 }
 
 /// Runs spawned thread `tid` to its end and returns the status it
 /// publishes. A call that ends the process ends it here, while the
 /// thread's store still exists, so the thread's end is published only
 /// after the process's end is recorded.
-pub(super) async fn run_wasix_thread<CpuImpl, Net, HostFs>(
+pub(super) async fn run_wasix_thread<CpuImpl, Net, StorageImpl>(
     engine: wasmtime::Engine,
-    compiled: Arc<WasmtimeCompiledCoreModule>,
-    imported_memory: SharedMemory,
-    store_data: Preview1ProgramStore<CpuImpl, Net, HostFs>,
+    instance_pre: Arc<wasmtime::InstancePre<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>>,
+    store_data: Preview1ProgramStore<CpuImpl, Net, StorageImpl>,
     tid: u32,
     args: u32,
 ) -> u32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut store = wasmtime::Store::new(&engine, store_data);
     let interrupts = configure_preview1_program_store(&mut store);
-    let end = match call_wasix_thread(
-        &mut store,
-        &interrupts,
-        &compiled,
-        imported_memory,
-        tid,
-        args,
-    )
-    .await
-    {
+    let end = match call_wasix_thread(&mut store, &interrupts, &instance_pre, tid, args).await {
         Ok(end) => end,
         // A thread that cannot be brought up fails its process, as the
         // same failure bringing up main's image does.
@@ -467,7 +169,14 @@ where
             // Nobody joins a thread of an ended process; the status is
             // only ever seen by the process's own end.
             let code = match &end {
-                WasixProcessEnd::Exit(code) => *code,
+                WasixProcessEnd::Exit(termination) => match termination {
+                    helios_unix::ChildTermination::Exited(code) => *code,
+                    helios_unix::ChildTermination::Signaled(sig) => {
+                        128u32.saturating_add(u32::from(sig.signal))
+                    }
+                    helios_unix::ChildTermination::Trapped
+                    | helios_unix::ChildTermination::Killed => WasixThreadEnded::EXIT_CODE,
+                },
                 WasixProcessEnd::Exec(_) => WasixThreadEnded::EXIT_CODE,
                 WasixProcessEnd::Fail(failure) => {
                     tracing::error!(tid, %failure, "wasix thread failed; its process fails with it");
@@ -480,29 +189,28 @@ where
     }
 }
 
-/// Instantiates spawned thread `tid` in `store` and calls its
-/// `wasi_thread_start` through every asyncify unwind and rewind, and
-/// says what the call's end ends. Bringing the thread up fails the way
-/// bringing main's image up does.
-async fn call_wasix_thread<CpuImpl, Net, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+/// Instantiates spawned thread `tid` in `store` from the process's shared
+/// `InstancePre` and calls its `wasi_thread_start` through every asyncify
+/// unwind and rewind, and says what the call's end ends. Bringing the thread
+/// up fails the way bringing main's image up does.
+async fn call_wasix_thread<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     interrupts: &StoreInterrupts<CpuImpl>,
-    compiled: &WasmtimeCompiledCoreModule,
-    imported_memory: SharedMemory,
+    instance_pre: &wasmtime::InstancePre<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     tid: u32,
     args: u32,
-) -> Result<WasixThreadCallEnd<Box<WasixExecReplacement<CpuImpl, Net, HostFs>>>, ProgramExecError>
+) -> Result<
+    WasixThreadCallEnd<Box<WasixExecReplacement<CpuImpl, Net, StorageImpl>>>,
+    ProgramExecError,
+>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let mut linker = CoreLinker::new(store.engine());
-    add_preview1_program_imports(&mut linker)?;
-    define_imported_shared_memory(&mut linker, store, &compiled.module, imported_memory)?;
     let turns = store.data().guest_turns();
     let instance = match interrupts
-        .drive(turns.drive(linker.instantiate_async(&mut *store, &compiled.module)))
+        .drive(turns.drive(instance_pre.instantiate_async(&mut *store)))
         .await
     {
         Ok(instance) => instance,
@@ -511,6 +219,7 @@ where
         }
         Err(error) => return Err(map_program_runtime_error(error)),
     };
+    store.data_mut().guest_instance = Some(instance);
     let start = instance
         .get_typed_func::<(i32, i32), ()>(&mut *store, "wasi_thread_start")
         .map_err(|_| ProgramExecError {
@@ -524,18 +233,15 @@ where
         let result = interrupts
             .drive(turns.drive(start.call_async(&mut *store, (tid_i32, args_i32))))
             .await;
-        if result.as_ref().is_err_and(WasixThreadEnded::is) {
+        if result.is_err() {
+            store.data_mut().asyncify.phase = WasixAsyncifyPhase::Idle;
             break result;
         }
-        match handle_wasix_asyncify_completion(store, interrupts, &instance).await {
-            Ok(true) => continue,
-            Ok(false) => break result,
-            // The process ended while the thread was between an unwind
-            // and its rewind; the rewind's call met the end.
-            Err(_) if store.data().thread_signals.thread_ended() => {
-                return Ok(WasixThreadCallEnd::Thread(WasixThreadEnded::EXIT_CODE));
-            }
-            Err(error) => return Err(error),
+        match finish_wasix_guest_call(store, interrupts).await {
+            Ok(AsyncifyOutcome::Rewinding) => continue,
+            Ok(AsyncifyOutcome::Idle) => break Ok(()),
+            Err(AsyncifyError::GuestStop(error)) => break Err(error),
+            Err(AsyncifyError::Exec(error)) => return Err(error),
         }
     };
     let requested_exit = store.data_mut().take_requested_exit();
@@ -593,42 +299,68 @@ pub(super) fn wasix_thread_call_end<Image>(
         return WasixThreadCallEnd::Process(WasixProcessEnd::Exec(image));
     }
     WasixThreadCallEnd::Process(match preview1_process_end(error, requested_exit) {
-        Ok(code) => WasixProcessEnd::Exit(code),
+        Ok(termination) => WasixProcessEnd::Exit(termination),
         Err(failure) => WasixProcessEnd::Fail(failure),
     })
 }
 
-pub(super) async fn wasix_thread_join<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_thread_join<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     tid: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if tid == caller.data().thread_id {
         return p1::errno::INVAL;
     }
     let threads = caller.data().threads.clone();
-    let Some(exit) = threads.exit_of(tid) else {
-        return p1::errno::SRCH;
+    let exit = match threads.join_target(tid) {
+        helios_unix::ThreadJoinTarget::Running(exit) => exit,
+        helios_unix::ThreadJoinTarget::AlreadyEnded => return p1::errno::SUCCESS,
+        helios_unix::ThreadJoinTarget::Unknown => return p1::errno::SRCH,
     };
     // No borrow of the store and no lock is held across this wait: the
-    // exit cell is the thread's own, shared with the table.
-    exit.wait().await;
-    threads.withdraw(tid);
+    // exit cell is the thread's own, shared with the table until the thread
+    // finishes and removes its entry.
+    if exit.code().is_some() {
+        return p1::errno::SUCCESS;
+    }
+    if caller.data().has_deliverable_catch() {
+        return p1::errno::INTR;
+    }
+    let signals = caller.data().signals();
+    let active_handlers = caller.data().active_signal_handlers;
+    let wait = exit.wait();
+    let catch_signal = signals.wait_for_catch_signal(active_handlers);
+    futures::pin_mut!(wait);
+    futures::pin_mut!(catch_signal);
+    let interrupted = core::future::poll_fn(|cx| {
+        if wait.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(false);
+        }
+        if catch_signal.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(true);
+        }
+        Poll::Pending
+    })
+    .await;
+    if interrupted {
+        return p1::errno::INTR;
+    }
     p1::errno::SUCCESS
 }
 
-pub(super) fn wasix_thread_parallelism<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_thread_parallelism<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     ret_parallelism: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -645,63 +377,69 @@ where
     )
 }
 
-pub(super) fn wasix_thread_signal<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_thread_signal<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     tid: i32,
     signal: i32,
 ) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if !(0..=31).contains(&signal) {
         return Ok(p1::errno::INVAL);
-    };
-    let signal = signal as u32;
-    // A signal to the calling thread itself ends that thread alone, as
-    // one raised on its mailbox would.
-    if u32::try_from(tid).ok() == Some(caller.data().thread_id) {
-        return Err(wasmtime::Error::new(WasixThreadSignalExit { signal }));
-    }
-    // A spawned thread signalling main: main's end is its process's, so
-    // the process ends with the signal's status.
-    if tid == 0 {
-        caller
-            .data_mut()
-            .request_exit(128u32.saturating_add(signal));
-        return Err(wasmtime::Error::new(Preview1Exit));
     }
     let Ok(tid) = u32::try_from(tid) else {
         return Ok(p1::errno::INVAL);
     };
+    if tid == caller.data().thread_id {
+        if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+            caller.data().thread_signals.raise(signal);
+        }
+        wasix_deliver_pending_signals(caller).await?;
+        return Ok(p1::errno::SUCCESS);
+    }
+    if tid == 0 {
+        if caller.data().thread_signals.thread_ended() {
+            return Ok(p1::errno::SRCH);
+        }
+        if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+            caller.data().threads.main_mailbox().raise(signal);
+        }
+        wasix_deliver_pending_signals(caller).await?;
+        return Ok(p1::errno::SUCCESS);
+    }
     let Some(mailbox) = caller.data().threads.live_mailbox(tid) else {
         return Ok(p1::errno::SRCH);
     };
-    mailbox.raise(signal);
+    if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+        mailbox.raise(signal);
+    }
+    wasix_deliver_pending_signals(caller).await?;
     Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn wasix_thread_exit<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_thread_exit<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     code: u32,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     caller.data_mut().request_exit(code);
     Err(wasmtime::Error::new(WasixThreadExitRequested))
 }
 
-pub(super) fn wasix_stack_bounds_from_caller<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_stack_bounds_from_caller<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> Result<(u32, u32, u32), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let stack_lower = wasix_global_u32_from_caller(caller, "__data_end")?;
     let stack_upper = wasix_global_u32_from_caller(caller, "__heap_base")?;
@@ -709,17 +447,16 @@ where
     Ok((stack_lower, stack_upper, stack_pointer))
 }
 
-pub(super) fn wasix_global_u32_from_caller<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_global_u32_from_caller<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     name: &str,
 ) -> Result<u32, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let global = caller
-        .get_export(name)
+    let global = p1_caller_export(caller, name)
         .and_then(|export| export.into_global())
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
@@ -734,150 +471,156 @@ where
     }
 }
 
-pub(super) async fn wasix_call_asyncify_start_unwind<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_call_asyncify_start_unwind<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     data: u32,
-) -> i32
+) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(function) = caller
-        .get_export("asyncify_start_unwind")
-        .and_then(|export| export.into_func())
+    let Some(function) =
+        p1_caller_export(caller, "asyncify_start_unwind").and_then(|export| export.into_func())
     else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
     let Ok(function) = function.typed::<i32, ()>(&mut *caller) else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
-    function
-        .call_async(&mut *caller, data as i32)
-        .await
-        .map_or(p1::errno::NOTSUP, |_| p1::errno::SUCCESS)
+    function.call_async(&mut *caller, data as i32).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) async fn wasix_call_asyncify_stop_rewind<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
-) -> i32
+pub(super) async fn wasix_call_asyncify_stop_rewind<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(function) = caller
-        .get_export("asyncify_stop_rewind")
-        .and_then(|export| export.into_func())
+    let Some(function) =
+        p1_caller_export(caller, "asyncify_stop_rewind").and_then(|export| export.into_func())
     else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
     let Ok(function) = function.typed::<(), ()>(&mut *caller) else {
-        return p1::errno::NOTSUP;
+        return Ok(p1::errno::NOTSUP);
     };
-    function
-        .call_async(&mut *caller, ())
-        .await
-        .map_or(p1::errno::NOTSUP, |_| p1::errno::SUCCESS)
+    function.call_async(&mut *caller, ()).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) async fn wasix_stack_checkpoint<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_stack_checkpoint<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     snapshot: u32,
     ret_value: u32,
-) -> i32
+) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    if let Some(value) = caller.data_mut().asyncify.rewind_value.take() {
-        if wasix_call_asyncify_stop_rewind(caller).await != p1::errno::SUCCESS {
-            return p1::errno::NOTSUP;
+    let ret_value_address = GuestAddress::wasm32(ret_value);
+    if let Some(value) = caller.data().asyncify.rewind_value {
+        let stop = wasix_call_asyncify_stop_rewind(caller).await;
+        caller.data_mut().asyncify.rewind_value = None;
+        if stop? != p1::errno::SUCCESS {
+            return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
         }
-        let Some(memory) = p1_memory(caller) else {
-            return p1::errno::FAULT;
+        let Some(memory) = p1_async_memory(caller) else {
+            return p1_finish_errno_call(caller, p1::errno::FAULT).await;
         };
-        return p1_write_u64(caller, memory, GuestAddress::wasm32(ret_value), value);
+        let write = memory
+            .write_u64(ret_value_address, value)
+            .await
+            .map(|()| p1::errno::SUCCESS)
+            .map_err(P1Stop::from);
+        return p1_finish_async_call(caller, write).await;
     }
 
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return p1_finish_errno_call(caller, p1::errno::FAULT).await;
     };
     let Ok((stack_lower, stack_upper, stack_pointer)) = wasix_stack_bounds_from_caller(caller)
     else {
-        return p1::errno::NOTSUP;
+        return p1_finish_errno_call(caller, p1::errno::NOTSUP).await;
     };
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
-        return p1::errno::INVAL;
+        return p1_finish_errno_call(caller, p1::errno::INVAL).await;
     }
     let memory_stack_len = match usize::try_from(stack_upper - stack_pointer) {
         Ok(len) => len,
-        Err(_) => return p1::errno::OVERFLOW,
+        Err(_) => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
     };
-    let memory_stack = match p1_read_memory(
-        caller,
-        memory,
-        GuestAddress::wasm32(stack_pointer),
-        memory_stack_len,
-    ) {
-        Ok(stack) => stack,
-        Err(_) => return p1::errno::FAULT,
+    let memory_stack = match memory
+        .read_bytes(GuestAddress::wasm32(stack_pointer), memory_stack_len)
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => return p1_finish_async_call(caller, Err(error.into())).await,
     };
     let unwind_stack_begin = match stack_lower.checked_add(WASIX_ASYNCIFY_DATA_SIZE) {
         Some(begin) if begin <= stack_pointer => begin,
-        _ => return p1::errno::OVERFLOW,
+        _ => return p1_finish_errno_call(caller, p1::errno::OVERFLOW).await,
     };
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    let status = p1_write_u32(caller, memory, stack_lower_address, unwind_stack_begin)
-        .max(p1_write_u32(
-            caller,
-            memory,
-            stack_lower_address.offset(4),
-            stack_pointer,
-        ))
-        .max(p1_write_u64(
-            caller,
-            memory,
-            GuestAddress::wasm32(ret_value),
-            0,
-        ));
-    if status != p1::errno::SUCCESS {
-        return status;
+    let setup = async {
+        memory
+            .write_u32(stack_lower_address, unwind_stack_begin)
+            .await?;
+        memory
+            .write_u32(stack_lower_address.offset(4), stack_pointer)
+            .await?;
+        memory.write_u64(ret_value_address, 0).await
     }
-    caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Capturing {
-        snapshot,
-        ret_value,
-        stack_lower,
-        stack_upper,
-        unwind_stack_begin,
-        memory_stack,
-        stack_pointer,
-    };
-    wasix_call_asyncify_start_unwind(caller, stack_lower).await
+    .await;
+    if let Err(error) = setup {
+        return p1_finish_async_call(caller, Err(error.into())).await;
+    }
+    let status = wasix_call_asyncify_start_unwind(caller, stack_lower).await?;
+    if status == p1::errno::SUCCESS {
+        caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Capturing {
+            snapshot,
+            ret_value,
+            stack_lower,
+            stack_upper,
+            unwind_stack_begin,
+            memory_stack,
+            stack_pointer,
+        };
+        Ok(p1::errno::SUCCESS)
+    } else {
+        p1_finish_errno_call(caller, status).await
+    }
 }
 
-pub(super) async fn wasix_stack_restore<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) async fn wasix_stack_restore<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     snapshot: u32,
     value: u64,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
+    let Some(memory) = p1_async_memory(caller) else {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
         }));
     };
     let snapshot = GuestAddress::wasm32(snapshot);
-    let hash_lower =
-        p1_try_read_u64(caller, memory, snapshot.offset(8)).map_err(wasmtime::Error::new)?;
-    let hash_upper =
-        p1_try_read_u64(caller, memory, snapshot.offset(16)).map_err(wasmtime::Error::new)?;
+    let hash_lower = memory
+        .read_u64(snapshot.offset(8))
+        .await
+        .map_err(wasix_stack_restore_trap)?;
+    let hash_upper = memory
+        .read_u64(snapshot.offset(16))
+        .await
+        .map_err(wasix_stack_restore_trap)?;
     let Ok((stack_lower, stack_upper, stack_pointer)) = wasix_stack_bounds_from_caller(caller)
     else {
         return Err(wasmtime::Error::new(ProgramExecError {
@@ -900,13 +643,18 @@ where
             })
         })?;
     let stack_lower_address = GuestAddress::wasm32(stack_lower);
-    let status = p1_write_u32(caller, memory, stack_lower_address, unwind_stack_begin).max(
-        p1_write_u32(caller, memory, stack_lower_address.offset(4), stack_pointer),
-    );
-    if status != p1::errno::SUCCESS {
+    memory
+        .write_u32(stack_lower_address, unwind_stack_begin)
+        .await
+        .map_err(wasix_stack_restore_trap)?;
+    memory
+        .write_u32(stack_lower_address.offset(4), stack_pointer)
+        .await
+        .map_err(wasix_stack_restore_trap)?;
+    if wasix_call_asyncify_start_unwind(caller, stack_lower).await? != p1::errno::SUCCESS {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
+            detail: ProgramExecErrorDetail::UnwindExportInvalid,
         }));
     }
     caller.data_mut().asyncify.phase = WasixAsyncifyPhase::Restoring {
@@ -914,98 +662,144 @@ where
         value: if value == 0 { 1 } else { value },
         stack_lower,
     };
-    if wasix_call_asyncify_start_unwind(caller, stack_lower).await != p1::errno::SUCCESS {
-        return Err(wasmtime::Error::new(ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::UnwindExportInvalid,
-        }));
-    }
     Ok(())
 }
 
-pub(super) async fn wasix_futex_wait<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+/// The trap `stack_restore` raises when it cannot reach the guest's
+/// snapshot or stack: a range outside linear memory is an invalid binary,
+/// and a page that cannot come back from swap is the swap failure.
+fn wasix_stack_restore_trap(error: GuestAccessError) -> wasmtime::Error {
+    match error {
+        GuestAccessError::OutOfBounds => wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
+        }),
+        GuestAccessError::Swap(error) => wasmtime::Error::new(error),
+    }
+}
+
+pub(super) async fn wasix_futex_wait<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     futex: u32,
     expected: u32,
     timeout: u32,
     ret_woken: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let timeout = match wasix_read_optional_timestamp(caller, memory, GuestAddress::wasm32(timeout))
-    {
-        Ok(timeout) => timeout,
-        Err(errno) => return errno,
-    };
+    let timeout =
+        wasix_read_optional_timestamp_async(&memory, GuestAddress::wasm32(timeout)).await?;
     let key = caller.data().futex_key(futex);
-    let registration = caller.data().runtime_state.prepare_futex_wait(key);
-    // The wait is armed before the guest word is compared. `futex_wake`
-    // stores a permit this wait can still claim, but `futex_wake_all`
-    // broadcasts to the waits that already exist and banks nothing, so a
-    // wake-all landing between the comparison and the park is only
-    // observed by a wait that was armed first.
-    let wake = registration.notify().notified();
-    let current = match p1_try_read_u32(caller, memory, GuestAddress::wasm32(futex)) {
-        Ok(value) => value,
-        Err(_) => {
-            drop(wake);
-            caller
-                .data()
-                .runtime_state
-                .complete_futex_wait(registration);
-            return p1::errno::FAULT;
-        }
-    };
+    let (mut registration, current) =
+        wasix_futex_armed_word(&memory, GuestAddress::wasm32(futex), || {
+            caller.data().threads.futex().prepare_wait(key)
+        })
+        .await?;
     if current != expected {
-        drop(wake);
-        caller
-            .data()
-            .runtime_state
-            .complete_futex_wait(registration);
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
 
-    let woken = match timeout {
-        Some(0) => {
-            drop(wake);
-            false
-        }
+    if !registration.is_released() && caller.data().has_deliverable_catch() {
+        return Ok(p1::errno::INTR);
+    }
+
+    let interrupted = match timeout {
+        Some(0) => false,
         Some(timeout_nanos) => {
             let sleep = caller.data().sleep_for(Duration::from_nanos(timeout_nanos));
+            let signals = caller.data().signals();
+            let active_handlers = caller.data().active_signal_handlers;
+            let catch_signal = signals.wait_for_catch_signal(active_handlers);
+            let wake = registration.released();
             futures::pin_mut!(wake);
             futures::pin_mut!(sleep);
-            matches!(
-                futures::future::select(wake, sleep).await,
-                futures::future::Either::Left(_)
-            )
+            futures::pin_mut!(catch_signal);
+            core::future::poll_fn(|cx| {
+                if wake.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                if catch_signal.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                if sleep.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                Poll::Pending
+            })
+            .await
         }
         None => {
-            wake.await;
-            true
+            let signals = caller.data().signals();
+            let active_handlers = caller.data().active_signal_handlers;
+            let catch_signal = signals.wait_for_catch_signal(active_handlers);
+            let wake = registration.released();
+            futures::pin_mut!(wake);
+            futures::pin_mut!(catch_signal);
+            core::future::poll_fn(|cx| {
+                if wake.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                if catch_signal.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                Poll::Pending
+            })
+            .await
         }
     };
-    caller
-        .data()
-        .runtime_state
-        .complete_futex_wait(registration);
-    p1_write_wasix_bool(caller, memory, GuestAddress::wasm32(ret_woken), woken)
+    // A wake that released this wait counted it, so the wait reports it
+    // even when the timeout or a caught signal arrived alongside it.
+    let woken = registration.is_released();
+    drop(registration);
+    if interrupted && !woken {
+        return Ok(p1::errno::INTR);
+    }
+    memory
+        .write_u8(GuestAddress::wasm32(ret_woken), u8::from(woken))
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn wasix_futex_wake<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+/// Arms a futex wait with `arm` and reads the guest word at `futex` it
+/// waits on, as one synchronous step of the poll that found the word's
+/// page present.
+///
+/// The wait is armed before the word is compared. A futex wake releases
+/// the waits queued on the key when it runs and banks nothing, so a wake
+/// landing between the comparison and the park is only observed by a wait
+/// that was queued first. Arming only once the page is back keeps the
+/// window in which a wake releases a wait that may then find the word
+/// changed as narrow as it is with every page present, however long the
+/// page took to come back.
+pub(super) async fn wasix_futex_armed_word<Armed>(
+    memory: &Preview1AsyncMemory,
+    futex: GuestAddress,
+    arm: impl FnOnce() -> Armed,
+) -> Result<(Armed, u32), GuestAccessError> {
+    memory
+        .read(futex, 4, |word| {
+            let armed = arm();
+            let word = word.try_into().expect("a futex word is four bytes");
+            (armed, u32::from_le_bytes(word))
+        })
+        .await
+}
+
+pub(super) fn wasix_futex_wake<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     futex: u32,
     ret_woken: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1014,19 +808,19 @@ where
         return p1::errno::FAULT;
     }
     let key = caller.data().futex_key(futex);
-    let woken = caller.data().runtime_state.wake_futex(key, 1) != 0;
+    let woken = caller.data().threads.futex().wake(key, 1) != 0;
     p1_write_wasix_bool(caller, memory, GuestAddress::wasm32(ret_woken), woken)
 }
 
-pub(super) fn wasix_futex_wake_all<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn wasix_futex_wake_all<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     futex: u32,
     ret_woken: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -1035,8 +829,15 @@ where
         return p1::errno::FAULT;
     }
     let key = caller.data().futex_key(futex);
-    let woken = caller.data().runtime_state.wake_all_futex(key) != 0;
+    let woken = caller.data().threads.futex().wake_all(key) != 0;
     p1_write_wasix_bool(caller, memory, GuestAddress::wasm32(ret_woken), woken)
+}
+
+fn thread_admission_errno(error: helios_unix::ThreadAdmissionError) -> i32 {
+    match error {
+        helios_unix::ThreadAdmissionError::Ended => p1::errno::AGAIN,
+        helios_unix::ThreadAdmissionError::IdOverflow => p1::errno::OVERFLOW,
+    }
 }
 
 #[cfg(test)]
@@ -1186,7 +987,7 @@ mod tests {
         let stray_exit = Arc::new(WasixThreadExit::new());
         assert_eq!(
             threads.admit(WasixSignalState::new(), stray_exit).err(),
-            Some(p1::errno::AGAIN),
+            Some(helios_unix::ThreadAdmissionError::Ended),
             "an ended process admits no thread"
         );
 
@@ -1260,14 +1061,14 @@ mod tests {
         let process = WasixSignalState::new();
         let thread = WasixSignalState::new();
         let signals = WasixStoreSignals::new(thread.clone(), process.clone());
-        thread.raise(15);
+        thread.raise(helios_unix::Signal::SIGTERM);
         thread.end_thread();
 
         for _ in 0..2 {
             let stop = signals.owed_stop().expect("an ended thread owes a stop");
             assert!(WasixThreadEnded::is(&stop));
         }
-        assert_eq!(thread.take_pending(), Some(15));
+        assert_eq!(thread.take_pending(), Some(helios_unix::Signal::SIGTERM));
     }
 
     /// A spawned thread that exits ends its whole process: the status is
@@ -1324,7 +1125,10 @@ mod tests {
             Box::pin(main_turns.drive(parked.call_async(&mut main_store, &[], &mut [])));
         assert!(main_call.as_mut().poll(&mut main_cx).is_pending());
 
-        threads.end_from_thread(exiting_tid, WasixProcessEnd::Exit(7));
+        threads.end_from_thread(
+            exiting_tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(7)),
+        );
         assert!(
             threads.main_mailbox().thread_ended(),
             "the exit ends main's image"
@@ -1342,10 +1146,13 @@ mod tests {
             threads
                 .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
                 .err(),
-            Some(p1::errno::AGAIN),
+            Some(helios_unix::ThreadAdmissionError::Ended),
             "an exiting process admits no thread"
         );
-        threads.end_from_thread(other_tid, WasixProcessEnd::Exit(3));
+        threads.end_from_thread(
+            other_tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(3)),
+        );
 
         match main_call.as_mut().poll(&mut main_cx) {
             Poll::Ready(Err(error)) => assert!(
@@ -1362,7 +1169,9 @@ mod tests {
         drop(main_store);
         assert_eq!(
             threads.take_process_end(),
-            Some(WasixProcessEnd::Exit(7)),
+            Some(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Exited(7)
+            )),
             "main takes the first exit's status"
         );
         assert_eq!(threads.take_process_end(), None, "and takes it once");
@@ -1407,7 +1216,10 @@ mod tests {
         assert!(threads.main_mailbox().thread_ended(), "main's image ends");
         assert!(other_mailbox.thread_ended(), "every other thread ends");
         assert!(!exec_mailbox.thread_ended());
-        threads.end_from_thread(exec_tid, WasixProcessEnd::Exit(1));
+        threads.end_from_thread(
+            exec_tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(1)),
+        );
         assert_eq!(
             threads.take_process_end(),
             Some(WasixProcessEnd::Exec("next")),
@@ -1440,7 +1252,10 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(end.as_mut().poll(&mut cx).is_pending());
 
-        threads.end_from_thread(tid, WasixProcessEnd::Exit(7));
+        threads.end_from_thread(
+            tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(7)),
+        );
         assert!(
             !threads.main_mailbox().thread_ended(),
             "main has already ended on its own"
@@ -1479,7 +1294,9 @@ mod tests {
         );
         assert_eq!(
             end(Err(wasmtime::Error::new(Preview1Exit)), Some(7)),
-            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(7)),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Exited(7)
+            )),
             "proc_exit ends the process"
         );
         assert_eq!(
@@ -1487,8 +1304,13 @@ mod tests {
                 Err(wasmtime::Error::new(Preview1SignalExit { signal: 15 })),
                 Some(7)
             ),
-            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(128 + 15)),
-            "a fatal signal ends the process with its status"
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Signaled(helios_unix::SignalTermination {
+                    signal: 15,
+                    core_dumped: false,
+                })
+            )),
+            "a fatal signal ends the process with its signal"
         );
         assert_eq!(
             wasix_thread_call_end(Err(wasmtime::Error::new(Preview1Exit)), None, Some("next")),
@@ -1497,29 +1319,47 @@ mod tests {
         );
     }
 
-    /// A trap on a spawned thread ends the whole process with the
-    /// failure the same trap on main reports: main's completion maps its
-    /// call's error through `preview1_process_end`, and the thread's end
-    /// carries exactly that, kind and detail alike. An exec the thread
-    /// asked for before it trapped still replaces the process, as on
-    /// main.
+    /// A trap or owner kill on a spawned thread ends the whole process
+    /// with the termination the same event on main reports, while an OOM
+    /// failure fails the process as on main. An exec the thread asked for
+    /// before it trapped still replaces the process, as on main.
     #[test]
     fn a_trap_on_a_thread_fails_the_process_as_a_trap_on_main_does() {
         let trap = || wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached);
-        let mains = preview1_process_end(trap(), None)
-            .expect_err("a trap on main is the process's failure");
-        assert_eq!(mains.kind, ProgramExecErrorKind::Internal);
+        assert_eq!(
+            preview1_process_end(trap(), None),
+            Ok(helios_unix::ChildTermination::Trapped),
+            "a trap on main reports Trapped"
+        );
         assert_eq!(
             wasix_thread_call_end::<()>(Err(trap()), None, None),
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Trapped
+            )),
+            "a trap on a thread ends its process as Trapped"
+        );
+
+        let oom = || {
+            wasmtime::Error::from(crate::InstanceKilled {
+                reason: crate::KillReason::OutOfMemory,
+            })
+        };
+        let mains = preview1_process_end(oom(), None)
+            .expect_err("an OOM kill on main is the process's failure");
+        assert_eq!(mains.kind, ProgramExecErrorKind::OutOfMemory);
+        assert_eq!(
+            wasix_thread_call_end::<()>(Err(oom()), None, None),
             WasixThreadCallEnd::Process(WasixProcessEnd::Fail(mains)),
-            "a trap on a thread fails its process"
+            "an OOM kill on a thread fails its process"
         );
 
         // A trap after the guest asked to exit ends the process with the
         // status it asked for, as on main.
         assert_eq!(
             wasix_thread_call_end::<()>(Err(trap()), Some(4), None),
-            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(4))
+            WasixThreadCallEnd::Process(WasixProcessEnd::Exit(
+                helios_unix::ChildTermination::Exited(4)
+            ))
         );
         // An exec comes first, as main's completion takes it first.
         assert_eq!(
@@ -1537,10 +1377,12 @@ mod tests {
     fn a_threads_failure_ends_main_with_the_failure() {
         let failure = || {
             preview1_process_end(
-                wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached),
+                wasmtime::Error::from(crate::InstanceKilled {
+                    reason: crate::KillReason::OutOfMemory,
+                }),
                 None,
             )
-            .expect_err("a trap is a failure")
+            .expect_err("an OOM kill is a failure")
         };
 
         let threads = WasixProcessThreads::<&'static str>::new();
@@ -1552,7 +1394,10 @@ mod tests {
             .admit(other_mailbox.clone(), Arc::new(WasixThreadExit::new()))
             .expect("a live process admits a thread");
         threads.end_from_thread(failing_tid, WasixProcessEnd::Fail(failure()));
-        threads.end_from_thread(other_tid, WasixProcessEnd::Exit(3));
+        threads.end_from_thread(
+            other_tid,
+            WasixProcessEnd::Exit(helios_unix::ChildTermination::Exited(3)),
+        );
         threads.end_from_thread(other_tid, WasixProcessEnd::Exec("next"));
         assert!(threads.main_mailbox().thread_ended(), "main is ended");
         assert!(other_mailbox.thread_ended(), "every other thread is ended");
@@ -1582,8 +1427,9 @@ mod tests {
     /// refuses the id past `i32::MAX` rather than hand it out.
     #[test]
     fn the_thread_table_hands_out_only_ids_an_i32_holds() {
-        let threads = WasixProcessThreads::<()>::new();
-        threads.table.lock().next_tid = i32::MAX as u32;
+        let threads = WasixProcessThreads::<()>::starting_at(
+            core::num::NonZeroU32::new(i32::MAX as u32).unwrap(),
+        );
         let last = threads
             .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
             .expect("i32::MAX is a thread id");
@@ -1592,12 +1438,13 @@ mod tests {
             threads
                 .admit(WasixSignalState::new(), Arc::new(WasixThreadExit::new()))
                 .err(),
-            Some(p1::errno::OVERFLOW)
+            Some(helios_unix::ThreadAdmissionError::IdOverflow)
         );
     }
 
     /// A joiner armed before a thread ends is woken by the end and gets
-    /// its status; a thread's id leaves the table once it is withdrawn.
+    /// its status; finishing the thread removes its entry from the live table
+    /// while `join_target` still reports `AlreadyEnded`.
     #[test]
     fn a_join_returns_the_status_the_thread_published() {
         let threads = WasixProcessThreads::<()>::new();
@@ -1614,15 +1461,87 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let mut join = pin!(joined.wait());
         assert!(join.as_mut().poll(&mut cx).is_pending());
-        exit.publish(3);
+        threads.finish(tid, &exit, 3);
         assert!(wakes.wakes() >= 1, "the end wakes the joiner");
         assert_eq!(join.as_mut().poll(&mut cx), Poll::Ready(3));
         assert!(
             threads.live_mailbox(tid).is_none(),
             "an ended thread takes no signal"
         );
-
-        threads.withdraw(tid);
         assert!(threads.exit_of(tid).is_none());
+        assert!(matches!(
+            threads.join_target(tid),
+            helios_unix::ThreadJoinTarget::AlreadyEnded
+        ));
+    }
+
+    /// A futex word on the second page of a two-page memory, which swap
+    /// has taken.
+    fn futex_word_over_an_evicted_page(word: u32) -> (crate::memory::GuestSwap, GuestAddress) {
+        let mut swap = crate::memory::GuestSwap::new(2);
+        swap.bytes_mut()[TEST_PAGE + 16..TEST_PAGE + 20].copy_from_slice(&word.to_le_bytes());
+        swap.evict(1);
+        (swap, GuestAddress::wasm32((TEST_PAGE + 16) as u32))
+    }
+
+    /// `futex_wait` over a word whose page is out waits for the page and
+    /// arms its wait only in the poll that compares the word, so the arm
+    /// and the compare stay one step however long the page took: a
+    /// wake-all broadcast while the page was out is not a wake of this
+    /// wait, and one after the compare is.
+    #[test]
+    fn a_futex_wait_on_an_evicted_word_arms_and_compares_once_it_is_back() {
+        let (mut swap, futex) = futex_word_over_an_evicted_page(0x5eed);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let notify = crate::Notify::new();
+        let armed = AtomicUsize::new(0);
+        let mut compare = pin!(wasix_futex_armed_word(&memory, futex, || {
+            armed.fetch_add(1, Ordering::AcqRel);
+            notify.waiter()
+        }));
+        assert!(poll_once(compare.as_mut()).is_none(), "the compare waits");
+        assert_eq!(armed.load(Ordering::Acquire), 0, "nothing is armed yet");
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+        notify.notify_all();
+
+        swap.serve();
+        let (mut wake, word) = poll_once(compare.as_mut())
+            .expect("the page is back")
+            .expect("the word is in bounds");
+        assert_eq!(word, 0x5eed);
+        assert_eq!(armed.load(Ordering::Acquire), 1);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            notify.poll_notified(&mut cx, &mut wake).is_pending(),
+            "a broadcast before the arm is not a wake of this wait"
+        );
+        notify.notify_all();
+        assert!(notify.poll_notified(&mut cx, &mut wake).is_ready());
+    }
+
+    /// The word's page cannot come back, so `futex_wait` traps, and no
+    /// wait was ever armed for it.
+    #[test]
+    fn a_futex_wait_on_a_lost_word_traps_without_arming() {
+        let (mut swap, futex) = futex_word_over_an_evicted_page(1);
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let armed = AtomicBool::new(false);
+        let mut compare = pin!(wasix_futex_armed_word(&memory, futex, || {
+            armed.store(true, Ordering::Release);
+        }));
+        assert!(poll_once(compare.as_mut()).is_none());
+        swap.serve();
+        let stop = P1Stop::from(
+            poll_once(compare.as_mut())
+                .expect("the compare ends")
+                .expect_err("the page is gone"),
+        );
+        assert_eq!(stop, P1Stop::Trap(crate::memory::SwapFaultError::Backend));
+        assert!(p1_reply(Err(stop)).is_err(), "the guest traps");
+        assert!(
+            !armed.load(Ordering::Acquire),
+            "no wait was armed over a word that never came back"
+        );
     }
 }

@@ -1,1147 +1,146 @@
-//! x86_64 user virtual address space backed by the running kernel CR3.
+//! The x86_64 user virtual address space of the running kernel.
 //!
-//! Limine sets up the kernel page tables with a higher-half direct map
-//! (HHDM) for physical memory and the kernel image. The lower 128 TiB
-//! of the canonical address space is otherwise unused, and we carve a
-//! [`USER_VA_BASE`..`USER_VA_END`) window out of it for dynamic user
-//! mappings.
-//!
-//! Reservations are tracked in software in `Reservations` ; commit /
-//! decommit / protect / release operate by walking the live CR3 and
-//! mutating leaf entries through `OffsetPageTable`. Local TLB
-//! invalidation uses `INVLPG`; cross-core TLB shootdown uses a
-//! dedicated local-APIC IPI vector and waits for every online
-//! processor to acknowledge the invalidation before old frames are
-//! returned to the user-memory pool.
+//! The address space itself — reservations, the reservation lock and
+//! every page-table walk — is [`helios_x86_vmm::X86UserAddressSpace`].
+//! This module is the machine it runs on: [`HhdmMachine`] reads `CR3`,
+//! reaches physical memory through Limine's higher-half direct map
+//! (HHDM), takes table frames from the kernel heap and user frames from
+//! the user-memory pool, and invalidates translations with `INVLPG` and
+//! the dedicated local-APIC shootdown IPI, which waits for every online
+//! processor to acknowledge before old frames return to the pool. It also
+//! installs the one address space the image has and the runtime hooks
+//! that reach it.
 
-use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::ffi::c_int;
-use core::ptr;
 use core::ptr::NonNull;
 
-use helios_hal::device::{DeviceRegion, DmaPlacement};
-use helios_hal::iommu::PhysicalRange;
-use helios_hal::pmm::PhysFrame;
-use helios_hal::vmm::{
-    AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
-};
+use helios_hal::vmm::{AddressSpace, AddressSpaceError, PageFlags, VirtAddr, VirtRange};
 use helios_kernel::runtime_memory::{
     self, RuntimeMemoryHooks, default_memory_image_free, default_memory_image_map_at,
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{
-    FiberStackVmHooks, MemoryOwner, ReservationLookup, ReservationTracker, VaCursor,
-    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, deallocate_user_frame_on,
-    deallocate_user_run_on, install_fiber_stack_hooks, validate_range,
+    FiberStackVmHooks, MemoryOwner, ResidencyVmHooks, allocate_user_frame_uninit_on_node,
+    allocate_user_frame_zeroed_on, allocate_user_run_zeroed_on, current_user_memory_owner,
+    deallocate_user_frame_on, deallocate_user_run_on, install_fiber_stack_hooks,
+    install_residency_hooks, residency_vm_hooks, user_frame_node,
 };
-use spin::{Mutex, Once};
-use x86_64::PhysAddr;
-use x86_64::VirtAddr as X86VirtAddr;
-use x86_64::instructions::tlb;
+use helios_x86_vmm::{InstalledMachine, Machine};
+use spin::Once;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::mapper::TranslateResult;
-use x86_64::structures::paging::page_table::{PageTableEntry, PageTableIndex};
-use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, Size4KiB, Translate,
-};
+use x86_64::structures::paging::{FrameAllocator, PhysFrame};
 
-use crate::memory_type;
 use crate::smp::{self, DirectMappedFrameAllocator};
 
-/// Start of the user-VA window. `0x0000_2000_0000_0000` keeps the
-/// canonical-address constraint satisfied (bits 47..63 must all be
-/// zero or all one for x86-64 four-level paging) and stays well clear
-/// of the user 0..2 TiB region typical userland tools assume.
-const USER_VA_BASE: usize = 0x0000_2000_0000_0000;
-/// 32 TiB user window — enough for ~6500 4 GiB+guard wasm linear
-/// memories, far beyond what realistic kernel-plugin loads will hold
-/// concurrently.
-const USER_VA_END: usize = 0x0000_4000_0000_0000;
-const PAGE: usize = PhysFrame::SIZE;
-/// Bytes one level-1 table maps: 512 four-kilobyte pages.
-const LEAF_TABLE_SPAN: usize = PAGE * 512;
+/// The image's user address space: the shared x86 page-table logic over
+/// this machine's direct map.
+pub type X86UserAddressSpace = helios_x86_vmm::X86UserAddressSpace<HhdmMachine>;
 
-/// A leaf an unmap has retired but whose frame is not yet free.
-///
-/// The first pass of [`X86UserAddressSpace::unmap_range`] clears
-/// `PRESENT` and sets this bit, keeping the frame address in the leaf;
-/// the shootdown goes out once for the whole range; the second pass
-/// reads the frame back out of every leaf so marked and frees it. The
-/// bit is one of the three the architecture leaves to software.
-const RETIRED: PageTableFlags = PageTableFlags::BIT_9;
+const PAGE: usize = helios_hal::pmm::PhysFrame::SIZE;
 
-/// Owned x86 user address space. Built once at boot, accessed through
-/// `&'static`.
-///
-/// # Concurrency contract
-///
-/// `state` is the one lock that serialises every mutation of this
-/// address space's page-table structure, and the reservation records it
-/// guards. A path that can build an intermediate table (`commit`,
-/// `relocate`, `prepare_demand_commit` and `ensure_accessible_subranges`,
-/// through `OffsetPageTable::map_to` or `ensure_table`), or rewrite a
-/// leaf of a committed range (`protect`, `relocate`,
-/// `substitute_memory`, `restore`, `withdraw`,
-/// `ensure_accessible_subranges`, `decommit_committed_subranges`), or
-/// that clears the leaves of a range it takes out of the tracker
-/// (`decommit`, `release`, `end_demand_commit`,
-/// `decommit_committed_subranges`), takes `state` before its first
-/// check and holds it through its last table access and the matching
-/// tracker record; for the clearing paths that is from the tracker
-/// update through the last leaf cleared, the shootdown and the frames
-/// freed behind it (and, for `release`, the return of the range to the
-/// free list). No helper it calls takes `state` again. The shape is "build under the lock", not
-/// "publish by compare-exchange": the lock already orders the tracker
-/// against the tables, so the check, the walk and the record are one
-/// critical section and there is no loser table to free, and the next
-/// holder of `state` sees tables and tracker agree.
-///
-/// `state` is a plain spin lock taken from task context with interrupts
-/// enabled and never from an interrupt or trap handler, so a processor
-/// spinning on it still acknowledges TLB shootdowns. Holding it across
-/// a shootdown is the existing order (`state` then the broadcast lock).
-/// Nothing awaits or blocks while holding it: the frame and table
-/// allocations under it take the user pool's and the kernel heap's
-/// interrupt-masking locks, which nothing holds across `state`.
-///
-/// Not under `state`: `commit_demand_page`, `leaf_entry` and the walk
-/// `translate` makes after its tracker lookup walk tables lock-free,
-/// which is sound because no intermediate table is freed while the
-/// address space lives, and the one leaf `commit_demand_page` writes
-/// belongs to a prepared demand-commit region only its fiber faults on;
-/// and `allocate_run` and `free_run`, which change no translation.
-/// `unmap_range`, `unmap_demand_pages`, `drop_substituted_leaves` and
-/// `drop_substituted_parts` take no lock themselves and are only called
-/// with `state` held.
-pub struct X86UserAddressSpace {
+/// The running kernel's machine: the tables `CR3` names, physical memory
+/// at a fixed offset in the HHDM, and the kernel heap and user pool as
+/// frame sources.
+pub struct HhdmMachine {
     physical_memory_offset: usize,
-    processor_count: usize,
-    /// Bump pointer for fresh reservations within the user-VA window.
-    /// Reservations released via `release` are returned to a free
-    /// list rather than to the bump pointer; the simple bump path
-    /// covers the steady-state allocate-and-release-much-later
-    /// pattern that the runtime drives, while the free list catches
-    /// tight reservation churn.
-    va_cursor: VaCursor,
-    state: Mutex<ReservationTracker>,
 }
 
-#[derive(Clone, Copy)]
-struct RelocationPage {
-    page: Page<Size4KiB>,
-    virt: usize,
-    old_phys: usize,
-    old_flags: PageTableFlags,
-    new_phys: usize,
+impl HhdmMachine {
+    fn user_frame_pointer(&self, phys: usize) -> NonNull<u8> {
+        NonNull::new(self.frame_pointer(phys))
+            .unwrap_or_else(|| panic!("x86 user frame {phys:#x} has a null HHDM address"))
+    }
+
+    fn physical(&self, pointer: NonNull<u8>) -> usize {
+        self.physical_address(pointer).unwrap_or_else(|| {
+            panic!(
+                "x86 user frame {:#x} lies below the HHDM",
+                pointer.as_ptr() as usize
+            )
+        })
+    }
 }
 
-impl X86UserAddressSpace {
-    /// Where `frame` appears in the kernel's own map.
-    ///
-    /// This backend maps every byte of physical memory at a fixed
-    /// offset, and the pinned runs `allocate_run` hands out come
-    /// out of that map, so the alias is the offset applied again.
-    pub fn kernel_alias(&self, frame: PhysFrame) -> VirtAddr {
-        VirtAddr::new(
-            frame
-                .phys_addr()
-                .checked_add(self.physical_memory_offset)
-                .expect("a physical frame plus the kernel's map offset fits the address space"),
-        )
+// SAFETY: the HHDM maps every byte of physical memory at
+// `physical_memory_offset`, so `frame_pointer` reaches every frame the
+// tables, the kernel heap and the user pool hold; `allocate_table` takes
+// a zeroed frame of the kernel heap, which lives in the HHDM and is never
+// given back; and `physical_address` subtracts the offset `frame_pointer`
+// adds.
+unsafe impl Machine for HhdmMachine {
+    fn root_table(&self) -> PhysFrame {
+        Cr3::read().0
     }
 
-    pub fn new(physical_memory_offset: usize, processor_count: usize) -> Self {
-        Self {
-            physical_memory_offset,
-            processor_count,
-            va_cursor: VaCursor::new(USER_VA_BASE, USER_VA_END),
-            state: Mutex::new(ReservationTracker::new()),
+    fn allocate_table(&self) -> Option<PhysFrame> {
+        DirectMappedFrameAllocator {
+            physical_memory_offset: self.physical_memory_offset,
         }
+        .allocate_frame()
     }
 
-    fn assert_smp_safe(&self) {
-        assert!(
-            self.processor_count <= usize::BITS as usize,
-            "X86UserAddressSpace supports at most {} processors in its TLB shootdown ack mask; got {}",
-            usize::BITS,
-            self.processor_count
-        );
+    fn frame_pointer(&self, phys: usize) -> *mut u8 {
+        phys.checked_add(self.physical_memory_offset)
+            .unwrap_or_else(|| panic!("x86 HHDM address of {phys:#x} overflows")) as *mut u8
     }
 
-    fn shootdown_range(&self, virt: VirtRange) {
-        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
+    fn physical_address(&self, pointer: NonNull<u8>) -> Option<usize> {
+        (pointer.as_ptr() as usize).checked_sub(self.physical_memory_offset)
     }
 
-    /// Give one pinned run back to the user pool with the layout it was
-    /// allocated with: a contiguous run is one allocation, not a pile of
-    /// frames, and the allocator is owed the size and alignment it
-    /// produced.
-    fn free_pinned_run(&self, phys: usize, bytes: usize, align: usize) {
-        let layout = Layout::from_size_align(bytes, align)
-            .unwrap_or_else(|_| panic!("x86 pinned run has an invalid layout"));
-        let ptr = NonNull::new((phys + self.physical_memory_offset) as *mut u8)
-            .unwrap_or_else(|| panic!("x86 pinned run has a null pointer"));
-        deallocate_user_run_on(smp::current_processor(), ptr, layout);
-    }
-
-    fn carve_reservation(&self, byte_len: usize) -> Option<VirtRange> {
-        self.state
-            .lock()
-            .reuse_free_range(byte_len)
-            .or_else(|| self.va_cursor.carve(byte_len))
-    }
-
-    fn map_pages(
-        &self,
-        mapper: &mut OffsetPageTable<'static>,
-        frame_allocator: &mut DirectMappedFrameAllocator,
-        virt: VirtRange,
-        flags: PageTableFlags,
-    ) -> Result<(), AddressSpaceError> {
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            let virt_addr = virt.start.raw() + offset;
-            let mapped_pages = offset / PAGE;
-            let phys = match self.alloc_user_frame() {
-                Ok(phys) => phys,
-                Err(error) => {
-                    self.rollback_partial_commit(virt.start.raw(), mapped_pages);
-                    return Err(error);
-                }
-            };
-            let frame = x86_64::structures::paging::PhysFrame::from_start_address(PhysAddr::new(
-                phys as u64,
-            ))
-            .map_err(|_| {
-                self.dealloc_user_phys(phys);
-                self.rollback_partial_commit(virt.start.raw(), mapped_pages);
-                AddressSpaceError::Misaligned
-            })?;
-            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                .map_err(|_| {
-                    self.dealloc_user_phys(phys);
-                    self.rollback_partial_commit(virt.start.raw(), mapped_pages);
-                    AddressSpaceError::Misaligned
-                })?;
-            unsafe {
-                match mapper.map_to(page, frame, flags, frame_allocator) {
-                    Ok(flush) => flush.flush(),
-                    Err(_) => {
-                        self.dealloc_user_phys(phys);
-                        self.rollback_partial_commit(virt.start.raw(), mapped_pages);
-                        return Err(AddressSpaceError::PageTableExhausted);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Unmaps every mapped page of `virt`, one shootdown for the whole
-    /// range, and frees the frames on the far side of it.
-    ///
-    /// A frame must not be reusable while another processor can still
-    /// translate to it, and `MapperFlush::flush` invalidates the calling
-    /// processor only, so the frames wait for the acknowledgement of the
-    /// broadcast. Rather than holding them in a batch and broadcasting
-    /// once per batch — one IPI round per 128 pages, so a linear
-    /// memory's teardown was hundreds of rounds — the leaves themselves
-    /// hold them: the first pass retires each leaf (`PRESENT` off,
-    /// [`RETIRED`] on, frame kept), one broadcast covers the range, and
-    /// the second pass frees what the retired leaves name. Pages that
-    /// were never mapped are left alone, which is what the runtime's
-    /// imprecise decommit of a pooled slot and a demand-commit region
-    /// nothing faulted on both need.
-    fn unmap_range(&self, virt: VirtRange) {
-        let mut retired = 0;
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            let virt_addr = virt.start.raw() + offset;
-            let Some(entry_ptr) = self.leaf_entry(virt_addr) else {
-                continue;
-            };
-            // SAFETY: the pointer came from a completed walk of live
-            // tables, and the caller owns the range: it holds `state`
-            // from the tracker update that took the range out.
-            let entry = unsafe { &mut *entry_ptr };
-            if entry.is_unused() {
-                continue;
-            }
-            assert!(
-                entry.flags().contains(PageTableFlags::PRESENT),
-                "x86 user page {virt_addr:#x} was already retired"
-            );
-            let flags = (entry.flags() - PageTableFlags::PRESENT) | RETIRED;
-            entry.set_flags(flags);
-            retired += 1;
-        }
-        if retired == 0 {
-            return;
-        }
-        smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
-        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            let virt_addr = virt.start.raw() + offset;
-            let Some(entry_ptr) = self.leaf_entry(virt_addr) else {
-                continue;
-            };
-            // SAFETY: as above.
-            let entry = unsafe { &mut *entry_ptr };
-            if !entry.flags().contains(RETIRED) {
-                continue;
-            }
-            let phys = entry.addr().as_u64() as usize;
-            entry.set_unused();
-            self.dealloc_user_phys(phys);
-        }
-    }
-
-    fn protect_pages(
-        &self,
-        mapper: &mut OffsetPageTable<'static>,
-        virt: VirtRange,
-        flags: PageTableFlags,
-    ) -> Result<(), AddressSpaceError> {
-        let mut old_flags = Vec::new();
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            let virt_addr = virt.start.raw() + offset;
-            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                .map_err(|_| AddressSpaceError::Misaligned)?;
-            let previous = match mapper.translate(X86VirtAddr::new(virt_addr as u64)) {
-                TranslateResult::Mapped { flags, .. } => flags,
-                _ => {
-                    rollback_partial_protect(mapper, &old_flags);
-                    return Err(AddressSpaceError::NotCommitted);
-                }
-            };
-            // A substituted device region keeps its memory type through
-            // a protection change: `flags` says what the owner may do,
-            // never how the hardware is reached.
-            let flags = flags | (previous & memory_type::MEMORY_TYPE_BITS);
-            match unsafe { mapper.update_flags(page, flags) } {
-                Ok(flush) => {
-                    flush.flush();
-                    old_flags.push((page, previous));
-                }
-                Err(_) => {
-                    rollback_partial_protect(mapper, &old_flags);
-                    return Err(AddressSpaceError::NotCommitted);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The level-4 table of the address space this processor is running
-    /// in, as a raw pointer through the HHDM.
-    fn level_4_table(&self) -> *mut PageTable {
-        let (level_4, _) = Cr3::read();
-        let virt = (level_4.start_address().as_u64() as usize)
-            .checked_add(self.physical_memory_offset)
-            .unwrap_or_else(|| panic!("x86 level-4 table HHDM address overflow"));
-        virt as *mut PageTable
-    }
-
-    /// The table `table[index]` points at, building it when the entry
-    /// is unused.
-    ///
-    /// The caller holds `state` (see the type's concurrency contract),
-    /// so no other processor is editing this walk. Intermediate entries
-    /// are present and writable and never carry `NO_EXECUTE`: the
-    /// permission that matters is the leaf's, and clearing execute on a
-    /// parent would take it away from every mapping below it, compiled
-    /// code included.
-    fn ensure_table(
-        &self,
-        table: *mut PageTable,
-        index: PageTableIndex,
-        frame_allocator: &mut DirectMappedFrameAllocator,
-    ) -> Result<*mut PageTable, AddressSpaceError> {
-        // SAFETY: `table` is a live page table reached through the
-        // HHDM, and the caller holds the reservation lock, so this is
-        // the only reference to the entry.
-        let table = unsafe { &mut *table };
-        let entry = &mut table[index];
-        if entry.is_unused() {
-            let frame = frame_allocator
-                .allocate_frame()
-                .ok_or(AddressSpaceError::PageTableExhausted)?;
-            entry.set_frame(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
-        }
-        assert!(
-            !entry.flags().contains(PageTableFlags::HUGE_PAGE),
-            "x86 user-VA walk hit a huge page where a table was expected"
-        );
-        let virt = (entry.addr().as_u64() as usize)
-            .checked_add(self.physical_memory_offset)
-            .unwrap_or_else(|| panic!("x86 page-table HHDM address overflow"));
-        Ok(virt as *mut PageTable)
-    }
-
-    /// The leaf entry for `virt`, or `None` when the walk runs into a
-    /// level that was never built.
-    ///
-    /// Lock-free by construction: no table below a prepared
-    /// demand-commit region is ever freed while the address space
-    /// lives, so a walk that finds one can keep going.
-    fn leaf_entry(&self, virt: usize) -> Option<*mut PageTableEntry> {
-        let page = Page::<Size4KiB>::containing_address(X86VirtAddr::new(virt as u64));
-        let mut table = self.level_4_table();
-        for index in [page.p4_index(), page.p3_index(), page.p2_index()] {
-            // SAFETY: `table` is a live page table in the HHDM.
-            let entry = &unsafe { &*table }[index];
-            if entry.is_unused() {
-                return None;
-            }
-            assert!(
-                !entry.flags().contains(PageTableFlags::HUGE_PAGE),
-                "x86 user VA {virt:#x} resolves through a huge page"
-            );
-            let next = (entry.addr().as_u64() as usize)
-                .checked_add(self.physical_memory_offset)
-                .unwrap_or_else(|| panic!("x86 page-table HHDM address overflow"));
-            table = next as *mut PageTable;
-        }
-        // SAFETY: `table` is the level-1 table for this address; the
-        // reference is turned straight back into a pointer, so nothing
-        // outlives this borrow.
-        let table = unsafe { &mut *table };
-        Some(core::ptr::from_mut(&mut table[page.p1_index()]))
-    }
-
-    /// Walks every page of `virt`, unmapping the ones a demand commit
-    /// mapped and leaving the ones nothing faulted on alone.
-    fn unmap_demand_pages(&self, virt: VirtRange) {
-        self.unmap_range(virt);
-    }
-
-    fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
+    fn allocate_frame(&self) -> Result<usize, AddressSpaceError> {
         let raw = allocate_user_frame_zeroed_on(smp::current_processor())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        Ok(raw.as_ptr() as usize - self.physical_memory_offset)
+        Ok(self.physical(raw))
     }
 
-    fn hhdm_ptr(&self, phys: usize) -> *mut u8 {
-        let virt = phys
-            .checked_add(self.physical_memory_offset)
-            .unwrap_or_else(|| panic!("x86 user-frame HHDM address overflow"));
-        virt as *mut u8
+    fn allocate_frame_beside(&self, phys: usize) -> Result<usize, AddressSpaceError> {
+        let node = user_frame_node(self.user_frame_pointer(phys));
+        let raw =
+            allocate_user_frame_uninit_on_node(node).map_err(|_| AddressSpaceError::OutOfFrames)?;
+        Ok(self.physical(raw))
     }
 
-    fn dealloc_user_phys(&self, phys: usize) {
-        let ptr = NonNull::new(self.hhdm_ptr(phys))
-            .unwrap_or_else(|| panic!("x86 user-frame dealloc received null HHDM pointer"));
-        deallocate_user_frame_on(smp::current_processor(), ptr);
+    fn free_frame(&self, phys: usize) {
+        deallocate_user_frame_on(smp::current_processor(), self.user_frame_pointer(phys));
     }
 
-    fn build_relocation_plan(
-        &self,
-        mapper: &OffsetPageTable<'static>,
-        virt: VirtRange,
-    ) -> Result<Vec<RelocationPage>, AddressSpaceError> {
-        let mut pages: Vec<RelocationPage> = Vec::new();
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            let virt_addr = virt.start.raw() + offset;
-            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                .map_err(|_| AddressSpaceError::Misaligned)?;
-            let (old_phys, old_flags) = match mapper.translate(X86VirtAddr::new(virt_addr as u64)) {
-                TranslateResult::Mapped { frame, flags, .. } => {
-                    (frame.start_address().as_u64() as usize, flags)
-                }
-                _ => {
-                    for page in pages {
-                        self.dealloc_user_phys(page.new_phys);
-                    }
-                    return Err(AddressSpaceError::NotCommitted);
-                }
-            };
-            let new_phys = match self.alloc_user_frame() {
-                Ok(phys) => phys,
-                Err(error) => {
-                    for page in pages {
-                        self.dealloc_user_phys(page.new_phys);
-                    }
-                    return Err(error);
-                }
-            };
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    self.hhdm_ptr(old_phys) as *const u8,
-                    self.hhdm_ptr(new_phys),
-                    PAGE,
-                );
-            }
-            pages.push(RelocationPage {
-                page,
-                virt: virt_addr,
-                old_phys,
-                old_flags,
-                new_phys,
-            });
-        }
-        Ok(pages)
-    }
-
-    fn remap_page(
-        &self,
-        mapper: &mut OffsetPageTable<'static>,
-        frame_allocator: &mut DirectMappedFrameAllocator,
-        page: RelocationPage,
-        phys: usize,
-        flags: PageTableFlags,
-    ) -> Result<(), AddressSpaceError> {
-        let (old_frame, flush) = mapper
-            .unmap(page.page)
-            .map_err(|_| AddressSpaceError::NotCommitted)?;
-        flush.flush();
-        let new_frame =
-            x86_64::structures::paging::PhysFrame::from_start_address(PhysAddr::new(phys as u64))
-                .map_err(|_| AddressSpaceError::Misaligned)?;
-        match unsafe { mapper.map_to(page.page, new_frame, flags, frame_allocator) } {
-            Ok(flush) => {
-                flush.flush();
-                Ok(())
-            }
-            Err(_) => {
-                unsafe {
-                    mapper
-                        .map_to(page.page, old_frame, page.old_flags, frame_allocator)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "x86 AddressSpace::relocate failed to restore page {:#x}: {error:?}",
-                                page.virt
-                            )
-                        })
-                        .flush();
-                }
-                Err(AddressSpaceError::PageTableExhausted)
-            }
-        }
-    }
-
-    fn rollback_relocation(
-        &self,
-        mapper: &mut OffsetPageTable<'static>,
-        frame_allocator: &mut DirectMappedFrameAllocator,
-        pages: &[RelocationPage],
-        installed: usize,
-    ) {
-        for page in pages[..installed].iter().rev().copied() {
-            self.remap_page(mapper, frame_allocator, page, page.old_phys, page.old_flags)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "x86 AddressSpace::relocate rollback failed at {:#x}: {error}",
-                        page.virt
-                    )
-                });
-        }
-        // The pages this restored were briefly mapped to the replacement
-        // frames, and `remap_page` only invalidates the local processor, so
-        // the replacements are not free to reuse until every processor has
-        // dropped those translations (AGENTS §3.4).
-        if let Some(first) = pages.first() {
-            self.shootdown_range(VirtRange::new(
-                VirtAddr::new(first.virt),
-                pages.len() * PAGE,
-            ));
-        }
-        for page in pages {
-            self.dealloc_user_phys(page.new_phys);
-        }
-    }
-
-    fn rollback_partial_commit(&self, start: usize, mapped_pages: usize) {
-        if mapped_pages == 0 {
-            return;
-        }
-        self.unmap_range(VirtRange::new(VirtAddr::new(start), mapped_pages * PAGE));
-    }
-
-    /// The leaf entry of every page of `virt`, when every one of them is
-    /// present. Nothing is changed.
-    fn present_leaves(
-        &self,
-        virt: VirtRange,
-    ) -> Result<Vec<*mut PageTableEntry>, AddressSpaceError> {
-        let mut leaves = Vec::with_capacity(virt.byte_len / PAGE);
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            let leaf = self
-                .leaf_entry(virt.start.raw() + offset)
-                .ok_or(AddressSpaceError::NotCommitted)?;
-            // SAFETY: the pointer came from a completed walk of live
-            // tables, and the caller holds the reservation lock.
-            if !unsafe { &*leaf }.flags().contains(PageTableFlags::PRESENT) {
-                return Err(AddressSpaceError::NotCommitted);
-            }
-            leaves.push(leaf);
-        }
-        Ok(leaves)
-    }
-
-    /// Show the physical bytes from `phys` at `virt` with `pt_flags`, in
-    /// place of the pool frames that are there.
-    ///
-    /// The reservation lock is held from the check that `virt` is
-    /// committed (this backend never swaps) and unsubstituted, across
-    /// every leaf rewrite and the shootdown, to the bookkeeping that
-    /// marks it. Each leaf goes from one present entry to another in a
-    /// single store, so a processor racing the call reads the old page or
-    /// the new one, and the old frames are freed only after the shootdown
-    /// has been acknowledged. The old and new leaves name different
-    /// physical frames, so no frame is ever mapped with two memory types
-    /// at once.
-    fn substitute_leaves(
-        &self,
-        virt: VirtRange,
-        phys: usize,
-        pt_flags: PageTableFlags,
-    ) -> Result<(), AddressSpaceError> {
-        let mut state = self.state.lock();
-        state.check_substitutable(virt)?;
-        let leaves = self.present_leaves(virt)?;
-        let mut replaced = Vec::with_capacity(leaves.len());
-        for (index, leaf) in leaves.into_iter().enumerate() {
-            // SAFETY: `present_leaves` walked live tables for this
-            // range, and the reservation lock is held.
-            let entry = unsafe { &mut *leaf };
-            replaced.push(entry.addr().as_u64() as usize);
-            entry.set_addr(PhysAddr::new((phys + index * PAGE) as u64), pt_flags);
-        }
-        smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
-        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
-        for old in replaced {
-            self.dealloc_user_phys(old);
-        }
-        // This backend never swaps, so every page was committed and no
-        // swap extent is orphaned.
-        let orphaned = state.record_substitute(virt)?;
-        debug_assert!(orphaned.is_empty());
-        Ok(())
-    }
-
-    /// Drop the leaves of a substituted range, freeing no frame, and
-    /// shoot the range down on every processor before returning.
-    ///
-    /// The frames behind a substitution belong to the run's owner, so
-    /// this is the unmap [`Self::unmap_range`] must never be allowed to
-    /// do to them. Pages with no leaf are left alone.
-    fn drop_substituted_leaves(&self, virt: VirtRange) {
-        let mut dropped = false;
-        for offset in (0..virt.byte_len).step_by(PAGE) {
-            let Some(leaf) = self.leaf_entry(virt.start.raw() + offset) else {
-                continue;
-            };
-            // SAFETY: as in `unmap_range`: the caller owns the range
-            // under `state`.
-            let entry = unsafe { &mut *leaf };
-            if !entry.is_unused() {
-                entry.set_unused();
-                dropped = true;
-            }
-        }
-        if dropped {
-            smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
-            smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
-        }
-    }
-
-    /// [`Self::drop_substituted_leaves`] for each part a tracker
-    /// reported, to run before the rest of the range is unmapped.
-    fn drop_substituted_parts(&self, parts: &[VirtRange]) {
-        for part in parts {
-            self.drop_substituted_leaves(*part);
-        }
-    }
-
-    /// Decommit only the parts of `range` that are actually committed.
-    ///
-    /// The runtime resets a pooled slot by asking for a range whose committed
-    /// extent it does not track precisely, so a whole-range decommit would
-    /// fail on the first uncommitted page. A substitution inside the range
-    /// is dropped without freeing the run's frames, as a withdraw would.
-    fn decommit_committed_subranges(&self, range: VirtRange) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(range)?;
-        let mut state = self.state.lock();
-        let removal = state.take_committed_intersections(range)?;
-        self.drop_substituted_parts(&removal.substituted);
-        for subrange in removal.ranges {
-            self.unmap_range(subrange);
-        }
-        Ok(())
-    }
-
-    /// Give `range` `flags`, committing the parts of it that are not
-    /// committed yet and re-protecting the parts that are.
-    fn ensure_accessible_subranges(
-        &self,
-        range: VirtRange,
-        flags: PageFlags,
-    ) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(range)?;
-        let pt_flags = page_flags_to_pt(flags)?;
-        let mut state = self.state.lock();
-        let plan = state.accessibility_plan(range)?;
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        let mut frame_allocator = DirectMappedFrameAllocator {
-            physical_memory_offset: self.physical_memory_offset,
-        };
-        for subrange in plan.protect {
-            state.ensure_committed(subrange)?;
-            self.protect_pages(&mut mapper, subrange, pt_flags)?;
-            self.shootdown_range(subrange);
-            state.record_protect(subrange, flags)?;
-        }
-        for subrange in plan.commit {
-            state.precheck_commit(subrange)?;
-            // No shootdown: see `commit`.
-            self.map_pages(&mut mapper, &mut frame_allocator, subrange, pt_flags)?;
-            // This backend has no swap, so committing over the range can
-            // never orphan a swap extent; the assertion keeps that true if
-            // swap reaches this architecture (#25).
-            let orphaned = state.record_commit(subrange, flags, MemoryOwner::NONE)?;
-            debug_assert!(orphaned.is_empty());
-        }
-        Ok(())
-    }
-}
-
-impl AddressSpace for X86UserAddressSpace {
-    fn reserve(&self, byte_len: usize) -> Result<VirtRange, AddressSpaceError> {
-        if byte_len == 0 {
-            return Err(AddressSpaceError::EmptyRange);
-        }
-        if !byte_len.is_multiple_of(PAGE) {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let range = self
-            .carve_reservation(byte_len)
-            .ok_or(AddressSpaceError::OutOfFrames)?;
-        self.state.lock().reserve(range);
-        Ok(range)
-    }
-
-    fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        // One critical section from the tracker update through the last
-        // leaf cleared to the return of the range to the free list: a
-        // `commit` of the range cannot map it between the record and the
-        // unmap, and `reserve` cannot reuse it before its leaves are gone.
-        let mut state = self.state.lock();
-        let released = state.release(virt)?;
-        // This backend has no swap, so a released reservation never holds a
-        // swap token; the assertion keeps that true if swap ever reaches
-        // this architecture (#25).
-        debug_assert!(released.swapped.is_empty());
-        for region in &released.committed {
-            if region.substituted {
-                self.drop_substituted_leaves(region.range);
-            } else {
-                self.unmap_range(region.range);
-            }
-        }
-        state.push_free_range(virt);
-        Ok(())
-    }
-
-    /// Maps fresh frames under `virt`.
-    ///
-    /// No shootdown goes out: every page here was not present a moment
-    /// ago, x86-64 caches no not-present translation, and every path
-    /// that unmaps a page broadcasts before its frame is freed, so no
-    /// processor can hold a translation for any of these pages. The
-    /// local `INVLPG` `map_pages` issues is the whole of the TLB work,
-    /// the same as `commit_demand_page` and the aarch64 and riscv
-    /// backends. A broadcast here was one IPI round per `memory.grow`,
-    /// and the compute rows that grow paid it on every step (#419).
-    fn commit(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        let pt_flags = page_flags_to_pt(flags)?;
-
-        // One critical section from precheck to record: two commits
-        // that share a missing intermediate table cannot both build it.
-        let mut state = self.state.lock();
-        state.precheck_commit(virt)?;
-
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        let mut frame_allocator = DirectMappedFrameAllocator {
-            physical_memory_offset: self.physical_memory_offset,
-        };
-        self.map_pages(&mut mapper, &mut frame_allocator, virt, pt_flags)?;
-
-        let orphaned = state.record_commit(virt, flags, MemoryOwner::NONE)?;
-        // This backend has no swap, see `ensure_accessible_subranges`.
-        debug_assert!(orphaned.is_empty());
-        Ok(())
-    }
-
-    /// One allocation out of the user pool, taken on the executing
-    /// processor: the run comes out of the user pool's direct map, and
-    /// what a device is told is where it sits in physical memory. No
-    /// translation changes, so no lock and no shootdown.
-    fn allocate_run(
-        &self,
-        bytes: usize,
-        placement: DmaPlacement,
-    ) -> Result<PhysicalRange, AddressSpaceError> {
-        if bytes == 0 {
-            return Err(AddressSpaceError::EmptyRange);
-        }
-        if !bytes.is_multiple_of(PAGE) {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let align = usize::try_from(placement.align)
-            .ok()
-            .filter(|align| align.is_power_of_two() && *align >= PAGE)
-            .ok_or(AddressSpaceError::Misaligned)?;
-        let layout =
-            Layout::from_size_align(bytes, align).map_err(|_| AddressSpaceError::Misaligned)?;
+    fn allocate_run(&self, layout: Layout) -> Result<usize, AddressSpaceError> {
         let raw = allocate_user_run_zeroed_on(smp::current_processor(), layout)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        let phys = raw.as_ptr() as usize - self.physical_memory_offset;
-        if !placement.accepts(phys as u64, bytes as u64) {
-            self.free_pinned_run(phys, bytes, align);
-            return Err(AddressSpaceError::OutOfFrames);
-        }
-        Ok(PhysicalRange::new(phys as u64, bytes as u64))
+        Ok(self.physical(raw))
     }
 
-    fn free_run(&self, run: PhysicalRange, align: u64) -> Result<(), AddressSpaceError> {
-        let align = usize::try_from(align)
-            .ok()
-            .filter(|align| align.is_power_of_two() && *align >= PAGE)
-            .ok_or(AddressSpaceError::Misaligned)?;
-        let bytes = usize::try_from(run.bytes).map_err(|_| AddressSpaceError::Misaligned)?;
-        let start = usize::try_from(run.start).map_err(|_| AddressSpaceError::Misaligned)?;
-        if bytes == 0 || !bytes.is_multiple_of(PAGE) || !start.is_multiple_of(align) {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        self.free_pinned_run(start, bytes, align);
-        Ok(())
+    fn free_run(&self, phys: usize, layout: Layout) {
+        deallocate_user_run_on(
+            smp::current_processor(),
+            self.user_frame_pointer(phys),
+            layout,
+        );
     }
 
-    /// The leaves carry ordinary write-back attributes. The reservation
-    /// lock is held across the rewrite: see [`Self::substitute_leaves`].
-    fn substitute_memory(
-        &self,
-        virt: VirtRange,
-        physical: PhysicalRange,
-        flags: PageFlags,
-    ) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        if physical.bytes as usize != virt.byte_len
-            || !(physical.start as usize).is_multiple_of(PAGE)
-        {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        // Ordinary memory attributes: these bytes are somebody's
-        // buffer, and a second holder that reached them uncached would
-        // see a picture the first holder's stores had not reached yet.
-        let pt_flags = page_flags_to_pt(flags)?;
-        self.substitute_leaves(virt, physical.start as usize, pt_flags)
+    fn current_owner(&self) -> MemoryOwner {
+        current_user_memory_owner(smp::current_processor())
     }
 
-    /// The region's own attributes, from
-    /// [`memory_type::device_leaf_flags`]: uncacheable for a register
-    /// file, write-back for memory, read-only when the region is not
-    /// writable, never executable. The
-    /// reservation lock is held across the rewrite: see
-    /// [`Self::substitute_leaves`].
-    fn substitute_device(
-        &self,
-        virt: VirtRange,
-        region: DeviceRegion,
-    ) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        if !region.is_frame_aligned() || region.physical.bytes as usize != virt.byte_len {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        self.substitute_leaves(
-            virt,
-            region.physical.start as usize,
-            memory_type::device_leaf_flags(region.attributes),
-        )
+    fn invalidate_local(&self, range: VirtRange) {
+        smp::flush_tlb_range_local(range.start.raw(), range.byte_len);
     }
 
-    /// The reservation lock is held from the check that `virt` is
-    /// substituted, across the allocation of every fresh frame and every
-    /// leaf rewrite, to the bookkeeping. Frames are all allocated
-    /// before the first leaf changes, so running out leaves the
-    /// substitution in place.
-    fn restore(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        let mut state = self.state.lock();
-        let regions = state.substituted_regions(virt)?;
-        let mut page_flags = Vec::with_capacity(virt.byte_len / PAGE);
-        for region in &regions {
-            let pt_flags = page_flags_to_pt(region.flags)?;
-            page_flags.extend(core::iter::repeat_n(pt_flags, region.range.byte_len / PAGE));
-        }
-        let leaves = self.present_leaves(virt)?;
-        let mut fresh = Vec::with_capacity(leaves.len());
-        for _ in &leaves {
-            match self.alloc_user_frame() {
-                Ok(phys) => fresh.push(phys),
-                Err(error) => {
-                    for phys in fresh {
-                        self.dealloc_user_phys(phys);
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        for ((leaf, phys), pt_flags) in leaves.into_iter().zip(fresh).zip(page_flags) {
-            // SAFETY: as in `substitute_memory`.
-            let entry = unsafe { &mut *leaf };
-            entry.set_addr(PhysAddr::new(phys as u64), pt_flags);
-        }
-        // What was shown here is not ours to free; the shootdown is so
-        // that no processor keeps reading it through the old leaf.
-        smp::flush_tlb_range_local(virt.start.raw(), virt.byte_len);
-        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
-        state.record_restore(virt)
-    }
-
-    /// The reservation lock is held across the leaf removal, the
-    /// shootdown and the bookkeeping. Nothing is allocated.
-    fn withdraw(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        let mut state = self.state.lock();
-        state.substituted_regions(virt)?;
-        self.drop_substituted_leaves(virt);
-        state.record_withdraw(virt)
-    }
-
-    fn decommit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        // Held from the tracker update through the last leaf cleared, as
-        // in `release`: a concurrent `commit` of `virt` waits for the
-        // unmap instead of interleaving with it.
-        let mut state = self.state.lock();
-        let removed = state.record_decommit(virt)?;
-        self.drop_substituted_parts(&removed.substituted);
-        self.unmap_range(virt);
-        Ok(())
-    }
-
-    fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        let pt_flags = page_flags_to_pt(flags)?;
-        // The check, the leaf rewrite and the record are one critical
-        // section, as in `ensure_accessible_subranges`: a concurrent
-        // decommit or commit of the range cannot slip between them.
-        let mut state = self.state.lock();
-        state.ensure_committed(virt)?;
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        self.protect_pages(&mut mapper, virt, pt_flags)?;
-        self.shootdown_range(virt);
-        state.record_protect(virt, flags)?;
-        Ok(())
-    }
-
-    fn prepare_demand_commit(
-        &self,
-        virt: VirtRange,
-        flags: PageFlags,
-    ) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        // The flags are validated here rather than at the first fault:
-        // a fault-time commit has no way to report a bad combination.
-        let _ = page_flags_to_pt(flags)?;
-        let mut state = self.state.lock();
-        state.precheck_commit(virt)?;
-        let mut frame_allocator = DirectMappedFrameAllocator {
-            physical_memory_offset: self.physical_memory_offset,
-        };
-        // One walk per level-1 table, not per page: every page of a
-        // block shares the table the walk builds, and this runs under
-        // the reservation lock on every store creation.
-        for block in virt.block_starts(LEAF_TABLE_SPAN) {
-            let page = Page::<Size4KiB>::containing_address(X86VirtAddr::new(block.raw() as u64));
-            let p4 = self.level_4_table();
-            let p3 = self.ensure_table(p4, page.p4_index(), &mut frame_allocator)?;
-            let p2 = self.ensure_table(p3, page.p3_index(), &mut frame_allocator)?;
-            self.ensure_table(p2, page.p2_index(), &mut frame_allocator)?;
-        }
-        // `MemoryOwner::NONE` on purpose. The residency accounting and
-        // the swap aging pass both key on a real owner, and neither may
-        // see this region: its pages are not resident until something
-        // faults on them, and ageing one would offer the swap policy the
-        // stack its own fault handler is standing on.
-        let orphaned = state.record_commit(virt, flags, MemoryOwner::NONE)?;
-        debug_assert!(orphaned.is_empty());
-        Ok(())
-    }
-
-    fn commit_demand_page(
-        &self,
-        addr: VirtAddr,
-        frame: NonNull<u8>,
-        flags: PageFlags,
-    ) -> Result<(), AddressSpaceError> {
-        let virt = addr.raw();
-        if !addr.is_page_aligned() {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let pt_flags = page_flags_to_pt(flags)?;
-        let entry_ptr = self
-            .leaf_entry(virt)
-            .ok_or(AddressSpaceError::NotDemandCommit)?;
-        let phys = (frame.as_ptr() as usize)
-            .checked_sub(self.physical_memory_offset)
-            .ok_or(AddressSpaceError::Misaligned)?;
-        let frame = x86_64::structures::paging::PhysFrame::<Size4KiB>::from_start_address(
-            PhysAddr::new(phys as u64),
-        )
-        .map_err(|_| AddressSpaceError::Misaligned)?;
-        // SAFETY: the walk above completed through live tables, and the
-        // page it names is inside a prepared demand-commit region, which
-        // only the fiber running on it ever faults on.
-        let entry = unsafe { &mut *entry_ptr };
-        if !entry.is_unused() {
-            return Err(AddressSpaceError::Overlap);
-        }
-        entry.set_frame(frame, pt_flags);
-        // The page went from unmapped to mapped, so no processor can
-        // hold a translation for it and the local invalidate is the
-        // whole of the TLB work. A negative entry is not cached on any
-        // x86-64 implementation that matters, and the architecture
-        // requires this invalidate for the ones that speculate.
-        tlb::flush(X86VirtAddr::new(virt as u64));
-        Ok(())
-    }
-
-    fn end_demand_commit(
-        &self,
-        virt: VirtRange,
-        mapped: VirtRange,
-    ) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        if !virt.encloses(mapped) {
-            return Err(AddressSpaceError::NotDemandCommit);
-        }
-        // Held through the unmap, as in `decommit`.
-        let mut state = self.state.lock();
-        let _ = state.record_decommit(virt)?;
-        self.unmap_demand_pages(mapped);
-        Ok(())
-    }
-
-    fn translate(&self, addr: VirtAddr) -> Translation {
-        if addr.raw() < USER_VA_BASE || addr.raw() >= USER_VA_END {
-            return Translation::Unmapped;
-        }
-        let committed = match self.state.lock().lookup(addr) {
-            ReservationLookup::Unreserved => return Translation::Unmapped,
-            ReservationLookup::Reserved => return Translation::Reserved,
-            ReservationLookup::Committed(region) => region,
-        };
-        let mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        match mapper.translate(X86VirtAddr::new(addr.raw() as u64)) {
-            TranslateResult::Mapped { frame, .. } => {
-                let phys = frame.start_address().as_u64() as usize;
-                Translation::Committed {
-                    frame: PhysFrame::from_phys_addr(phys & !(PAGE - 1)),
-                    flags: committed.flags,
-                }
-            }
-            _ => Translation::Reserved,
-        }
-    }
-
-    fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        self.assert_smp_safe();
-        validate_range(virt)?;
-        // Held through the remap: `remap_page` unmaps and re-maps leaves
-        // of a committed range and `map_to` may build a table.
-        let state = self.state.lock();
-        state.ensure_committed(virt)?;
-        // A substitution has no pool frames to copy and free.
-        state.ensure_unsubstituted(virt)?;
-
-        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
-        let mut frame_allocator = DirectMappedFrameAllocator {
-            physical_memory_offset: self.physical_memory_offset,
-        };
-        let pages = self.build_relocation_plan(&mapper, virt)?;
-        for (index, page) in pages.iter().copied().enumerate() {
-            if let Err(error) = self.remap_page(
-                &mut mapper,
-                &mut frame_allocator,
-                page,
-                page.new_phys,
-                page.old_flags,
-            ) {
-                self.rollback_relocation(&mut mapper, &mut frame_allocator, &pages, index);
-                return Err(error);
-            }
-        }
-        self.shootdown_range(virt);
-        for page in &pages {
-            self.dealloc_user_phys(page.old_phys);
-        }
-        Ok(())
+    fn shootdown(&self, range: VirtRange) {
+        smp::shootdown_tlb_range(range.start.raw(), range.byte_len);
     }
 }
 
-/// Restores the flags a failed `protect_pages` had already changed.
-///
-/// The pages briefly carried the new flags, and another processor may
-/// have translated one in that window, so the restored range is shot
-/// down the way the success path is: a stale narrower translation is
-/// a spurious fault on a page the tracker says is committed, and a
-/// stale wider one is a permission the caller withdrew.
-fn rollback_partial_protect(
-    mapper: &mut OffsetPageTable<'static>,
-    old_flags: &[(Page<Size4KiB>, PageTableFlags)],
-) {
-    for (page, flags) in old_flags.iter().rev().copied() {
-        unsafe {
-            mapper
-                .update_flags(page, flags)
-                .unwrap_or_else(|error| {
-                    panic!("x86 AddressSpace::protect rollback failed: {error:?}")
-                })
-                .flush();
-        }
-    }
-    if let (Some((first, _)), Some((last, _))) = (old_flags.first(), old_flags.last()) {
-        let start = first.start_address().as_u64() as usize;
-        let end = last.start_address().as_u64() as usize + PAGE;
-        smp::shootdown_tlb_range(start, end - start);
+impl InstalledMachine for HhdmMachine {
+    fn installed() -> &'static X86UserAddressSpace {
+        user_as()
     }
 }
 
-fn page_flags_to_pt(flags: PageFlags) -> Result<PageTableFlags, AddressSpaceError> {
-    // x86 has no allocation-tag storage to map.
-    if flags.is_empty() || flags.contains(PageFlags::TAGGED) {
-        return Err(AddressSpaceError::InvalidFlags);
-    }
-    // No `USER_ACCESSIBLE`: every helios thread runs in ring 0, guest wasm
-    // included, so the "user" window is a range the kernel owns on a guest's
-    // behalf rather than a privilege boundary. Marking it user-accessible
-    // would buy nothing and would make the mappings unusable the moment SMAP
-    // or SMEP is enabled — including for the runtime's compiled code, which
-    // is mapped in this window and fetched in ring 0. This matches the
-    // aarch64 backend's `AP_KERNEL_RW`.
-    let mut pt = PageTableFlags::PRESENT;
-    if flags.contains(PageFlags::WRITE) {
-        pt |= PageTableFlags::WRITABLE;
-    }
-    if !flags.contains(PageFlags::EXECUTE) {
-        pt |= PageTableFlags::NO_EXECUTE;
-    }
-    Ok(pt)
-}
+/// The kernel's view of how much of the user pool each instance holds.
+static X86_RESIDENCY_HOOKS: ResidencyVmHooks = residency_vm_hooks::<X86UserAddressSpace>();
 
 static USER_AS: Once<X86UserAddressSpace> = Once::new();
 
@@ -1150,8 +149,16 @@ static USER_AS: Once<X86UserAddressSpace> = Once::new();
 /// bootstrap CPU after Limine handoff is processed and before any
 /// runtime engine is constructed.
 pub fn install_user_address_space(physical_memory_offset: usize, processor_count: usize) {
-    USER_AS.call_once(|| X86UserAddressSpace::new(physical_memory_offset, processor_count));
+    USER_AS.call_once(|| {
+        X86UserAddressSpace::new(
+            HhdmMachine {
+                physical_memory_offset,
+            },
+            processor_count,
+        )
+    });
     runtime_memory::install_hooks(&X86_VMM_HOOKS);
+    install_residency_hooks(&X86_RESIDENCY_HOOKS);
     install_fiber_stack_hooks(&X86_FIBER_STACK_HOOKS);
 }
 

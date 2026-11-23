@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 clap = { version = "4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 getrandom = { version = "0.3.4", default-features = false, features = ["std"] }
+helios-artifact.workspace = true
 helios-compiler-abi.workspace = true
 helios-compiler-support.workspace = true
 serde = { version = "1.0.229", default-features = false, features = ["derive"] }
@@ -24,7 +25,7 @@ wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, 
 
 [dev-dependencies]
 tempfile.workspace = true
-wat = { version = "1.258.0", default-features = false }
+wat = { version = "1.263.0", default-features = false }
 
 [lints]
 workspace = true

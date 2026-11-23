@@ -3,12 +3,11 @@ use wasmtime::{Config, ModuleVersionStrategy, StackLimitLocation};
 pub use crate::component::{
     COMPONENT_ASYNC_STACK_SIZE, MAX_CONCURRENT_INSTANCES, MAX_CORE_INSTANCES_PER_COMPONENT,
     MAX_MEMORIES_PER_COMPONENT, MAX_POOLED_ADDRESS_SPACE, MAX_POOLED_USER_MEMORY,
-    MAX_TABLES_PER_COMPONENT,
+    MAX_TABLES_PER_COMPONENT, TABLES_PER_INSTANCE,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
-    Fast,
     Balanced,
     Performance,
 }
@@ -38,7 +37,7 @@ pub fn build_target_engine_config(target: &str) -> Config {
     // The engine has no compiler, so it cannot compare an artifact's signing
     // flags against its own. It requires the protection the target's
     // Cranelift producers emit through the artifact's version string instead,
-    // and refuses any other artifact, Winch output included. Nothing depends
+    // and refuses any other artifact. Nothing depends
     // on the processor: signed code runs on processors without pointer
     // authentication, where the signing instructions do nothing.
     if let Some(version) = helios_artifact::cwasm_target_code_protection(target)

@@ -1,0 +1,25 @@
+[package]
+name = "helios-sync"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[features]
+default = []
+runtime = ["dep:bytes", "dep:heapless", "dep:spin", "dep:triomphe", "dep:async-lock", "dep:event-listener"]
+
+[dependencies]
+bytes = { version = "1.12.1", default-features = false, optional = true }
+heapless = { version = "0.7.17", default-features = false, optional = true }
+spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"], optional = true }
+triomphe = { version = "0.1.15", default-features = false, optional = true }
+async-lock = { version = "3.4.2", default-features = false, optional = true }
+event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"], optional = true }
+
+[dev-dependencies]
+futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
+critical-section = { version = "1.2.0", features = ["std"] }
+futures-lite = "2.6.1"
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+name: Prune an artifact cache
+description: Delete the helios-cli artifact cache entries the job did not use, so the cache saved at job end holds what the job needed. Runs the helios-cli the `helios-cli` action exported as HELIOS_CLI_BIN.
+inputs:
+  cache-dir:
+    description: The artifact cache directory.
+    required: true
+  since:
+    description: Unix seconds the job started at, recorded before its cache was restored.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        CACHE_DIR: ${{ inputs.cache-dir }}
+        SINCE: ${{ inputs.since }}
+      run: |
+        set -euo pipefail
+        if [ -z "${HELIOS_CLI_BIN:-}" ]; then
+          echo "::error::HELIOS_CLI_BIN is unset; run the helios-cli action before pruning ${CACHE_DIR}"
+          exit 1
+        fi
+        "$HELIOS_CLI_BIN" artifact-cache-prune --cache-dir "$CACHE_DIR" --older-than "$SINCE"

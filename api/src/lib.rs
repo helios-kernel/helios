@@ -1,7 +1,7 @@
 //! Async-first userland SDK for Helios wasm programs.
 //!
 //! Each capability area lives behind a Cargo feature so programs only
-//! link the WIT interfaces they use: `fs`, `http`, `http-handler`, `http-kit-io`, `io`,
+//! link the WIT interfaces they use: `btrfs`, `fs`, `http`, `http-handler`, `http-kit-io`, `io`,
 //! `mounts`, `net`, `programs`, `serial`, `stats`, `sync`, `task`, `tracing`,
 //! `profiling`, `instances`, `display`, `gpu`, `input`, `surface`,
 //! `compositor`, `audio`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
@@ -11,6 +11,10 @@
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod bindings;
+#[cfg(feature = "btrfs")]
+pub mod btrfs;
+#[cfg(feature = "hv")]
+pub use bindings::helios::hv::virtualization as hv;
 #[cfg(feature = "channel")]
 pub mod channel;
 #[cfg(feature = "compositor")]
@@ -21,6 +25,9 @@ pub mod display;
 mod error;
 #[cfg(feature = "fs")]
 pub mod fs;
+#[cfg(any(feature = "display", feature = "gpu", feature = "surface"))]
+pub mod image;
+
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(feature = "http")]
@@ -40,6 +47,8 @@ pub mod mounts;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod prelude;
+#[cfg(feature = "processors")]
+pub mod processors;
 #[cfg(feature = "profiling")]
 pub mod profiling;
 #[cfg(feature = "programs")]
@@ -60,6 +69,8 @@ pub mod task;
 pub mod tracing;
 #[cfg(feature = "vsock")]
 pub mod vsock;
+#[cfg(feature = "webgpu")]
+pub mod webgpu;
 
 #[cfg(any(feature = "fs", feature = "io"))]
 pub use error::Result;

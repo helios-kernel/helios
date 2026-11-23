@@ -5,13 +5,108 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `helios/next-solver-bindgen`):
+The local checkout must be at (branch `helios/sync-main-52`):
 
 ```text
-18b428e6becfb6138b877a3fe70afb08bf5724ba
+56131f786d90a136fec6e80e143de18e5b38e8de
 ```
 
-That revision is `helios/stack-limit-percpu` at
+`56131f786d90a136fec6e80e143de18e5b38e8de` cherry-picks upstream
+`bytecodealliance/wasmtime#15350` (`6f943d5b0a`, "deliver `dropped` events as
+appropriate for host-written streams") onto
+`83843e3ad9613bf4d9f5a860ef8bb5aa5d9a9de5`, moving `dropped: bool` into
+`ProducerState<P, B>` inside `LockedState` so host-produced streams do not lose
+their dropped state across buffered reads (#1148).
+
+`helios/sync-main-52` replays the 32 surviving Helios fork commits from
+`helios/caller-memory` (`5048e15b9626f0382e9a5df653668a0d44b017ed`) onto
+upstream `bytecodealliance/wasmtime` `main` at
+`591684039699641a3ec725fbc86fc8c9f7681211` (Wasmtime 52.0.0-dev, #1099, which
+already includes bytecodealliance/wasmtime#13949 / `fb8c7616d6` from
+`helios/realloc-task-context`), dropping patches and hunks superseded upstream
+(`a34ece0e5a` via #14524, `18b428e6be` via #14193, and the `custom/vm.rs`
+`decommit_pages` and `decommit_queue.rs` `std::io` hunks via #14774 and #14874).
+
+Commit `83843e3ad9` tells a host function the linear memory of the call it is serving:
+
+- `Access::caller_memory()` returns the memory named by the `canon lower`
+  options the guest called through: the calling subcomponent's own memory.
+  It is `None` when those options name no memory or a shared one, and for an
+  `Access` that serves no guest call (`Access::new`, a spawned task).
+- The answer belongs to the call. The runtime captures the calling instance
+  and its options index when the host call is entered, on the array, register
+  and async-lowered paths alike, and carries them in that call's `Access`, or
+  in the `Accessor` its host future owns. A concurrent host that suspends
+  answers with its own call's memory after any number of other calls ran.
+- `LinkerInstance::func_wrap_access` is `func_wrap` with the store handed over
+  as an `Access`; `bindgen!` registers synchronous `store` imports through it.
+  `func_wrap_concurrent_immediate` hands its closure an `Access` as well, and
+  `Access` gains `data()` beside `data_mut()`.
+- Each component instance records the `Memory` handle of every core memory
+  its canonical options extract, as instantiation extracts it, so the lookup
+  is an index; `get_default_memory` reads the same record.
+
+Helios needs it because every span a guest passes to `gpu`, `surface`,
+`display` or `device` names "this instance's linear memory", and a component
+composed from several subcomponents has several. `get_default_memory`
+returns `None` for those, so the kernel's one recorded memory per store
+refused every span the WebGPU provider's Venus driver sent from inside
+`pride-flag` (`bad-span`). The kernel now resolves each span against the
+calling call's memory and keeps no memory in its store data.
+
+The revision it replaces is `helios/register-component-hosts` at
+`e06abcd4ca43e6af7b30d577f53c2e6848c9ac5e`, which combines the register trampoline implementation with
+`helios/borrowed-sync-wit-inputs` at `6e4440eff80a35670c7622d4be28d422ab624461`.
+Typed synchronous scalar and resource-handle imports select precompiled native
+register trampolines; other imports retain the array ABI. Canonical validation,
+resource scopes, call hooks and traps remain in the existing runtime helpers.
+
+Borrowed-input preparation extends to synchronous WIT functions
+implemented by asynchronous Rust hosts. `func_wrap_async_prepare` and bindgen's
+`borrowed | async` option complete input validation and request construction
+before the host future starts, retaining only the owned request across suspension.
+
+`helios/borrowed-host-inputs` at
+`578de3c7598ded3a324f08cab7fb2d64e7e9401b` adds scoped guest-memory borrowing to
+`helios/data-host-task-fast-path` at
+`685697120ea7dcf237fb5b7ef6b08fc4456c6fab`. `func_wrap_data_memory` separates
+mutable host data from a read-only memory view that cannot reenter guest code.
+The `borrowed` bindgen import option uses validated cursors for string and
+byte-list inputs, including aggregates. Async WIT imports prepare an owned
+request synchronously before starting their host future; guest references cannot
+cross that boundary. UTF-16 decoding, resource scopes, traps and owned results
+retain their canonical ABI behavior.
+
+`helios/data-host-task-fast-path` adds data-only synchronous host registration to
+`helios/immediate-wit-imports` at
+`dd02866a754619ca217201a91a32d2a1f0bdb08b`. `func_wrap_data` exposes only
+store data to the callback, preventing same-store guest reentry. Synchronous
+lowering skips the HostTask lifecycle when parameter and result types do not
+access resource/task state and the result does not require guest realloc.
+Generated synchronous imports without Store access use this registration;
+resource-bearing, reallocating, Store-taking and async calls retain their
+existing lifecycle.
+
+`helios/immediate-wit-imports` adds immediate host implementations of async WIT imports to
+`helios/guest-memory-residency` at
+`d10291f68ec29a00ec0261fb72d42069be198770`. The
+`func_wrap_concurrent_immediate` registration and bindgen's `immediate` import
+flag retain async WIT typing and canonical lowering while returning directly,
+without a host future allocation. Resource scopes and reentry checks use the
+existing completed-result path.
+
+`helios/guest-memory-residency` is `helios/next-solver-bindgen` at
+`18b428e6becfb6138b877a3fe70afb08bf5724ba` plus one additive commit (#537):
+a store may register a `GuestMemoryResidency`
+(`Store::set_guest_memory_residency`), which the component event loop asks,
+in the poll that copies, whether the guest bytes a `stream` or `future`
+transfer is about to touch are present; an absent page makes the copy wait
+for the embedder's fault-in and check again. A host consumer whose payload
+holds strings or lists is polled on a worker fiber when a hook is
+registered, because the bytes its lift follows cannot be named in advance.
+A store with no hook pays one branch per copy.
+
+`helios/next-solver-bindgen` is `helios/stack-limit-percpu` at
 `1ed7678a8ee4f57cbe4a4e89ade7f7fda6092055` plus upstream
 bytecodealliance/wasmtime#14193 (30dddb655), which spells out the type
 arguments of `with_getter` and `Access::new` in the code `bindgen!`
@@ -221,51 +316,54 @@ there and the revision here in the same change.
 This revision is based on upstream Wasmtime commit:
 
 ```text
-2fb59986ce75a005e0d12fd4637f2e772bb659fd
+591684039699641a3ec725fbc86fc8c9f7681211
 ```
 
-It corresponds to Wasmtime 48.0.0-dev and requires Rust 1.95 or newer. Helios
+It corresponds to Wasmtime 52.0.0-dev and requires Rust 1.95 or newer. Helios
 pins `nightly-2026-11-03` in `rust-toolchain.toml` for Rust 1.101 and installs all
 host, bare-metal, and WASI targets used by the workspace.
 
 ## Patch series
 
-The local `helios-upstream-series-ready` branch is organized as a stacked,
-independently reviewable series. Each `pr-ready/*` branch points at the tip intended
-for that upstream pull request:
+The local `helios/sync-main-52` branch carries the remaining Helios fork commits
+on top of upstream `main`:
 
-1. `pr-ready/no-std-threads` — host-provided synchronization primitives and no-std
+1. `no-std-threads` — host-provided synchronization primitives and no-std
    WebAssembly threads support.
-2. `pr-ready/no-std-pooling` — no-std pooling allocator, including deterministic
+2. `no-std-pooling` — no-std pooling allocator, including deterministic
    single-shard selection where host thread-local storage is unavailable.
-3. `pr-ready/generic-fiber-pool` — bounded reuse of generic async fiber stacks.
-4. `pr-ready/custom-vm-accessible-reset` — reset only the accessible prefix of
+3. `generic-fiber-pool` — bounded reuse of generic async fiber stacks.
+4. `custom-vm-accessible-reset` — reset only the accessible prefix of
    custom-VM linear memories.
-5. `pr-ready/global-pass-timing` — aggregate Cranelift pass timings published by
+5. `global-pass-timing` — aggregate Cranelift pass timings published by
    parallel compiler workers.
-6. `pr-ready/riscv64-simd-fail-fast` — reject SIMD and relaxed-SIMD during
-   configuration validation when a riscv64 target does not enable the V
-   extension.
-7. `pr-ready/riscv64-inline-copy` — scalarize fixed-size inline copies when an ISA
-   lacks native 128-bit SIMD. This fixes GC `array.copy` compilation on
-   riscv64 without the V extension and includes a target-specific disassembly
-   regression test.
 
-The final commit on `helios-upstream-series-ready` remains a Helios integration
-patch: it separates Component Model Async ABI compilation
-from Wasmtime's async runtime/fiber support so the compiler plugin can produce
-compatible artifacts while the no-std kernel only loads and runs precompiled
-code. It should remain in the fork unless upstream agrees on that feature
-boundary.
+It also retains the Helios integration patch that separates Component Model
+Async ABI compilation from Wasmtime's async runtime/fiber support so the
+compiler plugin can produce compatible artifacts while the no-std kernel only
+loads and runs precompiled code. It should remain in the fork unless upstream
+agrees on that feature boundary.
 
-Two former fork patches were removed because upstream already provides their
-functionality:
+Former fork patches and hunks were removed because upstream already provides
+their functionality:
 
 - Cranelift pass timing already computes `now.duration_since(start)` correctly.
 - Component async TLS already uses slot 1 of the custom-platform
   `wasmtime_tls_get`/`wasmtime_tls_set` ABI. Helios implements both Wasmtime TLS
   slots through `WasmtimeTlsSlots`; the removed standalone component-TLS symbols
   must not be reintroduced.
+- Inline copy scalarization without native 128-bit SIMD (`a34ece0e5a`,
+  `pr-ready/riscv64-inline-copy`) landed upstream in
+  bytecodealliance/wasmtime#14524 (`fc03998641`).
+- Configuration validation rejecting SIMD and relaxed-SIMD on riscv64 without
+  the V extension (`pr-ready/riscv64-simd-fail-fast`) landed upstream in
+  bytecodealliance/wasmtime#14897 (`d706822a76`).
+- Explicit type arguments on `with_getter` and `Access::new` for the
+  next-generation trait solver (`18b428e6be`, `helios/next-solver-bindgen`)
+  landed upstream in bytecodealliance/wasmtime#14193 (`30dddb6556`).
+- Custom-VM `decommit_pages` and `no_std` `decommit_queue` cleanup from the
+  no-std pooling series landed upstream in bytecodealliance/wasmtime#14774
+  (`db82603b51`) and bytecodealliance/wasmtime#14874 (`c16fd4dee9`).
 
 Do not submit replacement patches for those upstream implementations.
 
@@ -278,6 +376,35 @@ incompatible package identities. The files currently track the released
 `0.3.0` packages plus `wasi:http@0.3.0`; refresh them from Wasmtime's
 `crates/wasi/src/p3/wit/deps` and `crates/wasi-http/src/p3/wit/deps` when the
 vendored revision moves, rather than pointing bindgen at the sibling tree.
+
+## Cranelift x86 vector-state properties
+
+The x86 backend preserves no vector state beyond FXSAVE at interrupts and the
+`preserve_all` trampoline's 128-bit xmm0-xmm15 save at stack-limit checks
+(`x86/src/extended_state.rs`). That is sound only while the fork's x64
+Cranelift backend keeps three properties, which hold at
+`56131f786d90a136fec6e80e143de18e5b38e8de` and which every move of the fork
+must keep:
+
+- **A, 128-bit only.** Every EVEX instruction in the assembler is declared
+  `evex(L128, …)` (`cranelift/assembler-x64/meta/src/instructions/`), and no
+  VEX instruction is declared 256-bit. Compiled code never names a `ymm` or
+  `zmm` register.
+- **B, no opmask.** The EVEX encoder hard-codes `aaa = 0b000`, mask register
+  k0 (`cranelift/assembler-x64/src/evex.rs`). Compiled code never names k1-k7.
+- **C, xmm0-xmm15 only.** The x64 register environment holds xmm0-xmm15 and
+  leaves the Vector class empty (`create_reg_env_systemv` in
+  `cranelift/codegen/src/isa/x64/abi.rs`), and Winch defines only xmm0-xmm15
+  (`winch/codegen/src/isa/x64/regs.rs`). Compiled code never names
+  xmm16-xmm31.
+
+`compiler-support/tests/avx512_lowerings.rs` pins all three. It compiles
+`compiler-support/tests/data/avx512-lowerings.clif` for x86-64 with every flag
+of the top level of `helios_artifact::cwasm_target_isa_levels`, requires the
+EVEX forms (`vpmullq`, `vpabsq`, `vpsraq`, `vpopcntb`, `vpermi2b`,
+`vcvtudq2ps`) so that it notices AVX-512 not being exercised, and fails on any
+`ymm`, `zmm`, `k1`-`k7` or `xmm16`-`xmm31` operand. A fork revision that fails
+it needs full XSAVE state handling in the x86 backend before it can be taken.
 
 ## Per-target memory profile
 

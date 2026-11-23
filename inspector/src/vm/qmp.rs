@@ -7,11 +7,12 @@
 //! developer a hand-written `socat` session, not to grow a second QEMU
 //! front end.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -36,8 +37,8 @@ pub(crate) enum QmpError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to set a QMP read timeout: {source}")]
-    SetTimeout {
+    #[error("failed to configure the QMP socket: {source}")]
+    ConfigureSocket {
         #[source]
         source: std::io::Error,
     },
@@ -68,6 +69,8 @@ pub(crate) enum QmpError {
         #[source]
         source: std::io::Error,
     },
+    #[error("the QMP request identifier space is exhausted")]
+    RequestIdsExhausted,
     #[error("the QMP socket closed while waiting for a response")]
     Closed,
     #[error("failed to decode the QMP message {line:?}: {source}")]
@@ -81,8 +84,6 @@ pub(crate) enum QmpError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("the screendump path must be valid UTF-8, and {path:?} is not")]
-    ScreendumpPathNotUtf8 { path: String },
     #[error("the human monitor answered {command:?} with {value} instead of its text output")]
     DecodeHumanMonitor { command: String, value: Value },
 }
@@ -206,20 +207,6 @@ pub(crate) enum InputEvent {
     },
 }
 
-/// The arguments of one `screendump`.
-///
-/// `format` is named on every capture: QEMU's default is PPM, and a
-/// lane that uploaded a PPM under a `.png` name would produce an
-/// artifact nothing opens.
-#[derive(Debug, Serialize)]
-struct ScreendumpArguments<'a> {
-    filename: &'a str,
-    format: &'a str,
-}
-
-/// The image format every capture asks for.
-const SCREENDUMP_FORMAT: &str = "png";
-
 /// The arguments of one `input-send-event`.
 ///
 /// QEMU delivers the whole list to the guest as one input batch ended
@@ -261,6 +248,8 @@ pub(crate) enum SizeError {
 pub(crate) struct QmpClient {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    next_id: u64,
+    partial_line: Vec<u8>,
 }
 
 /// What `query-balloon` reports.
@@ -279,19 +268,21 @@ impl QmpClient {
             source,
         })?;
         stream
-            .set_read_timeout(Some(RESPONSE_TIMEOUT))
-            .map_err(|source| QmpError::SetTimeout { source })?;
+            .set_nonblocking(true)
+            .map_err(|source| QmpError::ConfigureSocket { source })?;
         let writer = stream
             .try_clone()
             .map_err(|source| QmpError::CloneSocket { source })?;
         let mut client = Self {
             reader: BufReader::new(stream),
             writer,
+            next_id: 1,
+            partial_line: Vec::new(),
         };
         // The greeting arrives unprompted and has to be consumed before
         // the handshake, or the handshake's own reply is read as the
         // greeting.
-        let greeting = client.read_message()?;
+        let greeting = client.read_message(Instant::now() + RESPONSE_TIMEOUT)?;
         if greeting.get("QMP").is_none() {
             return Err(QmpError::MissingGreeting { greeting });
         }
@@ -303,29 +294,6 @@ impl QmpClient {
     /// guest to keep, in bytes.
     pub(crate) fn set_balloon(&mut self, bytes: u64) -> Result<(), QmpError> {
         self.execute("balloon", json!({ "value": bytes }))?;
-        Ok(())
-    }
-
-    /// Writes the machine's current scanout to `path` as a PNG.
-    ///
-    /// The capture is QEMU's own view of the display device's surface,
-    /// so it is taken with no host display backend at all: a headless
-    /// lane sees exactly what a window would have shown.
-    pub(crate) fn screendump(&mut self, path: &Path) -> Result<(), QmpError> {
-        // QMP is JSON, and JSON strings are Unicode: a path that is not
-        // UTF-8 cannot be named to QEMU at all, and lossy-encoding one
-        // would write the capture somewhere the caller did not ask for.
-        let filename = path
-            .to_str()
-            .ok_or_else(|| QmpError::ScreendumpPathNotUtf8 {
-                path: path.display().to_string(),
-            })?;
-        let arguments = serde_json::to_value(ScreendumpArguments {
-            filename,
-            format: SCREENDUMP_FORMAT,
-        })
-        .map_err(|source| QmpError::Encode { source })?;
-        self.execute("screendump", arguments)?;
         Ok(())
     }
 
@@ -378,7 +346,18 @@ impl QmpClient {
     }
 
     fn execute(&mut self, command: &str, arguments: Value) -> Result<Value, QmpError> {
-        let mut request = json!({ "execute": command });
+        self.execute_until(command, arguments, Instant::now() + RESPONSE_TIMEOUT)
+    }
+
+    fn execute_until(
+        &mut self,
+        command: &str,
+        arguments: Value,
+        deadline: Instant,
+    ) -> Result<Value, QmpError> {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).ok_or(QmpError::RequestIdsExhausted)?;
+        let mut request = json!({ "execute": command, "id": id });
         if !arguments.is_null() {
             request["arguments"] = arguments;
         }
@@ -392,11 +371,21 @@ impl QmpClient {
                 source,
             }
         };
-        self.writer.write_all(&line).map_err(write("send"))?;
-        self.writer.flush().map_err(write("flush"))?;
+        if let Err(error) = self
+            .send_request(&line, deadline)
+            .map_err(write("send"))
+            .and_then(|()| self.writer.flush().map_err(write("flush")))
+        {
+            // A partial request cannot be followed by another JSON command.
+            let _ = self.writer.shutdown(std::net::Shutdown::Both);
+            return Err(error);
+        }
 
         loop {
-            let message = self.read_message()?;
+            let message = self.read_message(deadline)?;
+            if message.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
             if let Some(error) = message.get("error") {
                 return Err(QmpError::Refused {
                     command: command.to_owned(),
@@ -411,24 +400,79 @@ impl QmpClient {
         }
     }
 
-    fn read_message(&mut self) -> Result<Value, QmpError> {
-        let mut line = String::new();
+    fn remaining(deadline: Instant) -> io::Result<Duration> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "QMP command deadline elapsed"))
+    }
+
+    fn wait_ready(socket: &UnixStream, events: PollFlags, deadline: Instant) -> io::Result<()> {
         loop {
-            line.clear();
-            let read = self
-                .reader
-                .read_line(&mut line)
-                .map_err(|source| QmpError::Read { source })?;
+            let timeout = Timespec::try_from(Self::remaining(deadline)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            match poll(&mut [PollFd::new(socket, events)], Some(&timeout)) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "QMP command deadline elapsed",
+                    ));
+                }
+                Ok(_) => return Ok(()),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn send_request(&mut self, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+        while !bytes.is_empty() {
+            Self::remaining(deadline)?;
+            match self.writer.write(bytes) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "QMP socket accepted no request bytes",
+                    ));
+                }
+                Ok(written) => bytes = &bytes[written..],
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Self::wait_ready(&self.writer, PollFlags::OUT, deadline)?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_message(&mut self, deadline: Instant) -> Result<Value, QmpError> {
+        loop {
+            Self::remaining(deadline).map_err(|source| QmpError::Read { source })?;
+            let read = match self.reader.read_until(b'\n', &mut self.partial_line) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Self::wait_ready(self.reader.get_ref(), PollFlags::IN, deadline)
+                        .map_err(|source| QmpError::Read { source })?;
+                    continue;
+                }
+                Err(source) => return Err(QmpError::Read { source }),
+            };
             if read == 0 {
                 return Err(QmpError::Closed);
             }
-            if line.trim().is_empty() {
+            if self.partial_line.iter().all(u8::is_ascii_whitespace) {
+                self.partial_line.clear();
                 continue;
             }
-            return serde_json::from_str(&line).map_err(|source| QmpError::DecodeMessage {
-                line: line.clone(),
-                source,
+            let parsed = serde_json::from_slice(&self.partial_line).map_err(|source| {
+                QmpError::DecodeMessage {
+                    line: String::from_utf8_lossy(&self.partial_line).into_owned(),
+                    source,
+                }
             });
+            self.partial_line.clear();
+            return parsed;
         }
     }
 }
@@ -459,9 +503,64 @@ mod tests {
 
     use super::{
         ABS_AXIS_MAX, AbsCoordinate, HumanMonitorCommandArguments, InputEvent,
-        InputSendEventArguments, KeyValue, PointerAxis, PointerButton, QKeyCode,
-        ScreendumpArguments, parse_size,
+        InputSendEventArguments, KeyValue, PointerAxis, PointerButton, QKeyCode, parse_size,
     };
+
+    #[test]
+    fn a_late_partial_reply_cannot_answer_the_next_command() {
+        use super::QmpClient;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+        let (host, mut peer) = UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut old_reply =
+            serde_json::to_vec(&json!({"return":"中文、日本語、한국어", "id":1})).unwrap();
+        old_reply.push(b'\n');
+        // Split inside a UTF-8 code point, not merely between JSON tokens.
+        let split = old_reply.iter().position(|byte| *byte == 0xe4).unwrap() + 1;
+        peer.write_all(&old_reply[..split]).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = BufReader::new(peer.try_clone().unwrap());
+            for id in [1, 2] {
+                let mut line = String::new();
+                requests.read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["id"], id);
+            }
+            peer.write_all(&old_reply[split..]).unwrap();
+            serde_json::to_writer(&mut peer, &json!({"return":"current", "id":2})).unwrap();
+            peer.write_all(b"\n").unwrap();
+        });
+        let mut client = QmpClient {
+            reader: BufReader::new(host.try_clone().unwrap()),
+            writer: host,
+            next_id: 1,
+            partial_line: Vec::new(),
+        };
+        let error = client
+            .execute_until(
+                "first",
+                serde_json::Value::Null,
+                Instant::now() + Duration::from_millis(20),
+            )
+            .unwrap_err();
+        assert!(matches!(error, super::QmpError::Read { source }
+            if matches!(source.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)));
+        assert_eq!(client.partial_line.len(), split);
+        assert_eq!(
+            client
+                .execute_until(
+                    "second",
+                    serde_json::Value::Null,
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .unwrap(),
+            json!("current")
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn a_monitor_command_names_its_vcpu_only_when_it_has_one() {
@@ -479,19 +578,6 @@ mod tests {
         assert_eq!(
             on_one,
             json!({ "command-line": "info lapic", "cpu-index": 3 })
-        );
-    }
-
-    #[test]
-    fn a_capture_names_the_format_it_wants() {
-        let arguments = serde_json::to_value(ScreendumpArguments {
-            filename: "/tmp/desktop.png",
-            format: super::SCREENDUMP_FORMAT,
-        })
-        .expect("the screendump arguments serialise");
-        assert_eq!(
-            arguments,
-            json!({ "filename": "/tmp/desktop.png", "format": "png" })
         );
     }
 

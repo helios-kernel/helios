@@ -5,8 +5,15 @@ on:
     # `ready_for_review` runs the full selection a draft skipped.
     types: [opened, synchronize, reopened, ready_for_review]
   push:
-    branches: [dev]
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      check_lane:
+        description: "Required lane from ci-lanes.json"
+        required: true
+        type: string
+  schedule:
+    - cron: "37 3 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,9 +21,9 @@ concurrency:
   # the older run. `opened`, `reopened` and `ready_for_review` carry the
   # head a run is already building and queue behind it, because a run
   # cancelled before its matrix expands leaves a failed check named after
-  # the unexpanded expression that nothing replaces. A `dev` push runs to
+  # the unexpanded expression that nothing replaces. A `main` push runs to
   # completion: merges land faster than a run finishes, and a completed
-  # `dev` run is the only writer of the host lanes' caches.
+  # `main` run is the only writer of the host lanes' caches.
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
 
 permissions:
@@ -32,23 +39,21 @@ jobs:
   # by path. A lane also runs on `shared` and `pin` changes unless it is
   # `exclusive`, which reads only its own surfaces. A skipped lane
   # reports as skipped, which a required check counts as passing; no
-  # ruleset on `dev` requires a lane of this workflow. A dispatch and a
-  # push to `dev` run every lane. A draft pull request is not a merge
+  # ruleset on `main` requires a lane of this workflow. The nightly schedule
+  # runs every lane; a dispatch names a required `check_lane` from
+  # `.github/ci-lanes.json` and runs only that lane.
+  # PR and `main` pushes omit heavy suites,
+  # and Btrfs lanes filter pushes by surface. A draft pull request is not a merge
   # candidate and runs `lint-fmt` alone; marking it ready for review runs
   # the rest.
   #
-  # It also says whether the change touches what fixes the kernel
-  # profile's format (the profdata header check, the guest's raw writer)
-  # or the compiler that reads it. The profile every x86-64 lane spends is
-  # the newest one collected on dev, by the compiler dev pinned then; a
-  # pull request that moves any of these cannot read it, and dev cannot
-  # collect another until the pull request merges (#731). Only a pull
-  # request is asked: a push to dev is what `kernel-profile.yml` collects
-  # on, and a dispatch has no change to speak of.
+  # Full runs collect their own kernel profile before x86-64 smoke uses
+  # it. An independent scheduled collection may still be running, and
+  # its previous artifact can predate a toolchain or profile-format change.
   changes:
     name: changes
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: read
@@ -58,9 +63,18 @@ jobs:
       # JSON array of {name, command, rust-cache} for the legs of the
       # `checks` matrix.
       checks: ${{ steps.select.outputs.checks }}
-      # `true` when the change moves the kernel profile's format or the
-      # compiler that reads it; `kernel-profile` then collects this run's.
-      profile_format: ${{ steps.filter.outputs.profile_format || 'false' }}
+      tests: ${{ steps.select.outputs.tests }}
+      # Full suites use this run's profile, including manually selected refs.
+      profile_format: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'true' || steps.filter.outputs.profile_format || 'false' }}
+      # Guest-program profiles the selected checks and smoke lanes read.
+      wasm_profiles: ${{ steps.select.outputs.wasm_profiles }}
+      # Needed `(profile, runner, arch)` pairs for the `build-helios-cli` job.
+      cli_builds: ${{ steps.select.outputs.cli_builds }}
+      # gVisor's syscall suite: `full`, `listed` or `none`, and the
+      # build and shard matrices for that mode.
+      linux_suite_mode: ${{ steps.select.outputs.linux_suite_mode }}
+      linux_suite_build: ${{ steps.select.outputs.linux_suite_build }}
+      linux_suite_shards: ${{ steps.select.outputs.linux_suite_shards }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -68,8 +82,9 @@ jobs:
           sparse-checkout-cone-mode: false
       - uses: dorny/paths-filter@v4
         id: filter
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'workflow_dispatch'
         with:
+          base: ${{ github.event_name == 'pull_request' && github.base_ref || github.event.before }}
           # `shared` is everything no narrower surface claims, so a new
           # top-level path runs every lane until a surface claims it;
           # `docs/**` and Markdown run none, except the Wasmtime pin
@@ -81,37 +96,79 @@ jobs:
               - '!aarch64/**'
               - '!riscv/**'
               - '!x86/**'
+              - '!kernel/**'
+              - '!virtio/**'
+              - '!netstack/**'
+              - '!linux/**'
+              - '!unix/**'
+              - '!sync/**'
+              - '!btrfs/**'
+              - '!venus/**'
               - '!hosted/**'
               - '!inspector/**'
               - '!inspector-protocol/**'
               - '!cli/**'
+              - '!compiler-host/**'
               - '!compiler-support/**'
               - '!profdata/**'
+              - '!venus-gen/**'
               - '!workspace-root/**'
               - '!programs/**'
               - '!api/**'
               - '!api-macro/**'
               - '!compiler-plugin/**'
+              - '!tools/bench/**'
+              - '!tools/btrfs/**'
               - '!docs/**'
               - '!**/*.md'
             pin:
               - 'docs/wasmtime.md'
             aarch64:
+              - '!**/*.md'
               - 'aarch64/**'
             riscv:
+              - '!**/*.md'
               - 'riscv/**'
             x86:
+              - '!**/*.md'
               - 'x86/**'
+            # The kernel and the libraries only it builds on, the closure
+            # of `helios-kernel` less `hal/`, `artifact/` and
+            # `compiler-abi/`, which every lane reads and `shared` keeps.
+            kernel:
+              - '!**/*.md'
+              - 'kernel/**'
+              - 'virtio/**'
+              - 'netstack/**'
+            # The Linux process host and the libraries beneath it.
+            unix:
+              - '!**/*.md'
+              - 'linux/**'
+              - 'unix/**'
+              - 'sync/**'
+            # The Btrfs library the kernel mounts; `btrfs` below is the
+            # surface of its own test lanes.
+            btrfs_src:
+              - '!**/*.md'
+              - 'btrfs/**'
+            venus:
+              - '!**/*.md'
+              - 'venus/**'
             hosted:
+              - '!**/*.md'
               - 'hosted/**'
             host_tools:
+              - '!**/*.md'
               - 'inspector/**'
               - 'inspector-protocol/**'
               - 'cli/**'
+              - 'compiler-host/**'
               - 'compiler-support/**'
               - 'profdata/**'
+              - 'venus-gen/**'
               - 'workspace-root/**'
             programs:
+              - '!**/*.md'
               - 'programs/**'
               - 'api/**'
               - 'api-macro/**'
@@ -120,6 +177,7 @@ jobs:
             # definition. It overlaps `shared` rather than carving out of
             # it: a change here still runs every other lane `shared` does.
             gpu:
+              - '!**/*.md'
               - 'hal/src/display.rs'
               - 'hal/src/display/**'
               - 'hal/src/device.rs'
@@ -130,15 +188,59 @@ jobs:
               - 'kernel/src/wasmtime_adapter/component_host/service/gpu.rs'
               - 'kernel/src/wasmtime_adapter/component_host/service/display.rs'
               - 'x86/src/memory_type.rs'
+              - 'x86-vmm/src/memory_type.rs'
               - 'wit/deps/helios-system/gpu.wit'
               - 'wit/deps/helios-system/display.wit'
               - 'programs/gpu-test/**'
+              - 'webgpu/**'
+              - 'venus/**'
+              - 'programs/webgpu/**'
+              - 'programs/pride-flag/**'
+              - 'programs/compositor/**'
+              - 'wit/deps/webgpu/**'
+              - 'wit/deps/helios-webgpu/**'
               - 'inspector/**'
               - '.github/qemu/x86_64-venus-configure.args'
               - '.github/qemu/virglrenderer-meson.args'
               - '.github/ci-lanes.json'
               - '.github/workflows/ci.yml'
+            btrfs:
+              - '!**/*.md'
+              - 'btrfs/**'
+              - 'hal/**'
+              - 'tools/btrfs/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/ci-lanes.json'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/checkout-wasmtime/**'
+              - '.github/actions/ci-root-key/**'
+            # What gVisor's syscall suite measures and the suite itself:
+            # the Linux ABI and the libraries beneath it, the kernel's
+            # Linux process host, the native-execution contract and each
+            # backend's half of it, the suite's pin, runner and passing
+            # lists, the inspector action that runs it, and the lane's own
+            # definition. Like `gpu`, it overlaps `shared` rather than
+            # carving out of it.
+            linux_abi:
+              - '!**/*.md'
+              - 'linux/**'
+              - 'unix/**'
+              - 'sync/**'
+              - 'kernel/src/wasmtime_adapter/component_host/service/linux.rs'
+              - 'hal/src/native.rs'
+              - 'x86/src/native.rs'
+              - 'x86/src/native.S'
+              - 'aarch64/src/native.rs'
+              - 'aarch64/src/native.S'
+              - 'tools/gvisor-syscalls/**'
+              - 'inspector/src/linux_suite.rs'
+              - '.github/ci-lanes.json'
+              - '.github/workflows/ci.yml'
             profile_format:
+              - '!**/*.md'
               - 'rust-toolchain.toml'
               - 'profdata/**'
               - 'kernel/src/profiling/**'
@@ -146,43 +248,321 @@ jobs:
         env:
           CHANGED: ${{ steps.filter.outputs.changes || 'null' }}
           DRAFT: ${{ github.event.pull_request.draft == true }}
+          EVENT: ${{ github.event_name }}
+          HEAVY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          CHECK_LANE: ${{ github.event_name == 'workflow_dispatch' && inputs.check_lane || '' }}
         run: |
           set -euo pipefail
-          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" '
+          CHECK_LANE="${CHECK_LANE:-}"
+          if [[ "${EVENT:-}" == "workflow_dispatch" && -z "$CHECK_LANE" ]]; then
+            echo "workflow_dispatch requires a non-empty check_lane" >&2
+            exit 1
+          fi
+          if [[ -n "$CHECK_LANE" ]]; then
+            jq -e --arg lane "$CHECK_LANE" 'has($lane)' .github/ci-lanes.json > /dev/null || {
+              echo "Unknown lane: $CHECK_LANE" >&2
+              exit 1
+            }
+          fi
+          lanes="$(jq -c --argjson changed "${CHANGED}" --argjson draft "${DRAFT}" --arg event "${EVENT:-}" --argjson heavy "${HEAVY}" '
             to_entries
             | map(select($changed == null
+                or ($event == "push" and (.key != "test-btrfs-upstream" and .key != "test-btrfs-fuzz"
+                    and .key != "linux-syscalls"))
                 or (.value.surfaces + (if .value.exclusive then [] else ["shared", "pin"] end)
                     | any(. as $surface | $changed | index($surface)))))
+            | map(select($heavy or (.value.heavy != true)))
             | map(.key)
             | if $draft then map(select(. == "lint-fmt")) else . end' .github/ci-lanes.json)"
+          if [[ -n "$CHECK_LANE" ]]; then
+            lanes="$(jq -cn --arg lane "$CHECK_LANE" '[$lane]')"
+          fi
           checks="$(jq -c --argjson lanes "${lanes}" '
             to_entries
             | map(select(.value.command and (.key as $name | $lanes | index($name))))
             | map({name: .key, command: .value.command,
-                   "rust-cache": (.value["rust-cache"] // false)})' .github/ci-lanes.json)"
-          echo "lanes=${lanes}" >> "$GITHUB_OUTPUT"
-          echo "checks=${checks}" >> "$GITHUB_OUTPUT"
+                   "rust-cache": (.value["rust-cache"] // false),
+                   "helios-cli": (.value["helios-cli"] // ""),
+                   "guest-wasm": (.value["guest-wasm"] // ""),
+                   "warm": (.value.warm // "")})' .github/ci-lanes.json)"
+          # Every consumer declares the profile its prebuild reads.
+          wasm_profiles="$(jq -c --argjson lanes "${lanes}" '
+            [$lanes[] as $name | .[$name]["guest-wasm"] // empty] | unique' .github/ci-lanes.json)"
+          # gVisor's syscall suite: a full run takes every case, sharded
+          # so each shard fits a job; a listed run takes the committed
+          # passing lists' cases, sharded to fit the 15-minute review
+          # job limit. aarch64 runs under TCG (the Arm runners publish
+          # no KVM) and gets twice the shards.
+          linux_suite="$(jq -cn --argjson lanes "${lanes}" '
+            (if ($lanes | index("linux-syscalls-full")) then "full"
+             elif ($lanes | index("linux-syscalls")) then "listed"
+             else "none" end) as $mode
+            | [{arch: "x86_64", runner: "ubuntu-24.04", vm_arch: "x86-64", accel: "kvm", full_shards: 16, listed_shards: 8},
+               {arch: "aarch64", runner: "ubuntu-24.04-arm", vm_arch: "aarch64", accel: "tcg", full_shards: 32, listed_shards: 16}] as $arches
+            | {mode: $mode,
+               build: (if $mode == "none" then [] else $arches | map(del(.full_shards, .listed_shards)) end),
+               shards: (if $mode == "none" then []
+                        else [$arches[] | . as $a | (if $mode == "full" then $a.full_shards else $a.listed_shards end) as $n | range(0; $n)
+                              | {arch: $a.arch, runner: $a.runner, vm_arch: $a.vm_arch, accel: $a.accel,
+                                 shard: ., shards: $n}] end)}')"
+          linux_suite_mode="$(jq -r .mode <<< "$linux_suite")"
+          cli_builds="$(jq -cn \
+            --argjson checks "${checks}" \
+            --argjson wasm_profiles "${wasm_profiles}" \
+            --argjson lanes "${lanes}" \
+            --arg linux_mode "${linux_suite_mode}" '
+            [
+              (if ([$checks[] | select(.["helios-cli"] == "debug")] | length) > 0
+                  or ($wasm_profiles | length) > 0
+                  or ($lanes | index("smoke-x86-64-venus"))
+               then {profile: "debug", runner: "ubuntu-24.04", arch: "X64"} else empty end),
+              (if ([$checks[] | select(.["helios-cli"] == "release")] | length) > 0
+                  or ($lanes | index("smoke-riscv64"))
+                  or ($lanes | index("smoke-x86-64"))
+                  or ($lanes | index("smoke-x86-64-cpu-lifecycle"))
+                  or ($linux_mode != "none")
+               then {profile: "release", runner: "ubuntu-24.04", arch: "X64"} else empty end),
+              (if ($lanes | index("smoke-aarch64"))
+                  or ($linux_mode != "none")
+               then {profile: "release", runner: "ubuntu-24.04-arm", arch: "ARM64"} else empty end)
+            ]')"
+          {
+            echo "linux_suite_mode=${linux_suite_mode}"
+            echo "linux_suite_build=$(jq -c .build <<< "$linux_suite")"
+            echo "linux_suite_shards=$(jq -c .shards <<< "$linux_suite")"
+            echo "wasm_profiles=${wasm_profiles}"
+            echo "cli_builds=${cli_builds}"
+            echo "lanes=${lanes}"
+            echo "checks=$(jq -c 'map(select(.["guest-wasm"] == ""))' <<< "$checks")"
+            echo "tests=$(jq -c 'map(select(.["guest-wasm"] != ""))' <<< "$checks")"
+          } >> "$GITHUB_OUTPUT"
           echo "${lanes}"
 
-  # The collection a `profile_format` change spends in place of dev's
-  # profile: the same workflow `bench-suite.yml` calls, on this run's
-  # commit, uploaded under the stable artifact name. `smoke-x86-64` is its
-  # only reader, so a run that skips that lane (a draft) skips this too.
+  # Collect on this run's commit and upload under the stable artifact name
+  # before the x86-64 smoke lanes fetch it. Ordinary PRs skip these lanes.
   kernel-profile:
     name: kernel-profile
     needs: changes
-    if: needs.changes.outputs.profile_format == 'true' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64')
+    # The syscall suite boots a release x86-64 kernel too, so it needs this
+    # run's profile under the same condition the smoke lane does.
+    if: needs.changes.outputs.profile_format == 'true' && (contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') || needs.changes.outputs.linux_suite_mode != 'none')
     permissions:
       contents: read
     uses: ./.github/workflows/kernel-profile.yml
 
+  # Build `helios-cli` once per needed `(profile, runner)` on the stable
+  # toolchain with `stow`, cache it across runs by its input hash, and
+  # publish the binary as a run artifact so every consumer downloads it
+  # directly without compiling Wasmtime/Cranelift per job.
+  build-helios-cli:
+    name: helios-cli (${{ matrix.profile }} ${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.cli_builds != '[]'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.cli_builds) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - id: meta
+        shell: bash
+        env:
+          ROOT: helios
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          input_hash="$(
+            {
+              cd "${ROOT}"
+              git ls-files --cached --others --exclude-standard -z -- \
+                cli \
+                artifact \
+                compiler-support \
+                hal \
+                profdata \
+                venus-gen \
+                workspace-root \
+                Cargo.toml \
+                Cargo.lock \
+                rust-toolchain.toml \
+                .cargo/config.toml \
+                docs/wasmtime.md \
+                .github/actions/helios-cli/action.yml \
+                | LC_ALL=C sort -z \
+                | xargs -0 sha256sum
+            } | sha256sum | awk '{print $1}'
+          )"
+          echo "input_hash=${input_hash}" >> "$GITHUB_OUTPUT"
+          echo "dir=${RUNNER_TEMP}/helios-cli-${PROFILE}" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.meta.outputs.dir }}
+          key: helios-cli-stable-v1-${{ matrix.profile }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.meta.outputs.input_hash }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: ./helios/.github/actions/checkout-wasmtime
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: water-rs/stow@main
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Build helios-cli (${{ matrix.profile }})
+        working-directory: helios
+        env:
+          PROFILE: ${{ matrix.profile }}
+          DIR: ${{ steps.meta.outputs.dir }}
+          RUSTUP_TOOLCHAIN: stable
+        run: |
+          set -euo pipefail
+          if [[ "${PROFILE}" == release ]]; then
+            stow build --silent-compatible-upgrades -- --release -p helios-cli
+          else
+            stow build --silent-compatible-upgrades -- -p helios-cli
+          fi
+          mkdir -p "${DIR}"
+          cp "target/${PROFILE}/helios-cli" "${DIR}/helios-cli"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helios-cli-${{ matrix.profile }}-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ steps.meta.outputs.dir }}/helios-cli
+          if-no-files-found: error
+          retention-days: 1
+
+  # The wasm every check and smoke lane precompiles: the compiler
+  # plugin, `init` and every program under `programs/`. None of it depends
+  # on the target, so it is built once per run, in each requested profile
+  # (`release` for optimised kernels, `debug` for checks, the debug
+  # inspector of `smoke-x86-64-venus` and the debug kernel of
+  # `smoke-aarch64-cfi`). Consumers download the result with the
+  # `prebuilt-wasm` action just before their first prebuild, and read it
+  # through `HELIOS_PREBUILT_WASM`, so a file missing from it fails the
+  # lane's prebuild instead of being built there (#882). The smoke lanes
+  # start after their producer finishes; the `tests` lanes start beside it
+  # and wait in that action. What the producer costs is bounded by the
+  # programs whose inputs changed: the cache it restores holds every other
+  # program (#1022), and `helios-cli` arrives from `build-helios-cli`.
+  wasm-debug:
+    name: wasm-programs (${{ matrix.profile }})
+    needs: [changes, build-helios-cli]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli.result == 'success' && contains(fromJSON(needs.changes.outputs.wasm_profiles), 'debug') }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      matrix:
+        profile: [debug]
+    steps: &wasm-steps
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      # Each program's wasm, kept with the files its build read (#1022): a
+      # program none of whose inputs changed is taken from the cache
+      # instead of built. The key carries the run id so that each
+      # default-branch run saves its own cache, and the prefix restores the
+      # newest earlier one. A hit and a store both set an entry's
+      # modification time, so pruning what is older than the job's start,
+      # last of all, leaves the cache holding exactly what this run used.
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the guest wasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ github.workspace }}/wasm-cache
+          key: helios-wasm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-${{ github.run_id }}
+          restore-keys: helios-wasm-${{ runner.os }}-${{ runner.arch }}-${{ matrix.profile }}-
+      # The tool that drives the guest build links Wasmtime and Cranelift,
+      # and compiled cold took 3 to 5 minutes of a job that is the first
+      # link of every pull request's critical path; the lanes that restore
+      # a Rust cache build it from that in 1.5 minutes. The step names are
+      # the check lanes', for the reason given there.
+      - name: Make the pinned toolchain the only one rust-cache sees
+        working-directory: helios
+        run: |
+          rustup toolchain install
+          pinned="$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustup default "$pinned"
+          rustup toolchain list --quiet | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+          rustup toolchain list
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          shared-key: check-host-checks
+          save-if: "false"
+      # Pinned `wasi-sdk-34` used by `helios-cli wasm-build` to cross-compile
+      # BoringSSL for `programs/http-client`; restored read-only on PRs and
+      # populated on `main` pushes.
+      - name: Restore wasi-sdk-34 toolchain cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: helios/target/wasi-sdk-34
+          key: helios-wasi-sdk-34-${{ runner.os }}-${{ runner.arch }}
+      # The guest programs build in the profile the matrix names; the tool
+      # that drives them is downloaded directly from `build-helios-cli`.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: debug
+          download-only: "true"
+      # Outside `helios/target`, so that no Rust cache saves or restores
+      # the guest build directories or a stale copy of the result.
+      - name: Build the guest wasm
+        working-directory: helios
+        run: >-
+          "$HELIOS_CLI_BIN"
+          wasm-build --out-dir "${RUNNER_TEMP}/wasm-programs"
+          --profile ${{ matrix.profile }} --cargo cargo
+          --cache-dir "${GITHUB_WORKSPACE}/wasm-cache"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helios-wasm-${{ matrix.profile }}
+          path: ${{ runner.temp }}/wasm-programs/${{ matrix.profile }}
+          if-no-files-found: error
+          retention-days: 1
+      - name: Prune the guest wasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ github.workspace }}/wasm-cache
+          since: ${{ env.HELIOS_CACHE_START }}
+
+  wasm-release:
+    name: wasm-programs (${{ matrix.profile }})
+    needs: [changes, build-helios-cli]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli.result == 'success' && contains(fromJSON(needs.changes.outputs.wasm_profiles), 'release') }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      matrix:
+        profile: [release]
+    steps: *wasm-steps
+
   checks:
     name: ${{ matrix.name }}
-    needs: changes
+    needs: [changes, build-helios-cli]
     # An empty matrix is an error, not a skip.
-    if: needs.changes.outputs.checks != '[]'
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.build-helios-cli.result == 'success' || needs.build-helios-cli.result == 'skipped') && needs.changes.outputs.checks != '[]' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # `test-libraries` runs `just test-btrfs-mkfs` which uses `sudo mount -o loop`.
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      options: --privileged
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -192,51 +572,105 @@ jobs:
         # gates back to back locally; CI splits them so a lint failure
         # names the surface it came from.
         include: ${{ fromJSON(needs.changes.outputs.checks) }}
-    steps:
+    steps: &check-steps
       - uses: actions/checkout@v4
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
-      - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build
-      - uses: taiki-e/install-action@v2
+      - name: Restore Zig build cache
+        if: matrix.guest-wasm != ''
+        uses: ./helios/.github/actions/shared-cache
         with:
-          tool: wasm-tools,cargo-deny,nextest
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
+          path: ${{ github.workspace }}/.zig-cache
+          key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.13.0-${{ github.job }}-${{ hashFiles('helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/tools/bench/native/**', 'helios/tools/wasi-apps/**') }}
       - name: Restore WASI tooling artifacts
+        if: matrix.guest-wasm != ''
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
             helios/artifacts/python3-root
             helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
       - name: Stage WASI tooling artifacts
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        if: matrix.guest-wasm != '' && steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
         run: tools/wasi-apps/build.sh
-      # Only the host lanes nearly every pull request runs keep a Rust
-      # cache, and only a `dev` push writes it: the repository's cache
-      # quota holds these four and nothing more, and a pull request's
-      # entry is restorable from its own merge ref alone. Every other
-      # lane, workflow and action builds cold.
+      # Compile, lint and test lanes restore their default-branch Rust
+      # cache. Only a `main` push writes one; other caches follow the same
+      # single-writer policy through shared-cache.
+      # rust-cache hashes `rustc -vV` and `rustup run <t> rustc -vV` for
+      # every installed toolchain (src/config.ts `getRustVersions`), run
+      # from the checkout root where no `rust-toolchain.toml` applies. On
+      # a fresh runner that is only the image's stable, so an image update
+      # changed every key and forced a cold build (#884). Installing the
+      # pinned toolchain from `helios/rust-toolchain.toml`, making it the
+      # default and removing every other toolchain leaves the pinned
+      # compiler as the only one the key can see.
+      - name: Make the pinned toolchain the only one rust-cache sees
+        if: matrix.rust-cache
+        working-directory: helios
+        run: |
+          rustup toolchain install
+          pinned="$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustup default "$pinned"
+          rustup toolchain list --quiet | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+          rustup toolchain list
       - uses: Swatinem/rust-cache@v2
         if: matrix.rust-cache
         with:
           workspaces: helios
           key: ${{ matrix.name }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
-      - uses: astral-sh/setup-uv@v6
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # Download the prebuilt `helios-cli` artifact directly without compiling.
+      - uses: ./helios/.github/actions/helios-cli
+        if: matrix.helios-cli != ''
+        with:
+          profile: ${{ matrix.helios-cli }}
+          download-only: "true"
+      # What the lane's tests are compiled from reads no guest wasm, so they
+      # compile while the guest wasm is still building and the lane's own
+      # command, which compiles nothing then, starts when it lands.
+      - name: Compile the tests of ${{ matrix.name }}
+        if: matrix.warm != ''
+        working-directory: helios
+        run: ${{ matrix.warm }}
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        if: matrix.guest-wasm != ''
+        with:
+          profile: ${{ matrix.guest-wasm }}
+          path: helios/target/wasm-programs/${{ matrix.guest-wasm }}
       - name: ${{ matrix.name }}
         working-directory: helios
+        env:
+          HELIOS_PREBUILT_WASM: ${{ matrix.guest-wasm != '' && format('{0}/helios/target/wasm-programs', github.workspace) || '' }}
         run: ${{ matrix.command }}
+
+  # The lanes that read the guest wasm start with `changes`, not after
+  # `wasm-debug`: their setup, the WASI tooling and the compile of their
+  # tests need none of it, so it runs beside the guest build, and the
+  # `prebuilt-wasm` step waits for the artifact. A `wasm-debug` that fails
+  # fails that step at once.
+  tests:
+    name: ${{ matrix.name }}
+    needs: [changes, build-helios-cli]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.build-helios-cli.result == 'success' || needs.build-helios-cli.result == 'skipped') && needs.changes.outputs.tests != '[]' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.tests) }}
+    steps: *check-steps
 
   # Every smoke step that boots a guest carries a bound of its own, so a
   # guest that hangs fails that step and the lane uploads its runtime
@@ -247,45 +681,92 @@ jobs:
   # boot (64 s at most).
   smoke-riscv64:
     name: smoke-riscv64
-    needs: changes
-    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-riscv64')
+    needs: [changes, build-helios-cli, wasm-release]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli.result == 'success' && needs.wasm-release.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-riscv64') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 40
+    # `actions: read` is what the prebuilt-wasm action lists the run's
+    # artifacts and jobs with.
+    permissions:
+      contents: read
+      actions: read
+    env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # Where every `helios-cli kernel-prebuild` of this job, however the
+      # inspector starts it, finds and keeps the `cwasm` it precompiles
+      # (#1022). It is set for the job because no prebuild is named here.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
     steps:
       - uses: actions/checkout@v4
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # CI signs every boot payload with one key, so every image embeds the
+      # same public key and the cache below can hold the kernel image of
+      # inputs that did not change (#1023).
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
+      # An entry is addressed by its input, the `helios-cli` that compiled
+      # it, the target level and the hint, so a restored cache can only
+      # answer a precompile it is exact for. The same directory holds the
+      # kernel images the job linked, each addressed by what the build is
+      # and checked against every file it read, so a job whose kernel
+      # inputs did not change links none (#1023). The key carries the run id so
+      # that each default-branch run saves its own cache, and the prefix
+      # restores the newest earlier one. The job's prebuilds each use a
+      # subset of the entries and each hit or store sets an entry's
+      # modification time, so the last step prunes what is older than the
+      # job's start: the saved cache holds what the whole job used.
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-riscv64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
             qemu-system-misc opensbi
-          qemu-system-riscv64 --version
+      - name: Record QEMU version
+        run: qemu-system-riscv64 --version
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
             helios/artifacts/python3-root
             helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
       - name: Stage WASI tooling artifacts
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # The inspector's `vm` and the profile fetch download this one rather
+      # than building their own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: release
+          download-only: "true"
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
+      # The first step that prebuilds: `vm` builds the guest image.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
       - name: Boot riscv64 guest
         timeout-minutes: 30
         shell: bash
@@ -307,6 +788,32 @@ jobs:
             shell -c 'echo ok' 2>&1 > boot-smoke.out | tee "$runtime/inspector.log"
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
+      # Verified boot needs no TPM (#602): the payload the boot above
+      # ran, with one byte of its signed body inverted, is refused on
+      # its signature before anything in it is read.
+      - name: Refuse a tampered boot payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/tampered"
+          mkdir -p "$runtime"
+          "$check" tamper target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs \
+            "$runtime/helios-bootfs"
+          if ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs "$runtime/helios-bootfs" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            echo 'the inspector booted a payload whose signature does not match'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          "$check" refused "$runtime/debug-serial.log"
       - name: Seed the wall clock from the goldfish RTC
         timeout-minutes: 5
         shell: bash
@@ -361,6 +868,13 @@ jobs:
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
+      - name: Mount EROFS and btrfs disks from init
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: bash tools/fs-smoke/run.sh riscv64 tcg
       - name: Run CPython
         timeout-minutes: 5
         shell: bash
@@ -432,63 +946,39 @@ jobs:
             shell -c 'echo ok' > vsock-smoke.out
           cat vsock-smoke.out
           grep -Fqx ok vsock-smoke.out
-      - name: Fetch over virtio-net with curl
+      - name: Boot riscv64 guest on two NUMA nodes
         timeout-minutes: 5
         shell: bash
         working-directory: helios
         env:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
-          # Without this the step reports tee's status, not the
-          # command's, and a runner script that fails is invisible.
+          # Every other boot describes one node, so nothing else reads
+          # `numa-node-id` or the distance map from a real device tree
+          # (#516). The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          # The RPC rides vsock here because the boot UART carries the
+          # kernel log only when the debugger does not need the line.
           set -o pipefail
-          # curl speaks wasi:http, which the kernel forwards to the
-          # http-client plugin, so both boot programs are required. curl is
-          # invoked by bare name so dash resolves it through PATH and execs
-          # it with argv[0] == "curl", which is the shape that regressed in
-          # issue #35; tools/wasi-apps/smoke.sh covers the bootfs-path shape.
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl"
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
-            --accel tcg \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --rpc-transport vsock \
             --runtime-dir "$runtime" --keep-runtime-dir \
-            --boot-program dash --boot-program debugger \
-            --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl http://detectportal.firefox.com/success.txt' 2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
-          cat curl-smoke.out
-          grep -Fqx success curl-smoke.out
-      - name: Fetch over TLS with curl
-        shell: bash
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
+      - name: Fetch HTTP and verify TLS certificates with curl
+        timeout-minutes: 5
         working-directory: helios
-        env:
-          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
-          # Without this the step reports tee's status, not the
-          # command's, and a runner script that fails is invisible.
-          set -o pipefail
-          # The same fetch through the plugin's TLS transport: the
-          # handshake, the certificate chain against the compiled-in
-          # roots, and the validity window against the wall clock the
-          # platform RTC seeded. The same boot then fetches from three
-          # origins that each present a bad certificate (expired, issued
-          # for another name, self-signed), which must each fail as
-          # `tls-certificate-error`; the trailing `true` keeps the last
-          # failed fetch's exit status from failing the step before the
-          # log is read.
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
-          mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
-            --accel tcg \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --boot-program dash --boot-program debugger \
-            --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl https://detectportal.firefox.com/success.txt; curl https://expired.badssl.com/; curl https://wrong.host.badssl.com/; curl https://self-signed.badssl.com/; true' 2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
-          cat curl-https-smoke.out
-          grep -Fqx success curl-https-smoke.out
-          # curl prints the error code through its Debug form
-          # (`ErrorCode::TlsCertificateError`), on whichever stream the
-          # inspector relays the guest's stderr to.
-          test "$(cat curl-https-smoke.out "$runtime/inspector.log" | grep -Fc 'http request failed: ErrorCode::TlsCertificateError')" -eq 3
+          python3 tools/wasi-apps/tls-smoke.py --arch riscv64 --accel tcg \
+            --runtime-dir "$GITHUB_WORKSPACE/smoke-runtime/curl-https"
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -511,7 +1001,7 @@ jobs:
         id: guest-image
         # A lane that failed before it built the inspector has nothing
         # to build an image with.
-        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch riscv64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
@@ -532,6 +1022,12 @@ jobs:
             helios/target/kernel-prebuild/riscv64gc-unknown-none-elf/kernel-release/helios-bootfs
           if-no-files-found: error
           retention-days: 90
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
 
   # A native Arm Linux runner under multi-threaded TCG. This lane is a
   # functional check, not a performance surface: `ubuntu-24.04-arm`
@@ -553,11 +1049,17 @@ jobs:
   # boot needs, which the inspector finds through the prefix.
   smoke-aarch64:
     name: smoke-aarch64
-    needs: changes
-    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64')
+    needs: [changes, build-helios-cli, wasm-release]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli.result == 'success' && needs.wasm-release.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64') }}
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 300
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
     env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
       QEMU_VERSION: "11.1.1"
       # download.qemu.org publishes a detached signature but no checksum
       # file; this is the digest of the tarball that signature covers.
@@ -568,20 +1070,35 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-aarch64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            python3-venv pkg-config flex bison \
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
+            python3-venv pkg-config flex bison
             libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+            swtpm
+      - name: Record swtpm and KVM availability
+        run: |
+          swtpm --version
           # Recorded rather than required: the accelerator is picked by
           # capability and today's Arm runners publish no KVM node.
           ls -la /dev/kvm || echo 'no /dev/kvm on this runner'
       - name: Restore the pinned QEMU install prefix
         id: qemu-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.QEMU_PREFIX }}
           # The configure flags are part of the key: a build made with
@@ -613,30 +1130,49 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Stage Limine bootloader share
         run: |
-          git clone --depth 1 --branch v11.x-binary \
-            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+          # Limine publishes its prebuilt bootloader as a release asset;
+          # the digest is the one of v12.9.6's `limine-binary.tar.gz`.
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
           make -C "$GITHUB_WORKSPACE/limine"
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
             helios/artifacts/python3-root
             helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
       - name: Stage WASI tooling artifacts
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # The inspector's `vm` and the profile fetch download this one rather
+      # than building their own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: release
+          download-only: "true"
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
+      # The first step that prebuilds: `vm` builds the guest image.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
       # The aarch64 backend takes its whole platform description from
       # the firmware, and QEMU's `virt` publishes a device tree or ACPI
       # tables but never both. Both descriptions have to boot, so the
@@ -664,6 +1200,9 @@ jobs:
           cat boot-dt.out
           grep -Fqx ok boot-dt.out
           grep -F 'platform described by device-tree' "$runtime/inspector.log"
+          # Every processor installed the machine's key and enabled
+          # return-address signing before the kernel ran anything else.
+          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
           # The `virt` board's PL061 GPIO controller is hardware the
           # kernel has no driver for, so discovery offers it to a
           # user-mode one. This asserts the whole path from the device
@@ -671,6 +1210,56 @@ jobs:
           # proves the walk still sees a real device rather than
           # nothing.
           grep -F 'device grant published device=pl061@9030000' "$runtime/inspector.log"
+      - name: Boot aarch64 guest on two NUMA nodes from the device tree
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Every other boot describes one node, so nothing else reads
+          # `numa-node-id` or the distance map from a real device tree
+          # (#516). The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
+      - name: Boot aarch64 guest on two NUMA nodes from ACPI
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # The same machine as the boot above, described by the SRAT, the
+          # SLIT and the MADT's GICC entries instead of `numa-node-id` and
+          # the distance map (#516).
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi-numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-acpi-numa.out | tee "$runtime/inspector.log"
+          cat boot-acpi-numa.out
+          grep -Fqx ok boot-acpi-numa.out
+          grep -F 'platform described by acpi' "$runtime/inspector.log"
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
       # The same guest under the same accelerator as the device-tree
       # boot above, described the other way. ACPI carries no counterpart
       # to `/chosen/rng-seed`, so this boot's seed comes from the CPU's
@@ -698,12 +1287,271 @@ jobs:
           cat boot-acpi.out
           grep -Fqx ok boot-acpi.out
           grep -F 'platform described by acpi' "$runtime/inspector.log"
+          grep -F 'return-address signing enabled on every processor' "$runtime/inspector.log"
           # The ACPI walk looks for virtio transports by hardware id and
           # names nothing else, so an ACPI-described machine publishes
           # no grants. Asserting the absence keeps that a stated fact
           # rather than something that quietly starts or stops being
           # true.
           ! grep -qF 'device grant published' "$runtime/inspector.log"
+      - name: Run static Linux programs through dash
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+        run: |
+          # The aarch64 half of the native Linux check (#1025): the same
+          # programs built for aarch64 run at EL0 under the lane's QEMU.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/linux"
+          mkdir -p "$runtime"
+          bash linux/tests/build-fixtures.sh "$runtime/bootfs" aarch64
+          bash linux/tests/fetch-curl.sh "$runtime/bootfs/linux/curl" aarch64 "$GITHUB_WORKSPACE/linux-curl-cache"
+          python3 - "$runtime/curl-port" <<'PY' &
+          import http.server, sys
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = b"curl-smoke: ok\n"
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+          with open(sys.argv[1], "w") as f:
+              f.write(str(srv.server_address[1]))
+          srv.serve_forever()
+          PY
+          curl_srv_pid=$!
+          trap 'kill "$curl_srv_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do [[ -s "$runtime/curl-port" ]] && break; sleep 0.1; done
+          curl_port="$(cat "$runtime/curl-port")"
+          # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
+          # shellcheck disable=SC2016
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg --smp 4 --kernel-feature linux \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --boot-program dash --boot-program debugger --boot-program cat --boot-program wasix-port-list \
+            --no-compiler-plugin \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/permissions; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
+            2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
+          cat linux-smoke.out
+          grep -Fqx 'arg1=3' linux-smoke.out
+          grep -Fqx 'arg2=中文' linux-smoke.out
+          grep -Fqx 'arg3=日本語' linux-smoke.out
+          grep -Fqx 'arg4=한국어' linux-smoke.out
+          grep -Fqx 'environment:ok' linux-smoke.out
+          grep -Fqx 'status:3' linux-smoke.out
+          grep -Fqx 'native Linux syscall: ok' linux-smoke.out
+          grep -Fqx 'hello:0' linux-smoke.out
+          grep -Fqx 'Hello, World!' linux-smoke.out
+          grep -Fqx 'libc:0' linux-smoke.out
+          grep -Fqx 'fault:139' linux-smoke.out
+          # The memory fixture (#1026) runs in all its endings against the
+          # results check-memory.sh records from Linux, which build-fixtures.sh
+          # first confirmed on this runner.
+          grep -Fqx 'memory:0' linux-smoke.out
+          grep -Fqx 'pthreads:0' linux-smoke.out
+          grep -Fqx 'signals:0' linux-smoke.out
+          # The system-information suite (#1035), sockets (#1030), netconfig
+          # (#1031), file/readiness/tty suites (#1028), and process/dash suites
+          # (#1034) run in the same modes build-fixtures.sh asserts on Linux.
+          for suite in clock random identity limits machine priority container sockets netconfig busybox-netconfig files files-cross readiness stdin-epoll tty permissions process curl-smoke; do
+            grep -Fqx "$suite: ok" linux-smoke.out
+          done
+          grep -Fqx 'from-wasix: 中文 日本語 한국어' linux-smoke.out
+          grep -Fqx 'from-linux-write' linux-smoke.out
+          grep -Fqx 'from-linux-mmap' linux-smoke.out
+          grep -Fqx 'process mixed: ok' linux-smoke.out
+          grep -Fqx 'dash: ok' linux-smoke.out
+          grep -Fqx 'dash:0' linux-smoke.out
+      - name: Mount EROFS and btrfs disks from init
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: bash tools/fs-smoke/run.sh aarch64 tcg
+      - name: Take a wasm trap on aarch64
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
+          # A wasm32 guest cannot form an address outside the 4 GiB the
+          # kernel reserves behind its linear memory, which is why Cranelift
+          # emits no bounds check for its loads: an access past the pages the
+          # guest has grown into lands on reserved memory and faults. That
+          # fault has to reach the runtime's trap handler and come back out as
+          # a wasm trap that kills one instance. `oob-load` prints its marker,
+          # then makes the access; the shell printing afterwards is what says
+          # the fault did not take the machine with it (#59).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/oob-load"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --accel tcg \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program oob-load \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c '/bin/oob-load; echo guest-alive' \
+            2>&1 > oob-load-smoke.out | tee "$runtime/inspector.log"
+          cat oob-load-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx oob-load:before-fault oob-load-smoke.out
+          grep -Fqx guest-alive oob-load-smoke.out
+          ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - uses: ./helios/.github/actions/swtpm
+      # Measured boot (#602): the kernel's signing seed is sealed in the
+      # TPM to the boot chain. The ACPI description is the boot whose
+      # measured input repeats (PCR 9 holds the kernel and the payload),
+      # so the retention check runs here: two boots of one payload on
+      # one TPM state directory, the first provisions and seals a seed,
+      # the second unseals it, and the public half of the derived key is
+      # the same. The second boot is handed the payload the first booted
+      # by path, so both measure the same bytes whether or not a rebuild
+      # reproduces them. Whether it also skips recompiling needs the
+      # persisted cwasm of #579.
+      - name: Keep the kernel signing key across measured ACPI boots
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-aarch64-acpi"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            shift
+            mkdir -p "$runtime"
+            ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+              --accel tcg --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir "$@" \
+              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+          }
+          boot acpi-retention-1 --boot-program dash --boot-program debugger --no-compiler-plugin
+          cp target/kernel-prebuild/aarch64-unknown-none/kernel-release/helios-bootfs \
+            "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained"
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-retention-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot acpi-retention-2 --bootfs "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-retention-2/debug-serial.log" unsealed none)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" = "$second"
+          echo "$first" > "$RUNNER_TEMP/tpm-signer-aarch64-acpi"
+      # One byte of the payload's signed body is inverted. The kernel
+      # refuses the payload on its signature before it measures or
+      # parses it, so the guest never reaches the debugger and the
+      # inspector reports the panic.
+      - name: Refuse a tampered boot payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-tampered"
+          mkdir -p "$runtime"
+          "$check" tamper "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            "$runtime/helios-bootfs"
+          if ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --tpm swtpm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs "$runtime/helios-bootfs" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            echo 'the inspector booted a payload whose signature does not match'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          "$check" refused "$runtime/debug-serial.log"
+      # A different boot program set is a different payload, signed by
+      # the same build root, so it verifies and PCR 9 differs. The TPM
+      # state the retention step left is sealed to the old measurement:
+      # it is reported as changed state, a new seed replaces it, and the
+      # key is not the one of the two boots before.
+      - name: Reseal the kernel signing key after a changed payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/acpi-changed"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --accel tcg --tpm swtpm --tpm-state "$RUNNER_TEMP/tpm-state-aarch64-acpi" \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program date \
+            --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+          grep -Fqx ok "$runtime/shell.out"
+          changed="$("$check" settled "$runtime/debug-serial.log" provisioned-and-sealed state-changed)"
+          retained="$(cat "$RUNNER_TEMP/tpm-signer-aarch64-acpi")"
+          echo "signer: retained $retained, after the change $changed"
+          test "$changed" != "$retained"
+      # Booted from the device tree, QEMU's `virt` writes a fresh
+      # `/chosen/rng-seed` and `kaslr-seed` into the blob at every boot,
+      # and Limine measures the blob into PCR 9, so PCR 9 never repeats
+      # (#602). A sealed seed cannot survive a reboot here, and that is
+      # the sealing policy working: the second boot of one payload on
+      # one TPM state directory must report changed state, provision a
+      # new seed, and derive a different key, where the ACPI boots
+      # above retain it.
+      - name: Detect changed state across measured device-tree boots
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-aarch64-dt"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            mkdir -p "$runtime"
+            ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+              --accel tcg --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir \
+              --boot-program dash --boot-program debugger --no-compiler-plugin \
+              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+            grep -F 'platform described by device-tree' "$runtime/inspector.log"
+          }
+          boot dt-1
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/dt-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot dt-2
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/dt-2/debug-serial.log" provisioned-and-sealed state-changed)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" != "$second"
       - name: Upload the inspector runtime directories
         if: failure()
         uses: actions/upload-artifact@v4
@@ -711,6 +1559,7 @@ jobs:
           name: smoke-aarch64-runtime
           path: |
             smoke-runtime/*/*.log
+            smoke-runtime-measured/*/*.log
           if-no-files-found: warn
           retention-days: 7
       # Each boot above rebuilds the bootfs for its own `--boot-program`
@@ -721,7 +1570,7 @@ jobs:
         id: guest-image
         # A lane that failed before it built the inspector has nothing
         # to build an image with.
-        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch aarch64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
@@ -745,17 +1594,120 @@ jobs:
             helios/target/kernel-prebuild/aarch64-unknown-none/kernel-release/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
+
+  # A kernel built with HELIOS_CFI_SELF_TEST corrupts a signed return
+  # address once every processor has started, and the guest has to panic
+  # with a control-flow violation. The test builds a debug `helios-cli`,
+  # debug boot programs and a debug kernel of its own, none of which the
+  # `smoke-aarch64` boots use, so it runs beside that lane rather than
+  # after it (#883). It needs the pinned QEMU, the Limine share and the
+  # host dependencies the kernel build reads, and nothing the boots stage
+  # for their guests (WASI tooling, `wasm-tools`, zig, the release
+  # inspector). The test runs under `cargo test`, not nextest: its
+  # slow-timeout would kill the build it makes.
+  smoke-aarch64-cfi:
+    name: smoke-aarch64-cfi
+    needs: [changes, wasm-debug]
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-aarch64-cfi')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    env:
+      # The debug guest programs the test's kernel prebuild reads.
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # The QEMU `smoke-aarch64` pins, restored from the same cache entry.
+      QEMU_VERSION: "11.1.1"
+      QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
+      QEMU_PREFIX: ${{ github.workspace }}/qemu-install
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install host dependencies
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+            swtpm
+      - name: Restore the pinned QEMU install prefix
+        id: qemu-cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.QEMU_PREFIX }}
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
+      - name: Build the pinned QEMU
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          tarball="qemu-${QEMU_VERSION}.tar.xz"
+          curl -fsSLO "https://download.qemu.org/${tarball}"
+          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
+          tar xf "${tarball}"
+          cd "qemu-${QEMU_VERSION}"
+          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
+          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
+          ninja -C build install
+      # The inspector looks for `qemu-system-aarch64` on PATH.
+      - name: Put the pinned QEMU on PATH
+        run: |
+          echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
+      - name: Record the QEMU in use
+        run: |
+          command -v qemu-system-aarch64
+          qemu-system-aarch64 --version
+      - name: Stage Limine bootloader share
+        run: |
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      # The only step, and it prebuilds: the test builds its own kernel
+      # and the bootfs it boots.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: debug
+          path: helios/target/wasm-programs/debug
+      - name: Refuse a corrupted return address
+        timeout-minutes: 60
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          cargo test -p helios-inspector -- --ignored --nocapture --exact \
+            vm::tests::cfi_self_test_panics_aarch64
 
   smoke-x86-64:
     name: smoke-x86-64
-    needs: [changes, kernel-profile]
-    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    needs: [changes, build-helios-cli, kernel-profile, wasm-release]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli.result == 'success' && needs.wasm-release.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
-    timeout-minutes: 180
+    timeout-minutes: 40
     env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       # Every boot below names `--accel kvm`. The inspector no longer
@@ -768,14 +1720,28 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-x86-64-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
+            qemu-system-x86 ovmf swtpm
+      - name: Record QEMU, swtpm and KVM availability
         run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            qemu-system-x86 ovmf
           qemu-system-x86_64 --version
+          swtpm --version
           # The inspector picks the accelerator by capability; this only
           # fixes the permissions on the node when the runner has one.
           if [ -e /dev/kvm ]; then
@@ -785,27 +1751,41 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Stage Limine bootloader share
         run: |
-          git clone --depth 1 --branch v11.x-binary \
-            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+          # Limine publishes its prebuilt bootloader as a release asset;
+          # the digest is the one of v12.9.6's `limine-binary.tar.gz`.
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
           make -C "$GITHUB_WORKSPACE/limine"
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
             helios/artifacts/python3-root
             helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
       - name: Stage WASI tooling artifacts
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # The inspector's `vm` and the profile fetch download this one rather
+      # than building their own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: release
+          download-only: "true"
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector -p helios-desktop-text-check
@@ -820,7 +1800,8 @@ jobs:
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo run --release -p helios-cli -- profile-fetch
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch
       # A change to what fixes the profile's format or to the compiler
       # that reads it leaves the default branch's profile unreadable to
       # this tree, and nothing on that branch can replace it before the
@@ -831,7 +1812,14 @@ jobs:
         working-directory: helios
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo run --release -p helios-cli -- profile-fetch --run "${{ github.run_id }}"
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch --run "${{ github.run_id }}"
+      # The first step that prebuilds: `vm` builds the guest image. The
+      # steps before it only fetch the profile, which builds no guest.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
       - name: Boot x86-64 guest
         timeout-minutes: 30
         shell: bash
@@ -875,6 +1863,121 @@ jobs:
           grep -aF 'mount source online serial="src-a"' "$runtime/debug-serial.log" | grep -aF 'read_only=false'
           grep -aF 'mount source online serial="src-b"' "$runtime/debug-serial.log" | grep -aF 'read_only=true'
           grep -aF 'block device identified as the kernel scratch disk serial="helios-data"' "$runtime/debug-serial.log"
+          # The inspector attaches `vmgenid` on the x86 profile, so the
+          # guest has to have found its generation ID window (#572).
+          grep -aF 'vmgenid online' "$runtime/debug-serial.log"
+      - name: Boot x86-64 guest on two NUMA nodes
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          # Every other boot describes one node, so nothing else reads the
+          # SRAT or the SLIT from real ACPI tables (#516). `-smp
+          # 4,sockets=2,cores=2` gives processors 0-3 APIC ids 0-3 in MADT
+          # order, and `-numa node,cpus=` puts 0-1 on node 0 and 2-3 on
+          # node 1. The kernel prints the layout it placed memory and
+          # processors by; the log carries colour escapes, hence `-a`.
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/numa"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --smp 4 --numa-nodes 2 --numa-distance 20 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-numa.out | tee "$runtime/inspector.log"
+          cat boot-numa.out
+          grep -Fqx ok boot-numa.out
+          grep -aF 'NUMA topology nodes=2 distances=10,20;20,10' "$runtime/debug-serial.log"
+          grep -aF 'NUMA node node=0' "$runtime/debug-serial.log" | grep -aF 'processors=0-1'
+          grep -aF 'NUMA node node=1' "$runtime/debug-serial.log" | grep -aF 'processors=2-3'
+      - uses: ./helios/.github/actions/swtpm
+      # The kernel's signing seed is sealed in the TPM to the measured
+      # boot chain (#602). Two boots of one payload on one TPM state
+      # directory: the first provisions and seals a seed, the second
+      # unseals it, and the public half of the key the seed derives is
+      # the same in both. The second boot is handed the payload the
+      # first one booted by path, so the two measure the same bytes
+      # whether or not a rebuild reproduces them. Whether the second
+      # boot also skips recompiling needs the persisted cwasm of #579.
+      - name: Keep the kernel signing key across measured boots
+        timeout-minutes: 15
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          state="$RUNNER_TEMP/tpm-state-x86-64"
+          rm -rf "$state"
+          boot() {
+            runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/$1"
+            shift
+            mkdir -p "$runtime"
+            ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+              --accel kvm --tpm swtpm --tpm-state "$state" \
+              --runtime-dir "$runtime" --keep-runtime-dir "$@" \
+              shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+            grep -Fqx ok "$runtime/shell.out"
+          }
+          boot retention-1 --boot-program dash --boot-program debugger --no-compiler-plugin
+          cp target/kernel-prebuild/x86_64-unknown-none/profile-use/helios-bootfs \
+            "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained"
+          first="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/retention-1/debug-serial.log" provisioned-and-sealed empty)"
+          boot retention-2 --bootfs "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin
+          second="$("$check" settled "$GITHUB_WORKSPACE/smoke-runtime-measured/retention-2/debug-serial.log" unsealed none)"
+          echo "signer: first boot $first, second boot $second"
+          test "$first" = "$second"
+          echo "$first" > "$RUNNER_TEMP/tpm-signer-x86-64"
+      # One byte of the payload's signed body is inverted. The kernel
+      # refuses the payload on its signature before it measures or
+      # parses it, so the guest never reaches the debugger and the
+      # inspector reports the panic.
+      - name: Refuse a tampered boot payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/tampered"
+          mkdir -p "$runtime"
+          "$check" tamper "$GITHUB_WORKSPACE/smoke-runtime-measured/helios-bootfs.retained" \
+            "$runtime/helios-bootfs"
+          if ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --tpm swtpm \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs "$runtime/helios-bootfs" \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > "$runtime/shell.out" 2> "$runtime/inspector.log"; then
+            echo 'the inspector booted a payload whose signature does not match'
+            exit 1
+          fi
+          cat "$runtime/inspector.log"
+          "$check" refused "$runtime/debug-serial.log"
+      # A different boot program set is a different payload, signed by
+      # the same build root, so it verifies and PCR 9 differs. The TPM
+      # state the retention step left is sealed to the old measurement:
+      # it is reported as changed state, a new seed replaces it, and the
+      # key is not the one of the two boots before.
+      - name: Reseal the kernel signing key after a changed payload
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          check=tools/measured-boot-check.sh
+          runtime="$GITHUB_WORKSPACE/smoke-runtime-measured/changed"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --tpm swtpm --tpm-state "$RUNNER_TEMP/tpm-state-x86-64" \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --boot-program date \
+            --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > "$runtime/shell.out" | tee "$runtime/inspector.log"
+          grep -Fqx ok "$runtime/shell.out"
+          changed="$("$check" settled "$runtime/debug-serial.log" provisioned-and-sealed state-changed)"
+          retained="$(cat "$RUNNER_TEMP/tpm-signer-x86-64")"
+          echo "signer: retained $retained, after the change $changed"
+          test "$changed" != "$retained"
       - name: Run the coreutils applets through dash
         timeout-minutes: 5
         shell: bash
@@ -882,21 +1985,119 @@ jobs:
         run: |
           # coreutils is one multicall WASIX module published under
           # several bootfs names, so every applet is launched by bare
-          # name and dash resolves it through PATH.
+          # name and dash resolves it through PATH. `date` is a component
+          # program: dash's descriptors must become its stdio, so its
+          # stdout reaches a command substitution and a pipe, `2>&1` sends
+          # its stderr (`usage: date`) to the shell's stdout, and the
+          # shell's own stdout still works after that redirection (#904).
           runtime="$GITHUB_WORKSPACE/smoke-runtime/coreutils"
           mkdir -p "$runtime"
+          # The single-quoted -c argument is the guest dash's command line; $(date) must reach dash unexpanded, so the host shell must not expand it.
+          # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
             --accel kvm \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger \
             --boot-program ls --boot-program mkdir --boot-program cat \
+            --boot-program date \
             --no-compiler-plugin \
             shell --trace-log "$runtime/guest-tracing.log" \
-            -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /' \
+            -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /; echo "sub:$(date)"; date | cat; echo "suberr:$(date x 2>&1)"; date x 2>&1; echo after:ok' \
             2>&1 > coreutils-smoke.out | tee "$runtime/inspector.log"
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
           grep -Fqx bin coreutils-smoke.out
+          grep -q '^sub:unix_seconds=[0-9][0-9]*$' coreutils-smoke.out
+          grep -q '^unix_seconds=[0-9][0-9]*$' coreutils-smoke.out
+          grep -Fqx 'suberr:usage: date' coreutils-smoke.out
+          grep -Fqx 'usage: date' coreutils-smoke.out
+          grep -Fqx after:ok coreutils-smoke.out
+      - name: Run static Linux programs through dash
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          # A kernel built with the `linux` feature starts static musl
+          # programs through the program service (#1025): one's arguments
+          # reach it intact and its stdout pipes into a WASIX program, its
+          # exit status reaches `$?`, and a fault ends it with 128 + SIGSEGV.
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/linux"
+          mkdir -p "$runtime"
+          bash linux/tests/build-fixtures.sh "$runtime/bootfs" x86_64
+          bash linux/tests/fetch-curl.sh "$runtime/bootfs/linux/curl" x86_64 "$GITHUB_WORKSPACE/linux-curl-cache"
+          python3 - "$runtime/curl-port" <<'PY' &
+          import http.server, sys
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = b"curl-smoke: ok\n"
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+          with open(sys.argv[1], "w") as f:
+              f.write(str(srv.server_address[1]))
+          srv.serve_forever()
+          PY
+          curl_srv_pid=$!
+          trap 'kill "$curl_srv_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do [[ -s "$runtime/curl-port" ]] && break; sleep 0.1; done
+          curl_port="$(cat "$runtime/curl-port")"
+          # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
+          # shellcheck disable=SC2016
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --smp 4 --kernel-feature linux \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --bootfs-root "$runtime/bootfs" \
+            --boot-program dash --boot-program debugger --boot-program cat --boot-program wasix-port-list \
+            --no-compiler-plugin \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /bin/dash /linux/check-signals.sh /linux/signals; echo "signals:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged; /linux/container pid1; /linux/sockets; /linux/netconfig; /bin/dash /linux/check-busybox-netconfig.sh /linux/busybox /linux/udhcpc-script.sh /bin/wasix-port-list; /linux/files; printf "from-wasix: 中文 日本語 한국어\n" > /tmp/cross.txt && /linux/files cross /tmp/cross.txt && cat /tmp/cross.txt /tmp/cross.txt.mmap; /linux/readiness hold-open | /linux/readiness stdin-quiet; /linux/readiness stdin-epoll >/dev/null && echo "stdin-epoll: ok"; /linux/tty; /linux/permissions; /linux/process; /linux/process mixed /bin/cat; /bin/dash /linux/check-dash.sh /linux/dash /linux/hello /linux/args /bin/cat; echo "dash:$?"; /linux/curl -fsS --max-time 30 http://10.0.2.2:'"$curl_port"'/hello' \
+            2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
+          cat linux-smoke.out
+          grep -Fqx 'arg1=3' linux-smoke.out
+          grep -Fqx 'arg2=中文' linux-smoke.out
+          grep -Fqx 'arg3=日本語' linux-smoke.out
+          grep -Fqx 'arg4=한국어' linux-smoke.out
+          grep -Fqx 'environment:ok' linux-smoke.out
+          grep -Fqx 'status:3' linux-smoke.out
+          grep -Fqx 'native Linux syscall: ok' linux-smoke.out
+          grep -Fqx 'hello:0' linux-smoke.out
+          grep -Fqx 'Hello, World!' linux-smoke.out
+          grep -Fqx 'libc:0' linux-smoke.out
+          grep -Fqx 'fault:139' linux-smoke.out
+          # The memory fixture (#1026) runs in all its endings against the
+          # results check-memory.sh records from Linux, which build-fixtures.sh
+          # first confirmed on this runner.
+          grep -Fqx 'memory:0' linux-smoke.out
+          grep -Fqx 'pthreads:0' linux-smoke.out
+          grep -Fqx 'signals:0' linux-smoke.out
+          # The system-information suite (#1035), sockets (#1030), netconfig
+          # (#1031), file/readiness/tty suites (#1028), and process/dash suites
+          # (#1034) run in the same modes build-fixtures.sh asserts on Linux.
+          for suite in clock random identity limits machine priority container sockets netconfig busybox-netconfig files files-cross readiness stdin-epoll tty permissions process curl-smoke; do
+            grep -Fqx "$suite: ok" linux-smoke.out
+          done
+          grep -Fqx 'from-wasix: 中文 日本語 한국어' linux-smoke.out
+          grep -Fqx 'from-linux-write' linux-smoke.out
+          grep -Fqx 'from-linux-mmap' linux-smoke.out
+          grep -Fqx 'process mixed: ok' linux-smoke.out
+          grep -Fqx 'dash: ok' linux-smoke.out
+          grep -Fqx 'dash:0' linux-smoke.out
+      - name: Kill the guest during a btrfs write burst
+        timeout-minutes: 10
+        shell: bash
+        working-directory: helios
+        run: |
+          # The kill point is drawn from a seed this step prints; a failure
+          # replays with CRASH_SEED=<seed> bash tools/fs-smoke/crash.sh x86-64 kvm.
+          bash tools/fs-smoke/crash.sh x86-64 kvm
+      - name: Mount EROFS and btrfs disks from init
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: bash tools/fs-smoke/run.sh x86-64 kvm
       - name: Run CPython twice and record its launch phases
         timeout-minutes: 5
         shell: bash
@@ -993,6 +2194,40 @@ jobs:
           grep -Fqx oob-load:before-fault oob-load-smoke.out
           grep -Fqx guest-alive oob-load-smoke.out
           ! grep -Fq 'Kernel panic' oob-load-smoke.out
+      - name: Boot with online-capable processors that are not present
+        timeout-minutes: 5
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          # `-smp 2,maxcpus=4`: the MADT lists two enabled processors and
+          # two that are only online-capable. Boot builds a slot for all
+          # four and starts the two that are present (#493).
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/maxcpus"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
+            --accel kvm --smp 2 --max-processors 4 \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger \
+            --no-compiler-plugin \
+            shell --trace-log "$runtime/guest-tracing.log" \
+            -c 'echo guest-alive' \
+            2>&1 > maxcpus-smoke.out | tee "$runtime/inspector.log"
+          cat maxcpus-smoke.out
+          cat "$runtime/guest-tracing.log"
+          grep -Fqx guest-alive maxcpus-smoke.out
+          if grep -Fq 'Kernel panic' maxcpus-smoke.out "$runtime/inspector.log"; then
+            echo "the guest panicked" >&2
+            exit 1
+          fi
+          boot_log="$(cat "$runtime/inspector.log" "$runtime/guest-tracing.log")"
+          grep -Fq 'Processor topology possible=4' <<<"$boot_log"
+          grep -Fq 'Processor online processor=0' <<<"$boot_log"
+          grep -Fq 'Processor online processor=1' <<<"$boot_log"
+          if grep -Eq 'Processor online processor=[23]\b' <<<"$boot_log"; then
+            echo "a processor that is not present came online" >&2
+            exit 1
+          fi
       - name: Refuse a guest-written cwasm whose signature does not verify
         timeout-minutes: 5
         shell: bash
@@ -1003,12 +2238,14 @@ jobs:
           set -o pipefail
           # Only bytes that came from the boot payload load without a
           # signature check; a cwasm a guest writes must verify against
-          # the kernel's trusted roots (#483). CPython copies a bootfs
-          # cwasm to /copy unchanged and to /forged with the last byte
-          # of its payload signature flipped. The copy is still signed
-          # by the trusted root and runs; the forged one must be refused,
-          # so its marker line must not print a second time. A missing
-          # /forged is refused too, so the writes must report success.
+          # the kernel's trusted roots (#483). The build root signs the
+          # payload image once, not each cwasm in it (#602), so a bootfs
+          # cwasm carries no signature of its own and a guest's copy of
+          # it inherits nothing. CPython copies one to /copy unchanged
+          # and to /forged with one byte flipped: the original runs from
+          # the boot payload, and both copies must be refused, so the
+          # program's marker line prints exactly once. A missing file is
+          # refused too, so the writes must report success.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/unsigned-cwasm"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
@@ -1017,11 +2254,13 @@ jobs:
             --boot-program dash --boot-program debugger --boot-program python3 \
             --boot-program wasix-atomic-wait-timeout --no-compiler-plugin \
             shell --trace-log "$runtime/guest-tracing.log" \
-            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /copy && echo copy:ran; /forged && echo forged:ran || echo forged:refused' \
+            -c 'python3 -c "import pathlib; b = pathlib.Path(\"/bin/wasix-atomic-wait-timeout\").read_bytes(); pathlib.Path(\"/copy\").write_bytes(b); f = bytearray(b); f[-13] ^= 1; pathlib.Path(\"/forged\").write_bytes(bytes(f))" && echo cwasm:written; /bin/wasix-atomic-wait-timeout && echo original:ran; /copy && echo copy:ran || echo copy:refused; /forged && echo forged:ran || echo forged:refused' \
             2>&1 > unsigned-cwasm-smoke.out | tee "$runtime/inspector.log"
           cat unsigned-cwasm-smoke.out
           grep -Fqx cwasm:written unsigned-cwasm-smoke.out
-          grep -Fqx copy:ran unsigned-cwasm-smoke.out
+          grep -Fqx original:ran unsigned-cwasm-smoke.out
+          grep -Fqx copy:refused unsigned-cwasm-smoke.out
+          test "$(grep -cF copy:ran unsigned-cwasm-smoke.out)" -eq 0
           grep -Fqx forged:refused unsigned-cwasm-smoke.out
           test "$(grep -cF forged:ran unsigned-cwasm-smoke.out)" -eq 0
           test "$(grep -cFx atomic-wait-timeout:ok unsigned-cwasm-smoke.out)" -eq 1
@@ -1210,56 +2449,12 @@ jobs:
           [[ -n "$main_status" && "$main_status" != 0 && "$main_status" != 1 ]]
           [[ "$thread_status" == "$main_status" ]]
           ! grep -Fq 'Kernel panic' "$runtime/guest.log"
-      - name: Fetch over virtio-net with curl
+      - name: Fetch HTTP and verify TLS certificates with curl
         timeout-minutes: 5
-        shell: bash
         working-directory: helios
         run: |
-          # Without this the step reports tee's status, not the
-          # command's, and a runner script that fails is invisible.
-          set -o pipefail
-          # The counterpart of smoke-riscv64's curl step, and what #86
-          # died in twice over: nothing here drove the NIC, because the
-          # balloon service had wedged the bootstrap processor's
-          # executor, and once it did drive the NIC the transmit queue's
-          # MSI-X message landed on a vector the routing table did not
-          # know. Both are x86-only, and neither is visible from any
-          # step that does not move a packet.
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl"
-          mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
-            --accel kvm \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --boot-program dash --boot-program debugger \
-            --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl http://detectportal.firefox.com/success.txt' \
-            2>&1 > curl-smoke.out | tee "$runtime/inspector.log"
-          cat curl-smoke.out
-          grep -Fqx success curl-smoke.out
-      - name: Fetch over TLS with curl
-        shell: bash
-        working-directory: helios
-        run: |
-          # Without this the step reports tee's status, not the
-          # command's, and a runner script that fails is invisible.
-          set -o pipefail
-          # The counterpart of smoke-riscv64's TLS step, under KVM, with the
-          # same three bad-certificate fetches.
-          runtime="$GITHUB_WORKSPACE/smoke-runtime/curl-https"
-          mkdir -p "$runtime"
-          ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
-            --accel kvm \
-            --runtime-dir "$runtime" --keep-runtime-dir \
-            --boot-program dash --boot-program debugger \
-            --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c 'curl https://detectportal.firefox.com/success.txt; curl https://expired.badssl.com/; curl https://wrong.host.badssl.com/; curl https://self-signed.badssl.com/; true' \
-            2>&1 > curl-https-smoke.out | tee "$runtime/inspector.log"
-          cat curl-https-smoke.out
-          grep -Fqx success curl-https-smoke.out
-          # curl prints the error code through its Debug form
-          # (`ErrorCode::TlsCertificateError`), on whichever stream the
-          # inspector relays the guest's stderr to.
-          test "$(cat curl-https-smoke.out "$runtime/inspector.log" | grep -Fc 'http request failed: ErrorCode::TlsCertificateError')" -eq 3
+          python3 tools/wasi-apps/tls-smoke.py --arch x86-64 --accel kvm \
+            --runtime-dir "$GITHUB_WORKSPACE/smoke-runtime/curl-https"
       - name: Draw on the display and capture the scanout
         timeout-minutes: 5
         shell: bash
@@ -1633,6 +2828,7 @@ jobs:
           # rather than as console output.
           path: |
             smoke-runtime/*/*.log
+            smoke-runtime-measured/*/*.log
           if-no-files-found: warn
           retention-days: 7
       # Each boot above rebuilds the bootfs for its own `--boot-program`
@@ -1644,7 +2840,7 @@ jobs:
         id: guest-image
         # A lane that failed before it built the inspector has nothing
         # to build an image with.
-        if: always() && hashFiles('helios/target/release/helios-inspector') != ''
+        if: ${{ !cancelled() && hashFiles('helios/target/release/helios-inspector') != '' }}
         working-directory: helios
         run: ./target/release/helios-inspector vm --arch x86-64 --release build
       # The image a `--no-build` boot needs on another host, laid out as
@@ -1668,6 +2864,165 @@ jobs:
             helios/target/kernel-prebuild/x86_64-unknown-none/profile-use/compiler_plugin.wasm
           if-no-files-found: error
           retention-days: 90
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
+
+  # The processor lifecycle end to end (#498): `cpu` takes the guest's
+  # highest processor offline and back eight times while the in-kernel
+  # compiler builds from the host share and curl fetches over
+  # virtio-net, and `tools/cpu-lifecycle/check.sh` asserts every typed
+  # answer and the load's own output. It runs beside `smoke-x86-64`
+  # rather than inside it, so it adds no time to that lane; the cost is
+  # its own build of the inspector and the release kernel.
+  smoke-x86-64-cpu-lifecycle:
+    name: smoke-x86-64-cpu-lifecycle
+    needs: [changes, build-helios-cli, kernel-profile, wasm-release]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli.result == 'success' && needs.wasm-release.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-cpu-lifecycle') && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 40
+    env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
+      HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+      HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+      HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-x86-64-cpu-lifecycle-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install host dependencies
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils
+            qemu-system-x86 ovmf swtpm socat
+      - name: Record QEMU and KVM availability
+        run: |
+          qemu-system-x86_64 --version
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            ls -la /dev/kvm
+          fi
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+      - uses: ./helios/.github/actions/setup-zig
+        with:
+          version: 0.13.0
+      - name: Stage Limine bootloader share
+        run: |
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      # The host share the check fetches `curl.wasm` from.
+      - name: Restore WASI tooling artifacts
+        id: artifact-cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      # The inspector's `vm` and the profile fetch download this one rather
+      # than building their own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: release
+          download-only: "true"
+      - name: Build inspector
+        working-directory: helios
+        run: cargo build --release -p helios-inspector
+      # The same profile `smoke-x86-64` fetches: a `--release` x86-64
+      # kernel is built against it.
+      - name: Fetch the kernel profile
+        if: needs.changes.outputs.profile_format != 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch
+      - name: Fetch this run's kernel profile
+        if: needs.changes.outputs.profile_format == 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch --run "${{ github.run_id }}"
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
+      - name: Take a processor offline and back under load
+        timeout-minutes: 30
+        shell: bash
+        working-directory: helios
+        run: |
+          tools/cpu-lifecycle/check.sh ./target/release/helios-inspector \
+            "$GITHUB_WORKSPACE/smoke-runtime/cpu-lifecycle"
+      - name: Upload the inspector runtime directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-x86-64-cpu-lifecycle-runtime
+          path: smoke-runtime/cpu-lifecycle
+          if-no-files-found: ignore
+          retention-days: 14
+      # `-smp 2,maxcpus=4`: QMP `device_add` brings a vCPU online through
+      # SCI, GPE and AML Notify and `device_del` releases it, without a
+      # reboot (#497).
+      - name: Hot-add and hot-remove a vCPU through ACPI
+        timeout-minutes: 30
+        shell: bash
+        working-directory: helios
+        run: |
+          tools/cpu-lifecycle/hotplug.sh ./target/release/helios-inspector \
+            "$GITHUB_WORKSPACE/smoke-runtime/cpu-hotplug"
+      - name: Upload the hotplug runtime directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-x86-64-cpu-hotplug-runtime
+          path: smoke-runtime/cpu-hotplug
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
 
   # The 3D path against a real renderer: `gpu-test` opens a virgl
   # context, retires a fence on it, maps a host blob and a guest blob,
@@ -1682,11 +3037,25 @@ jobs:
   # needs.
   smoke-x86-64-venus:
     name: smoke-x86-64-venus
-    needs: changes
-    if: contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-venus')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    needs: [changes, build-helios-cli, wasm-debug]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.build-helios-cli.result == 'success' && needs.wasm-debug.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'smoke-x86-64-venus') }}
+    # QEMU's display reads the guest's scanout blob through llvmpipe on
+    # vgem, which maps an imported dma-buf only from Mesa 25.3 on
+    # (kms-dri-sw `create_mapped`); 24.04 ships 25.2. The image names the
+    # cached QEMU and virglrenderer builds, which link its libraries.
+    strategy:
+      matrix:
+        image: [ubuntu-26.04]
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
     env:
+      # The debug guest programs the lane's debug inspector prebuilds from.
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      # The `cwasm` cache of `smoke-riscv64`, for this lane's prebuilds.
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
       HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
       HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
       HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
@@ -1704,26 +3073,43 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
+      # The key `smoke-riscv64` installs, for the same reason.
+      - uses: ./helios/.github/actions/ci-root-key
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
+      - name: Record the job start
+        run: echo "HELIOS_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Restore the precompiled cwasm cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-smoke-x86-64-venus-${{ runner.os }}-${{ runner.arch }}-
       - name: Install host dependencies
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build meson ovmf
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev
+            libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev
+            mesa-vulkan-drivers libegl-mesa0 gdb
+      - name: Configure Venus render devices
         run: |
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          sudo apt-get update
-          # The build dependencies of both pinned builds, Mesa's lavapipe
-          # as the host Vulkan driver.
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build meson ovmf \
-            python3-venv pkg-config flex bison \
-            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev \
-            libepoxy-dev libdrm-dev libgbm-dev libvulkan-dev \
-            mesa-vulkan-drivers libegl-mesa0
           # vgem gives a GPU-less runner the render node QEMU's EGL
           # context opens; the azure kernel's own modules package carries
-          # it. No udmabuf: QEMU needs it for blobs only when neither virgl
-          # nor rutabaga backs the device (hw/display/virtio-gpu.c), and
-          # virgl hands guest blobs to virglrenderer as iovecs.
+          # it.
           sudo modprobe vgem
-          sudo chmod 666 /dev/kvm /dev/dri/renderD*
-          ls -la /dev/kvm /dev/dri
+          # Device rules may change the new node's owner and permissions.
+          # Complete them before granting the runner access.
+          sudo udevadm settle
+          # QEMU scans a blob out through an EGL dma-buf import
+          # (ui/egl-helpers.c), and lavapipe exports host-visible memory
+          # as a dma-buf only through /dev/udmabuf (lp_screen.c). Noble
+          # builds udmabuf into the kernel, so the node exists without a
+          # module; chmod fails the step if it does not.
+          sudo chmod 666 /dev/kvm /dev/dri/renderD* /dev/udmabuf
+          ls -la /dev/kvm /dev/dri /dev/udmabuf
           # lavapipe is the only Vulkan driver this runner can enumerate;
           # naming it keeps the loader from probing the hardware ones.
           # Mesa 25's package names the ICD without an architecture suffix.
@@ -1732,10 +3118,10 @@ jobs:
           echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
       - name: Restore the pinned virglrenderer install prefix
         id: virgl-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.VIRGL_PREFIX }}
-          key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
+          key: virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/virglrenderer-meson.args') }}
       - name: Build the pinned virglrenderer
         if: steps.virgl-cache.outputs.cache-hit != 'true'
         run: |
@@ -1751,12 +3137,12 @@ jobs:
           ninja -C "virglrenderer-${VIRGL_VERSION}/build" install
       - name: Restore the pinned QEMU install prefix
         id: qemu-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: ${{ env.QEMU_PREFIX }}
           # QEMU links the virglrenderer above, so its key carries that
           # build's too.
-          key: qemu-venus-${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
+          key: qemu-venus-${{ env.QEMU_VERSION }}-virglrenderer-${{ env.VIRGL_VERSION }}-${{ matrix.image }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/x86_64-venus-configure.args', 'helios/.github/qemu/virglrenderer-meson.args') }}
       - name: Build the pinned QEMU
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         env:
@@ -1784,10 +3170,15 @@ jobs:
           command -v qemu-system-x86_64
           qemu-system-x86_64 --version
           qemu-system-x86_64 -device virtio-gpu-gl-pci,help | grep -F venus
+          # Exercise the same EGL initialization before building any guest.
+          ls -la /dev/dri
+          jq -nc '{execute: "qmp_capabilities"}, {execute: "quit"}' | \
+            timeout 30 qemu-system-x86_64 -machine none -nodefaults -S \
+              -display egl-headless,gl=on -qmp stdio
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
-      - uses: mlugg/setup-zig@v2
+      - uses: ./helios/.github/actions/setup-zig
         with:
           version: 0.13.0
       - name: Stage Limine bootloader share
@@ -1799,20 +3190,30 @@ jobs:
       # under the key every lane shares.
       - name: Restore WASI tooling artifacts
         id: artifact-cache
-        uses: actions/cache@v4
+        uses: ./helios/.github/actions/shared-cache
         with:
           path: |
             helios/artifacts/wasi-tools
             helios/artifacts/python3-root
             helios/artifacts/wasix
-          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
       - name: Stage WASI tooling artifacts
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
         run: tools/wasi-apps/build.sh
+      # The inspector's `vm` downloads this one rather than building its own.
+      - uses: ./helios/.github/actions/helios-cli
+        with:
+          profile: debug
+          download-only: "true"
       - name: Build inspector
         working-directory: helios
         run: cargo build -p helios-inspector
+      # The first step that prebuilds: `vm` builds the guest image.
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        with:
+          profile: debug
+          path: helios/target/wasm-programs/debug
       - name: Run gpu-test against Venus
         # The debug build and the boot take a few minutes; a fence the
         # host never retires otherwise holds the step until the job's limit.
@@ -1845,9 +3246,69 @@ jobs:
           # blobs written and read back, and the second instance.
           for line in 'gpu-test:opened' 'gpu-test:fence ring=0' \
               'gpu-test:host-blob ok' 'gpu-test:guest-blob ok' \
-              'gpu-test:instances=2'; do
+              'gpu-test:instances=2' 'gpu-test:venus ring-reply ok'; do
             grep -Fq "$line" venus-smoke.out
           done
+      # The whole WebGPU path: the provider plugged into `pride-flag`
+      # draws over Venus, the canvas presents to the compositor, and the
+      # capture is what the scanout shows.
+      - name: Draw the pride flag through wasi:webgpu
+        timeout-minutes: 20
+        shell: bash
+        working-directory: helios
+        run: |
+          set -o pipefail
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/pride-flag"
+          captures="$GITHUB_WORKSPACE/pride-flag-scanout"
+          mkdir -p "$runtime" "$captures"
+          # The runner pipes cores to apport, which keeps none for an
+          # unpackaged binary; a crashed QEMU leaves its core here for the
+          # backtrace step below.
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/core.%e.%p"
+          ulimit -c unlimited
+          ./target/debug/helios-inspector vm --arch x86-64 --memory 2G \
+            --accel kvm --runtime-dir "$runtime" --keep-runtime-dir \
+            --renderer virtio-gpu-gl --renderer-hostmem 256M \
+            --display egl-headless \
+            --boot-program dash --boot-program debugger \
+            --boot-program compositor --boot-program pride-flag \
+            --no-compiler-plugin \
+            screendump --settle-seconds 20 --run /bin/pride-flag \
+              "$captures/pride-flag.png" \
+            2>&1 | tee "$runtime/inspector.log"
+          for line in 'pride-flag:device' 'pride-flag:canvas' \
+              'pride-flag:frame 60' 'pride-flag:done'; do
+            grep -Fq "$line" "$runtime/inspector.log"
+          done
+          file "$captures/pride-flag.png" | grep -Fq 'PNG image data'
+      - name: Print the QEMU crash backtrace
+        if: failure()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          # The kernel logs each segfault with the faulting library and
+          # offset, and udmabuf logs the allocations it refuses.
+          echo "::group::kernel log"
+          sudo dmesg | tail -n 100
+          grep -H . /sys/module/udmabuf/parameters/* || true
+          echo "::endgroup::"
+          # %e is the faulting thread's name (llvmpipe-0, say), not the
+          # binary's, so every core here is QEMU's.
+          for core in "$RUNNER_TEMP"/core.*; do
+            ls -la "$core"
+            echo "::group::backtrace of $core"
+            gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' \
+              "$(command -v qemu-system-x86_64)" "$core"
+            echo "::endgroup::"
+          done
+      - name: Upload the pride flag capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pride-flag-scanout
+          path: pride-flag-scanout/*.png
+          if-no-files-found: warn
+          retention-days: 14
       - name: Upload the inspector runtime directory
         if: failure()
         uses: actions/upload-artifact@v4
@@ -1858,3 +3319,552 @@ jobs:
             helios/venus-smoke.out
           if-no-files-found: warn
           retention-days: 7
+      - name: Prune the precompiled cwasm cache
+        if: always()
+        uses: ./helios/.github/actions/prune-artifact-cache
+        with:
+          cache-dir: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          since: ${{ env.HELIOS_CACHE_START }}
+
+  test-btrfs-upstream:
+    name: test-btrfs-upstream (${{ matrix.suite }})
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-upstream')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [btrfs, btrfs_single, btrfs_zlib, btrfs_lzo, btrfs_zstd, corpus]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install upstream test dependencies
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: btrfs-progs wamerican libclang-dev
+      - name: Build Helios upstream test adapters
+        working-directory: helios
+        run: cargo build --locked -p helios-btrfs --examples --features test-support
+      - name: Run independent reader assertions or malformed-image corpus
+        working-directory: helios
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          if [[ "$SUITE" == corpus ]]; then
+            python3 tools/btrfs/run.py corpus
+          else
+            python3 tools/btrfs/run.py grub "$SUITE"
+          fi
+      - name: Preserve results and populated fuzz seeds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-upstream-${{ matrix.suite }}
+          path: |
+            helios/target/btrfs-results
+            helios/target/btrfs-seeds
+          if-no-files-found: error
+          retention-days: 14
+
+  test-btrfs-fstests:
+    name: test-btrfs-fstests
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-fstests')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Resolve running kernel headers package
+        id: kernel-headers
+        run: echo "headers=linux-headers-$(uname -r)" >> "$GITHUB_OUTPUT"
+      - name: Install fstests, btrfs-progs and FUSE
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            acl attr automake bc dbench dump e2fsprogs fio gawk gcc git indent
+            libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool libtool-bin
+            liburing-dev libuuid1 lvm2 make psmisc python3 quota sed uuid-dev
+            uuid-runtime xfsprogs ${{ steps.kernel-headers.outputs.headers }} sqlite3
+            libgdbm-compat-dev xfslibs-dev btrfs-progs fuse3 libclang-dev
+      - name: Build the FUSE adapter
+        working-directory: helios
+        run: cargo build --locked --release -p helios-btrfs --example fuse-btrfs --features test-support,write
+      - name: Run fstests against the FUSE mount
+        working-directory: helios
+        run: sudo env "PATH=$PATH" tools/btrfs/fstests/run.sh
+      - name: Preserve fstests results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-fstests-results
+          path: helios/target/fstests/results
+          if-no-files-found: warn
+          retention-days: 14
+
+  test-btrfs-fuzz:
+    name: test-btrfs-fuzz (${{ matrix.target }})
+    needs: [changes, test-btrfs-upstream]
+    if: contains(fromJSON(needs.changes.outputs.lanes), 'test-btrfs-fuzz')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [btrfs-image-fuzz, btrfs-record-fuzz]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: btrfs-upstream-*
+          path: helios/target
+          merge-multiple: true
+      - name: Fuzz Helios with upstream seeds and AddressSanitizer
+        working-directory: helios
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: python3 tools/btrfs/run.py fuzz "$FUZZ_TARGET"
+      - name: Preserve sanitizer output, corpus and reproducers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-fuzz-${{ matrix.target }}
+          path: |
+            helios/target/btrfs-results
+            helios/target/btrfs-crashes
+            helios/target/btrfs-seeds
+          if-no-files-found: error
+          retention-days: 14
+
+  # gVisor's syscall suite (#1064). `linux-syscalls` runs the committed
+  # passing lists' cases on a pull request or push that touches the
+  # `linux_abi` surface; `linux-syscalls-full` runs every case on dispatch
+  # and nightly. Both build the pinned suite statically, run each case on
+  # a native Linux runner of the same architecture first, and run every
+  # case that does not fail there on Helios, one guest process per case
+  # under a bound. `tools/gvisor-syscalls` holds the pin, the runner and
+  # the lists.
+  linux-syscalls-build:
+    name: linux-syscalls-build (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.linux_suite_mode != 'none'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 40 || 15 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.linux_suite_build) }}
+    # The suite's build is kept as an image in this repository's container
+    # registry, one per architecture and per pin, build script and image
+    # definition; only a run that is not a pull request publishes one.
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SUITE: ${{ github.workspace }}/gvisor-syscalls
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+          sparse-checkout: |
+            tools/gvisor-syscalls
+            .github
+      - uses: astral-sh/setup-uv@v6
+      - name: Log in to the container registry
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      # A registry that answers anything but "manifest unknown" fails the
+      # step: only an image this pin has never had is built.
+      - name: Take this pin's prebuilt suite
+        id: prebuilt
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/helios-gvisor-syscalls:${{ matrix.arch }}-${{ hashFiles('helios/tools/gvisor-syscalls/pin.json', 'helios/tools/gvisor-syscalls/build.sh', 'helios/tools/gvisor-syscalls/image/Dockerfile') }}
+        run: |
+          set -euo pipefail
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          if output="$(docker pull "$IMAGE" 2>&1)"; then
+            # A scratch image has no command; `docker create` needs one
+            # only to exist, never to run.
+            container="$(docker create "$IMAGE" none)"
+            mkdir -p "$SUITE/bin"
+            docker cp "$container:/." "$SUITE/bin"
+            docker rm "$container" > /dev/null
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            cat "$SUITE/bin/BUILT"
+          elif grep -q 'manifest unknown' <<< "$output"; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "no prebuilt suite at $IMAGE"
+          else
+            echo "$output" >&2
+            exit 1
+          fi
+      # A listed run builds only the listed binaries, which make no
+      # complete image; a full run builds them all and, outside a pull
+      # request, publishes them.
+      - name: Build the suite's static binaries
+        if: steps.prebuilt.outputs.found == 'false'
+        shell: bash
+        working-directory: helios
+        env:
+          ARCH: ${{ matrix.arch }}
+          MODE: ${{ needs.changes.outputs.linux_suite_mode }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == listed ]]; then
+            uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls binaries \
+              "tools/gvisor-syscalls/passing/$ARCH.txt" > "$RUNNER_TEMP/binaries.txt"
+            bash tools/gvisor-syscalls/build.sh "$ARCH" "$SUITE/bin" "$RUNNER_TEMP/binaries.txt"
+          else
+            bash tools/gvisor-syscalls/build.sh "$ARCH" "$SUITE/bin"
+          fi
+          cat "$SUITE/bin/BUILT"
+      - name: Publish the suite's build
+        if: steps.prebuilt.outputs.found == 'false' && needs.changes.outputs.linux_suite_mode == 'full' && github.event_name != 'pull_request'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.prebuilt.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker build --file helios/tools/gvisor-syscalls/image/Dockerfile --tag "$IMAGE" "$SUITE/bin"
+          docker push "$IMAGE"
+      - name: List the cases the binaries hold
+        shell: bash
+        working-directory: helios
+        env:
+          ARCH: ${{ matrix.arch }}
+          MODE: ${{ needs.changes.outputs.linux_suite_mode }}
+        run: |
+          set -euo pipefail
+          only=()
+          if [[ "$MODE" == listed ]]; then
+            only=(--only "tools/gvisor-syscalls/passing/$ARCH.txt")
+          fi
+          uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls list \
+            --bin-dir "$SUITE/bin" --out "$SUITE/cases.txt" "${only[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gvisor-syscalls-${{ matrix.arch }}
+          path: ${{ env.SUITE }}
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-syscalls:
+    name: linux-syscalls (${{ matrix.arch }} ${{ matrix.shard }}/${{ matrix.shards }})
+    needs: [changes, build-helios-cli, kernel-profile, wasm-release, linux-syscalls-build]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.build-helios-cli.result == 'success' && needs.linux-syscalls-build.result == 'success' && needs.wasm-release.result == 'success' && (needs.kernel-profile.result == 'success' || needs.kernel-profile.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ needs.changes.outputs.linux_suite_mode == 'full' && 60 || 15 }}
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.linux_suite_shards) }}
+    env:
+      HELIOS_PREBUILT_WASM: ${{ github.workspace }}/helios/target/wasm-programs
+      HELIOS_ARTIFACT_CACHE: ${{ github.workspace }}/cwasm-cache
+      HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+      HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+      HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+      # The QEMU smoke-aarch64 builds, for the same reason: Ubuntu 24.04's
+      # asserts in its emulated GICv3 under multi-threaded TCG.
+      QEMU_VERSION: "11.1.1"
+      QEMU_SHA256: 079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482
+      QEMU_PREFIX: ${{ github.workspace }}/qemu-install
+      SUITE: ${{ github.workspace }}/gvisor-syscalls
+      RESULTS: ${{ github.workspace }}/gvisor-syscalls-results
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: actions/download-artifact@v4
+        with:
+          name: gvisor-syscalls-${{ matrix.arch }}
+          path: ${{ env.SUITE }}
+      - name: Count the shard's cases
+        id: cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An artifact does not keep file modes.
+          find "$SUITE/bin" -name '*_test' -type f -exec chmod +x {} +
+          count="$(awk 'NF && !/^#/' "$SUITE/cases.txt" | wc -l)"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "${count} cases in the suite list"
+      - uses: astral-sh/setup-uv@v6
+      # The bound native Linux gives one case. gVisor marks its slowest
+      # binaries `large` (fifteen minutes for the whole binary under
+      # Bazel); one case of them finishes in seconds natively, so a
+      # minute separates a hang from a slow case.
+      - name: Run the shard natively
+        shell: bash
+        working-directory: helios
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULTS"
+          uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls native \
+            --bin-dir "$SUITE/bin" --cases "$SUITE/cases.txt" \
+            --shard "${{ matrix.shard }}/${{ matrix.shards }}" --timeout 60 \
+            --results "$RESULTS/native-${{ matrix.arch }}-${{ matrix.shard }}.jsonl"
+      - uses: ./helios/.github/actions/checkout-wasmtime
+        if: steps.cases.outputs.count != '0'
+      - uses: ./helios/.github/actions/ci-root-key
+        if: steps.cases.outputs.count != '0'
+        with:
+          key: ${{ secrets.HELIOS_CI_ROOT_KEY }}
+      - name: Restore the precompiled cwasm cache
+        if: steps.cases.outputs.count != '0'
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.HELIOS_ARTIFACT_CACHE }}
+          key: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: helios-cwasm-linux-syscalls-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install host dependencies (x86_64)
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: libudev-dev just cmake ninja-build erofs-utils btrfs-progs qemu-system-x86 ovmf
+      - name: Record QEMU and KVM availability (x86_64)
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64'
+        run: |
+          qemu-system-x86_64 --version
+          sudo chmod 666 /dev/kvm
+          ls -la /dev/kvm
+      - name: Install host dependencies (aarch64)
+        if: steps.cases.outputs.count != '0' && matrix.arch != 'x86_64'
+        uses: ./helios/.github/actions/install-apt-packages
+        with:
+          packages: >-
+            libudev-dev just cmake ninja-build erofs-utils btrfs-progs
+            python3-venv pkg-config flex bison
+            libglib2.0-dev libpixman-1-dev libslirp-dev libfdt-dev zlib1g-dev
+      - name: Restore the pinned QEMU install prefix
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
+        id: qemu-cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: ${{ env.QEMU_PREFIX }}
+          key: qemu-${{ env.QEMU_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/.github/qemu/aarch64-configure.args') }}
+      - name: Build the pinned QEMU
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64' && steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          tarball="qemu-${QEMU_VERSION}.tar.xz"
+          curl -fsSLO "https://download.qemu.org/${tarball}"
+          echo "${QEMU_SHA256}  ${tarball}" | sha256sum -c -
+          tar xf "${tarball}"
+          cd "qemu-${QEMU_VERSION}"
+          mapfile -t flags < "${GITHUB_WORKSPACE}/helios/.github/qemu/aarch64-configure.args"
+          ./configure --prefix="${QEMU_PREFIX}" "${flags[@]}"
+          ninja -C build install
+      - name: Put the pinned QEMU on PATH
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'aarch64'
+        run: |
+          echo "${QEMU_PREFIX}/bin" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@v2
+        if: steps.cases.outputs.count != '0'
+        with:
+          tool: wasm-tools
+      - uses: ./helios/.github/actions/setup-zig
+        if: steps.cases.outputs.count != '0'
+        with:
+          version: 0.13.0
+      - name: Stage Limine bootloader share
+        if: steps.cases.outputs.count != '0'
+        run: |
+          # The digest is the one of v12.9.6's `limine-binary.tar.gz`.
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/limine-binary.tar.gz" \
+            https://github.com/limine-bootloader/limine/releases/download/v12.9.6/limine-binary.tar.gz
+          echo "b38aabb042b0c0f9f562b7741be3c1204838d7bbacfa78bb411c674bd5b984ee  $RUNNER_TEMP/limine-binary.tar.gz" \
+            | sha256sum --check -
+          mkdir -p "$GITHUB_WORKSPACE/limine"
+          tar -xzf "$RUNNER_TEMP/limine-binary.tar.gz" --strip-components=1 \
+            -C "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      - name: Restore WASI tooling artifacts
+        if: steps.cases.outputs.count != '0'
+        id: artifact-cache
+        uses: ./helios/.github/actions/shared-cache
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/tools/branch-hints/**', 'helios/docs/wasmtime.md', 'helios/api/**', 'helios/api-macro/**', 'helios/wit/**', 'helios/Cargo.toml', 'helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/.cargo/config.toml') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.cases.outputs.count != '0' && steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      - uses: ./helios/.github/actions/helios-cli
+        if: steps.cases.outputs.count != '0'
+        with:
+          profile: release
+          download-only: "true"
+      - name: Build inspector
+        if: steps.cases.outputs.count != '0'
+        working-directory: helios
+        run: cargo build --release -p helios-inspector
+      # An x86-64 release kernel is built against the kernel profile, as
+      # in smoke-x86-64: the default branch's, or this run's when the
+      # change moves the profile's format.
+      - name: Fetch the kernel profile
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64' && needs.changes.outputs.profile_format != 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch
+      - name: Fetch this run's kernel profile
+        if: steps.cases.outputs.count != '0' && matrix.arch == 'x86_64' && needs.changes.outputs.profile_format == 'true'
+        working-directory: helios
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          "$HELIOS_CLI_BIN" profile-fetch --run "${{ github.run_id }}"
+      - uses: ./helios/.github/actions/prebuilt-wasm
+        if: steps.cases.outputs.count != '0'
+        with:
+          profile: release
+          path: helios/target/wasm-programs/release
+      # Each case runs as its own guest process under the bound below,
+      # and a case that takes the guest down costs that case and a boot.
+      # The binaries reach the guest through the read-only host share at
+      # `/host`: the whole suite is far larger than a boot payload. Under
+      # TCG a case runs at emulation speed, so its bound is three times
+      # the KVM one.
+      - name: Run the shard on Helios
+        if: steps.cases.outputs.count != '0'
+        shell: bash
+        working-directory: helios
+        env:
+          VM_ARCH: ${{ matrix.vm_arch }}
+          ACCEL: ${{ matrix.accel }}
+          CASE_TIMEOUT: ${{ matrix.accel == 'tcg' && 180 || 60 }}
+        run: |
+          set -euo pipefail
+          runtime="$RESULTS/runtime-${{ matrix.arch }}-${{ matrix.shard }}"
+          mkdir -p "$runtime/tmp-root"
+          chmod 1777 "$runtime/tmp-root"
+          # Format a writable 128 MiB btrfs image mounted as a private container
+          # mount at `/tmp` so every case gets a fresh `TEST_TMPDIR` with full
+          # Unix permissions, ownership, set-id, ACL and xattr enforcement (#1084).
+          truncate -s 128M "$runtime/scratch.btrfs"
+          mkfs.btrfs -q -f --rootdir "$runtime/tmp-root" "$runtime/scratch.btrfs"
+          uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls helios \
+            --cases "$SUITE/cases.txt" \
+            --native "$RESULTS/native-${{ matrix.arch }}-${{ matrix.shard }}.jsonl" \
+            --shard "${{ matrix.shard }}/${{ matrix.shards }}" \
+            --results "$RESULTS/helios-${{ matrix.arch }}-${{ matrix.shard }}.jsonl" \
+            --log "$runtime/inspector.log" \
+            -- ./target/release/helios-inspector vm --arch "$VM_ARCH" --release --memory 2G \
+              --accel "$ACCEL" --kernel-feature linux \
+              --runtime-dir "$runtime" --keep-runtime-dir \
+              --disk "$runtime/scratch.btrfs,serial=linux-suite-tmp" \
+              --shared-dir "$SUITE/bin" \
+              --boot-program debugger --no-compiler-plugin \
+              linux-suite --guest-dir /host --private-btrfs linux-suite-tmp \
+              --case-timeout-seconds "$CASE_TIMEOUT"
+      # Nothing to boot for: the report still reads one file per shard.
+      - name: Record an empty Helios run
+        if: steps.cases.outputs.count == '0'
+        run: touch "$RESULTS/helios-${{ matrix.arch }}-${{ matrix.shard }}.jsonl"
+      - name: Preserve the shard's results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gvisor-syscalls-results-${{ matrix.arch }}-${{ matrix.shard }}
+          # The records and the guest's logs; the runtime directory's disk
+          # images stay behind.
+          path: |
+            ${{ env.RESULTS }}/*.jsonl
+            ${{ env.RESULTS }}/runtime-*/*.log
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-syscalls-report:
+    name: linux-syscalls-report
+    needs: [changes, linux-syscalls]
+    if: ${{ !cancelled() && needs.changes.outputs.linux_suite_mode != 'none' && needs.linux-syscalls.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      REPORT: ${{ github.workspace }}/gvisor-syscalls-report
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+          sparse-checkout: tools/gvisor-syscalls
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gvisor-syscalls-results-*
+          path: results
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: gvisor-syscalls-x86_64
+          path: suite/x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: gvisor-syscalls-aarch64
+          path: suite/aarch64
+      # Both architectures are counted and published before either gates,
+      # so a regression on one still leaves the other's report.
+      - name: Count, publish and gate both architectures
+        shell: bash
+        working-directory: helios
+        env:
+          MODE: ${{ needs.changes.outputs.linux_suite_mode }}
+        run: |
+          set -euo pipefail
+          status=0
+          for arch in x86_64 aarch64; do
+            shopt -s nullglob
+            native=("$GITHUB_WORKSPACE"/results/native-"$arch"-*.jsonl)
+            helios=("$GITHUB_WORKSPACE"/results/helios-"$arch"-*.jsonl)
+            shopt -u nullglob
+            uv run --project tools/gvisor-syscalls --quiet gvisor-syscalls report \
+              --arch "$arch" --mode "$MODE" \
+              --cases "$GITHUB_WORKSPACE/suite/$arch/cases.txt" \
+              --native "${native[@]}" --helios "${helios[@]}" \
+              --passing "tools/gvisor-syscalls/passing/$arch.txt" \
+              --pin tools/gvisor-syscalls/pin.json \
+              --out-dir "$REPORT" --summary "$GITHUB_STEP_SUMMARY" || status=1
+          done
+          exit "$status"
+      - name: Preserve the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gvisor-syscalls-report
+          path: ${{ env.REPORT }}
+          if-no-files-found: error
+          retention-days: 90
+
+  gate:
+    name: CI result
+    if: always()
+    needs: [changes, build-helios-cli, kernel-profile, wasm-debug, wasm-release, checks, tests, smoke-riscv64, smoke-aarch64, smoke-aarch64-cfi, smoke-x86-64, smoke-x86-64-cpu-lifecycle, smoke-x86-64-venus, test-btrfs-upstream, test-btrfs-fstests, test-btrfs-fuzz, linux-syscalls-build, linux-syscalls, linux-syscalls-report]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every selected lane to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"

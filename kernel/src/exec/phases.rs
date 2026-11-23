@@ -245,7 +245,9 @@ impl LaunchEnd {
     /// program itself is a refusal.
     pub(crate) fn of(kind: ProgramExecErrorKind) -> Self {
         match kind {
-            ProgramExecErrorKind::OutOfMemory | ProgramExecErrorKind::Internal => Self::Failed,
+            ProgramExecErrorKind::OutOfMemory
+            | ProgramExecErrorKind::Internal
+            | ProgramExecErrorKind::Io => Self::Failed,
             _ => Self::Refused,
         }
     }
@@ -642,18 +644,6 @@ impl<CpuImpl: Cpu> Trace<CpuImpl> {
         let replied_ns = monotonic_nanos(&self.cpu);
         self.timeline.record_at(LaunchPhase::Reply, replied_ns);
         replied_ns - clock.arrival_ns
-    }
-
-    /// Re-arms the emit-on-drop guard around a `Timeline` another
-    /// scope began — a guest launch syscall hands the timeline down
-    /// call by call, and each callee's failure exits are its own to
-    /// report.
-    pub(crate) fn adopt(cpu: CpuImpl, timeline: Timeline) -> Self {
-        Self {
-            cpu,
-            timeline,
-            emit_on_drop: true,
-        }
     }
 
     /// The shared handle — handed to the loader, the spawn, and the

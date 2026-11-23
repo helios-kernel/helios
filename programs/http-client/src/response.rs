@@ -71,7 +71,7 @@ async fn copy(
     while let Some(frame) = body.next().await {
         match frame.map_err(|error| body_code(&error, https))? {
             BodyFrame::Data(bytes) => {
-                if !writer.write_all(bytes.to_vec()).await.is_empty() {
+                if !writer.write_all(bytes.into()).await.is_empty() {
                     // The caller dropped the body: there is nobody to read the
                     // rest, and dropping the connection ends the exchange.
                     return Ok(None);

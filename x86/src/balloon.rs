@@ -19,7 +19,7 @@ use helios_kernel::{BalloonHandle, Timer};
 use helios_virtio::{DeviceType, OffsetDmaPool, VirtioBalloonDevice, VirtioPciTransport};
 use pci_types::PciAddress;
 
-use crate::pci::PciRoot;
+use crate::pci::{PciRoot, VirtioFunctions};
 
 type X86VirtioBalloonDevice = VirtioBalloonDevice<VirtioPciTransport<OffsetDmaPool>>;
 
@@ -34,14 +34,14 @@ type X86VirtioBalloonDevice = VirtioBalloonDevice<VirtioPciTransport<OffsetDmaPo
 const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The PCI function that carries the platform's memory balloon.
-pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
-    pci.find_virtio_function(DeviceType::MemoryBalloon)
+pub(crate) fn discover(virtio: &VirtioFunctions) -> Option<PciAddress> {
+    virtio.find_virtio_function(DeviceType::MemoryBalloon)
 }
 
 /// Brings up the virtio-balloon function at `address` and hands it to
 /// the kernel's balloon tasks.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     address: PciAddress,
     physical_memory_offset: usize,
@@ -49,6 +49,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> BalloonHandle
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let device = helios_virtio::balloon_from_pci(
         &pci.access(),

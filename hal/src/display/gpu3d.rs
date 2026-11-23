@@ -63,6 +63,7 @@
 //! retired since it last looked, and has still missed nothing.
 
 use core::future::Future;
+use core::num::NonZeroU32;
 
 use arrayvec::{ArrayString, ArrayVec};
 use thiserror::Error;
@@ -528,6 +529,30 @@ impl BlobCaching {
     }
 }
 
+/// What the rendering half of a display engine offers, read once at
+/// bring-up.
+///
+/// Hardware properties alone: whether the device renders at all,
+/// whether it holds blob resources and a host-visible aperture to map
+/// them through, whether a context names its renderer and ring count at
+/// creation, whether resources carry cross-device identifiers, and any
+/// power-of-two size alignment the device requires of blobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Gpu3dCapabilities {
+    /// The device offers a 3D renderer.
+    pub renders: bool,
+    /// The device creates blob resources (`Gpu3d::create_blob`).
+    pub blobs: bool,
+    /// The device publishes a host-visible aperture (`Gpu3d::map_blob`).
+    pub host_visible: bool,
+    /// Context creation selects a capability set and ring count.
+    pub context_init: bool,
+    /// Resources carry cross-device identifiers.
+    pub cross_device: bool,
+    /// Required byte-size alignment for blobs when the device imposes one.
+    pub blob_alignment: Option<NonZeroU32>,
+}
+
 /// The rendering half of a display engine.
 ///
 /// A second trait beside [`super::DisplayDevice`] rather than more
@@ -537,6 +562,9 @@ impl BlobCaching {
 /// carries a capability set. A caller asks [`Gpu3d::capsets`] which it
 /// has, and a device that answers with nothing renders nothing.
 pub trait Gpu3d: Send + Sync + 'static {
+    /// The static hardware capabilities of this engine's rendering half.
+    fn capabilities(&self) -> Gpu3dCapabilities;
+
     /// Whether this display engine renders at all.
     ///
     /// A hardware fact the device states about itself and the one
@@ -544,7 +572,9 @@ pub trait Gpu3d: Send + Sync + 'static {
     /// `false` carries no capability set and holds no context, and
     /// every other method refuses with [`Gpu3dError::Unsupported`].
     /// It is what a machine decides whether to publish a 3D service on.
-    fn renders(&self) -> bool;
+    fn renders(&self) -> bool {
+        self.capabilities().renders
+    }
 
     /// The capability sets this device carries, in its own order.
     ///
@@ -703,6 +733,10 @@ pub trait Gpu3d: Send + Sync + 'static {
 /// writing the same forwarding methods, exactly as
 /// [`super::DisplayDevice`]'s shared impl does.
 impl<Device: Gpu3d + ?Sized> Gpu3d for alloc::sync::Arc<Device> {
+    fn capabilities(&self) -> Gpu3dCapabilities {
+        Device::capabilities(self)
+    }
+
     fn renders(&self) -> bool {
         Device::renders(self)
     }

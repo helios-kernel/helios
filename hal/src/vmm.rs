@@ -592,7 +592,7 @@ pub trait AddressSpace: Send + Sync + 'static {
     ///    frames are unconstrained by the user-pool free list and
     ///    may not even be reachable through the HHDM the backend
     ///    expects). The required primitive is a per-platform
-    ///    `PhysFrameAllocator::allocate(count, zero_first_use=false)`
+    ///    `PhysFrameAllocator::allocate(node, count, zero_first_use=false)`
     ///    that returns a contiguous `PhysFrameRange`.
     /// 3. Copy bytes through the kernel data view of both the source
     ///    and destination frames (HHDM on x86/aarch64,
@@ -691,10 +691,29 @@ pub trait AddressSpace: Send + Sync + 'static {
         0
     }
 
-    /// Bytes this address space currently has committed for `owner`.
-    fn owned_resident_bytes(&self, _owner: u64) -> u64 {
-        0
-    }
+    /// Bytes of this address space's own pool it holds for `owner` right
+    /// now. A swapped-out page holds none, and neither does a page whose
+    /// leaf shows memory that is not the pool's.
+    ///
+    /// `owner` is the opaque tag the kernel attached at commit; this
+    /// layer never interprets it. Every backend answers, because the
+    /// kernel ranks and accounts what a kill returns by it, and a
+    /// backend that answered nothing would make every instance look
+    /// free to kill.
+    fn owned_resident_bytes(&self, owner: u64) -> u64;
+
+    /// [`Self::owned_resident_bytes`] for every owner at once, in one
+    /// pass under whatever lock the backend holds its records in.
+    ///
+    /// `visit` receives `(owner, bytes)` parts: an owner may be visited
+    /// more than once, and the sum of its parts is what
+    /// [`Self::owned_resident_bytes`] answers for it at the moment of
+    /// the pass. The untagged owner the kernel attaches to its own
+    /// mappings is not visited. `visit` runs with the backend's lock
+    /// held, so it must not call back into this address space.
+    fn visit_owned_resident_bytes<Visit>(&self, visit: Visit)
+    where
+        Visit: FnMut(u64, u64);
 
     /// Take the swap tokens this address space dropped on its own.
     ///

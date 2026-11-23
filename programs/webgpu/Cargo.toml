@@ -1,0 +1,22 @@
+[package]
+name = "helios-webgpu-provider"
+version = "0.1.0"
+edition.workspace = true
+autobins = false
+
+[package.metadata.helios]
+library = true
+venus-protocol = true
+target-features = ["atomics"]
+
+[dependencies]
+helios-api = { path = "../../api", default-features = false, features = ["webgpu-provider"] }
+helios-webgpu = { path = "../../webgpu", default-features = false, features = ["component"] }
+
+[lib]
+name = "helios_webgpu_provider"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true

@@ -15,12 +15,12 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
-use core::future::Future;
+use core::convert::Infallible;
 
 use bytes::Bytes;
 use helios_hal::fs::{
-    DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Metadata, NodeId,
-    NodeKind, OpenFlags, WritePosition,
+    DeviceId, DirCookie, DirEntry, DirStream, FileSystem, FsError, FsPath, FsResult, Metadata,
+    NodeId, NodeKind, OpenFlags, OwnedFsPath, RenameMode, WritePosition,
 };
 use triomphe::Arc;
 
@@ -367,12 +367,38 @@ const fn entry_inode(index: usize) -> u64 {
     index as u64 + FIRST_ENTRY_INODE
 }
 
+/// An open directory stream over the immutable boot filesystem.
+pub struct BootDir {
+    index: Arc<BootIndex>,
+    path: OwnedFsPath,
+}
+
+impl DirStream for BootDir {
+    async fn read(&self, cookie: DirCookie, max_entries: usize) -> FsResult<Vec<DirEntry>> {
+        self.index
+            .read_dir(self.path.as_path(), cookie, max_entries)
+    }
+
+    async fn rewind(&mut self) -> FsResult<()> {
+        Ok(())
+    }
+}
+
 impl FileSystem for BootFs {
+    crate::vfs::delegate_path_handles!();
+    type Write = Infallible;
+    type Dir = BootDir;
+
     async fn stat(&self, path: FsPath<'_>) -> FsResult<Metadata> {
         self.index.metadata(path)
     }
 
-    async fn open(&self, path: FsPath<'_>, flags: OpenFlags, _now: u64) -> FsResult<Metadata> {
+    async fn open(
+        &self,
+        path: FsPath<'_>,
+        flags: OpenFlags,
+        _now: u64,
+    ) -> FsResult<helios_hal::fs::Opened<OwnedFsPath>> {
         let metadata = match self.index.metadata(path) {
             Ok(metadata) => metadata,
             Err(FsError::NoEntry) if flags.contains(OpenFlags::CREATE) => {
@@ -389,7 +415,10 @@ impl FileSystem for BootFs {
         if flags.contains(OpenFlags::TRUNCATE) {
             return Err(FsError::ReadOnly);
         }
-        Ok(metadata)
+        Ok(helios_hal::fs::Opened {
+            metadata,
+            handle: OwnedFsPath::from(path),
+        })
     }
 
     async fn read_at(&self, path: FsPath<'_>, offset: u64, max_bytes: usize) -> FsResult<Bytes> {
@@ -402,18 +431,14 @@ impl FileSystem for BootFs {
         Ok(Bytes::from_static(&contents[offset..end]))
     }
 
-    fn write_with<'a, F>(
-        &'a self,
-        _: FsPath<'a>,
+    async fn prepare_write(
+        &self,
+        _: FsPath<'_>,
         _: WritePosition,
         _: usize,
         _: u64,
-        _: F,
-    ) -> impl Future<Output = FsResult<u64>> + Send + 'a
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        core::future::ready(Err(FsError::ReadOnly))
+    ) -> FsResult<Infallible> {
+        Err(FsError::ReadOnly)
     }
 
     async fn set_size(&self, _: FsPath<'_>, _: u64, _: u64) -> FsResult<()> {
@@ -430,28 +455,31 @@ impl FileSystem for BootFs {
         Err(FsError::ReadOnly)
     }
 
-    async fn read_dir(
-        &self,
-        path: FsPath<'_>,
-        cookie: DirCookie,
-        max_entries: usize,
-    ) -> FsResult<Vec<DirEntry>> {
-        self.index.read_dir(path, cookie, max_entries)
+    async fn open_dir(&self, path: FsPath<'_>) -> FsResult<BootDir> {
+        if let Some((_, node)) = self.index.lookup(path)?
+            && node.kind != NodeKind::Directory
+        {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(BootDir {
+            index: self.index.clone(),
+            path: OwnedFsPath::from(path),
+        })
     }
 
     async fn create_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn remove_directory(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn remove_directory(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn unlink(&self, _: FsPath<'_>) -> FsResult<()> {
+    async fn unlink(&self, _: FsPath<'_>, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
-    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: u64) -> FsResult<()> {
+    async fn rename(&self, _: FsPath<'_>, _: FsPath<'_>, _: RenameMode, _: u64) -> FsResult<()> {
         Err(FsError::ReadOnly)
     }
 
@@ -488,7 +516,8 @@ mod tests {
     use futures_lite::future::block_on;
     use helios_artifact::bootfs::{EntryKind, WriteEntry, write_image};
     use helios_hal::fs::{
-        DeviceId, DirCookie, FileSystem, FsError, FsPath, NodeKind, OpenFlags, WritePosition,
+        DeviceId, DirCookie, DirStream, FileSystem, FsError, FsPath, NodeKind, OpenFlags,
+        WritePosition,
     };
 
     use super::{BootFs, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
@@ -515,7 +544,8 @@ mod tests {
     }
 
     fn names(fs: &BootFs, directory: &str) -> Vec<(String, NodeKind)> {
-        block_on(fs.read_dir(path(directory), DirCookie::START, usize::MAX))
+        let dir = block_on(fs.open_dir(path(directory))).expect("opens directory");
+        block_on(dir.read(DirCookie::START, usize::MAX))
             .expect("directory lists")
             .into_iter()
             .map(|entry| (entry.name, entry.kind))
@@ -551,7 +581,8 @@ mod tests {
                 modified_nanos: 0,
             },
         ]);
-        crate::BootPayload::parse(Box::leak(bytes.into_boxed_slice()))
+        let signed = crate::wasmtime_adapter::cwasm::sign_bootfs_image_for_tests(bytes);
+        crate::BootPayload::parse(Box::leak(signed.into_boxed_slice()))
             .expect("payload image must parse")
             .bootfs()
     }
@@ -582,9 +613,10 @@ mod tests {
     #[test]
     fn listing_resumes_from_a_cookie() {
         let fs = boot();
-        let first = block_on(fs.read_dir(FsPath::ROOT, DirCookie::START, 2)).expect("lists");
+        let dir = block_on(fs.open_dir(FsPath::ROOT)).expect("opens");
+        let first = block_on(dir.read(DirCookie::START, 2)).expect("lists");
         assert_eq!(first.len(), 2);
-        let rest = block_on(fs.read_dir(FsPath::ROOT, first[1].next, usize::MAX)).expect("lists");
+        let rest = block_on(dir.read(first[1].next, usize::MAX)).expect("lists");
         let all: Vec<_> = first.iter().chain(&rest).map(|entry| &entry.name).collect();
         assert_eq!(all, ["bin", "empty", "etc", "lib", "lib.txt"]);
     }
@@ -618,12 +650,13 @@ mod tests {
         let past_end = block_on(fs.read_at(path("lib/runtime.component"), 99, 3)).expect("reads");
         assert!(past_end.is_empty());
         assert_eq!(
-            block_on(fs.write_with(
+            block_on(helios_hal::fs::write_with(
+                &fs,
                 path("etc/config.txt"),
                 WritePosition::At(0),
                 1,
                 0,
-                |_| panic!("a refused write needs no bytes"),
+                |_, _| panic!("a refused write needs no bytes"),
             )),
             Err(FsError::ReadOnly)
         );
@@ -632,7 +665,7 @@ mod tests {
             Err(FsError::ReadOnly)
         );
         assert_eq!(
-            block_on(fs.unlink(path("etc/config.txt"))),
+            block_on(fs.unlink(path("etc/config.txt"), 7_000_000_000)),
             Err(FsError::ReadOnly)
         );
     }
