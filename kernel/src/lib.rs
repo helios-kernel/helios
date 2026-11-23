@@ -196,7 +196,7 @@ pub use memory::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, FIBER_STACK_GUARD_BYTES,
     FREE_PAGE_REPORT_INTERVAL, FiberStack, FiberStackArenaStats, FiberStackError,
     FiberStackVmHooks, FrameReservation, FrameShortage, HardwareEntropySource, IDLE_SWAP_AFTER,
-    INCOMPRESSIBLE_BYTES, InstalledAddressSpace, KERNEL_HEAP_BOOTSTRAP_BYTES,
+    INCOMPRESSIBLE_BYTES, InstalledAddressSpace, InterruptedContext, KERNEL_HEAP_BOOTSTRAP_BYTES,
     KERNEL_HEAP_GROWTH_CHUNK_BYTES, KERNEL_HEAP_MAX_BOOT_FRACTION, KERNEL_HEAP_MIN_RESERVE_BYTES,
     KERNEL_HEAP_RESERVE_FRACTION, LocalMemory, LocalSlice, Locality, MemoryNodeStats, MemoryOwner,
     NativePage, NativePages, NativeSlice, NativeSpace, NoCryptographicEntropy, NoEntropyDevice,
@@ -1031,12 +1031,14 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
         // nothing, which is where a processor asked to go offline tears
         // itself down and stops.
         self.service_lifecycle(steps);
-        // The page-fault path that commits a fiber stack page takes its
-        // frame from this processor's reserve and may not wait on the
-        // pool's lock to refill it, so the refill happens here instead:
-        // every executor loop on every processor comes through this
-        // call, outside fault context and holding nothing. It is one
-        // relaxed load when the reserve is full, which is nearly always.
+        // A fiber-stack fault whose interrupted context had interrupts
+        // masked takes its frames from this processor's reserve, because
+        // it may not wait on the pool's lock. The reserve is refilled
+        // here, through the pool's ordinary blocking path: every executor
+        // loop on every processor comes through this call, holding
+        // nothing, so waiting out another processor's critical section is
+        // safe. It is one atomic load when the reserve is full, which is
+        // nearly always.
         memory::top_up_frame_reserve(current_processor());
         let mut progress = 0;
         let mut stats = KernelRunStats::default();
