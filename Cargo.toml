@@ -64,7 +64,7 @@ helios-firmware = { path = "firmware", default-features = false }
 i6300esb = { path = "i6300esb" }
 crossbeam-utils = { version = "0.8.23", default-features = false }
 tracing = { version = "0.1.44",  default-features = false }
-wit-bindgen = { version = "0.61.1", default-features = false }
+wit-bindgen = { version = "0.63.0", default-features = false }
 tempfile = "3.27.0"
 
 
@@ -179,10 +179,10 @@ inherits = "kernel-release"
 # The generator's crates come from one source, or their types disagree.
 [patch.crates-io]
 executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "main" }
-wit-bindgen = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
-wit-bindgen-core = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
-wit-bindgen-rust = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
-wit-bindgen-rust-macro = { git = "https://github.com/lexoliu/wit-bindgen", branch = "helios/atomics-type-guard" }
+wit-bindgen = { git = "https://github.com/lexoliu/wit-bindgen", branch = "fix/atomics-type-guard" }
+wit-bindgen-core = { git = "https://github.com/lexoliu/wit-bindgen", branch = "fix/atomics-type-guard" }
+wit-bindgen-rust = { git = "https://github.com/lexoliu/wit-bindgen", branch = "fix/atomics-type-guard" }
+wit-bindgen-rust-macro = { git = "https://github.com/lexoliu/wit-bindgen", branch = "fix/atomics-type-guard" }
 
 [lints]
 workspace = true

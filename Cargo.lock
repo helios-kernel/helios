@@ -2521,7 +2521,7 @@ dependencies = [
  "http",
  "http-kit-io",
  "thiserror 2.0.21",
- "wit-bindgen 0.61.1",
+ "wit-bindgen 0.63.0",
 ]
 
 [[package]]
@@ -2632,7 +2632,7 @@ dependencies = [
  "wac-graph",
  "walkdir",
  "wasmparser 0.263.0",
- "wit-component 0.263.0",
+ "wit-component",
  "zip",
 ]
 
@@ -2908,7 +2908,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "wit-bindgen 0.61.1",
+ "wit-bindgen 0.63.0",
 ]
 
 [[package]]
@@ -3152,7 +3152,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
- "wit-bindgen 0.61.1",
+ "wit-bindgen 0.63.0",
 ]
 
 [[package]]
@@ -7367,7 +7367,7 @@ dependencies = [
  "syn 3.0.10",
  "wasmtime-internal-component-util",
  "wasmtime-internal-wit-bindgen",
- "wit-parser 0.263.0",
+ "wit-parser",
 ]
 
 [[package]]
@@ -7477,8 +7477,8 @@ dependencies = [
  "bitflags 2.13.1",
  "heck",
  "indexmap",
- "wit-component 0.263.0",
- "wit-parser 0.263.0",
+ "wit-component",
+ "wit-parser",
 ]
 
 [[package]]
@@ -8060,8 +8060,8 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wit-bindgen"
-version = "0.61.1"
-source = "git+https://github.com/lexoliu/wit-bindgen?branch=helios%2Fatomics-type-guard#2d5259ff1851bdf604bab16be759175dcaf3bc92"
+version = "0.63.0"
+source = "git+https://github.com/lexoliu/wit-bindgen?branch=fix%2Fatomics-type-guard#64291e103e8cd8b4ac1211397be5919bebd206f0"
 dependencies = [
  "futures",
  "wit-bindgen-rust-macro",
@@ -8069,60 +8069,41 @@ dependencies = [
 
 [[package]]
 name = "wit-bindgen-core"
-version = "0.61.1"
-source = "git+https://github.com/lexoliu/wit-bindgen?branch=helios%2Fatomics-type-guard#2d5259ff1851bdf604bab16be759175dcaf3bc92"
+version = "0.63.0"
+source = "git+https://github.com/lexoliu/wit-bindgen?branch=fix%2Fatomics-type-guard#64291e103e8cd8b4ac1211397be5919bebd206f0"
 dependencies = [
  "anyhow",
  "heck",
- "wit-parser 0.258.0",
+ "wit-parser",
 ]
 
 [[package]]
 name = "wit-bindgen-rust"
-version = "0.61.1"
-source = "git+https://github.com/lexoliu/wit-bindgen?branch=helios%2Fatomics-type-guard#2d5259ff1851bdf604bab16be759175dcaf3bc92"
+version = "0.63.0"
+source = "git+https://github.com/lexoliu/wit-bindgen?branch=fix%2Fatomics-type-guard#64291e103e8cd8b4ac1211397be5919bebd206f0"
 dependencies = [
  "anyhow",
  "heck",
  "indexmap",
- "prettyplease 0.2.37",
- "syn 2.0.119",
- "wasm-metadata 0.258.0",
+ "prettyplease 0.3.0",
+ "syn 3.0.10",
+ "wasm-metadata 0.263.0",
  "wit-bindgen-core",
- "wit-component 0.258.0",
+ "wit-component",
 ]
 
 [[package]]
 name = "wit-bindgen-rust-macro"
-version = "0.61.1"
-source = "git+https://github.com/lexoliu/wit-bindgen?branch=helios%2Fatomics-type-guard#2d5259ff1851bdf604bab16be759175dcaf3bc92"
+version = "0.63.0"
+source = "git+https://github.com/lexoliu/wit-bindgen?branch=fix%2Fatomics-type-guard#64291e103e8cd8b4ac1211397be5919bebd206f0"
 dependencies = [
  "anyhow",
- "prettyplease 0.2.37",
+ "prettyplease 0.3.0",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.10",
  "wit-bindgen-core",
  "wit-bindgen-rust",
-]
-
-[[package]]
-name = "wit-component"
-version = "0.258.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "481b5c47b2ecce0389b5e08a05557d6a190c9cd761773b8880a8017ee04dc7ef"
-dependencies = [
- "anyhow",
- "bitflags 2.13.1",
- "indexmap",
- "log",
- "serde",
- "serde_derive",
- "serde_json",
- "wasm-encoder 0.258.0",
- "wasm-metadata 0.258.0",
- "wasmparser 0.258.0",
- "wit-parser 0.258.0",
 ]
 
 [[package]]
@@ -8141,26 +8122,7 @@ dependencies = [
  "wasm-encoder 0.263.0",
  "wasm-metadata 0.263.0",
  "wasmparser 0.263.0",
- "wit-parser 0.263.0",
-]
-
-[[package]]
-name = "wit-parser"
-version = "0.258.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff4daaa3cd97ae49ecd0a99dc009d453f93e0f083dd3be38c0f24a83a93e37ac"
-dependencies = [
- "anyhow",
- "hashbrown 0.17.1",
- "id-arena",
- "indexmap",
- "log",
- "semver",
- "serde",
- "serde_derive",
- "serde_json",
- "unicode-ident",
- "wasmparser 0.258.0",
+ "wit-parser",
 ]
 
 [[package]]
