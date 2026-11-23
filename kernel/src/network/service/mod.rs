@@ -39,13 +39,13 @@ use helios_netstack::{
     DnsResponse, DnsWireName, EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey,
     IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, InterfaceEventMark, IpAddress, IpCidr, IpProtocol,
     Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6AddressEntry, Ipv6Cidr, Ipv6Packet,
-    IsnSecret, MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry,
-    NetworkInterface as NetworkDevice, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
-    RxDrain, RxFrame, SegmentationOffload, Stack, StackConfig, StackError, StackEvent,
-    StackInstant, TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
-    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics,
-    TcpSendState, TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload,
-    UdpSocketBinding, UdpSocketError, flow_hash, next_transaction_id,
+    MAX_OUTBOUND_FRAMES, NeighborCache, NeighborEntry, NetworkInterface as NetworkDevice,
+    OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, RxDrain, RxFrame,
+    SegmentationOffload, Stack, StackConfig, StackError, StackEvent, StackInstant, StackSecret,
+    TcpCloseKind, TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog,
+    TcpPacket, TcpReadIntoState, TcpReadState, TcpReceiveDiagnostics, TcpSendState,
+    TcpStackCounters, UdpEgress, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding,
+    UdpSocketError, flow_hash, next_transaction_id,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -751,17 +751,19 @@ where
         } else {
             SegmentationOffload::none()
         };
-        // The key of the initial sequence number function (RFC 6528) is
+        // The secret of the stack's keyed functions (the initial sequence
+        // number function of RFC 6528 and the socket indexes' hash) is
         // drawn once, here, and shared by every shard's stack, so a
         // flow's number does not depend on which shard opens it.
-        let mut isn_key = [0_u8; IsnSecret::BYTES];
-        root_entropy.fill(&mut isn_key);
-        let stack_config = StackConfig::new(mac, max_frame_len, IsnSecret::from_bytes(isn_key))
-            .with_rx_budget(rx_poll_budget)
-            .with_rx_checksum_offload(rx_checksum_offload)
-            .with_tx_checksum_offload(tx_checksum_offload)
-            .with_direct_tx_dma(capabilities.direct_tx_dma)
-            .with_segmentation_offload(segmentation);
+        let mut stack_secret = [0_u8; StackSecret::BYTES];
+        root_entropy.fill(&mut stack_secret);
+        let stack_config =
+            StackConfig::new(mac, max_frame_len, StackSecret::from_bytes(stack_secret))
+                .with_rx_budget(rx_poll_budget)
+                .with_rx_checksum_offload(rx_checksum_offload)
+                .with_tx_checksum_offload(tx_checksum_offload)
+                .with_direct_tx_dma(capabilities.direct_tx_dma)
+                .with_segmentation_offload(segmentation);
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
         let state = NetworkShardSet::new(pool, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
@@ -1984,8 +1986,8 @@ mod tests {
     use helios_netstack::{
         ArpOperation, ArpPacket, ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol,
         IcmpEchoKey, Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr,
-        Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, IsnSecret, MAX_OUTBOUND_FRAMES,
-        NeighborEntry, NeighborState, StackConfig, StackInstant, TCP_RECEIVE_WINDOW_BYTES,
+        Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
+        NeighborState, StackConfig, StackInstant, StackSecret, TCP_RECEIVE_WINDOW_BYTES,
         TcpEndpoint, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum,
         UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
@@ -2227,7 +2229,7 @@ mod tests {
         StackConfig::new(
             [0x02, 0, 0, 0, 0, 1],
             ETHERNET_FRAME_BYTES,
-            IsnSecret::from_bytes([0x5a; IsnSecret::BYTES]),
+            StackSecret::from_bytes([0x5a; StackSecret::BYTES]),
         )
         .with_rx_budget(8)
     }
