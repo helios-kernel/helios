@@ -9,9 +9,8 @@ on:
   workflow_dispatch:
     inputs:
       check_lane:
-        description: "Optional lane from ci-lanes.json; empty runs the full suite"
-        required: false
-        default: ""
+        description: "Required lane from ci-lanes.json"
+        required: true
         type: string
   schedule:
     - cron: "37 3 * * *"
@@ -40,8 +39,9 @@ jobs:
   # by path. A lane also runs on `shared` and `pin` changes unless it is
   # `exclusive`, which reads only its own surfaces. A skipped lane
   # reports as skipped, which a required check counts as passing; no
-  # ruleset on `dev` requires a lane of this workflow. A dispatch and the
-  # nightly schedule run every lane unless a dispatch names a command lane;
+  # ruleset on `dev` requires a lane of this workflow. The nightly schedule
+  # runs every lane; a dispatch names a required `check_lane` from
+  # `.github/ci-lanes.json` and runs only that lane.
   # PR and dev pushes omit heavy suites,
   # and Btrfs lanes filter pushes by surface. A draft pull request is not a merge
   # candidate and runs `lint-fmt` alone; marking it ready for review runs
@@ -252,6 +252,10 @@ jobs:
         run: |
           set -euo pipefail
           CHECK_LANE="${CHECK_LANE:-}"
+          if [[ "${EVENT:-}" == "workflow_dispatch" && -z "$CHECK_LANE" ]]; then
+            echo "workflow_dispatch requires a non-empty check_lane" >&2
+            exit 1
+          fi
           if [[ -n "$CHECK_LANE" ]]; then
             jq -e --arg lane "$CHECK_LANE" 'has($lane)' .github/ci-lanes.json > /dev/null || {
               echo "Unknown lane: $CHECK_LANE" >&2
@@ -340,6 +344,8 @@ jobs:
     needs: changes
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'debug')
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
     timeout-minutes: 15
     strategy:
       matrix:
@@ -349,10 +355,6 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
-      - name: Install host dependencies
-        uses: ./helios/.github/actions/install-apt-packages
-        with:
-          packages: cmake ninja-build
       # Each program's wasm, kept with the files its build read (#1022): a
       # program none of whose inputs changed is taken from the cache
       # instead of built. The key carries the run id so that each
@@ -405,9 +407,9 @@ jobs:
         working-directory: helios
         run: >-
           "$HELIOS_CLI_BIN"
-          wasm-build --out-dir ${{ runner.temp }}/wasm-programs
+          wasm-build --out-dir "${RUNNER_TEMP}/wasm-programs"
           --profile ${{ matrix.profile }} --cargo cargo
-          --cache-dir ${{ github.workspace }}/wasm-cache
+          --cache-dir "${GITHUB_WORKSPACE}/wasm-cache"
       - uses: actions/upload-artifact@v4
         with:
           name: helios-wasm-${{ matrix.profile }}
@@ -426,6 +428,8 @@ jobs:
     needs: changes
     if: contains(fromJSON(needs.changes.outputs.wasm_profiles), 'release')
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
     timeout-minutes: 15
     strategy:
       matrix:
@@ -438,6 +442,10 @@ jobs:
     # An empty matrix is an error, not a skip.
     if: needs.changes.outputs.checks != '[]'
     runs-on: ubuntu-24.04
+    # `test-libraries` runs `just test-btrfs-mkfs` which uses `sudo mount -o loop`.
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
+      options: --privileged
     timeout-minutes: 15
     permissions:
       contents: read
@@ -456,28 +464,12 @@ jobs:
         with:
           path: helios
       - uses: ./helios/.github/actions/checkout-wasmtime
-      - name: Install format lint dependencies
-        if: matrix.name == 'lint-fmt'
-        uses: ./helios/.github/actions/install-apt-packages
+      - name: Restore Zig build cache
+        if: matrix.guest-wasm != ''
+        uses: ./helios/.github/actions/shared-cache
         with:
-          packages: just
-      - name: Install host dependencies
-        if: matrix.name != 'lint-fmt'
-        uses: ./helios/.github/actions/install-apt-packages
-        with:
-          packages: libudev-dev just cmake ninja-build erofs-utils btrfs-progs attr libclang-dev
-      - if: matrix.name == 'lint-fmt'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny
-      - if: matrix.name != 'lint-fmt'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools,cargo-deny,nextest
-      - if: matrix.name != 'lint-fmt'
-        uses: ./helios/.github/actions/setup-zig
-        with:
-          version: 0.13.0
+          path: ${{ github.workspace }}/.zig-cache
+          key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.13.0-${{ github.job }}-${{ hashFiles('helios/Cargo.lock', 'helios/rust-toolchain.toml', 'helios/tools/bench/native/**', 'helios/tools/wasi-apps/**') }}
       - name: Restore WASI tooling artifacts
         if: matrix.guest-wasm != ''
         id: artifact-cache
@@ -491,6 +483,9 @@ jobs:
       - name: Stage WASI tooling artifacts
         if: matrix.guest-wasm != '' && steps.artifact-cache.outputs.cache-hit != 'true'
         working-directory: helios
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
         run: tools/wasi-apps/build.sh
       # Compile, lint and test lanes restore their default-branch Rust
       # cache. Only a dev push writes one; other caches follow the same
@@ -518,8 +513,6 @@ jobs:
           workspaces: helios
           key: ${{ matrix.name }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
-      - if: matrix.name != 'lint-fmt'
-        uses: astral-sh/setup-uv@v6
       # After the Rust cache, so a lane whose cache holds the binary
       # builds it from there when no other job has uploaded it yet.
       - uses: ./helios/.github/actions/helios-cli
@@ -554,6 +547,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.tests != '[]'
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/lexoliu/helios-ci:72af6d0ff398b3d5b94b4dd731d9cf057433be71930cf25e7c64edd5c37834d3
     timeout-minutes: 15
     permissions:
       contents: read
