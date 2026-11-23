@@ -449,10 +449,10 @@ where
         self.activity.instance()
     }
 
-    /// The user pool, installed during boot before any program runs.
+    /// The user pool, installed during boot before any program runs (or the
+    /// shared test pool in unit tests that do not boot a machine).
     pub(super) fn user_pool() -> &'static crate::UserMemoryPool {
-        crate::memory::installed_user_memory_pool()
-            .expect("the user memory pool is installed before any program runs")
+        crate::vfs::default_memory_storage_pool()
     }
 
     /// Asks the shared OOM path to cover `requested_bytes` of user memory

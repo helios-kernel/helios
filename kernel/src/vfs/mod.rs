@@ -54,6 +54,7 @@ pub use btrfs::{
 pub use btrfs_management::{BtrfsManagementError, BtrfsVolumeRequest};
 pub use erofs::{DiskImage, ErofsError, ErofsFs, ReaderError};
 pub use host::{HostShare, HostShareWrite};
+pub(crate) use memory::default_memory_storage_pool;
 pub use memory::{
     MemoryFs, MemoryStorageBudget, MemoryStorageSetting, MemoryUnixMetadata, MemoryWrite,
     XattrSetMode,

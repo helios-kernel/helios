@@ -118,8 +118,8 @@ impl Setting for MemoryStorageSetting {
     }
 }
 
-/// The user pool backing in-memory filesystems on this machine.
-fn default_memory_storage_pool() -> &'static UserMemoryPool {
+/// The user pool backing in-memory filesystems and preview1 state on this machine.
+pub(crate) fn default_memory_storage_pool() -> &'static UserMemoryPool {
     #[cfg(not(test))]
     {
         crate::memory::installed_user_memory_pool()
