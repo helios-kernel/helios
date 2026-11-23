@@ -65,6 +65,25 @@ interface net {
     bytes: list<u8>,
   }
 
+  enum dns-error-kind {
+    unresolved-host,
+    timeout,
+    permission-denied,
+    unavailable,
+    internal,
+  }
+
+  record dns-error {
+    kind: dns-error-kind,
+    detail: string,
+  }
+
+  record https-record {
+    alpn: list<string>,
+    port: option<u16>,
+    ttl: mono-nanos,
+  }
+
   resource tcp-stream {
     /// Reads up to `max-bytes` octets from the peer.
     ///
@@ -102,4 +121,10 @@ interface net {
 
   /// Binds a UDP socket to `local-port`. `0` requests an ephemeral port.
   udp-bind: async func(local-port: u16) -> result<udp-socket, udp-error>;
+
+  /// Queries RFC 9460 Type 65 (`HTTPS`) records for `host:port`.
+  ///
+  /// `ok(none)` indicates that no usable `HTTPS` record exists (`NODATA`,
+  /// `NXDOMAIN`, IP literal, or `AliasMode` `.`).
+  resolve-https: async func(host: string, port: u16, timeout: mono-nanos) -> result<option<https-record>, dns-error>;
 }

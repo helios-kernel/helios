@@ -2,11 +2,15 @@
 //!
 //! # SMP contract
 //!
-//! There is one [`NetworkShard`] per processor and every shard owns an
-//! independent `Stack`, socket slab and port allocator. A flow belongs
-//! to exactly one shard ([`rx_frame_owner`]), so the frames for a
-//! socket are always placed in that socket's shard whichever processor
-//! drained them off the device.
+//! There is one [`NetworkShard`] per possible processor, in memory of
+//! that processor's node ([`PerProcessor`]: each shard's cell on cache
+//! lines of its own), and every shard owns an independent `Stack`,
+//! socket slab and port allocator. A flow belongs to exactly one shard
+//! ([`rx_frame_owner`]), so the frames for a socket are always placed in
+//! that socket's shard whichever processor drained them off the device.
+//! The set is never re-partitioned: a processor going offline leaves its
+//! shard, its sockets and its port window where they are, and only the
+//! queue pair whose pump serves the shard changes (`routes`).
 //!
 //! One frame is the exception: a Neighbor Advertisement belongs to the
 //! whole node, because the shard that asked for the address is the one
@@ -40,7 +44,8 @@
 //! an await point.
 
 use super::*;
-use crossbeam_utils::CachePadded;
+use crate::memory::{PerProcessor, UserMemoryPool};
+use helios_hal::cpu::ProcessorId;
 
 /// Who a received frame belongs to.
 pub(super) enum RxFrameOwner {
@@ -222,6 +227,45 @@ pub(super) fn shard_idx_for_flow(
         .unwrap_or(DEFAULT_SHARD_IDX)
 }
 
+/// The owner of every local port of one connect: what
+/// [`shard_idx_for_flow`] answers for the flow between two endpoints,
+/// for any local port, without hashing the whole tuple per port.
+///
+/// Concurrency contract: a plain value, a pure function of the
+/// endpoints, owned by the one connect that built it.
+#[derive(Clone, Copy)]
+pub(super) struct PortOwners {
+    /// `None` when the endpoints' families form no tuple, which
+    /// [`DEFAULT_SHARD_IDX`] owns for every port.
+    hashes: Option<DestinationPortHashes>,
+    shard_count: usize,
+}
+
+impl PortOwners {
+    /// The owners for flows between `local` and `remote` on
+    /// `shard_count` shards; the tuple is the receive direction, as in
+    /// [`shard_idx_for_flow`].
+    pub(super) fn new(
+        local: IpAddress,
+        remote: IpAddress,
+        remote_port: u16,
+        shard_count: usize,
+    ) -> Self {
+        Self {
+            hashes: FlowTuple::between(remote, remote_port, local, 0)
+                .map(|tuple| DestinationPortHashes::of(&tuple)),
+            shard_count,
+        }
+    }
+
+    /// The shard the flow hashes to once it has `local_port`.
+    pub(super) fn owner_of(&self, local_port: u16) -> usize {
+        self.hashes
+            .map(|hashes| hashes.hash(local_port).bucket(self.shard_count))
+            .unwrap_or(DEFAULT_SHARD_IDX)
+    }
+}
+
 pub(super) struct NetworkShard {
     pub(super) stack: Box<Stack>,
     /// This shard's index inside the parent `NetworkShardSet`.
@@ -236,6 +280,9 @@ pub(super) struct NetworkShard {
     /// Where this shard draws ephemeral ports and DNS question ids
     /// from. Touched only under the shard's lock.
     pub(super) entropy: ShardEntropy,
+    /// Where an outbound TCP connect's walk starts (RFC 6056 §3.3.3).
+    /// Touched only under the shard's lock.
+    pub(super) connect_ports: ConnectPortSelector,
     pub(super) tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
     pub(super) tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
     pub(super) udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
@@ -511,8 +558,34 @@ pub(super) enum WaitTarget {
     AnyShard,
 }
 
+/// The shards of a set, one per processor, each in memory of its
+/// processor's node. A shard's index is its processor's.
+pub(super) struct ShardTable {
+    cells: PerProcessor<ShardCell>,
+}
+
+impl ShardTable {
+    pub(super) fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &ShardCell> {
+        self.cells.iter().map(|(_, cell)| cell)
+    }
+}
+
+impl core::ops::Index<usize> for ShardTable {
+    type Output = ShardCell;
+
+    fn index(&self, index: usize) -> &ShardCell {
+        let processor = u16::try_from(index)
+            .unwrap_or_else(|_| panic!("network shard index {index} exceeds u16 range"));
+        self.cells.get(ProcessorId::new(processor))
+    }
+}
+
 pub(super) struct NetworkShardSet {
-    pub(super) shards: Box<[CachePadded<ShardCell>]>,
+    pub(super) shards: ShardTable,
     /// Slots for listeners, which exist on every shard because an
     /// inbound connection's hash is not known when the port is opened.
     pub(super) listener_slots: ReplicaSlots<MAX_TCP_LISTENER_HANDLES>,
@@ -567,28 +640,27 @@ impl ShardArrivals {
 }
 
 impl NetworkShardSet {
-    /// Builds a shard set sized to `shard_count`. Each shard owns
+    /// Builds a shard set with one shard per processor of `pool`'s
+    /// machine, each in its processor's node's memory. Each shard owns
     /// an independent `NetworkShard`, produced by `factory(i)` so
     /// the ctor can stagger per-shard fields (port allocator base,
     /// DHCP transaction id) across the set.
-    pub(super) fn new<F>(shard_count: usize, mut factory: F) -> Self
+    pub(super) fn new<F>(pool: &UserMemoryPool, mut factory: F) -> Self
     where
         F: FnMut(usize) -> NetworkShard,
     {
-        assert!(shard_count != 0, "network shard count must be non-zero");
-        let mut shards: Vec<CachePadded<ShardCell>> = Vec::with_capacity(shard_count);
-        for index in 0..shard_count {
-            shards.push(CachePadded::new(ShardCell {
-                inner: SpinMutex::new(factory(index)),
+        let shards = ShardTable {
+            cells: PerProcessor::new(pool, |processor, _| ShardCell {
+                inner: SpinMutex::new(factory(usize::from(processor.id()))),
                 rx_frames: AtomicU64::new(0),
                 tx_frames: AtomicU64::new(0),
                 rx_refused_frames: AtomicU64::new(0),
                 rx_device_refusals: AtomicU64::new(0),
                 arrival: ProgressSignal::new(),
-            }));
-        }
+            }),
+        };
         Self {
-            shards: shards.into_boxed_slice(),
+            shards,
             listener_slots: ReplicaSlots::new(0),
             // Slot zero is the DHCP client, which every shard reserves
             // so a replicated bind cannot land on top of it.
@@ -612,7 +684,7 @@ impl NetworkShardSet {
         for (installed, shard) in self.shards.iter().enumerate() {
             let outcome = install(&mut shard.inner.lock(), slot);
             if let Err(error) = outcome {
-                for unwound in &self.shards[..installed] {
+                for unwound in self.shards.iter().take(installed) {
                     remove(&mut unwound.inner.lock(), slot);
                 }
                 return Err(error);
@@ -883,7 +955,7 @@ impl NetworkShardSet {
     pub(super) fn with_handle_receive_drain<H, R>(
         &self,
         handle: H,
-        pair_count: usize,
+        pairs: &PairRoutes,
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R
     where
@@ -901,7 +973,7 @@ impl NetworkShardSet {
         };
         if relieved {
             self.raise_shard_progress(shard_idx);
-            let pump_shard = shard_idx % pair_count;
+            let pump_shard = pairs.pair_of_shard(shard_idx);
             if pump_shard != shard_idx {
                 self.raise_shard_progress(pump_shard);
             }
@@ -1051,7 +1123,7 @@ impl NetworkShardSet {
     where
         F: FnMut(&mut NetworkShard),
     {
-        for shard in &self.shards {
+        for shard in self.shards.iter() {
             let mut guard = shard.inner.lock();
             f(&mut guard);
         }
@@ -1060,16 +1132,21 @@ impl NetworkShardSet {
     /// Iterates the shards whose egress submits on `pair_idx`, calling
     /// `f` once per shard under its own lock.
     ///
-    /// Shard `s` submits on pair `s % pair_count`, so a pump that owns
-    /// a pair drives every shard that shares it — with fewer pairs than
-    /// processors, the pair's shards are exactly the ones its pump can
-    /// ever move.
-    pub(super) fn for_each_on_pair<F>(&self, pair_idx: usize, pair_count: usize, mut f: F)
+    /// A shard submits on the live pair `layout` folds it onto, so a
+    /// pump that owns a pair drives every shard that shares it — with
+    /// fewer live pairs than shards, the pair's shards are exactly the
+    /// ones its pump can ever move. One layout is used for the whole
+    /// walk, so a hand-off in the middle of it neither skips a shard
+    /// nor visits one twice.
+    pub(super) fn for_each_on_pair<F>(&self, pair_idx: usize, layout: PairLayout, mut f: F)
     where
         F: FnMut(&mut NetworkShard),
     {
-        for shard_idx in (pair_idx..self.shards.len()).step_by(pair_count) {
-            let mut guard = self.shards[shard_idx].inner.lock();
+        for (shard_idx, shard) in self.shards.iter().enumerate() {
+            if layout.pair_of_shard(shard_idx) != pair_idx {
+                continue;
+            }
+            let mut guard = shard.inner.lock();
             f(&mut guard);
         }
     }
@@ -1079,10 +1156,10 @@ impl NetworkShardSet {
     pub(super) fn pair_tcp_deadline_nanos(
         &self,
         pair_idx: usize,
-        pair_count: usize,
+        layout: PairLayout,
     ) -> Option<u64> {
         let mut next = None;
-        self.for_each_on_pair(pair_idx, pair_count, |shard| {
+        self.for_each_on_pair(pair_idx, layout, |shard| {
             if let Some(deadline) = shard.stack.next_tcp_deadline().map(StackInstant::nanos) {
                 next = Some(next.map_or(deadline, |current: u64| current.min(deadline)));
             }
@@ -1132,17 +1209,21 @@ impl NetworkShard {
         let slot = udp_sockets.insert(UdpSocketState {
             stack_socket,
             binding,
+            bound_local_address: None,
         });
         assert_eq!(
             slot, INTERNAL_DHCP_SOCKET_INDEX,
             "DHCP internal UDP socket slot changed"
         );
         let dhcp = DhcpClient::new(stack.config().mac, transaction_id);
+        let mut entropy = ShardEntropy::derive(root_entropy, shard_idx);
+        let connect_ports = ConnectPortSelector::new(&mut entropy);
         Self {
             stack,
             shard_idx,
             shard_count,
-            entropy: ShardEntropy::derive(root_entropy, shard_idx),
+            entropy,
+            connect_ports,
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets,
@@ -1234,13 +1315,31 @@ impl NetworkShard {
     }
 
     /// A walk over every port in this shard's window, from a random
-    /// starting point (RFC 6056 §3.3.1). An allocation takes the first
-    /// port it finds suitable, and gives up only after the whole window
-    /// has been tried.
+    /// starting point (RFC 6056 §3.3.1), for an allocation with no peer
+    /// whose four-tuple a previous use could leave held: a UDP socket
+    /// or a listener. An allocation takes the first port it finds
+    /// suitable, and gives up only after the whole window has been
+    /// tried. An outbound TCP connect uses
+    /// [`Self::connect_start`] instead.
     pub(super) fn ephemeral_walk(&mut self) -> EphemeralWalk {
         let (first, last) = self.ephemeral_window();
         let offset = self.entropy.below(EphemeralWalk::window_len(first, last));
         EphemeralWalk::starting_at(first, last, offset)
+    }
+
+    /// Where an outbound TCP connect to `request`'s destination starts
+    /// in this shard's window (RFC 6056 §3.3.3), and the counters its
+    /// take advances through [`ConnectPortSelector::took_own`] or
+    /// [`ConnectPortSelector::took_foreign`].
+    pub(super) fn connect_start(&self, request: &TcpConnectRequest) -> (ConnectStart, ConnectSlot) {
+        let (first, last) = self.ephemeral_window();
+        self.connect_ports.start(
+            first,
+            last,
+            request.local,
+            request.destination,
+            request.port,
+        )
     }
 
     pub(super) fn add_ipv4_address(

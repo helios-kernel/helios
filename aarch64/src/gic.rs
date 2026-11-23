@@ -30,9 +30,15 @@ use crate::platform::GicDescription;
 /// ones signalled as IRQ.
 const GROUP: InterruptGroup = InterruptGroup::Group1;
 
-/// `CNTV` — the EL1 virtual timer the kernel arms through
-/// `cntv_cval_el0` — is private peripheral interrupt 11, INTID 27.
-pub(crate) const VIRTUAL_TIMER_PPI: IntId = IntId::ppi(11);
+/// BSA architected timer interrupts: EL1 virtual is INTID 27, EL2
+/// virtual is INTID 28. Under VHE the host's CNTV accesses alias CNTHV.
+pub(crate) fn host_timer_interrupt() -> IntId {
+    if crate::current_exception_level() == 2 << 2 {
+        IntId::ppi(12)
+    } else {
+        IntId::ppi(11)
+    }
+}
 
 /// Software-generated interrupt that pulls one specific processor out
 /// of `wfi`. It carries no payload: taking it is the whole message.
@@ -131,25 +137,37 @@ impl Gic {
     /// Initialises the calling processor's CPU interface and enables the
     /// interrupts private to it.
     pub(crate) fn attach_current_processor(&self, mpidr: u64) {
+        let timer = host_timer_interrupt();
         let index = self.with_registers(|gic| {
             let index = redistributor_index(gic, mpidr, self.processor_count);
             gic.init_cpu(index);
             GicCpuInterface::enable_group1(true);
             GicCpuInterface::set_priority_mask(PRIORITY_MASK_ALL);
-            gic.set_interrupt_priority(VIRTUAL_TIMER_PPI, Some(index), DEVICE_PRIORITY)
+            gic.set_interrupt_priority(timer, Some(index), DEVICE_PRIORITY)
                 .unwrap_or_else(|error| {
                     panic!(
-                        "AArch64 GIC could not set the priority of {VIRTUAL_TIMER_PPI:?} on \
+                        "AArch64 GIC could not set the priority of {timer:?} on \
                          redistributor {index}: {error}"
                     )
                 });
-            for intid in [VIRTUAL_TIMER_PPI, WAKE_SGI] {
+            for intid in [timer, WAKE_SGI] {
                 gic.enable_interrupt(intid, Some(index), true)
                     .unwrap_or_else(|error| {
                         panic!(
                             "AArch64 GIC could not enable {intid:?} on redistributor {index}: {error}"
                         )
                     });
+            }
+            if crate::current_exception_level() == 2 << 2 {
+                // BSA: virtual-interface maintenance, EL2 physical slice
+                // timer. Guest timer deadlines use the EL2 timer; their
+                // physical PPIs stay disabled while vGIC delivers them.
+                for intid in [IntId::ppi(9), IntId::ppi(10)] {
+                    gic.set_interrupt_priority(intid, Some(index), DEVICE_PRIORITY)
+                        .expect("GICv3 virtualization PPI priority");
+                    gic.enable_interrupt(intid, Some(index), true)
+                        .expect("GICv3 virtualization PPI enable");
+                }
             }
             index
         });
@@ -165,16 +183,23 @@ impl Gic {
     /// it to say that nothing is left in flight, which the GIC requires
     /// before the processor loses power.
     pub(crate) fn detach_current_processor(&self, mpidr: u64) {
+        let timer = host_timer_interrupt();
         let index = self.with_registers(|gic| {
             let index = redistributor_index(gic, mpidr, self.processor_count);
             GicCpuInterface::enable_group1(false);
-            for intid in [VIRTUAL_TIMER_PPI, WAKE_SGI] {
+            for intid in [timer, WAKE_SGI] {
                 gic.enable_interrupt(intid, Some(index), false)
                     .unwrap_or_else(|error| {
                         panic!(
                             "AArch64 GIC could not disable {intid:?} on redistributor {index}: {error}"
                         )
                     });
+            }
+            if crate::current_exception_level() == 2 << 2 {
+                for intid in [IntId::ppi(9), IntId::ppi(10)] {
+                    gic.enable_interrupt(intid, Some(index), false)
+                        .expect("GICv3 virtualization PPI disable");
+                }
             }
             gic.redistributor_mark_core_asleep(index)
                 .unwrap_or_else(|error| {

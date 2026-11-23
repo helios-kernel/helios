@@ -1,0 +1,14 @@
+printf '\nHELIOS_ARCH_%s\n' "$(uname -m)"
+printf '\nHELIOS_CPUS_%s\n' "$(grep -c '^processor' /proc/cpuinfo)"
+if test -e /sys/devices/system/cpu/cpu1/online; then
+    echo 0 > /sys/devices/system/cpu/cpu1/online
+    test "$(cat /sys/devices/system/cpu/cpu1/online)" = 0 || exit 1
+    echo 1 > /sys/devices/system/cpu/cpu1/online
+    test "$(cat /sys/devices/system/cpu/cpu1/online)" = 1 || exit 1
+    printf '\nHELIOS_CPU_HOTPLUG_OK\n'
+fi
+printf 'helios-virtio-block\n' | dd of=/dev/vda bs=512 conv=sync
+sync
+IFS= read -r written < /dev/vda
+test "$written" = helios-virtio-block && printf '\nHELIOS_BLOCK_OK\n'
+poweroff -f

@@ -2,8 +2,10 @@ package helios:kernel@0.1.0;
 
 world init {
   include wasi:cli/command@0.3.0;
+  import helios:hv/virtualization@0.1.0;
   import helios:system/programs@0.1.0;
   import helios:system/mounts@0.1.0;
+  import helios:system/btrfs@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
@@ -16,14 +18,17 @@ world init {
   import helios:system/surface@0.1.0;
   import helios:system/gpu@0.1.0;
   import helios:system/audio@0.1.0;
+  import helios:system/processors@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
 
 world debugger{
   include wasi:cli/command@0.3.0;
+  import helios:hv/virtualization@0.1.0;
   import helios:system/programs@0.1.0;
   import helios:system/mounts@0.1.0;
+  import helios:system/btrfs@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
@@ -38,6 +43,7 @@ world debugger{
   import helios:system/surface@0.1.0;
   import helios:system/gpu@0.1.0;
   import helios:system/audio@0.1.0;
+  import helios:system/processors@0.1.0;
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;
 }
@@ -173,6 +179,12 @@ world gpu-host {
   import helios:system/gpu@0.1.0;
 }
 
+/// Imports used by Vulkan's synchronous canonical ABI boundary.
+world venus-host {
+  include gpu-host;
+  import helios:system/sync@0.1.0;
+}
+
 /// World the kernel generates the compositor plugin's *export* bindings
 /// from, the way `http-host` carries `wasi:http/handler`.
 world compositor-host {
@@ -187,4 +199,58 @@ world compositor-host {
 /// instead of regenerating every `wasi:cli` import a player also has.
 world audio-host {
   import helios:system/audio@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/processors`
+/// bindings from.
+///
+/// Separate from the program worlds for the reason `audio-host` is: the
+/// kernel serves this one interface to both the `init` and `debugger`
+/// worlds, and one generated type set keeps the two from mapping the
+/// lifecycle's result twice.
+world processors-host {
+  import helios:system/processors@0.1.0;
+}
+
+/// World the kernel generates its own `helios:system/btrfs` bindings from.
+///
+/// Separate from the program worlds for the same reason `processors-host` is:
+/// the kernel serves this one interface to both the `init` and `debugger`
+/// worlds, and one generated type set keeps the two from mapping results twice.
+world btrfs-host {
+  import helios:system/btrfs@0.1.0;
+}
+
+/// A program that draws through `wasi:webgpu` on a platform canvas: the
+/// build plugs `webgpu-provider` into its two WebGPU imports.
+world webgpu {
+  include wasi:cli/command@0.3.0;
+  import wasi:webgpu/webgpu@0.3.0-rc.2;
+  import helios:webgpu/canvas@0.1.0;
+  import helios:system/tracing@0.1.0;
+}
+
+/// A per-program WebGPU library, composed into its consumer's store.
+world webgpu-provider {
+  include wasi:cli/imports@0.3.0;
+  import helios:system/gpu@0.1.0;
+  import helios:system/surface@0.1.0;
+  import helios:system/sync@0.1.0;
+  import helios:system/tracing@0.1.0;
+  export wasi:webgpu/webgpu@0.3.0-rc.2;
+  export helios:webgpu/canvas@0.1.0;
+}
+
+world hv-host {
+  import helios:hv/virtualization@0.1.0;
+}
+
+/// Interfaces whose values cross the inspector's serialized RPC transport.
+world inspector-system {
+  import helios:system/programs@0.1.0;
+  import helios:system/stats@0.1.0;
+  import helios:system/tracing@0.1.0;
+  import helios:system/profiling@0.1.0;
+  import helios:system/instances@0.1.0;
+  import helios:system/processors@0.1.0;
 }

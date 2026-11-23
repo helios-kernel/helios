@@ -71,7 +71,7 @@ use bytes::BytesMut;
 use core::future::Future;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters};
-use helios_hal::fs::{WritePosition, WriteProgress};
+use helios_hal::fs::{Landed, NodeKind, WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use objectpool::{Pool, ReusableObject};
 use slab::Slab;
@@ -80,9 +80,9 @@ use triomphe::Arc;
 
 use super::cache::{CachedAttributes, HostFsCache, HostFsCacheStats, PooledReadFid};
 use crate::{
-    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
-    HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, Notify, ObjectIdentity,
-    ProfileSink, RawMutex,
+    AuthorityDomain, HostCreation, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite,
+    HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, Notify,
+    ObjectIdentity, ProfileSink, RawMutex,
 };
 
 /// The msize this client asks for. The server answers with its own
@@ -133,6 +133,8 @@ const P9_SETATTR_SIZE: u32 = 0x0000_0008;
 const P9_SETATTR_ATIME_SET: u32 = 0x0000_0080;
 const P9_SETATTR_MTIME_SET: u32 = 0x0000_0100;
 const P9_QTDIR: u8 = 0x80;
+/// 9p `QTSYMLINK`.
+const P9_QTSYMLINK: u8 = 0x02;
 const P9_HEADER_LEN: usize = 7;
 /// Most path elements one `Twalk` names: `MAXWELEM` in the 9P2000
 /// `walk(5)` definition and `P9_MAXWELEM` in Linux's
@@ -148,7 +150,10 @@ const P9_TWALK_FIXED_LEN: usize = P9_HEADER_LEN + 4 + 4 + 2;
 const P9_RGETATTR_QID_TYPE: usize = 15;
 const P9_RGETATTR_QID_PATH: usize = 20;
 const P9_RGETATTR_MODE: usize = 28;
+const P9_RGETATTR_UID: usize = 32;
+const P9_RGETATTR_GID: usize = 36;
 const P9_RGETATTR_NLINK: usize = 40;
+const P9_RGETATTR_RDEV: usize = 48;
 const P9_RGETATTR_SIZE: usize = 56;
 const P9_RGETATTR_ATIME_SECONDS: usize = 80;
 const P9_RGETATTR_MTIME_SECONDS: usize = 96;
@@ -557,12 +562,31 @@ struct GateEntry<'a> {
 
 impl Drop for GateEntry<'_> {
     fn drop(&mut self) {
-        let before = self
-            .gate
-            .state
-            .fetch_sub(GATE_ONE_OPERATION, Ordering::AcqRel);
+        self.gate.leave();
+    }
+}
+
+/// An operation whose owner persists across stream polls.
+struct OwnedGateEntry(Arc<SnapshotGate>);
+
+impl Drop for OwnedGateEntry {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
+
+impl SnapshotGate {
+    async fn enter_owned(gate: Arc<Self>) -> OwnedGateEntry {
+        let entry = gate.enter().await;
+        // Transfer this operation's existing count to the owning token.
+        core::mem::forget(entry);
+        OwnedGateEntry(gate)
+    }
+
+    fn leave(&self) {
+        let before = self.state.fetch_sub(GATE_ONE_OPERATION, Ordering::AcqRel);
         if before == GATE_HELD | GATE_ONE_OPERATION {
-            self.gate.drained.notify_all();
+            self.drained.notify_all();
         }
     }
 }
@@ -588,7 +612,7 @@ struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     profiles: ProfileSink,
     session: SessionCell,
     /// Closed for the length of a VMM snapshot; see the module docs.
-    gate: SnapshotGate,
+    gate: Arc<SnapshotGate>,
     tags: HandleAllocator,
     fids: HandleAllocator,
     cache: HostFsCache,
@@ -634,7 +658,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         Self {
             inner: Arc::new(ClientInner {
                 session: SessionCell::new(),
-                gate: SnapshotGate::new(),
+                gate: Arc::new(SnapshotGate::new()),
                 tags: HandleAllocator::new(
                     depth,
                     u32::from(P9_NOTAG),
@@ -1144,10 +1168,16 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     }
 
     /// A fid open for reading on `path`, from the pool where one is
-    /// parked and freshly walked and opened where none is.
-    async fn acquire_read_fid(&self, session: Session, path: &str) -> Result<u32, HostFsError> {
+    /// parked and freshly walked and opened where none is. A fresh open
+    /// also returns the attributes its kind check used.
+    async fn acquire_read_fid(
+        &self,
+        session: Session,
+        path: &str,
+        known: Option<&HostMetadata>,
+    ) -> Result<(u32, Option<HostMetadata>), HostFsError> {
         let retired = match self.inner.cache.take_read_fid(path, self.now_nanos()) {
-            PooledReadFid::Reusable(fid) => return Ok(fid),
+            PooledReadFid::Reusable(fid) => return Ok((fid, None)),
             PooledReadFid::Retired(fid) => Some(fid),
             PooledReadFid::Absent => None,
         };
@@ -1155,8 +1185,11 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             self.clunk_value(fid).await;
         }
         let target = self.walk(session, path).await?;
-        match self.open(target.value(), P9_DOTL_RDONLY).await {
-            Ok(()) => Ok(target.retain()),
+        match self
+            .open_checked(session, path, target.value(), P9_DOTL_RDONLY, known)
+            .await
+        {
+            Ok(metadata) => Ok((target.retain(), Some(metadata))),
             Err(error) => {
                 self.clunk(target).await;
                 Err(error)
@@ -1320,10 +1353,12 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
     async fn read_dir_entries(
         &self,
         session: Session,
+        path: &str,
         fid: u32,
         limit: HostDirLimit,
     ) -> Result<Vec<HostDirEntry>, HostFsError> {
-        self.open(fid, P9_DOTL_RDONLY | P9_DOTL_DIRECTORY).await?;
+        self.open_checked(session, path, fid, P9_DOTL_RDONLY | P9_DOTL_DIRECTORY, None)
+            .await?;
 
         let batch = u32::try_from(session.payload_chunk()).expect("a readdir batch fits in u32");
         let mut entries = Vec::new();
@@ -1386,11 +1421,45 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                 limit.check(entries.len() + 1, name_bytes)?;
                 entries.push(HostDirEntry {
                     name,
-                    is_directory: qid_type & P9_QTDIR != 0 || type_ == 4,
+                    kind: dirent_kind(qid_type, type_),
                 });
             }
         }
         Ok(entries)
+    }
+
+    /// Opens `fid` after asking the host what it names, so that a device,
+    /// FIFO, socket or symbolic link is refused before any `Tlopen`
+    /// reaches the host: the host's server would open it with its own
+    /// privileges.
+    ///
+    /// What the host last said about `path` answers: `known` when the
+    /// caller already looked the attributes up, else the attribute cache
+    /// when it holds them, so the usual `stat` then open costs no
+    /// request; otherwise the fid's own attributes are asked for and
+    /// remembered. Returns the attributes the check used.
+    async fn open_checked(
+        &self,
+        session: Session,
+        path: &str,
+        fid: u32,
+        flags: u32,
+        known: Option<&HostMetadata>,
+    ) -> Result<HostMetadata, HostFsError> {
+        let metadata = match known {
+            Some(metadata) => metadata.clone(),
+            None => match self.inner.cache.attributes(path, self.now_nanos()) {
+                CachedAttributes::Present(metadata) => metadata,
+                CachedAttributes::Absent | CachedAttributes::Unknown => {
+                    let metadata = self.get_attr(fid).await;
+                    self.record_stat(session, path, &metadata);
+                    metadata?
+                }
+            },
+        };
+        metadata.require_openable()?;
+        self.open(fid, flags).await?;
+        Ok(metadata)
     }
 
     async fn open(&self, fid: u32, flags: u32) -> Result<(), HostFsError> {
@@ -1423,8 +1492,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         path: &'a str,
         position: WritePosition,
         len: usize,
-    ) -> Result<HostFsWrite<'a, Transport, CpuImpl>, HostFsError> {
-        let inside = self.inner.gate.enter().await;
+    ) -> Result<HostFsWrite<Transport, CpuImpl>, HostFsError> {
+        let inside = SnapshotGate::enter_owned(self.inner.gate.clone()).await;
         self.clunk_abandoned().await;
         let started = self.profile_start();
         let phase = match position {
@@ -1434,10 +1503,10 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         match self.open_for_write(path, position, len).await {
             Ok((session, fid, landed)) => {
                 let mut write = HostFsWrite {
-                    client: self,
-                    path,
+                    client: self.clone(),
+                    path: String::from(path),
                     session,
-                    fid: Some(fid),
+                    fid: Some(fid.retain()),
                     _inside: inside,
                     started,
                     phase,
@@ -1470,15 +1539,28 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let session = self.session().await?;
         let file = self.walk(session, path).await?;
         let opened = async {
+            // An append resolves the end of file from the fid's own
+            // attributes, which also name the kind: one request serves
+            // both. A write at an offset asks no more than the check.
             let landed = match position {
                 WritePosition::At(offset) => offset,
-                WritePosition::End => self.get_attr(file.value()).await?.size,
+                WritePosition::End => {
+                    let metadata = self.get_attr(file.value()).await?;
+                    metadata.require_openable()?;
+                    metadata.size
+                }
             };
             u64::try_from(len)
                 .ok()
                 .and_then(|len| landed.checked_add(len))
                 .ok_or(HostFsError::Protocol("write offset overflowed u64"))?;
-            self.open(file.value(), P9_DOTL_WRONLY).await?;
+            match position {
+                WritePosition::At(_) => {
+                    self.open_checked(session, path, file.value(), P9_DOTL_WRONLY, None)
+                        .await?;
+                }
+                WritePosition::End => self.open(file.value(), P9_DOTL_WRONLY).await?,
+            }
             Ok(landed)
         }
         .await;
@@ -1546,7 +1628,9 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         }
         let session = self.session().await?;
         let target = self.walk(session, path).await?;
-        let entries = self.read_dir_entries(session, target.value(), limit).await;
+        let entries = self
+            .read_dir_entries(session, path, target.value(), limit)
+            .await;
         self.clunk(target).await;
         if let Ok(entries) = &entries
             && self.is_current(session)
@@ -1560,13 +1644,13 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
 
     async fn read_file_impl(&self, path: &str) -> Result<Vec<u8>, HostFsError> {
         let session = self.session().await?;
-        let cached_size = match self.inner.cache.attributes(path, self.now_nanos()) {
-            CachedAttributes::Present(metadata) => Some(metadata.size),
+        let cached = match self.inner.cache.attributes(path, self.now_nanos()) {
+            CachedAttributes::Present(metadata) => Some(metadata),
             CachedAttributes::Absent => return Err(HostFsError::Transport(IoError::NotFound)),
             CachedAttributes::Unknown => None,
         };
-        let fid = match self.acquire_read_fid(session, path).await {
-            Ok(fid) => fid,
+        let (fid, learned) = match self.acquire_read_fid(session, path, cached.as_ref()).await {
+            Ok(acquired) => acquired,
             Err(error) => {
                 self.record_stat(session, path, &Err(error.clone()));
                 tracing::warn!("host-fs read_file({path}) failed: {error:?}");
@@ -1574,7 +1658,9 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
             }
         };
         let data = async {
-            let size = match cached_size {
+            // The open's kind check may have just asked the host.
+            let known_size = cached.or(learned).map(|metadata| metadata.size);
+            let size = match known_size {
                 Some(size) => size,
                 None => {
                     let metadata = self.get_attr(fid).await?;
@@ -1600,7 +1686,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         max_bytes: u32,
     ) -> Result<Vec<u8>, HostFsError> {
         let session = self.session().await?;
-        let fid = self.acquire_read_fid(session, path).await?;
+        let (fid, _) = self.acquire_read_fid(session, path, None).await?;
         // The reply has to fit in one message, so a caller asking for
         // more than that gets a short read rather than a request the
         // server would have to truncate.
@@ -1616,7 +1702,11 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         data
     }
 
-    async fn create_directory_impl(&self, path: &str) -> Result<(), HostFsError> {
+    async fn create_directory_impl(
+        &self,
+        path: &str,
+        creation: HostCreation,
+    ) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(path)?;
         let session = self.session().await?;
         let name = session.string(name)?;
@@ -1628,8 +1718,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                 |body| {
                     push_u32(body, fid);
                     push_string(body, name);
-                    push_u32(body, 0o755);
-                    push_u32(body, P9_NOUID);
+                    push_u32(body, creation.permissions);
+                    push_u32(body, creation.gid);
                 },
                 P9_SMALL_REPLY_LEN,
             )
@@ -1640,7 +1730,11 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         result
     }
 
-    async fn create_file_impl(&self, path: &str) -> Result<(), HostFsError> {
+    async fn create_file_impl(
+        &self,
+        path: &str,
+        creation: HostCreation,
+    ) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(path)?;
         let session = self.session().await?;
         let name = session.string(name)?;
@@ -1653,8 +1747,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                     push_u32(body, fid);
                     push_string(body, name);
                     push_u32(body, P9_DOTL_WRONLY);
-                    push_u32(body, 0o644);
-                    push_u32(body, P9_NOUID);
+                    push_u32(body, creation.permissions);
+                    push_u32(body, creation.gid);
                 },
                 P9_SMALL_REPLY_LEN,
             )
@@ -1744,7 +1838,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         let result = async {
             // `Tfsync` requires an open fid; the host flushes the underlying
             // file description, so a read-only open is enough to name it.
-            self.open(fid, P9_DOTL_RDONLY).await?;
+            self.open_checked(session, path, fid, P9_DOTL_RDONLY, None)
+                .await?;
             self.transact(
                 P9Message::Fsync,
                 |body| {
@@ -1861,7 +1956,12 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         result
     }
 
-    async fn symlink_impl(&self, target: &str, link_path: &str) -> Result<(), HostFsError> {
+    async fn symlink_impl(
+        &self,
+        target: &str,
+        link_path: &str,
+        gid: u32,
+    ) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(link_path)?;
         let session = self.session().await?;
         let name = session.string(name)?;
@@ -1875,7 +1975,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                     push_u32(body, fid);
                     push_string(body, name);
                     push_string(body, target);
-                    push_u32(body, P9_NOUID);
+                    push_u32(body, gid);
                 },
                 P9_SMALL_REPLY_LEN,
             )
@@ -1909,7 +2009,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
 impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
     for HostFsClient<Transport, CpuImpl>
 {
-    type Write<'a> = HostFsWrite<'a, Transport, CpuImpl>;
+    type Write = HostFsWrite<Transport, CpuImpl>;
 
     fn cache_stats(&self) -> Option<HostFsCacheStats> {
         Some(self.cache_stats())
@@ -1974,7 +2074,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         path: &'a str,
         position: WritePosition,
         len: usize,
-    ) -> Result<HostFsWrite<'a, Transport, CpuImpl>, HostFsError> {
+    ) -> Result<HostFsWrite<Transport, CpuImpl>, HostFsError> {
         self.prepare_write_impl(path, position, len).await
     }
 
@@ -2007,14 +2107,30 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         .await
     }
 
-    async fn create_file<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
-        self.profiled("op-create-file", self.create_file_impl(path), |_| 0)
-            .await
+    async fn create_file<'a>(
+        &'a self,
+        path: &'a str,
+        creation: HostCreation,
+    ) -> Result<(), HostFsError> {
+        self.profiled(
+            "op-create-file",
+            self.create_file_impl(path, creation),
+            |_| 0,
+        )
+        .await
     }
 
-    async fn create_directory<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
-        self.profiled("op-create-dir", self.create_directory_impl(path), |_| 0)
-            .await
+    async fn create_directory<'a>(
+        &'a self,
+        path: &'a str,
+        creation: HostCreation,
+    ) -> Result<(), HostFsError> {
+        self.profiled(
+            "op-create-dir",
+            self.create_directory_impl(path, creation),
+            |_| 0,
+        )
+        .await
     }
 
     async fn remove<'a>(&'a self, path: &'a str, directory: bool) -> Result<(), HostFsError> {
@@ -2044,9 +2160,18 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         .await
     }
 
-    async fn symlink<'a>(&'a self, target: &'a str, link_path: &'a str) -> Result<(), HostFsError> {
-        self.profiled("op-symlink", self.symlink_impl(target, link_path), |_| 0)
-            .await
+    async fn symlink<'a>(
+        &'a self,
+        target: &'a str,
+        link_path: &'a str,
+        gid: u32,
+    ) -> Result<(), HostFsError> {
+        self.profiled(
+            "op-symlink",
+            self.symlink_impl(target, link_path, gid),
+            |_| 0,
+        )
+        .await
     }
 
     async fn read_link<'a>(&'a self, path: &'a str) -> Result<String, HostFsError> {
@@ -2111,14 +2236,14 @@ fn p9_optional_timestamp(flag: u32, nanos: Option<u64>) -> (u32, u64, u64) {
 /// sends, and the kernel memory a write holds is bounded
 /// by the request pool, never by the write's length. Each frame's tag is
 /// allocated when it is sent, so a staged frame holds no tag.
-pub struct HostFsWrite<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
-    client: &'a HostFsClient<Transport, CpuImpl>,
-    path: &'a str,
+pub struct HostFsWrite<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
+    client: HostFsClient<Transport, CpuImpl>,
+    path: String,
     session: Session,
     /// The fid open for writing, until the write is finished or dropped.
-    fid: Option<Handle<'a>>,
+    fid: Option<u32>,
     /// Counts the write as an operation in flight for a snapshot hold.
-    _inside: GateEntry<'a>,
+    _inside: OwnedGateEntry,
     started: Option<HostFsPerfStart>,
     /// `op-write` or `op-append`.
     phase: &'static str,
@@ -2132,20 +2257,19 @@ pub struct HostFsWrite<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
 }
 
 /// A round of a [`HostFsWrite`] whose frames are filled.
-pub struct FilledHostFsWrite<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
-    write: HostFsWrite<'a, Transport, CpuImpl>,
+pub struct FilledHostFsWrite<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
+    write: HostFsWrite<Transport, CpuImpl>,
 }
 
-impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<'_, Transport, CpuImpl> {
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<Transport, CpuImpl> {
     /// Readies the frames of the round that starts at `staged_from`: the
     /// header of each `Twrite`, and a payload region of its length.
     fn stage_round(&mut self) {
         let chunk = self.session.payload_chunk();
-        let fid = self
+        let fid = *self
             .fid
             .as_ref()
-            .expect("a write is staged only while its fid is open")
-            .value();
+            .expect("a write is staged only while its fid is open");
         let end = self.round_end();
         let mut at = self.staged_from;
         self.frames.clear();
@@ -2188,7 +2312,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<'_, Transport
     /// Sends this round's frames in order, each under a tag of its own,
     /// and checks that the host took every byte of each.
     async fn send_round(&mut self) -> Result<(), HostFsError> {
-        let client = self.client;
+        let client = &self.client;
         for mut frame in self.frames.drain(..) {
             let count = frame.len() - P9_TWRITE_HEADER_LEN;
             let tag = client.inner.tags.allocate()?;
@@ -2211,9 +2335,9 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<'_, Transport
     /// bytes that landed — all of them, or none for a failed write.
     async fn finish(&mut self, landed_all: bool) {
         if let Some(fid) = self.fid.take() {
-            self.client.clunk(fid).await;
+            self.client.clunk_value(fid).await;
         }
-        self.client.invalidate_contents(self.path).await;
+        self.client.invalidate_contents(&self.path).await;
         if let Some(started) = self.started {
             let bytes = if landed_all { self.len } else { 0 };
             self.client.record_phase(self.phase, started, 1, bytes);
@@ -2221,10 +2345,10 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsWrite<'_, Transport
     }
 }
 
-impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostWrite
-    for HostFsWrite<'a, Transport, CpuImpl>
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostWrite
+    for HostFsWrite<Transport, CpuImpl>
 {
-    type Filled = FilledHostFsWrite<'a, Transport, CpuImpl>;
+    type Filled = FilledHostFsWrite<Transport, CpuImpl>;
 
     fn staged_len(&self) -> usize {
         self.round_end() - self.staged_from
@@ -2244,10 +2368,10 @@ impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostWrite
     }
 }
 
-impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
-    for FilledHostFsWrite<'a, Transport, CpuImpl>
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
+    for FilledHostFsWrite<Transport, CpuImpl>
 {
-    type Next = HostFsWrite<'a, Transport, CpuImpl>;
+    type Next = HostFsWrite<Transport, CpuImpl>;
 
     async fn submit(self) -> Result<WriteProgress<Self::Next>, HostFsError> {
         let mut write = self.write;
@@ -2258,7 +2382,10 @@ impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
         write.staged_from = write.round_end();
         if write.staged_from == write.len {
             write.finish(true).await;
-            return Ok(WriteProgress::Done(write.landed));
+            return Ok(WriteProgress::Done(Landed {
+                offset: write.landed,
+                len: write.len,
+            }));
         }
         write.stage_round();
         Ok(WriteProgress::More(write))
@@ -2269,15 +2396,13 @@ impl<'a, Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFilledWrite
 /// with the vector that holds them, and its fid to the server through
 /// the abandoned list. The caches forget the file: a round may have
 /// landed, in whole or, if a submit was dropped part way, in part.
-impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> Drop
-    for HostFsWrite<'_, Transport, CpuImpl>
-{
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> Drop for HostFsWrite<Transport, CpuImpl> {
     fn drop(&mut self) {
         let Some(fid) = self.fid.take() else {
             return;
         };
-        self.client.abandon_fid(fid.retain());
-        if let Some(orphaned) = self.client.inner.cache.invalidate_contents(self.path) {
+        self.client.abandon_fid(fid);
+        if let Some(orphaned) = self.client.inner.cache.invalidate_contents(&self.path) {
             self.client.abandon_fid(orphaned);
         }
     }
@@ -2447,6 +2572,30 @@ fn read_string(buf: &[u8], cursor: &mut usize) -> Result<String, HostFsError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| HostFsError::Utf8)
 }
 
+/// The kind a `Treaddir` entry names, or `None` when the host does not say.
+///
+/// The qid type decides a directory or symbolic link; every other kind is
+/// the dirent's `d_type` (`DT_*` in Linux's `include/linux/fs_dtype.h`),
+/// where `DT_UNKNOWN` leaves the caller to ask for the entry's attributes.
+fn dirent_kind(qid_type: u8, d_type: u8) -> Option<NodeKind> {
+    if qid_type & P9_QTDIR != 0 {
+        return Some(NodeKind::Directory);
+    }
+    if qid_type & P9_QTSYMLINK != 0 {
+        return Some(NodeKind::Symlink);
+    }
+    match d_type {
+        1 => Some(NodeKind::Fifo),
+        2 => Some(NodeKind::CharacterDevice),
+        4 => Some(NodeKind::Directory),
+        6 => Some(NodeKind::BlockDevice),
+        8 => Some(NodeKind::File),
+        10 => Some(NodeKind::Symlink),
+        12 => Some(NodeKind::Socket),
+        _ => None,
+    }
+}
+
 /// Decodes an `Rgetattr` reply into the kernel's host metadata type.
 ///
 /// `st_dev`/`st_ino` identity comes from the qid path within the host-share
@@ -2456,7 +2605,10 @@ fn parse_getattr_reply(response: &[u8]) -> Result<HostMetadata, HostFsError> {
     let qid_type = read_u8(response, P9_RGETATTR_QID_TYPE)?;
     let qid_path = read_u64_le(response, P9_RGETATTR_QID_PATH)?;
     let mode = read_u32_le(response, P9_RGETATTR_MODE)?;
+    let uid = read_u32_le(response, P9_RGETATTR_UID)?;
+    let gid = read_u32_le(response, P9_RGETATTR_GID)?;
     let link_count = read_u64_le(response, P9_RGETATTR_NLINK)?;
+    let rdev = read_u64_le(response, P9_RGETATTR_RDEV)?;
     let size = read_u64_le(response, P9_RGETATTR_SIZE)?;
     let access_nanos = read_p9_timestamp(response, P9_RGETATTR_ATIME_SECONDS)?;
     let modified_nanos = read_p9_timestamp(response, P9_RGETATTR_MTIME_SECONDS)?;
@@ -2466,6 +2618,9 @@ fn parse_getattr_reply(response: &[u8]) -> Result<HostMetadata, HostFsError> {
         qid_path,
         qid_type,
         mode,
+        uid,
+        gid,
+        rdev,
         size,
         link_count,
         access_nanos,
@@ -2496,9 +2651,11 @@ fn append_read_payload(response: &[u8], output: &mut Vec<u8>) -> Result<usize, H
 mod tests {
     use super::wire_string::max_string_len;
     use super::*;
+    use crate::HostShare;
     use crate::test_support::ManualClockCpu;
     use core::pin::pin;
     use futures_lite::future::{block_on, poll_once, zip};
+    use helios_hal::fs::{DirCookie, DirStream, FileSystem, FsError, FsPath, OpenFlags};
 
     #[test]
     fn p9_setattr_times_uses_specific_timestamp_flags() {
@@ -2624,12 +2781,19 @@ mod tests {
 
     #[test]
     fn getattr_reply_reports_directory_qid_type() {
-        let reply = rgetattr_reply(P9_QTDIR, 7, 0o040_755, 2, 0, RgetattrTimes::ZERO);
+        let mut reply = rgetattr_reply(P9_QTDIR, 7, 0o040_755, 2, 0, RgetattrTimes::ZERO);
+        reply[P9_RGETATTR_UID..P9_RGETATTR_UID + 4].copy_from_slice(&1000_u32.to_le_bytes());
+        reply[P9_RGETATTR_GID..P9_RGETATTR_GID + 4].copy_from_slice(&100_u32.to_le_bytes());
+        reply[P9_RGETATTR_RDEV..P9_RGETATTR_RDEV + 8].copy_from_slice(&0x103_u64.to_le_bytes());
 
         let metadata = parse_getattr_reply(&reply).expect("Rgetattr reply should decode");
 
         assert_eq!(metadata.qid_type & P9_QTDIR, P9_QTDIR);
         assert_eq!(metadata.identity.local(), 7);
+        assert_eq!(
+            (metadata.mode, metadata.uid, metadata.gid, metadata.rdev),
+            (0o040_755, 1000, 100, 0x103)
+        );
     }
 
     #[test]
@@ -2665,6 +2829,8 @@ mod tests {
         readdir: ReaddirFault,
         /// Answer every `Twalk` past this many with `Rlerror`.
         refuse_walks_after: Option<usize>,
+        /// The `mode` every `Rgetattr` carries, a regular file's when absent.
+        getattr_mode: Option<u32>,
     }
 
     /// A misbehaving answer to `Treaddir`.
@@ -2678,7 +2844,24 @@ mod tests {
         /// A fresh one-entry batch every time, with offsets that rise, so
         /// the directory never ends.
         Endless,
+        /// [`MIXED_DIRECTORY`], once, then the end of the directory.
+        Mixed,
     }
+
+    /// `(dirent type, name)` of every entry [`ReaddirFault::Mixed`] lists:
+    /// a FIFO, a character device, a block device, a socket, a regular
+    /// file, an entry whose type the host leaves unknown, a directory and
+    /// a symbolic link.
+    const MIXED_DIRECTORY: [(u8, &str); 8] = [
+        (1, "fifo"),
+        (2, "tty"),
+        (6, "disk"),
+        (12, "sock"),
+        (8, "file"),
+        (0, "unknown"),
+        (4, "dir"),
+        (10, "link"),
+    ];
 
     /// A limit far above anything the happy-path tests list.
     const TEST_DIR_LIMIT: HostDirLimit = HostDirLimit {
@@ -2688,10 +2871,15 @@ mod tests {
 
     /// One `Treaddir` entry: qid, offset, type, name.
     fn dirent(offset: u64, name: &str) -> Vec<u8> {
+        typed_dirent(offset, 8, name) // DT_REG
+    }
+
+    /// One `Treaddir` entry of dirent type `d_type`.
+    fn typed_dirent(offset: u64, d_type: u8, name: &str) -> Vec<u8> {
         let mut entry = Vec::new();
         entry.extend_from_slice(&qid(0, offset));
         entry.extend_from_slice(&offset.to_le_bytes());
-        entry.push(8); // DT_REG
+        entry.push(d_type);
         entry.extend_from_slice(&(name.len() as u16).to_le_bytes());
         entry.extend_from_slice(name.as_bytes());
         entry
@@ -2723,6 +2911,8 @@ mod tests {
         walk_requests: Vec<(u32, u32, u16)>,
         /// `(fid, offset, payload)` of every `Twrite`, in arrival order.
         writes: Vec<(u32, u64, Vec<u8>)>,
+        /// The type and body of every `Tlcreate`, `Tmkdir` and `Tsymlink`.
+        creations: Vec<(u8, Vec<u8>)>,
     }
 
     impl ServerLog {
@@ -2798,6 +2988,9 @@ mod tests {
                 // is answered, so a request the fault injector refuses
                 // still shows up as one the client chose to send.
                 log.record(ty);
+                if matches!(ty, P9_TLCREATE | P9_TMKDIR | P9_TSYMLINK) {
+                    log.creations.push((ty, body.to_vec()));
+                }
             }
 
             let reply_tag = if self.inner.fault.corrupt_tag {
@@ -2843,7 +3036,8 @@ mod tests {
                     reply.extend_from_slice(&0_u32.to_le_bytes());
                 }
                 P9_TGETATTR => {
-                    reply.extend_from_slice(&rgetattr_body(FILE_CONTENT_LEN as u64));
+                    let mode = self.inner.fault.getattr_mode.unwrap_or(0o100_644);
+                    reply.extend_from_slice(&rgetattr_body(FILE_CONTENT_LEN as u64, mode));
                 }
                 P9_TREAD => {
                     let offset = u64::from_le_bytes([
@@ -2879,6 +3073,23 @@ mod tests {
                     ReaddirFault::None => reply.extend_from_slice(&0_u32.to_le_bytes()),
                     ReaddirFault::RepeatBatch => {
                         reply.extend_from_slice(&readdir_body(&dirent(7, "same")));
+                    }
+                    ReaddirFault::Mixed => {
+                        let asked = u64::from_le_bytes([
+                            body[4], body[5], body[6], body[7], body[8], body[9], body[10],
+                            body[11],
+                        ]);
+                        let mut entries = Vec::new();
+                        if asked == 0 {
+                            for (index, (d_type, name)) in MIXED_DIRECTORY.iter().enumerate() {
+                                entries.extend_from_slice(&typed_dirent(
+                                    index as u64 + 1,
+                                    *d_type,
+                                    name,
+                                ));
+                            }
+                        }
+                        reply.extend_from_slice(&readdir_body(&entries));
                     }
                     ReaddirFault::Endless => {
                         let offset = u64::from_le_bytes([
@@ -2959,8 +3170,8 @@ mod tests {
     }
 
     /// The `Rgetattr` body, i.e. the reply without its 7-byte header.
-    fn rgetattr_body(size: u64) -> Vec<u8> {
-        let reply = rgetattr_reply(0, 2, 0o100_644, 1, size, RgetattrTimes::ZERO);
+    fn rgetattr_body(size: u64, mode: u32) -> Vec<u8> {
+        let reply = rgetattr_reply(0, 2, mode, 1, size, RgetattrTimes::ZERO);
         reply[P9_HEADER_LEN..].to_vec()
     }
 
@@ -3113,7 +3324,10 @@ mod tests {
             });
             match filled.submit().await? {
                 WriteProgress::More(next) => write = next,
-                WriteProgress::Done(landed) => return Ok((landed, rounds)),
+                WriteProgress::Done(landed) => {
+                    assert_eq!(landed.len, bytes.len());
+                    return Ok((landed.offset, rounds));
+                }
             }
         }
     }
@@ -3204,7 +3418,13 @@ mod tests {
         ))
         .expect("write");
 
-        assert_eq!(landed, 0);
+        assert_eq!(
+            landed,
+            Landed {
+                offset: 0,
+                len: bytes.len()
+            }
+        );
         assert_eq!(regions, [(0, chunk), (chunk, chunk), (chunk * 2, 3)]);
         let sent: Vec<u8> = transport
             .log()
@@ -3283,11 +3503,7 @@ mod tests {
                 .prepare_write("/alpha", WritePosition::At(0), 4)
                 .await
                 .expect("prepare");
-            let fid = staged
-                .fid
-                .as_ref()
-                .expect("a staged write holds its fid")
-                .value();
+            let fid = *staged.fid.as_ref().expect("a staged write holds its fid");
             drop(staged.fill(|_, destination| destination.fill(b'z')));
             assert_eq!(
                 client.inner.fids.live_count(),
@@ -3319,11 +3535,7 @@ mod tests {
                 .prepare_write("/alpha", WritePosition::End, 4)
                 .await
                 .expect("prepare");
-            let fid = staged
-                .fid
-                .as_ref()
-                .expect("a staged write holds its fid")
-                .value();
+            let fid = *staged.fid.as_ref().expect("a staged write holds its fid");
             drop(staged);
             client.prepare_snapshot().await;
             assert!(transport.log().clunked.contains(&fid));
@@ -3459,16 +3671,16 @@ mod tests {
         // The name of a created file, a walked component, both names of
         // a rename and a symlink's target are all string fields.
         let results = [
-            block_on(client.create_file_impl(&alloc::format!("/dir/{too_long}"))),
-            block_on(client.create_directory_impl(&alloc::format!("/{too_long}"))),
+            block_on(client.create_file_impl(&alloc::format!("/dir/{too_long}"), CREATION)),
+            block_on(client.create_directory_impl(&alloc::format!("/{too_long}"), CREATION)),
             block_on(client.remove_impl(&alloc::format!("/{too_long}"), false)),
             block_on(client.stat_path_impl(&alloc::format!("/dir/{too_long}/leaf"))).map(|_| ()),
             block_on(client.rename_impl("/a", &alloc::format!("/{too_long}"))),
             block_on(client.rename_impl(&alloc::format!("/{too_long}/b"), "/a")),
             block_on(client.hard_link_impl("/a", &alloc::format!("/{too_long}"))),
             block_on(client.hard_link_impl(&alloc::format!("/{too_long}"), "/a")),
-            block_on(client.symlink_impl(&too_long, "/link")),
-            block_on(client.symlink_impl("/target", &alloc::format!("/{too_long}"))),
+            block_on(client.symlink_impl(&too_long, "/link", CREATION.gid)),
+            block_on(client.symlink_impl("/target", &alloc::format!("/{too_long}"), CREATION.gid)),
         ];
         for result in results {
             let error = result.expect_err("a 65536-byte name cannot be encoded");
@@ -3493,9 +3705,61 @@ mod tests {
         assert_eq!(client.inner.fids.live_count(), 1);
 
         // The longest name the format holds is still carried.
-        block_on(client.create_file_impl(&alloc::format!("/dir/{longest}")))
+        block_on(client.create_file_impl(&alloc::format!("/dir/{longest}"), CREATION))
             .expect("a 65535-byte name fits");
         assert!(transport.log().types.contains(&P9_TLCREATE));
+    }
+
+    /// The mode and group a creation is made with, as the parent's
+    /// inheritance gives them; the owner is the server's.
+    const CREATION: HostCreation = HostCreation {
+        permissions: 0o664,
+        gid: 1000,
+    };
+
+    #[test]
+    fn a_creation_carries_its_mode_and_group_to_the_host() {
+        let client = client(P9_REQUESTED_MSIZE, FakeFault::default());
+        let transport = client.inner.transport.clone();
+        let file = HostCreation {
+            permissions: 0o640,
+            gid: 100,
+        };
+        let directory = HostCreation {
+            permissions: 0o2775,
+            gid: 100,
+        };
+        block_on(async {
+            client
+                .create_file_impl("/中文/日本語のファイル", file)
+                .await
+                .expect("the file is created");
+            client
+                .create_directory_impl("/中文/한국어디렉터리", directory)
+                .await
+                .expect("the directory is created");
+            client
+                .symlink_impl("日本語のファイル", "/中文/링크", 100)
+                .await
+                .expect("the link is created");
+        });
+        let creations = transport.log().creations.clone();
+        let tail = |body: &[u8], words: usize| -> Vec<u32> {
+            body[body.len() - 4 * words..]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
+                .collect()
+        };
+        let types: Vec<u8> = creations.iter().map(|(ty, _)| *ty).collect();
+        assert_eq!(types, [P9_TLCREATE, P9_TMKDIR, P9_TSYMLINK]);
+        // Tlcreate: fid name[s] flags[4] mode[4] gid[4].
+        assert_eq!(tail(&creations[0].1, 3), [P9_DOTL_WRONLY, 0o640, 100]);
+        // Tmkdir: dfid name[s] mode[4] gid[4].
+        assert_eq!(tail(&creations[1].1, 2), [0o2775, 100]);
+        // Tsymlink: fid name[s] symtgt[s] gid[4].
+        assert_eq!(tail(&creations[2].1, 1), [100]);
     }
 
     #[test]
@@ -3504,16 +3768,17 @@ mod tests {
         let transport = client.inner.transport.clone();
         let longest = usize::from(max_string_len(P9_MIN_MSIZE));
 
-        let error =
-            block_on(client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest + 1))))
-                .expect_err("the request would not fit the msize");
+        let error = block_on(
+            client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest + 1)), CREATION),
+        )
+        .expect_err("the request would not fit the msize");
         assert!(
             matches!(error, HostFsError::NameTooLong { len, max_len } if len == longest + 1 && max_len == longest),
             "{error:?}"
         );
         assert!(!transport.log().types.contains(&P9_TLCREATE));
 
-        block_on(client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest))))
+        block_on(client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest)), CREATION))
             .expect("the longest name the msize allows is carried");
         assert!(transport.log().types.contains(&P9_TLCREATE));
     }
@@ -4079,7 +4344,7 @@ mod tests {
                 .await
                 .expect("first listing");
             client
-                .create_file_impl("/alpha/beta")
+                .create_file_impl("/alpha/beta", CREATION)
                 .await
                 .expect("create the file");
             client
@@ -4319,5 +4584,180 @@ mod tests {
             1,
             "the failed operation is counted too"
         );
+    }
+
+    /// `st_mode` file type bits of each object the host can report.
+    const S_IFSOCK: u32 = 0o140_000;
+    const S_IFLNK: u32 = 0o120_000;
+    const S_IFREG: u32 = 0o100_000;
+    const S_IFBLK: u32 = 0o060_000;
+    const S_IFDIR: u32 = 0o040_000;
+    const S_IFCHR: u32 = 0o020_000;
+    const S_IFIFO: u32 = 0o010_000;
+
+    fn share_over(
+        mode: u32,
+    ) -> (
+        HostShare<HostFsClient<FakeTransport, ManualClockCpu>>,
+        FakeTransport,
+    ) {
+        let Fixture {
+            client, transport, ..
+        } = fixture(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                getattr_mode: Some(mode | 0o644),
+                ..FakeFault::default()
+            },
+        );
+        (HostShare::new(client), transport)
+    }
+
+    fn share_path(path: &str) -> FsPath<'_> {
+        FsPath::new(path).expect("a relative path")
+    }
+
+    /// Whatever the host's `getattr` says an object is, the share reports
+    /// that kind, and every way of opening a device, FIFO, socket or
+    /// symbolic link for its data is refused before a `Tlopen` or a
+    /// `Twrite` leaves the guest.
+    #[test]
+    fn a_host_object_reports_its_mode_kind_and_is_never_opened_when_report_only() {
+        let cases = [
+            (
+                S_IFCHR,
+                NodeKind::CharacterDevice,
+                Some(FsError::NotPermitted),
+            ),
+            (S_IFBLK, NodeKind::BlockDevice, Some(FsError::NotPermitted)),
+            (S_IFIFO, NodeKind::Fifo, Some(FsError::Unsupported)),
+            (S_IFSOCK, NodeKind::Socket, Some(FsError::Unsupported)),
+            (S_IFLNK, NodeKind::Symlink, Some(FsError::Loop)),
+            (S_IFREG, NodeKind::File, None),
+            (S_IFDIR, NodeKind::Directory, None),
+        ];
+        for (mode, kind, refusal) in cases {
+            let (share, _) = share_over(mode);
+            let path = share_path("node");
+
+            let metadata = block_on(share.stat(path)).expect("stat reports the kind");
+            assert_eq!(metadata.kind, kind, "mode {mode:o}");
+
+            // The path-level open answers for symlinks, which resolution
+            // follows; the report-only kinds are refused.
+            let opened = block_on(share.open(path, OpenFlags::empty(), 0));
+            match kind.open_refusal() {
+                Some(refusal) => assert_eq!(opened.map(|_| ()), Err(refusal), "mode {mode:o}"),
+                None => assert_eq!(opened.expect("opens").metadata.kind, kind),
+            }
+
+            let Some(refusal) = refusal else {
+                continue;
+            };
+            // A share that never statted the node asks the host itself.
+            let (share, transport) = share_over(mode);
+            assert_eq!(
+                block_on(share.read_at(path, 0, 16)).map(|_| ()),
+                Err(refusal),
+                "read of mode {mode:o}"
+            );
+            assert_eq!(
+                block_on(share.prepare_write(path, WritePosition::At(0), 4, 0)).err(),
+                Some(refusal),
+                "write of mode {mode:o}"
+            );
+            assert_eq!(
+                block_on(share.prepare_write(path, WritePosition::End, 4, 0)).err(),
+                Some(refusal),
+                "append of mode {mode:o}"
+            );
+            assert_eq!(
+                block_on(share.sync(path)),
+                Err(refusal),
+                "sync of mode {mode:o}"
+            );
+            let log = transport.log();
+            assert_eq!(log.opens, 0, "no Tlopen for mode {mode:o}");
+            assert!(
+                !log.types.contains(&P9_TWRITE) && !log.types.contains(&P9_TREAD),
+                "no data request for mode {mode:o}"
+            );
+        }
+    }
+
+    /// A regular file is still opened, so the refusals above are not
+    /// the check refusing everything.
+    #[test]
+    fn a_regular_host_file_is_still_opened_and_read() {
+        let (share, transport) = share_over(S_IFREG);
+
+        let bytes = block_on(share.read_at(share_path("file"), 0, 16)).expect("reads");
+
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(transport.log().opens, 1);
+    }
+
+    /// A listing names each entry's kind from the dirent type, resolves
+    /// the one the host leaves unknown from its attributes, and a
+    /// directory holding a device node is listable.
+    #[test]
+    fn a_host_listing_names_devices_fifos_sockets_and_symlinks() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                readdir: ReaddirFault::Mixed,
+                ..FakeFault::default()
+            },
+        );
+        let share = HostShare::new(client);
+
+        let dir = block_on(share.open_dir(FsPath::ROOT)).expect("the directory opens");
+        let entries = block_on(dir.read(DirCookie::new(0), 64)).expect("the directory lists");
+
+        let listed: Vec<(&str, NodeKind)> = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.kind))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("fifo", NodeKind::Fifo),
+                ("tty", NodeKind::CharacterDevice),
+                ("disk", NodeKind::BlockDevice),
+                ("sock", NodeKind::Socket),
+                ("file", NodeKind::File),
+                // Resolved by `Tgetattr`: the fake answers a regular file.
+                ("unknown", NodeKind::File),
+                ("dir", NodeKind::Directory),
+                ("link", NodeKind::Symlink),
+            ]
+        );
+        assert_eq!(
+            transport.log().opens,
+            1,
+            "only the directory itself is opened"
+        );
+    }
+
+    #[test]
+    fn a_getattr_mode_without_a_file_type_is_a_protocol_error() {
+        let (share, _transport) = share_over(0);
+
+        let error = block_on(share.stat(share_path("node"))).expect_err("no file type");
+
+        assert_eq!(error, FsError::Io);
+    }
+
+    /// The directory-entry operations still work on a report-only node:
+    /// nothing opens it.
+    #[test]
+    fn unlinking_a_host_device_node_sends_no_open() {
+        let (share, transport) = share_over(S_IFCHR);
+
+        block_on(share.unlink(share_path("tty"), 0)).expect("unlink works on the entry");
+
+        assert_eq!(transport.log().opens, 0);
     }
 }

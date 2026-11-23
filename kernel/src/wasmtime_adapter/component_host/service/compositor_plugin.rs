@@ -5,7 +5,7 @@
 //! This module is what sits on the other end of that slot: it
 //! instantiates `bin/compositor` — an ordinary user-mode wasm component,
 //! with the ordinary isolation model — in its own store, calls the
-//! plugin's `helios:system/compositor.run` as a task of that store, and
+//! plugin's `helios:system/compositor.desktop.run` as a task of that store, and
 //! serves the surface calls concurrently with it.
 //!
 //! # Lifecycle
@@ -61,7 +61,7 @@ use crate::wasmtime_adapter::bindings::compositor::bindings::{CompositorHost, ex
 use crate::wasmtime_adapter::component_host::{guest_memory, view_trap};
 use crate::{DeviceClassRights, ProcessAuthority, ProviderReceiver, provider_channel};
 use thiserror::Error;
-use wasmtime::component::{Accessor, AccessorTask, HasSelf, ResourceTable};
+use wasmtime::component::{Accessor, ResourceAny};
 
 /// Bootfs path of the plugin. Absent on a kernel image built without it,
 /// in which case `helios:system/surface` reports `unavailable`.
@@ -229,46 +229,23 @@ where
     let started_at = exec_context
         .runtime_state
         .uptime_nanos(exec_context.cpu.now().ticks());
-    let instance = exec_context.instance_registry.register_with_policy(
-        COMPOSITOR_PLUGIN_INSTANCE_NAME,
-        started_at,
-        crate::OomPolicy::KernelPlugin,
-    );
-    let instance_id = instance.id();
-
-    let payload = trusted_bootfs_payload(artifact);
-    let instance_pre = service.load_precompiled_component(
+    let instance_pre = load_kernel_plugin_instance_pre(
+        service,
         COMPOSITOR_PLUGIN_PATH,
-        payload,
+        artifact,
         exec_context.write_serial,
         started_at,
-        &phases::Timeline::disabled(),
     )?;
 
-    let (mut store, interrupts) = crate::wasmtime_adapter::store_with_state(
-        &service.inner.engine,
-        StoreData::<CpuImpl, Net, StorageImpl>::new(
-            ResourceTable::new(),
-            exec_context.cpu.clone(),
-            exec_context.timer.clone(),
-            // A kernel plugin is kernel infrastructure: its tasks come
-            // out of the arena's kernel reserve, so user-mode load
-            // cannot starve the desktop.
-            exec_context
-                .spawner
-                .instance_spawner(crate::TaskFunding::Kernel),
-            exec_context.runtime_state.clone(),
-            exec_context.instance_registry.clone(),
-            instance,
-            None,
-            exec_context.runtime_state.root_namespace().descend(),
-            alloc::vec![String::from(COMPOSITOR_PLUGIN_PATH)],
-            Vec::new(),
-            compositor_authority(),
-            OutputMode::Serial,
-            exec_context.read_serial,
-            exec_context.write_serial,
-        ),
+    let (mut store, interrupts, instance_id) = open_kernel_plugin_store(
+        service,
+        exec_context,
+        KernelPluginSpec {
+            instance_name: COMPOSITOR_PLUGIN_INSTANCE_NAME,
+            bootfs_path: COMPOSITOR_PLUGIN_PATH,
+            authority: compositor_authority(),
+            started_at,
+        },
     );
 
     let turns = store.data().guest_turns();
@@ -276,11 +253,14 @@ where
         .drive(turns.drive(instance_pre.instantiate_async(&mut store)))
         .await
         .map_err(map_program_runtime_error)?;
-    crate::wasmtime_adapter::component_host::record_linear_memory(&mut store, &wasm_instance);
+    // The memory a span the compositor *returns* from `create` is in. It
+    // is no host call's caller, so it is not the call's memory but the
+    // instance's: a compositor that lowers through more than one memory,
+    // or a shared one, has none, and every window it answers is refused.
+    let memory = wasm_instance.get_default_memory(&mut store);
     let host =
         CompositorHost::new(&mut store, &wasm_instance).map_err(map_program_runtime_error)?;
     let guest = host.helios_system_compositor().clone();
-
     let registry = exec_context.runtime_state.surface_service();
     // From here on this instance is the compositor: it is the one that
     // may `deliver` input to somebody else's window, and the one whose
@@ -297,19 +277,34 @@ where
     let turns = store.data().guest_turns();
     interrupts
         .drive(turns.drive(store.run_concurrent(async move |accessor| {
+            let desktop = guest.desktop().call_constructor(accessor).await?;
             // The desktop itself, as a task of this store, so the calls
             // into it are not queued behind it.
-            accessor.spawn(RunDesktop {
-                guest: guest.clone(),
-                _marker: core::marker::PhantomData,
+            let run_guest = guest.clone();
+            accessor.spawn(async move |accessor| {
+                run_desktop::<CpuImpl, Net, StorageImpl>(accessor, run_guest, desktop).await
             })?;
-            accessor.spawn(DrainReturnedSurfaces {
-                guest: guest.clone(),
-                registry: serve_registry.clone(),
-                _marker: core::marker::PhantomData,
+            let drain_guest = guest.clone();
+            let drain_registry = serve_registry.clone();
+            accessor.spawn(async move |accessor| {
+                drain_returned_surfaces::<CpuImpl, Net, StorageImpl>(
+                    accessor,
+                    drain_guest,
+                    desktop,
+                    drain_registry,
+                )
+                .await
             })?;
             while let Some(request) = receiver.recv().await {
-                serve_request(accessor, &serve_guest, &serve_registry, request).await?;
+                serve_request(
+                    accessor,
+                    &serve_guest,
+                    desktop,
+                    memory,
+                    &serve_registry,
+                    request,
+                )
+                .await?;
             }
             Ok::<(), wasmtime::Error>(())
         })))
@@ -318,10 +313,13 @@ where
         .map_err(map_program_runtime_error)
 }
 
-/// Serve one surface call against the live compositor.
+/// Serve one surface call against the live compositor, whose spans are in
+/// `memory`.
 async fn serve_request<CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
+    desktop: ResourceAny,
+    memory: Option<wasmtime::Memory>,
     registry: &SurfaceService,
     request: SurfaceRequest,
 ) -> wasmtime::Result<()>
@@ -331,11 +329,72 @@ where
     StorageImpl: crate::Storage,
 {
     match request {
-        SurfaceRequest::Create(create) => serve_create(accessor, guest, registry, create).await,
+        SurfaceRequest::CreateImage(create) => {
+            let SurfaceCreate {
+                id,
+                geometry,
+                reply,
+                ..
+            } = create;
+            if registry.lookup(id).is_none() {
+                let _ = reply.send(Err(SurfaceServiceError::Gone));
+                return Ok(());
+            }
+            let answer = guest
+                .desktop()
+                .call_create_image(
+                    accessor,
+                    desktop,
+                    id.raw(),
+                    exports::helios::system::compositor::Rect {
+                        x: 0,
+                        y: 0,
+                        width: geometry.width,
+                        height: geometry.height,
+                    },
+                )
+                .await?;
+            if registry.lookup(id).is_none() {
+                guest
+                    .desktop()
+                    .call_destroy(accessor, desktop, id.raw())
+                    .await?;
+                let _ = reply.send(Err(SurfaceServiceError::Gone));
+            } else {
+                let _ = reply.send(answer.map_err(from_guest_error));
+            }
+            Ok(())
+        }
+        SurfaceRequest::PresentImage {
+            id,
+            image,
+            retired,
+            reply,
+        } => {
+            if registry.lookup(id).is_none() {
+                let _ = reply.send(Err(SurfaceServiceError::Gone));
+                return Ok(());
+            }
+            let (image, retired) = accessor.with(|mut access| {
+                let data = access.get();
+                Ok::<_, wasmtime::Error>((data.table.push(image)?, data.table.push(retired)?))
+            })?;
+            let answer = guest
+                .desktop()
+                .call_present_image(accessor, desktop, id.raw(), image, retired)
+                .await?;
+            let _ = reply.send(answer.map_err(from_guest_error));
+            Ok(())
+        }
+        SurfaceRequest::Create(create) => {
+            serve_create(accessor, guest, desktop, memory, registry, create).await
+        }
         SurfaceRequest::Commit { id, region, reply } => {
             let answer = guest
+                .desktop()
                 .call_commit(
                     accessor,
+                    desktop,
                     id.raw(),
                     exports::helios::system::compositor::Rect {
                         x: region.x,
@@ -357,10 +416,12 @@ where
 /// The compositor names the span, so it is told about the window before
 /// the buffer is shown; the interface promises it no `commit` for the
 /// window before the buffer is there, and this task serves the commit
-/// queue, so none is served in between.
+/// queue, so none is served in between. The span is in `memory`.
 async fn serve_create<CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
+    desktop: ResourceAny,
+    memory: Option<wasmtime::Memory>,
     registry: &SurfaceService,
     create: SurfaceCreate,
 ) -> wasmtime::Result<()>
@@ -384,8 +445,10 @@ where
     }
 
     let answer = guest
+        .desktop()
         .call_create(
             accessor,
+            desktop,
             id.raw(),
             exports::helios::system::compositor::Rect {
                 x: 0,
@@ -412,8 +475,7 @@ where
         if registry.lookup(id).is_none() {
             return Err(SurfaceServiceError::Gone);
         }
-        let linear_memory = access.get().linear_memory;
-        let memory = guest_memory(linear_memory, &access)?;
+        let memory = guest_memory(memory, &access)?;
         let data = access.get();
         data.device
             .surfaces_mut()
@@ -426,7 +488,10 @@ where
         // told here, whatever the drain did: nothing was shown at its
         // span, and a destroy for a window it already let go does
         // nothing.
-        guest.call_destroy(accessor, id.raw()).await?;
+        guest
+            .desktop()
+            .call_destroy(accessor, desktop, id.raw())
+            .await?;
         let _ = reply.send(Err(SurfaceServiceError::Gone));
         return Ok(());
     }
@@ -441,7 +506,10 @@ where
             %error,
             "the compositor answered create with a span the window cannot be shown at"
         );
-        guest.call_destroy(accessor, id.raw()).await?;
+        guest
+            .desktop()
+            .call_destroy(accessor, desktop, id.raw())
+            .await?;
         let _ = reply.send(Err(error));
         return Ok(());
     }
@@ -457,6 +525,7 @@ where
 async fn destroy_surface<CpuImpl, Net, StorageImpl>(
     accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: &exports::helios::system::compositor::Guest,
+    desktop: ResourceAny,
     id: SurfaceId,
 ) -> wasmtime::Result<()>
 where
@@ -470,7 +539,10 @@ where
             data.device.surfaces_mut().end_view(id, &mut data.views)
         })
         .map_err(view_trap)?;
-    guest.call_destroy(accessor, id.raw()).await?;
+    guest
+        .desktop()
+        .call_destroy(accessor, desktop, id.raw())
+        .await?;
     Ok(())
 }
 
@@ -480,6 +552,7 @@ const fn from_guest_error(
 ) -> SurfaceServiceError {
     use exports::helios::system::compositor::Error as GuestError;
     match error {
+        GuestError::RenderFailed => SurfaceServiceError::RenderFailed,
         GuestError::Unavailable => SurfaceServiceError::Unavailable,
         GuestError::NoCompositor => SurfaceServiceError::NoCompositor,
         GuestError::UnsupportedSize => SurfaceServiceError::UnsupportedSize,
@@ -492,88 +565,62 @@ const fn from_guest_error(
     }
 }
 
-/// The store's type parameters, carried by a task that names them
-/// without holding a value of any of them.
-type StoreTypeMarker<CpuImpl, Net, StorageImpl> =
-    core::marker::PhantomData<fn() -> (CpuImpl, Net, StorageImpl)>;
-
-/// The desktop itself: one `helios:system/compositor.run` that lasts as
+/// The desktop itself: one `helios:system/compositor.desktop.run` that lasts as
 /// long as the instance does.
-struct RunDesktop<CpuImpl, Net, StorageImpl> {
+async fn run_desktop<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: exports::helios::system::compositor::Guest,
-    _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
-}
-
-impl<CpuImpl, Net, StorageImpl>
-    AccessorTask<
-        StoreData<CpuImpl, Net, StorageImpl>,
-        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-    > for RunDesktop<CpuImpl, Net, StorageImpl>
+    desktop: ResourceAny,
+) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn run(
-        self,
-        accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-    ) -> wasmtime::Result<()> {
-        let outcome = self.guest.call_run(accessor).await?;
-        // A compositor that returned is a desktop that stopped, whatever
-        // it says about why. Reporting it as an error is what ends the
-        // concurrent run and hands the supervisor its rebuild.
-        Err(match outcome {
-            Ok(()) => wasmtime::Error::msg("the compositor returned from run"),
-            Err(error) => wasmtime::Error::msg(alloc::format!(
-                "the compositor gave up the desktop: {:?}",
-                error
-            )),
-        })
-    }
+    let outcome = guest.desktop().call_run(accessor, desktop).await?;
+    // A compositor that returned is a desktop that stopped, whatever
+    // it says about why. Reporting it as an error is what ends the
+    // concurrent run and hands the supervisor its rebuild.
+    Err(match outcome {
+        Ok(()) => wasmtime::Error::msg("the compositor returned from run"),
+        Err(error) => wasmtime::Error::msg(alloc::format!(
+            "the compositor gave up the desktop: {:?}",
+            error
+        )),
+    })
 }
 
 /// The drain that takes back every window a client let go: the windows
 /// of a client that died, a window a client dropped, and a window whose
 /// `create` its client stopped waiting for.
-struct DrainReturnedSurfaces<CpuImpl, Net, StorageImpl> {
+async fn drain_returned_surfaces<CpuImpl, Net, StorageImpl>(
+    accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
     guest: exports::helios::system::compositor::Guest,
+    desktop: ResourceAny,
     registry: SurfaceService,
-    _marker: StoreTypeMarker<CpuImpl, Net, StorageImpl>,
-}
-
-impl<CpuImpl, Net, StorageImpl>
-    AccessorTask<
-        StoreData<CpuImpl, Net, StorageImpl>,
-        HasSelf<StoreData<CpuImpl, Net, StorageImpl>>,
-    > for DrainReturnedSurfaces<CpuImpl, Net, StorageImpl>
+) -> wasmtime::Result<()>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    async fn run(
-        self,
-        accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
-    ) -> wasmtime::Result<()> {
-        let registry = self.registry;
-        // Armed before the first look, and re-armed as part of every
-        // completed wait: windows handed back between a drain and a park
-        // are ones this task is owed.
-        let mut waiter = registry.returns_waiter();
-        loop {
-            for returned in registry.take_returned() {
-                // The view ends and the window goes off the desktop;
-                // the client's buffer goes back to its pool with the
-                // view's reference.
-                destroy_surface(accessor, &self.guest, returned.id()).await?;
-                // Only now does the window's slot come back. A failure
-                // above ends this task and drops the guards it still
-                // holds, which releases them the way the dead
-                // compositor's windows are.
-                returned.drained();
-            }
-            core::future::poll_fn(|cx| registry.poll_returns(cx, &mut waiter)).await;
+    // Armed before the first look, and re-armed as part of every
+    // completed wait: windows handed back between a drain and a park
+    // are ones this task is owed.
+    let mut waiter = registry.returns_waiter();
+    loop {
+        for returned in registry.take_returned() {
+            // The view ends and the window goes off the desktop;
+            // the client's buffer goes back to its pool with the
+            // view's reference.
+            destroy_surface(accessor, &guest, desktop, returned.id()).await?;
+            // Only now does the window's slot come back. A failure
+            // above ends this task and drops the guards it still
+            // holds, which releases them the way the dead
+            // compositor's windows are.
+            returned.drained();
         }
+        core::future::poll_fn(|cx| registry.poll_returns(cx, &mut waiter)).await;
     }
 }
 

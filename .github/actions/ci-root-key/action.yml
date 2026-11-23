@@ -1,0 +1,45 @@
+name: Install the CI root signing key
+description: >-
+  Writes the key CI signs boot payloads with to a file in the runner's
+  temporary directory and exports its path as `HELIOS_ROOT_SECRET_KEY`,
+  which `helios-inspector vm` and `helios-cli kernel-prebuild` read as
+  `--root-secret-key`. Every CI kernel image then embeds one public key, so
+  an image built by one job boots a payload built by another (#1023). The
+  key signs CI's payloads and nothing else; a release signs with its own
+  (`release.yml`). The file is outside the checkout and every build
+  directory, so no artifact or cache path picks it up, and its content is
+  never printed.
+inputs:
+  key:
+    description: >-
+      The repository secret `HELIOS_CI_ROOT_KEY`, the base64 of the 32 raw
+      key bytes. A composite action cannot read secrets itself, so the
+      caller passes it.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        HELIOS_CI_ROOT_KEY: ${{ inputs.key }}
+      run: |
+        set -euo pipefail
+        if [ -z "${HELIOS_CI_ROOT_KEY}" ]; then
+          echo "::error::the repository secret HELIOS_CI_ROOT_KEY is empty or not available to this run (a pull request from a fork gets no secrets); CI cannot sign its boot payloads without it"
+          exit 1
+        fi
+        key="${RUNNER_TEMP}/helios-ci-root.key"
+        # Created owner-only before a byte is written, so the key is never
+        # on disk under the runner's umask.
+        install -m 600 /dev/null "${key}"
+        if ! printf '%s' "${HELIOS_CI_ROOT_KEY}" | base64 -d > "${key}" 2>/dev/null; then
+          rm -f "${key}"
+          echo "::error::the repository secret HELIOS_CI_ROOT_KEY is not valid base64; it holds the base64 of the 32 raw key bytes"
+          exit 1
+        fi
+        if [ "$(wc -c < "${key}")" -ne 32 ]; then
+          rm -f "${key}"
+          echo "::error::the repository secret HELIOS_CI_ROOT_KEY does not decode to 32 bytes; it holds the base64 of the 32 raw key bytes"
+          exit 1
+        fi
+        echo "HELIOS_ROOT_SECRET_KEY=${key}" >> "${GITHUB_ENV}"

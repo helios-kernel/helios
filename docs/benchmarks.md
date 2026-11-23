@@ -258,7 +258,7 @@ Per cell (workload × side), `iterations` executions (11 by default):
     from both images: a missing, failed or variance-rejected cell blocks
     as incomplete paired evidence, rather than disappearing from the
     acceptance decision. Comparable rows remain in the report.
-  - **Cross-run**, against the newest `dev` report of the same lane:
+  - **Cross-run**, against the newest `main` report of the same lane:
     another job, another runner. This half blocks only when both reports
     are publishable *and* their run records name the same host CPU;
     otherwise it comments the table and enforces nothing.
@@ -443,9 +443,9 @@ that a ratio against the unsampled Linux columns is not evidence. The
 gate keeps its verdicts only between columns sampled alike. The paired
 table says both columns carried the sampler and at what period, and
 keeps its verdicts; a report whose two columns disagree is refused. The
-cross-run table compares against a `dev` report that was not sampled, so
+cross-run table compares against a `main` report that was not sampled, so
 a sampled candidate's cross-run comparison is refused, and so is an
-unsampled candidate's against a sampled `dev` report: the refusal names
+unsampled candidate's against a sampled `main` report: the refusal names
 both sides' sampling and neither blocks nor passes, while the paired
 table stands. A sampled run with no paired table has nothing the gate
 can compare and fails naming why.
@@ -719,7 +719,7 @@ Until that machine exists, the lane runs on its hosted stand-in in
 says so, and nothing blocks. The stand-in has the lane's accelerator and
 its network backend; what it cannot promise is an idle machine or a fixed
 governor. The repository variable `HELIOS_BENCH_DEDICATED=true` turns on
-the dedicated-runner runs for pushes to `dev`; tags always use the
+the dedicated-runner runs for pushes to `main`; tags always use the
 dedicated label.
 
 Every difference between the host a run is taken on and the lane it
@@ -745,7 +745,7 @@ uv run helios-bench run --lane x86-64-kvm --out-dir … --baseline-ref
 ```
 
 Given a ref, `--baseline-ref` resolves it; given none, it means the merge
-base with `dev`, the commit the branch is a change to. The suite checks
+base with `main`, the commit the branch is a change to. The suite checks
 that commit out as a git worktree, `<candidate dir>-baseline-<sha12>`,
 and times its guest against the candidate's.
 
@@ -873,9 +873,9 @@ monitor socket with both guest images already built. The inspector puts
 own under `$XDG_RUNTIME_DIR` and links it as `<runtime>/sockets`; see
 `docs/debug-serial.md`.
 
-`bench-suite.yml` runs a pull request in paired mode against the `dev`
+`bench-suite.yml` runs a pull request in paired mode against the `main`
 commit it is merged against (the first parent of the merge commit the
-run checks out, not the event's `base.sha`, which is the tip `dev` had
+run checks out, not the event's `base.sha`, which is the tip `main` had
 when the pull request was opened), and `workflow_dispatch` takes a
 `baseline_ref` input. An advisory dispatch with an explicit baseline is
 revision acceptance: it runs only `helios` and `helios_baseline`, with

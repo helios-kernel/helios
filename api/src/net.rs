@@ -1,19 +1,60 @@
 //! Async networking helpers for Helios component programs.
 
 use std::io;
+use std::string::String;
 use std::time::Duration;
 use std::vec::Vec;
 
 use crate::bindings::helios::system::net as raw;
 
 const DEFAULT_TCP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default TCP read size used by convenience readers.
 pub const DEFAULT_READ_CHUNK_BYTES: usize = 1024 * 1024;
 
 pub use crate::bindings::helios::system::net::{
-    IpAddress, Ipv4Address, Ipv6Address, PingErrorKind, PingReply, TcpErrorKind, UdpDatagram,
-    UdpErrorKind,
+    DnsError, DnsErrorKind, IpAddress, Ipv4Address, Ipv6Address, PingErrorKind, PingReply,
+    TcpErrorKind, UdpDatagram, UdpErrorKind,
 };
+
+/// Usable RFC 9460 Type 65 (`HTTPS`) service parameters resolved for an origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpsRecord {
+    /// ALPN protocol identifiers from `SvcParamKey` 1, e.g. `["h2", "h3"]`.
+    pub alpn: Vec<String>,
+    /// Alternative endpoint port from `SvcParamKey` 3, when overridden.
+    pub port: Option<u16>,
+    /// Minimum TTL across the answer chain.
+    pub ttl: Duration,
+}
+
+/// Queries RFC 9460 Type 65 (`HTTPS`) DNS records for `host:port` using the
+/// default DNS lookup timeout.
+///
+/// Returns `Ok(None)` when no usable `HTTPS` record exists (`NODATA`,
+/// `NXDOMAIN`, IP literal, or `AliasMode` `.`).
+pub async fn resolve_https(host: &str, port: u16) -> io::Result<Option<HttpsRecord>> {
+    resolve_https_timeout(host, port, DEFAULT_DNS_TIMEOUT).await
+}
+
+/// Queries RFC 9460 Type 65 (`HTTPS`) DNS records for `host:port` bounded by
+/// `timeout`.
+pub async fn resolve_https_timeout(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> io::Result<Option<HttpsRecord>> {
+    raw::resolve_https(host.to_owned(), port, duration_to_nanos(timeout))
+        .await
+        .map(|record| {
+            record.map(|record| HttpsRecord {
+                alpn: record.alpn,
+                port: record.port,
+                ttl: Duration::from_nanos(record.ttl),
+            })
+        })
+        .map_err(map_dns_error)
+}
 
 /// Outbound TCP client stream backed by the kernel network service.
 pub struct TcpStream {
@@ -198,6 +239,17 @@ fn map_udp_error(error: raw::UdpError) -> io::Error {
         UdpErrorKind::PermissionDenied => io::ErrorKind::PermissionDenied,
         UdpErrorKind::Unavailable => io::ErrorKind::ConnectionAborted,
         UdpErrorKind::Internal => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, format!("{:?}: {}", error.kind, error.detail))
+}
+
+fn map_dns_error(error: raw::DnsError) -> io::Error {
+    let kind = match error.kind {
+        DnsErrorKind::Timeout => io::ErrorKind::TimedOut,
+        DnsErrorKind::UnresolvedHost => io::ErrorKind::NotFound,
+        DnsErrorKind::PermissionDenied => io::ErrorKind::PermissionDenied,
+        DnsErrorKind::Unavailable => io::ErrorKind::ConnectionAborted,
+        DnsErrorKind::Internal => io::ErrorKind::Other,
     };
     io::Error::new(kind, format!("{:?}: {}", error.kind, error.detail))
 }

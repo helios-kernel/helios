@@ -6,22 +6,14 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-
 use helios_hal::cpu::Cpu;
 use wasmtime::ResourceLimiter;
-use wasmtime::component::ResourceTable;
-use wasmtime_wasi_io::IoView;
-use wasmtime_wasi_io::bytes::Bytes;
-use wasmtime_wasi_io::poll::Pollable;
-use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamResult};
 
-use crate::io::{ByteReader, ByteWriter};
 use crate::wasmtime_adapter::component_host::{StoreData, deliver_kill};
 use crate::{
-    ComponentHostNetwork, ComponentRuntimeState, ComponentStoreData, KernelHeapHeadroom,
-    MemoryPool, OomKillOutcome, ProgramOutOfMemory, Storage, allow_instance_resource_growth,
-    heap_stats, monotonic_nanos, user_heap_stats,
+    ComponentHostNetwork, KernelHeapHeadroom, MemoryPool, OomKillOutcome, ProgramOutOfMemory,
+    Storage, UserResidency, allow_instance_resource_growth, heap_stats, monotonic_nanos,
+    user_heap_stats,
 };
 
 impl<CpuImpl, Net, StorageImpl> ResourceLimiter for StoreData<CpuImpl, Net, StorageImpl>
@@ -160,11 +152,14 @@ where
             balloon.request_deflate();
         }
         let requester = self.instance().id();
+        // Before the registry's lock, never under it: see `UserResidency`.
+        let residency = user_residency();
         let decision = self.instance_registry.condemn_for_oom(
             requester,
             pool,
             requested_bytes as u64,
             monotonic_nanos(&self.cpu),
+            &residency,
         );
         let condemned = decision.condemned;
         match decision.outcome {
@@ -178,6 +173,7 @@ where
                 victim_id = ?victim.id,
                 victim_name = %victim.name,
                 victim_memory_bytes = victim.memory_bytes,
+                victim_user_bytes = victim.user_bytes,
                 victim_kernel_bytes = victim.kernel_bytes,
                 victim_policy = ?victim.policy,
                 score = victim.score,
@@ -209,342 +205,21 @@ where
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem> IoView
-    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable, wasmtime::Memory>
-where
-    CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl<CpuImpl, RuntimeStateImpl> Pollable for crate::DeadlinePollable<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    async fn ready(&mut self) {
-        crate::DeadlinePollable::ready(self).await;
-    }
-}
-
-/// WASI P2 adapter: exposes a kernel `ByteReader` as an `InputStream`.
+/// What each instance holds of the user pool, for an OOM or kill
+/// decision about to be made against the instance registry.
 ///
-/// Wasmtime drives `Pollable::ready` and `InputStream::read` through `&mut
-/// self`, so the carry buffer is owned outright rather than wrapped in
-/// `Arc<Mutex<_>>`.
-pub struct ChannelInputStream {
-    reader: ByteReader,
-    carry: Bytes,
-}
-
-impl ChannelInputStream {
-    pub fn new(reader: ByteReader) -> Self {
-        Self {
-            reader,
-            carry: Bytes::new(),
-        }
+/// On bare metal every page the runtime commits for an instance comes
+/// out of the installed address space, so that is what answers. Under
+/// `wasmtime-host` the runtime's memories are host allocations the user
+/// pool never served: no instance holds any of the pool, and no kill
+/// gives any of it back.
+pub(crate) fn user_residency() -> UserResidency {
+    #[cfg(all(target_os = "none", feature = "wasmtime-bare-metal"))]
+    {
+        UserResidency::of_installed_address_space()
     }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl Pollable for ChannelInputStream {
-    async fn ready(&mut self) {
-        if !self.carry.is_empty() {
-            return;
-        }
-        if let Some(bytes) = self.reader.read().await {
-            self.carry = bytes;
-        }
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl InputStream for ChannelInputStream {
-    fn read(&mut self, size: usize) -> StreamResult<Bytes> {
-        if !self.carry.is_empty() {
-            let take = self.carry.len().min(size);
-            return Ok(self.carry.split_to(take));
-        }
-        match self.reader.try_read() {
-            crate::io::TryRead::Ready(mut bytes) => {
-                if bytes.len() > size {
-                    let taken = bytes.split_to(size);
-                    self.carry = bytes;
-                    return Ok(taken);
-                }
-                Ok(bytes)
-            }
-            crate::io::TryRead::Pending => Ok(Bytes::new()),
-            crate::io::TryRead::Eof => Err(StreamError::Closed),
-        }
-    }
-}
-
-/// Bytes a p2 `check-write` permit is worth while the channel has room.
-const P2_CHANNEL_WRITE_PERMIT_BYTES: usize = 64 * 1024;
-
-/// WASI P2 adapter: exposes a kernel `ByteWriter` as an `OutputStream`.
-///
-/// The p2 contract is permit-driven and `write` must never block, so a
-/// full channel is handled the same way the host-file output stream
-/// handles a 9p round trip: `check_write` withholds the permit, one batch
-/// is parked in `pending`, and `Pollable::ready` completes it once the
-/// reader has drained. No byte is dropped and a transiently full channel
-/// is never reported as an error.
-pub struct ChannelOutputStream {
-    writer: ByteWriter,
-    pending: Option<Bytes>,
-}
-
-impl ChannelOutputStream {
-    pub fn new(writer: ByteWriter) -> Self {
-        Self {
-            writer,
-            pending: None,
-        }
-    }
-
-    /// Hand the parked batch to the channel, waiting for room.
-    async fn flush_pending(&mut self) {
-        let Some(bytes) = self.pending.take() else {
-            // Nothing parked: report ready as soon as the channel could
-            // take a batch, so the guest's next `check-write` is non-zero.
-            self.writer.writable().await;
-            return;
-        };
-        // A vanished reader is surfaced by the next `check_write`/`write`
-        // as `StreamError::Closed`; there is nothing left to deliver.
-        let _: Result<(), crate::ClosedPeer> = self.writer.write(bytes).await;
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl Pollable for ChannelOutputStream {
-    async fn ready(&mut self) {
-        self.flush_pending().await;
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl OutputStream for ChannelOutputStream {
-    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
-        if self.writer.is_reader_closed() {
-            return Err(StreamError::Closed);
-        }
-        if self.pending.is_some() {
-            return Err(StreamError::trap(
-                "channel output stream write exceeded its check-write permit",
-            ));
-        }
-        match self.writer.try_write(bytes) {
-            crate::TryWrite::Written => Ok(()),
-            // Park the batch rather than dropping it or erroring: `ready`
-            // completes it and `check_write` withholds the next permit
-            // until then.
-            crate::TryWrite::Full(bytes) => {
-                self.pending = Some(bytes);
-                Ok(())
-            }
-            crate::TryWrite::Closed => Err(StreamError::Closed),
-        }
-    }
-
-    fn flush(&mut self) -> StreamResult<()> {
-        // A parked batch is drained by `ready`, which `check_write` pends
-        // on, so there is nothing to push here.
-        if self.writer.is_reader_closed() {
-            return Err(StreamError::Closed);
-        }
-        Ok(())
-    }
-
-    fn check_write(&mut self) -> StreamResult<usize> {
-        if self.writer.is_reader_closed() {
-            return Err(StreamError::Closed);
-        }
-        if self.pending.is_some() || !self.writer.is_writable() {
-            return Ok(0);
-        }
-        Ok(P2_CHANNEL_WRITE_PERMIT_BYTES)
-    }
-}
-
-/// WASI P2 stdout/stderr adapter: writes through either a child-IO byte
-/// channel or the serial debug port depending on the routing decided when
-/// the store was constructed.
-pub enum StdioOutputStream {
-    /// Bytes flow to a parent-facing byte channel.
-    Child(ChannelOutputStream),
-    /// Bytes flow to the machine's debug UART.
-    Serial(SerialOutputStream),
-    /// Bytes are recorded as observer trace events (no-op here because
-    /// serial debug does not model trace output for P2 programs).
-    Trace,
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl Pollable for StdioOutputStream {
-    async fn ready(&mut self) {
-        match self {
-            // The child channel is bounded, so readiness is real work:
-            // complete a parked batch and wait for room.
-            StdioOutputStream::Child(inner) => inner.ready().await,
-            // The debug UART is bounded too: its owner may be another
-            // processor writing a segment of its own, so readiness is
-            // the wait for the port's turn.
-            StdioOutputStream::Serial(inner) => Pollable::ready(inner).await,
-            StdioOutputStream::Trace => {}
-        }
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl OutputStream for StdioOutputStream {
-    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
-        match self {
-            StdioOutputStream::Child(inner) => inner.write(bytes),
-            StdioOutputStream::Serial(inner) => OutputStream::write(inner, bytes),
-            StdioOutputStream::Trace => Ok(()),
-        }
-    }
-
-    fn flush(&mut self) -> StreamResult<()> {
-        Ok(())
-    }
-
-    fn check_write(&mut self) -> StreamResult<usize> {
-        match self {
-            StdioOutputStream::Child(inner) => inner.check_write(),
-            StdioOutputStream::Serial(inner) => OutputStream::check_write(inner),
-            StdioOutputStream::Trace => Ok(P2_SERIAL_WRITE_PERMIT_BYTES),
-        }
-    }
-}
-
-/// Bytes a P2 stdio stream may hand the debug UART in one write.
-const P2_SERIAL_WRITE_PERMIT_BYTES: usize = 64 * 1024;
-
-/// WASI P2 stdout/stderr over the machine's debug UART.
-///
-/// The console takes a guest byte stream a line at a time, and only
-/// while no other processor owns the port (#103), so this parks what it
-/// could not place and offers it again from `ready`, withholding the
-/// next permit until it is gone. That is the flow control the
-/// child-channel stream applies, over a device instead of a channel.
-pub struct SerialOutputStream {
-    writer: crate::DebugSerialWriter,
-    pending: Option<Bytes>,
-}
-
-impl SerialOutputStream {
-    #[must_use]
-    pub fn new(writer: crate::DebugSerialWriter) -> Self {
-        Self {
-            writer,
-            pending: None,
-        }
-    }
-
-    /// Places as much of what is parked as the console will take now,
-    /// and reports whether anything is still parked.
-    fn push(&mut self) -> bool {
-        let Some(mut bytes) = self.pending.take() else {
-            return false;
-        };
-        while !bytes.is_empty() {
-            let taken = self.writer.write_stream(bytes.as_ref());
-            if taken == 0 {
-                self.pending = Some(bytes);
-                return true;
-            }
-            bytes = bytes.slice(taken..);
-        }
-        false
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl Pollable for SerialOutputStream {
-    async fn ready(&mut self) {
-        // The port has no readiness signal to register on: the wait is
-        // for another processor to finish the segment it owns, so the
-        // task yields between attempts rather than parking.
-        while self.push() {
-            crate::yield_now().await;
-        }
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl OutputStream for SerialOutputStream {
-    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
-        if self.pending.is_some() {
-            return Err(StreamError::trap(
-                "serial output stream write exceeded its check-write permit",
-            ));
-        }
-        self.pending = Some(bytes);
-        let _parked = self.push();
-        Ok(())
-    }
-
-    fn flush(&mut self) -> StreamResult<()> {
-        // What is parked is drained by `ready`, which `check_write`
-        // pends on, so there is nothing to push here.
-        Ok(())
-    }
-
-    fn check_write(&mut self) -> StreamResult<usize> {
-        if self.push() {
-            return Ok(0);
-        }
-        Ok(P2_SERIAL_WRITE_PERMIT_BYTES)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use wasmtime_wasi_io::bytes::Bytes;
-    use wasmtime_wasi_io::streams::{OutputStream, StreamError};
-
-    use super::ChannelOutputStream;
-    use crate::io::{TryRead, byte_channel};
-
-    /// #183: a parent that lets go of a child's stdout breaks the
-    /// child's pipe even though every byte it wrote was delivered
-    /// first.
-    ///
-    /// `wasi:io/streams.blocking-write-and-flush` asks for the next
-    /// write permit after the flush, so a child whose bytes have
-    /// already reached the parent still learns that the pipe is gone,
-    /// on the very write it had completed. That is what a write to a
-    /// pipe nobody reads is, and the kernel reports it rather than
-    /// swallowing it, so a parent that means to hold a child alive
-    /// holds the child's stdout with it.
-    #[test]
-    fn a_delivered_write_still_breaks_once_the_parent_drops_the_reader() {
-        let (writer, reader) = byte_channel();
-        let mut stdout = ChannelOutputStream::new(writer);
-
-        assert!(matches!(stdout.check_write(), Ok(permit) if permit != 0));
-        stdout
-            .write(Bytes::from_static(b"hello\n"))
-            .expect("the parent still holds the pipe");
-        assert!(
-            matches!(reader.try_read(), TryRead::Ready(bytes) if bytes.as_ref() == b"hello\n"),
-            "the parent did not receive the bytes it then stopped reading"
-        );
-
-        drop(reader);
-
-        assert!(matches!(stdout.check_write(), Err(StreamError::Closed)));
-        assert!(matches!(
-            stdout.write(Bytes::from_static(b"more\n")),
-            Err(StreamError::Closed)
-        ));
+    #[cfg(not(all(target_os = "none", feature = "wasmtime-bare-metal")))]
+    {
+        UserResidency::default()
     }
 }

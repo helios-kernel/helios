@@ -1,8 +1,9 @@
 //! `http-kit-io` over `wasi:sockets` and `wasi:clocks`.
 //!
 //! [`HeliosNet`] is the implementation of the capability traits an HTTP
-//! client asks of its platform: [`Dial`] opens TCP connections, [`Resolve`]
-//! looks names up, and [`Timer`] waits on the monotonic clock.
+//! client asks of its platform: [`Dial`] opens TCP connections, [`Datagram`]
+//! binds UDP sockets, [`Resolve`] looks names up, and [`Timer`] waits on the
+//! monotonic clock.
 //! [`HeliosExecutor`] runs the client's local tasks on the component's
 //! executor.
 //!
@@ -17,7 +18,8 @@ use std::borrow::Borrow;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read as _, Seek as _, SeekFrom};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::num::NonZeroU16;
 #[cfg(unix)]
 use std::path::Path;
 use std::rc::Rc;
@@ -31,8 +33,9 @@ use http_kit_io::DialUnix;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use http_kit_io::splice::{FilledPipe, Pipe, Spliced};
 use http_kit_io::{
-    Answer, BufResult, Dial, IoBuf, IoBufMut, IoVectoredBuf, Read, ReadAhead, ReadOwned, Received,
-    Resolve, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions, Timer, Write,
+    Answer, BufResult, Datagram, DatagramSocket, Dial, IoBuf, IoBufMut, IoVectoredBuf, NoBuf, Read,
+    ReadAhead, ReadOwned, Received, RecvMeta, Resolve, SendFile, SpliceRead, SpliceWrite, Split,
+    TcpOptions, Timer, Write,
 };
 use thiserror::Error;
 use wit_bindgen::rt::async_support::{FutureReader, StreamReader, StreamWriter};
@@ -41,7 +44,7 @@ use crate::bindings::wasi::clocks::monotonic_clock;
 use crate::bindings::wasi::sockets::ip_name_lookup::{self, ErrorCode as LookupCode};
 use crate::bindings::wasi::sockets::types::{
     ErrorCode as SocketCode, IpAddress, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress,
-    Ipv6SocketAddress, TcpSocket,
+    Ipv6SocketAddress, TcpSocket, UdpSocket as WasiUdpSocket,
 };
 use crate::bindings::wit_stream;
 use crate::stream_closed;
@@ -114,11 +117,7 @@ impl Dial for HeliosNet {
     type Connection = TcpConnection;
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpConnection> {
-        let family = match addr {
-            SocketAddr::V4(_) => IpAddressFamily::Ipv4,
-            SocketAddr::V6(_) => IpAddressFamily::Ipv6,
-        };
-        let socket = TcpSocket::create(family).map_err(socket_error)?;
+        let socket = TcpSocket::create(address_family(addr)).map_err(socket_error)?;
         socket
             .connect(to_wasi_address(addr))
             .await
@@ -139,6 +138,16 @@ impl Dial for HeliosNet {
                 _socket: socket,
             },
         })
+    }
+}
+
+impl Datagram for HeliosNet {
+    type UdpSocket = UdpSocket;
+
+    async fn bind_udp(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
+        let socket = WasiUdpSocket::create(address_family(addr)).map_err(socket_error)?;
+        socket.bind(to_wasi_address(addr)).map_err(socket_error)?;
+        Ok(UdpSocket { socket })
     }
 }
 
@@ -183,6 +192,13 @@ impl Timer for HeliosNet {
     }
 }
 
+fn address_family(addr: SocketAddr) -> IpAddressFamily {
+    match addr {
+        SocketAddr::V4(_) => IpAddressFamily::Ipv4,
+        SocketAddr::V6(_) => IpAddressFamily::Ipv6,
+    }
+}
+
 fn to_wasi_address(addr: SocketAddr) -> IpSocketAddress {
     match addr {
         SocketAddr::V4(addr) => IpSocketAddress::Ipv4(Ipv4SocketAddress {
@@ -198,6 +214,24 @@ fn to_wasi_address(addr: SocketAddr) -> IpSocketAddress {
     }
 }
 
+fn from_wasi_address(address: IpSocketAddress) -> SocketAddr {
+    match address {
+        IpSocketAddress::Ipv4(addr) => {
+            let (a, b, c, d) = addr.address;
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), addr.port))
+        }
+        IpSocketAddress::Ipv6(addr) => {
+            let (a, b, c, d, e, f, g, h) = addr.address;
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(a, b, c, d, e, f, g, h),
+                addr.port,
+                addr.flow_info,
+                addr.scope_id,
+            ))
+        }
+    }
+}
+
 fn from_wasi_ip(address: IpAddress) -> IpAddr {
     match address {
         IpAddress::Ipv4((a, b, c, d)) => IpAddr::V4(Ipv4Addr::new(a, b, c, d)),
@@ -205,6 +239,32 @@ fn from_wasi_ip(address: IpAddress) -> IpAddr {
             IpAddr::V6(Ipv6Addr::new(a, b, c, d, e, f, g, h))
         }
     }
+}
+
+fn reject_explicit_source(source: Option<IpAddr>) -> io::Result<()> {
+    if source.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "choosing a datagram's source address is not supported on wasi:sockets",
+        ));
+    }
+    Ok(())
+}
+
+fn segment_chunks(bytes: &[u8], segment_size: NonZeroU16) -> std::slice::Chunks<'_, u8> {
+    bytes.chunks(usize::from(segment_size.get()))
+}
+
+fn copy_datagram_into<B: IoBufMut>(bytes: &[u8], buf: &mut B) -> usize {
+    let dst = buf.as_uninit();
+    let copied = bytes.len().min(dst.len());
+    for (slot, byte) in dst[..copied].iter_mut().zip(&bytes[..copied]) {
+        slot.write(*byte);
+    }
+    // SAFETY: the first `copied` bytes of `buf` were initialized above, and
+    // `copied <= dst.len()`.
+    unsafe { buf.set_len(copied) };
+    copied
 }
 
 /// An established TCP connection: the two halves of `wasi:sockets` streams
@@ -307,15 +367,15 @@ impl Read for ReadHalf {
 }
 
 impl ReadOwned for ReadHalf {
-    type Buf = Vec<u8>;
+    type Buf = NoBuf;
 
-    /// Lends the vector the stream read into, so no byte is copied.
-    async fn read_owned(&mut self) -> io::Result<Received<Vec<u8>>> {
+    /// Transfers the receive allocation so protocol bodies can retain it directly.
+    async fn read_owned(&mut self) -> io::Result<Received<NoBuf>> {
         let bytes = self.receive(RECEIVE_CHUNK_BYTES).await?;
         Ok(if bytes.is_empty() {
             Received::End
         } else {
-            Received::Lent(bytes)
+            Received::Owned(bytes.into())
         })
     }
 }
@@ -448,9 +508,9 @@ impl Read for TcpConnection {
 }
 
 impl ReadOwned for TcpConnection {
-    type Buf = Vec<u8>;
+    type Buf = NoBuf;
 
-    fn read_owned(&mut self) -> impl Future<Output = io::Result<Received<Vec<u8>>>> {
+    fn read_owned(&mut self) -> impl Future<Output = io::Result<Received<NoBuf>>> {
         self.reader.read_owned()
     }
 }
@@ -540,6 +600,76 @@ impl TcpOptions for TcpConnection {
     }
 }
 
+/// A bound `wasi:sockets` UDP socket implementing [`DatagramSocket`].
+#[derive(Debug)]
+pub struct UdpSocket {
+    socket: WasiUdpSocket,
+}
+
+impl DatagramSocket for UdpSocket {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket
+            .get_local_address()
+            .map(from_wasi_address)
+            .map_err(socket_error)
+    }
+
+    fn max_send_segments(&self) -> usize {
+        1
+    }
+
+    async fn send_from<B: IoBuf>(
+        &self,
+        buf: B,
+        target: SocketAddr,
+        source: Option<IpAddr>,
+    ) -> BufResult<usize, B> {
+        if let Err(error) = reject_explicit_source(source) {
+            return BufResult(Err(error), buf);
+        }
+        let bytes = buf.as_init().to_vec();
+        let len = bytes.len();
+        let result = self
+            .socket
+            .send(bytes, Some(to_wasi_address(target)))
+            .await
+            .map(|()| len)
+            .map_err(socket_error);
+        BufResult(result, buf)
+    }
+
+    async fn send_segments_from<B: IoBuf>(
+        &self,
+        buf: B,
+        segment_size: NonZeroU16,
+        target: SocketAddr,
+        source: Option<IpAddr>,
+    ) -> BufResult<usize, B> {
+        if let Err(error) = reject_explicit_source(source) {
+            return BufResult(Err(error), buf);
+        }
+        let wasi_target = to_wasi_address(target);
+        let mut sent = 0usize;
+        for chunk in segment_chunks(buf.as_init(), segment_size) {
+            if let Err(code) = self.socket.send(chunk.to_vec(), Some(wasi_target)).await {
+                return BufResult(Err(socket_error(code)), buf);
+            }
+            sent += chunk.len();
+        }
+        BufResult(Ok(sent), buf)
+    }
+
+    async fn recv_from<B: IoBufMut>(&self, mut buf: B) -> BufResult<RecvMeta, B> {
+        match self.socket.receive().await {
+            Ok((bytes, from)) => {
+                let copied = copy_datagram_into(&bytes, &mut buf);
+                BufResult(Ok(RecvMeta::single(copied, from_wasi_address(from))), buf)
+            }
+            Err(code) => BufResult(Err(socket_error(code)), buf),
+        }
+    }
+}
+
 /// Runs a client's local tasks on the component's executor.
 ///
 /// A task polls on the component-model executor that drives the export
@@ -564,5 +694,183 @@ impl LocalExecutor for HeliosExecutor {
         });
         runnable.schedule();
         task
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::num::NonZeroU16;
+
+    use http_kit_io::RecvMeta;
+
+    use super::{
+        SocketCode, SocketError, address_family, copy_datagram_into, from_wasi_address,
+        reject_explicit_source, segment_chunks, socket_error, to_wasi_address,
+    };
+    use crate::bindings::wasi::sockets::types::IpAddressFamily;
+
+    #[test]
+    fn address_round_trip_ipv4() {
+        let addresses = [
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4433)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, u16::MAX)),
+        ];
+        for addr in addresses {
+            assert_eq!(address_family(addr), IpAddressFamily::Ipv4);
+            assert_eq!(from_wasi_address(to_wasi_address(addr)), addr);
+        }
+    }
+
+    #[test]
+    fn address_round_trip_ipv6_preserves_flowinfo_and_scope() {
+        let addresses = [
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 8443, 0x12345, 7)),
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 1, 2, 3, 4),
+                5353,
+                0xffff_ffff,
+                42,
+            )),
+        ];
+        for addr in addresses {
+            assert_eq!(address_family(addr), IpAddressFamily::Ipv6);
+            assert_eq!(from_wasi_address(to_wasi_address(addr)), addr);
+        }
+    }
+
+    #[test]
+    fn explicit_source_is_rejected_with_unsupported() {
+        assert!(reject_explicit_source(None).is_ok());
+
+        for source in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let err = reject_explicit_source(Some(source)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        }
+    }
+
+    #[test]
+    fn segment_chunks_split_on_boundaries() {
+        let seg_4 = NonZeroU16::new(4).unwrap();
+        let empty: Vec<&[u8]> = segment_chunks(&[], seg_4).collect();
+        assert!(empty.is_empty());
+
+        let exact: Vec<&[u8]> = segment_chunks(b"abcdefgh", seg_4).collect();
+        assert_eq!(exact, [b"abcd".as_slice(), b"efgh".as_slice()]);
+
+        let with_tail: Vec<&[u8]> = segment_chunks(b"abcdefghi", seg_4).collect();
+        assert_eq!(
+            with_tail,
+            [b"abcd".as_slice(), b"efgh".as_slice(), b"i".as_slice()]
+        );
+
+        let seg_1 = NonZeroU16::new(1).unwrap();
+        let single_bytes: Vec<&[u8]> = segment_chunks(b"xyz", seg_1).collect();
+        assert_eq!(
+            single_bytes,
+            [b"x".as_slice(), b"y".as_slice(), b"z".as_slice()]
+        );
+
+        let seg_max = NonZeroU16::new(u16::MAX).unwrap();
+        let large: Vec<&[u8]> = segment_chunks(b"hello", seg_max).collect();
+        assert_eq!(large, [b"hello".as_slice()]);
+    }
+
+    fn assert_single_segment(meta: RecvMeta, expected: std::ops::Range<usize>) {
+        let segments: Vec<_> = meta.segments().collect();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0], expected);
+    }
+
+    #[test]
+    fn copy_datagram_into_copies_and_truncates() {
+        let from: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+
+        // Pre-populated Vec gets reset to exact datagram length.
+        let mut buf = vec![0xAAu8; 16];
+        let copied = copy_datagram_into(b"hello", &mut buf);
+        assert_eq!(copied, 5);
+        assert_eq!(buf, b"hello");
+        let meta = RecvMeta::single(copied, from);
+        assert_eq!(meta.len(), 5);
+        assert_eq!(meta.segment_size(), 5);
+        assert_eq!(meta.from(), from);
+        assert_eq!(meta.destination(), None);
+        assert_single_segment(meta, 0..5);
+
+        // Empty datagram sets length to 0 and produces one empty segment.
+        let mut non_empty = vec![1, 2, 3];
+        let copied = copy_datagram_into(b"", &mut non_empty);
+        assert_eq!(copied, 0);
+        assert!(non_empty.is_empty());
+        let empty_meta = RecvMeta::single(copied, from);
+        assert!(empty_meta.is_empty());
+        assert_single_segment(empty_meta, 0..0);
+
+        // Datagram larger than fixed-capacity buffer truncates cleanly.
+        let mut small = [0u8; 4];
+        let copied = copy_datagram_into(b"abcdefgh", &mut small);
+        assert_eq!(copied, 4);
+        assert_eq!(&small, b"abcd");
+        let trunc_meta = RecvMeta::single(copied, from);
+        assert_eq!(trunc_meta.len(), 4);
+        assert_single_segment(trunc_meta, 0..4);
+
+        // Zero-capacity buffer truncates to 0 without panic.
+        let mut zero = [0u8; 0];
+        let copied = copy_datagram_into(b"payload", &mut zero);
+        assert_eq!(copied, 0);
+    }
+
+    #[test]
+    fn socket_error_translates_codes_and_preserves_source() {
+        let cases = [
+            (SocketCode::AccessDenied, io::ErrorKind::PermissionDenied),
+            (SocketCode::NotSupported, io::ErrorKind::Unsupported),
+            (SocketCode::InvalidArgument, io::ErrorKind::InvalidInput),
+            (SocketCode::OutOfMemory, io::ErrorKind::OutOfMemory),
+            (SocketCode::Timeout, io::ErrorKind::TimedOut),
+            (SocketCode::InvalidState, io::ErrorKind::InvalidInput),
+            (
+                SocketCode::AddressNotBindable,
+                io::ErrorKind::AddrNotAvailable,
+            ),
+            (SocketCode::AddressInUse, io::ErrorKind::AddrInUse),
+            (
+                SocketCode::RemoteUnreachable,
+                io::ErrorKind::HostUnreachable,
+            ),
+            (
+                SocketCode::ConnectionRefused,
+                io::ErrorKind::ConnectionRefused,
+            ),
+            (SocketCode::ConnectionBroken, io::ErrorKind::BrokenPipe),
+            (SocketCode::ConnectionReset, io::ErrorKind::ConnectionReset),
+            (
+                SocketCode::ConnectionAborted,
+                io::ErrorKind::ConnectionAborted,
+            ),
+            (SocketCode::DatagramTooLarge, io::ErrorKind::InvalidInput),
+            (SocketCode::Other(None), io::ErrorKind::Other),
+            (
+                SocketCode::Other(Some("detail".to_owned())),
+                io::ErrorKind::Other,
+            ),
+        ];
+
+        for (code, expected_kind) in cases {
+            let err = socket_error(code);
+            assert_eq!(err.kind(), expected_kind);
+            let inner = err
+                .get_ref()
+                .expect("socket_error preserves SocketError inner error");
+            assert!(inner.downcast_ref::<SocketError>().is_some());
+        }
     }
 }

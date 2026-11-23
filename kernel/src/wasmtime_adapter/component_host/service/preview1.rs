@@ -14,11 +14,13 @@ where
     /// threads' stores register with too.
     pub(super) interrupts: Arc<GuestInterrupts>,
     activity: crate::InstanceActivity,
+    pub(super) identity: helios_unix::ProcessIdentity,
     pub(super) parent_instance_id: Option<crate::InstanceId>,
     pub(super) filesystem: Namespace<StorageImpl>,
     pub(super) clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>,
     pub(super) wall_clock_cap: Option<crate::SetWallClockCap>,
-    pub(super) cwd: Option<Preview1Cwd>,
+    /// The process's working directory, shared by every store of the process.
+    pub(super) cwd: SharedCwd,
     pub(super) arguments: Vec<String>,
     pub(super) environment: Vec<(String, String)>,
     pub(super) output_mode: OutputMode,
@@ -27,11 +29,19 @@ where
     pub(super) write_serial: crate::DebugSerialWriter,
     pub(super) imported_memory: Option<SharedMemory>,
     pub(super) current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
+    /// The process's pre-linked core-module template, built once per process
+    /// with its host imports and shared linear memory bound so every spawned
+    /// thread instantiates directly from it.
+    pub(super) thread_instance_pre: Option<Arc<wasmtime::InstancePre<Self>>>,
+    pub(super) guest_instance: Option<wasmtime::Instance>,
+    #[cfg(test)]
+    pub(super) test_exports: Vec<(Arc<str>, wasmtime::Extern)>,
     pub(super) wasix_abi: bool,
     pub(super) entropy: crate::EntropyPool,
     pub(super) authority: ProcessAuthority,
     pub(super) tty_state: WasixTtyState,
-    pub(super) signal_callback: Option<String>,
+    pub(super) process_signals: WasixProcessSignals,
+    pub(super) active_signal_handlers: helios_unix::SignalSet,
     pub(super) signal_state: WasixSignalState,
     /// Signals raised on this store's thread alone (`thread_signal`),
     /// and the end of its process. Main's is its process table's
@@ -46,9 +56,11 @@ where
     /// asked for it (#132).
     pub(super) signal_interval: Option<crate::JoinHandle<()>>,
     pub(super) signal_dispositions: Vec<WasixSignalDisposition>,
-    pub(super) descriptors: Preview1DescriptorTable<Net>,
+    /// The process's descriptor table, shared by every store of the process.
+    pub(super) descriptors: SharedDescriptorTable<Net>,
     pub(super) asyncify: WasixAsyncifyState<Net>,
-    pub(super) children: Vec<WasixChildProcess>,
+    /// The process's child table, shared by every store of the process.
+    pub(super) children: WasixChildren,
     pub(super) thread_id: u32,
     /// The threads of this store's process, shared by every store of it.
     pub(super) threads: WasixImageThreads<CpuImpl, Net, StorageImpl>,
@@ -88,13 +100,18 @@ where
         threads: WasixImageThreads<CpuImpl, Net, StorageImpl>,
     ) -> Self {
         let filesystem = filesystem.unwrap_or_else(|| runtime_state.root_namespace().descend());
+        let identity = helios_unix::ProcessIdentity::new(
+            core::num::NonZeroU64::new(instance.id().raw()).expect("live instance ID is nonzero"),
+        );
         let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
-        let descriptors =
-            descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
+        let descriptors = SharedDescriptorTable::new(
+            descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority)),
+        );
         let clock = crate::KernelClock::new(cpu.clone(), runtime_state.clone());
         let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
-        let cwd = preview1_cwd_from_authority(&authority);
+        let cwd = SharedCwd::new(preview1_cwd_from_authority(&authority));
         let tty_state = WasixTtyState::from_authority(&authority);
+        let process_signals = WasixProcessSignals::from_dispositions(&signal_dispositions);
         Self {
             cpu,
             timer,
@@ -105,6 +122,7 @@ where
                 instance,
                 crate::store_kernel_heap_bytes(size_of::<Self>()),
             ),
+            identity,
             parent_instance_id,
             filesystem,
             clock,
@@ -118,23 +136,107 @@ where
             write_serial,
             imported_memory,
             current_core_module,
+            thread_instance_pre: None,
+            guest_instance: None,
+            #[cfg(test)]
+            test_exports: Vec::new(),
             wasix_abi,
             entropy,
             authority,
             tty_state,
-            signal_callback: None,
+            process_signals,
+            active_signal_handlers: helios_unix::SignalSet::EMPTY,
             signal_state,
             thread_signals,
             signal_interval: None,
             signal_dispositions,
             descriptors,
             asyncify: WasixAsyncifyState::new(),
-            children: Vec::new(),
+            children: WasixChildren::new(),
             thread_id: 0,
             threads,
             requested_exit: None,
             exec_replacement: None,
         }
+    }
+
+    /// Builds a sibling thread's store within the same WASIX process.
+    ///
+    /// Process-owned tables (`descriptors`, `cwd`, `children`, `threads`,
+    /// `process_signals`, `signal_state`, `imported_memory`, and
+    /// `thread_instance_pre`) are shared by reference with the spawning store
+    /// rather than copied, while per-thread execution state (`thread_signals`,
+    /// `asyncify`, `guest_instance`, `active_signal_handlers`,
+    /// `requested_exit`, `exec_replacement`) starts fresh for the new thread.
+    pub(super) fn spawn_thread_store(&self, thread_signals: WasixSignalState) -> Self {
+        let authority = self.effective_authority();
+        let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
+        let instance = self.instance().clone();
+        let entropy =
+            crate::EntropyPool::derive(self.runtime_state.root_entropy(), instance.id().raw());
+        Self {
+            cpu: self.cpu.clone(),
+            timer: self.timer.clone(),
+            spawner: self.spawner.clone(),
+            runtime_state: self.runtime_state.clone(),
+            interrupts: self.interrupts.clone(),
+            activity: crate::InstanceActivity::new(
+                instance,
+                crate::store_kernel_heap_bytes(size_of::<Self>()),
+            ),
+            identity: self.identity,
+            parent_instance_id: self.parent_instance_id,
+            filesystem: self.filesystem.clone(),
+            clock: crate::KernelClock::new(self.cpu.clone(), self.runtime_state.clone()),
+            wall_clock_cap,
+            cwd: self.cwd.clone(),
+            arguments: self.arguments.clone(),
+            environment: self.environment.clone(),
+            output_mode: self.output_mode.clone(),
+            read_serial: self.read_serial,
+            serial_read_buffer: Vec::new(),
+            write_serial: self.write_serial,
+            imported_memory: self.imported_memory.clone(),
+            current_core_module: self.current_core_module.clone(),
+            thread_instance_pre: self.thread_instance_pre.clone(),
+            guest_instance: None,
+            #[cfg(test)]
+            test_exports: Vec::new(),
+            wasix_abi: self.wasix_abi,
+            entropy,
+            authority,
+            tty_state: self.tty_state,
+            process_signals: self.process_signals.clone(),
+            active_signal_handlers: helios_unix::SignalSet::EMPTY,
+            signal_state: self.signal_state.clone(),
+            thread_signals,
+            signal_interval: None,
+            signal_dispositions: self.signal_dispositions.clone(),
+            descriptors: self.descriptors.clone(),
+            asyncify: WasixAsyncifyState::new(),
+            children: self.children.clone(),
+            thread_id: 0,
+            threads: self.threads.clone(),
+            requested_exit: None,
+            exec_replacement: None,
+        }
+    }
+
+    /// Returns this store's [`ProcessAuthority`] synchronized with the
+    /// process's current shared working directory so `fork`, `spawn`, `exec`,
+    /// and `proc_snapshot` from any thread inherit the latest `chdir`.
+    pub(super) fn effective_authority(&self) -> ProcessAuthority {
+        let mut authority = self.authority.clone();
+        if let Some(cwd) = self.cwd.get()
+            && let Ok(cap) = authority.derive_directory_cap(
+                &cwd.descriptor.path,
+                &cwd.guest_name,
+                descriptor_flags_to_directory_authority(cwd.descriptor.flags),
+            )
+        {
+            authority.chdir(cap);
+        }
+        authority
     }
 
     pub(super) fn now_nanos(&self) -> u64 {
@@ -153,11 +255,24 @@ where
         self.timer.sleep_for(duration)
     }
 
-    pub(super) fn futex_key(&self, address: u32) -> crate::FutexKey {
-        crate::FutexKey::new(
-            crate::ProcessMemoryIdentity::new(self.instance().id().raw()),
+    pub(super) fn futex_key(&self, address: u32) -> helios_unix::FutexKey {
+        helios_unix::FutexKey::new(
+            helios_unix::ProcessMemoryIdentity::new(self.instance().id().raw()),
             GuestAddress::wasm32(address),
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn define_test_export(&mut self, name: &str, export: wasmtime::Extern) {
+        if let Some((_, slot)) = self
+            .test_exports
+            .iter_mut()
+            .find(|(existing, _)| existing.as_ref() == name)
+        {
+            *slot = export;
+            return;
+        }
+        self.test_exports.push((Arc::from(name), export));
     }
 
     pub(super) fn set_system_time_nanos(&mut self, nanos: u64) -> i32 {
@@ -233,10 +348,25 @@ where
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
     }
 
-    pub(super) fn require_privileged_bind_authority(&self) -> i32 {
-        self.authority
-            .derive_privileged_bind_cap()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+    pub(super) fn require_socket_bind_authority(
+        &self,
+        authority: WasixSocketAuthority,
+        local_port: u16,
+    ) -> i32 {
+        let base = match authority {
+            WasixSocketAuthority::LocalOnly => return p1::errno::SUCCESS,
+            WasixSocketAuthority::Tcp => crate::NetworkAuthorityRights::TCP,
+            WasixSocketAuthority::Udp => crate::NetworkAuthorityRights::UDP,
+        };
+        if self
+            .authority
+            .network_rights()
+            .contains(base.bind_rights(local_port))
+        {
+            p1::errno::SUCCESS
+        } else {
+            p1::errno::NOTCAPABLE
+        }
     }
 
     pub(super) fn require_spawn_authority(&self) -> Result<SpawnAuthority, i32> {
@@ -294,7 +424,7 @@ where
     pub(super) fn take_process_end(
         &mut self,
         error: wasmtime::Error,
-    ) -> Result<u32, ProgramExecError> {
+    ) -> Result<helios_unix::ChildTermination, ProgramExecError> {
         preview1_process_end(error, self.requested_exit.take())
     }
 
@@ -336,9 +466,20 @@ where
     }
 
     /// The signals this store answers to: its own thread's, ahead of its
-    /// process's.
+    /// process's, resolved through the process image's shared dispositions.
     pub(super) fn signals(&self) -> WasixStoreSignals {
-        WasixStoreSignals::new(self.thread_signals.clone(), self.signal_state.clone())
+        WasixStoreSignals::with_dispositions(
+            self.thread_signals.clone(),
+            self.signal_state.clone(),
+            self.process_signals.clone(),
+        )
+    }
+
+    pub(super) fn has_deliverable_catch(&self) -> bool {
+        self.asyncify.is_idle()
+            && self
+                .signals()
+                .has_deliverable_catch(self.active_signal_handlers)
     }
 
     /// The interrupt callback for this store: where the end of the
@@ -353,7 +494,7 @@ where
     /// the host first meets them where it completes (see
     /// [`crate::component::TurnEpilogue::take_stop`]). The thread's end
     /// comes first, then a signal, then a kill.
-    fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
+    pub(super) fn on_interrupt(&mut self) -> wasmtime::Result<wasmtime::InterruptAction> {
         if let Some(stop) = self.signals().owed_stop() {
             return Err(stop);
         }
@@ -387,22 +528,19 @@ where
         }
     }
 
+    pub(super) fn stdin_route(&self) -> crate::ComponentInputRoute {
+        self.output_mode.stdin_route()
+    }
+
     pub(super) fn output_route(&self, stream: crate::ComponentOutputStreamKind) -> OutputRoute {
-        match &self.output_mode {
-            OutputMode::Serial => OutputRoute::Serial,
-            OutputMode::Trace => OutputRoute::Trace,
-            OutputMode::Child {
-                stdout_tx,
-                stderr_tx,
-                ..
-            } => match stream {
-                crate::ComponentOutputStreamKind::Stdout => OutputRoute::Child(stdout_tx.clone()),
-                crate::ComponentOutputStreamKind::Stderr => OutputRoute::Child(stderr_tx.clone()),
-            },
-            OutputMode::RoutedChild { stdout, stderr, .. } => match stream {
-                crate::ComponentOutputStreamKind::Stdout => stdout.clone(),
-                crate::ComponentOutputStreamKind::Stderr => stderr.clone(),
-            },
+        self.output_mode.route(stream)
+    }
+
+    pub(super) fn fork_output_mode(&self) -> OutputMode {
+        OutputMode::RoutedChild {
+            stdin: self.stdin_route(),
+            stdout: self.output_route(crate::ComponentOutputStreamKind::Stdout),
+            stderr: self.output_route(crate::ComponentOutputStreamKind::Stderr),
         }
     }
 
@@ -410,86 +548,84 @@ where
         &mut self,
         pid: u32,
         signal_state: WasixSignalState,
-        exit: futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>,
+        exit: WasixChildExit,
     ) {
-        self.children.push(WasixChildProcess {
-            pid,
-            signal_state,
-            exit: Some(exit),
-            completed: None,
+        self.children.insert(pid, signal_state, exit);
+    }
+
+    /// Returns child `pid`'s signal mailbox if it is still running, recording
+    /// any already-arrived completion in place without reaping it.
+    pub(super) fn live_child_signal_target(&mut self, pid: u32) -> Option<WasixSignalState> {
+        let filesystem = &mut self.filesystem;
+        self.children
+            .poll_signal_target(pid, |layer| filesystem.adopt_root_layer(layer))
+    }
+
+    /// Non-blocking [`WasixChildren::try_join`] on this process's shared child
+    /// table, adopting any filesystem layer an observed exit hands back.
+    pub(super) fn try_child_join(&mut self, pid: Option<u32>) -> Poll<Option<WasixJoinedChild>> {
+        let filesystem = &mut self.filesystem;
+        self.children
+            .try_join(pid, |layer| filesystem.adopt_root_layer(layer))
+    }
+
+    /// [`WasixChildren::poll_join`] on this process's shared child table, with
+    /// each filesystem layer an exit hands back adopted into this store's
+    /// namespace.
+    pub(super) fn poll_child_join(
+        &mut self,
+        pid: Option<u32>,
+        cx: &mut Context<'_>,
+        wait: &mut crate::NotifyWaiter,
+    ) -> Poll<Option<WasixJoinedChild>> {
+        let filesystem = &mut self.filesystem;
+        self.children
+            .poll_join(pid, cx, wait, |layer| filesystem.adopt_root_layer(layer))
+    }
+
+    pub(super) async fn read_stdin(&mut self, fd: i32, max_bytes: u32) -> Bytes {
+        if max_bytes == 0 {
+            return Bytes::new();
+        }
+        let carried = self.descriptors.with_mut(|descriptors| {
+            let Some(Preview1Descriptor::Stdin { carry }) = descriptors.get_mut(fd) else {
+                return None;
+            };
+            if !carry.is_empty() {
+                Some(Some(take_preview1_carry(carry, max_bytes as usize)))
+            } else {
+                Some(None)
+            }
         });
-    }
-
-    pub(super) fn poll_child_exit(&mut self, index: usize) -> Result<Option<u32>, i32> {
-        if let Some(code) = self.children[index].completed {
-            return Ok(Some(code));
-        }
-        let Some(exit) = self.children[index].exit.as_mut() else {
-            return Ok(self.children[index].completed);
-        };
-        let waker = futures::task::noop_waker_ref();
-        let mut context = Context::from_waker(waker);
-        match Pin::new(exit).poll(&mut context) {
-            Poll::Pending => Ok(None),
-            Poll::Ready(Ok(Ok(exit))) => {
-                let code = exit.exit_code;
-                if let Some(filesystem) = exit.filesystem {
-                    self.filesystem.adopt_root_layer(filesystem);
-                }
-                self.children[index].completed = Some(code);
-                self.children[index].exit = None;
-                Ok(Some(code))
-            }
-            Poll::Ready(Ok(Err(_))) | Poll::Ready(Err(_)) => {
-                let code = u32::from(p1::errno::IO as u16);
-                self.children[index].completed = Some(code);
-                self.children[index].exit = None;
-                Ok(Some(code))
-            }
-        }
-    }
-
-    pub(super) fn find_child_index(&self, pid: Option<u32>) -> Option<usize> {
-        match pid {
-            Some(pid) => self.children.iter().position(|child| child.pid == pid),
-            None => {
-                if let Some(index) = self
-                    .children
-                    .iter()
-                    .position(|child| child.completed.is_some())
-                {
-                    return Some(index);
-                }
-                (!self.children.is_empty()).then_some(0)
-            }
-        }
-    }
-
-    pub(super) async fn read_stdin(&mut self, max_bytes: u32) -> Bytes {
-        let descriptor = self.descriptors.get_mut(0);
-        let Some(Preview1Descriptor::Stdin { carry }) = descriptor else {
+        let Some(carried) = carried else {
             return Bytes::new();
         };
-        if carry.is_empty() {
-            match &self.output_mode {
-                OutputMode::Serial => loop {
-                    let wait = self.write_serial.wait_for_debug_serial_input();
-                    (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
-                    if !self.serial_read_buffer.is_empty() {
-                        *carry = Bytes::copy_from_slice(&self.serial_read_buffer);
-                        break;
-                    }
-                    wait.await;
-                },
-                OutputMode::Trace => {}
-                OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                    if let Some(bytes) = stdin_rx.read().await {
-                        *carry = bytes;
-                    }
-                }
-            }
+        if let Some(bytes) = carried {
+            return bytes;
         }
-        take_preview1_carry(carry, max_bytes as usize)
+        match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial => loop {
+                let wait = self.write_serial.wait_for_debug_serial_input();
+                (self.read_serial)(&mut self.serial_read_buffer, max_bytes);
+                if !self.serial_read_buffer.is_empty() {
+                    let bytes = Bytes::copy_from_slice(&self.serial_read_buffer);
+                    return self.descriptors.with_mut(|descriptors| {
+                        let Some(Preview1Descriptor::Stdin { carry }) = descriptors.get_mut(fd)
+                        else {
+                            return Bytes::new();
+                        };
+                        *carry = bytes;
+                        take_preview1_carry(carry, max_bytes as usize)
+                    });
+                }
+                wait.await;
+            },
+            crate::ComponentInputRoute::Closed => Bytes::new(),
+            crate::ComponentInputRoute::Child(stdin_rx) => stdin_rx
+                .read_limit(max_bytes as usize)
+                .await
+                .unwrap_or_default(),
+        }
     }
 
     /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
@@ -497,26 +633,29 @@ where
     /// Serial-backed stdin waits on the console's receive signal, so the
     /// probe pulls whatever the console already has into the descriptor's
     /// carry; a later `fd_read` drains that carry, so nothing is lost. A
-    /// child's stdin is a byte channel that answers directly, and trace
-    /// output never delivers input at all.
+    /// child's stdin is a byte channel that answers directly, and trace/closed
+    /// input never delivers input at all.
     pub(super) fn probe_stdin(&mut self, fd: i32) -> P1Readiness {
-        match self.descriptors.get(fd) {
-            Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
-                return P1Readiness::Ready {
-                    bytes: carry.len() as u64,
-                };
-            }
-            Some(Preview1Descriptor::Stdin { .. }) => {}
-            _ => return P1Readiness::Pending,
+        let initial = self
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
+                    Some(P1Readiness::Ready {
+                        bytes: carry.len() as u64,
+                    })
+                }
+                Some(Preview1Descriptor::Stdin { .. }) => None,
+                _ => Some(P1Readiness::Pending),
+            });
+        if let Some(readiness) = initial {
+            return readiness;
         }
         // Resolve the mode to a plain value first so the console read below
         // does not overlap the borrow of `output_mode`.
-        let channel_readable = match &self.output_mode {
-            OutputMode::Serial => None,
-            OutputMode::Trace => return P1Readiness::Hangup,
-            OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
-                Some(stdin_rx.is_readable())
-            }
+        let channel_readable = match self.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial => None,
+            crate::ComponentInputRoute::Closed => return P1Readiness::Hangup,
+            crate::ComponentInputRoute::Child(stdin_rx) => Some(stdin_rx.is_readable()),
         };
         if let Some(readable) = channel_readable {
             return if readable {
@@ -532,94 +671,45 @@ where
         }
         let bytes = Bytes::copy_from_slice(&self.serial_read_buffer);
         let len = bytes.len() as u64;
-        let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd) else {
-            return P1Readiness::Pending;
-        };
-        *carry = bytes;
-        P1Readiness::Ready { bytes: len }
+        self.descriptors.with_mut(|descriptors| {
+            let Some(Preview1Descriptor::Stdin { carry }) = descriptors.get_mut(fd) else {
+                return P1Readiness::Pending;
+            };
+            *carry = bytes;
+            P1Readiness::Ready { bytes: len }
+        })
     }
 
-    pub(super) async fn read_pipe(&mut self, fd: i32, max_bytes: usize) -> Result<Bytes, i32> {
-        let reader = match self.descriptors.get_mut(fd) {
-            Some(Preview1Descriptor::PipeRead { reader, carry }) => {
-                if !carry.is_empty() {
-                    return Ok(take_preview1_carry(carry, max_bytes));
-                }
-                reader.clone()
-            }
-            Some(_) => return Err(p1::errno::BADF),
-            None => return Err(p1::errno::BADF),
-        };
-
-        let bytes = reader.read().await.unwrap_or_default();
-        let Some(Preview1Descriptor::PipeRead { carry, .. }) = self.descriptors.get_mut(fd) else {
-            return Err(p1::errno::BADF);
-        };
-        *carry = bytes;
-        Ok(take_preview1_carry(carry, max_bytes))
-    }
-
-    pub(super) async fn read_socket_pair(
+    pub(super) async fn recv_socket_pair(
         &mut self,
         fd: i32,
         max_bytes: usize,
+        nonblocking: bool,
+        peek: bool,
     ) -> Result<Bytes, i32> {
-        let reader = match self.descriptors.get_mut(fd) {
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-                reader, carry, ..
-            })) => {
-                if !carry.is_empty() {
-                    return Ok(take_preview1_carry(carry, max_bytes));
-                }
-                reader.clone()
-            }
-            Some(Preview1Descriptor::Socket(_)) => return Err(p1::errno::INVAL),
-            Some(_) => return Err(p1::errno::NOTSOCK),
-            None => return Err(p1::errno::BADF),
-        };
-
-        let bytes = reader.read().await.unwrap_or_default();
-        let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { carry, .. })) =
-            self.descriptors.get_mut(fd)
-        else {
-            return Err(p1::errno::BADF);
-        };
-        *carry = bytes;
-        Ok(take_preview1_carry(carry, max_bytes))
-    }
-
-    pub(super) fn try_read_socket_pair(
-        &mut self,
-        fd: i32,
-        max_bytes: usize,
-    ) -> Result<Option<Bytes>, i32> {
-        let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })) =
-            self.descriptors.get_mut(fd)
-        else {
-            return match self.descriptors.get(fd) {
+        let socket = self
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                Some(Preview1Descriptor::Socket(socket)) if socket.is_pair() => Ok(socket.clone()),
                 Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
                 Some(_) => Err(p1::errno::NOTSOCK),
                 None => Err(p1::errno::BADF),
-            };
-        };
-        if !carry.is_empty() {
-            return Ok(Some(take_preview1_carry(carry, max_bytes)));
-        }
-        match reader.try_read() {
-            crate::TryRead::Ready(bytes) => {
-                *carry = bytes;
-                Ok(Some(take_preview1_carry(carry, max_bytes)))
-            }
-            crate::TryRead::Eof => Ok(Some(Bytes::new())),
-            crate::TryRead::Pending => Ok(None),
-        }
+            })?;
+        socket
+            .recv_pair(max_bytes, nonblocking, peek)
+            .await
+            .map_err(|error| match error {
+                helios_unix::PairRecvError::NotPair => p1::errno::INVAL,
+                helios_unix::PairRecvError::WouldBlock => p1::errno::AGAIN,
+            })
     }
 
-    pub(super) fn getcwd(&self) -> Result<&str, i32> {
-        self.cwd
-            .as_ref()
-            .map(|cwd| cwd.guest_name.as_str())
-            .ok_or(p1::errno::NOTCAPABLE)
+    pub(super) fn getcwd(&self) -> Result<String, i32> {
+        self.cwd.with(|cwd| {
+            cwd.as_ref()
+                .map(|cwd| cwd.guest_name.clone())
+                .ok_or(p1::errno::NOTCAPABLE)
+        })
     }
 
     pub(super) async fn chdir(&mut self, path: &str) -> i32 {
@@ -632,7 +722,7 @@ where
             Err(_) => return p1::errno::NOTCAPABLE,
         };
         self.authority.chdir(cap);
-        self.cwd = Some(cwd);
+        self.cwd.set(Some(cwd));
         p1::errno::SUCCESS
     }
 
@@ -654,16 +744,16 @@ where
             let (base, suffix) = self.resolve_absolute_guest_base(&guest_name)?;
             (guest_name, base, suffix)
         } else {
-            let cwd = self.cwd.as_ref().ok_or(p1::errno::NOTCAPABLE)?;
+            let cwd = self.cwd.get().ok_or(p1::errno::NOTCAPABLE)?;
             let guest_name = crate::resolve_child_path(&cwd.guest_name, path)
                 .map_err(p1_errno_from_component_path)?;
-            (guest_name, cwd.descriptor.clone(), path.to_owned())
+            (guest_name, cwd.descriptor, path.to_owned())
         };
         let source_path =
             crate::resolve_child_path(&base.path, &suffix).map_err(p1_errno_from_component_path)?;
         let flags = base.flags;
 
-        if !flags.contains(fs_types::DescriptorFlags::READ) {
+        if !flags.contains(FsDescriptorFlags::READ) {
             return Err(p1::errno::NOTCAPABLE);
         }
         // chdir follows a symbolic link to the directory it names, inside
@@ -686,6 +776,7 @@ where
                 flags,
                 identity: None,
                 mount: None,
+                open: None,
             },
         })
     }
@@ -693,7 +784,7 @@ where
     pub(super) fn resolve_absolute_guest_path(
         &self,
         guest_name: &str,
-    ) -> Result<(String, fs_types::DescriptorFlags), i32> {
+    ) -> Result<(String, FsDescriptorFlags), i32> {
         let (descriptor, suffix) = self.resolve_absolute_guest_base(guest_name)?;
         let source_path = if suffix.is_empty() {
             descriptor.path.clone()
@@ -708,41 +799,47 @@ where
         &self,
         guest_name: &str,
     ) -> Result<(FsDescriptor, String), i32> {
-        let mut best: Option<(&str, &FsDescriptor)> = None;
-        for entry in &self.descriptors.entries {
-            let Some(entry) = entry else {
-                continue;
-            };
-            let Preview1Descriptor::Preopen {
-                guest_name: preopen_guest,
-                descriptor,
-            } = &entry.descriptor
-            else {
-                continue;
-            };
-            if !guest_path_is_within_preopen(guest_name, preopen_guest) {
-                continue;
+        let mut best: Option<(String, FsDescriptor)> = self.descriptors.with(|descriptors| {
+            let mut best: Option<(&str, &FsDescriptor)> = None;
+            for entry in &descriptors.entries {
+                let Some(entry) = entry else {
+                    continue;
+                };
+                let Preview1Descriptor::Preopen {
+                    guest_name: preopen_guest,
+                    descriptor,
+                } = &entry.descriptor
+                else {
+                    continue;
+                };
+                if !guest_path_is_within_preopen(guest_name, preopen_guest) {
+                    continue;
+                }
+                if best.is_none_or(|(best_guest, _)| preopen_guest.len() > best_guest.len()) {
+                    best = Some((preopen_guest.as_str(), descriptor));
+                }
             }
-            if best.is_none_or(|(best_guest, _)| preopen_guest.len() > best_guest.len()) {
-                best = Some((preopen_guest.as_str(), descriptor));
-            }
-        }
+            best.map(|(preopen_guest, descriptor)| (preopen_guest.to_owned(), descriptor.clone()))
+        });
 
-        let cwd_descriptor;
-        if let Some(cwd) = self.cwd.as_ref()
+        if let Some(cwd) = self.cwd.get()
             && guest_path_is_within_preopen(guest_name, &cwd.guest_name)
-            && best.is_none_or(|(best_guest, _)| cwd.guest_name.len() > best_guest.len())
+            && best
+                .as_ref()
+                .is_none_or(|(best_guest, _)| cwd.guest_name.len() > best_guest.len())
         {
-            cwd_descriptor = cwd.descriptor.clone();
-            best = Some((cwd.guest_name.as_str(), &cwd_descriptor));
+            best = Some((cwd.guest_name, cwd.descriptor));
         }
 
         let Some((preopen_guest, descriptor)) = best else {
             return Err(p1::errno::NOTCAPABLE);
         };
-        let suffix = guest_path_suffix(guest_name, preopen_guest);
-        Ok((descriptor.clone(), suffix.to_owned()))
+        let suffix = guest_path_suffix(guest_name, &preopen_guest);
+        Ok((descriptor, suffix.to_owned()))
     }
+
+    /// The descriptor `wasix-libc` (`<fcntl.h>`) passes for `AT_FDCWD`.
+    pub(super) const WASIX_AT_FDCWD: i32 = -2;
 
     pub(super) fn resolve_wasix_path_base(
         &self,
@@ -754,19 +851,18 @@ where
                 crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
             return self.resolve_absolute_guest_base(&guest_name);
         }
-        if let Some(cwd) = self.cwd.as_ref() {
-            return Ok((cwd.descriptor.clone(), path.to_owned()));
+        if fd == Self::WASIX_AT_FDCWD {
+            let cwd = self.cwd.get().ok_or(p1::errno::BADF)?;
+            return Ok((cwd.descriptor, path.to_owned()));
         }
-        let base = match self.descriptors.get(fd) {
-            Some(Preview1Descriptor::Preopen { descriptor, .. })
-            | Some(Preview1Descriptor::File { descriptor, .. })
-                if descriptor.kind == FsNodeKind::Directory =>
-            {
-                descriptor.clone()
-            }
-            Some(_) => return Err(p1::errno::NOTDIR),
-            None => return Err(p1::errno::BADF),
-        };
+        let base = self
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                None => Err(p1::errno::BADF),
+                descriptor => p1_directory_descriptor(descriptor)
+                    .ok_or(p1::errno::NOTDIR)
+                    .cloned(),
+            })?;
         Ok((base, path.to_owned()))
     }
 
@@ -778,10 +874,11 @@ where
         if self.wasix_abi {
             return self.resolve_wasix_path_base(fd, path);
         }
-        let Some(base) = p1_directory_descriptor(self.descriptors.get(fd)) else {
-            return Err(p1::errno::BADF);
-        };
-        Ok((base.clone(), path.to_owned()))
+        let base = self
+            .descriptors
+            .with(|descriptors| p1_directory_descriptor(descriptors.get(fd)).cloned())
+            .ok_or(p1::errno::BADF)?;
+        Ok((base, path.to_owned()))
     }
 
     pub(super) fn resolve_preview1_path(
@@ -793,6 +890,90 @@ where
         let absolute =
             crate::resolve_child_path(&base.path, &path).map_err(p1_errno_from_component_path)?;
         Ok((base, path, absolute))
+    }
+
+    pub(super) fn resolve_preview1_open_base(
+        &self,
+        fd: i32,
+        path: &str,
+    ) -> Result<(FsDescriptor, String), i32> {
+        if self.wasix_abi {
+            return self.resolve_wasix_path_base(fd, path);
+        }
+        let base = self
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                None => Err(p1::errno::BADF),
+                descriptor => p1_directory_descriptor(descriptor)
+                    .ok_or(p1::errno::NOTDIR)
+                    .cloned(),
+            })?;
+        Ok((base, path.to_owned()))
+    }
+
+    pub(super) async fn stat_preview1_path(
+        &self,
+        fd: i32,
+        flags: u32,
+        path: &str,
+    ) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32> {
+        let (base, path, absolute) = self.resolve_preview1_path(fd, path)?;
+        if absolute == WASIX_NULL_DEVICE_PATH {
+            return Ok((p1_null_device_identity(), p1_null_device_stat()));
+        }
+        let granted = p1_grant(&base)?;
+        let metadata = wasi_fs::stat_at(&self.filesystem, granted, p1_path_flags(flags), &path)
+            .await
+            .map_err(p1_errno_from_fs)?;
+        Ok((
+            crate::object_identity(&metadata),
+            wasi_fs::descriptor_stat(&metadata),
+        ))
+    }
+
+    pub(super) async fn set_preview1_path_times(
+        &self,
+        fd: i32,
+        path_flags: fs_types::PathFlags,
+        path: &str,
+        atim: u64,
+        mtim: u64,
+        fstflags: u16,
+    ) -> i32 {
+        let (base, path, _) = match self.resolve_preview1_path(fd, path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return errno,
+        };
+        let granted = match p1_grant(&base) {
+            Ok(granted) => granted,
+            Err(errno) => return errno,
+        };
+        let now_nanos = self.system_time_nanos();
+        let access = p1_timestamp_from_fstflags(
+            fstflags,
+            P1_FSTFLAG_ATIM,
+            P1_FSTFLAG_ATIM_NOW,
+            atim,
+            now_nanos,
+        );
+        let modified = p1_timestamp_from_fstflags(
+            fstflags,
+            P1_FSTFLAG_MTIM,
+            P1_FSTFLAG_MTIM_NOW,
+            mtim,
+            now_nanos,
+        );
+        wasi_fs::set_times_at(
+            &self.filesystem,
+            granted,
+            path_flags,
+            &path,
+            access,
+            modified,
+            now_nanos,
+        )
+        .await
+        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
     }
 }
 
@@ -892,7 +1073,7 @@ where
              count: i32,
              size: i32|
              -> i32 {
-                let thread_count = compiler_plugin_worker_threads(&caller.data().context.cpu);
+                let thread_count = caller.data().context.shared.worker_threads();
                 let env_len = compiler_rayon_env_len(thread_count);
                 let memory = caller.data().memory();
                 let first = write_u32(memory, GuestAddress::wasm32(count as u32), 1);
@@ -967,6 +1148,11 @@ where
                     return -1;
                 };
                 let thread_id = previous + 1;
+                let worker_slot = context
+                    .shared
+                    .session_worker_cursor
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                let preferred = context.affinity_plan.worker(worker_slot);
                 let instance_pre = context
                     .shared
                     .instance_pre
@@ -974,9 +1160,10 @@ where
                     .unwrap_or_else(|| panic!("compiler thread-spawn called before instance pre"))
                     .clone();
                 let spawner = context.spawner.clone();
+                let affinity_plan = context.affinity_plan.clone();
                 let shared = context.shared.clone();
                 let spawned_ns = crate::monotonic_nanos(&context.cpu);
-                let task = spawner.spawn(async move {
+                let task = affinity_plan.spawn_pinned(&spawner, preferred, async move {
                     let started_ns = crate::monotonic_nanos(&context.cpu);
                     let processor = helios_hal::cpu::current_processor().id();
                     // The worker's own store, accounted and driven like the
@@ -1014,7 +1201,7 @@ where
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
                         store.data().context.condemn_for_store_end(error)
                     });
-                    CompilerThreadReport {
+                    SharedMemoryThreadReport {
                         trap,
                         thread_id,
                         processor,
@@ -1052,11 +1239,14 @@ where
     let registration = interrupts.register(instance, store, store.data().cpu.clone());
     // The thread's mailbox needs a target as well, so a running thread
     // meets a signal raised on it at its next interrupt check.
-    store
-        .data()
-        .signal_state
-        .attach(interrupts.clone(), instance);
-    store.data().thread_signals.attach(interrupts, instance);
+    store.data().signal_state.attach(SignalTarget {
+        interrupts: interrupts.clone(),
+        instance,
+    });
+    store.data().thread_signals.attach(SignalTarget {
+        interrupts,
+        instance,
+    });
     registration
 }
 
@@ -1148,10 +1338,10 @@ where
         .func_wrap_async(
             "wasi_snapshot_preview1",
             "sched_yield",
-            |_caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>, ()| {
                 Box::new(async move {
                     crate::yield_now().await;
-                    p1::errno::SUCCESS
+                    p1_finish_errno_call(&mut caller, p1::errno::SUCCESS).await
                 })
             },
         )
@@ -1173,14 +1363,15 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nwritten): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_fd_write(
+                    let answer = p1_fd_write(
                         &mut caller,
                         fd,
                         iovs as u32,
                         iovs_len as u32,
                         nwritten as u32,
                     )
-                    .await
+                    .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -1192,7 +1383,10 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, nread): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_fd_read(&mut caller, fd, iovs as u32, iovs_len as u32, nread as u32).await
+                    let answer =
+                        p1_fd_read(&mut caller, fd, iovs as u32, iovs_len as u32, nread as u32)
+                            .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
@@ -1250,20 +1444,20 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_fdstat_set_rights",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             fd: i32,
-             rights_base: i64,
-             rights_inheriting: i64|
-             -> i32 {
-                p1_fd_fdstat_set_rights(
-                    &mut caller,
-                    fd,
-                    rights_base as u64,
-                    rights_inheriting as u64,
-                )
+             (fd, rights_base, rights_inheriting): (i32, i64, i64)| {
+                Box::new(async move {
+                    p1_fd_fdstat_set_rights(
+                        &mut caller,
+                        fd,
+                        rights_base as u64,
+                        rights_inheriting as u64,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -1273,7 +1467,9 @@ where
             "fd_filestat_get",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, stat): (i32, i32)| {
-                Box::new(async move { p1_fd_filestat_get(&mut caller, fd, stat as u32).await })
+                Box::new(
+                    async move { p1_reply(p1_fd_filestat_get(&mut caller, fd, stat as u32).await) },
+                )
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -1357,15 +1553,17 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, offset, nread): (i32, i32, i32, i64, i32)| {
                 Box::new(async move {
-                    p1_fd_pread(
-                        &mut caller,
-                        fd,
-                        iovs as u32,
-                        iovs_len as u32,
-                        offset as u64,
-                        nread as u32,
+                    p1_reply(
+                        p1_fd_pread(
+                            &mut caller,
+                            fd,
+                            iovs as u32,
+                            iovs_len as u32,
+                            offset as u64,
+                            nread as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1377,15 +1575,17 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, iovs, iovs_len, offset, nwritten): (i32, i32, i32, i64, i32)| {
                 Box::new(async move {
-                    p1_fd_pwrite(
-                        &mut caller,
-                        fd,
-                        iovs as u32,
-                        iovs_len as u32,
-                        offset as u64,
-                        nwritten as u32,
+                    p1_reply(
+                        p1_fd_pwrite(
+                            &mut caller,
+                            fd,
+                            iovs as u32,
+                            iovs_len as u32,
+                            offset as u64,
+                            nwritten as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1397,15 +1597,17 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, buf, buf_len, cookie, bufused): (i32, i32, i32, i64, i32)| {
                 Box::new(async move {
-                    p1_fd_readdir(
-                        &mut caller,
-                        fd,
-                        buf as u32,
-                        buf_len as u32,
-                        cookie as u64,
-                        bufused as u32,
+                    p1_reply(
+                        p1_fd_readdir(
+                            &mut caller,
+                            fd,
+                            buf as u32,
+                            buf_len as u32,
+                            cookie as u64,
+                            bufused as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1427,19 +1629,21 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, offset, whence, new_offset): (i32, i64, i32, i32)| {
                 Box::new(async move {
-                    p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32).await
+                    p1_reply(
+                        p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32).await,
+                    )
                 })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_tell",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             fd: i32,
-             offset: i32|
-             -> i32 { p1_fd_tell(&mut caller, fd, offset as u32) },
+             (fd, offset): (i32, i32)| {
+                Box::new(async move { p1_reply(p1_fd_tell(&mut caller, fd, offset as u32).await) })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -1459,18 +1663,20 @@ where
                 opened_fd,
             ): (i32, i32, i32, i32, i32, i64, i64, i32, i32)| {
                 Box::new(async move {
-                    p1_path_open(
-                        &mut caller,
-                        fd,
-                        dirflags as u32,
-                        path as u32,
-                        path_len as u32,
-                        oflags as u16,
-                        fs_rights_base as u64,
-                        fdflags as u16,
-                        opened_fd as u32,
+                    p1_reply(
+                        p1_path_open(
+                            &mut caller,
+                            fd,
+                            dirflags as u32,
+                            path as u32,
+                            path_len as u32,
+                            oflags as u16,
+                            fs_rights_base as u64,
+                            fdflags as u16,
+                            opened_fd as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1510,7 +1716,10 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, path, path_len): (i32, i32, i32)| {
                 Box::new(async move {
-                    p1_path_create_directory(&mut caller, fd, path as u32, path_len as u32).await
+                    p1_reply(
+                        p1_path_create_directory(&mut caller, fd, path as u32, path_len as u32)
+                            .await,
+                    )
                 })
             },
         )
@@ -1522,15 +1731,17 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, flags, path, path_len, stat): (i32, i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_path_filestat_get(
-                        &mut caller,
-                        fd,
-                        flags as u32,
-                        path as u32,
-                        path_len as u32,
-                        stat as u32,
+                    p1_reply(
+                        p1_path_filestat_get(
+                            &mut caller,
+                            fd,
+                            flags as u32,
+                            path as u32,
+                            path_len as u32,
+                            stat as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1550,17 +1761,19 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_filestat_set_times(
-                        &mut caller,
-                        fd,
-                        flags as u32,
-                        path as u32,
-                        path_len as u32,
-                        atim as u64,
-                        mtim as u64,
-                        fstflags as u16,
+                    p1_reply(
+                        p1_path_filestat_set_times(
+                            &mut caller,
+                            fd,
+                            flags as u32,
+                            path as u32,
+                            path_len as u32,
+                            atim as u64,
+                            mtim as u64,
+                            fstflags as u16,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1580,17 +1793,19 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_link(
-                        &mut caller,
-                        old_fd,
-                        old_flags as u32,
-                        old_path as u32,
-                        old_path_len as u32,
-                        new_fd,
-                        new_path as u32,
-                        new_path_len as u32,
+                    p1_reply(
+                        p1_path_link(
+                            &mut caller,
+                            old_fd,
+                            old_flags as u32,
+                            old_path as u32,
+                            old_path_len as u32,
+                            new_fd,
+                            new_path as u32,
+                            new_path_len as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1609,16 +1824,18 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_readlink(
-                        &mut caller,
-                        fd,
-                        path as u32,
-                        path_len as u32,
-                        buf as u32,
-                        buf_len as u32,
-                        bufused as u32,
+                    p1_reply(
+                        p1_path_readlink(
+                            &mut caller,
+                            fd,
+                            path as u32,
+                            path_len as u32,
+                            buf as u32,
+                            buf_len as u32,
+                            bufused as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1630,7 +1847,10 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, path, path_len): (i32, i32, i32)| {
                 Box::new(async move {
-                    p1_path_remove_directory(&mut caller, fd, path as u32, path_len as u32).await
+                    p1_reply(
+                        p1_path_remove_directory(&mut caller, fd, path as u32, path_len as u32)
+                            .await,
+                    )
                 })
             },
         )
@@ -1649,16 +1869,18 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_rename(
-                        &mut caller,
-                        old_fd,
-                        old_path as u32,
-                        old_path_len as u32,
-                        new_fd,
-                        new_path as u32,
-                        new_path_len as u32,
+                    p1_reply(
+                        p1_path_rename(
+                            &mut caller,
+                            old_fd,
+                            old_path as u32,
+                            old_path_len as u32,
+                            new_fd,
+                            new_path as u32,
+                            new_path_len as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1676,15 +1898,17 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_path_symlink(
-                        &mut caller,
-                        old_path as u32,
-                        old_path_len as u32,
-                        fd,
-                        new_path as u32,
-                        new_path_len as u32,
+                    p1_reply(
+                        p1_path_symlink(
+                            &mut caller,
+                            old_path as u32,
+                            old_path_len as u32,
+                            fd,
+                            new_path as u32,
+                            new_path_len as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1696,7 +1920,9 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, path, path_len): (i32, i32, i32)| {
                 Box::new(async move {
-                    p1_path_unlink_file(&mut caller, fd, path as u32, path_len as u32).await
+                    p1_reply(
+                        p1_path_unlink_file(&mut caller, fd, path as u32, path_len as u32).await,
+                    )
                 })
             },
         )
@@ -1708,25 +1934,27 @@ where
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (subscriptions, events, nsubscriptions, nevents): (i32, i32, i32, i32)| {
                 Box::new(async move {
-                    p1_poll_oneoff(
+                    let answer = p1_poll_oneoff(
                         &mut caller,
                         subscriptions as u32,
                         events as u32,
                         nsubscriptions as u32,
                         nevents as u32,
                     )
-                    .await
+                    .await;
+                    p1_finish_async_call(&mut caller, answer).await
                 })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "proc_raise",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-             signal: i32|
-             -> wasmtime::Result<i32> { p1_proc_raise(&mut caller, signal as u32) },
+             (signal,): (i32,)| {
+                Box::new(async move { p1_proc_raise(&mut caller, signal).await })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -1735,9 +1963,9 @@ where
             "sock_accept",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
              (fd, fdflags, fd_out): (i32, i32, i32)| {
-                Box::new(
-                    async move { p1_sock_accept(&mut caller, fd, fdflags, fd_out as u32).await },
-                )
+                Box::new(async move {
+                    p1_reply(p1_sock_accept(&mut caller, fd, fdflags, fd_out as u32).await)
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -1755,16 +1983,18 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_sock_recv(
-                        &mut caller,
-                        fd,
-                        ri_data as u32,
-                        ri_data_len as u32,
-                        ri_flags as u16,
-                        ro_datalen as u32,
-                        ro_flags as u32,
+                    p1_reply(
+                        p1_sock_recv(
+                            &mut caller,
+                            fd,
+                            ri_data as u32,
+                            ri_data_len as u32,
+                            ri_flags as u16,
+                            ro_datalen as u32,
+                            ro_flags as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -1782,15 +2012,17 @@ where
                 i32,
             )| {
                 Box::new(async move {
-                    p1_sock_send(
-                        &mut caller,
-                        fd,
-                        si_data as u32,
-                        si_data_len as u32,
-                        si_flags as u16,
-                        so_datalen as u32,
+                    p1_reply(
+                        p1_sock_send(
+                            &mut caller,
+                            fd,
+                            si_data as u32,
+                            si_data_len as u32,
+                            si_flags as u16,
+                            so_datalen as u32,
+                        )
+                        .await,
                     )
-                    .await
                 })
             },
         )
@@ -2021,7 +2253,7 @@ pub(super) async fn p1_fd_write<CpuImpl, Net, StorageImpl>(
     iovs: u32,
     iovs_len: u32,
     nwritten: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -2046,24 +2278,19 @@ pub(super) async fn p1_fd_write_inner<CpuImpl, Net, StorageImpl>(
     iovs: GuestAddress,
     iovs_len: u32,
     nwritten: GuestAddress,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let layout = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
-    let written = match p1_write_descriptor(caller, fd, memory, &layout).await {
-        Ok(written) => written,
-        Err(errno) => return errno,
-    };
-    p1_write_u32(caller, memory, nwritten, written)
+    let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
+    let written = p1_write_descriptor(caller, fd, &memory, &layout).await?;
+    memory.write_u32(nwritten, written).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_fd_read<CpuImpl, Net, StorageImpl>(
@@ -2072,7 +2299,7 @@ pub(super) async fn p1_fd_read<CpuImpl, Net, StorageImpl>(
     iovs: u32,
     iovs_len: u32,
     nread: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -2097,77 +2324,38 @@ pub(super) async fn p1_fd_read_inner<CpuImpl, Net, StorageImpl>(
     iovs: GuestAddress,
     iovs_len: u32,
     nread: GuestAddress,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let layout = match p1_read_iovs_with_byte_len(memory, iovs, iovs_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
+    let layout = p1_read_iovs_with_byte_len(&memory, iovs, iovs_len).await?;
     let capacity = layout.byte_len;
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => {
-            let bytes = caller.data_mut().read_stdin(capacity).await;
-            return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
-        }
-        Some(Preview1Descriptor::PipeRead { .. }) => {
-            let bytes = match caller.data_mut().read_pipe(fd, capacity as usize).await {
-                Ok(bytes) => bytes,
-                Err(errno) => return errno,
-            };
-            return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
-        }
-        Some(Preview1Descriptor::File {
-            descriptor, offset, ..
-        }) => {
-            let descriptor = descriptor.clone();
-            let offset = *offset;
+    let bytes = match caller.data().descriptors.get_cloned(fd) {
+        Some(Preview1Descriptor::Stdin { .. }) => caller.data_mut().read_stdin(fd, capacity).await,
+        Some(Preview1Descriptor::PipeRead { reader, .. }) => reader
+            .read_limit(capacity as usize)
+            .await
+            .unwrap_or_default(),
+        Some(Preview1Descriptor::File(file)) => {
             let namespace = p1_namespace(caller);
-            let file = match p1_grant(&descriptor) {
-                Ok(file) => file,
-                Err(errno) => return errno,
-            };
-            let bytes = match wasi_fs::read(&namespace, file, offset, capacity as usize).await {
+            match p1_read_open_file(&namespace, &file, capacity as usize).await {
                 Ok(bytes) => bytes,
-                Err(error) => return p1_errno_from_fs(error),
-            };
-            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
-            return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
+                Err(errno) => return Ok(errno),
+            }
         }
-        _ => {}
-    }
-    let bytes = match p1_read_descriptor(caller, fd, capacity).await {
-        Ok(bytes) => bytes,
-        Err(errno) => return errno,
+        _ => p1_read_descriptor(caller, fd, capacity).await?,
     };
-    let mut copied = 0usize;
-    for (ptr, len) in layout.iovs {
-        if copied >= bytes.len() {
-            break;
-        }
-        let len = (len as usize).min(bytes.len() - copied);
-        let status = p1_write_memory(
-            caller,
-            memory,
-            GuestAddress::wasm32(ptr),
-            &bytes[copied..copied + len],
-        );
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        copied += len;
-    }
-    let copied = match u32::try_from(copied) {
-        Ok(copied) => copied,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    p1_write_u32(caller, memory, nread, copied)
+    // The read above awaited, so the guest's buffers are checked again as
+    // each is written.
+    memory
+        .write_iovs_from_bytes(&layout.iovs, &bytes, nread)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) fn p1_fd_prestat_get<CpuImpl, Net, StorageImpl>(
@@ -2180,11 +2368,15 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::Preopen { guest_name, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(guest_name_len) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::Preopen { guest_name, .. }) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(guest_name.len())
+    }) else {
         return p1::errno::BADF;
     };
-    let len = match u32::try_from(guest_name.len()) {
+    let len = match u32::try_from(guest_name_len) {
         Ok(len) => len,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -2209,8 +2401,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let Some(Preview1Descriptor::Preopen { guest_name, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(guest_name) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::Preopen { guest_name, .. }) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(guest_name.clone())
+    }) else {
         return p1::errno::BADF;
     };
     let bytes = guest_name.as_bytes();
@@ -2239,21 +2435,24 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(descriptor) = caller.data().descriptors.get(fd) else {
+    let Some((filetype, fdflags, rights)) = caller.data().descriptors.with(|descriptors| {
+        let descriptor = descriptors.get(fd)?;
+        let filetype = match descriptor {
+            Preview1Descriptor::Stdin { .. } => 2,
+            Preview1Descriptor::Stdout | Preview1Descriptor::Stderr => 2,
+            Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => 2,
+            Preview1Descriptor::Event(_) | Preview1Descriptor::Epoll(_) => 2,
+            Preview1Descriptor::Preopen { .. } => 3,
+            Preview1Descriptor::File(file) => p1_filetype(file.node().kind),
+            Preview1Descriptor::NullDevice => 2,
+            Preview1Descriptor::Socket(_) => 6,
+        };
+        let fdflags = descriptors.fdflags(fd).unwrap_or(0);
+        let rights = p1_descriptor_rights(descriptor);
+        Some((filetype, fdflags, rights))
+    }) else {
         return p1::errno::BADF;
     };
-    let filetype = match descriptor {
-        Preview1Descriptor::Stdin { .. } => 2,
-        Preview1Descriptor::Stdout | Preview1Descriptor::Stderr => 2,
-        Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => 2,
-        Preview1Descriptor::Event(_) | Preview1Descriptor::Epoll(_) => 2,
-        Preview1Descriptor::Preopen { .. } => 3,
-        Preview1Descriptor::File { descriptor, .. } => p1_filetype(descriptor.kind),
-        Preview1Descriptor::NullDevice => 2,
-        Preview1Descriptor::Socket(_) => 6,
-    };
-    let fdflags = caller.data().descriptors.fdflags(fd).unwrap_or(0);
-    let rights = p1_descriptor_rights(descriptor);
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -2274,22 +2473,25 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File { .. } | Preview1Descriptor::NullDevice)
-            if p1_file_fdflags_supported(fdflags) =>
-        {
-            caller.data_mut().descriptors.set_fdflags(fd, fdflags)
-        }
-        Some(Preview1Descriptor::Socket(_)) if p1_socket_fdflags_supported(fdflags) => {
-            caller.data_mut().descriptors.set_fdflags(fd, fdflags)
-        }
-        Some(_) if fdflags == 0 => caller.data_mut().descriptors.set_fdflags(fd, fdflags),
-        Some(_) => p1::errno::INVAL,
-        None => p1::errno::BADF,
-    }
+    caller
+        .data()
+        .descriptors
+        .with_mut(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::File(_) | Preview1Descriptor::NullDevice)
+                if p1_file_fdflags_supported(fdflags) =>
+            {
+                descriptors.set_fdflags(fd, fdflags)
+            }
+            Some(Preview1Descriptor::Socket(_)) if p1_socket_fdflags_supported(fdflags) => {
+                descriptors.set_fdflags(fd, fdflags)
+            }
+            Some(_) if fdflags == 0 => descriptors.set_fdflags(fd, fdflags),
+            Some(_) => p1::errno::INVAL,
+            None => p1::errno::BADF,
+        })
 }
 
-pub(super) fn p1_fd_fdstat_set_rights<CpuImpl, Net, StorageImpl>(
+pub(super) async fn p1_fd_fdstat_set_rights<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     rights_base: u64,
@@ -2301,57 +2503,93 @@ where
     StorageImpl: crate::Storage,
 {
     let requested = rights_base | rights_inheriting;
-    let Some(descriptor) = caller.data().descriptors.get(fd) else {
-        return p1::errno::BADF;
-    };
-    let current = p1_descriptor_rights(descriptor);
-    if requested & !current != 0 {
-        return p1::errno::NOTCAPABLE;
-    }
-    let lowered_flags = p1_descriptor_flags(requested, 0);
-    match caller.data_mut().descriptors.get_mut(fd) {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. }) => {
-            descriptor.flags &= lowered_flags;
-            p1::errno::SUCCESS
+    let file_to_tell = match caller.data().descriptors.with(|descriptors| {
+        let Some(descriptor) = descriptors.get(fd) else {
+            return Err(p1::errno::BADF);
+        };
+        let current = p1_descriptor_rights(descriptor);
+        if requested & !current != 0 {
+            return Err(p1::errno::NOTCAPABLE);
         }
-        Some(_) => p1::errno::SUCCESS,
-        None => p1::errno::BADF,
-    }
+        Ok(match descriptor {
+            Preview1Descriptor::File(file) => Some(file.clone()),
+            _ => None,
+        })
+    }) {
+        Ok(file) => file,
+        Err(errno) => return errno,
+    };
+    let lowered_flags = p1_descriptor_flags(requested, 0);
+    let file_offset = match file_to_tell {
+        Some(file) => Some(p1_tell_open_file(&file).await),
+        None => None,
+    };
+    caller.data().descriptors.with_mut(|descriptors| {
+        let Some(entry) = descriptors.get_entry_mut(fd) else {
+            return p1::errno::BADF;
+        };
+        match &mut entry.descriptor {
+            Preview1Descriptor::Preopen { descriptor, .. } => {
+                descriptor.flags &= lowered_flags;
+            }
+            // Rights belong to the descriptor in preview1, and a node handle
+            // carries the rights it was opened with, so a file descriptor whose
+            // rights narrow becomes its own open of the same node, at the offset
+            // and with the status flags it had; its duplicates keep the rights
+            // and the description they shared.
+            Preview1Descriptor::File(file) => {
+                let Some(offset) = file_offset else {
+                    return p1::errno::BADF;
+                };
+                let mut node = file.node().clone();
+                node.flags &= lowered_flags;
+                let narrowed = OpenFile::new_at(node, offset);
+                let own = Preview1DescriptorEntry::new(
+                    Preview1Descriptor::File(narrowed),
+                    entry.close_on_exec,
+                );
+                own.set_fdflags(entry.fdflags());
+                *entry = own;
+            }
+            _ => {}
+        }
+        p1::errno::SUCCESS
+    })
 }
 
 pub(super) async fn p1_fd_filestat_get<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     stat: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
     let stat = GuestAddress::wasm32(stat);
-    if matches!(
-        caller.data().descriptors.get(fd),
-        Some(Preview1Descriptor::NullDevice)
-    ) {
-        return p1_write_filestat(
-            caller,
-            stat,
-            p1_null_device_identity(),
-            p1_null_device_stat(),
-        );
-    }
-    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
-    else {
-        return p1::errno::BADF;
+    let inspected = caller.data().descriptors.with(|descriptors| {
+        let descriptor = descriptors.get(fd)?;
+        if let Some(synthetic) = p1_synthetic_descriptor_stat(descriptor) {
+            return Some(Ok(synthetic));
+        }
+        p1_fs_descriptor(Some(descriptor)).cloned().map(Err)
+    });
+    let fs_descriptor = match inspected {
+        Some(Ok((identity, stat_value))) => {
+            return p1_write_filestat(caller, stat, identity, stat_value).await;
+        }
+        Some(Err(descriptor)) => descriptor,
+        None => return Ok(p1::errno::BADF),
     };
-    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path, crate::Follow::No).await
-    {
-        Ok(stat) => stat,
-        Err(errno) => return errno,
+    let namespace = p1_namespace(caller);
+    let metadata = match wasi_fs::stat_descriptor(&namespace, &fs_descriptor).await {
+        Ok(metadata) => metadata,
+        Err(error) => return Ok(p1_errno_from_fs(error)),
     };
-    p1_write_filestat(caller, stat, identity, stat_value)
+    let identity = crate::object_identity(&metadata);
+    let stat_value = wasi_fs::descriptor_stat(&metadata);
+    p1_write_filestat(caller, stat, identity, stat_value).await
 }
 
 /// Resolves `path` below the directory `base` to its object identity and
@@ -2379,29 +2617,6 @@ where
     ))
 }
 
-/// Resolves a guest-absolute path through the store's namespace to its
-/// object identity and descriptor stat, following a final symbolic link
-/// when `follow` is set.
-pub(super) async fn p1_stat_absolute_path<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    path: &str,
-    follow: crate::Follow<'_>,
-) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32>
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let namespace = p1_namespace(caller);
-    let metadata = wasi_fs::stat_path(&namespace, path, follow)
-        .await
-        .map_err(p1_errno_from_fs)?;
-    Ok((
-        crate::object_identity(&metadata),
-        wasi_fs::descriptor_stat(&metadata),
-    ))
-}
-
 /// The namespace the store's filesystem calls resolve through, owned so a
 /// call can await on it while the store stays borrowable.
 pub(super) fn p1_namespace<CpuImpl, Net, StorageImpl>(
@@ -2421,28 +2636,10 @@ pub(super) fn p1_fs_descriptor<Net: ComponentHostNetwork>(
     descriptor: Option<&Preview1Descriptor<Net>>,
 ) -> Option<&FsDescriptor> {
     match descriptor {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. }) => Some(descriptor),
+        Some(Preview1Descriptor::Preopen { descriptor, .. }) => Some(descriptor),
+        Some(Preview1Descriptor::File(file)) => Some(file.node()),
         _ => None,
     }
-}
-
-/// Moves the offset of the open file `fd` after one of its own reads or
-/// writes.
-fn p1_set_file_offset<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    fd: i32,
-    next: u64,
-) where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
-    else {
-        panic!("Preview1 file descriptor {fd} disappeared during its own operation");
-    };
-    *offset = next;
 }
 
 pub(super) async fn p1_fd_filestat_set_size<CpuImpl, Net, StorageImpl>(
@@ -2455,11 +2652,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(descriptor) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::File(file)) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(file.node().clone())
+    }) else {
         return p1::errno::BADF;
     };
-    let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
     let file = match p1_grant(&descriptor) {
@@ -2483,7 +2683,11 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
+    let Some(descriptor) = caller
+        .data()
+        .descriptors
+        .with(|descriptors| p1_fs_descriptor(descriptors.get(fd)).cloned())
+    else {
         return p1::errno::BADF;
     };
     let target = match descriptor.grant_touch() {
@@ -2538,11 +2742,11 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    caller
-        .data()
-        .descriptors
-        .get(fd)
-        .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
+    caller.data().descriptors.with(|descriptors| {
+        descriptors
+            .get(fd)
+            .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
+    })
 }
 
 pub(super) async fn p1_fd_allocate<CpuImpl, Net, StorageImpl>(
@@ -2560,13 +2764,16 @@ where
         Some(end) => end,
         None => return p1::errno::OVERFLOW,
     };
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
+    let Some(descriptor) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::File(file)) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(file.node().clone())
+    }) else {
         return p1::errno::BADF;
     };
-    let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
-    let current = match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
+    let current = match wasi_fs::stat_descriptor(&namespace, &descriptor).await {
         Ok(metadata) => metadata.size,
         Err(error) => return p1_errno_from_fs(error),
     };
@@ -2621,11 +2828,15 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(descriptor) = caller.data().descriptors.get(fd) else {
-        return p1::errno::BADF;
-    };
-    let Some(descriptor) = p1_fs_descriptor(Some(descriptor)).cloned() else {
-        return p1::errno::SUCCESS;
+    let descriptor = match caller.data().descriptors.with(|descriptors| {
+        let Some(descriptor) = descriptors.get(fd) else {
+            return Err(p1::errno::BADF);
+        };
+        Ok(p1_fs_descriptor(Some(descriptor)).cloned())
+    }) {
+        Ok(Some(descriptor)) => descriptor,
+        Ok(None) => return p1::errno::SUCCESS,
+        Err(errno) => return errno,
     };
     let namespace = p1_namespace(caller);
     wasi_fs::sync(&namespace, &descriptor, data_only)
@@ -2640,40 +2851,65 @@ pub(super) async fn p1_fd_pread<CpuImpl, Net, StorageImpl>(
     iovs_len: u32,
     offset: u64,
     nread: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let layout = match p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(iovs), iovs_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
+    let layout = p1_read_iovs_with_byte_len(&memory, GuestAddress::wasm32(iovs), iovs_len).await?;
+    let Some(open) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::File(file)) = descriptors.get(fd) else {
+            return None;
+        };
+        Some(file.clone())
+    }) else {
+        return Ok(p1::errno::BADF);
     };
-    let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
-    else {
-        return p1::errno::BADF;
-    };
-    let descriptor = descriptor.clone();
     let namespace = p1_namespace(caller);
-    let file = match p1_grant(&descriptor) {
-        Ok(file) => file,
-        Err(errno) => return errno,
-    };
-    let bytes = match wasi_fs::read(&namespace, file, offset, layout.byte_len as usize).await {
+    let bytes = match p1_pread_open_file(&namespace, &open, offset, layout.byte_len as usize).await
+    {
         Ok(bytes) => bytes,
-        Err(error) => return p1_errno_from_fs(error),
+        Err(errno) => return Ok(errno),
     };
-    p1_write_iovs_from_bytes(
-        caller,
-        memory,
-        layout.iovs,
-        &bytes,
-        GuestAddress::wasm32(nread),
-    )
+    memory
+        .write_iovs_from_bytes(&layout.iovs, &bytes, GuestAddress::wasm32(nread))
+        .await?;
+    Ok(p1::errno::SUCCESS)
+}
+
+/// Positioned read on `open` at `offset`: bypasses and preserves the open
+/// file description's position lock and offset.
+async fn p1_pread_open_file<StorageImpl: crate::Storage>(
+    namespace: &Namespace<StorageImpl>,
+    open: &OpenFile<FsDescriptor>,
+    offset: u64,
+    capacity: usize,
+) -> Result<Bytes, i32> {
+    let grant = p1_grant(open.node())?;
+    wasi_fs::read(namespace, grant, offset, capacity)
+        .await
+        .map_err(p1_errno_from_fs)
+}
+
+/// Offset-advancing read on `open`: serialises with other offset-using
+/// operations via [`OpenFile::lock_position`] across the read and update.
+async fn p1_read_open_file<StorageImpl: crate::Storage>(
+    namespace: &Namespace<StorageImpl>,
+    open: &OpenFile<FsDescriptor>,
+    capacity: usize,
+) -> Result<Bytes, i32> {
+    let grant = p1_grant(open.node())?;
+    let mut position = open.lock_position().await;
+    let offset = position.get();
+    let bytes = wasi_fs::read(namespace, grant, offset, capacity)
+        .await
+        .map_err(p1_errno_from_fs)?;
+    position.set(offset.saturating_add(bytes.len() as u64));
+    Ok(bytes)
 }
 
 pub(super) async fn p1_fd_pwrite<CpuImpl, Net, StorageImpl>(
@@ -2683,78 +2919,97 @@ pub(super) async fn p1_fd_pwrite<CpuImpl, Net, StorageImpl>(
     iovs_len: u32,
     offset: u64,
     nwritten: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let nwritten = GuestAddress::wasm32(nwritten);
-    let layout = match p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(iovs), iovs_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
-    let written = match p1_write_file(caller, fd, memory, &layout, Some(offset)).await {
-        Ok(written) => written,
-        Err(errno) => return errno,
-    };
-    p1_write_u32(caller, memory, nwritten, written)
+    let layout = p1_read_iovs_with_byte_len(&memory, GuestAddress::wasm32(iovs), iovs_len).await?;
+    let written = p1_write_file(caller, fd, &memory, &layout, Some(offset)).await?;
+    memory.write_u32(nwritten, written).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 /// Writes the bytes `layout` names in guest memory to the file `fd`,
-/// gathered straight into the filesystem's destination: at `at` when
+/// gathered straight into the filesystem's destination, one chunk at a
+/// time: at `at` when
 /// given (`fd_pwrite`, which leaves the offset alone), else at the
 /// descriptor's offset or, in append mode, at the end of the file, moving
 /// the offset past them.
 async fn p1_write_file<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
-    memory: Preview1Memory,
+    memory: &Preview1AsyncMemory,
     layout: &Preview1IovLayout,
     at: Option<u64>,
-) -> Result<u32, i32>
+) -> Result<u32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(Preview1Descriptor::File {
-        descriptor,
-        offset,
-        fdflags,
-    }) = caller.data().descriptors.get(fd)
-    else {
-        return Err(p1::errno::BADF);
-    };
-    let position = match at {
-        Some(at) => WritePosition::At(at),
-        None if fdflags & P1_FDFLAG_APPEND != 0 => WritePosition::End,
-        None => WritePosition::At(*offset),
-    };
-    let descriptor = descriptor.clone();
-    let mut gather = Preview1Gather::new(memory, layout)?;
+    let (open, append) = caller.data().descriptors.with(|descriptors| {
+        let Some(Preview1Descriptor::File(file)) = descriptors.get(fd) else {
+            return Err(P1Stop::Errno(p1::errno::BADF));
+        };
+        let append = descriptors.fdflags(fd)? & P1_FDFLAG_APPEND != 0;
+        Ok((file.clone(), append))
+    })?;
     let namespace = p1_namespace(caller);
     let now_nanos = caller.data().now_nanos();
-    let (end, written) = {
-        let file =
-            wasi_fs::writable_file(&namespace, p1_grant(&descriptor)?).map_err(p1_errno_from_fs)?;
-        let mut file = ResolvedFileChunks {
-            file: &file,
-            now_nanos,
-        };
-        p1_write_gathered(&mut gather, position, &mut file)
-            .await
-            .map_err(p1_errno_from_fs)?
+    p1_write_open_file(&namespace, &open, append, memory, layout, at, now_nanos).await
+}
+
+/// Writes the bytes `layout` names through the open file description
+/// `open`, as [`p1_write_file`] describes; `append` is the description's
+/// `APPEND` status flag.
+async fn p1_write_open_file<StorageImpl: crate::Storage>(
+    namespace: &Namespace<StorageImpl>,
+    open: &OpenFile<FsDescriptor>,
+    append: bool,
+    memory: &Preview1AsyncMemory,
+    layout: &Preview1IovLayout,
+    at: Option<u64>,
+    now_nanos: u64,
+) -> Result<u32, P1Stop> {
+    let mut gather = Preview1Gather::new(memory, layout)?;
+    let file =
+        wasi_fs::writable_file(namespace, p1_grant(open.node())?).map_err(p1_errno_from_fs)?;
+    let mut resolved = ResolvedFileChunks {
+        file: &file,
+        now_nanos,
     };
-    if at.is_none() {
-        // After an append the offset is the end of the file the write
-        // reached, which another writer may have moved meanwhile.
-        p1_set_file_offset(caller, fd, end);
+    match at {
+        Some(at) => {
+            let (_end, written) =
+                p1_write_gathered(memory, &mut gather, WritePosition::At(at), &mut resolved)
+                    .await?
+                    .map_err(p1_errno_from_fs)?;
+            Ok(written)
+        }
+        None => {
+            let mut position = open.lock_position().await;
+            let write_position = if append {
+                WritePosition::End
+            } else {
+                WritePosition::At(position.get())
+            };
+            let (end, written) =
+                p1_write_gathered(memory, &mut gather, write_position, &mut resolved)
+                    .await?
+                    .map_err(p1_errno_from_fs)?;
+            // After an append the offset is the end of the file the write
+            // reached, which another writer may have moved meanwhile. Every
+            // descriptor sharing the open file description sees it.
+            position.set(end);
+            Ok(written)
+        }
     }
-    Ok(written)
 }
 
 /// A resolved file as what a gathered write lands in: each chunk goes
@@ -2769,20 +3024,27 @@ impl<StorageImpl: crate::Storage> Preview1ChunkedFile for ResolvedFileChunks<'_,
 
     async fn land(
         &mut self,
+        memory: &Preview1AsyncMemory,
         gather: &mut Preview1Gather,
         position: WritePosition,
         len: usize,
-    ) -> Result<u64, fs_types::ErrorCode> {
-        // The regions arrive in write order and cover the chunk exactly,
-        // which is the order `gather` hands its bytes out in.
-        wasi_fs::write_resolved_with(
-            self.file,
-            position,
-            len,
-            self.now_nanos,
-            |_, destination| gather.fill(destination),
-        )
-        .await
+    ) -> Result<Result<ChunkLanded, fs_types::ErrorCode>, GuestAccessError> {
+        // The chunk's pages are brought in before the write is staged, so
+        // waiting on swap holds up this write and never the file; each
+        // round checks them again in the poll that fills it.
+        gather.bring_in(memory, len).await?;
+        let write =
+            match wasi_fs::prepare_resolved_write(self.file, position, len, self.now_nanos).await {
+                Ok(write) => write,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+        let landed = gather.submit_staged(memory, write).await?;
+        Ok(landed.map_err(wasi_fs::fs_error_code).and_then(|landed| {
+            Ok(ChunkLanded {
+                end: landed.end().ok_or(fs_types::ErrorCode::Overflow)?,
+                len: landed.len,
+            })
+        }))
     }
 }
 
@@ -2793,99 +3055,81 @@ pub(super) async fn p1_fd_readdir<CpuImpl, Net, StorageImpl>(
     buf_len: u32,
     cookie: u64,
     bufused: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
     let (buf, bufused) = (GuestAddress::wasm32(buf), GuestAddress::wasm32(bufused));
-    let Some(descriptor) = p1_fs_descriptor(caller.data().descriptors.get(fd)).cloned() else {
-        return p1::errno::BADF;
+    let Some(descriptor) = caller
+        .data()
+        .descriptors
+        .with(|descriptors| p1_fs_descriptor(descriptors.get(fd)).cloned())
+    else {
+        return Ok(p1::errno::BADF);
     };
     let namespace = p1_namespace(caller);
-    let directory = match p1_grant(&descriptor) {
-        Ok(directory) => directory,
-        Err(errno) => return errno,
-    };
+    let directory = p1_grant(&descriptor)?;
     let entries = match wasi_fs::read_directory(&namespace, directory).await {
         Ok(entries) => entries,
-        Err(error) => return p1_errno_from_fs(error),
+        Err(error) => return Ok(p1_errno_from_fs(error)),
     };
-    p1_fd_readdir_entries(caller, entries, buf, buf_len, cookie, bufused)
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let records = p1_fd_readdir_records(&entries, buf_len, cookie)?;
+    memory.write_bytes(buf, &records).await?;
+    let used = u32::try_from(records.len()).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+    memory.write_u32(bufused, used).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
-pub(super) fn p1_fd_readdir_entries<CpuImpl, Net, StorageImpl>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    entries: Vec<fs_types::DirectoryEntry>,
-    buf: GuestAddress,
+/// The size of a preview1 `dirent` header.
+const P1_DIRENT_BYTES: usize = 24;
+
+/// The `dirent` records of `entries` from `cookie` on, each header followed
+/// by its name, cut off at `buf_len` bytes: what `fd_readdir` copies to the
+/// guest's buffer.
+///
+/// Preview 1 callers (`wasi-libc` `readdir`) read `bufused < buf_len` as
+/// end-of-directory, so whenever another entry exists the remaining bytes of
+/// `buf` must be filled, truncating the `dirent` header itself when fewer than
+/// `P1_DIRENT_BYTES` remain.
+pub(super) fn p1_fd_readdir_records(
+    entries: &[fs_types::DirectoryEntry],
     buf_len: u32,
     cookie: u64,
-    bufused: GuestAddress,
-) -> i32
-where
-    CpuImpl: Cpu + Clone,
-    Net: ComponentHostNetwork,
-    StorageImpl: crate::Storage,
-{
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let start_index = match usize::try_from(cookie) {
-        Ok(index) => index,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    let mut used = 0usize;
+) -> Result<Vec<u8>, i32> {
+    let start_index = usize::try_from(cookie).map_err(|_| p1::errno::OVERFLOW)?;
     let capacity = buf_len as usize;
+    let mut records = Vec::new();
     for (index, entry) in entries.iter().enumerate().skip(start_index) {
-        let dirent_len = 24usize;
+        let used = records.len();
         if used >= capacity {
             break;
         }
-        let next = match u64::try_from(index + 1) {
-            Ok(next) => next,
-            Err(_) => return p1::errno::OVERFLOW,
-        };
+        let next = u64::try_from(index + 1).map_err(|_| p1::errno::OVERFLOW)?;
         let name = entry.name.as_bytes();
-        if capacity - used < dirent_len {
+        // The header is `d_next`, `d_ino`, `d_namlen`, `d_type` and 3 padding bytes.
+        let mut header = [0_u8; P1_DIRENT_BYTES];
+        header[0..8].copy_from_slice(&next.to_le_bytes());
+        header[8..16].copy_from_slice(&next.to_le_bytes());
+        header[16..20]
+            .copy_from_slice(&u32::try_from(name.len()).unwrap_or(u32::MAX).to_le_bytes());
+        header[20] = p1_filetype_from_descriptor_type(entry.type_.clone());
+        let header_copied = (capacity - used).min(P1_DIRENT_BYTES);
+        records.extend_from_slice(&header[..header_copied]);
+        if header_copied < P1_DIRENT_BYTES {
             break;
         }
-        let dirent_ptr = buf.offset(used as u64);
-        let status = p1_write_u64(caller, memory, dirent_ptr, next)
-            .max(p1_write_u64(caller, memory, dirent_ptr.offset(8), next))
-            .max(p1_write_u32(
-                caller,
-                memory,
-                dirent_ptr.offset(16),
-                name.len().try_into().unwrap_or(u32::MAX),
-            ))
-            .max(p1_write_u8(
-                caller,
-                memory,
-                dirent_ptr.offset(20),
-                p1_filetype_from_descriptor_type(entry.type_.clone()),
-            ));
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        used += dirent_len;
-        let remaining = capacity - used;
-        let copied = remaining.min(name.len());
-        let name_ptr = buf.offset(used as u64);
-        let status = p1_write_memory(caller, memory, name_ptr, &name[..copied]);
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        used += copied;
+        let copied = (capacity - records.len()).min(name.len());
+        records.extend_from_slice(&name[..copied]);
         if copied < name.len() {
             break;
         }
     }
-    let used = match u32::try_from(used) {
-        Ok(used) => used,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    p1_write_u32(caller, memory, bufused, used)
+    Ok(records)
 }
 
 pub(super) fn p1_fd_renumber<CpuImpl, Net, StorageImpl>(
@@ -2907,69 +3151,102 @@ pub(super) async fn p1_fd_seek<CpuImpl, Net, StorageImpl>(
     offset: i64,
     whence: u8,
     new_offset: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let (descriptor, current) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File {
-            descriptor, offset, ..
-        }) => (descriptor.clone(), *offset),
-        Some(_) => return p1::errno::SPIPE,
-        None => return p1::errno::BADF,
+    let file = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::File(file)) => Ok(file.clone()),
+            Some(_) => Err(p1::errno::SPIPE),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(file) => file,
+        Err(errno) => return Ok(errno),
     };
+    let namespace = p1_namespace(caller);
+    let next = match p1_seek_open_file(&namespace, &file, offset, whence).await {
+        Ok(next) => next,
+        Err(errno) => return Ok(errno),
+    };
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    memory
+        .write_u64(GuestAddress::wasm32(new_offset), next)
+        .await?;
+    Ok(p1::errno::SUCCESS)
+}
+
+/// Seeks `open` under its position lock so concurrent reads, writes and seeks
+/// never observe or clobber an in-flight offset update.
+async fn p1_seek_open_file<StorageImpl: crate::Storage>(
+    namespace: &Namespace<StorageImpl>,
+    open: &OpenFile<FsDescriptor>,
+    offset: i64,
+    whence: u8,
+) -> Result<u64, i32> {
+    if whence > 2 {
+        return Err(p1::errno::INVAL);
+    }
+    let mut position = open.lock_position().await;
     let base = match whence {
         0 => 0,
-        1 => current,
-        2 => {
-            let namespace = p1_namespace(caller);
-            match wasi_fs::stat_path(&namespace, &descriptor.path, crate::Follow::No).await {
-                Ok(metadata) => metadata.size,
-                Err(error) => return p1_errno_from_fs(error),
-            }
-        }
-        _ => return p1::errno::INVAL,
+        1 => position.get(),
+        2 => match wasi_fs::stat_descriptor(namespace, open.node()).await {
+            Ok(metadata) => metadata.size,
+            Err(error) => return Err(p1_errno_from_fs(error)),
+        },
+        _ => unreachable!("validated whence <= 2"),
     };
     let next = if offset >= 0 {
         base.checked_add(offset as u64)
     } else {
         base.checked_sub(offset.unsigned_abs())
-    };
-    let Some(next) = next else {
-        return p1::errno::INVAL;
-    };
-    let Some(Preview1Descriptor::File { offset, .. }) = caller.data_mut().descriptors.get_mut(fd)
-    else {
-        return p1::errno::BADF;
-    };
-    *offset = next;
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    p1_write_u64(caller, memory, GuestAddress::wasm32(new_offset), next)
+    }
+    .ok_or(p1::errno::INVAL)?;
+    position.set(next);
+    Ok(next)
 }
 
-pub(super) fn p1_fd_tell<CpuImpl, Net, StorageImpl>(
+/// Reads `open`'s current offset after any in-flight offset update completes.
+async fn p1_tell_open_file(open: &OpenFile<FsDescriptor>) -> u64 {
+    open.lock_position().await.get()
+}
+
+pub(super) async fn p1_fd_tell<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
     offset_out: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let offset = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File { offset, .. }) => *offset,
-        Some(_) => return p1::errno::SPIPE,
-        None => return p1::errno::BADF,
+    let file = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::File(file)) => Ok(file.clone()),
+            Some(_) => Err(p1::errno::SPIPE),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(file) => file,
+        Err(errno) => return Ok(errno),
     };
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let offset = p1_tell_open_file(&file).await;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    p1_write_u64(caller, memory, GuestAddress::wasm32(offset_out), offset)
+    memory
+        .write_u64(GuestAddress::wasm32(offset_out), offset)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2983,49 +3260,34 @@ pub(super) async fn p1_path_open<CpuImpl, Net, StorageImpl>(
     rights: u64,
     fdflags: u16,
     opened_fd: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path) = if caller.data().wasix_abi {
-        match caller.data().resolve_wasix_path_base(fd, &path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return errno,
-        }
-    } else {
-        let base = match caller.data().descriptors.get(fd) {
-            Some(Preview1Descriptor::Preopen { descriptor, .. })
-            | Some(Preview1Descriptor::File { descriptor, .. })
-                if descriptor.kind == FsNodeKind::Directory =>
-            {
-                descriptor.clone()
-            }
-            Some(_) => return p1::errno::NOTDIR,
-            None => return p1::errno::BADF,
-        };
-        (base, path)
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    let (base, path) = match caller.data().resolve_preview1_open_base(fd, &path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return Ok(errno),
     };
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
     if !p1_file_fdflags_supported(fdflags) {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
     let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
     if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
-        descriptor_flags |= fs_types::DescriptorFlags::WRITE;
+        descriptor_flags |= FsDescriptorFlags::WRITE;
     }
     p1_path_open_resolved(
         caller,
-        memory,
+        &memory,
         base,
         path,
         path_flags,
@@ -3040,15 +3302,15 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn p1_path_open_resolved<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    memory: Preview1Memory,
+    memory: &Preview1AsyncMemory,
     base: FsDescriptor,
     path: String,
     path_flags: fs_types::PathFlags,
     open_flags: fs_types::OpenFlags,
-    descriptor_flags: fs_types::DescriptorFlags,
+    descriptor_flags: FsDescriptorFlags,
     fdflags: u16,
     opened_fd: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -3062,12 +3324,15 @@ where
                 .insert(Preview1Descriptor::NullDevice)
             {
                 Ok(fd) => fd,
-                Err(errno) => return errno,
+                Err(errno) => return Ok(errno),
             };
-            return p1_write_u32(caller, memory, GuestAddress::wasm32(opened_fd), fd);
+            memory
+                .write_u32(GuestAddress::wasm32(opened_fd), fd)
+                .await?;
+            return Ok(p1::errno::SUCCESS);
         }
         Ok(false) => {}
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     }
     let opened = match p1_open_descriptor_resolved(
         caller,
@@ -3080,20 +3345,20 @@ where
     .await
     {
         Ok(descriptor) => descriptor,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
-    let fd = match caller
-        .data_mut()
-        .descriptors
-        .insert(Preview1Descriptor::File {
-            descriptor: opened,
-            offset: 0,
-            fdflags,
-        }) {
+    let fd = match caller.data_mut().descriptors.insert_with_fdflags(
+        Preview1Descriptor::File(OpenFile::new(opened)),
+        false,
+        fdflags,
+    ) {
         Ok(fd) => fd,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
-    p1_write_u32(caller, memory, GuestAddress::wasm32(opened_fd), fd)
+    memory
+        .write_u32(GuestAddress::wasm32(opened_fd), fd)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) fn p1_open_null_device(
@@ -3123,7 +3388,7 @@ pub(super) async fn p1_open_descriptor_resolved<CpuImpl, Net, StorageImpl>(
     path_flags: fs_types::PathFlags,
     path: &str,
     open_flags: fs_types::OpenFlags,
-    descriptor_flags: fs_types::DescriptorFlags,
+    descriptor_flags: FsDescriptorFlags,
 ) -> Result<FsDescriptor, i32>
 where
     CpuImpl: Cpu + Clone,
@@ -3151,20 +3416,32 @@ pub(super) async fn p1_path_create_directory<CpuImpl, Net, StorageImpl>(
     fd: i32,
     path: u32,
     path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    Ok(p1_path_create_directory_at(caller, fd, &path).await)
+}
+
+async fn p1_path_create_directory_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3186,38 +3463,21 @@ pub(super) async fn p1_path_filestat_get<CpuImpl, Net, StorageImpl>(
     path: u32,
     path_len: u32,
     stat: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let stat = GuestAddress::wasm32(stat);
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
-        Ok(resolved) => resolved,
-        Err(errno) => return errno,
-    };
-    if absolute == WASIX_NULL_DEVICE_PATH {
-        return p1_write_filestat(
-            caller,
-            stat,
-            p1_null_device_identity(),
-            p1_null_device_stat(),
-        );
-    }
-    let (identity, stat_value) =
-        match p1_stat_below(caller, &base, p1_path_flags(flags), &path).await {
-            Ok(stat) => stat,
-            Err(errno) => return errno,
-        };
-    p1_write_filestat(caller, stat, identity, stat_value)
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    let (identity, stat_value) = caller.data().stat_preview1_path(fd, flags, &path).await?;
+    p1_write_filestat(caller, stat, identity, stat_value).await
 }
 
 #[expect(
@@ -3227,9 +3487,41 @@ where
 pub(super) async fn p1_path_filestat_set_times<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
-    _flags: u32,
+    flags: u32,
     path: u32,
     path_len: u32,
+    atim: u64,
+    mtim: u64,
+    fstflags: u16,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    Ok(p1_path_filestat_set_times_at(
+        caller,
+        fd,
+        p1_path_flags(flags),
+        &path,
+        atim,
+        mtim,
+        fstflags,
+    )
+    .await)
+}
+
+async fn p1_path_filestat_set_times_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    path_flags: fs_types::PathFlags,
+    path: &str,
     atim: u64,
     mtim: u64,
     fstflags: u16,
@@ -3239,26 +3531,10 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
-        Ok(resolved) => resolved,
-        Err(errno) => return errno,
-    };
-    let granted = match p1_grant(&base) {
-        Ok(granted) => granted,
-        Err(errno) => return errno,
-    };
-    let (access, modified, now_nanos) = p1_set_times_arguments(caller, atim, mtim, fstflags);
-    let namespace = p1_namespace(caller);
-    wasi_fs::set_times_at(&namespace, granted, &path, access, modified, now_nanos)
+    caller
+        .data()
+        .set_preview1_path_times(fd, path_flags, path, atim, mtim, fstflags)
         .await
-        .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
 
 #[expect(
@@ -3274,35 +3550,46 @@ pub(super) async fn p1_path_link<CpuImpl, Net, StorageImpl>(
     new_fd: i32,
     new_path: u32,
     new_path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let old_path = memory
+        .read_path(GuestAddress::wasm32(old_path), old_path_len)
+        .await?;
+    let new_path = memory
+        .read_path(GuestAddress::wasm32(new_path), new_path_len)
+        .await?;
+    Ok(p1_path_link_at(caller, old_fd, &old_path, new_fd, &new_path).await)
+}
+
+async fn p1_path_link_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    old_fd: i32,
+    old_path: &str,
+    new_fd: i32,
+    new_path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let old_path = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let new_path = match p1_read_path(caller, memory, GuestAddress::wasm32(new_path), new_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
     let status = caller.data().require_hardlink_authority();
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, &old_path) {
+    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, old_path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
     let (destination_base, new_path, _) =
-        match caller.data().resolve_preview1_path(new_fd, &new_path) {
+        match caller.data().resolve_preview1_path(new_fd, new_path) {
             Ok(resolved) => resolved,
             Err(errno) => return errno,
         };
@@ -3329,47 +3616,45 @@ pub(super) async fn p1_path_readlink<CpuImpl, Net, StorageImpl>(
     buf: u32,
     buf_len: u32,
     bufused: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
     let status = caller.data().require_symlink_read_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Ok(status);
     }
     let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
     let namespace = p1_namespace(caller);
     let base = match p1_grant(&base) {
         Ok(base) => base,
-        Err(errno) => return errno,
+        Err(errno) => return Ok(errno),
     };
     let target = match wasi_fs::readlink_at(&namespace, base, &path).await {
         Ok(target) => target,
-        Err(error) => return p1_errno_from_fs(error),
+        Err(error) => return Ok(p1_errno_from_fs(error)),
     };
     let bytes = target.as_bytes();
     let copied = (buf_len as usize).min(bytes.len());
-    let status = p1_write_memory(caller, memory, GuestAddress::wasm32(buf), &bytes[..copied]);
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    let copied = match u32::try_from(copied) {
-        Ok(copied) => copied,
-        Err(_) => return p1::errno::OVERFLOW,
-    };
-    p1_write_u32(caller, memory, GuestAddress::wasm32(bufused), copied)
+    memory
+        .write_bytes(GuestAddress::wasm32(buf), &bytes[..copied])
+        .await?;
+    let copied = u32::try_from(copied).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+    memory
+        .write_u32(GuestAddress::wasm32(bufused), copied)
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_path_remove_directory<CpuImpl, Net, StorageImpl>(
@@ -3377,20 +3662,32 @@ pub(super) async fn p1_path_remove_directory<CpuImpl, Net, StorageImpl>(
     fd: i32,
     path: u32,
     path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    Ok(p1_path_remove_directory_at(caller, fd, &path).await)
+}
+
+async fn p1_path_remove_directory_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3399,7 +3696,7 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::remove_directory_at(&namespace, granted, &path)
+    wasi_fs::remove_directory_at(&namespace, granted, &path, caller.data().now_nanos())
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3412,31 +3709,42 @@ pub(super) async fn p1_path_rename<CpuImpl, Net, StorageImpl>(
     new_fd: i32,
     new_path: u32,
     new_path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let old_path = memory
+        .read_path(GuestAddress::wasm32(old_path), old_path_len)
+        .await?;
+    let new_path = memory
+        .read_path(GuestAddress::wasm32(new_path), new_path_len)
+        .await?;
+    Ok(p1_path_rename_at(caller, old_fd, &old_path, new_fd, &new_path).await)
+}
+
+async fn p1_path_rename_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    old_fd: i32,
+    old_path: &str,
+    new_fd: i32,
+    new_path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let old_path = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let new_path = match p1_read_path(caller, memory, GuestAddress::wasm32(new_path), new_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, &old_path) {
+    let (source_base, old_path, _) = match caller.data().resolve_preview1_path(old_fd, old_path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
     let (destination_base, new_path, _) =
-        match caller.data().resolve_preview1_path(new_fd, &new_path) {
+        match caller.data().resolve_preview1_path(new_fd, new_path) {
             Ok(resolved) => resolved,
             Err(errno) => return errno,
         };
@@ -3463,29 +3771,40 @@ pub(super) async fn p1_path_symlink<CpuImpl, Net, StorageImpl>(
     fd: i32,
     new_path: u32,
     new_path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let target = memory
+        .read_path(GuestAddress::wasm32(old_path), old_path_len)
+        .await?;
+    let new_path = memory
+        .read_path(GuestAddress::wasm32(new_path), new_path_len)
+        .await?;
+    Ok(p1_path_symlink_at(caller, &target, fd, &new_path).await)
+}
+
+async fn p1_path_symlink_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    target: &str,
+    fd: i32,
+    new_path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let target = match p1_read_path(caller, memory, GuestAddress::wasm32(old_path), old_path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let new_path = match p1_read_path(caller, memory, GuestAddress::wasm32(new_path), new_path_len)
-    {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
     let status = caller.data().require_symlink_create_authority();
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (base, new_path, _) = match caller.data().resolve_preview1_path(fd, &new_path) {
+    let (base, new_path, _) = match caller.data().resolve_preview1_path(fd, new_path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3495,7 +3814,7 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::symlink_at(&namespace, granted, &target, &new_path, now_nanos)
+    wasi_fs::symlink_at(&namespace, granted, target, &new_path, now_nanos)
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3505,20 +3824,32 @@ pub(super) async fn p1_path_unlink_file<CpuImpl, Net, StorageImpl>(
     fd: i32,
     path: u32,
     path_len: u32,
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
+    };
+    let path = memory
+        .read_path(GuestAddress::wasm32(path), path_len)
+        .await?;
+    Ok(p1_path_unlink_file_at(caller, fd, &path).await)
+}
+
+async fn p1_path_unlink_file_at<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    path: &str,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let path = match p1_read_path(caller, memory, GuestAddress::wasm32(path), path_len) {
-        Ok(path) => path,
-        Err(_) => return p1::errno::FAULT,
-    };
-    let (base, path, _) = match caller.data().resolve_preview1_path(fd, &path) {
+    let (base, path, _) = match caller.data().resolve_preview1_path(fd, path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
@@ -3527,7 +3858,7 @@ where
         Ok(granted) => granted,
         Err(errno) => return errno,
     };
-    wasi_fs::unlink_file_at(&namespace, granted, &path)
+    wasi_fs::unlink_file_at(&namespace, granted, &path, caller.data().now_nanos())
         .await
         .map_or_else(p1_errno_from_fs, |()| p1::errno::SUCCESS)
 }
@@ -3583,33 +3914,31 @@ pub(super) async fn p1_poll_oneoff<CpuImpl, Net, StorageImpl>(
     events: u32,
     nsubscriptions: u32,
     nevents: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
     if nsubscriptions == 0 {
-        return p1::errno::INVAL;
+        return Ok(p1::errno::INVAL);
     }
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
 
     let (monotonic_now, system_now) =
         (caller.data().now_nanos(), caller.data().system_time_nanos());
-    let max_subscriptions = p1_subscription_limit(caller.data().descriptors.limit);
-    let parsed = match p1_read_subscriptions(
-        memory,
+    let max_subscriptions = p1_subscription_limit(caller.data().descriptors.limit());
+    let parsed = p1_read_subscriptions(
+        &memory,
         GuestAddress::wasm32(subscriptions),
         nsubscriptions,
         max_subscriptions,
         monotonic_now,
         system_now,
-    ) {
-        Ok(parsed) => parsed,
-        Err(errno) => return errno,
-    };
+    )
+    .await?;
 
     let ready = loop {
         // Arm every subscribed descriptor before testing any of them: a
@@ -3623,101 +3952,144 @@ where
             }
         }
 
-        let mut ready = Vec::new();
-        let mut earliest: Option<Duration> = None;
-
+        // Descriptor readiness is the only part of a pass that awaits, so
+        // it is resolved here and the pass itself stays a pure function of
+        // the subscriptions, their readiness and the two clocks.
+        let mut readiness = Vec::with_capacity(parsed.len());
         for subscription in &parsed {
-            match subscription {
-                P1Subscription::Failed {
-                    userdata,
-                    event_type,
-                    error,
-                } => ready.push(P1ReadyEvent {
-                    userdata: *userdata,
-                    error: *error,
-                    event_type: *event_type,
-                    nbytes: 0,
-                    fd_flags: 0,
-                }),
-                P1Subscription::Fd {
-                    userdata,
-                    event_type,
-                    fd,
-                } => {
-                    let readiness = p1_descriptor_readiness(caller, *fd, *event_type).await;
-                    if let Some(event) = p1_fd_event(*userdata, *event_type, readiness) {
-                        ready.push(event);
-                    }
+            readiness.push(match subscription {
+                P1Subscription::Fd { fd, event_type, .. } => {
+                    p1_descriptor_readiness(caller, *fd, *event_type).await
                 }
-                P1Subscription::Clock {
-                    userdata,
-                    monotonic,
-                    deadline_nanos,
-                } => {
-                    let now = if *monotonic {
-                        caller.data().now_nanos()
-                    } else {
-                        caller.data().system_time_nanos()
-                    };
-                    match p1_clock_progress(*userdata, *deadline_nanos, now) {
-                        P1ClockProgress::Elapsed(event) => ready.push(event),
-                        P1ClockProgress::Waiting(remaining) => {
-                            earliest = Some(
-                                earliest
-                                    .map_or(remaining, |current: Duration| current.min(remaining)),
-                            );
-                        }
+                P1Subscription::Clock { .. } | P1Subscription::Failed { .. } => {
+                    Ok(P1Readiness::Pending)
+                }
+            });
+        }
+        let pass = p1_poll_pass(
+            &parsed,
+            &readiness,
+            caller.data().now_nanos(),
+            caller.data().system_time_nanos(),
+        );
+
+        if !pass.ready.is_empty() {
+            break pass.ready;
+        }
+        if caller.data().has_deliverable_catch() {
+            return Ok(p1::errno::INTR);
+        }
+
+        // Nothing is ready and no deadline has expired: sleep until one
+        // of the armed descriptors makes progress, a caught signal arrives,
+        // or the earliest deadline arrives.
+        let timer = caller.data().timer();
+        let signals = caller.data().signals();
+        let active_handlers = caller.data().active_signal_handlers;
+        if p1_wait_step(&timer, &mut wait, pass.earliest, &signals, active_handlers).await {
+            return Ok(p1::errno::INTR);
+        }
+    };
+
+    // The wait above awaited, so the guest's pages are checked again here,
+    // in the poll that writes the events. Each record keeps the padding
+    // between its fields as the guest had it.
+    let event_size = P1_EVENT_SIZE as usize;
+    memory
+        .write(
+            GuestAddress::wasm32(events),
+            ready.len() * event_size,
+            |records| {
+                for (event, record) in ready.iter().zip(records.chunks_exact_mut(event_size)) {
+                    record[0..8].copy_from_slice(&event.userdata.to_le_bytes());
+                    record[8..10].copy_from_slice(&event.error.to_le_bytes());
+                    record[10] = event.event_type;
+                    record[16..24].copy_from_slice(&event.nbytes.to_le_bytes());
+                    record[24..26].copy_from_slice(&event.fd_flags.to_le_bytes());
+                }
+            },
+        )
+        .await?;
+    // Every event of `ready` is reported, and `ready` is bounded by the
+    // subscriptions the guest passed, which fit a `u32`.
+    let event_count = u32::try_from(ready.len()).map_err(|_| P1Stop::Errno(p1::errno::OVERFLOW))?;
+    memory
+        .write_u32(GuestAddress::wasm32(nevents), event_count)
+        .await?;
+    Ok(p1::errno::SUCCESS)
+}
+
+/// What one evaluation of a `poll_oneoff` subscription set found.
+struct P1PollPass {
+    /// The events to hand back to the guest; the call returns once this is
+    /// not empty.
+    ready: Vec<P1ReadyEvent>,
+    /// The time left until the earliest clock deadline that has not elapsed,
+    /// which bounds the next sleep; `None` when no clock is pending.
+    earliest: Option<Duration>,
+}
+
+/// One pass of the `poll_oneoff` wait loop over `subscriptions`.
+///
+/// `readiness` is index-aligned with `subscriptions` and holds the probed
+/// readiness of every `Fd` subscription (the other kinds ignore their
+/// entry); `monotonic_now` and `system_now` are the two clocks a `Clock`
+/// subscription is judged against.
+fn p1_poll_pass(
+    subscriptions: &[P1Subscription],
+    readiness: &[Result<P1Readiness, i32>],
+    monotonic_now: u64,
+    system_now: u64,
+) -> P1PollPass {
+    let mut pass = P1PollPass {
+        ready: Vec::new(),
+        earliest: None,
+    };
+    for (subscription, readiness) in subscriptions.iter().zip(readiness) {
+        match subscription {
+            P1Subscription::Failed {
+                userdata,
+                event_type,
+                error,
+            } => pass.ready.push(P1ReadyEvent {
+                userdata: *userdata,
+                error: *error,
+                event_type: *event_type,
+                nbytes: 0,
+                fd_flags: 0,
+            }),
+            P1Subscription::Fd {
+                userdata,
+                event_type,
+                ..
+            } => {
+                if let Some(event) = p1_fd_event(*userdata, *event_type, *readiness) {
+                    pass.ready.push(event);
+                }
+            }
+            P1Subscription::Clock {
+                userdata,
+                monotonic,
+                deadline_nanos,
+            } => {
+                let now = if *monotonic {
+                    monotonic_now
+                } else {
+                    system_now
+                };
+                match p1_clock_progress(*userdata, *deadline_nanos, now) {
+                    P1ClockProgress::Elapsed(event) => pass.ready.push(event),
+                    P1ClockProgress::Waiting(remaining) => {
+                        pass.earliest = Some(
+                            pass.earliest
+                                .map_or(remaining, |current| current.min(remaining)),
+                        );
                     }
                 }
             }
         }
-
-        if !ready.is_empty() {
-            break ready;
-        }
-
-        // Nothing is ready and no deadline has expired: sleep until one
-        // of the armed descriptors makes progress or the earliest
-        // deadline arrives.
-        let timer = caller.data().timer();
-        p1_wait_step(&timer, &mut wait, earliest).await;
-    };
-
-    let events = GuestAddress::wasm32(events);
-    let mut event_count = 0u32;
-    for event in &ready {
-        let event_ptr = events.offset(u64::from(event_count) * u64::from(P1_EVENT_SIZE));
-        let status = p1_write_u64(caller, memory, event_ptr, event.userdata)
-            .max(p1_write_u16(
-                caller,
-                memory,
-                event_ptr.offset(8),
-                event.error,
-            ))
-            .max(p1_write_u8(
-                caller,
-                memory,
-                event_ptr.offset(10),
-                event.event_type,
-            ))
-            .max(p1_write_u64(
-                caller,
-                memory,
-                event_ptr.offset(16),
-                event.nbytes,
-            ))
-            .max(p1_write_u16(
-                caller,
-                memory,
-                event_ptr.offset(24),
-                event.fd_flags,
-            ));
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        event_count += 1;
     }
-    p1_write_u32(caller, memory, GuestAddress::wasm32(nevents), event_count)
+    pass
 }
 
 /// Whether a clock subscription's deadline has arrived.
@@ -3791,30 +4163,28 @@ fn p1_subscription_limit(limit: DescriptorLimit) -> usize {
 /// clock timeouts at `monotonic_now` / `system_now`. A count above
 /// `max_subscriptions` is `EINVAL`, and the array must lie inside `memory`;
 /// both are checked before anything is collected for it.
-fn p1_read_subscriptions(
-    memory: Preview1Memory,
+async fn p1_read_subscriptions(
+    memory: &Preview1AsyncMemory,
     subscriptions: GuestAddress,
     nsubscriptions: u32,
     max_subscriptions: usize,
     monotonic_now: u64,
     system_now: u64,
-) -> Result<Vec<P1Subscription>, i32> {
+) -> Result<Vec<P1Subscription>, P1Stop> {
     if nsubscriptions as usize > max_subscriptions {
-        return Err(p1::errno::INVAL);
+        return Err(P1Stop::Errno(p1::errno::INVAL));
     }
     let mut parsed = Vec::with_capacity(nsubscriptions as usize);
     for index in 0..nsubscriptions {
         let subscription_ptr =
             subscriptions.offset(u64::from(index) * u64::from(P1_SUBSCRIPTION_SIZE));
-        let userdata = u64::from_le_bytes(p1_read_array(memory, subscription_ptr)?);
-        let [event_type] = p1_read_array(memory, subscription_ptr.offset(8))?;
+        let userdata = memory.read_u64(subscription_ptr).await?;
+        let event_type = memory.read_u8(subscription_ptr.offset(8)).await?;
         parsed.push(match event_type {
             P1_EVENTTYPE_CLOCK => {
-                let clock_id =
-                    u32::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(16))?);
-                let timeout =
-                    u64::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(24))?);
-                let flags = u16::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(40))?);
+                let clock_id = memory.read_u32(subscription_ptr.offset(16)).await?;
+                let timeout = memory.read_u64(subscription_ptr.offset(24)).await?;
+                let flags = memory.read_u16(subscription_ptr.offset(40)).await?;
                 if !matches!(clock_id, 0 | 1) {
                     P1Subscription::Failed {
                         userdata,
@@ -3840,7 +4210,7 @@ fn p1_read_subscriptions(
                 }
             }
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE => {
-                let fd = i32::from_le_bytes(p1_read_array(memory, subscription_ptr.offset(16))?);
+                let fd = memory.read_u32(subscription_ptr.offset(16)).await? as i32;
                 P1Subscription::Fd {
                     userdata,
                     event_type,
@@ -3857,19 +4227,234 @@ fn p1_read_subscriptions(
     Ok(parsed)
 }
 
-pub(super) fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
+pub(super) async fn p1_finish_async_call<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
-    signal: u32,
+    answer: Result<i32, P1Stop>,
 ) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    caller
-        .data_mut()
-        .request_exit(128u32.saturating_add(signal));
-    Err(wasmtime::Error::new(Preview1Exit))
+    let errno = p1_reply(answer)?;
+    wasix_deliver_pending_signals(caller).await?;
+    Ok(errno)
+}
+
+pub(super) async fn p1_finish_errno_call<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    errno: i32,
+) -> wasmtime::Result<i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    wasix_deliver_pending_signals(caller).await?;
+    Ok(errno)
+}
+
+pub(super) fn p1_caller_export<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    name: &str,
+) -> Option<wasmtime::Extern>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if let Some(export) = caller.get_export(name) {
+        return Some(export);
+    }
+    if let Some(instance) = caller.data().guest_instance {
+        return instance.get_export(&mut *caller, name);
+    }
+    #[cfg(test)]
+    {
+        caller
+            .data()
+            .test_exports
+            .iter()
+            .find(|(export_name, _)| export_name.as_ref() == name)
+            .map(|(_, export)| export.clone())
+    }
+    #[cfg(not(test))]
+    None
+}
+
+pub(super) fn p1_store_export<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    name: &str,
+) -> Option<wasmtime::Extern>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if let Some(instance) = store.data().guest_instance {
+        return instance.get_export(&mut *store, name);
+    }
+    #[cfg(test)]
+    {
+        store
+            .data()
+            .test_exports
+            .iter()
+            .find(|(export_name, _)| export_name.as_ref() == name)
+            .map(|(_, export)| export.clone())
+    }
+    #[cfg(not(test))]
+    None
+}
+
+fn missing_catch_fallback_stop(
+    signal: helios_unix::Signal,
+    thread_directed: bool,
+) -> Option<wasmtime::Error> {
+    match signal.default_action() {
+        helios_unix::DefaultSignalAction::Ignore | helios_unix::DefaultSignalAction::Continue => {
+            None
+        }
+        helios_unix::DefaultSignalAction::Terminate
+        | helios_unix::DefaultSignalAction::CoreDump
+        | helios_unix::DefaultSignalAction::Stop => {
+            if thread_directed {
+                Some(wasmtime::Error::new(WasixThreadSignalExit {
+                    signal: signal.raw(),
+                }))
+            } else {
+                Some(wasmtime::Error::new(Preview1SignalExit {
+                    signal: signal.raw(),
+                }))
+            }
+        }
+    }
+}
+
+/// Delivers pending signals at a host-call safe point when asyncify is idle,
+/// invoking the registered `callback_signal` export `(i32) -> ()` for caught
+/// signals and stopping the thread or process on fatal ones.
+pub(super) async fn wasix_deliver_pending_signals<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if !caller.data().asyncify.is_idle() {
+        if let Some(stop) = caller.data().signals().owed_stop() {
+            return Err(stop);
+        }
+        return Ok(());
+    }
+    while caller.data().asyncify.is_idle() {
+        let signals = caller.data().signals();
+        let active = caller.data().active_signal_handlers;
+        match signals.take_next_delivery(active) {
+            None => return Ok(()),
+            Some(WasixPendingDelivery::ThreadEnded) => {
+                return Err(wasmtime::Error::new(WasixThreadEnded));
+            }
+            Some(WasixPendingDelivery::TerminateThread(signal)) => {
+                return Err(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::TerminateProcess(signal)) => {
+                return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed,
+            }) => {
+                let handler = p1_caller_export(caller, &callback)
+                    .and_then(wasmtime::Extern::into_func)
+                    .and_then(|func| func.typed::<i32, ()>(&mut *caller).ok());
+                if let Some(handler) = handler {
+                    caller.data_mut().active_signal_handlers.insert(signal);
+                    let outcome = handler
+                        .call_async(&mut *caller, i32::from(signal.raw()))
+                        .await;
+                    caller.data_mut().active_signal_handlers.remove(signal);
+                    outcome?;
+                } else if let Some(stop) = missing_catch_fallback_stop(signal, thread_directed) {
+                    return Err(stop);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delivers pending signals on `store` after a top-level guest export returns
+/// cleanly with asyncify idle.
+pub(super) async fn wasix_deliver_pending_signals_on_store<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    interrupts: &StoreInterrupts<CpuImpl>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    while store.data().asyncify.is_idle() {
+        let signals = store.data().signals();
+        let active = store.data().active_signal_handlers;
+        match signals.take_next_delivery(active) {
+            None => return Ok(()),
+            Some(WasixPendingDelivery::ThreadEnded) => {
+                return Err(wasmtime::Error::new(WasixThreadEnded));
+            }
+            Some(WasixPendingDelivery::TerminateThread(signal)) => {
+                return Err(wasmtime::Error::new(WasixThreadSignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::TerminateProcess(signal)) => {
+                return Err(wasmtime::Error::new(Preview1SignalExit { signal }));
+            }
+            Some(WasixPendingDelivery::Catch {
+                signal,
+                callback,
+                thread_directed,
+            }) => {
+                let handler = p1_store_export(store, &callback)
+                    .and_then(wasmtime::Extern::into_func)
+                    .and_then(|func| func.typed::<i32, ()>(&mut *store).ok());
+                if let Some(handler) = handler {
+                    store.data_mut().active_signal_handlers.insert(signal);
+                    let turns = store.data().guest_turns();
+                    let outcome = interrupts
+                        .drive(
+                            turns.drive(handler.call_async(&mut *store, i32::from(signal.raw()))),
+                        )
+                        .await;
+                    store.data_mut().active_signal_handlers.remove(signal);
+                    outcome?;
+                } else if let Some(stop) = missing_catch_fallback_stop(signal, thread_directed) {
+                    return Err(stop);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn p1_proc_raise<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    signal: i32,
+) -> wasmtime::Result<i32>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if !(0..=31).contains(&signal) {
+        return Ok(p1::errno::INVAL);
+    }
+    if let Some(signal) = helios_unix::Signal::from_standard(signal as u8) {
+        caller.data().signal_state.raise(signal);
+    }
+    wasix_deliver_pending_signals(caller).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) fn p1_errno_from_wasmtime_error(error: &wasmtime::Error) -> i32 {
@@ -3879,6 +4464,14 @@ pub(super) fn p1_errno_from_wasmtime_error(error: &wasmtime::Error) -> i32 {
 }
 
 pub(super) fn p1_errno_from_program_exec_error(error: &ProgramExecError) -> i32 {
+    if matches!(
+        error.detail,
+        ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds
+            | ProgramExecErrorDetail::GuestMemoryAccessOverflow
+            | ProgramExecErrorDetail::InvalidProgramPathEncoding
+    ) {
+        return p1::errno::FAULT;
+    }
     match error.kind {
         ProgramExecErrorKind::InvalidBinary
         | ProgramExecErrorKind::MissingEntry
@@ -3899,7 +4492,38 @@ pub(super) async fn p1_sock_accept<CpuImpl, Net, StorageImpl>(
     fd: i32,
     fdflags: i32,
     fd_out: u32,
-) -> i32
+) -> Result<i32, P1Stop>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let accepted_fd = match p1_sock_accepted_fd(caller, fd, fdflags).await {
+        Ok(accepted_fd) => accepted_fd,
+        Err(errno) => return Ok(errno),
+    };
+    // The accept awaited, so the guest's page is checked again as it is
+    // written. A descriptor the guest never learned of is closed again.
+    let written = match p1_async_memory(caller) {
+        Some(memory) => memory
+            .write_u32(GuestAddress::wasm32(fd_out), accepted_fd)
+            .await
+            .map_err(P1Stop::from),
+        None => Err(P1Stop::Errno(p1::errno::FAULT)),
+    };
+    if written.is_err() {
+        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
+    }
+    written.map(|()| p1::errno::SUCCESS)
+}
+
+/// Accepts a connection on the listening socket `fd` and installs it as a
+/// descriptor, whose number it answers.
+async fn p1_sock_accepted_fd<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
+    fd: i32,
+    fdflags: i32,
+) -> Result<u32, i32>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -3907,63 +4531,49 @@ where
 {
     let fdflags = match u16::try_from(fdflags) {
         Ok(fdflags) if p1_socket_fdflags_supported(fdflags) => fdflags,
-        _ => return p1::errno::INVAL,
+        _ => return Err(p1::errno::INVAL),
     };
     let status = caller.data().require_tcp_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Err(status);
     }
-    let (listener, family) = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Listening {
-                listener, family, ..
-            },
-        ))) => (listener.id(), *family),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
-            return p1::errno::INVAL;
-        }
-        Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
-        Some(_) => return p1::errno::NOTSOCK,
-        None => return p1::errno::BADF,
-    };
+    let (listener, family) =
+        caller
+            .data()
+            .descriptors
+            .with(|descriptors| match descriptors.get(fd) {
+                Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+                    Some(UnixTcpSocket::Listening {
+                        listener, family, ..
+                    }) => Ok((listener.id(), family)),
+                    _ => Err(p1::errno::INVAL),
+                },
+                Some(_) => Err(p1::errno::NOTSOCK),
+                None => Err(p1::errno::BADF),
+            })?;
     let Some(service) = caller.data().runtime_state.network_service() else {
-        return p1::errno::NETDOWN;
+        return Err(p1::errno::NETDOWN);
     };
     let timeout = if p1_fdflags_nonblocking(fdflags) {
         0
     } else {
         u64::MAX
     };
-    let accepted = match service.tcp_accept(listener, timeout).await {
-        Ok(accepted) => accepted,
-        Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
-    };
-    let descriptor =
-        Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-            family,
-            stream: WasixOwnedTcpStream::new(service.clone(), accepted.stream),
-            peer_address: accepted.address,
-            peer_port: accepted.port,
-            options: WasixSocketOptions::default(),
-        }));
-    let accepted_fd = match caller
+    let accepted = service
+        .tcp_accept(listener, timeout)
+        .await
+        .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))?;
+    let descriptor = Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
+        family,
+        stream: OwnedTcpStream::new(crate::UnixNetwork::new(service.clone()), accepted.stream),
+        peer_address: accepted.address,
+        peer_port: accepted.port,
+        options: unix_socket_options::<Net>(),
+    }));
+    caller
         .data_mut()
         .descriptors
         .insert_with_fdflags(descriptor, false, fdflags)
-    {
-        Ok(fd) => fd,
-        Err(errno) => return errno,
-    };
-    let Some(memory) = p1_memory(caller) else {
-        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
-        return p1::errno::FAULT;
-    };
-    let status = p1_write_u32(caller, memory, GuestAddress::wasm32(fd_out), accepted_fd);
-    if status != p1::errno::SUCCESS {
-        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
-        return status;
-    }
-    p1::errno::SUCCESS
 }
 
 pub(super) fn p1_connected_tcp_stream<CpuImpl, Net, StorageImpl>(
@@ -3975,14 +4585,17 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { stream, .. },
-        ))) => Ok(stream.id()),
-        Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
-        Some(_) => Err(p1::errno::NOTSOCK),
-        None => Err(p1::errno::BADF),
-    }
+    caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+                Some(UnixTcpSocket::Connected { stream, .. }) => Ok(stream.id()),
+                _ => Err(p1::errno::INVAL),
+            },
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        })
 }
 
 pub(super) async fn p1_sock_recv<CpuImpl, Net, StorageImpl>(
@@ -3993,7 +4606,7 @@ pub(super) async fn p1_sock_recv<CpuImpl, Net, StorageImpl>(
     _ri_flags: u16,
     ro_datalen: u32,
     ro_flags: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -4028,14 +4641,14 @@ pub(super) async fn p1_sock_recv_inner<CpuImpl, Net, StorageImpl>(
     _ri_flags: u16,
     ro_datalen: u32,
     ro_flags: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let (ri_data, ro_datalen, ro_flags) = (
         GuestAddress::wasm32(ri_data),
@@ -4043,103 +4656,107 @@ where
         GuestAddress::wasm32(ro_flags),
     );
     let iovs_started = p1_kernel_profile_start(caller.data());
-    let layout = match p1_read_iovs_with_byte_len(memory, ri_data, ri_data_len) {
-        Ok(layout) => layout,
-        Err(errno) => return errno,
-    };
+    let layout = p1_read_iovs_with_byte_len(&memory, ri_data, ri_data_len).await?;
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_iovs", iovs_started);
     let capacity = layout.byte_len;
-    let fdflags = match caller.data().descriptors.fdflags(fd) {
-        Ok(fdflags) => fdflags,
-        Err(errno) => return errno,
-    };
-    if matches!(
-        caller.data().descriptors.get(fd),
-        Some(Preview1Descriptor::Socket(
-            WasixSocketDescriptor::Pair { .. }
-        ))
-    ) {
-        if capacity == 0 {
-            let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &[], ro_datalen);
-            if status != p1::errno::SUCCESS {
-                return status;
-            }
-            return p1_write_u16(caller, memory, ro_flags, 0);
-        }
-        if p1_fdflags_nonblocking(fdflags) {
-            let bytes = match caller
-                .data_mut()
-                .try_read_socket_pair(fd, capacity as usize)
-            {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => return p1::errno::AGAIN,
-                Err(errno) => return errno,
-            };
-            let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ro_datalen);
-            if status != p1::errno::SUCCESS {
-                return status;
-            }
-            return p1_write_u16(caller, memory, ro_flags, 0);
-        }
-        let bytes = match caller
-            .data_mut()
-            .read_socket_pair(fd, capacity as usize)
-            .await
-        {
-            Ok(bytes) => bytes,
-            Err(errno) => return errno,
-        };
-        let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ro_datalen);
-        if status != p1::errno::SUCCESS {
-            return status;
-        }
-        return p1_write_u16(caller, memory, ro_flags, 0);
+    let fdflags = caller.data().descriptors.fdflags(fd)?;
+    enum RecvTarget<Stream> {
+        Pair,
+        Tcp(Stream),
     }
-    let stream = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { stream, .. },
-        ))) => stream.id(),
-        Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
-        Some(_) => return p1::errno::NOTSOCK,
-        None => return p1::errno::BADF,
+    let target = match caller
+        .data()
+        .descriptors
+        .with(|descriptors| match descriptors.get(fd) {
+            Some(Preview1Descriptor::Socket(socket)) if socket.is_pair() => Ok(RecvTarget::Pair),
+            Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+                Some(UnixTcpSocket::Connected { stream, .. }) => Ok(RecvTarget::Tcp(stream.id())),
+                _ => Err(p1::errno::INVAL),
+            },
+            Some(_) => Err(p1::errno::NOTSOCK),
+            None => Err(p1::errno::BADF),
+        }) {
+        Ok(target) => target,
+        Err(errno) => return Ok(errno),
+    };
+    let stream = match target {
+        RecvTarget::Pair => {
+            let bytes = caller
+                .data_mut()
+                .recv_socket_pair(
+                    fd,
+                    capacity as usize,
+                    p1_fdflags_nonblocking(fdflags),
+                    false,
+                )
+                .await?;
+            return p1_write_received(&memory, &layout.iovs, &bytes, ro_datalen, ro_flags).await;
+        }
+        RecvTarget::Tcp(stream) => stream,
     };
     let status = caller.data().require_tcp_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Ok(status);
     }
     let Some(service) = caller.data().runtime_state.network_service() else {
-        return p1::errno::NETDOWN;
+        return Ok(p1::errno::NETDOWN);
     };
     let timeout = if p1_fdflags_nonblocking(fdflags) {
         0
     } else {
         u64::MAX
     };
-    let ranges = match p1_iovs_memory_ranges(memory, &layout.iovs) {
-        Ok(ranges) => ranges,
-        Err(errno) => return errno,
-    };
-    let buffer = crate::RegisteredTcpReadBuffer::new(memory.base, &ranges);
+    // The stack copies straight out of its receive queue into the guest's
+    // buffers, on this call's own poll, each page checked present in the
+    // step that writes it.
+    let ranges = memory.iov_ranges(&layout.iovs)?;
+    let mut buffer = memory.tcp_receive_buffer(&ranges);
     let service_started = p1_kernel_profile_start(caller.data());
-    let bytes = match service.tcp_read_into(stream, buffer, timeout).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => 0,
-        Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
-    };
+    let received = p1_tcp_received(service.tcp_read_into(stream, &mut buffer, timeout).await);
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_tcp_read", service_started);
+    let received = match received? {
+        Ok(received) => received,
+        Err(error) => return Ok(p1_errno_from_tcp_error_for_fdflags(error, fdflags)),
+    };
     let write_started = p1_kernel_profile_start(caller.data());
-    let status = p1_write_u32(
-        caller,
-        memory,
-        ro_datalen,
-        u32::try_from(bytes).unwrap_or_else(|_| panic!("TCP receive byte count exceeds u32")),
-    );
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    let status = p1_write_u16(caller, memory, ro_flags, 0);
+    memory.write_u32(ro_datalen, received).await?;
+    memory.write_u16(ro_flags, 0).await?;
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_write_iovs", write_started);
-    status
+    Ok(p1::errno::SUCCESS)
+}
+
+/// The byte count a read into a guest's registered buffer delivered, or
+/// the stream's error for the caller to answer with its errno; a buffer
+/// page that could not come back from swap traps the guest.
+pub(super) fn p1_tcp_received(
+    read: Result<crate::TcpReadInto, crate::TcpError>,
+) -> Result<Result<u32, crate::TcpError>, P1Stop> {
+    let received = match read {
+        Ok(crate::TcpReadInto::Data(received)) => received,
+        Ok(crate::TcpReadInto::Eof) => 0,
+        Ok(crate::TcpReadInto::PageLost(error)) => return Err(P1Stop::Trap(error)),
+        Err(error) => return Ok(Err(error)),
+    };
+    // The buffer's capacity is the iovecs' sum, which fits a `u32`.
+    Ok(Ok(u32::try_from(received).expect(
+        "a TCP read delivers no more than its buffer, whose length fits a u32",
+    )))
+}
+
+/// Hands a receive's `bytes` to the guest: scattered over its buffers, the
+/// count in `ro_datalen`, and no message flags.
+pub(super) async fn p1_write_received(
+    memory: &Preview1AsyncMemory,
+    iovs: &[(u32, u32)],
+    bytes: &[u8],
+    ro_datalen: GuestAddress,
+    ro_flags: GuestAddress,
+) -> Result<i32, P1Stop> {
+    memory
+        .write_iovs_from_bytes(iovs, bytes, ro_datalen)
+        .await?;
+    memory.write_u16(ro_flags, 0).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_sock_send<CpuImpl, Net, StorageImpl>(
@@ -4149,7 +4766,7 @@ pub(super) async fn p1_sock_send<CpuImpl, Net, StorageImpl>(
     si_data_len: u32,
     _si_flags: u16,
     so_datalen: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -4174,69 +4791,59 @@ pub(super) async fn p1_sock_send_inner<CpuImpl, Net, StorageImpl>(
     si_data_len: u32,
     _si_flags: u16,
     so_datalen: u32,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let (si_data, so_datalen) = (
         GuestAddress::wasm32(si_data),
         GuestAddress::wasm32(so_datalen),
     );
-    let mut gather = match p1_read_iovs_with_byte_len(memory, si_data, si_data_len)
-        .and_then(|layout| Preview1Gather::new(memory, &layout))
+    let layout = p1_read_iovs_with_byte_len(&memory, si_data, si_data_len).await?;
+    let mut gather = Preview1Gather::new(&memory, &layout)?;
+    let descriptor = caller.data().descriptors.get_cloned(fd);
+    if let Some(Preview1Descriptor::Socket(socket)) = &descriptor
+        && let Some(writer) = socket.pair_writer()
     {
-        Ok(gather) => gather,
-        Err(errno) => return errno,
-    };
-    let descriptor = caller.data().descriptors.get(fd).cloned();
-    if let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) = descriptor
-    {
-        let fdflags = match caller.data().descriptors.fdflags(fd) {
-            Ok(fdflags) => fdflags,
-            Err(errno) => return errno,
-        };
-        let written = match p1_send_gathered(&mut gather, |chunk| {
+        let fdflags = caller.data().descriptors.fdflags(fd)?;
+        let written = p1_send_gathered(&memory, &mut gather, |chunk| {
             p1_send_to_socketpair(&writer, chunk, fdflags)
         })
-        .await
-        {
-            Ok(written) => written,
-            Err(errno) => return errno,
-        };
-        return p1_write_u32(caller, memory, so_datalen, written);
+        .await?;
+        memory.write_u32(so_datalen, written).await?;
+        return Ok(p1::errno::SUCCESS);
     }
-    let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-        stream,
-        ..
-    }))) = &descriptor
-    else {
-        return p1_connected_tcp_stream(caller, fd)
+    let Some(stream_id) = (match &descriptor {
+        Some(Preview1Descriptor::Socket(socket)) => match socket.tcp_state() {
+            Some(UnixTcpSocket::Connected { stream, .. }) => Some(stream.id()),
+            _ => None,
+        },
+        _ => None,
+    }) else {
+        return Ok(p1_connected_tcp_stream(caller, fd)
             .err()
-            .unwrap_or(p1::errno::INVAL);
+            .unwrap_or(p1::errno::INVAL));
     };
     let status = caller.data().require_tcp_authority();
     if status != p1::errno::SUCCESS {
-        return status;
+        return Ok(status);
     }
     let Some(service) = caller.data().runtime_state.network_service() else {
-        return p1::errno::NETDOWN;
+        return Ok(p1::errno::NETDOWN);
     };
-    let fdflags = match caller.data().descriptors.fdflags(fd) {
-        Ok(fdflags) => fdflags,
-        Err(errno) => return errno,
-    };
+    let fdflags = caller.data().descriptors.fdflags(fd)?;
     let timeout = if p1_fdflags_nonblocking(fdflags) {
         0
     } else {
         u64::MAX
     };
-    let written = match p1_send_gathered(&mut gather, |chunk| {
-        let (service, stream) = (&service, stream.id());
+    let written = p1_send_gathered(&memory, &mut gather, |chunk| {
+        let (service, stream) = (&service, stream_id);
         async move {
             service
                 .tcp_write_all_bytes(stream, Bytes::from(chunk), timeout)
@@ -4244,12 +4851,9 @@ where
                 .map_err(|error| p1_errno_from_tcp_error_for_fdflags(error, fdflags))
         }
     })
-    .await
-    {
-        Ok(written) => written,
-        Err(errno) => return errno,
-    };
-    p1_write_u32(caller, memory, so_datalen, written)
+    .await?;
+    memory.write_u32(so_datalen, written).await?;
+    Ok(p1::errno::SUCCESS)
 }
 
 pub(super) async fn p1_sock_shutdown<CpuImpl, Net, StorageImpl>(
@@ -4265,73 +4869,72 @@ where
     if how == 0 || how & !P1_SDFLAGS_SUPPORTED != 0 {
         return p1::errno::INVAL;
     }
-    let descriptor = caller.data().descriptors.get(fd).cloned();
+    let descriptor = caller.data().descriptors.get_cloned(fd);
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { .. },
-        ))) => {
-            let status = caller.data().require_tcp_authority();
-            if status != p1::errno::SUCCESS {
-                return status;
+        Some(Preview1Descriptor::Socket(socket)) => {
+            if let Some(tcp) = socket.tcp_state() {
+                if !matches!(tcp, UnixTcpSocket::Connected { .. }) {
+                    return p1::errno::INVAL;
+                }
+                let status = caller.data().require_tcp_authority();
+                if status != p1::errno::SUCCESS {
+                    return status;
+                }
+                if caller.data().runtime_state.network_service().is_none() {
+                    return p1::errno::NETDOWN;
+                }
+                // Replacing the state drops this socket's handle, and the
+                // stream is retired once the last duplicate is gone.
+                socket
+                    .with_tcp_mut(|slot| {
+                        if !matches!(slot, UnixTcpSocket::Connected { .. }) {
+                            return p1::errno::INVAL;
+                        }
+                        let options = *slot.options();
+                        *slot = UnixTcpSocket::Unconnected {
+                            family: slot.family(),
+                            options,
+                        };
+                        p1::errno::SUCCESS
+                    })
+                    .unwrap_or(p1::errno::INVAL)
+            } else if let Some(udp) = socket.udp_state() {
+                if !matches!(udp, UnixUdpSocket::Bound { .. }) {
+                    return p1::errno::INVAL;
+                }
+                let status = caller.data().require_udp_authority();
+                if status != p1::errno::SUCCESS {
+                    return status;
+                }
+                if caller.data().runtime_state.network_service().is_none() {
+                    return p1::errno::NETDOWN;
+                }
+                // Replacing the state drops this socket's handle, and the
+                // socket is retired once the last duplicate is gone.
+                socket
+                    .with_udp_mut(|slot| {
+                        if !matches!(slot, UnixUdpSocket::Bound { .. }) {
+                            return p1::errno::INVAL;
+                        }
+                        let options = *slot.options();
+                        *slot = UnixUdpSocket::Unbound {
+                            family: slot.family(),
+                            options,
+                        };
+                        p1::errno::SUCCESS
+                    })
+                    .unwrap_or(p1::errno::INVAL)
+            } else if let Some((reader, writer)) = socket.pair_ends() {
+                if how & P1_SDFLAGS_RD != 0 {
+                    reader.close();
+                }
+                if how & P1_SDFLAGS_WR != 0 {
+                    writer.close();
+                }
+                p1::errno::SUCCESS
+            } else {
+                p1::errno::INVAL
             }
-            if caller.data().runtime_state.network_service().is_none() {
-                return p1::errno::NETDOWN;
-            }
-            let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(slot))) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                return p1::errno::BADF;
-            };
-            // Replacing the slot drops this descriptor's handle, and the
-            // stream is retired once the last one is gone.
-            let options = *slot.options();
-            *slot = WasixTcpSocket::Unconnected {
-                family: slot.family(),
-                options,
-            };
-            p1::errno::SUCCESS
-        }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
-            ..
-        }))) => {
-            let status = caller.data().require_udp_authority();
-            if status != p1::errno::SUCCESS {
-                return status;
-            }
-            if caller.data().runtime_state.network_service().is_none() {
-                return p1::errno::NETDOWN;
-            }
-            let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(slot))) =
-                caller.data_mut().descriptors.get_mut(fd)
-            else {
-                return p1::errno::BADF;
-            };
-            // Replacing the slot drops this descriptor's handle, and the
-            // socket is retired once the last one is gone.
-            let options = *slot.options();
-            *slot = WasixUdpSocket::Unbound {
-                family: slot.family(),
-                options,
-            };
-            p1::errno::SUCCESS
-        }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-            ..
-        }))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
-            reader, writer, ..
-        })) => {
-            if how & P1_SDFLAGS_RD != 0 {
-                reader.close();
-            }
-            if how & P1_SDFLAGS_WR != 0 {
-                writer.close();
-            }
-            p1::errno::SUCCESS
         }
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -4457,17 +5060,21 @@ pub(super) enum RoutedOutput {
 pub(super) async fn p1_write_descriptor<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     fd: i32,
-    memory: Preview1Memory,
+    memory: &Preview1AsyncMemory,
     layout: &Preview1IovLayout,
-) -> Result<u32, i32>
+) -> Result<u32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    // A file takes the guest's bytes straight into its own destination;
-    // every other sink takes them gathered, one bounded chunk at a time.
-    if let Some(Preview1Descriptor::File { .. }) = caller.data().descriptors.get(fd) {
+    // Every sink takes the guest's bytes gathered, one bounded chunk at a
+    // time.
+    if caller
+        .data()
+        .descriptors
+        .with(|descriptors| matches!(descriptors.get(fd), Some(Preview1Descriptor::File(_))))
+    {
         return p1_write_file(caller, fd, memory, layout, None).await;
     }
     // A descriptor whose sink is a bounded channel blocks the guest while
@@ -4482,13 +5089,13 @@ where
     let mut written = 0_u32;
     // An empty write still reaches the sink once.
     loop {
-        let chunk = gather.next_chunk().unwrap_or_default();
+        let chunk = gather.next_chunk(memory).await?.unwrap_or_default();
         let taken = match p1_write_sink_chunk(caller, fd, &chunk, nonblocking).await {
             Ok(taken) => taken,
             // What an earlier chunk wrote stands; the guest meets the
             // refusal on its next call.
             Err(_) if written > 0 => break,
-            Err(errno) => return Err(errno),
+            Err(errno) => return Err(P1Stop::Errno(errno)),
         };
         // A count above `u32::MAX` cannot arise: the iovecs' sum fits it.
         written += taken;
@@ -4512,7 +5119,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(fd) {
+    match caller.data().descriptors.get_cloned(fd) {
         Some(Preview1Descriptor::Stdout) => {
             p1_write_stdio(
                 caller,
@@ -4531,8 +5138,7 @@ where
             )
             .await
         }
-        Some(Preview1Descriptor::PipeWrite { writer }) => {
-            let writer = writer.clone();
+        Some(Preview1Descriptor::PipeWrite { writer, .. }) => {
             if nonblocking {
                 match writer.try_write(Bytes::copy_from_slice(bytes)) {
                     crate::TryWrite::Written => {}
@@ -4556,7 +5162,10 @@ where
                     .try_into()
                     .unwrap_or_else(|_| panic!("eventfd write length was checked")),
             );
-            event.write(increment)?;
+            event.write(increment).map_err(|error| match error {
+                helios_unix::EventError::InvalidIncrement => p1::errno::INVAL,
+                helios_unix::EventError::WouldBlock => p1::errno::AGAIN,
+            })?;
             Ok(8)
         }
         Some(Preview1Descriptor::NullDevice) => {
@@ -4577,11 +5186,14 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => Ok(caller.data_mut().read_stdin(capacity).await),
-        Some(Preview1Descriptor::PipeRead { .. }) => {
-            caller.data_mut().read_pipe(fd, capacity as usize).await
+    match caller.data().descriptors.get_cloned(fd) {
+        Some(Preview1Descriptor::Stdin { .. }) => {
+            Ok(caller.data_mut().read_stdin(fd, capacity).await)
         }
+        Some(Preview1Descriptor::PipeRead { reader, .. }) => Ok(reader
+            .read_limit(capacity as usize)
+            .await
+            .unwrap_or_default()),
         Some(Preview1Descriptor::Event(event)) => {
             if capacity < 8 {
                 return Err(p1::errno::INVAL);
@@ -4589,22 +5201,9 @@ where
             Ok(Bytes::copy_from_slice(&event.read().await.to_le_bytes()))
         }
         Some(Preview1Descriptor::NullDevice) => Ok(Bytes::new()),
-        Some(Preview1Descriptor::File {
-            descriptor, offset, ..
-        }) => {
-            let descriptor = descriptor.clone();
-            let offset = *offset;
+        Some(Preview1Descriptor::File(file)) => {
             let namespace = p1_namespace(caller);
-            let bytes = wasi_fs::read(
-                &namespace,
-                p1_grant(&descriptor)?,
-                offset,
-                capacity as usize,
-            )
-            .await
-            .map_err(p1_errno_from_fs)?;
-            p1_set_file_offset(caller, fd, offset.saturating_add(bytes.len() as u64));
-            Ok(bytes)
+            p1_read_open_file(&namespace, &file, capacity as usize).await
         }
         Some(_) => Err(p1::errno::BADF),
         None => Err(p1::errno::BADF),
@@ -4636,18 +5235,18 @@ pub(super) fn p1_open_flags(flags: u16) -> fs_types::OpenFlags {
     result
 }
 
-pub(super) fn p1_descriptor_flags(rights: u64, fdflags: u16) -> fs_types::DescriptorFlags {
-    let mut flags = fs_types::DescriptorFlags::empty();
+pub(super) fn p1_descriptor_flags(rights: u64, fdflags: u16) -> FsDescriptorFlags {
+    let mut flags = FsDescriptorFlags::empty();
     if rights & P1_RIGHT_FD_READ != 0 || rights & P1_RIGHT_FD_READDIR != 0 {
-        flags |= fs_types::DescriptorFlags::READ;
+        flags |= FsDescriptorFlags::READ;
     }
     if rights & (P1_RIGHT_FD_WRITE | P1_RIGHT_FD_FILESTAT_SET_SIZE | P1_RIGHT_FD_FILESTAT_SET_TIMES)
         != 0
     {
-        flags |= fs_types::DescriptorFlags::WRITE;
+        flags |= FsDescriptorFlags::WRITE;
     }
     if rights & P1_RIGHT_PATH_MUTATE_MASK != 0 {
-        flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+        flags |= FsDescriptorFlags::MUTATE_DIRECTORY;
     }
     let _ = fdflags;
     flags
@@ -4672,19 +5271,19 @@ pub(super) fn p1_fdflags_nonblocking(fdflags: u16) -> bool {
 /// local id is the inode. Programs that de-duplicate files by `(dev, ino)` —
 /// `cp -r`, `find`, `rsync`, tar — need both to be real and stable, so no
 /// field here may be a placeholder zero.
-pub(super) fn p1_write_filestat<CpuImpl, Net, StorageImpl>(
+pub(super) async fn p1_write_filestat<CpuImpl, Net, StorageImpl>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     stat: GuestAddress,
     identity: crate::ObjectIdentity,
     value: fs_types::DescriptorStat,
-) -> i32
+) -> Result<i32, P1Stop>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
+    let Some(memory) = p1_async_memory(caller) else {
+        return Ok(p1::errno::FAULT);
     };
     let atim = value
         .data_access_timestamp
@@ -4713,30 +5312,28 @@ where
                 .saturating_add(u64::from(datetime.nanoseconds))
         })
         .unwrap_or(0);
-    p1_write_u64(caller, memory, stat, identity.domain().raw())
-        .max(p1_write_u64(
-            caller,
-            memory,
-            stat.offset(8),
-            identity.local(),
-        ))
-        .max(p1_write_u8(
-            caller,
-            memory,
-            stat.offset(16),
-            p1_filetype_from_descriptor_type(value.type_),
-        ))
-        .max(p1_write_u64(
-            caller,
-            memory,
-            stat.offset(24),
-            value.link_count,
-        ))
-        .max(p1_write_u64(caller, memory, stat.offset(32), value.size))
-        .max(p1_write_u64(caller, memory, stat.offset(40), atim))
-        .max(p1_write_u64(caller, memory, stat.offset(48), mtim))
-        .max(p1_write_u64(caller, memory, stat.offset(56), ctim))
+    // The `filestat` record: `dev`, `ino`, the file type (its padding is
+    // the guest's own), then `nlink`, `size` and the three times.
+    memory
+        .write(stat, P1_FILESTAT_SIZE, |record| {
+            let mut field = |offset: usize, bytes: &[u8]| {
+                record[offset..offset + bytes.len()].copy_from_slice(bytes);
+            };
+            field(0, &identity.domain().raw().to_le_bytes());
+            field(8, &identity.local().to_le_bytes());
+            field(16, &[p1_filetype_from_descriptor_type(value.type_)]);
+            field(24, &value.link_count.to_le_bytes());
+            field(32, &value.size.to_le_bytes());
+            field(40, &atim.to_le_bytes());
+            field(48, &mtim.to_le_bytes());
+            field(56, &ctim.to_le_bytes());
+        })
+        .await?;
+    Ok(p1::errno::SUCCESS)
 }
+
+/// The size of a preview1 `filestat` record.
+const P1_FILESTAT_SIZE: usize = 64;
 
 pub(super) fn p1_timestamp_from_fstflags(
     fstflags: u16,
@@ -4784,6 +5381,7 @@ pub(super) fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
         fs_types::ErrorCode::Unsupported => p1::errno::NOTSUP,
         fs_types::ErrorCode::Overflow => p1::errno::OVERFLOW,
         fs_types::ErrorCode::NotPermitted => p1::errno::PERM,
+        fs_types::ErrorCode::InsufficientSpace => p1::errno::NOSPC,
         fs_types::ErrorCode::ReadOnly => p1::errno::ROFS,
         fs_types::ErrorCode::CrossDevice => p1::errno::XDEV,
         _ => p1::errno::IO,
@@ -4800,6 +5398,9 @@ pub(super) fn p1_errno_from_dns_error(error: crate::DnsError) -> i32 {
 }
 
 pub(super) fn p1_errno_from_tcp_error(error: crate::TcpError) -> i32 {
+    if matches!(error.detail, crate::NetworkErrorDetail::AddressNotAvailable) {
+        return p1::errno::ADDRNOTAVAIL;
+    }
     match error.kind {
         crate::TcpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::TcpErrorKind::Timeout => p1::errno::TIMEDOUT,
@@ -4819,6 +5420,9 @@ pub(super) fn p1_errno_from_tcp_error_for_fdflags(error: crate::TcpError, fdflag
 }
 
 pub(super) fn p1_errno_from_udp_error(error: crate::UdpError) -> i32 {
+    if matches!(error.detail, crate::NetworkErrorDetail::AddressNotAvailable) {
+        return p1::errno::ADDRNOTAVAIL;
+    }
     match error.kind {
         crate::UdpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::UdpErrorKind::Unsupported => p1::errno::NOTSUP,
@@ -4841,17 +5445,14 @@ mod tests {
     use super::*;
 
     fn regular_file() -> Preview1Descriptor<crate::test_support::TestNetworkService> {
-        Preview1Descriptor::File {
-            descriptor: FsDescriptor {
-                path: "/data".into(),
-                kind: FsNodeKind::File,
-                flags: fs_types::DescriptorFlags::READ,
-                identity: None,
-                mount: None,
-            },
-            offset: 0,
-            fdflags: 0,
-        }
+        Preview1Descriptor::File(OpenFile::new(FsDescriptor {
+            path: "/data".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ,
+            identity: None,
+            mount: None,
+            open: None,
+        }))
     }
 
     /// `path_open(O_TRUNC)` against a preopen that may read and change its
@@ -4861,7 +5462,7 @@ mod tests {
     fn path_open_truncate_without_write_authority_leaves_the_file_untouched() {
         use futures_lite::future::block_on;
 
-        let namespace: crate::Namespace<crate::UnsupportedStorage> =
+        let namespace: crate::Namespace<crate::test_support::UnsupportedStorage> =
             crate::Namespace::new(crate::MountTable::new(
                 crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
                 1,
@@ -4869,11 +5470,12 @@ mod tests {
         let owner = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         let file = block_on(wasi_fs::open_at(
             &namespace,
@@ -4881,7 +5483,7 @@ mod tests {
             fs_types::PathFlags::empty(),
             "notes.txt",
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
             1,
         ))
         .expect("the owner creates the file");
@@ -4895,7 +5497,7 @@ mod tests {
         .expect("the owner writes the file");
 
         let preopen = FsDescriptor {
-            flags: fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ | FsDescriptorFlags::MUTATE_DIRECTORY,
             ..owner
         };
         for rights in [P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE, P1_RIGHT_FD_READ] {
@@ -4922,7 +5524,7 @@ mod tests {
 
     /// A namespace with one file, `/data`, and the time it was last
     /// modified.
-    fn namespace_with_file() -> crate::Namespace<crate::UnsupportedStorage> {
+    fn namespace_with_file() -> crate::Namespace<crate::test_support::UnsupportedStorage> {
         use futures_lite::future::block_on;
 
         let namespace = crate::Namespace::new(crate::MountTable::new(
@@ -4932,11 +5534,12 @@ mod tests {
         let owner = FsDescriptor {
             path: "/".into(),
             kind: FsNodeKind::Directory,
-            flags: fs_types::DescriptorFlags::READ
-                | fs_types::DescriptorFlags::WRITE
-                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
             identity: None,
             mount: None,
+            open: None,
         };
         block_on(wasi_fs::open_at(
             &namespace,
@@ -4944,14 +5547,109 @@ mod tests {
             fs_types::PathFlags::empty(),
             "data",
             fs_types::OpenFlags::CREATE,
-            fs_types::DescriptorFlags::READ,
+            FsDescriptorFlags::READ,
             1,
         ))
         .expect("the owner creates the file");
         namespace
     }
 
-    fn modified_nanos(namespace: &crate::Namespace<crate::UnsupportedStorage>) -> u64 {
+    /// `cmd > out 2>&1`: stdout and the stderr `dup2` points at it, and a
+    /// further `fd_dup` of stdout, share one open file description, so each
+    /// write lands where the previous one through any of them ended and the
+    /// file reads back every write in order.
+    #[test]
+    fn writes_through_duplicated_descriptors_share_one_offset() {
+        use futures_lite::future::block_on;
+
+        let namespace = namespace_with_file();
+        let node = FsDescriptor {
+            path: "/data".into(),
+            kind: FsNodeKind::File,
+            flags: FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+            identity: None,
+            mount: None,
+            open: None,
+        };
+        let mut table =
+            Preview1DescriptorTable::<crate::test_support::TestNetworkService>::from_entries(
+                alloc::vec![
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stdin {
+                            carry: Bytes::new(),
+                        },
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::File(OpenFile::new(node.clone())),
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stderr,
+                        false,
+                    )),
+                ],
+            );
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+        let duplicate = table.dup(1).expect("the table has room") as i32;
+
+        let writes: [(i32, &str); 3] = [
+            (1, "標準出力 "),
+            (2, "標準エラー出力 "),
+            (duplicate, "표준 출력"),
+        ];
+        let mut guest: Vec<u8> = writes
+            .iter()
+            .flat_map(|(_, text)| text.as_bytes().iter().copied())
+            .collect();
+        let memory = Preview1AsyncMemory::new(Preview1Memory {
+            base: guest.as_mut_ptr() as usize,
+            len: guest.len(),
+        });
+        let mut start = 0_u32;
+        for (fd, text) in writes {
+            let len = text.len() as u32;
+            let layout = Preview1IovLayout {
+                iovs: SmallVec::from_slice(&[(start, len)]),
+                byte_len: len,
+            };
+            let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
+                panic!("descriptor {fd} must name the file");
+            };
+            let written = block_on(p1_write_open_file(
+                &namespace,
+                file,
+                table.fdflags(fd).expect("the descriptor is open") & P1_FDFLAG_APPEND != 0,
+                &memory,
+                &layout,
+                None,
+                2,
+            ))
+            .expect("the write lands");
+            assert_eq!(written, len);
+            start += len;
+        }
+
+        let expected: String = writes.iter().map(|(_, text)| *text).collect();
+        for (fd, _) in writes {
+            let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
+                panic!("descriptor {fd} must name the file");
+            };
+            assert_eq!(block_on(p1_tell_open_file(file)), expected.len() as u64);
+        }
+        let contents = block_on(wasi_fs::read(
+            &namespace,
+            p1_grant(&node).expect("the node may be read"),
+            0,
+            expected.len() + 1,
+        ))
+        .expect("the file reads back");
+        assert_eq!(contents.as_ref(), expected.as_bytes());
+    }
+
+    fn modified_nanos(
+        namespace: &crate::Namespace<crate::test_support::UnsupportedStorage>,
+    ) -> u64 {
         futures_lite::future::block_on(wasi_fs::stat_path(namespace, "/data", crate::Follow::No))
             .expect("the file exists")
             .modified_nanos
@@ -4969,7 +5667,7 @@ mod tests {
         let file = |rights| FsDescriptor {
             flags: p1_descriptor_flags(rights, 0),
             ..match regular_file() {
-                Preview1Descriptor::File { descriptor, .. } => descriptor,
+                Preview1Descriptor::File(file) => file.node().clone(),
                 _ => unreachable!("regular_file is a file"),
             }
         };
@@ -5010,6 +5708,7 @@ mod tests {
             flags: p1_descriptor_flags(rights, 0),
             identity: None,
             mount: None,
+            open: None,
         };
 
         let reader = base(P1_RIGHT_FD_READDIR);
@@ -5023,6 +5722,7 @@ mod tests {
         block_on(wasi_fs::set_times_at(
             &namespace,
             p1_grant(&creator).expect("PATH_CREATE_FILE gives mutate-directory"),
+            fs_types::PathFlags::empty(),
             "data",
             None,
             Some(88),
@@ -5036,39 +5736,34 @@ mod tests {
         service: Net,
         stream: Net::TcpStream,
     ) -> Preview1DescriptorEntry<Net> {
-        Preview1DescriptorEntry {
-            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Connected {
-                    family: WasixSocketFamily::Ipv4,
-                    stream: WasixOwnedTcpStream::new(service, stream),
-                    peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
-                        127, 0, 0, 1,
-                    ])),
-                    peer_port: 80,
-                    options: WasixSocketOptions::default(),
-                },
-            )),
-            close_on_exec: false,
-            fdflags: 0,
-        }
+        Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
+                family: SocketFamily::Ipv4,
+                stream: OwnedTcpStream::new(crate::UnixNetwork::new(service), stream),
+                peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                    127, 0, 0, 1,
+                ])),
+                peer_port: 80,
+                options: unix_socket_options::<Net>(),
+            })),
+            false,
+        )
     }
 
     fn listening_socket_entry<Net: ComponentHostNetwork>(
         service: Net,
         listener: Net::TcpListener,
     ) -> Preview1DescriptorEntry<Net> {
-        Preview1DescriptorEntry {
-            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-                WasixTcpSocket::Listening {
-                    family: WasixSocketFamily::Ipv4,
-                    listener: WasixOwnedTcpListener::new(service, listener),
-                    local_port: 8080,
-                    options: WasixSocketOptions::default(),
-                },
-            )),
-            close_on_exec: false,
-            fdflags: 0,
-        }
+        Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Listening {
+                family: SocketFamily::Ipv4,
+                listener: OwnedTcpListener::new(crate::UnixNetwork::new(service), listener),
+                local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
+                local_port: 8080,
+                options: unix_socket_options::<Net>(),
+            })),
+            false,
+        )
     }
 
     /// A program that exits with a listener open retires it.
@@ -5197,7 +5892,7 @@ mod tests {
     ///
     /// #224 put the segment on the outbound queue and #232 kicked the
     /// packet pump from the retirement drain, but a preview1 descriptor
-    /// closes its stream straight from `WasixOwnedTcpStream::drop` and
+    /// closes its stream straight from `OwnedTcpStream::drop` and
     /// never went through that drain. Its FIN therefore sat in the
     /// queue until the pump's park expired, which on a guest with
     /// nothing else to send is `CONFIGURATION_POLL_NANOS` — a second of
@@ -5257,18 +5952,17 @@ mod tests {
         service: Net,
         socket: Net::UdpSocket,
     ) -> Preview1DescriptorEntry<Net> {
-        Preview1DescriptorEntry {
-            descriptor: Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(
-                WasixUdpSocket::Bound {
-                    family: WasixSocketFamily::Ipv4,
-                    socket: WasixOwnedUdpSocket::new(service, socket),
-                    local_port: 5353,
-                    options: WasixSocketOptions::default(),
-                },
-            )),
-            close_on_exec: false,
-            fdflags: 0,
-        }
+        Preview1DescriptorEntry::new(
+            Preview1Descriptor::Socket(UnixSocket::from_udp(UnixUdpSocket::Bound {
+                family: SocketFamily::Ipv4,
+                socket: OwnedUdpSocket::new(crate::UnixNetwork::new(service), socket),
+                local_address: crate::unix::unspecified_address(SocketFamily::Ipv4),
+                local_port: 5353,
+                peer: None,
+                options: unix_socket_options::<Net>(),
+            })),
+            false,
+        )
     }
 
     /// A program that exits with a datagram socket open retires it.
@@ -5317,12 +6011,15 @@ mod tests {
     }
 
     fn connected_socket() -> Preview1Descriptor<crate::test_support::TestNetworkService> {
-        Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-            family: WasixSocketFamily::Ipv4,
-            stream: WasixOwnedTcpStream::new(crate::test_support::test_network_service(), 9),
+        Preview1Descriptor::Socket(UnixSocket::from_tcp(UnixTcpSocket::Connected {
+            family: SocketFamily::Ipv4,
+            stream: OwnedTcpStream::new(
+                crate::UnixNetwork::new(crate::test_support::test_network_service()),
+                9,
+            ),
             peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
             peer_port: 80,
-            options: WasixSocketOptions::default(),
+            options: unix_socket_options::<crate::test_support::TestNetworkService>(),
         }))
     }
 
@@ -5395,42 +6092,62 @@ mod tests {
     /// deadline never arrived.
     #[test]
     fn poll_oneoff_returns_early_when_a_descriptor_becomes_ready() {
-        let mut ready = Vec::new();
-        let mut earliest: Option<Duration> = None;
-
-        if let Some(event) = p1_fd_event(
-            11,
-            P1_EVENTTYPE_FD_READ,
+        let subscriptions = [
+            P1Subscription::Fd {
+                userdata: 11,
+                event_type: P1_EVENTTYPE_FD_READ,
+                fd: 3,
+            },
+            P1Subscription::Clock {
+                userdata: 12,
+                monotonic: true,
+                deadline_nanos: 1_000_000,
+            },
+        ];
+        let readiness = [
             Ok(P1Readiness::Ready { bytes: 4 }),
-        ) {
-            ready.push(event);
-        }
-        match p1_clock_progress(12, 1_000_000, 0) {
-            P1ClockProgress::Elapsed(event) => ready.push(event),
-            P1ClockProgress::Waiting(remaining) => {
-                earliest =
-                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
-            }
-        }
+            Ok(P1Readiness::Pending),
+        ];
 
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].userdata, 11);
-        assert_eq!(ready[0].event_type, P1_EVENTTYPE_FD_READ);
+        let pass = p1_poll_pass(&subscriptions, &readiness, 0, 0);
+
+        assert_eq!(pass.ready.len(), 1);
+        assert_eq!(pass.ready[0].userdata, 11);
+        assert_eq!(pass.ready[0].event_type, P1_EVENTTYPE_FD_READ);
         // The clock only ever bounded the sleep; it never became an event.
-        assert_eq!(earliest, Some(Duration::from_nanos(1_000_000)));
+        assert_eq!(pass.earliest, Some(Duration::from_nanos(1_000_000)));
     }
 
-    /// The sleep is bounded by the earliest of several clock deadlines.
+    /// The sleep is bounded by the earliest of several clock deadlines, each
+    /// judged against its own timebase.
     #[test]
     fn poll_oneoff_sleeps_until_the_earliest_deadline() {
-        let mut earliest: Option<Duration> = None;
-        for deadline in [900u64, 300, 700] {
-            if let P1ClockProgress::Waiting(remaining) = p1_clock_progress(0, deadline, 100) {
-                earliest =
-                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
-            }
-        }
-        assert_eq!(earliest, Some(Duration::from_nanos(200)));
+        let clock = |userdata, monotonic, deadline_nanos| P1Subscription::Clock {
+            userdata,
+            monotonic,
+            deadline_nanos,
+        };
+        let subscriptions = [
+            clock(0, true, 900),
+            clock(1, true, 300),
+            clock(2, true, 700),
+            // On the system clock this one is 150ns away, nearer than any
+            // monotonic deadline above.
+            clock(3, false, 5_150),
+        ];
+        let readiness = [Ok(P1Readiness::Pending); 4];
+
+        let pass = p1_poll_pass(&subscriptions, &readiness, 100, 5_000);
+
+        assert!(pass.ready.is_empty(), "no deadline has arrived");
+        assert_eq!(pass.earliest, Some(Duration::from_nanos(150)));
+
+        // Once the earliest deadline passes, it is reported and the next one
+        // bounds the following sleep.
+        let pass = p1_poll_pass(&subscriptions, &readiness, 100, 5_150);
+        assert_eq!(pass.ready.len(), 1);
+        assert_eq!(pass.ready[0].userdata, 3);
+        assert_eq!(pass.earliest, Some(Duration::from_nanos(200)));
     }
 
     /// Regular files never block, in either direction. They used to fall
@@ -5457,11 +6174,11 @@ mod tests {
         let socket = connected_socket();
         assert!(matches!(
             p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_READ),
-            Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
+            Ok(P1Probe::Network(helios_unix::SocketHandle::TcpStream(9)))
         ));
         assert!(matches!(
             p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_WRITE),
-            Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
+            Ok(P1Probe::Network(helios_unix::SocketHandle::TcpStream(9)))
         ));
     }
 
@@ -5514,13 +6231,21 @@ mod tests {
         // The last host call is where the program is signalled; it
         // returns without suspending, and so does the export.
         let call = core::future::poll_fn(move |_| {
-            sender.raise(15);
+            sender.raise(helios_unix::Signal::SIGTERM);
             core::task::Poll::Ready(Ok(()))
         });
 
         let error =
             drive_wasix_call(&activity, &signal_state, call).expect_err("the signal ends the call");
-        assert_eq!(preview1_exit_status(&error, Some(0)), Some(143));
+        assert_eq!(
+            preview1_exit_status(&error, Some(0)),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 15,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(
             signal_state.take_pending(),
             None,
@@ -5562,9 +6287,14 @@ mod tests {
         let mut driven = core::pin::pin!(turns.drive(call));
 
         assert!(driven.as_mut().poll(&mut cx).is_pending());
-        signal_state.raise(9);
+        signal_state.raise(helios_unix::Signal::SIGKILL);
         assert_eq!(
-            registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+            registry.request_kill(
+                instance.id(),
+                crate::KillReason::Operator,
+                0,
+                &crate::UserResidency::default()
+            ),
             crate::KillOutcome::Requested
         );
         assert!(
@@ -5574,7 +6304,15 @@ mod tests {
         let core::task::Poll::Ready(Err(error)) = driven.as_mut().poll(&mut cx) else {
             panic!("the signal ends the suspended call");
         };
-        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 9,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(signal_state.take_pending(), None, "delivered once");
     }
 
@@ -5610,7 +6348,7 @@ mod tests {
 
         assert!(caller_call.as_mut().poll(&mut caller_cx).is_pending());
         assert!(target_call.as_mut().poll(&mut target_cx).is_pending());
-        target_thread.raise(9);
+        target_thread.raise(helios_unix::Signal::SIGKILL);
 
         assert_eq!(
             caller_wakes.wakes.load(AtomicOrdering::Acquire),
@@ -5632,7 +6370,15 @@ mod tests {
         let core::task::Poll::Ready(Err(error)) = target_call.as_mut().poll(&mut target_cx) else {
             panic!("the signal ends the target thread's suspended call");
         };
-        assert_eq!(preview1_exit_status(&error, None), Some(137));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 9,
+                    core_dumped: false,
+                }
+            ))
+        );
         assert_eq!(target_thread.take_pending(), None, "delivered once");
         assert_eq!(
             process.take_pending(),
@@ -5650,8 +6396,8 @@ mod tests {
         let process = WasixSignalState::new();
         let thread = WasixSignalState::new();
         let signals = WasixStoreSignals::new(thread.clone(), process.clone());
-        process.raise(15);
-        thread.raise(9);
+        process.raise(helios_unix::Signal::SIGTERM);
+        thread.raise(helios_unix::Signal::SIGKILL);
 
         let stop = signals.owed_stop().expect("a raised thread owes a stop");
         assert_eq!(
@@ -5690,9 +6436,14 @@ mod tests {
         let signal_state = WasixSignalState::new();
         let sender = signal_state.clone();
         let call = core::future::poll_fn(move |_| {
-            sender.raise(2);
+            sender.raise(helios_unix::Signal::SIGINT);
             assert_eq!(
-                registry.request_kill(instance.id(), crate::KillReason::Operator, 0),
+                registry.request_kill(
+                    instance.id(),
+                    crate::KillReason::Operator,
+                    0,
+                    &crate::UserResidency::default()
+                ),
                 crate::KillOutcome::Requested
             );
             core::task::Poll::Ready(Ok(()))
@@ -5701,7 +6452,15 @@ mod tests {
         let error =
             drive_wasix_call(&activity, &signal_state, call).expect_err("the call is stopped");
         assert!(error.downcast_ref::<crate::InstanceKilled>().is_none());
-        assert_eq!(preview1_exit_status(&error, None), Some(130));
+        assert_eq!(
+            preview1_exit_status(&error, None),
+            Some(helios_unix::ChildTermination::Signaled(
+                helios_unix::SignalTermination {
+                    signal: 2,
+                    core_dumped: false,
+                }
+            ))
+        );
     }
 
     fn memory_of(bytes: &[u8]) -> Preview1Memory {
@@ -5709,6 +6468,26 @@ mod tests {
             base: bytes.as_ptr() as usize,
             len: bytes.len(),
         }
+    }
+
+    /// The accessor over `bytes`, on a machine that cannot swap, so every
+    /// page is present. What the accessor does once pages go missing is
+    /// tested with the swap service.
+    fn async_memory_of(bytes: &[u8]) -> Preview1AsyncMemory {
+        Preview1AsyncMemory::new(memory_of(bytes))
+    }
+
+    /// [`async_memory_of`] for a test that reads back what a host call
+    /// wrote.
+    fn async_memory_over(bytes: &mut [u8]) -> Preview1AsyncMemory {
+        Preview1AsyncMemory::new(Preview1Memory {
+            base: bytes.as_mut_ptr() as usize,
+            len: bytes.len(),
+        })
+    }
+
+    fn run<F: Future>(future: F) -> F::Output {
+        futures_lite::future::block_on(future)
     }
 
     fn iovec_table(entries: &[(u32, u32)]) -> Vec<u8> {
@@ -5762,26 +6541,49 @@ mod tests {
     fn poll_oneoff_refuses_a_subscription_count_beyond_its_bounds() {
         assert_eq!(p1_subscription_limit(DescriptorLimit::DEFAULT), 2049);
         let guest = vec![0_u8; 4 * P1_SUBSCRIPTION_SIZE as usize];
-        let memory = memory_of(&guest);
+        let memory = async_memory_of(&guest);
         let max = p1_subscription_limit(DescriptorLimit::new(1));
         assert_eq!(max, 3);
         for count in [u32::MAX, 4] {
             assert_eq!(
-                p1_read_subscriptions(memory, GuestAddress::wasm32(0), count, max, 0, 0).err(),
-                Some(p1::errno::INVAL),
+                run(p1_read_subscriptions(
+                    &memory,
+                    GuestAddress::wasm32(0),
+                    count,
+                    max,
+                    0,
+                    0
+                ))
+                .err(),
+                Some(P1Stop::Errno(p1::errno::INVAL)),
                 "poll_oneoff count {count} over a bound of {max}",
             );
         }
         let max = p1_subscription_limit(DescriptorLimit::new(1 << 20));
         for (ptr, count) in [(0, 5), (16, 4), (u32::MAX, 1)] {
             assert_eq!(
-                p1_read_subscriptions(memory, GuestAddress::wasm32(ptr), count, max, 0, 0).err(),
-                Some(p1::errno::FAULT),
+                run(p1_read_subscriptions(
+                    &memory,
+                    GuestAddress::wasm32(ptr),
+                    count,
+                    max,
+                    0,
+                    0
+                ))
+                .err(),
+                Some(P1Stop::Errno(p1::errno::FAULT)),
                 "poll_oneoff subscriptions at {ptr}, count {count}",
             );
         }
-        let subscriptions = p1_read_subscriptions(memory, GuestAddress::wasm32(0), 4, max, 0, 0)
-            .expect("four subscriptions fit");
+        let subscriptions = run(p1_read_subscriptions(
+            &memory,
+            GuestAddress::wasm32(0),
+            4,
+            max,
+            0,
+            0,
+        ))
+        .expect("four subscriptions fit");
         assert_eq!(subscriptions.len(), 4);
     }
 
@@ -5791,7 +6593,7 @@ mod tests {
     #[test]
     fn vectored_io_refuses_iovecs_guest_memory_cannot_hold() {
         let guest = vec![0_u8; 4096];
-        let memory = memory_of(&guest);
+        let memory = async_memory_of(&guest);
         let table_at = |table: &[u8]| {
             let mut guest = guest.clone();
             guest[..table.len()].copy_from_slice(table);
@@ -5800,31 +6602,54 @@ mod tests {
         // More iovecs than `IOV_MAX`.
         for count in [u32::MAX, P1_IOV_MAX as u32 + 1] {
             assert_eq!(
-                p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), count).err(),
-                Some(p1::errno::INVAL)
+                run(p1_read_iovs_with_byte_len(
+                    &memory,
+                    GuestAddress::wasm32(0),
+                    count
+                ))
+                .err(),
+                Some(P1Stop::Errno(p1::errno::INVAL))
             );
         }
         // The array does not fit.
         assert_eq!(
-            p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), P1_IOV_MAX as u32).err(),
-            Some(p1::errno::FAULT)
+            run(p1_read_iovs_with_byte_len(
+                &memory,
+                GuestAddress::wasm32(0),
+                P1_IOV_MAX as u32
+            ))
+            .err(),
+            Some(P1Stop::Errno(p1::errno::FAULT))
         );
         // A buffer lies outside memory.
         let table = table_at(&iovec_table(&[(0, 16), (4090, u32::MAX)]));
         assert_eq!(
-            p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2).err(),
-            Some(p1::errno::FAULT)
+            run(p1_read_iovs_with_byte_len(
+                &async_memory_of(&table),
+                GuestAddress::wasm32(0),
+                2
+            ))
+            .err(),
+            Some(P1Stop::Errno(p1::errno::FAULT))
         );
         // Overlapping buffers may add up to more than memory holds: nothing
         // is sized by the total, so that is a valid transfer.
         let table = table_at(&iovec_table(&[(0, 4096), (0, 4096)]));
-        let layout = p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2)
-            .expect("overlapping buffers are valid");
+        let layout = run(p1_read_iovs_with_byte_len(
+            &async_memory_of(&table),
+            GuestAddress::wasm32(0),
+            2,
+        ))
+        .expect("overlapping buffers are valid");
         assert_eq!(layout.byte_len, 8192);
         // Overlapping buffers that fit are a valid transfer.
         let table = table_at(&iovec_table(&[(64, 2048), (1024, 1024)]));
-        let layout = p1_read_iovs_with_byte_len(memory_of(&table), GuestAddress::wasm32(0), 2)
-            .expect("buffers that fit are valid");
+        let layout = run(p1_read_iovs_with_byte_len(
+            &async_memory_of(&table),
+            GuestAddress::wasm32(0),
+            2,
+        ))
+        .expect("buffers that fit are valid");
         assert_eq!(layout.byte_len, 3072);
     }
 
@@ -5835,15 +6660,20 @@ mod tests {
     #[test]
     fn iovecs_summing_past_u32_are_refused_not_converted() {
         let table = iovec_table(&[(0, 0x8000_0000), (0, 0x8000_0000)]);
-        let memory = Preview1Memory {
+        let memory = Preview1AsyncMemory::new(Preview1Memory {
             base: table.as_ptr() as usize,
             // Linear memory of 4 GiB: each buffer is inside it, and only
             // the iovec table, which is real, is ever read.
             len: 1 << 32,
-        };
+        });
         assert_eq!(
-            p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 2).err(),
-            Some(p1::errno::INVAL)
+            run(p1_read_iovs_with_byte_len(
+                &memory,
+                GuestAddress::wasm32(0),
+                2
+            ))
+            .err(),
+            Some(P1Stop::Errno(p1::errno::INVAL))
         );
     }
 
@@ -5852,8 +6682,6 @@ mod tests {
     /// iovecs, and hands the sink every byte once.
     #[test]
     fn gathered_writes_move_in_bounded_chunks() {
-        use futures_lite::future::block_on;
-
         let guest: Vec<u8> = (0..3 * GUEST_IO_CHUNK_BYTES)
             .map(|index| index as u8)
             .collect();
@@ -5861,17 +6689,21 @@ mod tests {
         let table_at = guest.len() - table.len();
         let mut memory = guest.clone();
         memory[table_at..].copy_from_slice(&table);
-        let memory = memory_of(&memory);
-        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table_at as u32), 3)
-            .expect("iovecs fit");
+        let memory = async_memory_of(&memory);
+        let layout = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(table_at as u32),
+            3,
+        ))
+        .expect("iovecs fit");
         let expected: Vec<u8> = guest[..150_000]
             .iter()
             .chain(&guest[50_000..90_000])
             .copied()
             .collect();
-        let mut gather = Preview1Gather::new(memory, &layout).expect("buffers fit");
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
         let mut chunks = Vec::new();
-        let sent = block_on(p1_send_gathered(&mut gather, |chunk| {
+        let sent = run(p1_send_gathered(&memory, &mut gather, |chunk| {
             chunks.push(chunk);
             core::future::ready(Ok(()))
         }))
@@ -5891,18 +6723,21 @@ mod tests {
     /// went is the error.
     #[test]
     fn a_refusal_after_some_chunks_reports_what_went() {
-        use futures_lite::future::block_on;
-
         let guest = vec![1_u8; 3 * GUEST_IO_CHUNK_BYTES];
         let table = iovec_table(&[(0, (3 * GUEST_IO_CHUNK_BYTES) as u32)]);
         let mut memory = guest.clone();
         memory[..table.len()].copy_from_slice(&table);
-        let memory = memory_of(&memory);
-        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 1).expect("fits");
+        let memory = async_memory_of(&memory);
+        let layout = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(0),
+            1,
+        ))
+        .expect("fits");
 
         let mut calls = 0;
-        let mut gather = Preview1Gather::new(memory, &layout).expect("fits");
-        let sent = block_on(p1_send_gathered(&mut gather, |_| {
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("fits");
+        let sent = run(p1_send_gathered(&memory, &mut gather, |_| {
             calls += 1;
             core::future::ready(if calls == 1 {
                 Ok(())
@@ -5912,24 +6747,27 @@ mod tests {
         }));
         assert_eq!(sent, Ok(GUEST_IO_CHUNK_BYTES as u32));
 
-        let mut gather = Preview1Gather::new(memory, &layout).expect("fits");
-        let sent = block_on(p1_send_gathered(&mut gather, |_| {
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("fits");
+        let sent = run(p1_send_gathered(&memory, &mut gather, |_| {
             core::future::ready(Err(p1::errno::AGAIN))
         }));
-        assert_eq!(sent, Err(p1::errno::AGAIN));
+        assert_eq!(sent, Err(P1Stop::Errno(p1::errno::AGAIN)));
     }
 
     /// An empty transfer still reaches the sink once, as an empty write.
     #[test]
     fn an_empty_gathered_write_reaches_the_sink_once() {
-        use futures_lite::future::block_on;
-
         let guest = vec![0_u8; 64];
-        let memory = memory_of(&guest);
-        let layout = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(0), 0).expect("empty");
-        let mut gather = Preview1Gather::new(memory, &layout).expect("empty");
+        let memory = async_memory_of(&guest);
+        let layout = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(0),
+            0,
+        ))
+        .expect("empty");
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("empty");
         let mut calls = Vec::new();
-        let sent = block_on(p1_send_gathered(&mut gather, |chunk| {
+        let sent = run(p1_send_gathered(&memory, &mut gather, |chunk| {
             calls.push(chunk.len());
             core::future::ready(Ok(()))
         }));
@@ -5942,10 +6780,50 @@ mod tests {
     fn one_iovec(len: usize) -> (Vec<u8>, Preview1IovLayout) {
         let mut guest: Vec<u8> = (0..len).map(|index| index as u8).collect();
         guest.extend(iovec_table(&[(0, len as u32)]));
-        let layout =
-            p1_read_iovs_with_byte_len(memory_of(&guest), GuestAddress::wasm32(len as u32), 1)
-                .expect("the iovec fits");
+        let layout = run(p1_read_iovs_with_byte_len(
+            &async_memory_of(&guest),
+            GuestAddress::wasm32(len as u32),
+            1,
+        ))
+        .expect("the iovec fits");
         (guest, layout)
+    }
+
+    /// A receive reaches the guest scattered over its buffers in Chinese,
+    /// Japanese and Korean alike, with the byte count and the cleared
+    /// message flags after it; a buffer outside memory is `EFAULT`.
+    #[test]
+    fn a_receive_is_scattered_over_the_guest_buffers() {
+        for text in ["你好，世界", "こんにちは世界", "안녕하세요 세계"] {
+            let mut guest = vec![0xee_u8; 256];
+            let memory = async_memory_over(&mut guest);
+            let bytes = text.as_bytes();
+            let (head, tail) = bytes.split_at(5);
+            let status = run(p1_write_received(
+                &memory,
+                &[(0, 5), (100, tail.len() as u32 + 10)],
+                bytes,
+                GuestAddress::wasm32(200),
+                GuestAddress::wasm32(204),
+            ));
+            assert_eq!(status, Ok(p1::errno::SUCCESS));
+            assert_eq!(guest[..5], *head);
+            assert_eq!(guest[100..100 + tail.len()], *tail);
+            assert_eq!(guest[200..204], (bytes.len() as u32).to_le_bytes());
+            assert_eq!(guest[204..206], [0, 0], "no message flags");
+        }
+        let mut guest = vec![0_u8; 16];
+        let memory = async_memory_over(&mut guest);
+        assert_eq!(
+            run(p1_write_received(
+                &memory,
+                &[(12, 8)],
+                b"datagram",
+                GuestAddress::wasm32(0),
+                GuestAddress::wasm32(4),
+            )),
+            Err(P1Stop::Errno(p1::errno::FAULT))
+        );
     }
 
     /// A datagram's payload is gathered whole, across its buffers and past
@@ -5957,18 +6835,32 @@ mod tests {
         let mut guest: Vec<u8> = (0..max + 1).map(|index| index as u8).collect();
         let table = guest.len() as u32;
         guest.extend(iovec_table(&[(0, 9), (9, max as u32 - 9), (max as u32, 1)]));
-        let memory = memory_of(&guest);
+        let memory = async_memory_of(&guest);
 
-        let whole = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 2)
-            .expect("the iovecs fit");
-        let mut gather = Preview1Gather::new(memory, &whole).expect("buffers fit");
-        assert_eq!(gather.datagram(max).as_deref(), Ok(&guest[..max]));
+        let whole = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(table),
+            2,
+        ))
+        .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(&memory, &whole).expect("buffers fit");
+        assert_eq!(
+            run(gather.datagram(&memory, max)),
+            Ok(guest[..max].to_vec())
+        );
         assert_eq!(gather.remaining(), 0);
 
-        let over = p1_read_iovs_with_byte_len(memory, GuestAddress::wasm32(table), 3)
-            .expect("the iovecs fit");
-        let mut gather = Preview1Gather::new(memory, &over).expect("buffers fit");
-        assert_eq!(gather.datagram(max), Err(p1::errno::MSGSIZE));
+        let over = run(p1_read_iovs_with_byte_len(
+            &memory,
+            GuestAddress::wasm32(table),
+            3,
+        ))
+        .expect("the iovecs fit");
+        let mut gather = Preview1Gather::new(&memory, &over).expect("buffers fit");
+        assert_eq!(
+            run(gather.datagram(&memory, max)),
+            Err(P1Stop::Errno(p1::errno::MSGSIZE))
+        );
         assert_eq!(gather.remaining(), max + 1);
     }
 
@@ -5981,6 +6873,9 @@ mod tests {
         accepts: usize,
         /// What another writer appends after the first chunk landed.
         other_writer: &'static [u8],
+        /// How many bytes the file can still store: a chunk past it is
+        /// stored in part, as a filesystem that runs out of space does.
+        room: usize,
     }
 
     impl ChunkedFile {
@@ -5990,6 +6885,7 @@ mod tests {
                 positions: Vec::new(),
                 accepts,
                 other_writer: b"",
+                room: usize::MAX,
             }
         }
     }
@@ -5999,27 +6895,35 @@ mod tests {
 
         async fn land(
             &mut self,
+            memory: &Preview1AsyncMemory,
             gather: &mut Preview1Gather,
             position: WritePosition,
             len: usize,
-        ) -> Result<u64, i32> {
+        ) -> Result<Result<ChunkLanded, i32>, GuestAccessError> {
             if self.positions.len() == 1 {
                 self.bytes.extend_from_slice(self.other_writer);
             }
             self.positions.push(position);
             if self.accepts == 0 {
-                return Err(p1::errno::IO);
+                return Ok(Err(p1::errno::IO));
             }
             self.accepts -= 1;
             let at = match position {
                 WritePosition::End => self.bytes.len(),
                 WritePosition::At(at) => at as usize,
             };
-            if self.bytes.len() < at + len {
-                self.bytes.resize(at + len, 0);
+            let stored = len.min(self.room);
+            self.room -= stored;
+            if self.bytes.len() < at + stored {
+                self.bytes.resize(at + stored, 0);
             }
-            gather.fill(&mut self.bytes[at..at + len]);
-            Ok((at + len) as u64)
+            gather
+                .fill(memory, &mut self.bytes[at..at + stored])
+                .await?;
+            Ok(Ok(ChunkLanded {
+                end: (at + stored) as u64,
+                len: stored,
+            }))
         }
     }
 
@@ -6028,18 +6932,19 @@ mod tests {
     /// are still there afterwards.
     #[test]
     fn a_chunked_append_never_lands_on_another_writers_bytes() {
-        use futures_lite::future::block_on;
-
         let len = 2 * GUEST_IO_CHUNK_BYTES + 10;
         let (guest, layout) = one_iovec(len);
-        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+        let memory = async_memory_of(&guest);
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
         let mut file = ChunkedFile::new(b"head", usize::MAX);
         file.other_writer = b"other";
-        let landed = block_on(p1_write_gathered(
+        let landed = run(p1_write_gathered(
+            &memory,
             &mut gather,
             WritePosition::End,
             &mut file,
-        ));
+        ))
+        .expect("the guest's pages are present");
         let expected: Vec<u8> = b"head"
             .iter()
             .chain(&guest[..GUEST_IO_CHUNK_BYTES])
@@ -6056,17 +6961,18 @@ mod tests {
     /// it was given.
     #[test]
     fn a_chunked_positioned_write_continues_where_the_last_chunk_ended() {
-        use futures_lite::future::block_on;
-
         let len = 2 * GUEST_IO_CHUNK_BYTES + 10;
         let (guest, layout) = one_iovec(len);
-        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+        let memory = async_memory_of(&guest);
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
         let mut file = ChunkedFile::new(&[0xEE; 16], usize::MAX);
-        let landed = block_on(p1_write_gathered(
+        let landed = run(p1_write_gathered(
+            &memory,
             &mut gather,
             WritePosition::At(3),
             &mut file,
-        ));
+        ))
+        .expect("the guest's pages are present");
         assert_eq!(landed, Ok((3 + len as u64, len as u32)));
         assert_eq!(
             file.positions,
@@ -6085,17 +6991,18 @@ mod tests {
     /// chunk is the error, and an empty write reaches the file once.
     #[test]
     fn a_refused_file_chunk_is_a_short_write() {
-        use futures_lite::future::block_on;
-
         let (guest, layout) = one_iovec(3 * GUEST_IO_CHUNK_BYTES);
+        let memory = async_memory_of(&guest);
         let write = |accepts: usize| {
-            let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("buffers fit");
+            let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
             let mut file = ChunkedFile::new(b"", accepts);
-            let landed = block_on(p1_write_gathered(
+            let landed = run(p1_write_gathered(
+                &memory,
                 &mut gather,
                 WritePosition::At(0),
                 &mut file,
-            ));
+            ))
+            .expect("the guest's pages are present");
             (landed, file.positions.len())
         };
         let two = 2 * GUEST_IO_CHUNK_BYTES;
@@ -6103,14 +7010,426 @@ mod tests {
         assert_eq!(write(0), (Err(p1::errno::IO), 1));
 
         let (guest, layout) = one_iovec(0);
-        let mut gather = Preview1Gather::new(memory_of(&guest), &layout).expect("empty");
+        let memory = async_memory_of(&guest);
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("empty");
         let mut file = ChunkedFile::new(b"four", usize::MAX);
-        let landed = block_on(p1_write_gathered(
+        let landed = run(p1_write_gathered(
+            &memory,
             &mut gather,
             WritePosition::End,
             &mut file,
-        ));
+        ))
+        .expect("the guest's pages are present");
         assert_eq!(landed, Ok((4, 0)));
         assert_eq!(file.positions, [WritePosition::End]);
+    }
+
+    /// A chunk the file stores only a prefix of ends the write there: the
+    /// guest is told how many bytes landed, and no later chunk is tried.
+    #[test]
+    fn a_chunk_stored_in_part_ends_the_write_after_the_prefix() {
+        let (guest, layout) = one_iovec(3 * GUEST_IO_CHUNK_BYTES);
+        let memory = async_memory_of(&guest);
+        let mut gather = Preview1Gather::new(&memory, &layout).expect("buffers fit");
+        let mut file = ChunkedFile::new(b"", usize::MAX);
+        let prefix = GUEST_IO_CHUNK_BYTES + 5;
+        file.room = prefix;
+        let landed = run(p1_write_gathered(
+            &memory,
+            &mut gather,
+            WritePosition::At(0),
+            &mut file,
+        ))
+        .expect("the guest's pages are present");
+        assert_eq!(landed, Ok((prefix as u64, prefix as u32)));
+        assert_eq!(
+            file.positions.len(),
+            2,
+            "no chunk is tried after the short one"
+        );
+        assert!(file.bytes == guest[..prefix]);
+    }
+
+    /// A receive whose buffers run from a present page onto one swap has
+    /// taken, over a memory with its count and flags slots on page zero.
+    fn receive_over_an_evicted_page() -> (crate::memory::GuestSwap, [(u32, u32); 2], Vec<u8>) {
+        let mut swap = crate::memory::GuestSwap::new(3);
+        swap.evict(2);
+        let iovs = [
+            ((TEST_PAGE + 100) as u32, 100),
+            ((2 * TEST_PAGE) as u32, 200),
+        ];
+        (swap, iovs, cjk_bytes(300))
+    }
+
+    /// The scatter of a receive waits for a buffer page that is out
+    /// rather than writing it, asks for it, and once it is back lands
+    /// every byte, the count and the flags.
+    #[test]
+    fn a_receive_into_an_evicted_buffer_page_lands_once_the_page_is_back() {
+        let (mut swap, iovs, payload) = receive_over_an_evicted_page();
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(p1_write_received(
+            &memory,
+            &iovs,
+            &payload,
+            GuestAddress::wasm32(0),
+            GuestAddress::wasm32(8),
+        ));
+        assert!(poll_once(write.as_mut()).is_none(), "the scatter waits");
+        assert_eq!(swap.queued_faults(), 1, "the page was asked for");
+        assert!(swap.is_out(2));
+
+        swap.serve();
+        assert_eq!(poll_once(write.as_mut()), Some(Ok(p1::errno::SUCCESS)));
+        let bytes = swap.bytes();
+        assert!(bytes[TEST_PAGE + 100..TEST_PAGE + 200] == payload[..100]);
+        assert!(bytes[2 * TEST_PAGE..2 * TEST_PAGE + 200] == payload[100..]);
+        assert_eq!(bytes[0..4], 300_u32.to_le_bytes());
+        assert_eq!(bytes[8..10], [0, 0]);
+    }
+
+    /// A buffer page that cannot come back traps the guest instead of
+    /// answering it an errno.
+    #[test]
+    fn a_receive_into_a_lost_buffer_page_traps_the_guest() {
+        let (mut swap, iovs, payload) = receive_over_an_evicted_page();
+        swap.fail_reads(1);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let mut write = core::pin::pin!(p1_write_received(
+            &memory,
+            &iovs,
+            &payload,
+            GuestAddress::wasm32(0),
+            GuestAddress::wasm32(8),
+        ));
+        assert!(poll_once(write.as_mut()).is_none());
+        swap.serve();
+        let stop = poll_once(write.as_mut()).expect("the scatter ends");
+        assert_eq!(
+            stop,
+            Err(P1Stop::Trap(crate::memory::SwapFaultError::Backend))
+        );
+        assert!(p1_reply(stop).is_err(), "the guest traps");
+    }
+
+    #[test]
+    fn readdir_truncates_trailing_header_so_partial_buffer_never_signals_eof_early() {
+        let entries = [
+            fs_types::DirectoryEntry {
+                type_: fs_types::DescriptorType::RegularFile,
+                name: "alpha".into(),
+            },
+            fs_types::DirectoryEntry {
+                type_: fs_types::DescriptorType::RegularFile,
+                name: "utf_8.py".into(),
+            },
+        ];
+        // `"alpha"` takes 24 + 5 = 29 bytes, leaving 7 bytes (< P1_DIRENT_BYTES)
+        // in a 36-byte buffer. Preview 1 `readdir` treats `bufused < buf_len` as
+        // end-of-directory, so those 7 bytes must hold the prefix of the next
+        // header rather than leaving `buf` short.
+        let first = p1_fd_readdir_records(&entries, 36, 0).expect("first readdir pass");
+        assert_eq!(first.len(), 36);
+        assert_eq!(u64::from_le_bytes(first[0..8].try_into().unwrap()), 1);
+        assert_eq!(&first[24..29], b"alpha");
+        assert_eq!(&first[29..36], &2_u64.to_le_bytes()[..7]);
+
+        // Resuming from the last complete entry's `d_next` (1) yields the full
+        // second entry and `bufused < buf_len` (32 < 36) to signal true EOF.
+        let second = p1_fd_readdir_records(&entries, 36, 1).expect("second readdir pass");
+        assert_eq!(second.len(), 32);
+        assert_eq!(u64::from_le_bytes(second[0..8].try_into().unwrap()), 2);
+        assert_eq!(&second[24..32], b"utf_8.py");
+    }
+}
+
+#[cfg(test)]
+mod open_file_offset_tests {
+    use super::*;
+    use core::pin::Pin;
+    use futures_lite::future::{block_on, poll_once};
+
+    fn poll<T>(future: Pin<&mut impl core::future::Future<Output = T>>) -> Option<T> {
+        block_on(poll_once(future))
+    }
+
+    fn namespace_with_rw_file() -> (
+        crate::Namespace<crate::test_support::UnsupportedStorage>,
+        FsDescriptor,
+        Preview1DescriptorTable<crate::test_support::TestNetworkService>,
+    ) {
+        let namespace = crate::Namespace::new(crate::MountTable::new(
+            crate::BootFs::new(crate::EmbeddedBootFs::new(&[], &[]), crate::BOOT_DEVICE),
+            1,
+        ));
+        let root = FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: FsDescriptorFlags::READ
+                | FsDescriptorFlags::WRITE
+                | FsDescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+            mount: None,
+            open: None,
+        };
+        let opened = block_on(wasi_fs::open_at(
+            &namespace,
+            root.grant().expect("root directory grant"),
+            fs_types::PathFlags::empty(),
+            "shared.txt",
+            fs_types::OpenFlags::CREATE,
+            FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+            1,
+        ))
+        .expect("creates shared.txt");
+        let table =
+            Preview1DescriptorTable::<crate::test_support::TestNetworkService>::from_entries(
+                alloc::vec![
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stdin {
+                            carry: Bytes::new(),
+                        },
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::File(OpenFile::new(opened.clone())),
+                        false,
+                    )),
+                    Some(Preview1DescriptorEntry::new(
+                        Preview1Descriptor::Stderr,
+                        false,
+                    )),
+                ],
+            );
+        (namespace, opened, table)
+    }
+
+    fn open_file_at(
+        table: &Preview1DescriptorTable<crate::test_support::TestNetworkService>,
+        fd: i32,
+    ) -> &OpenFile<FsDescriptor> {
+        let Some(Preview1Descriptor::File(file)) = table.get(fd) else {
+            panic!("descriptor {fd} must name a file");
+        };
+        file
+    }
+
+    /// Two overlapping writes through duplicated descriptors (`cmd > out 2>&1`)
+    /// serialise on the open file description's position lock so neither
+    /// overwrites the other's bytes and every byte of both reads back in order.
+    #[test]
+    fn concurrent_writes_through_duplicated_descriptors_preserve_every_byte() {
+        let (namespace, node, mut table) = namespace_with_rw_file();
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+
+        let first_payload = "標準出力 日本語 ".as_bytes();
+        let mut swap = crate::memory::GuestSwap::new(1);
+        swap.bytes_mut()[..first_payload.len()].copy_from_slice(first_payload);
+        swap.evict(0);
+        let first_memory = Preview1AsyncMemory::over_swap(&swap);
+        let first_layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, first_payload.len() as u32)]),
+            byte_len: first_payload.len() as u32,
+        };
+
+        let second_payload = "표준 출력 한국어".as_bytes();
+        let mut second_guest = second_payload.to_vec();
+        let second_memory = Preview1AsyncMemory::new(Preview1Memory {
+            base: second_guest.as_mut_ptr() as usize,
+            len: second_guest.len(),
+        });
+        let second_layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, second_payload.len() as u32)]),
+            byte_len: second_payload.len() as u32,
+        };
+
+        let fd1 = open_file_at(&table, 1).clone();
+        let fd2 = open_file_at(&table, 2).clone();
+
+        let mut first_write = core::pin::pin!(p1_write_open_file(
+            &namespace,
+            &fd1,
+            false,
+            &first_memory,
+            &first_layout,
+            None,
+            10,
+        ));
+        let mut second_write = core::pin::pin!(p1_write_open_file(
+            &namespace,
+            &fd2,
+            false,
+            &second_memory,
+            &second_layout,
+            None,
+            11,
+        ));
+
+        // First write acquires the position lock and suspends bringing in its guest page.
+        assert!(
+            poll(first_write.as_mut()).is_none(),
+            "first write suspends on evicted guest page while holding position lock"
+        );
+        assert_eq!(swap.queued_faults(), 1);
+        // Second write on the duplicated fd must park on the position lock rather than
+        // reading offset 0 and overwriting the first write.
+        assert!(
+            poll(second_write.as_mut()).is_none(),
+            "second write must wait for the first write's position lock"
+        );
+
+        swap.serve();
+        assert_eq!(
+            poll(first_write.as_mut()),
+            Some(Ok(first_payload.len() as u32))
+        );
+        assert_eq!(
+            poll(second_write.as_mut()),
+            Some(Ok(second_payload.len() as u32))
+        );
+
+        let expected: Vec<u8> = [first_payload, second_payload].concat();
+        assert_eq!(block_on(p1_tell_open_file(&fd1)), expected.len() as u64);
+        assert_eq!(block_on(p1_tell_open_file(&fd2)), expected.len() as u64);
+
+        let contents = block_on(wasi_fs::read(
+            &namespace,
+            p1_grant(&node).expect("read grant"),
+            0,
+            expected.len() + 16,
+        ))
+        .expect("file reads back");
+        assert_eq!(contents.as_ref(), expected.as_slice());
+    }
+
+    /// Positioned I/O (`pread` and `pwrite`) does not acquire the open file
+    /// description's position lock and completes immediately even while a
+    /// sequential write is in flight.
+    #[test]
+    fn positioned_io_does_not_block_on_held_offset_lock() {
+        let (namespace, node, mut table) = namespace_with_rw_file();
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+
+        let seq_payload = "sequential-日本語".as_bytes();
+        let mut swap = crate::memory::GuestSwap::new(1);
+        swap.bytes_mut()[..seq_payload.len()].copy_from_slice(seq_payload);
+        swap.evict(0);
+        let seq_memory = Preview1AsyncMemory::over_swap(&swap);
+        let seq_layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, seq_payload.len() as u32)]),
+            byte_len: seq_payload.len() as u32,
+        };
+
+        let pwrite_payload = "pwrite-한국어".as_bytes();
+        let mut pwrite_guest = pwrite_payload.to_vec();
+        let pwrite_memory = Preview1AsyncMemory::new(Preview1Memory {
+            base: pwrite_guest.as_mut_ptr() as usize,
+            len: pwrite_guest.len(),
+        });
+        let pwrite_layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, pwrite_payload.len() as u32)]),
+            byte_len: pwrite_payload.len() as u32,
+        };
+
+        let fd1 = open_file_at(&table, 1).clone();
+        let fd2 = open_file_at(&table, 2).clone();
+
+        let mut seq_write = core::pin::pin!(p1_write_open_file(
+            &namespace,
+            &fd1,
+            false,
+            &seq_memory,
+            &seq_layout,
+            None,
+            10,
+        ));
+        assert!(poll(seq_write.as_mut()).is_none());
+
+        // Positioned write and read on the duplicated descriptor must finish immediately.
+        let pwrite_at = 64_u64;
+        let written = block_on(poll_once(p1_write_open_file(
+            &namespace,
+            &fd2,
+            false,
+            &pwrite_memory,
+            &pwrite_layout,
+            Some(pwrite_at),
+            11,
+        )))
+        .expect("pwrite must not block on the offset lock")
+        .expect("pwrite succeeds");
+        assert_eq!(written, pwrite_payload.len() as u32);
+
+        let pread_back = block_on(poll_once(p1_pread_open_file(
+            &namespace,
+            &fd2,
+            pwrite_at,
+            pwrite_payload.len(),
+        )))
+        .expect("pread must not block on the offset lock")
+        .expect("pread succeeds");
+        assert_eq!(pread_back.as_ref(), pwrite_payload);
+
+        // Complete the sequential write; offset advances only by seq_payload.len().
+        swap.serve();
+        assert_eq!(poll(seq_write.as_mut()), Some(Ok(seq_payload.len() as u32)));
+        assert_eq!(block_on(p1_tell_open_file(&fd1)), seq_payload.len() as u64);
+
+        let head = block_on(wasi_fs::read(
+            &namespace,
+            p1_grant(&node).expect("read grant"),
+            0,
+            seq_payload.len(),
+        ))
+        .expect("sequential prefix reads back");
+        assert_eq!(head.as_ref(), seq_payload);
+    }
+
+    /// Reads, seeks and tells through one open file description serialise
+    /// against an in-flight write and observe the post-write offset.
+    #[test]
+    fn concurrent_read_seek_and_tell_serialise_against_in_flight_write() {
+        let (namespace, _node, mut table) = namespace_with_rw_file();
+        assert_eq!(table.dup2(1, 2), p1::errno::SUCCESS);
+
+        let payload = "Cjk-日本語-한국어".as_bytes();
+        let mut swap = crate::memory::GuestSwap::new(1);
+        swap.bytes_mut()[..payload.len()].copy_from_slice(payload);
+        swap.evict(0);
+        let memory = Preview1AsyncMemory::over_swap(&swap);
+        let layout = Preview1IovLayout {
+            iovs: SmallVec::from_slice(&[(0, payload.len() as u32)]),
+            byte_len: payload.len() as u32,
+        };
+
+        let fd1 = open_file_at(&table, 1).clone();
+        let fd2 = open_file_at(&table, 2).clone();
+
+        let mut in_flight_write = core::pin::pin!(p1_write_open_file(
+            &namespace, &fd1, false, &memory, &layout, None, 10,
+        ));
+        assert!(poll(in_flight_write.as_mut()).is_none());
+
+        let mut tell_fut = core::pin::pin!(p1_tell_open_file(&fd2));
+        let mut seek_fut = core::pin::pin!(p1_seek_open_file(&namespace, &fd2, 0, 0));
+        let mut read_fut = core::pin::pin!(p1_read_open_file(&namespace, &fd2, payload.len()));
+
+        assert!(poll(tell_fut.as_mut()).is_none(), "tell parks on lock");
+        assert!(poll(seek_fut.as_mut()).is_none(), "seek parks on lock");
+        assert!(poll(read_fut.as_mut()).is_none(), "read parks on lock");
+
+        swap.serve();
+        assert_eq!(
+            poll(in_flight_write.as_mut()),
+            Some(Ok(payload.len() as u32))
+        );
+        assert_eq!(poll(tell_fut.as_mut()), Some(payload.len() as u64));
+        assert_eq!(poll(seek_fut.as_mut()), Some(Ok(0)));
+        assert_eq!(
+            poll(read_fut.as_mut()).map(|res| res.map(|b| b.to_vec())),
+            Some(Ok(payload.to_vec()))
+        );
+        assert_eq!(block_on(p1_tell_open_file(&fd1)), payload.len() as u64);
     }
 }

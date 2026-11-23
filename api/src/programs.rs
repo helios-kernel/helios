@@ -12,12 +12,54 @@ use crate::wit_bindgen::{FutureReader, StreamReader};
 use futures_lite::future::zip;
 
 pub use crate::bindings::helios::system::programs::{
-    AotHint, AotRequest, AotResult, CapabilityGrant, ClockGrant, ClockRight, DeviceClass,
-    DeviceGrant, DiagnosticsGrant, DiagnosticsRight, DirectoryGrant, ExecError, ExecErrorKind,
-    ExecOutput, ExecRequest, ExecResult, ExitStatus, FilesystemRight, LinkGrant, LinkRight,
-    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SpawnError,
-    SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
+    AotHint, AotRequest, AotResult, CapabilityGrant, ChildTermination, ClockGrant, ClockRight,
+    ContainerConfig, ContainerCredentials, ContainerExecRequest, ContainerIdentity, ContainerMount,
+    ContainerMountSharing, ContainerSpawnRequest, DeviceClass, DeviceGrant, DiagnosticsGrant,
+    DiagnosticsRight, DirectoryGrant, ExecError, ExecErrorKind, ExecOutput, ExecRequest,
+    ExecResult, ExitStatus, FilesystemRight, LinkGrant, LinkRight, MachineGrant, MachineRight,
+    MountGrant, MountRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight,
+    SignalTermination, SpawnError, SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
 };
+
+impl PartialEq for ChildTermination {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Exited(a), Self::Exited(b)) => a == b,
+            (
+                Self::Signaled(SignalTermination {
+                    signal: a_sig,
+                    core_dumped: a_core,
+                }),
+                Self::Signaled(SignalTermination {
+                    signal: b_sig,
+                    core_dumped: b_core,
+                }),
+            ) => a_sig == b_sig && a_core == b_core,
+            (Self::Trapped, Self::Trapped) | (Self::Killed, Self::Killed) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ChildTermination {}
+
+impl core::fmt::Display for ChildTermination {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Exited(code) => write!(f, "exited with code {code}"),
+            Self::Signaled(SignalTermination {
+                signal,
+                core_dumped: false,
+            }) => write!(f, "ended by signal {signal}"),
+            Self::Signaled(SignalTermination {
+                signal,
+                core_dumped: true,
+            }) => write!(f, "ended by signal {signal} (core dumped)"),
+            Self::Trapped => f.write_str("trapped"),
+            Self::Killed => f.write_str("was killed"),
+        }
+    }
+}
 
 /// Build a directory capability grant for `helios:system/programs`.
 pub fn directory_grant(
@@ -121,6 +163,18 @@ pub fn diagnostics_grant(rights: Vec<DiagnosticsRight>) -> CapabilityGrant {
 /// machine owner's behalf.
 pub fn observe_machine_grant() -> CapabilityGrant {
     diagnostics_grant(vec![DiagnosticsRight::ObserveMachine])
+}
+
+/// Build a machine grant. A program holds a right only when its parent
+/// granted it, so the rights must be a subset of the caller's.
+pub fn machine_grant(rights: Vec<MachineRight>) -> CapabilityGrant {
+    CapabilityGrant::Machine(MachineGrant { rights })
+}
+
+/// Take processors offline and bring them online, for a trusted
+/// launcher that runs programs on the machine owner's behalf.
+pub fn control_processors_grant() -> CapabilityGrant {
+    machine_grant(vec![MachineRight::ControlProcessors])
 }
 
 pub fn root_process_grant() -> CapabilityGrant {
@@ -227,6 +281,41 @@ async fn drain_stream(pair: (StreamReader<u8>, FutureReader<Result<(), ()>>)) ->
     }
     let _ = std::future::IntoFuture::into_future(future).await;
     collected
+}
+
+/// Owned handle to a kernel Linux container.
+///
+/// The handle wraps the `helios:system/programs.container` WIT resource.
+/// Processes launched through it share its root, mounts, PID namespace
+/// (starting at 1), hostname and domain name, and are bounded by the
+/// container's granted authority.
+pub struct Container {
+    inner: raw::Container,
+}
+
+impl Container {
+    /// Create a new Linux container bounded by the caller's authority.
+    pub async fn create(config: ContainerConfig) -> Result<Self, SpawnError> {
+        let inner = raw::create_container(config).await?;
+        Ok(Self { inner })
+    }
+
+    /// Spawn a Linux program inside this container and return its live handle.
+    pub async fn spawn(&self, request: ContainerSpawnRequest) -> Result<Child, SpawnError> {
+        let inner = self.inner.spawn(request).await?;
+        Ok(Child { inner })
+    }
+
+    /// Run a Linux program to completion inside this container, collecting its
+    /// buffered stdout and stderr.
+    pub async fn exec(&self, request: ContainerExecRequest) -> Result<ExecResult, ExecError> {
+        self.inner.exec(request).await
+    }
+}
+
+/// Create a new Linux container bounded by the caller's authority.
+pub async fn create_container(config: ContainerConfig) -> Result<Container, SpawnError> {
+    Container::create(config).await
 }
 
 /// Launch a program by path and wait for it to finish, collecting its
