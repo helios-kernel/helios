@@ -11,8 +11,13 @@ from helios_bench.manifest import REPO_ROOT
 
 
 @pytest.fixture
-def ci_jobs():
-    return yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)["jobs"]
+def ci_workflow():
+    return yaml.load((REPO_ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+
+
+@pytest.fixture
+def ci_jobs(ci_workflow):
+    return ci_workflow["jobs"]
 
 
 def select_lanes(ci_jobs, tmp_path, changed, draft=False, heavy=False):
@@ -84,10 +89,11 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
         assert lanes == []
     if changed == ["btrfs_src"] and not draft:
         assert "test-libraries" in lanes
-    assert ci_jobs["checks"]["needs"] == "changes"
-    # The payload tests start with `changes` and wait for the guest wasm in
-    # a step, after their tests have compiled and before their command runs.
-    assert ci_jobs["tests"]["needs"] == "changes"
+    assert ci_jobs["checks"]["needs"] == ["changes", "build-helios-cli"]
+    # The payload tests start beside `wasm-debug` after `build-helios-cli`
+    # and wait for the guest wasm in a step, after their tests have compiled
+    # and before their command runs.
+    assert ci_jobs["tests"]["needs"] == ["changes", "build-helios-cli"]
     steps = [step.get("uses", step.get("name", "")) for step in ci_jobs["tests"]["steps"]]
     wait = steps.index("./helios/.github/actions/prebuilt-wasm")
     assert steps.index("Compile the tests of ${{ matrix.name }}") < wait
@@ -98,9 +104,13 @@ def test_selected_checks_keep_their_commands_and_only_payload_tests_wait(
 
 
 @pytest.mark.parametrize(
-    "lane", ["test-libraries", "test-kernel", "missing", "test-btrfs-fuzz", "smoke-x86-64"]
+    "lane", ["", "test-libraries", "test-kernel", "missing", "test-btrfs-fuzz", "smoke-x86-64"]
 )
-def test_manual_lane_validates_selection_and_keeps_dependencies(ci_jobs, tmp_path, lane):
+def test_manual_lane_validates_selection_and_keeps_dependencies(ci_workflow, ci_jobs, tmp_path, lane):
+    dispatch_input = ci_workflow["on"]["workflow_dispatch"]["inputs"]["check_lane"]
+    assert dispatch_input["required"] == "true"
+    assert "default" not in dispatch_input
+
     select = next(step for step in ci_jobs["changes"]["steps"] if step.get("id") == "select")
     output = tmp_path / "outputs"
     result = subprocess.run(
@@ -117,6 +127,10 @@ def test_manual_lane_validates_selection_and_keeps_dependencies(ci_jobs, tmp_pat
         },
         capture_output=True,
     )
+    if lane == "":
+        assert result.returncode != 0
+        assert b"check_lane" in result.stderr
+        return
     if lane == "missing":
         assert result.returncode != 0
         assert b"Unknown lane" in result.stderr
@@ -131,9 +145,33 @@ def test_manual_lane_validates_selection_and_keeps_dependencies(ci_jobs, tmp_pat
     assert [check["name"] for check in checks] == ([lane] if "command" in catalog[lane] else [])
 
 
+def test_schedule_still_selects_full_suite(ci_jobs, tmp_path):
+    select = next(step for step in ci_jobs["changes"]["steps"] if step.get("id") == "select")
+    output = tmp_path / "outputs"
+    result = subprocess.run(
+        ["bash", "-c", select["run"]],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "CHANGED": "null",
+            "DRAFT": "false",
+            "HEAVY": "true",
+            "EVENT": "schedule",
+            "CHECK_LANE": "",
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    selected = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    catalog = json.loads((REPO_ROOT / ".github/ci-lanes.json").read_text())
+    assert set(json.loads(selected["lanes"])) == set(catalog)
+    assert selected["linux_suite_mode"] == "full"
+
+
 def test_every_selected_review_job_has_a_fifteen_minute_limit(ci_jobs, tmp_path):
     selected = select_lanes(ci_jobs, tmp_path, changed=None, heavy=False)
-    jobs = {"changes", "checks", "tests", "gate"}
+    jobs = {"changes", "build-helios-cli", "checks", "tests", "gate"}
     jobs.update(name for name in json.loads(selected["lanes"]) if name in ci_jobs)
     jobs.update(f"wasm-{profile}" for profile in json.loads(selected["wasm_profiles"]))
     mode = selected["linux_suite_mode"]
@@ -254,3 +292,42 @@ def test_mixed_prose_and_code_keeps_code_selection(ci_jobs, tmp_path, path):
     assert code
     selected = select_lanes(ci_jobs, tmp_path, mixed)
     assert json.loads(selected["lanes"])
+
+
+def test_helios_cli_producer_covers_every_selected_consumer_and_consumers_only_download(ci_jobs, tmp_path):
+    for name, job in ci_jobs.items():
+        cli_steps = [
+            step for step in job.get("steps", []) if step.get("uses") == "./helios/.github/actions/helios-cli"
+        ]
+        if cli_steps:
+            assert "build-helios-cli" in job["needs"], name
+            for step in cli_steps:
+                assert step["with"].get("download-only") == "true", name
+
+    cases = [
+        (["docs"], True, False),
+        (["kernel"], False, False),
+        (["linux_abi"], False, False),
+        (None, False, True),
+    ]
+    for changed, draft, heavy in cases:
+        selected = select_lanes(ci_jobs, tmp_path, changed, draft=draft, heavy=heavy)
+        lanes = set(json.loads(selected["lanes"]))
+        checks = json.loads(selected["checks"]) + json.loads(selected["tests"])
+        wasm_profiles = json.loads(selected["wasm_profiles"])
+        cli_builds = {(entry["profile"], entry["arch"]) for entry in json.loads(selected["cli_builds"])}
+        expected = set()
+        for entry in checks:
+            if entry["helios-cli"]:
+                expected.add((entry["helios-cli"], "X64"))
+        if wasm_profiles:
+            expected.add(("debug", "X64"))
+        if "smoke-x86-64-venus" in lanes:
+            expected.add(("debug", "X64"))
+        if lanes & {"smoke-riscv64", "smoke-x86-64", "smoke-x86-64-cpu-lifecycle"}:
+            expected.add(("release", "X64"))
+        if "smoke-aarch64" in lanes:
+            expected.add(("release", "ARM64"))
+        if selected["linux_suite_mode"] != "none":
+            expected.update({("release", "X64"), ("release", "ARM64")})
+        assert cli_builds == expected, (changed, draft, heavy)
