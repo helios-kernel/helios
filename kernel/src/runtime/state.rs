@@ -52,6 +52,12 @@ struct RuntimeStateInner<ProgramService, NetworkService, StorageImpl: Storage> {
     /// the root DRBG rekeys against and the reactions to a restore wait
     /// on. Installed before the root entropy.
     machine_generation: Once<MachineGenerationHandle>,
+    /// This boot's Ed25519 machine identity key, settled alongside the
+    /// compiler-signing key from the measured-boot or ephemeral seed.
+    machine_identity: Once<crate::MachineIdentityKey>,
+    /// True while a `snapshot-hold` resource holds the 9p share quiet
+    /// for a VM snapshot.
+    snapshot_hold_active: AtomicBool,
     /// Nanoseconds between the monotonic clock and wall time, as the
     /// platform's real-time clock last set them: at bring-up, and again
     /// after each machine restore. Unseeded on a machine that carries no
@@ -353,6 +359,8 @@ where
                 network_service_ready: Notify::new(),
                 root_entropy: Once::new(),
                 machine_generation: Once::new(),
+                machine_identity: Once::new(),
+                snapshot_hold_active: AtomicBool::new(false),
                 wall_clock: crate::exec::WallClock::new(),
                 http_client: PerProcessorProvider::new(),
                 host_fs_service: Mutex::new(None),
@@ -1005,6 +1013,50 @@ where
         })
     }
 
+    /// Publishes this boot's Ed25519 machine identity key once bring-up
+    /// settles the signing seed.
+    pub fn install_machine_identity_key(&self, key: crate::MachineIdentityKey) {
+        let mut installed = false;
+        self.inner.machine_identity.call_once(|| {
+            installed = true;
+            key
+        });
+        assert!(
+            installed,
+            "the machine identity key was installed more than once"
+        );
+    }
+
+    /// This boot's Ed25519 machine identity key, once installed.
+    pub fn machine_identity_key(&self) -> Option<&crate::MachineIdentityKey> {
+        self.inner.machine_identity.get()
+    }
+
+    /// Acquires the exclusive snapshot hold and quiets the 9p host share
+    /// (when attached). Dropping the returned [`SnapshotHold`] reopens
+    /// the share and clears the hold, including if this future is
+    /// cancelled mid-drain.
+    pub async fn prepare_snapshot_hold(
+        &self,
+    ) -> Result<SnapshotHold<ProgramService, NetworkService, StorageImpl>, SnapshotHoldBusy> {
+        if self
+            .inner
+            .snapshot_hold_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(SnapshotHoldBusy);
+        }
+        let hold = SnapshotHold {
+            state: self.clone(),
+            active: true,
+        };
+        if let Some(host_fs) = self.host_fs_service() {
+            host_fs.prepare_snapshot().await;
+        }
+        Ok(hold)
+    }
+
     /// Publishes the root DRBG the backend seeded at boot.
     pub fn install_root_entropy(&self, root: RootEntropyHandle) {
         let mut installed = false;
@@ -1290,6 +1342,10 @@ where
         crate::retire_queued_handles(retired, &service);
     }
 
+    fn release_snapshot_hold(&self) {
+        self.finish_snapshot_hold();
+    }
+
     fn uptime_nanos(&self, current_ticks: u64) -> u64 {
         RuntimeState::uptime_nanos(self, current_ticks)
     }
@@ -1359,6 +1415,72 @@ where
         sample: PerfSample,
     ) {
         RuntimeState::record_perf_metric_parts(self, scope, prefix, suffix, sample);
+    }
+}
+
+impl<ProgramService, NetworkService, StorageImpl: Storage>
+    RuntimeState<ProgramService, NetworkService, StorageImpl>
+{
+    /// Releases an active snapshot hold and reopens the 9p host share.
+    /// Idempotent when no hold is active.
+    pub fn finish_snapshot_hold(&self) {
+        if self
+            .inner
+            .snapshot_hold_active
+            .swap(false, Ordering::AcqRel)
+        {
+            let host_fs = self.inner.host_fs_service.lock().clone();
+            if let Some(host_fs) = host_fs {
+                host_fs.snapshot_finished();
+            }
+        }
+    }
+
+    pub fn snapshot_hold_active(&self) -> bool {
+        self.inner.snapshot_hold_active.load(Ordering::Acquire)
+    }
+}
+
+/// Another caller already holds an active [`SnapshotHold`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a machine snapshot hold is already active")]
+pub struct SnapshotHoldBusy;
+
+/// Exclusive RAII hold over the machine's 9p snapshot gate.
+#[must_use = "dropping a SnapshotHold reopens the host-share gate"]
+pub struct SnapshotHold<ProgramService, NetworkService, StorageImpl: Storage> {
+    state: RuntimeState<ProgramService, NetworkService, StorageImpl>,
+    active: bool,
+}
+
+impl<ProgramService, NetworkService, StorageImpl>
+    SnapshotHold<ProgramService, NetworkService, StorageImpl>
+where
+    ProgramService: Clone,
+    NetworkService: Clone,
+    StorageImpl: Storage,
+{
+    /// Whether this boot exposes a VM generation ID window so a snapshot
+    /// restore can tell itself apart from the continuing machine.
+    pub fn has_generation_id(&self) -> bool {
+        self.state.machine_generation().has_window()
+    }
+
+    /// Transfers cleanup responsibility to an external retirement channel
+    /// (such as a component store's resource retirement queue) without
+    /// releasing the hold now.
+    pub(crate) fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl<ProgramService, NetworkService, StorageImpl: Storage> Drop
+    for SnapshotHold<ProgramService, NetworkService, StorageImpl>
+{
+    fn drop(&mut self) {
+        if self.active {
+            self.state.finish_snapshot_hold();
+        }
     }
 }
 

@@ -7,25 +7,23 @@
 //! either world reaches the kernel through one function here, which reads
 //! the caller's [`crate::ProcessAuthority`] and answers in kernel types;
 //! the world's own conversion then renders the answer in its generated
-//! types. That keeps the two worlds from drifting apart in policy: the
-//! debugger sees the whole machine because it was provisioned with the
-//! right, not because its world skips the check.
+//! types. The system component sees the whole machine because it was
+//! provisioned with explicit capabilities, never because its world skips a
+//! check.
 //!
-//! Two kinds of call:
-//! - A control (`set-target-enabled`, `profiling.set-enabled`, `clear`,
-//!   `set-instruction-sampling`, `instruction-samples`, `raw-profile-size`
-//!   and `raw-profile-read`) acts on the whole machine, or reads what
-//!   cannot be attributed to one instance, and is refused with
-//!   [`Denied`] unless the caller holds [`ObserveMachineCap`].
-//! - A read of the histories (`recent`, `subscribe`, `folded`, `metrics`)
-//!   is answered for every caller, through the scope its authority
-//!   selects: the whole machine for a holder of the right, and only the
-//!   caller's own records otherwise. The kernel's own records are never
-//!   returned without the right.
-//!
-//! Concurrency: everything here runs on the task that owns the store and
-//! reads the store's own authority, which no other processor changes. The
-//! reads then take the history locks only as `exec/observer.rs` states.
+//! Orthogonal capability lattice:
+//! - Global diagnostic controls (`tracing.set-target-enabled`,
+//!   `profiling.set-enabled`, `profiling.clear`,
+//!   `profiling.start-instruction-sampling`) require
+//!   [`crate::DiagnosticsControlCap`] and emit a non-suppressible
+//!   `helios_kernel::audit` event.
+//! - Trace reads (`tracing.recent`, `tracing.subscribe`) inspect
+//!   [`crate::TraceReadCap`] (`None`, `Own`, `Subtree`, `Machine`).
+//! - Attributed profile reads (`profiling.folded`, `profiling.metrics`)
+//!   inspect [`crate::ProfileReadCap`] (`None`, `Own`, `Subtree`, `Machine`).
+//! - Unattributed machine-wide profile exports (`profiling.instruction-samples`,
+//!   `profiling.raw-profile-size`, `profiling.raw-profile-read`) require
+//!   [`crate::ProfileReadCap`] with [`crate::AuthorityScope::Machine`].
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -34,19 +32,20 @@ use helios_hal::cpu::Cpu;
 use triomphe::Arc;
 
 use crate::{
-    ComponentHostNetwork, FoldedProfileSample, InstructionProfile, InstructionProfileError,
-    KernelLlvmProfile, LlvmProfile, LlvmProfileError, ObserveMachineCap, OwnInstance,
-    PerfMetricFilter, PerfMetricSample, ProfileFilter, TraceEvent, TraceFilter,
+    AuthorityScope, ComponentHostNetwork, ComponentSamplingSession, DiagnosticsControlCap,
+    FoldedProfileSample, InstructionProfile, InstructionProfileError, KernelLlvmProfile,
+    LlvmProfile, LlvmProfileError, MachineObservation, NoObservation, OwnInstance,
+    PerfMetricFilter, PerfMetricSample, ProfileFilter, SubtreeObservation, TraceEvent, TraceFilter,
 };
 
 use super::StoreData;
 
-/// The caller does not hold the right to observe the machine.
+/// The caller does not hold the required diagnostic capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Denied;
 
-/// A control that the caller may not make, or that it made and the kernel
-/// could not carry out.
+/// A control or machine-wide read that the caller may not make, or that it
+/// made and the kernel could not carry out.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Refused<Failure> {
     Denied,
@@ -74,46 +73,90 @@ impl From<Denied> for TargetRefusal {
     }
 }
 
-/// The scope a read runs in, chosen from the caller's authority.
-///
-/// A read is generic over [`crate::ObservationScope`], and the scope is a
-/// different type for the two cases, so the choice is made here, once, and
-/// each read then runs monomorphised. This carries the choice from the
-/// authority check to the call that uses it; it is not itself a scope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The monomorphised [`crate::ObservationScope`] a trace or profile read runs in,
+/// chosen from the caller's [`crate::TraceReadCap`] or [`crate::ProfileReadCap`].
+#[derive(Clone, Debug)]
 pub(super) enum Visibility {
-    /// The caller holds the right: every record, the kernel's included.
-    Machine(ObserveMachineCap),
-    /// The caller does not: only what its own instance wrote.
+    None(NoObservation),
     Own(OwnInstance),
+    Subtree(SubtreeObservation),
+    Machine(MachineObservation),
 }
 
 impl Visibility {
-    pub(super) fn of<CpuImpl, Net, StorageImpl>(data: &StoreData<CpuImpl, Net, StorageImpl>) -> Self
+    pub(super) fn trace_of<CpuImpl, Net, StorageImpl>(
+        data: &StoreData<CpuImpl, Net, StorageImpl>,
+    ) -> Self
     where
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
         StorageImpl: crate::Storage,
     {
-        match data.process_authority().derive_observe_machine_cap() {
-            Ok(cap) => Self::Machine(cap),
-            Err(_) => Self::Own(OwnInstance::new(data.instance().id())),
+        match data.process_authority().derive_trace_read_cap() {
+            Err(_) => Self::None(NoObservation),
+            Ok(cap) => Self::from_scope(cap.scope(), data),
+        }
+    }
+
+    pub(super) fn profile_of<CpuImpl, Net, StorageImpl>(
+        data: &StoreData<CpuImpl, Net, StorageImpl>,
+    ) -> Self
+    where
+        CpuImpl: Cpu + Clone,
+        Net: ComponentHostNetwork,
+        StorageImpl: crate::Storage,
+    {
+        match data.process_authority().derive_profile_read_cap() {
+            Err(_) => Self::None(NoObservation),
+            Ok(cap) => Self::from_scope(cap.scope(), data),
+        }
+    }
+
+    fn from_scope<CpuImpl, Net, StorageImpl>(
+        scope: AuthorityScope,
+        data: &StoreData<CpuImpl, Net, StorageImpl>,
+    ) -> Self
+    where
+        CpuImpl: Cpu + Clone,
+        Net: ComponentHostNetwork,
+        StorageImpl: crate::Storage,
+    {
+        match scope {
+            AuthorityScope::Own => Self::Own(OwnInstance::new(data.instance().id())),
+            AuthorityScope::Subtree(root) => Self::Subtree(SubtreeObservation::new(
+                root,
+                data.instance_registry.clone(),
+            )),
+            AuthorityScope::Machine => Self::Machine(MachineObservation),
         }
     }
 }
 
-/// The proof that the caller may control and read the whole machine.
-fn observe_machine<CpuImpl, Net, StorageImpl>(
+fn diagnostics_control<CpuImpl, Net, StorageImpl>(
     data: &StoreData<CpuImpl, Net, StorageImpl>,
-) -> Result<ObserveMachineCap, Denied>
+) -> Result<DiagnosticsControlCap, Denied>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
     data.process_authority()
-        .derive_observe_machine_cap()
+        .derive_diagnostics_control_cap()
         .map_err(|_| Denied)
+}
+
+fn machine_profile_read<CpuImpl, Net, StorageImpl>(
+    data: &StoreData<CpuImpl, Net, StorageImpl>,
+) -> Result<(), Denied>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    match data.process_authority().derive_profile_read_cap() {
+        Ok(cap) if cap.scope() == AuthorityScope::Machine => Ok(()),
+        _ => Err(Denied),
+    }
 }
 
 /// `tracing.set-target-enabled`.
@@ -127,9 +170,19 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    observe_machine(data)?;
-    crate::log::set_gated_target(target, enabled)
-        .map_err(|error| TargetRefusal::Unknown(error.to_string()))
+    let caller_id = data.instance().id();
+    if diagnostics_control(data).is_err() {
+        crate::audit::diagnostic_gate_change(caller_id, "tracing.target.denied", target, false);
+        return Err(TargetRefusal::Denied);
+    }
+    let result = crate::log::set_gated_target(target, enabled)
+        .map_err(|error| TargetRefusal::Unknown(error.to_string()));
+    if result.is_ok() {
+        crate::audit::diagnostic_gate_change(caller_id, "tracing.target", target, enabled);
+    } else {
+        crate::audit::diagnostic_gate_change(caller_id, "tracing.target.rejected", target, enabled);
+    }
+    result
 }
 
 /// `tracing.recent`, after the filter is lifted.
@@ -143,9 +196,11 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match Visibility::of(data) {
-        Visibility::Machine(scope) => data.runtime_state.recent(&scope, filter, limit),
+    match Visibility::trace_of(data) {
+        Visibility::None(scope) => data.runtime_state.recent(&scope, filter, limit),
         Visibility::Own(scope) => data.runtime_state.recent(&scope, filter, limit),
+        Visibility::Subtree(scope) => data.runtime_state.recent(&scope, filter, limit),
+        Visibility::Machine(scope) => data.runtime_state.recent(&scope, filter, limit),
     }
 }
 
@@ -159,8 +214,18 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    observe_machine(data)?;
+    let caller_id = data.instance().id();
+    if diagnostics_control(data).is_err() {
+        crate::audit::diagnostic_gate_change(caller_id, "profiling.enabled", "denied", false);
+        return Err(Denied);
+    }
     data.runtime_state.set_profiling_enabled(enabled);
+    crate::audit::diagnostic_gate_change(
+        caller_id,
+        "profiling.enabled",
+        if enabled { "enabled" } else { "disabled" },
+        true,
+    );
     Ok(())
 }
 
@@ -173,8 +238,13 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    observe_machine(data)?;
+    let caller_id = data.instance().id();
+    if diagnostics_control(data).is_err() {
+        crate::audit::diagnostic_gate_change(caller_id, "profiling.clear", "denied", false);
+        return Err(Denied);
+    }
     data.runtime_state.clear_profile();
+    crate::audit::diagnostic_gate_change(caller_id, "profiling.clear", "cleared", true);
     Ok(())
 }
 
@@ -190,11 +260,17 @@ where
     StorageImpl: crate::Storage,
 {
     let ticks = data.cpu.now().ticks();
-    match Visibility::of(data) {
-        Visibility::Machine(scope) => data
+    match Visibility::profile_of(data) {
+        Visibility::None(scope) => data
             .runtime_state
             .folded_profile(ticks, &scope, filter, limit),
         Visibility::Own(scope) => data
+            .runtime_state
+            .folded_profile(ticks, &scope, filter, limit),
+        Visibility::Subtree(scope) => data
+            .runtime_state
+            .folded_profile(ticks, &scope, filter, limit),
+        Visibility::Machine(scope) => data
             .runtime_state
             .folded_profile(ticks, &scope, filter, limit),
     }
@@ -211,27 +287,53 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    match Visibility::of(data) {
-        Visibility::Machine(scope) => data.runtime_state.perf_metrics(&scope, filter, limit),
+    match Visibility::profile_of(data) {
+        Visibility::None(scope) => data.runtime_state.perf_metrics(&scope, filter, limit),
         Visibility::Own(scope) => data.runtime_state.perf_metrics(&scope, filter, limit),
+        Visibility::Subtree(scope) => data.runtime_state.perf_metrics(&scope, filter, limit),
+        Visibility::Machine(scope) => data.runtime_state.perf_metrics(&scope, filter, limit),
     }
 }
 
-/// `profiling.set-instruction-sampling`.
-pub(super) fn set_instruction_sampling<CpuImpl, Net, StorageImpl>(
+/// `profiling.start-instruction-sampling`.
+pub(super) fn start_instruction_sampling<CpuImpl, Net, StorageImpl>(
     data: &StoreData<CpuImpl, Net, StorageImpl>,
-    enabled: bool,
-) -> Result<(), Refused<InstructionProfileError>>
+) -> Result<ComponentSamplingSession, Refused<InstructionProfileError>>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    observe_machine(data)?;
-    data.runtime_state
-        .instruction_sampler()
-        .set_sampling(enabled)
-        .map_err(Refused::Failed)
+    let caller_id = data.instance().id();
+    if diagnostics_control(data).is_err() {
+        crate::audit::diagnostic_gate_change(
+            caller_id,
+            "profiling.instruction-sampling",
+            "denied",
+            false,
+        );
+        return Err(Refused::Denied);
+    }
+    match data.runtime_state.instruction_sampler().start_sampling() {
+        Ok(session) => {
+            crate::audit::diagnostic_gate_change(
+                caller_id,
+                "profiling.instruction-sampling",
+                "started",
+                true,
+            );
+            Ok(ComponentSamplingSession(session))
+        }
+        Err(error) => {
+            crate::audit::diagnostic_gate_change(
+                caller_id,
+                "profiling.instruction-sampling",
+                "failed",
+                false,
+            );
+            Err(Refused::Failed(error))
+        }
+    }
 }
 
 /// `profiling.instruction-samples`.
@@ -247,7 +349,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    if observe_machine(data).is_err() {
+    if machine_profile_read(data).is_err() {
         return Ok(Err(Refused::Denied));
     }
     let service = data.runtime_state.program_service().ok_or_else(|| {
@@ -271,7 +373,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    observe_machine(data)?;
+    machine_profile_read(data)?;
     KernelLlvmProfile.size().map_err(Refused::Failed)
 }
 
@@ -286,7 +388,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    observe_machine(data)?;
+    machine_profile_read(data)?;
     super::read_raw_profile(offset, length).map_err(Refused::Failed)
 }
 
@@ -304,24 +406,25 @@ mod observation_authority_tests {
     };
     use helios_hal::cpu::HardwarePerfCounterDelta;
 
-    /// A store whose instance holds `rights`.
-    fn store(rights: DiagnosticAuthorityRights) -> TestStoreData {
+    fn unprivileged() -> TestStoreData {
+        store_data_authorized(ProcessAuthority::empty(), |_| {})
+    }
+
+    fn own_reader() -> TestStoreData {
         let mut authority = ProcessAuthority::empty();
-        if !rights.is_empty() {
-            authority.grant_diagnostic_rights(rights);
-        }
+        authority.grant_trace_read(AuthorityScope::Own);
+        authority.grant_profile_read(AuthorityScope::Own);
         store_data_authorized(authority, |_| {})
     }
 
-    fn ordinary() -> TestStoreData {
-        store(DiagnosticAuthorityRights::empty())
+    fn full_observer() -> TestStoreData {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_trace_read(AuthorityScope::Machine);
+        authority.grant_profile_read(AuthorityScope::Machine);
+        authority.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
+        store_data_authorized(authority, |_| {})
     }
 
-    fn observer() -> TestStoreData {
-        store(DiagnosticAuthorityRights::OBSERVE_MACHINE)
-    }
-
-    /// An instance other than the one `data` runs.
     fn other_instance(data: &TestStoreData) -> InstanceId {
         InstanceId::from_raw(data.instance().id().raw() + 1000)
     }
@@ -346,8 +449,6 @@ mod observation_authority_tests {
         }
     }
 
-    /// Records a console line from the kernel, one from `data`'s own
-    /// instance and one from another instance.
     fn record_events(data: &TestStoreData) {
         let own = data.instance().id();
         let other = other_instance(data);
@@ -357,8 +458,6 @@ mod observation_authority_tests {
         state.record_console_text(3, Some(other), "INFO [guest] theirs\n");
     }
 
-    /// Enables profiling and records a kernel stack and metric, and a
-    /// user stack and metric for `data`'s own instance and for another.
     fn record_profile(data: &TestStoreData) {
         let own = data.instance().id();
         let other = other_instance(data);
@@ -378,70 +477,105 @@ mod observation_authority_tests {
     }
 
     #[test]
-    fn visibility_follows_the_callers_authority() {
-        let holder = observer();
-        assert!(matches!(Visibility::of(&holder), Visibility::Machine(_)));
+    fn visibility_distinguishes_none_own_subtree_and_machine_orthogonally() {
+        let none = unprivileged();
+        assert!(matches!(Visibility::trace_of(&none), Visibility::None(_)));
+        assert!(matches!(Visibility::profile_of(&none), Visibility::None(_)));
 
-        let program = ordinary();
-        assert_eq!(
-            Visibility::of(&program),
-            Visibility::Own(OwnInstance::new(program.instance().id()))
-        );
+        let mut trace_only = ProcessAuthority::empty();
+        trace_only.grant_trace_read(AuthorityScope::Own);
+        let trace_only_store = store_data_authorized(trace_only, |_| {});
+        assert!(matches!(
+            Visibility::trace_of(&trace_only_store),
+            Visibility::Own(_)
+        ));
+        assert!(matches!(
+            Visibility::profile_of(&trace_only_store),
+            Visibility::None(_)
+        ));
+
+        let holder = full_observer();
+        assert!(matches!(
+            Visibility::trace_of(&holder),
+            Visibility::Machine(_)
+        ));
+        assert!(matches!(
+            Visibility::profile_of(&holder),
+            Visibility::Machine(_)
+        ));
     }
 
     #[test]
-    fn ordinary_program_is_refused_the_global_controls() {
-        let program = ordinary();
+    fn unprivileged_program_reads_no_traces_no_profiles_and_is_refused_global_controls() {
+        let program = unprivileged();
+        record_events(&program);
+        record_profile(&program);
+
+        assert!(recent_events(&program, &any_trace(), 16).is_empty());
+        assert!(folded_samples(&program, &any_stack(), 0).is_empty());
+        assert!(metric_samples(&program, &any_metric(), 0).is_empty());
+
         let enabled_before = program.runtime_state.profiling_enabled();
-        // A real target: were the check not first, this would flip the
-        // gate and answer `Ok`.
         assert_eq!(
             set_target_enabled(&program, crate::exec::phases::TARGET, true),
             Err(TargetRefusal::Denied)
         );
-        assert_eq!(set_profiling_enabled(&program, true), Err(Denied));
+        assert_eq!(set_profiling_enabled(&program, false), Err(Denied));
         assert_eq!(clear_profile(&program), Err(Denied));
-        assert_eq!(
-            set_instruction_sampling(&program, true),
+        assert!(matches!(
+            start_instruction_sampling(&program),
             Err(Refused::Denied)
-        );
+        ));
         assert!(matches!(
             instruction_samples(&program).expect("the refusal precedes the bring-up check"),
             Err(Refused::Denied)
         ));
         assert_eq!(raw_profile_size(&program), Err(Refused::Denied));
         assert_eq!(raw_profile_read(&program, 0, 16), Err(Refused::Denied));
-        // Refused before the window is even checked against the limit.
         assert_eq!(
             raw_profile_read(&program, 0, crate::MAX_PROFILE_READ + 1),
             Err(Refused::Denied)
         );
-
-        // Nothing the refused calls would have changed was changed.
-        assert_eq!(
-            program.runtime_state.profiling_enabled(),
-            enabled_before,
-            "a refused set-enabled must not turn profiling on"
-        );
+        assert_eq!(program.runtime_state.profiling_enabled(), enabled_before);
     }
 
     #[test]
-    fn refused_clear_leaves_the_profile_alone() {
-        let program = ordinary();
-        record_profile(&program);
+    fn read_only_machine_observer_cannot_mutate_controls_and_control_only_cannot_read() {
+        let mut read_only_auth = ProcessAuthority::empty();
+        read_only_auth.grant_trace_read(AuthorityScope::Machine);
+        read_only_auth.grant_profile_read(AuthorityScope::Machine);
+        let reader = store_data_authorized(read_only_auth, |_| {});
+        record_events(&reader);
+        record_profile(&reader);
 
-        assert_eq!(clear_profile(&program), Err(Denied));
+        assert_eq!(recent_events(&reader, &any_trace(), 16).len(), 3);
+        assert_eq!(folded_samples(&reader, &any_stack(), 0).len(), 3);
+        assert_eq!(set_profiling_enabled(&reader, false), Err(Denied));
+        assert_eq!(clear_profile(&reader), Err(Denied));
+        assert!(matches!(
+            start_instruction_sampling(&reader),
+            Err(Refused::Denied)
+        ));
 
-        let own = folded_samples(&program, &any_stack(), 0);
-        assert_eq!(own.len(), 1, "the caller's own sample survived the clear");
+        let mut control_only_auth = ProcessAuthority::empty();
+        control_only_auth.grant_diagnostic_rights(DiagnosticAuthorityRights::CONTROL);
+        let controller = store_data_authorized(control_only_auth, |_| {});
+        record_events(&controller);
+        record_profile(&controller);
+
+        assert_eq!(set_profiling_enabled(&controller, true), Ok(()));
+        assert!(recent_events(&controller, &any_trace(), 16).is_empty());
+        assert!(folded_samples(&controller, &any_stack(), 0).is_empty());
+        assert!(matches!(
+            instruction_samples(&controller).unwrap(),
+            Err(Refused::Denied)
+        ));
+        assert_eq!(raw_profile_size(&controller), Err(Refused::Denied));
     }
 
     #[test]
-    fn holder_of_the_right_passes_every_global_control() {
-        let holder = observer();
-        // Each of these reaches the kernel and answers with what the
-        // fixture's kernel says, never `Denied`. A name nothing registered
-        // keeps the target gate untouched.
+    fn holder_of_controls_and_machine_profile_passes_every_global_operation() {
+        let holder = full_observer();
         assert!(matches!(
             set_target_enabled(&holder, "helios_kernel::exec::nope", true),
             Err(TargetRefusal::Unknown(_))
@@ -451,12 +585,10 @@ mod observation_authority_tests {
         assert_eq!(clear_profile(&holder), Ok(()));
         assert_eq!(set_profiling_enabled(&holder, false), Ok(()));
         assert!(!holder.runtime_state.profiling_enabled());
-        // The fixture installs no instruction capture and no program
-        // service, and its kernel image carries no instrumentation.
-        assert_eq!(
-            set_instruction_sampling(&holder, true),
+        assert!(matches!(
+            start_instruction_sampling(&holder),
             Err(Refused::Failed(InstructionProfileError::NotCaptured))
-        );
+        ));
         assert!(instruction_samples(&holder).is_err());
         assert!(!matches!(raw_profile_size(&holder), Err(Refused::Denied)));
         assert!(!matches!(
@@ -466,31 +598,109 @@ mod observation_authority_tests {
     }
 
     #[test]
-    fn ordinary_program_cannot_read_another_instances_events() {
-        let program = ordinary();
+    fn own_scope_reads_only_its_own_traces_and_profile() {
+        let program = own_reader();
         record_events(&program);
+        record_profile(&program);
 
-        // It sees what it wrote, and neither the kernel's console nor the
-        // other instance's output.
         let seen = recent_events(&program, &any_trace(), 16);
         assert_eq!(origins(&seen), [Some(program.instance().id())]);
         assert_eq!(seen[0].target, "guest");
+
+        let folded = folded_samples(&program, &any_stack(), 0);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].scope, ProfileScope::User);
+        assert_eq!(&*folded[0].stack, "user;dash");
+        assert_eq!(folded[0].weight, 3);
+
+        assert!(metric_samples(&program, &any_metric(), 0).is_empty());
+        assert!(matches!(
+            instruction_samples(&program).unwrap(),
+            Err(Refused::Denied)
+        ));
     }
 
     #[test]
-    fn program_that_wrote_nothing_reads_no_events() {
-        let program = ordinary();
-        let state = &program.runtime_state;
-        state.record_console_text(1, None, "INFO [kernel] boot\n");
-        state.record_console_text(2, Some(other_instance(&program)), "INFO [guest] theirs\n");
+    fn subtree_scope_reads_descendants_including_retired_children_and_excludes_kernel_and_siblings()
+    {
+        let base = unprivileged();
+        let root_id = base.instance().id();
+        let mut subtree_auth = ProcessAuthority::empty();
+        subtree_auth.grant_trace_read(AuthorityScope::Subtree(root_id));
+        subtree_auth.grant_profile_read(AuthorityScope::Subtree(root_id));
+        let mut store = store_data_authorized(subtree_auth, |_| {});
+        // Align subtree root to `store`'s own instance.
+        let store_id = store.instance().id();
+        let mut aligned_auth = ProcessAuthority::empty();
+        aligned_auth.grant_trace_read(AuthorityScope::Subtree(store_id));
+        aligned_auth.grant_profile_read(AuthorityScope::Subtree(store_id));
+        store = store_data_authorized(aligned_auth, |_| {});
+        // Wait: `store_data_authorized` creates a fresh registry each time; test
+        // `Subtree(child_root)` directly on `store` by rooting at a child subtree!
+        let sibling = store.instance_registry.register("sibling", 1);
+        let child_root =
+            store
+                .instance_registry
+                .register_child(Some(store.instance().id()), "sub-root", 2);
+        let child_root_id = child_root.id();
+        let grandchild =
+            store
+                .instance_registry
+                .register_child(Some(child_root_id), "grandchild", 3);
+        let grandchild_id = grandchild.id();
 
-        assert!(recent_events(&program, &any_trace(), 16).is_empty());
+        let mut scoped_auth = ProcessAuthority::empty();
+        scoped_auth.grant_trace_read(AuthorityScope::Subtree(child_root_id));
+        scoped_auth.grant_profile_read(AuthorityScope::Subtree(child_root_id));
+        let mut observer = store_data_authorized(scoped_auth, |_| {});
+        observer.instance_registry = store.instance_registry.clone();
+
+        // Retire `grandchild` AFTER recording console & profile samples for it!
+        observer
+            .runtime_state
+            .record_console_text(1, None, "INFO [kernel] k\n");
+        observer
+            .runtime_state
+            .record_console_text(2, Some(sibling.id()), "INFO [sib] s\n");
+        observer
+            .runtime_state
+            .record_console_text(3, Some(child_root_id), "INFO [root] r\n");
+        observer
+            .runtime_state
+            .record_console_text(4, Some(grandchild_id), "INFO [gc] g\n");
+
+        observer.runtime_state.set_profiling_enabled(true);
+        observer
+            .runtime_state
+            .record_profile_stack_str_nanos(ProfileScope::Kernel, "kernel;k", 50);
+        observer
+            .runtime_state
+            .record_user_profile(sibling.id(), "sib", 20);
+        observer
+            .runtime_state
+            .record_user_profile(child_root_id, "worker", 10);
+        observer
+            .runtime_state
+            .record_user_profile(grandchild_id, "worker", 7);
+
+        drop(grandchild);
+
+        let seen = recent_events(&observer, &any_trace(), 16);
+        assert_eq!(origins(&seen), [Some(child_root_id), Some(grandchild_id)]);
+
+        let folded = folded_samples(&observer, &any_stack(), 0);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(&*folded[0].stack, "user;worker");
+        assert_eq!(folded[0].weight, 17);
+
+        drop((sibling, child_root, base));
     }
 
     #[test]
-    fn debugger_scope_reads_every_instances_events() {
-        let holder = observer();
+    fn machine_scope_reads_every_instances_events_and_merged_profile() {
+        let holder = full_observer();
         record_events(&holder);
+        record_profile(&holder);
 
         let seen = recent_events(&holder, &any_trace(), 16);
         assert_eq!(
@@ -501,30 +711,6 @@ mod observation_authority_tests {
                 Some(other_instance(&holder))
             ]
         );
-    }
-
-    #[test]
-    fn ordinary_program_reads_only_its_own_profile() {
-        let program = ordinary();
-        record_profile(&program);
-
-        let folded = folded_samples(&program, &any_stack(), 0);
-        assert_eq!(folded.len(), 1);
-        assert_eq!(folded[0].scope, ProfileScope::User);
-        assert_eq!(&*folded[0].stack, "user;dash");
-        assert_eq!(folded[0].weight, 3, "not summed with another instance's");
-
-        let metrics = metric_samples(&program, &any_metric(), 0);
-        assert!(
-            metrics.is_empty(),
-            "the user metric was recorded for no instance and the kernel's is not its own"
-        );
-    }
-
-    #[test]
-    fn holder_of_the_right_reads_the_merged_profile() {
-        let holder = observer();
-        record_profile(&holder);
 
         let folded = folded_samples(&holder, &any_stack(), 0);
         let rows = folded
@@ -539,8 +725,6 @@ mod observation_authority_tests {
                 (ProfileScope::User, "user;other", 5),
             ]
         );
-
-        let metrics = metric_samples(&holder, &any_metric(), 0);
-        assert_eq!(metrics.len(), 2);
+        assert_eq!(metric_samples(&holder, &any_metric(), 0).len(), 2);
     }
 }

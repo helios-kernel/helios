@@ -2365,11 +2365,36 @@ pub(super) fn wasix_proc_spawn_inherited_non_directory_authority(
     // device does not: it belongs to the driver instance it was granted
     // to, not to that instance's children.
     authority.grant_device_classes(parent.device_class_rights());
-    // The observation right follows the shell the same way: the programs
-    // a launcher runs through `dash` observe the machine as it does.
+    // Subtree and machine observation/control scopes follow the shell so
+    // diagnostic and instance-control utilities run from it act within the
+    // launcher's scope; `Own` stays with the parent instance itself.
+    if let Some(scope) = parent
+        .inspect_read_scope()
+        .filter(|&scope| scope != crate::AuthorityScope::Own)
+    {
+        authority.grant_inspect_read(scope);
+    }
+    if let Some(scope) = parent
+        .trace_read_scope()
+        .filter(|&scope| scope != crate::AuthorityScope::Own)
+    {
+        authority.grant_trace_read(scope);
+    }
+    if let Some(scope) = parent
+        .profile_read_scope()
+        .filter(|&scope| scope != crate::AuthorityScope::Own)
+    {
+        authority.grant_profile_read(scope);
+    }
     authority.grant_diagnostic_rights(parent.diagnostic_rights());
-    // So does the right to control processors: `cpu` run from the
-    // launcher's shell acts with the launcher's authority.
+    if let Some(scope) = parent
+        .instance_control_scope()
+        .filter(|&scope| scope != crate::AuthorityScope::Own)
+    {
+        authority.grant_instance_control(scope);
+    }
+    // Machine control and identity rights follow the shell when the
+    // launcher explicitly handed them down.
     authority.grant_machine_rights(parent.machine_rights());
     authority
 }
@@ -3603,6 +3628,8 @@ where
                 argv,
                 env: LaunchEnvironment::from_guest(environment),
                 authority,
+                ipc_grants: crate::IpcEndpointGrants::new(),
+                launched_instance: None,
                 filesystem,
                 descriptors,
                 signal_dispositions,

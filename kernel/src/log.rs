@@ -114,15 +114,20 @@ pub(crate) fn set_gated_target(name: &str, enabled: bool) -> Result<(), UnknownD
 }
 
 impl<Console: Write + Send + 'static> Subscriber for KernelConsoleSubscriber<Console> {
-    /// `enabled` is constant-true for `INFO` and stronger, so those
-    /// callsites answer `always()` and pay nothing per event. `DEBUG`
-    /// and `TRACE` sites exist only for gated diagnostic targets:
-    /// while every gate is shut they answer `never()` — one
-    /// callsite-local atomic per event, the pre-gate off-cost — and
-    /// while any gate is open they answer `sometimes()` and re-ask
-    /// [`enabled`](Self::enabled) per event. `set_gated_target`
-    /// rebuilds the interest cache on each flip so the answers move.
+    /// `helios_kernel::audit` is non-suppressible at every level and
+    /// always answers `always()`. `enabled` is also constant-true for
+    /// `INFO` and stronger, so those callsites answer `always()` and pay
+    /// nothing per event. `DEBUG` and `TRACE` sites on other targets
+    /// exist only for gated diagnostic targets: while every gate is shut
+    /// they answer `never()` — one callsite-local atomic per event, the
+    /// pre-gate off-cost — and while any gate is open they answer
+    /// `sometimes()` and re-ask [`enabled`](Self::enabled) per event.
+    /// `set_gated_target` rebuilds the interest cache on each flip so
+    /// the answers move.
     fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
+        if metadata.target() == crate::audit::TARGET {
+            return Interest::always();
+        }
         match *metadata.level() {
             tracing::Level::ERROR | tracing::Level::WARN | tracing::Level::INFO => {
                 Interest::always()
@@ -133,6 +138,9 @@ impl<Console: Write + Send + 'static> Subscriber for KernelConsoleSubscriber<Con
     }
 
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        if metadata.target() == crate::audit::TARGET {
+            return true;
+        }
         match *metadata.level() {
             tracing::Level::ERROR | tracing::Level::WARN | tracing::Level::INFO => true,
             _ => gated_target_enabled(metadata.target()),
@@ -360,5 +368,74 @@ mod tests {
         });
 
         assert!(set_gated_target("helios_kernel::exec::nope", true).is_err());
+    }
+
+    #[test]
+    fn audit_target_is_non_suppressible_and_cannot_be_gated_off() {
+        use alloc::sync::Arc;
+        use core::fmt;
+        use spin::Mutex;
+
+        #[derive(Clone, Default)]
+        struct SharedBuffer(Arc<Mutex<String>>);
+
+        impl fmt::Write for SharedBuffer {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                self.0.lock().push_str(s);
+                Ok(())
+            }
+        }
+
+        assert!(
+            set_gated_target(crate::audit::TARGET, false).is_err(),
+            "the audit target must never be registered in the suppressible gate list"
+        );
+
+        let sink = SharedBuffer::default();
+        let logger = KernelConsoleSubscriber::new(sink.clone());
+
+        tracing::subscriber::with_default(logger, || {
+            assert!(tracing::enabled!(
+                target: crate::audit::TARGET,
+                tracing::Level::INFO
+            ));
+            assert!(tracing::enabled!(
+                target: crate::audit::TARGET,
+                tracing::Level::DEBUG
+            ));
+            assert!(tracing::enabled!(
+                target: crate::audit::TARGET,
+                tracing::Level::TRACE
+            ));
+
+            crate::audit::privileged_spawn(
+                Some(crate::InstanceId::from_raw(1)),
+                crate::InstanceId::from_raw(2),
+                "/bin/worker",
+                1,
+            );
+            crate::audit::instance_kill(
+                Some(crate::InstanceId::from_raw(1)),
+                crate::InstanceId::from_raw(2),
+                crate::KillReason::Operator,
+                crate::KillOutcome::Requested,
+            );
+            crate::audit::processor_transition(crate::InstanceId::from_raw(1), 3, "offline", true);
+            crate::audit::diagnostic_gate_change(
+                crate::InstanceId::from_raw(1),
+                "tracing",
+                "helios_kernel::exec::phases",
+                true,
+            );
+            tracing::trace!(target: crate::audit::TARGET, probe = 1_u64, "audit trace probe");
+        });
+
+        let captured = sink.0.lock();
+        assert!(captured.contains("[helios_kernel::audit]"));
+        assert!(captured.contains("action=spawn"));
+        assert!(captured.contains("action=kill"));
+        assert!(captured.contains("action=processor"));
+        assert!(captured.contains("action=diagnostic-gate"));
+        assert!(captured.contains("audit trace probe"));
     }
 }

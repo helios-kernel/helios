@@ -610,15 +610,10 @@ pub(crate) fn test_profile_sink() -> crate::ProfileSink {
     )
 }
 
-/// The proof that an instance may observe the whole machine, derived
-/// the way a kernel host function derives it: from an authority that was
-/// granted the right.
-pub(crate) fn test_observe_machine_cap() -> crate::ObserveMachineCap {
-    let mut authority = crate::ProcessAuthority::empty();
-    authority.grant_diagnostic_rights(crate::DiagnosticAuthorityRights::OBSERVE_MACHINE);
-    authority
-        .derive_observe_machine_cap()
-        .expect("an authority granted the right derives its proof")
+/// Machine-wide observation scope for subsystem tests below the
+/// component host boundary.
+pub(crate) fn test_observe_machine_cap() -> crate::MachineObservation {
+    crate::MachineObservation
 }
 
 /// The uptime clock a test service reads, at a 1 GHz timebase whose
@@ -730,6 +725,8 @@ impl crate::component::ComponentRuntimeState for TestRuntimeState {
             ),
         }
     }
+
+    fn release_snapshot_hold(&self) {}
 }
 
 /// A network interface that moves no frames and does nothing but report

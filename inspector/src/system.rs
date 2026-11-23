@@ -197,6 +197,10 @@ async fn kill(client: &RpcClient, id: u64) -> Result<(), SystemError> {
             id,
             reason: "it is already stopping",
         }),
+        Err(instances::KillError::Denied) => Err(SystemError::KillRefused {
+            id,
+            reason: "the session does not hold instance-control over that instance",
+        }),
     }
 }
 

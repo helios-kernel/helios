@@ -8,9 +8,7 @@ use crate::error::DispatchError;
 use crate::system::accept;
 use crate::system::server::{self, Dispatcher, Invocations};
 
-use super::bindings::helios::system::{
-    filters, instances, processors, profiling, programs, stats, tracing,
-};
+use super::bindings::helios::system::{filters, instances, processors, profiling, stats, tracing};
 use super::methods::{
     INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROCESSORS_INSTANCE,
     PROCESSORS_OFFLINE, PROCESSORS_ONLINE, PROCESSORS_SETS, PROFILING_CLEAR, PROFILING_FOLDED,
@@ -19,6 +17,7 @@ use super::methods::{
     PROFILING_SET_INSTRUCTION_SAMPLING, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
     STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT, TRACING_SET_TARGET_ENABLED,
 };
+use super::programs;
 use crate::debugger::{filesystem, programs as debugger_programs, snapshot as debugger_snapshot};
 
 /// The embedded debugger's dispatcher: every method it exposes,
@@ -348,8 +347,18 @@ async fn dispatch(
                     operation: "profiling.set-instruction-sampling",
                     source,
                 })?;
-            let result = host_profiling::set_instruction_sampling(enabled)
-                .map_err(convert_instruction_profile_error);
+            let result: Result<(), profiling::InstructionProfileError> = if enabled {
+                match host_profiling::start_instruction_sampling() {
+                    Ok(session) => {
+                        invocations.set_sampling_session(Some(session));
+                        Ok(())
+                    }
+                    Err(error) => Err(convert_instruction_profile_error(error)),
+                }
+            } else {
+                invocations.set_sampling_session(None);
+                Ok(())
+            };
             postcard::to_allocvec(&result).map_err(|source| DispatchError::Encode {
                 operation: "profiling.set-instruction-sampling",
                 source,
@@ -494,13 +503,10 @@ fn map_capability_grants_to_host(
                 })
             }
             programs::CapabilityGrant::Diagnostics(grant) => {
-                host_programs::CapabilityGrant::Diagnostics(host_programs::DiagnosticsGrant {
-                    rights: grant
-                        .rights
-                        .into_iter()
-                        .map(map_diagnostics_right_to_host)
-                        .collect(),
-                })
+                host_programs::CapabilityGrant::Diagnostics(map_diagnostics_grant_to_host(grant))
+            }
+            programs::CapabilityGrant::InstanceControl(scope) => {
+                host_programs::CapabilityGrant::InstanceControl(map_authority_scope_to_host(scope))
             }
             programs::CapabilityGrant::Machine(grant) => {
                 host_programs::CapabilityGrant::Machine(host_programs::MachineGrant {
@@ -515,9 +521,18 @@ fn map_capability_grants_to_host(
         .collect()
 }
 
+fn map_authority_scope_to_host(scope: programs::AuthorityScope) -> host_programs::AuthorityScope {
+    match scope {
+        programs::AuthorityScope::Own => host_programs::AuthorityScope::Own,
+        programs::AuthorityScope::Subtree(target) => host_programs::AuthorityScope::Subtree(target),
+        programs::AuthorityScope::Machine => host_programs::AuthorityScope::Machine,
+    }
+}
+
 fn map_machine_right_to_host(right: programs::MachineRight) -> host_programs::MachineRight {
     match right {
-        programs::MachineRight::ControlProcessors => host_programs::MachineRight::ControlProcessors,
+        programs::MachineRight::Control => host_programs::MachineRight::Control,
+        programs::MachineRight::Identity => host_programs::MachineRight::Identity,
     }
 }
 
@@ -594,13 +609,20 @@ fn map_device_class_to_host(class: programs::DeviceClass) -> host_programs::Devi
     }
 }
 
-fn map_diagnostics_right_to_host(
-    right: programs::DiagnosticsRight,
-) -> host_programs::DiagnosticsRight {
-    match right {
-        programs::DiagnosticsRight::ObserveMachine => {
-            host_programs::DiagnosticsRight::ObserveMachine
+fn map_diagnostics_grant_to_host(
+    grant: programs::DiagnosticsGrant,
+) -> host_programs::DiagnosticsGrant {
+    match grant {
+        programs::DiagnosticsGrant::InspectRead(scope) => {
+            host_programs::DiagnosticsGrant::InspectRead(map_authority_scope_to_host(scope))
         }
+        programs::DiagnosticsGrant::TraceRead(scope) => {
+            host_programs::DiagnosticsGrant::TraceRead(map_authority_scope_to_host(scope))
+        }
+        programs::DiagnosticsGrant::ProfileRead(scope) => {
+            host_programs::DiagnosticsGrant::ProfileRead(map_authority_scope_to_host(scope))
+        }
+        programs::DiagnosticsGrant::Control => host_programs::DiagnosticsGrant::Control,
     }
 }
 
@@ -844,6 +866,7 @@ fn convert_kill_error(error: host_instances::KillError) -> instances::KillError 
     match error {
         host_instances::KillError::NoSuchInstance => instances::KillError::NoSuchInstance,
         host_instances::KillError::AlreadyStopping => instances::KillError::AlreadyStopping,
+        host_instances::KillError::Denied => instances::KillError::Denied,
     }
 }
 
@@ -972,6 +995,7 @@ fn convert_instruction_profile_error(
         host_profiling::InstructionProfileError::Denied => {
             profiling::InstructionProfileError::Denied
         }
+        host_profiling::InstructionProfileError::Busy => profiling::InstructionProfileError::Busy,
     }
 }
 

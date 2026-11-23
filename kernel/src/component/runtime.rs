@@ -477,15 +477,19 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// back into closes. See [`super::SocketRetirementQueue`] for why
     /// a socket resource cannot do it itself.
     fn retire_network_handles(&self, retired: &super::SocketRetirementQueue);
+
+    /// Reopens the host-share snapshot gate when a dying store still held an
+    /// active `snapshot-hold` resource.
+    fn release_snapshot_hold(&self);
 }
 
 pub(crate) struct ComponentExecutionContext<FileSystem> {
     activity: InstanceActivity,
-    debug_port: Option<()>,
     filesystem: FileSystem,
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     process_authority: ProcessAuthority,
+    ipc_grants: crate::IpcEndpointGrants,
     output_mode: ComponentOutputMode,
 }
 
@@ -547,7 +551,6 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
     pub(crate) fn new(
         instance: RegisteredInstance,
         store_kernel_heap_bytes: u64,
-        debug_port: Option<()>,
         filesystem: FileSystem,
         arguments: Vec<String>,
         environment: Vec<(String, String)>,
@@ -556,11 +559,11 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
     ) -> Self {
         Self {
             activity: InstanceActivity::new(instance, store_kernel_heap_bytes),
-            debug_port,
             filesystem,
             arguments,
             environment,
             process_authority,
+            ipc_grants: crate::IpcEndpointGrants::new(),
             output_mode,
         }
     }
@@ -582,7 +585,6 @@ where
         runtime_state: RuntimeStateImpl,
         instance_registry: InstanceRegistry,
         instance: RegisteredInstance,
-        debug_port: Option<()>,
         filesystem: FileSystem,
         arguments: Vec<String>,
         environment: Vec<(String, String)>,
@@ -606,7 +608,6 @@ where
             execution_context: ComponentExecutionContext::new(
                 instance,
                 store_kernel_heap_bytes(size_of::<Self>()),
-                debug_port,
                 filesystem,
                 arguments,
                 environment,
@@ -620,6 +621,12 @@ where
             input: crate::input::InputOwnership::new(),
             requested_exit: None,
         }
+    }
+
+    /// Attaches explicit IPC endpoint capabilities granted to this instance at spawn.
+    pub fn with_ipc_grants(mut self, ipc_grants: crate::IpcEndpointGrants) -> Self {
+        self.execution_context.ipc_grants = ipc_grants;
+        self
     }
 
     /// Retires every network handle a dying socket resource queued
@@ -673,8 +680,8 @@ where
         self.execution_context.activity.instance()
     }
 
-    pub(crate) fn debug_port(&self) -> Option<()> {
-        self.execution_context.debug_port
+    pub(crate) fn ipc_grants(&self) -> &crate::IpcEndpointGrants {
+        &self.execution_context.ipc_grants
     }
 
     pub(crate) fn filesystem(&self) -> &FileSystem {

@@ -32,7 +32,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use helios_artifact::bootfs::Fingerprint;
 use helios_artifact::{ParsedArtifact, TrailerError, sign_payload_with_key, verify_signed_payload};
 use helios_hal::measured_boot::{
@@ -57,6 +57,18 @@ pub const PAYLOAD_REGISTER: MeasurementRegister = MeasurementRegister::new(9);
 
 /// The HKDF-SHA256 `info` the compiler-signing key is expanded under.
 const CWASM_SIGNING_INFO: &[u8] = b"helios.cwasm-signing.v1";
+
+/// The HKDF-SHA256 `info` the machine identity Ed25519 key is expanded under.
+pub const MACHINE_IDENTITY_INFO: &[u8] = b"helios.machine-identity.v1";
+
+/// Fixed protocol prefix prepended to every message signed by [`MachineIdentityKey`].
+pub const MACHINE_IDENTITY_SIGNATURE_PREFIX: &[u8] = b"helios.machine-identity.v1\0";
+
+/// Maximum length of a domain-separation tag accepted by [`MachineIdentityKey::sign`].
+pub const MAX_MACHINE_IDENTITY_DOMAIN_BYTES: usize = 128;
+
+/// Maximum challenge payload size accepted by [`MachineIdentityKey::sign`].
+pub const MAX_MACHINE_IDENTITY_CHALLENGE_BYTES: usize = 64 * 1024;
 
 /// The Ed25519 key the in-kernel compiler's output is signed with, and
 /// the only key a written `cwasm` verifies against.
@@ -105,6 +117,123 @@ impl CwasmSigningKey {
 impl fmt::Debug for CwasmSigningKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "CwasmSigningKey({})", self.fingerprint())
+    }
+}
+
+/// Why [`MachineIdentityKey::sign`] refused a signing request.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum MachineIdentitySignError {
+    /// Domain tag was empty, longer than [`MAX_MACHINE_IDENTITY_DOMAIN_BYTES`],
+    /// or contained whitespace / non-graphic ASCII bytes.
+    #[error(
+        "machine identity signing domain must be 1..={MAX_MACHINE_IDENTITY_DOMAIN_BYTES} graphic ASCII bytes"
+    )]
+    InvalidDomain,
+    /// Challenge exceeded [`MAX_MACHINE_IDENTITY_CHALLENGE_BYTES`].
+    #[error("machine identity challenge exceeds the {limit}-byte limit")]
+    ChallengeTooLarge { limit: u32 },
+}
+
+/// Why [`MachineIdentityKey::verify`] rejected a signature.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum MachineIdentityVerifyError {
+    #[error(transparent)]
+    Message(#[from] MachineIdentitySignError),
+    #[error("machine identity signature verification failed")]
+    BadSignature,
+}
+
+/// Builds the canonical length-prefixed, domain-separated byte sequence
+/// signed and verified by [`MachineIdentityKey`]:
+///
+/// `b"helios.machine-identity.v1\0" || u32_le(domain.len()) || domain || u32_le(challenge.len()) || challenge`
+pub fn machine_identity_signing_message(
+    domain: &str,
+    challenge: &[u8],
+) -> Result<Vec<u8>, MachineIdentitySignError> {
+    if domain.is_empty()
+        || domain.len() > MAX_MACHINE_IDENTITY_DOMAIN_BYTES
+        || !domain.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(MachineIdentitySignError::InvalidDomain);
+    }
+    if challenge.len() > MAX_MACHINE_IDENTITY_CHALLENGE_BYTES {
+        return Err(MachineIdentitySignError::ChallengeTooLarge {
+            limit: MAX_MACHINE_IDENTITY_CHALLENGE_BYTES as u32,
+        });
+    }
+    let domain_len = domain.len() as u32;
+    let challenge_len = challenge.len() as u32;
+    let total = MACHINE_IDENTITY_SIGNATURE_PREFIX.len() + 4 + domain.len() + 4 + challenge.len();
+    let mut message = Vec::with_capacity(total);
+    message.extend_from_slice(MACHINE_IDENTITY_SIGNATURE_PREFIX);
+    message.extend_from_slice(&domain_len.to_le_bytes());
+    message.extend_from_slice(domain.as_bytes());
+    message.extend_from_slice(&challenge_len.to_le_bytes());
+    message.extend_from_slice(challenge);
+    Ok(message)
+}
+
+/// This boot's Ed25519 machine identity key, derived under
+/// [`MACHINE_IDENTITY_INFO`] from the same measured-boot sealed or
+/// per-boot ephemeral seed as [`CwasmSigningKey`] so the two keys share
+/// provenance while remaining cryptographically independent.
+pub struct MachineIdentityKey {
+    key: SigningKey,
+}
+
+impl MachineIdentityKey {
+    pub(crate) fn from_seed(seed: &SealedSecret) -> Self {
+        let mut okm = Zeroizing::new([0_u8; ed25519_dalek::SECRET_KEY_LENGTH]);
+        Hkdf::<Sha256>::new(None, seed.expose())
+            .expand(MACHINE_IDENTITY_INFO, okm.as_mut_slice())
+            .unwrap_or_else(|_| {
+                panic!("HKDF-SHA256 expands up to 8160 bytes, and an Ed25519 secret is 32")
+            });
+        Self {
+            key: SigningKey::from_bytes(&okm),
+        }
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        self.key.verifying_key().to_bytes()
+    }
+
+    pub fn fingerprint(&self) -> Fingerprint {
+        Fingerprint::of(&self.public_key())
+    }
+
+    /// Signs `challenge` under `domain` using the canonical length-prefixed
+    /// domain-separated transcript.
+    pub fn sign(
+        &self,
+        domain: &str,
+        challenge: &[u8],
+    ) -> Result<[u8; 64], MachineIdentitySignError> {
+        let message = machine_identity_signing_message(domain, challenge)?;
+        Ok(self.key.sign(&message).to_bytes())
+    }
+
+    /// Verifies `signature` over `(domain, challenge)` against this key's
+    /// public half.
+    pub fn verify(
+        &self,
+        domain: &str,
+        challenge: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<(), MachineIdentityVerifyError> {
+        let message = machine_identity_signing_message(domain, challenge)?;
+        let sig = Signature::from_bytes(signature);
+        self.key
+            .verifying_key()
+            .verify(&message, &sig)
+            .map_err(|_| MachineIdentityVerifyError::BadSignature)
+    }
+}
+
+impl fmt::Debug for MachineIdentityKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MachineIdentityKey({})", self.fingerprint())
     }
 }
 
@@ -177,16 +306,18 @@ pub enum SigningKeyError {
     },
 }
 
-/// This boot's compiler-signing key and where its seed came from.
+/// This boot's compiler-signing and machine-identity keys and where their
+/// shared seed came from.
 #[derive(Debug)]
 pub struct SettledSigningKey {
     pub key: CwasmSigningKey,
+    pub machine_identity: MachineIdentityKey,
     pub source: SeedSource,
     /// The registers the seed is sealed to; empty for an ephemeral seed.
     pub bound_to: MeasurementSet,
 }
 
-/// Settles this boot's compiler-signing key.
+/// Settles this boot's compiler-signing and machine-identity keys.
 ///
 /// With a device, `payload_digest` is extended into [`PAYLOAD_REGISTER`]
 /// first, and only then is the slot bound to the kernel image registers
@@ -202,6 +333,7 @@ pub async fn settle_signing_key<Device: MeasuredBoot>(
         let seed = draw_seed(entropy);
         return Ok(SettledSigningKey {
             key: CwasmSigningKey::from_seed(&seed),
+            machine_identity: MachineIdentityKey::from_seed(&seed),
             source: SeedSource::Ephemeral,
             bound_to: MeasurementSet::empty(),
         });
@@ -219,6 +351,7 @@ pub async fn settle_signing_key<Device: MeasuredBoot>(
         Ok(seed) => {
             return Ok(SettledSigningKey {
                 key: CwasmSigningKey::from_seed(&seed),
+                machine_identity: MachineIdentityKey::from_seed(&seed),
                 source: SeedSource::Unsealed,
                 bound_to,
             });
@@ -243,12 +376,13 @@ pub async fn settle_signing_key<Device: MeasuredBoot>(
         })?;
     Ok(SettledSigningKey {
         key: CwasmSigningKey::from_seed(&seed),
+        machine_identity: MachineIdentityKey::from_seed(&seed),
         source: SeedSource::Provisioned(cause),
         bound_to,
     })
 }
 
-/// Settles the key during bring-up, states which path it took, and
+/// Settles the keys during bring-up, states which path they took, and
 /// stops the boot when the device failed.
 ///
 /// It runs before the executor starts, so the device's futures are
@@ -258,7 +392,7 @@ pub(crate) fn settle_signing_key_at_bring_up<Device: MeasuredBoot>(
     measured_boot: Option<&mut Device>,
     payload_digest: &Sha256Digest,
     entropy: &RootEntropy,
-) -> CwasmSigningKey {
+) -> (CwasmSigningKey, MachineIdentityKey) {
     let settled = complete_device_future_at_bring_up(settle_signing_key(
         measured_boot,
         payload_digest,
@@ -280,9 +414,10 @@ pub(crate) fn settle_signing_key_at_bring_up<Device: MeasuredBoot>(
         cause,
         bound_to = format_args!("{:#x}", settled.bound_to.bits()),
         signer = %settled.key.fingerprint(),
+        identity = %settled.machine_identity.fingerprint(),
         "compiler-signing key settled"
     );
-    settled.key
+    (settled.key, settled.machine_identity)
 }
 
 /// A new seed from the root DRBG, written straight into the secret.
@@ -566,6 +701,82 @@ mod tests {
         assert_eq!(
             CwasmSigningKey::from_seed(&seed).public_key(),
             SigningKey::from_bytes(&expected).verifying_key().to_bytes()
+        );
+    }
+
+    #[test]
+    fn machine_identity_key_is_domain_separated_from_cwasm_key_and_across_challenges() {
+        let seed = SealedSecret::new([0x42; SealedSecret::LEN]);
+        let cwasm = CwasmSigningKey::from_seed(&seed);
+        let identity = MachineIdentityKey::from_seed(&seed);
+        assert_ne!(
+            cwasm.public_key(),
+            identity.public_key(),
+            "separate HKDF info labels must yield distinct Ed25519 keys from one seed"
+        );
+        assert_eq!(
+            alloc::format!("{identity:?}"),
+            alloc::format!("MachineIdentityKey({})", identity.fingerprint())
+        );
+
+        let mut expected = [0_u8; 32];
+        Hkdf::<Sha256>::new(None, seed.expose())
+            .expand(MACHINE_IDENTITY_INFO, &mut expected)
+            .unwrap();
+        assert_eq!(
+            identity.public_key(),
+            SigningKey::from_bytes(&expected).verifying_key().to_bytes()
+        );
+
+        // Sealed boots keep the same machine identity key across reboots.
+        let mut device = MeasuredBootModel::new(KERNEL_IMAGE);
+        let first = boot(&mut device, 1, &payload(0x09)).unwrap();
+        let second = boot(&mut device, 2, &payload(0x09)).unwrap();
+        assert_eq!(
+            first.machine_identity.public_key(),
+            second.machine_identity.public_key()
+        );
+
+        // Domain-separated challenge signing & boundary-shift resistance.
+        let sig = identity.sign("helios.rpc.peer.v1", b"nonce-123").unwrap();
+        identity
+            .verify("helios.rpc.peer.v1", b"nonce-123", &sig)
+            .expect("matching domain and challenge verify");
+        assert_eq!(
+            identity.verify("helios.rpc.peer.v2", b"nonce-123", &sig),
+            Err(MachineIdentityVerifyError::BadSignature)
+        );
+        // Shifting bytes across the `(domain, challenge)` boundary must fail.
+        let shift_sig = identity.sign("ab", b"c").unwrap();
+        assert_eq!(
+            identity.verify("a", b"bc", &shift_sig),
+            Err(MachineIdentityVerifyError::BadSignature)
+        );
+
+        // Domain & challenge bounds.
+        assert_eq!(
+            identity.sign("", b"x"),
+            Err(MachineIdentitySignError::InvalidDomain)
+        );
+        assert_eq!(
+            identity.sign("bad domain", b"x"),
+            Err(MachineIdentitySignError::InvalidDomain)
+        );
+        assert_eq!(
+            identity.sign("bad\0domain", b"x"),
+            Err(MachineIdentitySignError::InvalidDomain)
+        );
+        let long_domain = "d".repeat(MAX_MACHINE_IDENTITY_DOMAIN_BYTES + 1);
+        assert_eq!(
+            identity.sign(&long_domain, b"x"),
+            Err(MachineIdentitySignError::InvalidDomain)
+        );
+        let big_challenge = alloc::vec![0_u8; MAX_MACHINE_IDENTITY_CHALLENGE_BYTES + 1];
+        assert_eq!(
+            identity.sign("helios.attest.v1", &big_challenge),
+            Err(MachineIdentitySignError::ChallengeTooLarge {
+                limit: MAX_MACHINE_IDENTITY_CHALLENGE_BYTES as u32,
+            })
         );
     }
 }

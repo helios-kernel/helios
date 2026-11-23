@@ -10,6 +10,8 @@
 //! name what they own by id, push the ids here when they die, and the
 //! store — which is generic over the service — closes them.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use triomphe::Arc;
 
@@ -49,12 +51,14 @@ pub enum RetiredNetworkHandle {
 /// kernel heap, on a path that runs once per socket death.
 pub struct SocketRetirementQueue {
     handles: Arc<ConcurrentQueue<RetiredNetworkHandle>>,
+    snapshot_released: Arc<AtomicBool>,
 }
 
 impl SocketRetirementQueue {
     pub fn new() -> Self {
         Self {
             handles: Arc::new(ConcurrentQueue::unbounded()),
+            snapshot_released: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -63,6 +67,18 @@ impl SocketRetirementQueue {
         SocketRetirementSender {
             handles: self.handles.clone(),
         }
+    }
+
+    /// A release signal for an open snapshot-hold resource owned by this store.
+    pub fn snapshot_sender(&self) -> SnapshotRetirementSender {
+        SnapshotRetirementSender {
+            released: self.snapshot_released.clone(),
+        }
+    }
+
+    /// Consumes a queued snapshot-hold release flag, if a dying resource set one.
+    pub fn take_snapshot_release(&self) -> bool {
+        self.snapshot_released.swap(false, Ordering::AcqRel)
     }
 
     /// Whether anything is waiting to be retired.
@@ -125,6 +141,19 @@ impl SocketRetirementSender {
                 unreachable!("the socket retirement queue is never closed")
             }
         }
+    }
+}
+
+/// One snapshot-hold resource's end of the store retirement signal, ensuring
+/// a hold left open when a store tears down reopens the 9p gate immediately.
+#[derive(Clone)]
+pub struct SnapshotRetirementSender {
+    released: Arc<AtomicBool>,
+}
+
+impl SnapshotRetirementSender {
+    pub fn mark_released(&self) {
+        self.released.store(true, Ordering::Release);
     }
 }
 
@@ -192,9 +221,17 @@ where
         self.queue.sender()
     }
 
+    /// A release signal for a snapshot-hold resource this store creates.
+    pub fn snapshot_sender(&self) -> SnapshotRetirementSender {
+        self.queue.snapshot_sender()
+    }
+
     /// Retires everything queued since the last drain.
     pub fn drain(&self) {
         self.runtime_state.retire_network_handles(&self.queue);
+        if self.queue.take_snapshot_release() {
+            self.runtime_state.release_snapshot_hold();
+        }
     }
 
     /// The queue again, for the code that drives this store's turns.
@@ -206,6 +243,7 @@ where
     pub fn turn_queue(&self) -> SocketRetirementQueue {
         SocketRetirementQueue {
             handles: self.queue.handles.clone(),
+            snapshot_released: self.queue.snapshot_released.clone(),
         }
     }
 }

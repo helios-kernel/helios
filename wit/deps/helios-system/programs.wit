@@ -20,6 +20,8 @@ package helios:system@0.1.0;
 /// interface boundary so the common case does not need to express
 /// streams in its wire format.
 interface programs {
+  use ipc.{endpoint};
+
   /// Stable identifier for a live program instance, used by the observer.
   type instance-id = u64;
 
@@ -141,31 +143,56 @@ interface programs {
     classes: list<device-class>,
   }
 
-  /// A right over the machine's diagnostics. A program that holds none
-  /// of them reads only its own tracing and profiling records.
-  enum diagnostics-right {
-    /// Control the machine-wide tracing and profiling and read every
-    /// instance's records.
-    observe-machine,
+  /// Visibility or control scope for an instance-scoped capability.
+  variant authority-scope {
+    /// Only the holding instance itself.
+    %own,
+    /// The subtree rooted at the named instance, or at the newly spawned
+    /// child instance itself when `none`.
+    subtree(option<instance-id>),
+    /// The entire machine, including kernel records and all instances.
+    machine,
   }
 
-  record diagnostics-grant {
-    /// Diagnostics rights granted to the child. These must be a subset
-    /// of the caller's diagnostics authority.
-    rights: list<diagnostics-right>,
+  /// Orthogonal observation and diagnostic-control grants.
+  variant diagnostics-grant {
+    /// Read component and machine state (`helios:system/instances.snapshot`,
+    /// `helios:system/stats`, and `helios:system/inspect`) within the scope.
+    inspect-read(authority-scope),
+    /// Read tracing events (`helios:system/tracing.recent` and `subscribe`)
+    /// within the scope.
+    trace-read(authority-scope),
+    /// Read profile samples (`helios:system/profiling.folded`, `metrics`,
+    /// `instruction-samples`, and `raw-profile-*`) within the scope.
+    profile-read(authority-scope),
+    /// Mutate global diagnostic gates and profilers
+    /// (`tracing.set-target-enabled`, `profiling.set-enabled`,
+    /// `profiling.clear`, `profiling.start-instruction-sampling`).
+    control,
   }
 
-  /// A right over the machine itself rather than over what runs on it.
+  /// A right over the machine itself rather than over individual instances.
   enum machine-right {
-    /// Take processors offline and bring them online
-    /// (`helios:system/processors`).
-    control-processors,
+    /// Control machine-level execution and lifecycle (`helios:system/processors`
+    /// online/offline transitions and `helios:system/snapshot.prepare`).
+    control,
+    /// Sign domain-separated challenges with this boot's Ed25519 machine
+    /// identity key (`helios:system/machine-identity`).
+    identity,
   }
 
   record machine-grant {
     /// Machine rights granted to the child. These must be a subset of
     /// the caller's machine authority.
     rights: list<machine-right>,
+  }
+
+  /// An IPC channel endpoint transferred to the child at launch.
+  record ipc-grant {
+    /// Name under which the child claims the endpoint via `helios:system/ipc.take`.
+    name: string,
+    /// Endpoint moved out of the caller into the child.
+    endpoint: endpoint,
   }
 
   variant capability-grant {
@@ -178,7 +205,10 @@ interface programs {
     mount(mount-grant),
     device(device-grant),
     diagnostics(diagnostics-grant),
+    /// Stop live instances (`helios:system/instances.kill`) within the scope.
+    instance-control(authority-scope),
     machine(machine-grant),
+    ipc(ipc-grant),
   }
 
   record spawn-request {

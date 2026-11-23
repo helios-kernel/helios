@@ -187,6 +187,18 @@ impl VsockBindings for ProgramVsock {
 /// machine's device have both been checked.
 type Authorised<Bindings> = Result<ComponentHostVsockService, <Bindings as VsockBindings>::Error>;
 
+fn has_host_link_authority<CpuImpl, Net, StorageImpl>(
+    store: &StoreData<CpuImpl, Net, StorageImpl>,
+) -> bool
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    let authority = store.process_authority();
+    authority.derive_terminal_input_cap().is_ok() && authority.derive_terminal_output_cap().is_ok()
+}
+
 fn authorise<Bindings, CpuImpl, Net, StorageImpl>(
     store: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> Authorised<Bindings>
@@ -196,7 +208,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
-    if store.debug_port().is_none() {
+    if !has_host_link_authority(store) {
         return Err(denied::<Bindings>());
     }
     store
@@ -250,9 +262,9 @@ where
         "guest-cid",
         |caller: Access<'_, StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
             let store = caller.data();
-            let cid = store
-                .debug_port()
-                .and_then(|()| store.runtime_state.vsock_service())
+            let cid = has_host_link_authority(store)
+                .then(|| store.runtime_state.vsock_service())
+                .flatten()
                 .map(|service| service.guest_cid());
             Ok((cid,))
         },

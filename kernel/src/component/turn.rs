@@ -116,6 +116,9 @@ where
         if !self.is_empty() {
             runtime_state.retire_network_handles(self);
         }
+        if self.take_snapshot_release() {
+            runtime_state.release_snapshot_hold();
+        }
     }
 
     fn take_stop(&self) -> Option<Error> {

@@ -110,12 +110,15 @@ pub trait CodeAttribution {
     fn attribute(&self, address: usize) -> SampledCode;
 }
 
-/// Why the kernel cannot produce an instruction profile.
+/// Why the kernel cannot produce an instruction profile or start a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InstructionProfileError {
     /// The running backend does not capture instruction addresses.
     #[error("this backend does not sample instruction addresses")]
     NotCaptured,
+    /// Another instruction-sampling session is already running.
+    #[error("an instruction sampling session is already active")]
+    Busy,
 }
 
 /// Every sample taken since sampling last started, attributed.
@@ -139,6 +142,8 @@ pub struct InstructionSampler {
 struct SamplerInner {
     processor_count: usize,
     capture: Once<SampleCapture>,
+    /// True while a live [`SamplingSession`] owns the sampler.
+    session_active: AtomicBool,
     /// Whether the backend should be sampling. Written by the profiling
     /// control, read by every processor's timer interrupt.
     sampling: AtomicBool,
@@ -149,6 +154,31 @@ struct SamplerInner {
     rings: Once<Box<[SampleRing]>>,
     /// The drain lock and what it has attributed so far.
     attributed: Mutex<Attributed>,
+}
+
+/// Active instruction-address sampling lease.
+///
+/// Dropping the session stops timer-interrupt sampling and releases the
+/// sampler for subsequent runs while leaving the collected samples
+/// available to [`InstructionSampler::profile`].
+#[must_use = "dropping a SamplingSession stops instruction sampling"]
+pub struct SamplingSession {
+    inner: Arc<SamplerInner>,
+}
+
+impl core::fmt::Debug for SamplingSession {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("SamplingSession")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SamplingSession {
+    fn drop(&mut self) {
+        self.inner.sampling.store(false, Ordering::Release);
+        self.inner.session_active.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Default)]
@@ -229,6 +259,7 @@ impl InstructionSampler {
             inner: Arc::new(SamplerInner {
                 processor_count,
                 capture: Once::new(),
+                session_active: AtomicBool::new(false),
                 sampling: AtomicBool::new(false),
                 started: Notify::new(),
                 rings: Once::new(),
@@ -252,21 +283,26 @@ impl InstructionSampler {
         self.inner.capture.call_once(|| capture);
     }
 
-    /// Starts or stops sampling.
+    /// Starts an exclusive instruction-sampling session.
     ///
     /// Sampling is its own control, separate from the scoped profiler's:
-    /// it shortens every processor's timer period, so it runs only when a
-    /// reader asked for an instruction profile. Starting discards every
+    /// it shortens every processor's timer period, so it runs only while
+    /// the returned [`SamplingSession`] is alive. Starting discards every
     /// sample an earlier run left, so a profile covers exactly one run,
-    /// from its start to the read that follows. A backend that installed
-    /// no capture refuses both directions.
-    pub fn set_sampling(&self, enabled: bool) -> Result<(), InstructionProfileError> {
+    /// from its start to the read that follows. Dropping the session
+    /// stops sampling automatically, including when its owner traps or
+    /// disconnects.
+    pub fn start_sampling(&self) -> Result<SamplingSession, InstructionProfileError> {
         if self.inner.capture.get().is_none() {
             return Err(InstructionProfileError::NotCaptured);
         }
-        if !enabled {
-            self.inner.sampling.store(false, Ordering::Release);
-            return Ok(());
+        if self
+            .inner
+            .session_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(InstructionProfileError::Busy);
         }
         let processor_count = self.inner.processor_count;
         self.inner.rings.call_once(|| {
@@ -279,7 +315,9 @@ impl InstructionSampler {
         // reads the flag with acquire.
         self.inner.sampling.store(true, Ordering::Release);
         self.inner.started.notify_all();
-        Ok(())
+        Ok(SamplingSession {
+            inner: self.inner.clone(),
+        })
     }
 
     /// Whether the backend should be sampling.
@@ -402,8 +440,8 @@ mod tests {
     fn a_backend_without_capture_reports_it_rather_than_an_empty_profile() {
         let sampler = InstructionSampler::new(1);
         assert_eq!(
-            sampler.set_sampling(true),
-            Err(InstructionProfileError::NotCaptured)
+            sampler.start_sampling().unwrap_err(),
+            InstructionProfileError::NotCaptured
         );
         assert!(!sampler.sampling());
         assert_eq!(
@@ -416,13 +454,18 @@ mod tests {
     fn samples_are_attributed_and_ranked() {
         let sampler = InstructionSampler::new(1);
         sampler.install_capture(CAPTURE);
-        sampler.set_sampling(true).expect("capture is installed");
+        let session = sampler.start_sampling().expect("capture is installed");
         assert!(sampler.sampling());
         for address in [0x1000, 0x1004, 0x10, 0x1008] {
             sampler.record(address);
         }
         sampler.drain(&Split);
         sampler.record(0x10);
+        drop(session);
+        assert!(
+            !sampler.sampling(),
+            "dropping the sampling session stops timer-interrupt capture"
+        );
 
         let profile = sampler.profile(&Split).expect("capture is installed");
         assert_eq!(profile.capture, CAPTURE);
@@ -439,7 +482,7 @@ mod tests {
     fn a_full_ring_counts_drops_and_keeps_what_it_holds() {
         let sampler = InstructionSampler::new(1);
         sampler.install_capture(CAPTURE);
-        sampler.set_sampling(true).expect("capture is installed");
+        let _session = sampler.start_sampling().expect("capture is installed");
         for _ in 0..SAMPLE_RING_CAPACITY + 5 {
             sampler.record(0x20);
         }
@@ -458,17 +501,27 @@ mod tests {
     }
 
     #[test]
-    fn starting_a_run_discards_the_previous_runs_samples() {
+    fn session_is_exclusive_until_dropped_and_new_session_discards_previous_samples() {
         let sampler = InstructionSampler::new(1);
         sampler.install_capture(CAPTURE);
-        sampler.set_sampling(true).expect("capture is installed");
+        let first = sampler.start_sampling().expect("capture is installed");
+        assert_eq!(
+            sampler.start_sampling().unwrap_err(),
+            InstructionProfileError::Busy
+        );
         sampler.record(0x10);
         sampler.drain(&Split);
         sampler.record(0x1000);
-        sampler.set_sampling(false).expect("capture is installed");
-        sampler.set_sampling(true).expect("capture is installed");
+        drop(first);
+        assert!(!sampler.sampling());
+
+        let second = sampler
+            .start_sampling()
+            .expect("dropping the first session releases the sampler");
         let profile = sampler.profile(&Split).expect("capture is installed");
         assert!(profile.samples.is_empty());
         assert_eq!(profile.dropped, 0);
+        drop(second);
+        assert!(!sampler.sampling());
     }
 }
